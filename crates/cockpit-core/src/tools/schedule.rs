@@ -34,7 +34,7 @@ use crate::engine::schedule::spec::{
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
 
 /// The fixed schema for the `schedule` meta-tool.
-pub const SCHEDULE_DESCRIPTION: &str = "Schedule async work: loop.start{prompt,interval,limit?,...}, loop.cancel{job_id}, background.start{command,cwd?}, background.tail{job_id,lines?}, background.cancel{job_id}, list{} (limit=1=timer)";
+pub const SCHEDULE_DESCRIPTION: &str = "Schedule async loop/background work without blocking the conversation; choose `action` (`loop.start`, `loop.cancel`, `background.start`, `background.tail`, `background.cancel`, `list`) and put per-action details in `args`; use limit=1 for one-shot timers";
 
 /// The defensive (`LlmMode::Defensive`) `schedule` description
 /// (implementation note): explicit steering for the
@@ -42,6 +42,8 @@ pub const SCHEDULE_DESCRIPTION: &str = "Schedule async work: loop.start{prompt,i
 /// `schedule` directly as a native tool with an `action` argument; do not
 /// route it through MCP.
 pub const SCHEDULE_DESCRIPTION_DEFENSIVE: &str = "Run work in the background or on a recurring schedule so the conversation isn't blocked waiting. Call `schedule` directly as a native tool (an `action` argument), not through MCP. Pick the kind of work with `action`: `loop.start` runs a prompt repeatedly on an interval (set `limit=1` for a single delayed/one-shot timer), `loop.cancel` stops a running loop, `background.start` launches a long task that runs detached, `background.tail` shows that task's latest output, `background.cancel` stops it, and `list` shows what is currently scheduled. Put the per-action details in `args`. Use this for things like polling a build, watching for a condition, or kicking off something slow you'll check later — not for ordinary step-by-step work, which you should just do directly.";
+const FORK_SCHEDULE_DESCRIPTION: &str = "Request scheduled work from the main agent or cancel this fork's own loop; forked schedule never launches detached work itself";
+const FORK_SCHEDULE_DESCRIPTION_DEFENSIVE: &str = "Inside a scheduled fork, use `schedule` only to request that the main agent consider new loop/background work, or to cancel this fork's own loop. `loop.start` and `background.start` record requests for the main agent; they do not launch detached work from the fork. `loop.cancel` cancels this fork's loop. Other schedule actions are rejected here.";
 
 /// Build the `schedule` meta-tool's JSON schema. Kept in a free function so
 /// tests can assert on it directly; see [`schedule_parameters_defensive`] for
@@ -212,7 +214,7 @@ impl Tool for NoteTool {
     }
 
     fn description(&self) -> &str {
-        "Surface a progress note to the human now; it reaches the main conversation only at loop end"
+        "Show the human a live progress note from this background loop; notes join the main conversation when the loop ends"
     }
 
     fn defensive_description(&self) -> Option<String> {
@@ -286,11 +288,11 @@ impl Tool for ForkScheduleTool {
     }
 
     fn description(&self) -> &str {
-        SCHEDULE_DESCRIPTION
+        FORK_SCHEDULE_DESCRIPTION
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some(SCHEDULE_DESCRIPTION_DEFENSIVE.to_string())
+        Some(FORK_SCHEDULE_DESCRIPTION_DEFENSIVE.to_string())
     }
 
     fn parameters(&self) -> Value {
@@ -459,40 +461,29 @@ mod tests {
         assert_eq!(terse, defensive);
     }
 
-    /// The `schedule` description must name every action plus that action's
-    /// required `args` field(s), so the model is never pointed at a field
-    /// `spec.rs`'s parser rejects. This catches drift between the
-    /// description hints and the parser at `cargo test` time. The
-    /// `(action, &[required fields])` table mirrors the required-vs-optional
-    /// contract in `crate::engine::schedule::spec`.
+    /// The `schedule` description names the action surface but leaves
+    /// per-action field shapes to the machine-readable schema. Keeping field
+    /// names out of the prose prevents a second, drifting schema.
     #[test]
-    fn description_documents_each_action_and_required_fields() {
-        // Required fields per action, matching `spec.rs` exactly:
-        //   loop.start       → prompt, interval
-        //   loop.cancel      → job_id
-        //   background.start → command
-        //   background.tail  → job_id
-        //   background.cancel→ job_id
-        //   list             → (none)
-        let contract: &[(&str, &[&str])] = &[
-            ("loop.start", &["prompt", "interval"]),
-            ("loop.cancel", &["job_id"]),
-            ("background.start", &["command"]),
-            ("background.tail", &["job_id"]),
-            ("background.cancel", &["job_id"]),
-            ("list", &[]),
-        ];
-        for (action, required) in contract {
+    fn description_names_actions_without_parameter_shapes() {
+        for action in [
+            "loop.start",
+            "loop.cancel",
+            "background.start",
+            "background.tail",
+            "background.cancel",
+            "list",
+        ] {
             assert!(
                 SCHEDULE_DESCRIPTION.contains(action),
                 "`schedule` description must name action `{action}`"
             );
-            for field in *required {
-                assert!(
-                    SCHEDULE_DESCRIPTION.contains(field),
-                    "`schedule` description must name `{action}`'s required field `{field}`"
-                );
-            }
+        }
+        for field in ["prompt", "interval", "job_id", "command", "cwd", "lines"] {
+            assert!(
+                !SCHEDULE_DESCRIPTION.contains(field),
+                "`schedule` description should not duplicate schema field `{field}`"
+            );
         }
     }
 
@@ -536,6 +527,23 @@ mod tests {
         let reqs = state.take_requests();
         assert_eq!(reqs.len(), 1);
         assert!(matches!(reqs[0], SpawnRequest::Background(_)));
+    }
+
+    #[test]
+    fn fork_schedule_description_differs_but_schema_matches_main_schedule() {
+        let state = Arc::new(ForkScheduleState::new("sched-abc".into()));
+        let fork = ForkScheduleTool::new(state);
+        let main = ScheduleTool;
+
+        assert_ne!(fork.description(), main.description());
+        assert!(
+            !fork
+                .defensive_description()
+                .unwrap()
+                .contains("launches a long task that runs detached")
+        );
+        assert_eq!(fork.parameters(), main.parameters());
+        assert_eq!(fork.defensive_parameters(), main.defensive_parameters());
     }
 
     #[tokio::test]

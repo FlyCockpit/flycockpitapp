@@ -307,7 +307,9 @@ mod typed_args_tests {
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
 
-    /// One-sentence description per GOALS §10. Keep it under ~80 chars.
+    /// One-sentence description per GOALS §10. Keep this terse enough for the
+    /// normal/frontier tool array; the invariant test treats ~200 chars as the
+    /// hard ceiling for built-ins.
     /// This is the **normal** `llm_mode` form (terse, the token-economy
     /// budget the CI check enforces).
     fn description(&self) -> &str;
@@ -315,17 +317,11 @@ pub trait Tool: Send + Sync {
     /// The **defensive** `llm_mode` description: explicit, steering prose
     /// for the weak-model target (implementation note).
     /// `None` (the default) means "no defensive variant — fall back to the
-    /// terse [`Self::description`]." Every *built-in* tool overrides this so
-    /// the full surface is covered (a registry-driven test enforces it);
-    /// the only `None`-keepers are user-config-driven tools (custom-bash),
-    /// whose author owns their wording.
+    /// terse [`Self::description`]." Registry-driven tests enforce defensive
+    /// coverage for built-ins that reach the normal agent surface; dynamic or
+    /// user-authored tools may rely on the terse fallback where that is the
+    /// correct wording.
     fn defensive_description(&self) -> Option<String> {
-        None
-    }
-
-    /// Optional expanded description for the strongest model tier. `None`
-    /// falls back to the normal terse description.
-    fn frontier_description(&self) -> Option<String> {
         None
     }
 
@@ -334,6 +330,10 @@ pub trait Tool: Send + Sync {
     /// proven read-only by that tool's own policy.
     fn effect(&self) -> ToolEffect {
         ToolEffect::Dynamic
+    }
+
+    fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
+        Vec::new()
     }
 
     fn presentation(&self, args: &Value) -> ToolPresentation {
@@ -750,6 +750,10 @@ pub struct ToolCtx {
     /// package activation uses this session-local surface for Hermes
     /// `requires_tools` / `fallback_for_tools` gates.
     pub available_tools: Arc<std::collections::HashSet<String>>,
+    /// Frozen Monty builtin registry for this agent/tool context. It contains
+    /// the host control functions plus native tools made scriptable for the
+    /// session's tool tier placement.
+    pub mcp_builtin_registry: Arc<crate::mcp::builtin::BuiltinRegistry>,
     /// Whether the calling agent holds the `tree` tool. Lets a tool steer a
     /// recovery hint to the caller's actual surface (e.g. `read` on a
     /// directory suggests `tree` only when the agent can use it) rather than
@@ -855,12 +859,7 @@ pub fn definition_of(
             tool.defensive_parameters()
                 .unwrap_or_else(|| tool.parameters()),
         ),
-        LlmMode::Normal => (tool.description().to_string(), tool.parameters()),
-        LlmMode::Frontier => (
-            tool.frontier_description()
-                .unwrap_or_else(|| tool.description().to_string()),
-            tool.parameters(),
-        ),
+        LlmMode::Normal | LlmMode::Frontier => (tool.description().to_string(), tool.parameters()),
     };
     // Per-agent axis: an override for the active mode wins over the base
     // description. Schema is intentionally untouched.
@@ -929,6 +928,7 @@ impl Capability {
 #[derive(Default, Clone)]
 pub struct ToolBox {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    mcp_builtin_tools: BTreeMap<String, McpBuiltinToolEntry>,
     /// Per-tool-name description overrides. Empty (the default) means every
     /// tool renders its own base/per-mode description — byte-identical to the
     /// pre-override behavior.
@@ -936,6 +936,29 @@ pub struct ToolBox {
     /// Rendered tool schemas for this finalized toolbox, keyed by LLM mode.
     /// Builder-style mutations clear it so per-agent overrides stay exact.
     definition_cache: Arc<Mutex<HashMap<crate::config::extended::LlmMode, Vec<ToolDefinition>>>>,
+    capability_unavailable: BTreeMap<String, Vec<crate::capabilities::ToolCapabilityIssue>>,
+    capability_description_suffixes: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone)]
+struct McpBuiltinToolEntry {
+    tool: Arc<dyn Tool>,
+    directly_callable: bool,
+}
+
+fn is_monty_builtin_adaptable(name: &str) -> bool {
+    !matches!(
+        name,
+        "question"
+            | "handoff"
+            | "return"
+            | "schedule"
+            | "task"
+            | "spawn"
+            | "defer_to_orchestrator"
+            | "start_build"
+            | "mcp"
+    )
 }
 
 impl ToolBox {
@@ -944,16 +967,71 @@ impl ToolBox {
     }
 
     pub fn with(mut self, tool: Arc<dyn Tool>) -> Self {
-        self.tools.insert(tool.name().to_string(), tool);
+        let name = tool.name().to_string();
+        if is_monty_builtin_adaptable(&name) {
+            self.mcp_builtin_tools.insert(
+                name.clone(),
+                McpBuiltinToolEntry {
+                    tool: tool.clone(),
+                    directly_callable: true,
+                },
+            );
+        }
+        self.tools.insert(name.clone(), tool);
+        self.capability_unavailable.remove(&name);
+        self.capability_description_suffixes.remove(&name);
         self.definition_cache.lock().unwrap().clear();
         self
     }
 
     pub fn without(mut self, name: &str) -> Self {
         self.tools.remove(name);
+        self.mcp_builtin_tools.remove(name);
         self.overrides.remove(name);
+        self.capability_unavailable.remove(name);
+        self.capability_description_suffixes.remove(name);
         self.definition_cache.lock().unwrap().clear();
         self
+    }
+
+    pub fn with_discoverable_mcp(mut self, tool: Arc<dyn Tool>) -> Self {
+        let name = tool.name().to_string();
+        if is_monty_builtin_adaptable(&name) {
+            self.mcp_builtin_tools.insert(
+                name,
+                McpBuiltinToolEntry {
+                    tool,
+                    directly_callable: false,
+                },
+            );
+        }
+        self.definition_cache.lock().unwrap().clear();
+        self
+    }
+
+    pub fn mcp_builtin_registry(&self) -> Arc<crate::mcp::builtin::BuiltinRegistry> {
+        let funcs = self
+            .mcp_builtin_tools
+            .iter()
+            .filter(|(name, _entry)| !self.capability_unavailable.contains_key(*name))
+            .filter_map(|(_name, entry)| {
+                let adapter =
+                    crate::mcp::builtin::ToolOutputBuiltinAdapter::new(entry.tool.clone())
+                        .with_direct_call_marker(entry.directly_callable);
+                adapter.into_function().ok()
+            })
+            .collect();
+        Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(funcs))
+    }
+
+    pub(crate) fn discoverable_mcp_tool_names(&self) -> Vec<String> {
+        self.mcp_builtin_tools
+            .iter()
+            .filter(|(name, entry)| {
+                !entry.directly_callable && !self.capability_unavailable.contains_key(*name)
+            })
+            .map(|(name, _entry)| name.clone())
+            .collect()
     }
 
     /// Register a per-agent description override for the tool named `name`.
@@ -983,7 +1061,90 @@ impl ToolBox {
     }
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        if self.capability_unavailable.contains_key(name) {
+            return None;
+        }
         self.tools.get(name)
+    }
+
+    pub fn get_cloned(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.get(name).cloned()
+    }
+
+    pub fn apply_capabilities(
+        mut self,
+        env: &std::collections::HashMap<String, String>,
+        cwd: &std::path::Path,
+        target: crate::capabilities::ExecutionTarget,
+    ) -> Self {
+        let cache = crate::capabilities::default_probe_cache();
+        self.apply_capabilities_with_cache(env, cwd, target, &cache);
+        self
+    }
+
+    pub fn apply_capabilities_with_cache(
+        &mut self,
+        env: &std::collections::HashMap<String, String>,
+        cwd: &std::path::Path,
+        target: crate::capabilities::ExecutionTarget,
+        cache: &crate::capabilities::CapabilityProbeCache,
+    ) {
+        self.capability_unavailable.clear();
+        self.capability_description_suffixes.clear();
+        for (name, tool) in &self.tools {
+            let requirements = tool.binary_requirements();
+            let evaluation = crate::capabilities::evaluate_tool_requirements(
+                name,
+                &requirements,
+                env,
+                cwd,
+                target,
+                cache,
+            );
+            if !evaluation.unavailable.is_empty() {
+                self.capability_unavailable
+                    .insert(name.clone(), evaluation.unavailable);
+            }
+            if !evaluation.optional_missing.is_empty() {
+                self.capability_description_suffixes.insert(
+                    name.clone(),
+                    evaluation
+                        .optional_missing
+                        .into_iter()
+                        .map(|issue| {
+                            format!(
+                                " Optional `{}` missing: {}",
+                                issue.requirement.name,
+                                issue.render_remedy(crate::capabilities::RemedyPlatform::current())
+                            )
+                        })
+                        .collect(),
+                );
+            }
+        }
+        self.definition_cache.lock().unwrap().clear();
+    }
+
+    pub fn capability_unavailable(
+        &self,
+    ) -> impl Iterator<Item = &crate::capabilities::ToolCapabilityIssue> {
+        self.capability_unavailable
+            .values()
+            .flat_map(|issues| issues.iter())
+    }
+
+    pub fn capability_notice_text(&self) -> Option<String> {
+        crate::capabilities::missing_required_notice(
+            self.capability_unavailable().cloned(),
+            crate::capabilities::RemedyPlatform::current(),
+        )
+    }
+
+    pub fn capability_notice_fix_command(&self) -> Option<String> {
+        crate::capabilities::first_copyable_install_command(
+            self.capability_unavailable().cloned(),
+            crate::capabilities::RemedyPlatform::current(),
+        )
     }
 
     /// Project every tool to a `ToolDefinition`, rendering descriptions in
@@ -998,7 +1159,14 @@ impl ToolBox {
         let definitions: Vec<ToolDefinition> = self
             .tools
             .values()
-            .map(|t| definition_of(&**t, mode, self.overrides.get(t.name())))
+            .filter(|t| !self.capability_unavailable.contains_key(t.name()))
+            .map(|t| {
+                let mut definition = definition_of(&**t, mode, self.overrides.get(t.name()));
+                if let Some(suffixes) = self.capability_description_suffixes.get(t.name()) {
+                    definition.description.push_str(&suffixes.join(""));
+                }
+                definition
+            })
             .collect();
         self.definition_cache
             .lock()
@@ -1008,7 +1176,11 @@ impl ToolBox {
     }
 
     pub fn names(&self) -> Vec<&str> {
-        self.tools.keys().map(String::as_str).collect()
+        self.tools
+            .keys()
+            .filter(|name| !self.capability_unavailable.contains_key(*name))
+            .map(String::as_str)
+            .collect()
     }
 
     // Registry-emptiness query; retained for the tool-registry API surface.
@@ -1022,6 +1194,10 @@ impl ToolBox {
 mod capability_tests {
     use super::*;
     use crate::config::extended::LlmMode;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     /// The follow-up/seed capability is disabled only for defensive mode.
     #[test]
@@ -1029,6 +1205,241 @@ mod capability_tests {
         assert!(Capability::FollowupSeed.enabled(LlmMode::Normal));
         assert!(Capability::FollowupSeed.enabled(LlmMode::Frontier));
         assert!(!Capability::FollowupSeed.enabled(LlmMode::Defensive));
+    }
+
+    struct RequirementTool {
+        name: &'static str,
+        requirements: Vec<crate::capabilities::BinaryRequirement>,
+    }
+
+    #[async_trait]
+    impl Tool for RequirementTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "require external binary"
+        }
+
+        fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
+            self.requirements.clone()
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::text("ok"))
+        }
+    }
+
+    struct ToolTestProbe {
+        present: BTreeSet<String>,
+        calls: AtomicUsize,
+    }
+
+    impl ToolTestProbe {
+        fn new(present: &[&str]) -> Self {
+            Self {
+                present: present.iter().map(|name| (*name).to_string()).collect(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl crate::capabilities::BinaryProbe for ToolTestProbe {
+        fn resolve(
+            &self,
+            name: &str,
+            _path: Option<&str>,
+            _cwd: &Path,
+            _budget: Duration,
+        ) -> crate::capabilities::BinaryProbeStatus {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.present.contains(name) {
+                crate::capabilities::BinaryProbeStatus::Present(PathBuf::from(format!(
+                    "/bin/{name}"
+                )))
+            } else {
+                crate::capabilities::BinaryProbeStatus::Missing
+            }
+        }
+    }
+
+    #[test]
+    fn capability_tool_trait_defaults_empty_and_declared_requirement_round_trips() {
+        struct NoRequirementTool;
+        #[async_trait]
+        impl Tool for NoRequirementTool {
+            fn name(&self) -> &str {
+                "none"
+            }
+            fn description(&self) -> &str {
+                "none"
+            }
+            fn parameters(&self) -> Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+            async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+                Ok(ToolOutput::text("ok"))
+            }
+        }
+
+        assert!(NoRequirementTool.binary_requirements().is_empty());
+
+        let tool = RequirementTool {
+            name: "declared",
+            requirements: vec![crate::capabilities::BinaryRequirement::required(
+                "demo-bin",
+                crate::capabilities::CapabilityRemedy::prose("Install demo-bin."),
+            )],
+        };
+        let requirements = tool.binary_requirements();
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].name, "demo-bin");
+        assert_eq!(
+            requirements[0].kind,
+            crate::capabilities::BinaryRequirementKind::Required
+        );
+    }
+
+    #[test]
+    fn capability_required_binary_controls_callable_set_and_notice_dedupes() {
+        let probe = std::sync::Arc::new(ToolTestProbe::new(&["present-bin"]));
+        let cache = crate::capabilities::CapabilityProbeCache::new(probe, Duration::from_millis(1));
+        let mut toolbox = ToolBox::new()
+            .with(std::sync::Arc::new(RequirementTool {
+                name: "present_tool",
+                requirements: vec![crate::capabilities::BinaryRequirement::required(
+                    "present-bin",
+                    crate::capabilities::common_remedy("present-bin"),
+                )],
+            }))
+            .with(std::sync::Arc::new(RequirementTool {
+                name: "missing_a",
+                requirements: vec![crate::capabilities::BinaryRequirement::required(
+                    "missing-bin",
+                    crate::capabilities::common_remedy("missing-bin"),
+                )],
+            }))
+            .with(std::sync::Arc::new(RequirementTool {
+                name: "missing_b",
+                requirements: vec![crate::capabilities::BinaryRequirement::required(
+                    "missing-bin",
+                    crate::capabilities::common_remedy("missing-bin"),
+                )],
+            }));
+
+        toolbox.apply_capabilities_with_cache(
+            &std::collections::HashMap::from([("PATH".to_string(), "/bin".to_string())]),
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+
+        assert!(toolbox.get("present_tool").is_some());
+        assert!(toolbox.get("missing_a").is_none());
+        assert!(toolbox.get("missing_b").is_none());
+        let definitions = toolbox.definitions(LlmMode::Normal);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name, "present_tool");
+        let notice = toolbox.capability_notice_text().unwrap();
+        assert_eq!(notice.matches("`missing-bin` missing").count(), 1);
+    }
+
+    #[test]
+    fn capability_notice_ignores_missing_binary_for_ungranted_tool() {
+        let probe = std::sync::Arc::new(ToolTestProbe::new(&[]));
+        let cache =
+            crate::capabilities::CapabilityProbeCache::new(probe.clone(), Duration::from_millis(1));
+        let mut toolbox = ToolBox::new().with(std::sync::Arc::new(RequirementTool {
+            name: "granted_tool",
+            requirements: Vec::new(),
+        }));
+
+        toolbox.apply_capabilities_with_cache(
+            &std::collections::HashMap::new(),
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+
+        assert!(toolbox.capability_notice_text().is_none());
+        assert_eq!(
+            probe.calls.load(Ordering::SeqCst),
+            0,
+            "only granted toolbox tools are probed"
+        );
+    }
+
+    #[test]
+    fn capability_optional_binary_keeps_tool_callable_and_updates_description() {
+        let cache = crate::capabilities::CapabilityProbeCache::new(
+            std::sync::Arc::new(ToolTestProbe::new(&[])),
+            Duration::from_millis(1),
+        );
+        let mut toolbox = ToolBox::new().with(std::sync::Arc::new(RequirementTool {
+            name: "optional_tool",
+            requirements: vec![crate::capabilities::BinaryRequirement::optional(
+                "optional-bin",
+                crate::capabilities::CapabilityRemedy::prose("Install optional-bin."),
+            )],
+        }));
+
+        toolbox.apply_capabilities_with_cache(
+            &std::collections::HashMap::new(),
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+
+        assert!(toolbox.get("optional_tool").is_some());
+        let definitions = toolbox.definitions(LlmMode::Normal);
+        assert_eq!(definitions.len(), 1);
+        assert!(
+            definitions[0]
+                .description
+                .contains("Optional `optional-bin` missing")
+        );
+    }
+
+    #[test]
+    fn capability_toolbox_rebuild_cache_is_keyed_by_path() {
+        let probe = std::sync::Arc::new(ToolTestProbe::new(&[]));
+        let cache =
+            crate::capabilities::CapabilityProbeCache::new(probe.clone(), Duration::from_millis(1));
+        let mut toolbox = ToolBox::new().with(std::sync::Arc::new(RequirementTool {
+            name: "missing_tool",
+            requirements: vec![crate::capabilities::BinaryRequirement::required(
+                "missing-bin",
+                crate::capabilities::common_remedy("missing-bin"),
+            )],
+        }));
+        let env_a = std::collections::HashMap::from([("PATH".to_string(), "/a".to_string())]);
+        let env_b = std::collections::HashMap::from([("PATH".to_string(), "/b".to_string())]);
+
+        toolbox.apply_capabilities_with_cache(
+            &env_a,
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+        toolbox.apply_capabilities_with_cache(
+            &env_a,
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        toolbox.apply_capabilities_with_cache(
+            &env_b,
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+            &cache,
+        );
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
     }
 }
 
@@ -1204,6 +1615,92 @@ mod llm_mode_tests {
         crate::engine::builtin::invariant_builtin_tools()
     }
 
+    fn tool_by_name(name: &str) -> Arc<dyn Tool> {
+        all_builtin_tools()
+            .into_iter()
+            .find(|tool| tool.name() == name)
+            .unwrap_or_else(|| panic!("built-in tool `{name}` missing from invariant registry"))
+    }
+
+    fn words(text: &str) -> std::collections::BTreeSet<String> {
+        text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .filter(|word| !word.is_empty())
+            .map(|word| word.to_ascii_lowercase())
+            .collect()
+    }
+
+    fn has_description_steering_shape(normal: &str, defensive: &str) -> bool {
+        let normal_words = words(normal);
+        let defensive_words = words(defensive);
+        let added_distinct_words = defensive_words.difference(&normal_words).count();
+        let defensive_lower = defensive.to_ascii_lowercase();
+        let when_to_use_markers = [
+            "use ",
+            "call ",
+            "read ",
+            "write ",
+            "replace ",
+            "search ",
+            "find ",
+            "get ",
+            "show ",
+            "list ",
+            "send ",
+            "create ",
+            "update ",
+            "run ",
+            "schedule ",
+            "ask ",
+            "spawn ",
+            "emit ",
+            "request ",
+            "return ",
+            "surface ",
+        ];
+        let when_not_to_use_markers = [
+            " do not ",
+            " don't ",
+            " not ",
+            " never ",
+            " instead",
+            " rather than",
+            " avoid",
+            " prefer",
+            " without",
+            " only ",
+            " cannot",
+            " can't",
+            " must not",
+            " must ",
+            " fails",
+            " rejected",
+            " requires",
+            " required",
+            " takes no arguments",
+            " no arguments",
+            " no filesystem",
+            " no network",
+            " no environment",
+            " scope with",
+            " confined",
+            " budget",
+            " capped",
+            " bounded",
+            " limit",
+            " reserve",
+            " path-confined",
+            " preview",
+            " omit",
+        ];
+        added_distinct_words >= 8
+            && when_to_use_markers
+                .iter()
+                .any(|marker| defensive_lower.contains(marker))
+            && when_not_to_use_markers
+                .iter()
+                .any(|marker| defensive_lower.contains(marker))
+    }
+
     /// CONFLICT-AVOIDANCE INVARIANT (implementation note):
     /// for every built-in tool, in BOTH its terse and defensive schema, no
     /// `x-cockpit-aliases` entry may (a) shadow a canonical property name or
@@ -1286,8 +1783,8 @@ mod llm_mode_tests {
                 tool.name()
             );
             // Defensive is the *verbose* form: it must be longer than the
-            // terse one and not byte-identical (the deliberate token
-            // tradeoff). A handful of words wouldn't be "explicit steering."
+            // terse one, not byte-identical, and add real use/avoid steering
+            // rather than padding.
             assert!(
                 defensive.len() > terse.len(),
                 "tool `{}` defensive description is not more explicit than terse ({} <= {})",
@@ -1296,11 +1793,114 @@ mod llm_mode_tests {
                 terse.len()
             );
             assert!(
-                defensive.len() >= 80,
-                "tool `{}` defensive description is too terse to be steering ({} chars)",
-                tool.name(),
-                defensive.len()
+                has_description_steering_shape(&terse, &defensive),
+                "tool `{}` defensive description lacks structural use/avoid steering or meaningful new vocabulary: {defensive}",
+                tool.name()
             );
+        }
+    }
+
+    #[test]
+    fn padded_description_without_steering_fails_structural_check() {
+        let normal = "Read a file.";
+        let padded = "Read a file. padding padding padding padding padding padding padding padding padding padding padding padding padding padding.";
+        assert!(padded.len() >= 80);
+        assert!(!has_description_steering_shape(normal, padded));
+    }
+
+    #[test]
+    fn description_quality_rewrites_pin_load_bearing_clauses() {
+        let writeunlock = tool_by_name("writeunlock")
+            .description()
+            .to_ascii_lowercase();
+        assert!(writeunlock.contains("complete new contents"));
+        assert!(writeunlock.contains("omitted lines are deleted"));
+        assert!(writeunlock.contains("editunlock"));
+
+        let impact = tool_by_name("impact").description().to_ascii_lowercase();
+        let change_impact = tool_by_name("change_impact")
+            .description()
+            .to_ascii_lowercase();
+        assert!(impact.contains("change_impact"));
+        assert!(change_impact.contains("impact"));
+
+        let context_pack = tool_by_name("context_pack")
+            .description()
+            .to_ascii_lowercase();
+        assert!(context_pack.contains("first move"));
+        assert!(context_pack.contains("never prints file contents"));
+        assert!(context_pack.contains("read"));
+
+        for name in ["create_goal", "get_goal", "update_goal"] {
+            let description = tool_by_name(name).description().to_ascii_lowercase();
+            assert!(
+                description.contains("goal")
+                    && (description.contains("only")
+                        || description.contains("before")
+                        || description.contains("evidence")),
+                "`{name}` normal description lacks goal guardrail: {description}"
+            );
+        }
+
+        let note = tool_by_name("note").description().to_ascii_lowercase();
+        assert!(note.contains("live progress note"));
+        assert!(!note.contains("now; it reaches"));
+
+        let todo = tool_by_name("todo").description().to_ascii_lowercase();
+        assert!(todo.contains("long-horizon"));
+        assert!(todo.contains("task"));
+
+        let names: std::collections::BTreeSet<_> = all_builtin_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert!(names.contains("websearch"), "{names:?}");
+        assert!(names.contains("webfetch"), "{names:?}");
+        for name in ["websearch", "webfetch"] {
+            let tool = tool_by_name(name);
+            let normal = tool.description().to_string();
+            let defensive = tool.defensive_description().unwrap();
+            assert!(has_description_steering_shape(&normal, &defensive));
+        }
+    }
+
+    #[test]
+    fn sibling_disambiguation_normal_descriptions_name_siblings() {
+        let cases: &[(&str, &[&str])] = &[
+            ("search", &["grep", "word", "symbol_find"]),
+            ("grep", &["search", "word", "symbol_find"]),
+            ("word", &["search", "grep", "symbol_find"]),
+            ("symbol_find", &["search", "grep", "word"]),
+            ("outline", &["tree", "context_pack", "read"]),
+            ("tree", &["outline", "context_pack"]),
+            ("deps", &["impact", "change_impact"]),
+            ("context_pack", &["read"]),
+            ("impact", &["change_impact"]),
+            ("change_impact", &["impact"]),
+            ("read", &["readlock", "writeunlock", "editunlock"]),
+            ("readlock", &["writeunlock", "editunlock", "unlock"]),
+            ("writeunlock", &["readlock", "editunlock"]),
+            ("editunlock", &["writeunlock", "unlock"]),
+            ("unlock", &["readlock", "writeunlock", "editunlock"]),
+            (
+                "plan_read",
+                &["plan_edit", "plan_write", "todo", "get_goal"],
+            ),
+            ("plan_write", &["plan_edit", "todo", "create_goal"]),
+            ("plan_edit", &["plan_read", "plan_write"]),
+            ("todo", &["task"]),
+            ("create_goal", &["goal"]),
+            ("get_goal", &["update_goal"]),
+            ("update_goal", &["get_goal"]),
+        ];
+        for (name, siblings) in cases {
+            let description = tool_by_name(name).description().to_ascii_lowercase();
+            for sibling in *siblings {
+                assert!(
+                    description.contains(sibling),
+                    "`{name}` normal description must name sibling `{sibling}`; got: {description}"
+                );
+            }
         }
     }
 
@@ -1479,8 +2079,13 @@ mod llm_mode_tests {
         for tool in all_builtin_tools() {
             for mode in [LlmMode::Normal, LlmMode::Frontier] {
                 let def = definition_of(&*tool, mode, None);
+                let budget = match tool.name() {
+                    "schedule" => 280,
+                    "writeunlock" => 240,
+                    _ => 200,
+                };
                 assert!(
-                    def.description.len() <= 200,
+                    def.description.len() <= budget,
                     "tool `{}` {mode:?} description exceeds the terse budget ({} chars): {}",
                     tool.name(),
                     def.description.len(),
@@ -1628,6 +2233,7 @@ mod llm_mode_tests {
     fn btw_tool_effect_metadata_complete() {
         let expected = [
             ("bash", ToolEffect::Dynamic),
+            ("add-package", ToolEffect::Dynamic),
             ("change_impact", ToolEffect::Dynamic),
             ("circular", ToolEffect::Dynamic),
             ("context_pack", ToolEffect::Dynamic),
@@ -1645,8 +2251,10 @@ mod llm_mode_tests {
             ("harness_list", ToolEffect::Dynamic),
             ("hot", ToolEffect::Dynamic),
             ("impact", ToolEffect::Dynamic),
+            ("list-packages", ToolEffect::Dynamic),
             ("lsp", ToolEffect::Dynamic),
             ("mcp", ToolEffect::Dynamic),
+            ("note", ToolEffect::Dynamic),
             ("outline", ToolEffect::Dynamic),
             ("plan_edit", ToolEffect::Dynamic),
             ("plan_read", ToolEffect::Dynamic),
@@ -1657,10 +2265,12 @@ mod llm_mode_tests {
             ("return", ToolEffect::Dynamic),
             ("schedule", ToolEffect::Dynamic),
             ("search", ToolEffect::Dynamic),
+            ("seed", ToolEffect::Dynamic),
             ("session_read", ToolEffect::ReadOnly),
             ("session_search", ToolEffect::ReadOnly),
             ("skill", ToolEffect::Dynamic),
             ("skill_manage", ToolEffect::Dynamic),
+            ("spawn", ToolEffect::Dynamic),
             ("start_build", ToolEffect::Dynamic),
             ("symbol_find", ToolEffect::Dynamic),
             ("task", ToolEffect::Dynamic),
@@ -1670,6 +2280,8 @@ mod llm_mode_tests {
             ("tree", ToolEffect::Dynamic),
             ("unlock", ToolEffect::Dynamic),
             ("update_goal", ToolEffect::Dynamic),
+            ("webfetch", ToolEffect::Dynamic),
+            ("websearch", ToolEffect::Dynamic),
             ("word", ToolEffect::Dynamic),
             ("writeunlock", ToolEffect::Dynamic),
         ];

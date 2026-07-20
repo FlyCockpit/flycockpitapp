@@ -174,6 +174,58 @@ pub enum Request {
         session_id: Uuid,
     },
 
+    /// Read the current open goal for a session after refreshing token usage.
+    GoalStatus {
+        session_id: Uuid,
+    },
+
+    /// Pause or resume the current open goal for a session.
+    SetGoalStatus {
+        session_id: Uuid,
+        status: GoalStatus,
+    },
+
+    /// Mark the current open goal complete without requiring model evidence.
+    ClearGoal {
+        session_id: Uuid,
+    },
+
+    /// List persisted assistant definitions.
+    ListAssistants,
+
+    /// Create a new assistant session through the daemon registry. The
+    /// session is deferred and is not persisted until its first user message.
+    CreateAssistantSession {
+        name: String,
+        project_root: String,
+        #[serde(default)]
+        no_sandbox: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env_snapshot: Option<EnvSnapshotWire>,
+    },
+
+    /// Generate and persist a title for an untitled session.
+    AutoTitle {
+        session_id: Uuid,
+    },
+
+    /// Return export-ready session data while leaving user-path file writing
+    /// to the client.
+    ExportSessionData {
+        session_id: Uuid,
+        kind: ExportSessionKind,
+        #[serde(default)]
+        include_generated_artifacts: bool,
+        #[serde(default)]
+        include_sensitive: bool,
+    },
+
+    /// Execute a daemon-owned skill curator operation for a trusted project.
+    Curator {
+        project_root: String,
+        action: CuratorAction,
+    },
+
     /// Cancel the in-flight model call for the attached session. The
     /// daemon aborts the streaming completion and returns control to
     /// the agent stack so the user can redirect.
@@ -630,6 +682,11 @@ pub enum Request {
         vars: HashMap<String, String>,
     },
 
+    /// Explicitly re-resolve the attached session's layered config in the
+    /// daemon and push the next [`Event::ConfigSnapshot`] generation. A failed
+    /// re-resolution keeps the last good generation and emits a notice.
+    RefreshConfig,
+
     /// Record one accepted autocomplete pick into the 30-day frequency
     /// tally (GOALS §1; tie-breaker for the model / slash / @-tag
     /// surfaces). Fire-and-forget — acked immediately; no attached
@@ -648,6 +705,15 @@ pub enum Request {
     GetUsageCounts {
         #[serde(default)]
         project_id: Option<String>,
+    },
+
+    /// Return the `/stats` rollup from the daemon-owned database handle.
+    StatsRollup {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        range: StatsRange,
+        #[serde(default)]
+        by_role: bool,
     },
 
     /// Pre-flight sizing of the project's instruction/guidance file and
@@ -694,6 +760,14 @@ macro_rules! command {
             (Request::ResumePausedWork { session_id }, "resume_paused_work", session_row_writer(session_id), field(session_id), true, none);
             (Request::CancelPausedWork { session_id }, "cancel_paused_work", session_row_writer(session_id), field(session_id), true, none);
             (Request::RepairResume { session_id }, "repair_resume", session_writer, field(session_id), true, none);
+            (Request::GoalStatus { session_id }, "goal_status", session_row_reader(session_id), field(session_id), false, none);
+            (Request::SetGoalStatus { session_id, .. }, "set_goal_status", session_row_writer(session_id), field(session_id), true, none);
+            (Request::ClearGoal { session_id }, "clear_goal", session_row_writer(session_id), field(session_id), true, none);
+            (Request::ListAssistants, "list_assistants", owner_only, none, false, none);
+            (Request::CreateAssistantSession { .. }, "create_assistant_session", owner_only, none, true, none);
+            (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, none);
+            (Request::ExportSessionData { session_id, .. }, "export_session_data", owner_only, field(session_id), false, none);
+            (Request::Curator { project_root, .. }, "curator", owner_only, none, true, path(project_root));
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, none);
             (Request::FsList { project_root, .. }, "fs_list", project_files(project_root), none, false, none);
             (Request::FsStat { project_root, .. }, "fs_stat", project_files(project_root), none, false, none);
@@ -755,8 +829,10 @@ macro_rules! command {
             (Request::ClearFlycockpitCredential, "clear_flycockpit_credential", owner_only, none, true, none);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, none);
             (Request::RefreshEnv { .. }, "refresh_env", session_writer, attached, true, none);
+            (Request::RefreshConfig, "refresh_config", session_writer, attached, true, none);
             (Request::RecordUsage { .. }, "record_usage", owner_only, none, true, none);
             (Request::GetUsageCounts { .. }, "get_usage_counts", owner_only, none, false, none);
+            (Request::StatsRollup { .. }, "stats_rollup", owner_only, none, false, none);
             (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, none);
             (Request::StopDaemon { .. }, "stop_daemon", owner_only, none, true, none);
         ] }

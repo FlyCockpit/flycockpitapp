@@ -2,14 +2,16 @@
 
 use anyhow::{Result, bail};
 
-use crate::cli::{ScheduleCommand, ScheduleListArgs};
+use crate::cli::{ScheduleCommand, ScheduleCreateArgs, ScheduleListArgs};
 use crate::daemon::client::{LifecycleMode, probe_or_spawn};
 use crate::daemon::proto::{
-    Request, Response, ScheduledJobPayload, ScheduledJobSchedule, ScheduledJobSummary,
+    MissedRunPolicy, Request, Response, ScheduledJobCreate, ScheduledJobPayload,
+    ScheduledJobSchedule, ScheduledJobSummary,
 };
 
 pub async fn run(cmd: ScheduleCommand) -> Result<()> {
     match cmd {
+        ScheduleCommand::Create(args) => create(args).await,
         ScheduleCommand::List(args) => list(args).await,
         ScheduleCommand::Enable { id } => set_enabled(&id, true).await,
         ScheduleCommand::Disable { id } => set_enabled(&id, false).await,
@@ -41,6 +43,40 @@ async fn list(args: ScheduleListArgs) -> Result<()> {
     Ok(())
 }
 
+async fn create(args: ScheduleCreateArgs) -> Result<()> {
+    let job = build_create(args)?;
+    let response = client()
+        .await?
+        .request_ok(Request::CreateScheduledJob { job })
+        .await?;
+    let Response::ScheduledJob { job } = response else {
+        bail!("unexpected schedule create response: {response:?}");
+    };
+    println!("{}", format_job(&job));
+    Ok(())
+}
+
+fn build_create(args: ScheduleCreateArgs) -> Result<ScheduledJobCreate> {
+    Ok(ScheduledJobCreate {
+        id: args.id,
+        owner: args.owner,
+        schedule: serde_json::from_str(&args.schedule_json)
+            .map_err(|error| anyhow::anyhow!("invalid --schedule-json: {error}"))?,
+        payload: serde_json::from_str(&args.payload_json)
+            .map_err(|error| anyhow::anyhow!("invalid --payload-json: {error}"))?,
+        enabled: !args.disabled,
+        missed_run_policy: parse_missed_run_policy(&args.missed_run_policy)?,
+    })
+}
+
+fn parse_missed_run_policy(raw: &str) -> Result<MissedRunPolicy> {
+    match raw {
+        "skip" => Ok(MissedRunPolicy::Skip),
+        "run_once_on_start" => Ok(MissedRunPolicy::RunOnceOnStart),
+        other => bail!("invalid missed-run policy `{other}`"),
+    }
+}
+
 async fn set_enabled(id: &str, enabled: bool) -> Result<()> {
     let response = client()
         .await?
@@ -61,11 +97,10 @@ async fn run_now(id: &str) -> Result<()> {
         .await?
         .request_ok(Request::RunScheduledJob { id: id.to_string() })
         .await?;
-    let Response::ScheduledJobRun { id, result } = response else {
+    let Response::ScheduledJobRunQueued { id } = response else {
         bail!("unexpected schedule run response: {response:?}");
     };
-    let status = if result.ok { "ok" } else { "failed" };
-    println!("{id}: {status}: {}", result.summary);
+    println!("{id}: queued");
     Ok(())
 }
 
@@ -114,5 +149,50 @@ fn format_payload(payload: &ScheduledJobPayload) -> String {
             ..
         } => format!("run_prompt(assistant={assistant},project={project_root})"),
         ScheduledJobPayload::Callback { subsystem } => format!("callback({subsystem})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_subcommand_builds_rpc_job() {
+        let job = build_create(ScheduleCreateArgs {
+            id: "job-1".to_string(),
+            owner: "system:test".to_string(),
+            schedule_json: r#"{"type":"every","seconds":60}"#.to_string(),
+            payload_json: r#"{"type":"callback","subsystem":"test"}"#.to_string(),
+            disabled: false,
+            missed_run_policy: "run_once_on_start".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(job.id, "job-1");
+        assert_eq!(job.owner, "system:test");
+        assert_eq!(job.schedule, ScheduledJobSchedule::Every { seconds: 60 });
+        assert_eq!(
+            job.payload,
+            ScheduledJobPayload::Callback {
+                subsystem: "test".to_string()
+            }
+        );
+        assert!(job.enabled);
+        assert_eq!(job.missed_run_policy, MissedRunPolicy::RunOnceOnStart);
+    }
+
+    #[test]
+    fn create_subcommand_rejects_bad_json() {
+        let error = build_create(ScheduleCreateArgs {
+            id: "job-1".to_string(),
+            owner: "system:test".to_string(),
+            schedule_json: "not json".to_string(),
+            payload_json: r#"{"type":"callback","subsystem":"test"}"#.to_string(),
+            disabled: false,
+            missed_run_policy: "skip".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--schedule-json"));
     }
 }

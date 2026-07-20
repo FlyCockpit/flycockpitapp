@@ -326,6 +326,102 @@ async fn handle_request(
             }
         }
 
+        Request::GoalStatus { session_id } => {
+            ctx.db
+                .refresh_session_goal_usage(session_id)
+                .map_err(internal)?;
+            let goal = ctx
+                .db
+                .current_session_goal(session_id, false)
+                .map_err(internal)?
+                .map(goal_to_proto);
+            Ok(Response::GoalStatus { goal })
+        }
+
+        Request::SetGoalStatus { session_id, status } => {
+            let goal = ctx
+                .db
+                .set_session_goal_status(session_id, status)
+                .map_err(|e| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: e.to_string(),
+                })?;
+            Ok(Response::GoalUpdated {
+                goal: goal_to_proto(goal),
+            })
+        }
+
+        Request::ClearGoal { session_id } => {
+            let cleared = ctx.db.clear_session_goal(session_id).map_err(internal)?;
+            Ok(Response::GoalCleared { cleared })
+        }
+
+        Request::ListAssistants => {
+            let assistants = ctx
+                .db
+                .list_assistants()
+                .map_err(internal)?
+                .into_iter()
+                .map(assistant_to_proto)
+                .collect();
+            Ok(Response::Assistants { assistants })
+        }
+
+        Request::CreateAssistantSession {
+            name,
+            project_root,
+            no_sandbox,
+            env_snapshot,
+        } => {
+            let env_snapshot = env_snapshot
+                .map(EnvSnapshot::from_wire)
+                .unwrap_or_else(|| {
+                    ctx.env_baseline
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                });
+            let handle = ctx
+                .registry
+                .create_assistant_session(&name, PathBuf::from(project_root), no_sandbox, env_snapshot)
+                .await
+                .map_err(|e| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: e.to_string(),
+                })?;
+            Ok(Response::AssistantSessionCreated {
+                session: proto::AssistantSessionCreated {
+                    session_id: handle.session_id,
+                    short_id: handle.short_id(),
+                    project_root: handle.project_root.display().to_string(),
+                    project_id: handle.project_id(),
+                    assistant_name: name,
+                    active_agent: handle.active_agent_name,
+                },
+            })
+        }
+
+        Request::AutoTitle { session_id } => auto_title_request(ctx, session_id).await,
+
+        Request::ExportSessionData {
+            session_id,
+            kind,
+            include_generated_artifacts,
+            include_sensitive,
+        } => export_session_data(
+            ctx,
+            session_id,
+            kind,
+            include_generated_artifacts,
+            include_sensitive,
+        )
+        .await,
+
+        Request::Curator {
+            project_root,
+            action,
+        } => curator_request(ctx, PathBuf::from(project_root), action).await,
+
         Request::CancelTurn => {
             let att = require_attached(state)?;
             att.handle
@@ -339,17 +435,23 @@ async fn handle_request(
             project_root,
             path,
             show_hidden,
-        } => crate::daemon::fs_api::fs_list(&state.principal, &project_root, &path, show_hidden),
+        } => crate::daemon::fs_api::fs_list(
+            ctx,
+            &state.principal,
+            &project_root,
+            &path,
+            show_hidden,
+        ),
 
         Request::FsStat { project_root, path } => {
-            crate::daemon::fs_api::fs_stat(&state.principal, &project_root, &path)
+            crate::daemon::fs_api::fs_stat(ctx, &state.principal, &project_root, &path)
         }
 
         Request::FsRead {
             project_root,
             path,
             base64,
-        } => crate::daemon::fs_api::fs_read(&state.principal, &project_root, &path, base64),
+        } => crate::daemon::fs_api::fs_read(ctx, &state.principal, &project_root, &path, base64),
 
         Request::FsWrite {
             project_root,
@@ -424,9 +526,10 @@ async fn handle_request(
         } => {
             let att = require_attached(state)?;
             let cwd = Path::new(&project_root);
+            let trust_policy = attached_trust_policy(ctx, att)?;
             let (_, config) = ctx
                 .config_source()
-                .load_with_trust(cwd, &att.handle.trust_policy)
+                .load_with_trust(cwd, &trust_policy)
                 .map_err(internal)?;
             let message = ctx
                 .registry
@@ -563,9 +666,10 @@ async fn handle_request(
             // discovery used by the `skill` tool and auto-select path.
             let att = require_attached(state)?;
             let cwd = Path::new(&project_root);
+            let trust_policy = attached_trust_policy(ctx, att)?;
             let (_, extended) = ctx
                 .config_source()
-                .load_with_trust(cwd, &att.handle.trust_policy)
+                .load_with_trust(cwd, &trust_policy)
                 .map_err(internal)?;
             let active_tools = att.handle.active_tool_names();
             let activation = crate::skills::ActivationContext::from_tool_names(
@@ -583,6 +687,7 @@ async fn handle_request(
                     name: s.frontmatter.name,
                     description: s.frontmatter.description,
                     source: s.source.display().to_string(),
+                    user_invocable: s.frontmatter.user_invocable,
                 })
                 .collect();
             Ok(Response::Skills { skills })
@@ -625,12 +730,12 @@ async fn handle_request(
         }
         Request::RunScheduledJob { id } => {
             let scheduler = require_scheduler(ctx)?;
-            let result = scheduler.run_now(&id).await.map_err(internal)?;
-            Ok(Response::ScheduledJobRun { id, result })
+            scheduler.run_now(&id).map_err(internal)?;
+            Ok(Response::ScheduledJobRunQueued { id })
         }
 
-        Request::ListAgents => Err(not_implemented("ListAgents")),
-        Request::ListModels { .. } => Err(not_implemented("ListModels")),
+        Request::ListAgents => list_agents(ctx, state),
+        Request::ListModels { provider } => list_models(ctx, state, provider.as_deref()),
 
         Request::SetActiveModel {
             provider,
@@ -872,6 +977,40 @@ async fn handle_request(
             Ok(Response::Ack)
         }
 
+        Request::RefreshConfig => {
+            let att = require_attached(state)?;
+            let trust_policy =
+                crate::config::trust::resolve_workspace_trust_policy_from_db(
+                    &ctx.db,
+                    &att.handle.project_root,
+                )
+                .map_err(internal)?;
+            let (providers, extended) = match ctx
+                .config_source()
+                .load_with_trust(&att.handle.project_root, &trust_policy)
+            {
+                Ok(configs) => configs,
+                Err(error) => {
+                    att.handle.broadcast_notice(format!(
+                        "Config refresh failed; keeping the last good snapshot: {error:#}"
+                    ));
+                    return Ok(Response::Ack);
+                }
+            };
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            att.handle
+                .send_work(SessionWork::ReplaceConfigSnapshot {
+                    snapshot: Box::new(crate::daemon::session_worker::SessionConfigSnapshot::new(
+                        0, providers, extended,
+                    )),
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let _generation = response_rx.await.map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
         Request::RecordUsage {
             kind,
             key,
@@ -917,6 +1056,12 @@ async fn handle_request(
                 tags,
             })
         }
+
+        Request::StatsRollup {
+            project_id,
+            range,
+            by_role,
+        } => stats_rollup(ctx, project_id, range, by_role).await,
 
         Request::GuidanceEstimate {
             project_root,
@@ -982,6 +1127,99 @@ async fn handle_request(
             request_shutdown(ctx);
             Ok(Response::Ack)
         }
+    }
+}
+
+fn attached_trust_policy(
+    ctx: &DaemonContext,
+    att: &AttachedSession,
+) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
+    crate::config::trust::resolve_workspace_trust_policy_from_db(
+        &ctx.db,
+        &att.handle.project_root,
+    )
+    .map_err(internal)
+}
+
+fn list_agents(
+    ctx: &DaemonContext,
+    state: &ClientState,
+) -> std::result::Result<Response, ErrorPayload> {
+    let att = require_attached(state)?;
+    let trust_policy = attached_trust_policy(ctx, att)?;
+    let (_, cfg) = ctx
+        .config_source()
+        .load_with_trust(&att.handle.project_root, &trust_policy)
+        .map_err(internal)?;
+    let ownable = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        crate::agents::chat_ownable_primaries(&att.handle.project_root)
+    });
+    let mut agents = Vec::with_capacity(ownable.len());
+    for name in &ownable {
+        validate_set_agent_name(name, cfg.experimental_mode, &ownable)?;
+        let def = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            crate::agents::resolve(&att.handle.project_root, name)
+        })
+            .map_err(internal)?
+            .ok_or_else(|| ErrorPayload {
+                code: ErrorCode::Internal,
+                message: format!("chat-ownable agent `{name}` did not resolve"),
+            })?;
+        agents.push(proto::AgentSummary {
+            builtin: crate::agents::is_builtin_agent(name),
+            name: name.clone(),
+            description: def.description,
+            mode: agent_mode_summary(def.mode).to_string(),
+            source: def.source.display().to_string(),
+        });
+    }
+    Ok(Response::Agents { agents })
+}
+
+fn list_models(
+    ctx: &DaemonContext,
+    state: &ClientState,
+    requested_provider: Option<&str>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let att = require_attached(state)?;
+    let trust_policy = attached_trust_policy(ctx, att)?;
+    let (providers, _) = ctx
+        .config_source()
+        .load_with_trust(&att.handle.project_root, &trust_policy)
+        .map_err(internal)?;
+    let active_provider = providers
+        .active_model
+        .as_ref()
+        .map(|model| model.provider.as_str());
+    let provider_filter = requested_provider.or(active_provider);
+    let mut models = Vec::new();
+    for (provider_id, provider) in &providers.providers {
+        if provider_filter.is_some_and(|wanted| wanted != provider_id) {
+            continue;
+        }
+        for model in &provider.models {
+            models.push(proto::ModelSummary {
+                provider: provider_id.clone(),
+                id: model.id.clone(),
+                display_name: model.name.clone(),
+                favorite: model.favorite,
+            });
+        }
+    }
+    models.sort_by(|a, b| {
+        a.provider
+            .cmp(&b.provider)
+            .then_with(|| b.favorite.cmp(&a.favorite))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(Response::Models { models })
+}
+
+fn agent_mode_summary(mode: crate::agents::AgentMode) -> &'static str {
+    match mode {
+        crate::agents::AgentMode::All => "all",
+        crate::agents::AgentMode::Primary => "primary",
+        crate::agents::AgentMode::Subagent => "subagent",
     }
 }
 
@@ -1220,10 +1458,9 @@ async fn attach(
     // registry actually returned. This is safe for both branches: live
     // workers retain their original policy, while newly-started workers have
     // already performed the post-claim DB read-through.
-    let (providers_cfg, extended_cfg) = ctx
-        .config_source()
-        .load_with_trust(&handle.project_root, &handle.trust_policy)
-        .map_err(internal)?;
+    let config_snapshot = handle.config_snapshot();
+    let providers_cfg = config_snapshot.providers.clone();
+    let extended_cfg = config_snapshot.extended.clone();
 
     if session_id.is_none()
         && let Some(tag) = principal.tag()
@@ -1321,6 +1558,7 @@ async fn attach(
         att.handle.broadcast_active_interrupt();
         att.handle.broadcast_sandbox_escalation();
         att.handle.broadcast_sandbox_unavailable_or_probe();
+        att.handle.broadcast_config_snapshot();
     }
 
     // Full chronological history snapshot (user messages + assistant turns +
@@ -1516,6 +1754,348 @@ fn active_model_trigger_from_proto(
         proto::ActiveModelSwitchTrigger::Quick => crate::session::ModelSwitchTrigger::Quick,
         proto::ActiveModelSwitchTrigger::Cycle => crate::session::ModelSwitchTrigger::Cycle,
         proto::ActiveModelSwitchTrigger::Daemon => crate::session::ModelSwitchTrigger::Daemon,
+    }
+}
+
+fn goal_to_proto(goal: crate::db::session_goals::SessionGoal) -> proto::GoalSummary {
+    proto::GoalSummary {
+        id: goal.id,
+        session_id: goal.session_id,
+        project_id: goal.project_id,
+        objective: goal.objective,
+        context: goal.context,
+        status: goal.status,
+        token_budget: goal.token_budget,
+        tokens_used: goal.tokens_used,
+        blocked_attempts: goal.blocked_attempts,
+        last_read_at: goal.last_read_at,
+        created_at: goal.created_at,
+        updated_at: goal.updated_at,
+    }
+}
+
+fn assistant_to_proto(row: crate::db::assistants::AssistantRow) -> proto::AssistantSummary {
+    proto::AssistantSummary {
+        name: row.name,
+        created_at: row.created_at,
+        home_dir: row.home_dir,
+        config_json: row.config_json,
+        content_hash: row.content_hash,
+    }
+}
+
+fn stats_range_from_proto(range: proto::StatsRange) -> crate::db::stats::StatsRange {
+    match range {
+        proto::StatsRange::Last7Days => crate::db::stats::StatsRange::Last7Days,
+        proto::StatsRange::AllTime => crate::db::stats::StatsRange::AllTime,
+    }
+}
+
+async fn stats_rollup(
+    ctx: &Arc<DaemonContext>,
+    project_id: Option<String>,
+    range: proto::StatsRange,
+    by_role: bool,
+) -> std::result::Result<Response, ErrorPayload> {
+    let db = ctx.db.clone();
+    let rollup = tokio::task::spawn_blocking(move || {
+        let scope = project_id
+            .map(crate::db::stats::StatsScope::Project)
+            .unwrap_or(crate::db::stats::StatsScope::All);
+        let range = stats_range_from_proto(range);
+        let prices = crate::db::stats::PriceTable::load_default();
+        let now = chrono::Utc::now().timestamp();
+        db.read_blocking(move |conn| {
+            crate::db::stats::rollup(conn, &scope, range, &prices, by_role, now)
+        })
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
+    Ok(Response::StatsRollup { rollup })
+}
+
+async fn export_session_data(
+    ctx: &Arc<DaemonContext>,
+    session_id: Uuid,
+    kind: proto::ExportSessionKind,
+    include_generated_artifacts: bool,
+    include_sensitive: bool,
+) -> std::result::Result<Response, ErrorPayload> {
+    let db = ctx.db.clone();
+    let data = tokio::task::spawn_blocking(move || -> Result<proto::ExportSessionData> {
+        let Some(target) = db.get_session(session_id)? else {
+            anyhow::bail!("unknown session {session_id}");
+        };
+        match kind {
+            proto::ExportSessionKind::TranscriptJson => {
+                let mut messages = Vec::new();
+                let mut before_seq = None;
+                loop {
+                    let (mut page, has_more) =
+                        db.read_session_messages(session_id, before_seq, u32::MAX)?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    before_seq = page.first().map(|message| message.seq);
+                    messages.append(&mut page);
+                    if !has_more {
+                        break;
+                    }
+                }
+                messages.sort_by_key(|message| message.seq);
+                let bytes = serde_json::to_vec_pretty(&messages)?;
+                Ok(proto::ExportSessionData {
+                    session_id,
+                    kind,
+                    filename_extension: "json".to_string(),
+                    mime: "application/json".to_string(),
+                    content_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    byte_len: bytes.len(),
+                    session_count: Some(1),
+                    redacted: true,
+                })
+            }
+            proto::ExportSessionKind::DebugBundle => {
+                let bundle = crate::session::export::build_bundle_zip_bytes(
+                    &db,
+                    &target,
+                    include_generated_artifacts,
+                    include_sensitive,
+                )?;
+                Ok(proto::ExportSessionData {
+                    session_id,
+                    kind,
+                    filename_extension: "zip".to_string(),
+                    mime: "application/zip".to_string(),
+                    content_base64: base64::engine::general_purpose::STANDARD.encode(&bundle.bytes),
+                    byte_len: bundle.summary.byte_len,
+                    session_count: Some(bundle.summary.session_count),
+                    redacted: !include_sensitive,
+                })
+            }
+        }
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|error| {
+        let message = error.to_string();
+        if message.contains("unknown session") {
+            ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message,
+            }
+        } else {
+            internal(error)
+        }
+    })?;
+    Ok(Response::ExportSessionData { data })
+}
+
+async fn auto_title_request(
+    ctx: &Arc<DaemonContext>,
+    session_id: Uuid,
+) -> std::result::Result<Response, ErrorPayload> {
+    let live = ctx.registry.live_handle(session_id);
+    let session = if let Some(handle) = live.as_ref() {
+        handle.session()
+    } else {
+        std::sync::Arc::new(
+            crate::session::Session::resume(ctx.db.clone(), session_id)
+                .map_err(internal)?
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: format!("unknown session {session_id}"),
+                })?,
+        )
+    };
+
+    if session.title().is_some() {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "session already has a title".to_string(),
+        });
+    }
+
+    let trust_policy =
+        crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &session.project_root)
+            .map_err(workspace_trust_error)?;
+    let (providers, extended) = ctx
+        .config_source()
+        .load_with_trust(&session.project_root, &trust_policy)
+        .map_err(workspace_trust_error)?;
+    let redact = if let Some(handle) = live {
+        handle.redaction_table()
+    } else {
+        let table = match session.persisted_redaction_table().map_err(internal)? {
+            Some(table) => table,
+            None => crate::redact::RedactionTable::build(&extended.redact, &session.project_root)
+                .map_err(internal)?,
+        };
+        std::sync::Arc::new(table)
+    };
+
+    let title = crate::auto_title::generate_session_title_slug_once(
+        &session,
+        extended,
+        providers,
+        redact,
+        String::new(),
+        crate::session::TitleAction::Explicit,
+    )
+    .await
+    .map_err(|error| ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: error.to_string(),
+    })?
+    .ok_or_else(|| ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: "utility model returned no usable title".to_string(),
+    })?;
+
+    if !session
+        .set_explicit_auto_title_if_untitled(&title)
+        .map_err(internal)?
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "session already has a title".to_string(),
+        });
+    }
+
+    Ok(Response::AutoTitle { session_id, title })
+}
+
+async fn curator_request(
+    ctx: &Arc<DaemonContext>,
+    project_root: PathBuf,
+    action: proto::CuratorAction,
+) -> std::result::Result<Response, ErrorPayload> {
+    let trust_policy =
+        crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &project_root)
+            .map_err(workspace_trust_error)?;
+    let (_, extended) = ctx
+        .config_source()
+        .load_with_trust(&project_root, &trust_policy)
+        .map_err(workspace_trust_error)?;
+    let db = ctx.db.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<proto::CuratorResult> {
+        crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+            let curator = crate::skills::curator::SkillCurator::new(
+                db,
+                project_root,
+                extended.skills,
+            );
+            match action {
+                proto::CuratorAction::Status => Ok(proto::CuratorResult::Status {
+                    status: curator_status_to_proto(curator.status()?),
+                }),
+                proto::CuratorAction::Run {
+                    dry_run,
+                    consolidate,
+                } => Ok(proto::CuratorResult::Run {
+                    report: curator_run_report_to_proto(curator.run(
+                        crate::skills::curator::CuratorRunOptions {
+                            dry_run,
+                            consolidate,
+                        },
+                    )?),
+                }),
+                proto::CuratorAction::Pin { name } => {
+                    curator.pin(&name, true)?;
+                    Ok(proto::CuratorResult::Pinned { name, pinned: true })
+                }
+                proto::CuratorAction::Unpin { name } => {
+                    curator.pin(&name, false)?;
+                    Ok(proto::CuratorResult::Pinned {
+                        name,
+                        pinned: false,
+                    })
+                }
+                proto::CuratorAction::Restore { name } => {
+                    curator.restore(&name)?;
+                    Ok(proto::CuratorResult::Restored { name })
+                }
+                proto::CuratorAction::Rollback { list, id } => {
+                    if list {
+                        Ok(proto::CuratorResult::Snapshots {
+                            snapshots: curator
+                                .snapshots()?
+                                .into_iter()
+                                .map(curator_snapshot_to_proto)
+                                .collect(),
+                        })
+                    } else {
+                        Ok(proto::CuratorResult::RolledBack {
+                            snapshot: curator_snapshot_to_proto(curator.rollback(id.as_deref())?),
+                        })
+                    }
+                }
+            }
+        })
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|error| ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: error.to_string(),
+    })?;
+    Ok(Response::Curator { result })
+}
+
+fn curator_status_to_proto(status: crate::skills::curator::CuratorStatus) -> proto::CuratorStatus {
+    proto::CuratorStatus {
+        skills: status
+            .skills
+            .into_iter()
+            .map(curator_skill_to_proto)
+            .collect(),
+        snapshots: status
+            .snapshots
+            .into_iter()
+            .map(curator_snapshot_to_proto)
+            .collect(),
+    }
+}
+
+fn curator_skill_to_proto(
+    skill: crate::skills::curator::CuratorSkillStatus,
+) -> proto::CuratorSkillStatus {
+    proto::CuratorSkillStatus {
+        name: skill.name,
+        state: skill.state,
+        created_by: skill.created_by,
+        use_count: skill.use_count,
+        view_count: skill.view_count,
+        pinned: skill.pinned,
+        source_path: skill.source_path,
+        archive_path: skill.archive_path,
+    }
+}
+
+fn curator_snapshot_to_proto(
+    snapshot: crate::skills::curator::CuratorSnapshotStatus,
+) -> proto::CuratorSnapshotStatus {
+    proto::CuratorSnapshotStatus {
+        id: snapshot.id,
+        path: snapshot.path,
+        reason: snapshot.reason,
+        created_at: snapshot.created_at,
+    }
+}
+
+fn curator_run_report_to_proto(
+    report: crate::skills::curator::CuratorRunReport,
+) -> proto::CuratorRunReport {
+    proto::CuratorRunReport {
+        dry_run: report.dry_run,
+        scanned: report.scanned,
+        stale: report.stale,
+        archived: report.archived,
+        reactivated: report.reactivated,
+        skipped: report.skipped,
+        snapshot_id: report.snapshot_id,
+        consolidation: report.consolidation,
     }
 }
 

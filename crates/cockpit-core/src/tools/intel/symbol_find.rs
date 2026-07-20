@@ -10,7 +10,7 @@ impl Tool for SymbolFindTool {
         "symbol_find"
     }
     fn description(&self) -> &str {
-        "Find symbol definitions by name (exact or prefix), optionally filtered by kind"
+        "Find symbol definitions by name; use `word` for uses and `search`/`grep` for general text"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(

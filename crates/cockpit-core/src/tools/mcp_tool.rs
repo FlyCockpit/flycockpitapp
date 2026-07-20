@@ -50,14 +50,73 @@ pub(crate) fn apply_mcp_description_adverts(toolbox: &mut ToolBox, adverts: &[St
     toolbox.set_override_if_changed("mcp", override_text)
 }
 
+pub(crate) fn discoverable_tool_adverts(toolbox: &ToolBox) -> Vec<String> {
+    let names = toolbox.discoverable_mcp_tool_names();
+    let mut adverts = Vec::new();
+    push_family_advert(
+        &names,
+        &mut adverts,
+        "intel tail",
+        &["word", "hot", "circular", "impact", "change_impact"],
+    );
+    push_family_advert(
+        &names,
+        &mut adverts,
+        "harness delegation",
+        &["harness_list", "harness_invoke"],
+    );
+    push_family_advert(
+        &names,
+        &mut adverts,
+        "prior sessions",
+        &["session_search", "session_read"],
+    );
+    push_family_advert(
+        &names,
+        &mut adverts,
+        "goal state",
+        &["create_goal", "get_goal", "update_goal"],
+    );
+    push_family_advert(&names, &mut adverts, "code navigation", &["lsp"]);
+    push_family_advert(&names, &mut adverts, "skill management", &["skill_manage"]);
+    adverts
+}
+
+fn push_family_advert(
+    names: &[String],
+    adverts: &mut Vec<String>,
+    family: &str,
+    family_tools: &[&str],
+) {
+    let present = family_tools
+        .iter()
+        .copied()
+        .filter(|tool| names.iter().any(|name| name == tool))
+        .collect::<Vec<_>>();
+    if present.is_empty() {
+        return;
+    }
+    adverts.push(format!(
+        "{family}: {} via mcp.invoke(\"cockpit\", ...).",
+        present.join("/")
+    ));
+}
+
 pub(crate) fn current_mcp_description_adverts(
     session: &crate::session::Session,
     cwd: &std::path::Path,
 ) -> Vec<String> {
-    let mut adverts = Vec::new();
     let auto_title_configured = crate::config::extended::load_for_cwd(cwd)
         .auto_title_model_ref()
         .is_some();
+    mcp_description_adverts_for_session(session, auto_title_configured)
+}
+
+fn mcp_description_adverts_for_session(
+    session: &crate::session::Session,
+    auto_title_configured: bool,
+) -> Vec<String> {
+    let mut adverts = Vec::new();
     if session.agent_rename_session_available(auto_title_configured) {
         adverts.push(
             "This session may be named via mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": ...})."
@@ -257,6 +316,44 @@ mod tests {
     }
 
     #[test]
+    fn advert_grouping_keeps_one_line_per_discoverable_family() {
+        let toolbox = ToolBox::new()
+            .with(Arc::new(McpTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::intel::WordTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::intel::HotTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::harness::HarnessListTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::harness::HarnessInvokeTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::session_search::SessionSearchTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::session_read::SessionReadTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::goal::CreateGoalTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::goal::GetGoalTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::goal::UpdateGoalTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::lsp::LspTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::skill_manage::SkillManageTool));
+
+        let adverts = discoverable_tool_adverts(&toolbox);
+
+        assert_eq!(adverts.len(), 6, "{adverts:?}");
+        for family in [
+            "intel tail",
+            "harness delegation",
+            "prior sessions",
+            "goal state",
+            "code navigation",
+            "skill management",
+        ] {
+            assert_eq!(
+                adverts
+                    .iter()
+                    .filter(|line| line.starts_with(family))
+                    .count(),
+                1,
+                "{family}: {adverts:?}"
+            );
+        }
+    }
+
+    #[test]
     fn advert_flip_invalidates_definition_cache_only_on_change() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut toolbox = ToolBox::new().with(Arc::new(CountingMcpTool {
@@ -345,7 +442,10 @@ mod tests {
                                     .unwrap();
                             }
 
-                            let adverts = current_mcp_description_adverts(&ctx.session, tmp.path());
+                            let adverts = mcp_description_adverts_for_session(
+                                &ctx.session,
+                                auto_title_configured,
+                            );
                             let has_rename_advert = adverts
                                 .iter()
                                 .any(|advert| advert.contains("rename_session"));

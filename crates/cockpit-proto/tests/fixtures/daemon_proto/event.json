@@ -65,6 +65,230 @@
     },
     "event": "caffeinate_state"
   },
+  "config_snapshot": {
+    "data": {
+      "snapshot": {
+        "extended": {
+          "agent_chooses_subagent_model": false,
+          "agent_dirs": [],
+          "agent_guidance_files": ["AGENTS.md"],
+          "allow_remote_config": false,
+          "approvalPolicy": {
+            "keyMaxScope": {},
+            "programMaxScope": {},
+            "riskMaxScope": {}
+          },
+          "concurrency": "subagents",
+          "daemon": {
+            "autostart": "shared",
+            "uploads": {
+              "global_bytes": 268435456,
+              "global_uploads": 32,
+              "per_client_uploads": 4,
+              "per_upload_bytes": 4194304
+            }
+          },
+          "data_syntax": {
+            "enabled": true,
+            "max_bytes": 10485760
+          },
+          "deepthink": {
+            "enabled": false
+          },
+          "defaultApprovalMode": "manual",
+          "defaultPrimaryAgent": "auto",
+          "delegation": {
+            "defaultRecursionDepth": 0,
+            "maxParallel": 4,
+            "recursionEnabled": true
+          },
+          "dialog": {
+            "lockout_ms": 1500
+          },
+          "experimentalMode": false,
+          "gitignore_allow": [],
+          "harnesses": {},
+          "hintToolCallCorrections": false,
+          "inlineThink": true,
+          "intelCentralityRanking": true,
+          "knowledge_inject_max_tokens": 2048,
+          "llm_mode": "defensive",
+          "loop_guard": {
+            "repeat_threshold": 2
+          },
+          "lsp": {
+            "auto_install": "ask",
+            "diagnostics": {
+              "debounce_ms": 150,
+              "document_timeout_ms": 5000,
+              "enabled": true,
+              "other_files_limit": 5,
+              "per_file_limit": 20,
+              "severity": "error",
+              "workspace_timeout_ms": 10000
+            },
+            "enabled": true,
+            "idle_ttl_secs": 1800,
+            "max_cached_clients": 16
+          },
+          "maxPrimaryRounds": 0,
+          "predictNextMessage": "short",
+          "preflight": {
+            "enabled": false
+          },
+          "project_knowledge": false,
+          "prompt_injection_guard": {
+            "resultAction": "block",
+            "threshold": "off"
+          },
+          "redact": {
+            "allowlist": [],
+            "denylist": [],
+            "dotenv_patterns": [".env", ".env.local"],
+            "enabled": true,
+            "extra_dotenv_paths": [],
+            "min_secret_length": 8,
+            "placeholder": "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**",
+            "scan_dotenv": true,
+            "scan_environment": true,
+            "scan_ssh_keys": true,
+            "ssh_key_dir": null
+          },
+          "resourceScheduler": {
+            "enabled": true,
+            "limits": {
+              "maxQueued": 128
+            },
+            "pools": {
+              "cpu": {
+                "capacity": 1
+              },
+              "memory": {
+                "capacity": 1
+              }
+            }
+          },
+          "retention": {
+            "payload_window_days": 30,
+            "session_window_days": 0,
+            "sweep_interval_hours": 6,
+            "vacuum_interval_days": 7,
+            "vacuum_min_deletions": 1000
+          },
+          "review": {},
+          "sandbox_escalation_enabled": true,
+          "schedule": {
+            "allowUnboundedLoops": false,
+            "max_concurrent": 8
+          },
+          "shellCompression": "enabled",
+          "skills": {
+            "ancestor_walk": false,
+            "auto_bang_commands": false,
+            "consolidate": false,
+            "external_dirs": [],
+            "prune_builtins": false,
+            "scan_dirs": [],
+            "write_approval": false
+          },
+          "swarm": {
+            "maxConcurrency": 8,
+            "maxDepth": 3
+          },
+          "system_prompt": {
+            "time_injection_interval_minutes": 5
+          },
+          "textEmbeddedRecovery": "available",
+          "translation": {
+            "model_language": "",
+            "user_language": ""
+          },
+          "trustedOnly": false,
+          "tui": {
+            "attention": {
+              "bell": false,
+              "desktop": false,
+              "enabled": true,
+              "title": true
+            },
+            "banner": {
+              "enabled": true
+            },
+            "caffeinate_display_awake": false,
+            "diff_style": "side-by-side",
+            "exit_tail_lines": 100,
+            "hyperlinks": true,
+            "mouse_capture": true,
+            "render_agent_markdown": true,
+            "render_user_markdown": false,
+            "rich_text_copy": true,
+            "show_branch": true,
+            "show_cwd": true,
+            "thinking": "condensed",
+            "use_emojis": false,
+            "vim_mode": "hint"
+          }
+        },
+        "generation": 4,
+        "providers": {
+          "active_model": {
+            "model": "gpt-5",
+            "provider": "openai"
+          },
+          "category_defaults": {
+            "smart_code": {
+              "model": "gpt-5",
+              "provider": "openai"
+            }
+          },
+          "on_unlisted_models_fetch": "ask",
+          "providers": {
+            "openai": {
+              "credential_configured": true,
+              "entry": {
+                "cache": {
+                  "mode": "none",
+                  "ttl_secs": 300
+                },
+                "context": {
+                  "auto_compact_pct": 60,
+                  "auto_prune_pct": 50,
+                  "auto_prune_prunable_pct": 30,
+                  "compact_keep_recent_turns": 4,
+                  "compact_shadow": true,
+                  "compact_shadow_margin_pct": 10
+                },
+                "headers": [],
+                "models": [
+                  {
+                    "id": "gpt-5"
+                  }
+                ],
+                "shrink": {
+                  "margin_secs": 30,
+                  "strategy": "prune"
+                },
+                "timeout": {
+                  "idle_secs": 90,
+                  "ttft_secs": 120
+                },
+                "url": "https://api.openai.com/v1"
+              },
+              "headers": [
+                {
+                  "name": "Authorization",
+                  "redacted": true,
+                  "value": "[redacted]"
+                }
+              ]
+            }
+          }
+        },
+        "session_id": "11111111-1111-4111-8111-111111111111"
+      }
+    },
+    "event": "config_snapshot"
+  },
   "compact_ready": {
     "data": {
       "brief": "brief-fixture",
@@ -584,6 +808,14 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "sandbox_unavailable"
+  },
+  "command_capability_unavailable": {
+    "data": {
+      "fix_command": "fix_command-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "text": "text-fixture"
+    },
+    "event": "command_capability_unavailable"
   },
   "schedule_completed": {
     "data": {

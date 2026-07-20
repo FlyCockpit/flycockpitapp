@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use croner::parser::{CronParser, Seconds};
 use serde_json::json;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 
 use crate::daemon::proto::{
     EnvSnapshotSource, MissedRunPolicy, ScheduledJobCreate, ScheduledJobLastResult,
@@ -25,6 +25,7 @@ use crate::db::scheduler::{NewScheduledJobRow, ScheduledJobRow, ScheduledJobRunU
 const MAX_FAILURES: u32 = 5;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const RUN_PROMPT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const MAX_CONCURRENT_JOBS: usize = 4;
 
 type CallbackFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 type SchedulerCallback = Arc<dyn Fn(ScheduledJob) -> CallbackFuture + Send + Sync>;
@@ -98,6 +99,12 @@ pub trait SchedulerSleeper: Send + Sync {
     async fn sleep_until(&self, now: i64, wake_at: Option<i64>);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunKind {
+    Scheduled,
+    Manual,
+}
+
 #[derive(Debug, Default)]
 pub struct TokioSchedulerSleeper;
 
@@ -118,6 +125,8 @@ pub struct DaemonScheduler {
     executor: Arc<dyn JobExecutor>,
     last_user_activity: Arc<RwLock<i64>>,
     timeline: Arc<RwLock<BinaryHeap<Reverse<i64>>>>,
+    in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
+    slots: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -184,10 +193,10 @@ impl DaemonSchedulerHandle {
         Ok(job)
     }
 
-    pub async fn run_now(&self, id: &str) -> Result<ScheduledJobLastResult> {
-        let result = self.scheduler.run_job_by_id(id).await?;
+    pub fn run_now(&self, id: &str) -> Result<()> {
+        self.scheduler.run_job_by_id(id)?;
         self.wake();
-        Ok(result)
+        Ok(())
     }
 }
 
@@ -200,6 +209,8 @@ impl DaemonScheduler {
             executor,
             last_user_activity: Arc::new(RwLock::new(now)),
             timeline: Arc::new(RwLock::new(BinaryHeap::new())),
+            in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            slots: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
         }
     }
 
@@ -243,7 +254,7 @@ impl DaemonScheduler {
     }
 
     pub fn create_job(&self, job: ScheduledJobCreate) -> Result<ScheduledJobSummary> {
-        validate_job_create(&job)?;
+        validate_job_create_with_db(&job, &self.db)?;
         let now = self.clock.now();
         let next_run_at = compute_next_run(
             &job.schedule,
@@ -359,7 +370,7 @@ impl DaemonScheduler {
             .into_iter()
             .map(row_to_job)
             .collect::<Result<Vec<_>>>()?;
-        let mut results = Vec::new();
+        let results = Vec::new();
         for job in jobs {
             if !job.enabled || job.next_run_at.is_none_or(|next| next > now) {
                 continue;
@@ -367,30 +378,87 @@ impl DaemonScheduler {
             if job.backoff_until.is_some_and(|until| until > now) {
                 continue;
             }
+            if self.is_in_flight(&job.id) {
+                continue;
+            }
             if let Some(wait_until) = self.idle_wait_until(&job, now)? {
                 self.db
                     .update_scheduled_job_next_run(&job.id, Some(wait_until), now)?;
                 continue;
             }
-            results.push(self.execute_and_record(job).await?);
+            self.enqueue_job(job, RunKind::Scheduled)?;
         }
         self.rebuild_timeline()?;
         Ok(results)
     }
 
-    pub async fn run_job_by_id(&self, id: &str) -> Result<ScheduledJobLastResult> {
+    pub fn run_job_by_id(&self, id: &str) -> Result<()> {
         let row = self
             .db
             .get_scheduled_job(id)?
             .ok_or_else(|| anyhow::anyhow!("scheduled job `{id}` not found"))?;
-        let result = self.execute_manual_and_record(row_to_job(row)?).await?;
+        self.enqueue_job(row_to_job(row)?, RunKind::Manual)?;
         self.rebuild_timeline()?;
-        Ok(result)
+        Ok(())
     }
 
-    async fn execute_and_record(&self, job: ScheduledJob) -> Result<ScheduledJobLastResult> {
-        let finished_at = self.clock.now();
+    fn enqueue_job(&self, job: ScheduledJob, kind: RunKind) -> Result<()> {
+        self.mark_in_flight(&job.id)?;
+        let scheduler = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = scheduler.execute_and_record(job.clone(), kind).await {
+                tracing::warn!(
+                    error = %error,
+                    job_id = %job.id,
+                    "scheduled job execution failed before recording"
+                );
+            }
+            scheduler.clear_in_flight(&job.id);
+            if let Err(error) = scheduler.rebuild_timeline() {
+                tracing::warn!(error = %error, "scheduler timeline rebuild after job failed");
+            }
+        });
+        Ok(())
+    }
+
+    fn mark_in_flight(&self, id: &str) -> Result<()> {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !in_flight.insert(id.to_string()) {
+            bail!("scheduled job `{id}` is already running");
+        }
+        Ok(())
+    }
+
+    fn clear_in_flight(&self, id: &str) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id);
+    }
+
+    fn is_in_flight(&self, id: &str) -> bool {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(id)
+    }
+
+    async fn execute_and_record(
+        &self,
+        job: ScheduledJob,
+        kind: RunKind,
+    ) -> Result<ScheduledJobLastResult> {
+        let _slot = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .context("scheduler concurrency limiter closed")?;
         let execution = self.executor.execute(job.clone()).await;
+        let finished_at = self.clock.now();
         let (ok, summary) = match execution {
             Ok(summary) => (true, summary),
             Err(error) => (false, format!("{error:#}")),
@@ -400,10 +468,14 @@ impl DaemonScheduler {
             summary,
             finished_at,
         };
+        let Some(current_row) = self.db.get_scheduled_job(&job.id)? else {
+            return Ok(result);
+        };
+        let current = row_to_job(current_row)?;
         let failure_count = if ok {
             0
         } else {
-            job.failure_count.saturating_add(1)
+            current.failure_count.saturating_add(1)
         };
         let disabled = failure_count >= MAX_FAILURES;
         let disabled_notice = disabled.then(|| {
@@ -414,18 +486,21 @@ impl DaemonScheduler {
         });
         let backoff_until = (!ok && !disabled)
             .then(|| finished_at.saturating_add(backoff_seconds(failure_count, &job.id)));
-        let next_run_at = if disabled {
+        let enabled = current.enabled && !disabled;
+        let next_run_at = if !enabled {
             None
-        } else {
+        } else if kind == RunKind::Scheduled {
             compute_next_run(
-                &job.schedule,
+                &current.schedule,
                 finished_at,
                 Some(finished_at),
                 finished_at,
                 self.last_user_activity(),
-                job.missed_run_policy,
+                current.missed_run_policy,
                 None,
             )?
+        } else {
+            current.next_run_at
         };
         self.db
             .update_scheduled_job_after_run(ScheduledJobRunUpdate {
@@ -435,29 +510,9 @@ impl DaemonScheduler {
                 last_result_json: serde_json::to_string(&result)?,
                 failure_count,
                 backoff_until,
-                enabled: !disabled,
-                disabled_notice,
+                enabled,
+                disabled_notice: disabled_notice.or(current.disabled_notice),
             })?;
-        Ok(result)
-    }
-
-    async fn execute_manual_and_record(&self, job: ScheduledJob) -> Result<ScheduledJobLastResult> {
-        let finished_at = self.clock.now();
-        let execution = self.executor.execute(job.clone()).await;
-        let (ok, summary) = match execution {
-            Ok(summary) => (true, summary),
-            Err(error) => (false, format!("{error:#}")),
-        };
-        let result = ScheduledJobLastResult {
-            ok,
-            summary,
-            finished_at,
-        };
-        self.db.update_scheduled_job_manual_run_result(
-            &job.id,
-            finished_at,
-            serde_json::to_string(&result)?,
-        )?;
         Ok(result)
     }
 
@@ -470,13 +525,23 @@ impl DaemonScheduler {
 
     fn idle_wait_until(&self, job: &ScheduledJob, now: i64) -> Result<Option<i64>> {
         let ScheduledJobSchedule::Idle {
-            min_idle_seconds, ..
+            min_idle_seconds,
+            max_age_seconds,
         } = &job.schedule
         else {
             return Ok(None);
         };
         let min_idle = i64::try_from(*min_idle_seconds).context("idle min_idle too large")?;
-        let wait_until = self.last_user_activity().saturating_add(min_idle);
+        let max_age = i64::try_from(*max_age_seconds).context("idle max_age too large")?;
+        let age_base = job.last_run_at.unwrap_or(job.created_at);
+        let max_age_at = age_base.saturating_add(max_age);
+        if now >= max_age_at {
+            return Ok(None);
+        }
+        let wait_until = self
+            .last_user_activity()
+            .saturating_add(min_idle)
+            .min(max_age_at);
         Ok((wait_until > now).then_some(wait_until))
     }
 
@@ -486,6 +551,9 @@ impl DaemonScheduler {
         for row in self.db.list_scheduled_jobs(None)? {
             let job = row_to_job(row)?;
             if !job.enabled {
+                continue;
+            }
+            if self.is_in_flight(&job.id) {
                 continue;
             }
             let wake_at = if let Some(backoff) = job.backoff_until
@@ -677,18 +745,30 @@ struct RegistryPromptRunner {
 impl ScheduledPromptRunner for RegistryPromptRunner {
     async fn run_prompt_turn(
         &self,
-        _db: &Db,
+        db: &Db,
         job: &ScheduledJob,
         session_id: uuid::Uuid,
         assistant: &str,
         prompt: String,
         env_snapshot: crate::env_snapshot::EnvSnapshot,
     ) -> Result<String> {
-        let handle = self
+        let handle = match self
             .registry
             .attach(Some(session_id), None, false, None, env_snapshot)
             .await
-            .context("starting scheduled assistant session")?;
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Err(cleanup_error) = db.delete_session(session_id, true) {
+                    tracing::warn!(
+                        error = %cleanup_error,
+                        %session_id,
+                        "failed to clean up refused scheduled session"
+                    );
+                }
+                return Err(error).context("starting scheduled assistant session");
+            }
+        };
         let mut events = handle.subscribe();
         let (respond_to, response_rx) = oneshot::channel();
         handle
@@ -710,17 +790,19 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
             })
             .await
             .context("dispatching scheduled prompt")?;
-        let _ = response_rx
+        let (queued_item, _) = response_rx
             .await
             .context("scheduled prompt queue ack dropped")?;
+        let expected_turn_id = queued_item.id.to_string();
         tokio::time::timeout(RUN_PROMPT_TIMEOUT, async {
             loop {
                 match events.recv().await {
                     Ok(envelope)
                         if matches!(
-                            envelope.event,
-                            crate::daemon::proto::Event::AgentIdle { session_id, .. }
-                                if session_id == handle.session_id
+                            &envelope.event,
+                            crate::daemon::proto::Event::AgentIdle { session_id, turn_id, .. }
+                                if *session_id == handle.session_id
+                                    && turn_id.as_deref() == Some(expected_turn_id.as_str())
                         ) =>
                     {
                         return Ok(format!(
@@ -730,11 +812,15 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
                     }
                     Ok(envelope)
                         if matches!(
-                            envelope.event,
+                            &envelope.event,
                             crate::daemon::proto::Event::SessionDriverFailed {
                                 session_id,
+                                turn_id,
                                 ..
-                            } if session_id == handle.session_id
+                            } if *session_id == handle.session_id
+                                && turn_id
+                                    .as_deref()
+                                    .is_none_or(|turn_id| turn_id == expected_turn_id)
                         ) =>
                     {
                         if let crate::daemon::proto::Event::SessionDriverFailed { error, .. } =
@@ -784,6 +870,16 @@ pub fn validate_job_create(job: &ScheduledJobCreate) -> Result<()> {
                 bail!("Callback owner must be `{expected}`");
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_job_create_with_db(job: &ScheduledJobCreate, db: &Db) -> Result<()> {
+    validate_job_create(job)?;
+    if let ScheduledJobPayload::RunPrompt { assistant, .. } = &job.payload
+        && db.get_assistant(assistant)?.is_none()
+    {
+        bail!("assistant `{assistant}` not found");
     }
     Ok(())
 }
@@ -1044,6 +1140,7 @@ mod tests {
     use crate::daemon::shutdown::ShutdownSignal;
     use crate::db::workspace_trust::WorkspaceTrustMode;
     use crate::locks::LockManager;
+    use tokio::sync::Notify;
 
     #[derive(Debug)]
     struct ManualClock(std::sync::Mutex<i64>);
@@ -1077,6 +1174,107 @@ mod tests {
                 bail!("boom");
             }
             Ok("ok".to_string())
+        }
+    }
+
+    struct BlockingByIdExecutor {
+        blocked_id: String,
+        started: std::sync::Mutex<Vec<String>>,
+        notify: Notify,
+    }
+
+    impl BlockingByIdExecutor {
+        fn new(blocked_id: impl Into<String>) -> Arc<Self> {
+            Arc::new(Self {
+                blocked_id: blocked_id.into(),
+                started: std::sync::Mutex::new(Vec::new()),
+                notify: Notify::new(),
+            })
+        }
+
+        fn started(&self) -> Vec<String> {
+            self.started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl JobExecutor for BlockingByIdExecutor {
+        async fn execute(&self, job: ScheduledJob) -> Result<String> {
+            self.started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(job.id.clone());
+            if job.id == self.blocked_id {
+                self.notify.notified().await;
+            }
+            Ok(format!("ok {}", job.id))
+        }
+    }
+
+    struct AdvancingExecutor {
+        runs: AtomicUsize,
+        clock: Arc<ManualClock>,
+        advance_seconds: i64,
+    }
+
+    #[async_trait]
+    impl JobExecutor for AdvancingExecutor {
+        async fn execute(&self, _job: ScheduledJob) -> Result<String> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let now = self.clock.now();
+            self.clock.set(now.saturating_add(self.advance_seconds));
+            Ok("advanced".to_string())
+        }
+    }
+
+    struct GatedExecutor {
+        started: std::sync::Mutex<Vec<String>>,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        gate: Notify,
+    }
+
+    impl GatedExecutor {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                started: std::sync::Mutex::new(Vec::new()),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                gate: Notify::new(),
+            })
+        }
+
+        fn started(&self) -> Vec<String> {
+            self.started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    struct ActiveJob<'a>(&'a GatedExecutor);
+
+    impl Drop for ActiveJob<'_> {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl JobExecutor for GatedExecutor {
+        async fn execute(&self, job: ScheduledJob) -> Result<String> {
+            self.started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(job.id.clone());
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            let _active = ActiveJob(self);
+            self.gate.notified().await;
+            Ok(format!("ok {}", job.id))
         }
     }
 
@@ -1195,6 +1393,77 @@ mod tests {
         );
     }
 
+    async fn wait_for_executor_runs(executor: &CountingExecutor, expected: usize) {
+        for _ in 0..100 {
+            if executor.runs.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "expected at least {expected} executor runs, saw {}",
+            executor.runs.load(Ordering::SeqCst)
+        );
+    }
+
+    async fn wait_for_started_jobs(executor: &BlockingByIdExecutor, expected: usize) {
+        for _ in 0..100 {
+            if executor.started().len() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "expected at least {expected} started jobs, saw {:?}",
+            executor.started()
+        );
+    }
+
+    async fn wait_for_gated_started_jobs(executor: &GatedExecutor, expected: usize) {
+        for _ in 0..100 {
+            if executor.started().len() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "expected at least {expected} gated jobs, saw {:?}",
+            executor.started()
+        );
+    }
+
+    async fn wait_for_job_result(scheduler: &DaemonScheduler, id: &str) -> ScheduledJobSummary {
+        for _ in 0..100 {
+            let jobs = scheduler.list_jobs(None).unwrap();
+            if let Some(job) = jobs
+                .into_iter()
+                .find(|job| job.id == id && job.last_result.is_some())
+            {
+                return job;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("expected job `{id}` to record a result");
+    }
+
+    async fn wait_for_job_failure_count(
+        scheduler: &DaemonScheduler,
+        id: &str,
+        expected: u32,
+    ) -> ScheduledJobSummary {
+        for _ in 0..100 {
+            let jobs = scheduler.list_jobs(None).unwrap();
+            if let Some(job) = jobs
+                .into_iter()
+                .find(|job| job.id == id && job.failure_count == expected)
+            {
+                return job;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("expected job `{id}` failure_count to reach {expected}");
+    }
+
     fn callback_job(id: &str, schedule: ScheduledJobSchedule) -> ScheduledJobCreate {
         ScheduledJobCreate {
             id: id.to_string(),
@@ -1246,6 +1515,7 @@ mod tests {
                 description: "Helper bot".to_string(),
                 mode: AgentMode::Primary,
                 tools: Some(vec!["read".to_string()]),
+                tool_tiers: std::collections::BTreeMap::new(),
                 model: None,
                 prompt: "You help with scheduled workspace maintenance.".to_string(),
                 home_dir,
@@ -1406,6 +1676,7 @@ mod tests {
             "run_once_on_start should catch up one missed one-shot"
         );
         restarted.run_due_once().await.unwrap();
+        wait_for_executor_runs(&executor, 1).await;
         assert_eq!(executor.runs.load(Ordering::SeqCst), 1);
         assert!(
             restarted
@@ -1421,6 +1692,7 @@ mod tests {
         restarted_again.recompute_after_start().unwrap();
         clock.set(1_030);
         restarted_again.run_due_once().await.unwrap();
+        wait_for_executor_runs(&executor, 1).await;
         assert_eq!(executor.runs.load(Ordering::SeqCst), 1);
     }
 
@@ -1443,7 +1715,267 @@ mod tests {
         clock.set(1_370);
         scheduler.recompute_after_start().unwrap();
         scheduler.run_due_once().await.unwrap();
+        wait_for_executor_runs(&executor, 1).await;
         assert_eq!(executor.runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn hung_job_does_not_block_other_jobs() {
+        let db = Db::open_in_memory().unwrap();
+        let clock = ManualClock::new(1_000);
+        let executor = BlockingByIdExecutor::new("job-a");
+        let scheduler = DaemonScheduler::new(db, clock.clone(), executor.clone());
+        scheduler
+            .create_job(callback_job(
+                "job-a",
+                ScheduledJobSchedule::Every { seconds: 1 },
+            ))
+            .unwrap();
+        scheduler
+            .create_job(callback_job(
+                "job-b",
+                ScheduledJobSchedule::Every { seconds: 1 },
+            ))
+            .unwrap();
+
+        clock.set(1_001);
+        scheduler.run_due_once().await.unwrap();
+        wait_for_started_jobs(&executor, 2).await;
+        assert_eq!(executor.started(), vec!["job-a", "job-b"]);
+
+        scheduler
+            .create_job(callback_job(
+                "job-c",
+                ScheduledJobSchedule::Every { seconds: 10 },
+            ))
+            .unwrap();
+        assert!(
+            scheduler
+                .list_jobs(None)
+                .unwrap()
+                .iter()
+                .any(|job| job.id == "job-c")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrency_is_bounded_and_nothing_is_dropped() {
+        let db = Db::open_in_memory().unwrap();
+        let clock = ManualClock::new(1_000);
+        let executor = GatedExecutor::new();
+        let scheduler = DaemonScheduler::new(db, clock.clone(), executor.clone());
+        let total = MAX_CONCURRENT_JOBS + 2;
+        for i in 0..total {
+            scheduler
+                .create_job(callback_job(
+                    &format!("job-{i:02}"),
+                    ScheduledJobSchedule::Every { seconds: 1 },
+                ))
+                .unwrap();
+        }
+
+        clock.set(1_001);
+        scheduler.run_due_once().await.unwrap();
+        wait_for_gated_started_jobs(&executor, MAX_CONCURRENT_JOBS).await;
+        assert_eq!(executor.started().len(), MAX_CONCURRENT_JOBS);
+        assert_eq!(
+            executor.max_active.load(Ordering::SeqCst),
+            MAX_CONCURRENT_JOBS
+        );
+
+        executor.gate.notify_waiters();
+        wait_for_gated_started_jobs(&executor, total).await;
+        executor.gate.notify_waiters();
+        for i in 0..total {
+            let id = format!("job-{i:02}");
+            wait_for_job_result(&scheduler, &id).await;
+        }
+        assert!(executor.max_active.load(Ordering::SeqCst) <= MAX_CONCURRENT_JOBS);
+        assert_eq!(
+            executor.started(),
+            (0..total)
+                .map(|i| format!("job-{i:02}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn next_run_computed_from_completion_not_start() {
+        let db = Db::open_in_memory().unwrap();
+        let clock = ManualClock::new(1_000);
+        let executor = Arc::new(AdvancingExecutor {
+            runs: AtomicUsize::new(0),
+            clock: clock.clone(),
+            advance_seconds: 90,
+        });
+        let scheduler = DaemonScheduler::new(db, clock.clone(), executor.clone());
+        scheduler
+            .create_job(callback_job(
+                "job-slow",
+                ScheduledJobSchedule::Every { seconds: 60 },
+            ))
+            .unwrap();
+
+        clock.set(1_060);
+        scheduler.run_due_once().await.unwrap();
+        let job = wait_for_job_result(&scheduler, "job-slow").await;
+        let result = job.last_result.expect("slow result");
+        assert_eq!(result.finished_at, 1_150);
+        assert_eq!(job.last_run_at, Some(1_150));
+        assert_eq!(job.next_run_at, Some(1_210));
+    }
+
+    #[tokio::test]
+    async fn idle_max_age_overrides_min_idle() {
+        let (scheduler, clock, executor) = scheduler(1_000, false);
+        scheduler
+            .create_job(callback_job(
+                "job-idle-max-age",
+                ScheduledJobSchedule::Idle {
+                    min_idle_seconds: 300,
+                    max_age_seconds: 60,
+                },
+            ))
+            .unwrap();
+
+        clock.set(1_059);
+        scheduler.record_user_activity().unwrap();
+        clock.set(1_060);
+        scheduler.run_due_once().await.unwrap();
+        wait_for_executor_runs(&executor, 1).await;
+        assert_eq!(executor.runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn manual_and_scheduled_runs_are_mutually_exclusive() {
+        let db = Db::open_in_memory().unwrap();
+        let clock = ManualClock::new(1_000);
+        let executor = BlockingByIdExecutor::new("job-blocked");
+        let scheduler = DaemonScheduler::new(db, clock.clone(), executor.clone());
+        scheduler
+            .create_job(callback_job(
+                "job-blocked",
+                ScheduledJobSchedule::Every { seconds: 1 },
+            ))
+            .unwrap();
+
+        clock.set(1_001);
+        scheduler.run_due_once().await.unwrap();
+        wait_for_started_jobs(&executor, 1).await;
+        let error = scheduler.run_job_by_id("job-blocked").unwrap_err();
+        assert!(error.to_string().contains("already running"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn run_now_does_not_block_the_caller() {
+        let db = Db::open_in_memory().unwrap();
+        let clock = ManualClock::new(1_000);
+        let executor = BlockingByIdExecutor::new("job-blocked");
+        let scheduler = DaemonScheduler::new(db, clock, executor.clone());
+        scheduler
+            .create_job(callback_job(
+                "job-blocked",
+                ScheduledJobSchedule::Every { seconds: 60 },
+            ))
+            .unwrap();
+
+        scheduler.run_job_by_id("job-blocked").unwrap();
+        wait_for_started_jobs(&executor, 1).await;
+        assert!(scheduler.is_in_flight("job-blocked"));
+    }
+
+    #[tokio::test]
+    async fn manual_failures_count_toward_disable() {
+        let (scheduler, _clock, executor) = scheduler(1_000, true);
+        scheduler
+            .create_job(callback_job(
+                "job-manual-fail",
+                ScheduledJobSchedule::Every { seconds: 60 },
+            ))
+            .unwrap();
+
+        let mut job = scheduler.list_jobs(None).unwrap().remove(0);
+        for expected in 1..=MAX_FAILURES {
+            scheduler.run_job_by_id("job-manual-fail").unwrap();
+            job = wait_for_job_failure_count(&scheduler, "job-manual-fail", expected).await;
+        }
+        assert_eq!(executor.runs.load(Ordering::SeqCst), MAX_FAILURES as usize);
+        assert!(!job.enabled);
+        assert!(job.disabled_notice.unwrap().contains("disabled"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn callback_watchdog_times_out_and_records_failure() {
+        let db = Db::open_in_memory().unwrap();
+        let registry = production_registry(db.clone());
+        let executor = Arc::new(ProductionJobExecutor::new(db.clone(), registry));
+        let clock = ManualClock::new(1_000);
+        let scheduler = DaemonScheduler::new(db, clock.clone(), executor.clone());
+        executor.register_callback("test", |_job| async {
+            std::future::pending::<Result<String>>().await
+        });
+        scheduler
+            .create_job(callback_job(
+                "job-timeout",
+                ScheduledJobSchedule::Every { seconds: 1 },
+            ))
+            .unwrap();
+
+        clock.set(1_001);
+        scheduler.run_due_once().await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(CALLBACK_TIMEOUT).await;
+        let job = wait_for_job_failure_count(&scheduler, "job-timeout", 1).await;
+        let result = job.last_result.expect("timeout result");
+        assert!(!result.ok);
+        assert!(result.summary.contains("timed out"), "{}", result.summary);
+    }
+
+    #[tokio::test]
+    async fn inflight_result_does_not_resurrect_deleted_job() {
+        let db = Db::open_in_memory().unwrap();
+        let clock = ManualClock::new(1_000);
+        let executor = BlockingByIdExecutor::new("job-delete");
+        let scheduler = DaemonScheduler::new(db, clock, executor.clone());
+        scheduler
+            .create_job(callback_job(
+                "job-delete",
+                ScheduledJobSchedule::Every { seconds: 60 },
+            ))
+            .unwrap();
+
+        scheduler.run_job_by_id("job-delete").unwrap();
+        wait_for_started_jobs(&executor, 1).await;
+        assert!(scheduler.delete_job("job-delete").unwrap());
+        executor.notify.notify_waiters();
+        for _ in 0..100 {
+            if scheduler.list_jobs(None).unwrap().is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("deleted in-flight job was resurrected");
+    }
+
+    #[tokio::test]
+    async fn inflight_result_does_not_reenable_disabled_job() {
+        let db = Db::open_in_memory().unwrap();
+        let clock = ManualClock::new(1_000);
+        let executor = BlockingByIdExecutor::new("job-disable");
+        let scheduler = DaemonScheduler::new(db, clock, executor.clone());
+        scheduler
+            .create_job(callback_job(
+                "job-disable",
+                ScheduledJobSchedule::Every { seconds: 60 },
+            ))
+            .unwrap();
+
+        scheduler.run_job_by_id("job-disable").unwrap();
+        wait_for_started_jobs(&executor, 1).await;
+        scheduler.set_enabled("job-disable", false).unwrap();
+        executor.notify.notify_waiters();
+        let job = wait_for_job_result(&scheduler, "job-disable").await;
+        assert!(!job.enabled);
     }
 
     #[tokio::test]
@@ -1457,7 +1989,8 @@ mod tests {
             .unwrap();
         clock.set(1_001);
         scheduler.run_due_once().await.unwrap();
-        let mut job = scheduler.list_jobs(None).unwrap().remove(0);
+        wait_for_executor_runs(&executor, 1).await;
+        let mut job = wait_for_job_result(&scheduler, "job-fail").await;
         assert_eq!(executor.runs.load(Ordering::SeqCst), 1);
         assert_eq!(job.failure_count, 1);
         let mut backoff = job.backoff_until.expect("first failure backs off");
@@ -1474,7 +2007,8 @@ mod tests {
         for expected_failure in 2..=MAX_FAILURES {
             clock.set(backoff);
             scheduler.run_due_once().await.unwrap();
-            job = scheduler.list_jobs(None).unwrap().remove(0);
+            wait_for_executor_runs(&executor, expected_failure as usize).await;
+            job = wait_for_job_result(&scheduler, "job-fail").await;
             assert_eq!(job.failure_count, expected_failure);
             if expected_failure < MAX_FAILURES {
                 let next_backoff = job.backoff_until.expect("failure backs off");
@@ -1566,7 +2100,9 @@ mod tests {
             ))
             .unwrap();
         clock.set(1_001);
-        let result = scheduler.run_due_once().await.unwrap().remove(0);
+        scheduler.run_due_once().await.unwrap();
+        let job = wait_for_job_result(&scheduler, "job-callback").await;
+        let result = job.last_result.expect("callback result");
         assert!(result.ok);
         assert_eq!(result.summary, "hook ran job-callback");
         assert_eq!(runs.load(Ordering::SeqCst), 1);
@@ -1583,16 +2119,17 @@ mod tests {
                 ScheduledJobSchedule::Once { at: 2_000 },
             ))
             .unwrap();
-        let result = scheduler.run_job_by_id("job-once").await.unwrap();
-        assert!(result.ok);
+        scheduler.run_job_by_id("job-once").unwrap();
+        let job = wait_for_job_result(&scheduler, "job-once").await;
+        assert!(job.last_result.as_ref().unwrap().ok);
         assert_eq!(executor.runs.load(Ordering::SeqCst), 1);
-        let job = scheduler.list_jobs(None).unwrap().remove(0);
         assert_eq!(job.last_run_at, Some(1_000));
         assert_eq!(job.next_run_at, Some(2_000));
         assert!(job.enabled);
 
         clock.set(2_000);
         scheduler.run_due_once().await.unwrap();
+        wait_for_executor_runs(&executor, 2).await;
         assert_eq!(executor.runs.load(Ordering::SeqCst), 2);
     }
 
@@ -1623,6 +2160,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_rejects_unknown_assistant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let scheduler = DaemonScheduler::new(
+            db.clone(),
+            ManualClock::new(1_000),
+            Arc::new(CountingExecutor {
+                runs: AtomicUsize::new(0),
+                fail: false,
+            }),
+        );
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let error = scheduler
+            .create_job(run_prompt_job("job-missing", "helper-bot", &project_root))
+            .unwrap_err();
+        assert!(error.to_string().contains("helper-bot"), "{error:#}");
+
+        create_helper_assistant(&db, tmp.path().join("assistants/helper-bot"));
+        scheduler
+            .create_job(run_prompt_job("job-present", "helper-bot", &project_root))
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn scheduler_runprompt_creates_owned_session() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
@@ -1644,11 +2206,9 @@ mod tests {
             .create_job(run_prompt_job("job-run", "helper-bot", &project_root))
             .unwrap();
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), scheduler.run_job_by_id("job-run"))
-                .await
-                .expect("scheduled prompt should settle")
-                .expect("scheduler records prompt result");
+        scheduler.run_job_by_id("job-run").unwrap();
+        let job = wait_for_job_result(&scheduler, "job-run").await;
+        let result = job.last_result.expect("scheduled prompt result");
 
         let sessions = db.list_sessions(false, 10).unwrap();
         assert_eq!(sessions.len(), 1);
@@ -1688,22 +2248,16 @@ mod tests {
             .create_job(run_prompt_job("job-trust", "helper-bot", &project_root))
             .unwrap();
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), scheduler.run_job_by_id("job-trust"))
-                .await
-                .expect("trust refusal should settle")
-                .expect("scheduler records trust result");
+        scheduler.run_job_by_id("job-trust").unwrap();
+        let job = wait_for_job_result(&scheduler, "job-trust").await;
+        let result = job.last_result.expect("trust refusal result");
 
         assert!(!result.ok);
         assert!(result.summary.contains("untrusted"), "{}", result.summary);
         let sessions = db.list_sessions(false, 10).unwrap();
-        assert_eq!(sessions.len(), 1);
-        let events = db.list_session_events(sessions[0].session_id).unwrap();
         assert!(
-            events
-                .iter()
-                .any(|event| event.data.to_string().contains("daemon_scheduler")),
-            "trust refusal should leave a scheduler notice"
+            sessions.is_empty(),
+            "trust refusal must not leave an orphan session row"
         );
     }
 }

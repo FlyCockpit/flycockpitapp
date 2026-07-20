@@ -422,8 +422,8 @@ impl VirtualDisplayBackend {
 
     #[cfg(target_os = "linux")]
     fn new_virtual() -> Result<Self, ComputerError> {
-        let xvfb = require_tool("Xvfb", "the `xvfb` package")?;
-        let xdotool = require_tool("xdotool", "the `xdotool` package")?;
+        let xvfb = require_capability("Xvfb", "the `xvfb` package")?;
+        let xdotool = require_capability("xdotool", "the `xdotool` package")?;
         let capture = require_capture_tool()?;
         let display = format!(":{}", 90 + (std::process::id() % 1000));
         let geometry = DisplayGeometry {
@@ -992,29 +992,25 @@ fn click_repetitions(count: ClickCount) -> u8 {
 }
 
 #[cfg(target_os = "linux")]
-fn require_tool(tool: &'static str, install_hint: &'static str) -> Result<PathBuf, ComputerError> {
-    find_on_path(tool).ok_or(ComputerError::MissingTool { tool, install_hint })
+fn require_capability(
+    tool: &'static str,
+    install_hint: &'static str,
+) -> Result<PathBuf, ComputerError> {
+    crate::capabilities::resolve_binary(tool)
+        .ok_or(ComputerError::MissingTool { tool, install_hint })
 }
 
 #[cfg(target_os = "linux")]
 fn require_capture_tool() -> Result<CaptureTool, ComputerError> {
-    if let Some(path) = find_on_path("scrot") {
+    if let Some(path) = crate::capabilities::resolve_binary("scrot") {
         return Ok(CaptureTool::Scrot(path));
     }
-    if let Some(path) = find_on_path("import") {
+    if let Some(path) = crate::capabilities::resolve_binary("import") {
         return Ok(CaptureTool::Import(path));
     }
     Err(ComputerError::MissingTool {
         tool: "scrot or import",
         install_hint: "the `scrot` package or ImageMagick",
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn find_on_path(tool: &str) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?).find_map(|dir| {
-        let path = dir.join(tool);
-        path.is_file().then_some(path)
     })
 }
 

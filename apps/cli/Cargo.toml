@@ -40,32 +40,26 @@ futures = { workspace = true }
 bytes = { workspace = true }
 
 # TUI
-ratatui = "0.30"
-crossterm = { version = "0.29", features = ["event-stream"] }
 # Markdown parser for rendering agent (and optionally user) messages as
 # styled ratatui spans. Event-driven; we walk the parser output to emit
 # `Vec<Line>` directly — no HTML/ANSI intermediary. We also use the
 # `html` module to convert agent markdown to HTML for the rich-text
 # clipboard path.
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 # System clipboard for local sessions. Supports
 # multi-format set (plain text + HTML) which OSC52 cannot do, so
 # rich-text copy goes through arboard when not running over SSH.
 # `image-data` enables `Clipboard::get_image` for composer image paste
 # (composer-paste-handling); it pulls arboard's own `image` dep.
-arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
 # Decode/normalize/encode pasted clipboard images to PNG before they go
 # to a vision model (composer-paste-handling). PNG-only feature set keeps
 # the build lean; we never decode other formats ourselves (arboard hands
 # us raw RGBA, we only encode).
-image = { workspace = true }
 # Best-effort native desktop notifications for the attention subsystem on
 # local sessions (zbus/D-Bus on Linux via the default `z` feature, the native
 # notification centre on macOS/Windows). Fired on a detached thread with all
 # errors ignored; over SSH we skip it and rely on terminal notification
 # escapes instead. We only set a summary + body, so the default features are
 # all we need.
-notify-rust = "4.11"
 # Embedded-PTY panes for `/editor` + `/lazygit`. `portable-pty`
 # (wezterm's pure-Rust PTY layer) spawns + resizes
 # the child; `vt100` is the terminal-screen state machine fed by the
@@ -73,8 +67,6 @@ notify-rust = "4.11"
 # `PseudoTerminal` widget. `tui-term` 0.3 pins `ratatui ^0.30` — a
 # ratatui bump must be matched by a `tui-term` bump.
 portable-pty = "0.9"
-vt100 = "0.16"
-tui-term = { version = "0.3", default-features = false, features = ["vt100"] }
 
 # HTTP / providers
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
@@ -90,6 +82,7 @@ cockpit-core = { path = "../../crates/cockpit-core" }
 cockpit-config = { path = "../../crates/cockpit-config" }
 cockpit-db = { path = "../../crates/cockpit-db" }
 cockpit-proto = { path = "../../crates/cockpit-proto" }
+cockpit-tui = { path = "../../crates/cockpit-tui" }
 # rusqlite 0.40 has no separate `fts5` feature; bundled SQLite includes FTS5
 # and the knowledge sidecar tests create/query an FTS5 virtual table.
 rusqlite = { workspace = true }
@@ -130,6 +123,9 @@ toml = { workspace = true }
 # keeping the dependency surface (and the schemas we validate against,
 # all hand-authored object schemas) minimal.
 jsonschema = { workspace = true }
+jaq-core = { workspace = true }
+jaq-json = { workspace = true }
+jaq-std = { workspace = true }
 
 # Filesystem helpers
 dirs = { workspace = true }

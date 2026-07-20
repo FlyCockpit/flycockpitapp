@@ -29,7 +29,7 @@
 //! — it stays entirely hardcoded in [`crate::engine::builtin`] and
 //! [`crate::engine::docs_pipeline`] and is never exposed here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 mod builtin_defs;
 pub(crate) mod invariants;
 
+pub(crate) use builtin_defs::embedded_internal_default;
 pub use builtin_defs::{
     BUILTIN_AGENT_NAMES, FALLBACK_PRIMARY, embedded_default, is_builtin_agent,
     is_experimental_primary, is_hidden_primary, resolve_primary_for_flag,
@@ -66,6 +67,11 @@ pub struct AgentDef {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub tools: Option<Vec<String>>,
+    /// Per-agent tool placement. Omitted tools use the role default; for
+    /// user-authored definitions without a role default, omission means
+    /// [`ToolTier::Builtin`].
+    #[serde(rename = "toolTiers", default)]
+    pub tool_tiers: BTreeMap<String, ToolTier>,
     /// Per-agent tool-description overrides (prompt
     /// `per-agent-tool-definitions.md`): re-word a granted tool's *description*
     /// for **this** agent without touching its ID or schema, so the same tool
@@ -77,7 +83,7 @@ pub struct AgentDef {
     /// start, so the tools array stays byte-stable (cache-safe). Empty / absent
     /// means every tool keeps its base description (byte-identical to today).
     #[serde(default)]
-    pub tool_descriptions: std::collections::BTreeMap<String, ToolDescriptionSpec>,
+    pub tool_descriptions: BTreeMap<String, ToolDescriptionSpec>,
     /// Whether this agent's untrusted tool/subagent results are scanned by the
     /// prompt-injection guard before entering parent history. `None` means use
     /// the role/name default.
@@ -108,6 +114,101 @@ pub struct AgentDef {
     /// for diagnostics and override detection.
     #[serde(skip)]
     pub source: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolTier {
+    Builtin,
+    Discoverable,
+    Disabled,
+}
+
+impl ToolTier {
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolTier::Builtin => "builtin",
+            ToolTier::Discoverable => "discoverable",
+            ToolTier::Disabled => "disabled",
+        }
+    }
+
+    pub fn from_label(value: &str) -> Option<Self> {
+        match value {
+            "builtin" => Some(ToolTier::Builtin),
+            "discoverable" => Some(ToolTier::Discoverable),
+            "disabled" => Some(ToolTier::Disabled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolSurfaceSelection {
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(rename = "toolTiers", default)]
+    pub tool_tiers: BTreeMap<String, ToolTier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSurfaceItem {
+    pub name: &'static str,
+    pub family: &'static str,
+    pub tiers: &'static [ToolTier],
+}
+
+const ALL_TOOL_TIERS: &[ToolTier] = &[
+    ToolTier::Builtin,
+    ToolTier::Discoverable,
+    ToolTier::Disabled,
+];
+const NON_DISCOVERABLE_TOOL_TIERS: &[ToolTier] = &[ToolTier::Builtin, ToolTier::Disabled];
+
+pub fn known_tool_names() -> &'static [&'static str] {
+    invariants::known_tool_names()
+}
+
+pub fn legal_tool_tiers(tool: &str) -> &'static [ToolTier] {
+    if invariants::STRUCTURAL_TOOLS.contains(&tool) || invariants::LOCK_WRITE_TOOLS.contains(&tool)
+    {
+        NON_DISCOVERABLE_TOOL_TIERS
+    } else {
+        ALL_TOOL_TIERS
+    }
+}
+
+pub fn tool_surface_catalog() -> Vec<ToolSurfaceItem> {
+    known_tool_names()
+        .iter()
+        .map(|name| ToolSurfaceItem {
+            name,
+            family: tool_family(name),
+            tiers: legal_tool_tiers(name),
+        })
+        .collect()
+}
+
+fn tool_family(name: &str) -> &'static str {
+    match name {
+        "read" | "readlock" | "writeunlock" | "editunlock" | "unlock" => "files",
+        "context_pack" | "tree" | "outline" | "symbol_find" | "word" | "deps" | "hot"
+        | "circular" | "search" | "impact" | "change_impact" | "lsp" => "code intel",
+        "bash" | "escalate" | "harness_list" | "harness_invoke" => "execution",
+        "task"
+        | "spawn"
+        | "handoff"
+        | "return"
+        | "question"
+        | "defer_to_orchestrator"
+        | "schedule"
+        | "start_build" => "coordination",
+        "session_search" | "session_read" | "todo" | "todo_read" | "create_goal" | "get_goal"
+        | "update_goal" => "memory",
+        "skill" | "skill_manage" | "mcp" => "extensions",
+        "grep" | "glob" => "sandbox",
+        _ => "other",
+    }
 }
 
 /// A markdown agent's per-agent description override for one tool (prompt
@@ -397,6 +498,9 @@ impl AgentDef {
             let seq: Vec<serde_yaml::Value> = tools.iter().map(|t| t.clone().into()).collect();
             fm.insert("tools".into(), serde_yaml::Value::Sequence(seq));
         }
+        if !self.tool_tiers.is_empty() {
+            fm.insert("toolTiers".into(), serde_yaml::to_value(&self.tool_tiers)?);
+        }
         if !self.tool_descriptions.is_empty() {
             fm.insert(
                 "tool_descriptions".into(),
@@ -462,8 +566,10 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         temperature: Option<f32>,
         #[serde(default)]
         tools: Option<Vec<String>>,
+        #[serde(rename = "toolTiers", default)]
+        tool_tiers: BTreeMap<String, ToolTier>,
         #[serde(default)]
-        tool_descriptions: std::collections::BTreeMap<String, ToolDescriptionSpec>,
+        tool_descriptions: BTreeMap<String, ToolDescriptionSpec>,
         #[serde(rename = "scanToolResults", default)]
         scan_tool_results: Option<bool>,
         #[serde(default)]
@@ -496,6 +602,7 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         model: fm.model,
         temperature: fm.temperature,
         tools: fm.tools,
+        tool_tiers: fm.tool_tiers,
         tool_descriptions: fm.tool_descriptions,
         scan_tool_results: fm.scan_tool_results,
         permission: fm.permission,

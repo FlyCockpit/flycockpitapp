@@ -55,8 +55,8 @@ impl ConfigSource {
         }
     }
 
-    /// The production source: layered discovery from disk. This mirrors
-    /// `tui::agent_runner::load_providers` / `load_extended` so the
+    /// The production source: layered discovery from disk. This mirrors the
+    /// TUI agent runner's provider and extended-config loading so the
     /// in-process and daemon-mediated paths see identical config behavior
     /// (GOALS §2a), and is the daemon's **only** route to
     /// `secret_ref::load_effective` / `extended::load_for_cwd`.

@@ -15,7 +15,7 @@ impl Tool for SearchTool {
         "search"
     }
     fn description(&self) -> &str {
-        "Budgeted structured regex search across the repo (ripgrep-backed)"
+        "Budgeted repo-wide regex text search; use `grep` for root-confined regex, `word` for identifier uses, `symbol_find` for definitions"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(

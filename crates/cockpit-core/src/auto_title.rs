@@ -199,6 +199,29 @@ pub async fn generate_session_title_once(
     }
 }
 
+/// Generate a slug for an explicit title request without storing it. Daemon
+/// RPCs use this to separate the provider call from an atomic "still
+/// untitled" storage guard.
+pub async fn generate_session_title_slug_once(
+    session: &Session,
+    extended: ExtendedConfig,
+    providers: ProvidersConfig,
+    redact: Arc<crate::redact::RedactionTable>,
+    content_prefix: String,
+    action: TitleAction,
+) -> Result<Option<String>> {
+    generate_slug_inner(
+        session,
+        extended,
+        providers,
+        redact,
+        content_prefix,
+        action,
+        None,
+    )
+    .await
+}
+
 async fn generate_inner(
     session: &Session,
     extended: ExtendedConfig,
@@ -208,6 +231,50 @@ async fn generate_inner(
     action: TitleAction,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> Result<TitleOutcome> {
+    let Some(slug) = generate_slug_inner(
+        session,
+        extended,
+        providers,
+        redact,
+        content_prefix,
+        action,
+        shutdown_gate,
+    )
+    .await?
+    else {
+        return Ok(TitleOutcome::Deferred);
+    };
+
+    let stored = if matches!(action, TitleAction::Explicit) {
+        session.set_explicit_auto_title(&slug)
+    } else {
+        session.set_auto_title(&slug)
+    };
+    match stored {
+        Ok(updated) => {
+            if updated && matches!(action, TitleAction::Eager) {
+                // The eager title stuck — advance past an unclaimed slot 1 for
+                // compatibility with older callers.
+                session.mark_eager_titled();
+            }
+            Ok(TitleOutcome::Titled(slug))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "auto_title: persist failed");
+            Ok(TitleOutcome::Titled(slug))
+        }
+    }
+}
+
+async fn generate_slug_inner(
+    session: &Session,
+    extended: ExtendedConfig,
+    providers: ProvidersConfig,
+    redact: Arc<crate::redact::RedactionTable>,
+    content_prefix: String,
+    action: TitleAction,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
+) -> Result<Option<String>> {
     let Some(model_ref) = extended.auto_title_model_ref() else {
         anyhow::bail!("utility_model is not configured");
     };
@@ -242,28 +309,9 @@ async fn generate_inner(
         // The model answered but nothing slug-worthy survived. On the
         // eager path this is a clean deferral, not a failure; on refine
         // (a one-shot) we likewise just leave the eager title in place.
-        return Ok(TitleOutcome::Deferred);
+        return Ok(None);
     };
-
-    let stored = if matches!(action, TitleAction::Explicit) {
-        session.set_explicit_auto_title(&slug)
-    } else {
-        session.set_auto_title(&slug)
-    };
-    match stored {
-        Ok(updated) => {
-            if updated && matches!(action, TitleAction::Eager) {
-                // The eager title stuck — advance past an unclaimed slot 1 for
-                // compatibility with older callers.
-                session.mark_eager_titled();
-            }
-            Ok(TitleOutcome::Titled(slug))
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "auto_title: persist failed");
-            Ok(TitleOutcome::Titled(slug))
-        }
-    }
+    Ok(Some(slug))
 }
 
 /// Build the refresh pass's richer context: the session's accumulated

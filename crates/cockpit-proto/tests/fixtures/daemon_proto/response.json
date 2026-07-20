@@ -16,6 +16,33 @@
     },
     "response": "agents"
   },
+  "assistants": {
+    "data": {
+      "assistants": [
+        {
+          "config_json": "{\"name\":\"helper-bot\"}",
+          "content_hash": "hash-fixture",
+          "created_at": 1700000000,
+          "home_dir": "/tmp/assistants/helper-bot",
+          "name": "helper-bot"
+        }
+      ]
+    },
+    "response": "assistants"
+  },
+  "assistant_session_created": {
+    "data": {
+      "session": {
+        "active_agent": "helper-bot",
+        "assistant_name": "helper-bot",
+        "project_id": "project_id-fixture",
+        "project_root": "/tmp/project",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "short_id": "abc123"
+      }
+    },
+    "response": "assistant_session_created"
+  },
   "approval_mode_state": {
     "data": {
       "mode": "auto"
@@ -142,6 +169,13 @@
     },
     "response": "attachment_uploaded"
   },
+  "auto_title": {
+    "data": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "title": "fixture-title"
+    },
+    "response": "auto_title"
+  },
   "btw_fork": {
     "data": {
       "created": true,
@@ -163,6 +197,36 @@
       "message": "message-fixture"
     },
     "response": "caffeinate_state"
+  },
+  "curator": {
+    "data": {
+      "result": {
+        "result": "status",
+        "status": {
+          "skills": [
+            {
+              "archive_path": "/tmp/archive/skill",
+              "created_by": "curator",
+              "name": "skill",
+              "pinned": true,
+              "source_path": "/tmp/project/.agents/skills/skill",
+              "state": "active",
+              "use_count": 3,
+              "view_count": 4
+            }
+          ],
+          "snapshots": [
+            {
+              "created_at": 1700000000,
+              "id": "snapshot-fixture",
+              "path": "/tmp/snapshot",
+              "reason": "test"
+            }
+          ]
+        }
+      }
+    },
+    "response": "curator"
   },
   "daemon_status": {
     "data": {
@@ -207,6 +271,21 @@
       "short_id": "short_id-fixture"
     },
     "response": "forked"
+  },
+  "export_session_data": {
+    "data": {
+      "data": {
+        "byte_len": 12,
+        "content_base64": "Zmlyc3QgZGF0YQ==",
+        "filename_extension": "json",
+        "kind": "transcript_json",
+        "mime": "application/json",
+        "redacted": true,
+        "session_count": 1,
+        "session_id": "11111111-1111-4111-8111-111111111111"
+      }
+    },
+    "response": "export_session_data"
   },
   "fs_list": {
     "data": {
@@ -272,6 +351,50 @@
       ]
     },
     "response": "git_status"
+  },
+  "goal_cleared": {
+    "data": {
+      "cleared": true
+    },
+    "response": "goal_cleared"
+  },
+  "goal_status": {
+    "data": {
+      "goal": {
+        "blocked_attempts": 1,
+        "context": "context-fixture",
+        "created_at": 1700000000,
+        "id": "11111111-1111-4111-8111-111111111111",
+        "last_read_at": 1700000001,
+        "objective": "ship fixture",
+        "project_id": "project_id-fixture",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "status": "active",
+        "token_budget": 100,
+        "tokens_used": 7,
+        "updated_at": 1700000002
+      }
+    },
+    "response": "goal_status"
+  },
+  "goal_updated": {
+    "data": {
+      "goal": {
+        "blocked_attempts": 1,
+        "context": "context-fixture",
+        "created_at": 1700000000,
+        "id": "11111111-1111-4111-8111-111111111111",
+        "last_read_at": 1700000001,
+        "objective": "ship fixture",
+        "project_id": "project_id-fixture",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "status": "paused",
+        "token_budget": 100,
+        "tokens_used": 7,
+        "updated_at": 1700000002
+      }
+    },
+    "response": "goal_updated"
   },
   "guidance_estimate": {
     "data": {
@@ -664,16 +787,11 @@
     },
     "response": "scheduled_job_deleted"
   },
-  "scheduled_job_run": {
+  "scheduled_job_run_queued": {
     "data": {
-      "id": "job-fixture",
-      "result": {
-        "finished_at": 1700000001,
-        "ok": true,
-        "summary": "completed"
-      }
+      "id": "job-fixture"
     },
-    "response": "scheduled_job_run"
+    "response": "scheduled_job_run_queued"
   },
   "scheduled_jobs": {
     "data": {
@@ -788,11 +906,96 @@
         {
           "description": "desc",
           "name": "skill",
-          "source": "builtin"
+          "source": "builtin",
+          "user_invocable": true
         }
       ]
     },
     "response": "skills"
+  },
+  "stats_rollup": {
+    "data": {
+      "rollup": {
+        "language": {
+          "languages": [
+            {
+              "calls": 2,
+              "language": "rust",
+              "pct": 100.0
+            }
+          ],
+          "non_file": [
+            {
+              "calls": 1,
+              "tool": "bash"
+            }
+          ],
+          "total_file_calls": 2
+        },
+        "project_id": "project_id-fixture",
+        "range": "all",
+        "recovery": {
+          "by_model": [
+            {
+              "calls": 2,
+              "hard_fail": 0,
+              "hard_fail_pct": 0.0,
+              "malformed_pct": 50.0,
+              "model": "model-fixture",
+              "recovered": 1,
+              "recovered_pct": 50.0
+            }
+          ],
+          "by_stage": [
+            {
+              "count": 1,
+              "model": "model-fixture",
+              "recovery_kind": "json_repair",
+              "recovery_stage": "parsed"
+            }
+          ],
+          "by_tool": [
+            {
+              "calls": 2,
+              "hard_fail": 0,
+              "model": "model-fixture",
+              "recovered": 1,
+              "tool": "edit"
+            }
+          ]
+        },
+        "tokens": {
+          "by_model": [
+            {
+              "cache_creation_input_tokens": 2,
+              "cached_input_tokens": 3,
+              "calls": 1,
+              "cost_usd": 0.01,
+              "input_tokens": 10,
+              "model": "model-fixture",
+              "output_tokens": 5,
+              "provider": "provider-fixture",
+              "total_tokens": 20
+            }
+          ],
+          "by_role": [
+            {
+              "agent": "Build",
+              "cache_creation_input_tokens": 2,
+              "cached_input_tokens": 3,
+              "calls": 1,
+              "cost_usd": 0.01,
+              "input_tokens": 10,
+              "model": "model-fixture",
+              "output_tokens": 5,
+              "provider": "provider-fixture",
+              "total_tokens": 20
+            }
+          ]
+        }
+      }
+    },
+    "response": "stats_rollup"
   },
   "subagent_transcript": {
     "data": {

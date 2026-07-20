@@ -25,7 +25,7 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Snapshot-read a file; line-numbered output, 2000-line/8KB cap, no lock"
+        "Snapshot-read a file with no lock; use `readlock` before `writeunlock`/`editunlock` when you intend to edit"
     }
 
     fn effect(&self) -> ToolEffect {

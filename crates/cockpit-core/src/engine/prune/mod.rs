@@ -377,7 +377,40 @@ fn arg_canonical_path(args: &serde_json::Value) -> Option<String> {
 /// bodies elided. Safe to call with a plan computed against the same
 /// history; indices are validated defensively.
 pub fn apply_plan(history: &mut [Message], plan: &DedupPlan) -> usize {
+    let applied = count_plan_matches(history, plan);
+    apply_plan_direct(history, plan);
+    applied
+}
+
+/// Return a derived history with `plan` applied, leaving `history` untouched.
+/// The output has the same length and message ordering as the input; only
+/// matching tool-result bodies are rewritten.
+pub fn apply_plan_to(history: &[Message], plan: &DedupPlan) -> Vec<Message> {
+    let mut derived = history.to_vec();
+    apply_plan_direct(&mut derived, plan);
+    derived
+}
+
+fn count_plan_matches(history: &[Message], plan: &DedupPlan) -> usize {
     let mut n = 0;
+    for target in &plan.targets {
+        let Some(msg) = history.get(target.history_index) else {
+            continue;
+        };
+        if let Message::User { content } = msg {
+            for c in content.iter() {
+                if let UserContent::ToolResult(tr) = c
+                    && tr.id == target.target_call_id
+                {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+fn apply_plan_direct(history: &mut [Message], plan: &DedupPlan) {
     for target in &plan.targets {
         let Some(msg) = history.get_mut(target.history_index) else {
             continue;
@@ -393,12 +426,10 @@ pub fn apply_plan(history: &mut [Message], plan: &DedupPlan) -> usize {
                     // body (non-overlapping remainder + marker); an
                     // exact-identity target writes the whole-body marker.
                     tr.content = OneOrMany::one(ToolResultContent::text(target.replacement_body()));
-                    n += 1;
                 }
             }
         }
     }
-    n
 }
 
 /// Convenience: compute and apply in one shot. Returns the plan that was
@@ -465,6 +496,49 @@ pub fn condense_candidates(history: &[Message]) -> Vec<CondenseCandidate> {
 }
 
 pub fn apply_condensed_tool_result(
+    history: &mut [Message],
+    candidate: &CondenseCandidate,
+    hash: &str,
+) -> bool {
+    apply_condensed_tool_result_direct(history, candidate, hash)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CondensePlan {
+    pub targets: Vec<CondenseTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CondenseTarget {
+    pub candidate: CondenseCandidate,
+    pub hash: String,
+}
+
+pub fn apply_condense_plan_to(history: &[Message], plan: &CondensePlan) -> Vec<Message> {
+    let mut derived = history.to_vec();
+    for target in &plan.targets {
+        apply_condensed_tool_result_direct(&mut derived, &target.candidate, &target.hash);
+    }
+    derived
+}
+
+pub fn apply_condensed_tool_result_to(
+    history: &[Message],
+    candidate: &CondenseCandidate,
+    hash: &str,
+) -> Vec<Message> {
+    apply_condense_plan_to(
+        history,
+        &CondensePlan {
+            targets: vec![CondenseTarget {
+                candidate: candidate.clone(),
+                hash: hash.to_string(),
+            }],
+        },
+    )
+}
+
+fn apply_condensed_tool_result_direct(
     history: &mut [Message],
     candidate: &CondenseCandidate,
     hash: &str,
@@ -714,7 +788,9 @@ pub fn reapply_ledger(
         target.tokens_saved = cached_tokens_saved(target);
     }
     let plan = DedupPlan { targets };
-    Ok(apply_plan(history, &plan))
+    let applied = count_plan_matches(history, &plan);
+    apply_plan_direct(history, &plan);
+    Ok(applied)
 }
 
 /// The cache-cold predicate (GOALS §10 / `plan.md` T6.f): "expected
@@ -895,6 +971,24 @@ mod tests {
         }
     }
 
+    fn tool_results(results: &[(&str, &str)]) -> Message {
+        Message::User {
+            content: OneOrMany::many(
+                results
+                    .iter()
+                    .map(|(call_id, body)| {
+                        UserContent::ToolResult(ToolResult {
+                            id: (*call_id).to_string(),
+                            call_id: None,
+                            content: OneOrMany::one(ToolResultContent::text(*body)),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("non-empty tool results"),
+        }
+    }
+
     fn body_at(history: &[Message], idx: usize) -> String {
         match &history[idx] {
             Message::User { content } => tool_result_body(match content.first_ref() {
@@ -903,6 +997,331 @@ mod tests {
             }),
             _ => panic!("not a user message"),
         }
+    }
+
+    fn tool_result_id_at(history: &[Message], idx: usize) -> String {
+        match &history[idx] {
+            Message::User { content } => match content.first_ref() {
+                UserContent::ToolResult(tr) => tr.id.clone(),
+                _ => panic!("not a tool result"),
+            },
+            _ => panic!("not a user message"),
+        }
+    }
+
+    fn assert_message_kinds(history: &[Message], expected: &[&str]) {
+        let actual = history
+            .iter()
+            .map(|msg| match msg {
+                Message::System { .. } => "system",
+                Message::Assistant { .. } => "assistant",
+                Message::User { .. } => "user",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn characterize_dedup_apply_wire_shape() {
+        let exact_args = json!({ "path": "/abs/exact.rs" });
+        let overlap_older = json!({ "path": "/abs/overlap.rs", "offset": 1, "limit": 3 });
+        let overlap_newer = json!({ "path": "/abs/overlap.rs", "offset": 2, "limit": 3 });
+        let mut history = vec![
+            assistant_call("exact-old", "read", exact_args.clone()),
+            tool_result("exact-old", "exact old body with enough padding"),
+            assistant_call("exact-new", "read", exact_args),
+            tool_result("exact-new", "exact new body with enough padding"),
+            assistant_call("overlap-old", "read", overlap_older),
+            tool_result(
+                "overlap-old",
+                "1|line 1 content\n2|line 2 content\n3|line 3 content\n",
+            ),
+            assistant_call("overlap-new", "read", overlap_newer),
+            tool_result(
+                "overlap-new",
+                "2|line 2 content\n3|line 3 content\n4|line 4 content\n",
+            ),
+        ];
+
+        let plan = dedup_plan(&history);
+        assert_eq!(plan.targets.len(), 2);
+        assert_eq!(apply_plan(&mut history, &plan), 2);
+
+        assert_eq!(history.len(), 8);
+        assert_message_kinds(
+            &history,
+            &[
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+            ],
+        );
+        assert_eq!(tool_result_id_at(&history, 1), "exact-old");
+        assert_eq!(tool_result_id_at(&history, 3), "exact-new");
+        assert_eq!(tool_result_id_at(&history, 5), "overlap-old");
+        assert_eq!(tool_result_id_at(&history, 7), "overlap-new");
+        assert_eq!(
+            body_at(&history, 1),
+            "[elided: snapshot superseded — superseded by a later identical call; full body in transcript event exact-old]"
+        );
+        assert_eq!(body_at(&history, 3), "exact new body with enough padding");
+        assert_eq!(
+            body_at(&history, 5),
+            "1|line 1 content\n[elided: overlapping read superseded — these lines are in a later read; full body in transcript event overlap-new]\n"
+        );
+        assert_eq!(
+            body_at(&history, 7),
+            "2|line 2 content\n3|line 3 content\n4|line 4 content\n"
+        );
+    }
+
+    #[test]
+    fn characterize_condense_apply_wire_shape() {
+        let original = long_shell_body();
+        let mut history = vec![
+            assistant_call("bash-one", "bash", json!({ "command": "cargo test" })),
+            tool_result("bash-one", &original),
+        ];
+
+        let candidates = condense_candidates(&history);
+        assert_eq!(candidates.len(), 1);
+        let expected_condensed =
+            crate::tools::shell_compress::prune_boundary_condense("cargo test", &original)
+                .expect("fixture should condense");
+        let expected = format!(
+            "{}\n{}",
+            compressed_tool_result_marker(
+                "bash",
+                original.len(),
+                expected_condensed.len(),
+                "0123456789abcdefabcdef12",
+            ),
+            expected_condensed
+        );
+
+        assert!(apply_condensed_tool_result(
+            &mut history,
+            &candidates[0],
+            "0123456789abcdefabcdef12",
+        ));
+
+        assert_eq!(history.len(), 2);
+        assert_message_kinds(&history, &["assistant", "user"]);
+        assert_eq!(tool_result_id_at(&history, 1), "bash-one");
+        assert_eq!(body_at(&history, 1), expected);
+    }
+
+    #[test]
+    fn apply_plan_to_matches_apply_plan() {
+        let empty = vec![
+            assistant_call("empty", "read", json!({ "path": "/empty" })),
+            tool_result("empty", "single body"),
+        ];
+        let empty_plan = DedupPlan::default();
+        let mut empty_mutating = empty.clone();
+        assert_eq!(apply_plan(&mut empty_mutating, &empty_plan), 0);
+        assert_eq!(apply_plan_to(&empty, &empty_plan), empty_mutating);
+
+        let args = json!({ "path": "/exact" });
+        let whole = vec![
+            assistant_call("whole-old", "read", args.clone()),
+            tool_result("whole-old", "older whole body padding padding"),
+            assistant_call("whole-new", "read", args),
+            tool_result("whole-new", "newer whole body padding padding"),
+        ];
+        let whole_plan = dedup_plan(&whole);
+        let mut whole_mutating = whole.clone();
+        assert_eq!(apply_plan(&mut whole_mutating, &whole_plan), 1);
+        assert_eq!(
+            serde_json::to_value(apply_plan_to(&whole, &whole_plan)).unwrap(),
+            serde_json::to_value(&whole_mutating).unwrap()
+        );
+
+        let partial = vec![
+            assistant_call(
+                "partial-old",
+                "read",
+                json!({ "path": "/p", "offset": 1, "limit": 3 }),
+            ),
+            tool_result("partial-old", "1|a\n2|b\n3|c\n"),
+            assistant_call(
+                "partial-new",
+                "read",
+                json!({ "path": "/p", "offset": 2, "limit": 3 }),
+            ),
+            tool_result("partial-new", "2|b\n3|c\n4|d\n"),
+        ];
+        let partial_plan = dedup_plan(&partial);
+        let mut partial_mutating = partial.clone();
+        assert_eq!(apply_plan(&mut partial_mutating, &partial_plan), 1);
+        assert_eq!(
+            serde_json::to_value(apply_plan_to(&partial, &partial_plan)).unwrap(),
+            serde_json::to_value(&partial_mutating).unwrap()
+        );
+
+        let index_miss_plan = DedupPlan {
+            targets: vec![ElisionTarget {
+                history_index: 99,
+                current_body: "missing".into(),
+                elision: Elision {
+                    original_event_id: "missing".into(),
+                    reason: REASON_SNAPSHOT_SUPERSEDED,
+                },
+                partial_body: None,
+                tokens_saved: 0,
+                target_call_id: "missing".into(),
+            }],
+        };
+        let mut index_mutating = partial.clone();
+        assert_eq!(apply_plan(&mut index_mutating, &index_miss_plan), 0);
+        assert_eq!(apply_plan_to(&partial, &index_miss_plan), index_mutating);
+
+        let multi = vec![
+            assistant_call("multi-a", "read", json!({ "path": "/a" })),
+            assistant_call("multi-b", "read", json!({ "path": "/b" })),
+            tool_results(&[
+                ("multi-a", "multi body a padding padding"),
+                ("multi-b", "multi body b padding padding"),
+            ]),
+        ];
+        let multi_plan = DedupPlan {
+            targets: vec![
+                ElisionTarget {
+                    history_index: 2,
+                    current_body: "multi body a padding padding".into(),
+                    elision: Elision {
+                        original_event_id: "multi-a".into(),
+                        reason: REASON_SNAPSHOT_SUPERSEDED,
+                    },
+                    partial_body: None,
+                    tokens_saved: 0,
+                    target_call_id: "multi-a".into(),
+                },
+                ElisionTarget {
+                    history_index: 2,
+                    current_body: "multi body b padding padding".into(),
+                    elision: Elision {
+                        original_event_id: "multi-b".into(),
+                        reason: REASON_SNAPSHOT_SUPERSEDED,
+                    },
+                    partial_body: None,
+                    tokens_saved: 0,
+                    target_call_id: "multi-b".into(),
+                },
+            ],
+        };
+        let mut multi_mutating = multi.clone();
+        assert_eq!(apply_plan(&mut multi_mutating, &multi_plan), 2);
+        assert_eq!(
+            serde_json::to_value(apply_plan_to(&multi, &multi_plan)).unwrap(),
+            serde_json::to_value(&multi_mutating).unwrap()
+        );
+    }
+
+    #[test]
+    fn apply_plan_preserves_length_and_order() {
+        let args = json!({ "path": "/abs/order.rs" });
+        let history = vec![
+            assistant_call("order-old", "read", args.clone()),
+            tool_result("order-old", "older body padding padding"),
+            assistant_call("order-new", "read", args),
+            tool_result("order-new", "newer body padding padding"),
+        ];
+        let plan = dedup_plan(&history);
+        let derived = apply_plan_to(&history, &plan);
+
+        assert_eq!(derived.len(), history.len());
+        assert_message_kinds(&derived, &["assistant", "user", "assistant", "user"]);
+        assert_eq!(tool_result_id_at(&derived, 1), "order-old");
+        assert_eq!(tool_result_id_at(&derived, 3), "order-new");
+        assert_ne!(body_at(&derived, 1), body_at(&history, 1));
+        assert_eq!(body_at(&derived, 3), body_at(&history, 3));
+    }
+
+    #[test]
+    fn condense_plan_applies_in_bulk() {
+        let first = long_shell_body();
+        let second = (0..720)
+            .map(|index| format!("second noise line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let history = vec![
+            assistant_call("bash-a", "bash", json!({ "command": "cargo test" })),
+            tool_result("bash-a", &first),
+            assistant_call("bash-b", "bash", json!({ "command": "cargo test" })),
+            tool_result("bash-b", &second),
+        ];
+        let candidates = condense_candidates(&history);
+        assert_eq!(candidates.len(), 2);
+        let plan = CondensePlan {
+            targets: candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| CondenseTarget {
+                    candidate: candidate.clone(),
+                    hash: format!("hash-{index}"),
+                })
+                .collect(),
+        };
+
+        let mut sequential = history.clone();
+        for target in &plan.targets {
+            assert!(apply_condensed_tool_result(
+                &mut sequential,
+                &target.candidate,
+                &target.hash,
+            ));
+        }
+        let bulk = apply_condense_plan_to(&history, &plan);
+
+        assert_eq!(
+            serde_json::to_value(bulk).unwrap(),
+            serde_json::to_value(&sequential).unwrap()
+        );
+        assert!(body_at(&sequential, 1).contains("hash=hash-0"));
+        assert!(body_at(&sequential, 3).contains("hash=hash-1"));
+    }
+
+    #[test]
+    fn index_miss_is_tolerated() {
+        let history = vec![
+            assistant_call("real", "read", json!({ "path": "/real" })),
+            tool_result("real", "real body padding padding"),
+        ];
+        let wrong_id = DedupPlan {
+            targets: vec![ElisionTarget {
+                history_index: 1,
+                current_body: "real body padding padding".into(),
+                elision: Elision {
+                    original_event_id: "ghost".into(),
+                    reason: REASON_SNAPSHOT_SUPERSEDED,
+                },
+                partial_body: None,
+                tokens_saved: 0,
+                target_call_id: "ghost".into(),
+            }],
+        };
+        assert_eq!(apply_plan_to(&history, &wrong_id), history);
+
+        let wrong_index = DedupPlan {
+            targets: vec![ElisionTarget {
+                history_index: 99,
+                current_body: "real body padding padding".into(),
+                elision: Elision {
+                    original_event_id: "real".into(),
+                    reason: REASON_SNAPSHOT_SUPERSEDED,
+                },
+                partial_body: None,
+                tokens_saved: 0,
+                target_call_id: "real".into(),
+            }],
+        };
+        assert_eq!(apply_plan_to(&history, &wrong_index), history);
     }
 
     /// Two identical reads of the same file: the older body is elided,

@@ -28,6 +28,14 @@ pub enum Event {
         policy: EnvDriftPolicy,
     },
 
+    /// Authoritative daemon-resolved config snapshot for one session. Carries
+    /// the effective extended config plus a provider/model projection whose
+    /// credential-bearing values have already been resolved daemon-side and
+    /// redacted before crossing the wire.
+    ConfigSnapshot {
+        snapshot: Box<ConfigSnapshot>,
+    },
+
     /// Authoritative pending user-message queue snapshot for one session.
     QueueUpdated {
         session_id: Uuid,
@@ -170,6 +178,8 @@ pub enum Event {
     /// and show the error because the worker will end this session.
     SessionDriverFailed {
         session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
         error: String,
     },
 
@@ -631,6 +641,16 @@ pub enum Event {
     SandboxUnavailable {
         session_id: Uuid,
         remedy: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fix_command: Option<String>,
+    },
+
+    /// Required command-line capabilities are unavailable for one or more
+    /// tools granted to this session. Rendered as persistent startup chrome
+    /// with a copyable install command when the remedy supplies one.
+    CommandCapabilityUnavailable {
+        session_id: Uuid,
+        text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fix_command: Option<String>,
     },

@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
-use crate::config::extended::ToolCommandTemplate;
 use crate::engine::agent::Agent;
 use crate::engine::model::{Model, ModelParams};
 use crate::engine::tool::ToolBox;
@@ -107,7 +106,7 @@ pub(crate) const MULTIREVIEW_PROMPT_NORMAL: &str = include_str!("multireview.nor
 pub(crate) const BEE_PROMPT: &str = include_str!("bee.md");
 pub(crate) const BEE_PROMPT_NORMAL: &str = include_str!("bee.normal.md");
 pub(crate) const BEE_PROMPT_FRONTIER: &str = include_str!("bee.frontier.md");
-const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use the provider-native computer tool to inspect and operate the display only for the delegated task. Report concise progress and stop when the delegated display work is complete.";
+pub(crate) const COMPUTER_PROMPT: &str = "You are the computer-use subagent. Use the provider-native computer tool to inspect and operate the display only for the delegated task. Report concise progress and stop when the delegated display work is complete.";
 
 /// Select a bundled agent's prompt body for the active `llm_mode`: defensive
 /// uses the flat body; normal uses the normal body when present; frontier uses
@@ -127,8 +126,8 @@ fn builtin_prompt_for(
     }
 }
 /// Docs pipeline stage prompts (GOALS §3a, prompt `docs-agent.md`).
-const DOCS_RESOLVER_PROMPT: &str = include_str!("docs_resolver.md");
-const DOCS_ANSWERER_PROMPT: &str = include_str!("docs_answerer.md");
+pub(crate) const DOCS_RESOLVER_PROMPT: &str = include_str!("docs_resolver.md");
+pub(crate) const DOCS_ANSWERER_PROMPT: &str = include_str!("docs_answerer.md");
 
 /// Per-spawn knobs threaded from the driver.
 #[derive(Clone)]
@@ -380,6 +379,35 @@ fn with_recall_tools(tb: ToolBox, args: &SpawnArgs) -> ToolBox {
         .with(Arc::new(crate::tools::goal::UpdateGoalTool))
 }
 
+fn with_tiered_recall_tools(
+    mut tb: ToolBox,
+    args: &SpawnArgs,
+    def: &crate::agents::AgentDef,
+    is_assistant: bool,
+) -> Result<ToolBox> {
+    if !args.interactive {
+        return Ok(tb);
+    }
+    for name in [
+        "session_search",
+        "session_read",
+        "todo",
+        "todo_read",
+        "create_goal",
+        "get_goal",
+        "update_goal",
+    ] {
+        tb = match effective_tool_tier(def, name, is_assistant) {
+            crate::agents::ToolTier::Builtin => add_tool_by_name(tb, name, def, args)?,
+            crate::agents::ToolTier::Discoverable => {
+                add_discoverable_tool_by_name(tb, name, def, args)?
+            }
+            crate::agents::ToolTier::Disabled => tb,
+        };
+    }
+    Ok(tb)
+}
+
 fn with_task_for_targets(tb: ToolBox, args: &SpawnArgs, targets: &[&str]) -> ToolBox {
     let allowed: Vec<&str> = if args.delegated {
         targets
@@ -425,6 +453,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "hot",
         "circular",
         "search",
+        "impact",
         "change_impact",
         "task",
         "skill",
@@ -461,8 +490,304 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
     ]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinToolInventoryItem {
+    pub family: &'static str,
+    pub name: &'static str,
+    pub summary: &'static str,
+    pub condition: Option<&'static str>,
+}
+
+/// Read-only inventory of native tool names grouped for UI/settings surfaces.
+///
+/// Keep this list next to [`known_agent_tool_names`] and
+/// [`materialize_tool_by_name`] so agent grants, runtime materialization, and
+/// user-facing inventory drift together instead of each UI re-spelling names.
+pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
+    &[
+        BuiltinToolInventoryItem {
+            family: "Filesystem",
+            name: "read",
+            summary: "Read project files through the sandbox boundary.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Filesystem",
+            name: "grep",
+            summary: "Search file contents with scoped regular expressions.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Filesystem",
+            name: "glob",
+            summary: "Find files by glob pattern.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Shell",
+            name: "bash",
+            summary: "Run shell commands with approval and sandbox checks.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Shell",
+            name: "escalate",
+            summary: "Request elevated command or path access from the user.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Locks",
+            name: "readlock",
+            summary: "Acquire a read lock on a project path.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Locks",
+            name: "writeunlock",
+            summary: "Write while releasing daemon-arbitrated file locks.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Locks",
+            name: "editunlock",
+            summary: "Edit while releasing daemon-arbitrated file locks.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Locks",
+            name: "unlock",
+            summary: "Release held file locks.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "context_pack",
+            summary: "Assemble a focused code context bundle.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "tree",
+            summary: "Inspect the project tree with pruning.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "outline",
+            summary: "Summarize symbols in source files.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "symbol_find",
+            summary: "Find symbols across indexed code.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "word",
+            summary: "Search indexed identifiers and words.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "deps",
+            summary: "Inspect package and dependency information.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "hot",
+            summary: "Surface high-centrality code paths.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "circular",
+            summary: "Find circular dependencies.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "search",
+            summary: "Search project code using Cockpit intelligence.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "impact",
+            summary: "Estimate impact for symbols or files.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Intel",
+            name: "change_impact",
+            summary: "Estimate impact for local changes.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Skills",
+            name: "skill",
+            summary: "Run user-invocable skills.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Skills",
+            name: "skill_manage",
+            summary: "Create and manage local skills.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "plan_read",
+            summary: "Read the shared plan document.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "plan_write",
+            summary: "Replace the shared plan document.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "plan_edit",
+            summary: "Patch the shared plan document.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "start_build",
+            summary: "Start a build from the current plan.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "todo",
+            summary: "Update the session todo list.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "todo_read",
+            summary: "Read the session todo list.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "create_goal",
+            summary: "Create a resumable session goal.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "get_goal",
+            summary: "Read the current session goal.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Planning",
+            name: "update_goal",
+            summary: "Update the current session goal.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "session_search",
+            summary: "Search prior persisted sessions.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "session_read",
+            summary: "Read a prior persisted session.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "tool_result_retrieve",
+            summary: "Retrieve an elided tool result.",
+            condition: Some("internal recovery"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "delegation_payload_retrieve",
+            summary: "Retrieve an elided delegation payload.",
+            condition: Some("internal recovery"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Delegation",
+            name: "task",
+            summary: "Delegate work to configured subagents.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Delegation",
+            name: "spawn",
+            summary: "Spawn a subagent with an explicit role.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Delegation",
+            name: "handoff",
+            summary: "Hand off control to another agent.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Delegation",
+            name: "return",
+            summary: "Return from a delegated agent.",
+            condition: Some("delegated agents"),
+        },
+        BuiltinToolInventoryItem {
+            family: "MCP",
+            name: "mcp",
+            summary: "Search, describe, and invoke MCP server tools.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "LSP",
+            name: "lsp",
+            summary: "Query language-server diagnostics and navigation.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Harnesses",
+            name: "harness_list",
+            summary: "List external coding harnesses.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Harnesses",
+            name: "harness_invoke",
+            summary: "Invoke an external coding harness.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Utility",
+            name: "question",
+            summary: "Ask the user a structured question.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Utility",
+            name: "schedule",
+            summary: "Schedule follow-up work.",
+            condition: None,
+        },
+        BuiltinToolInventoryItem {
+            family: "Utility",
+            name: "defer_to_orchestrator",
+            summary: "Defer a decision to the orchestrator.",
+            condition: None,
+        },
+    ]
+}
+
 fn extra_custom_tool_reserved_names() -> &'static [&'static str] {
     &[
+        "webfetch",
+        "websearch",
         "seed",
         "list-packages",
         "add-package",
@@ -471,16 +796,14 @@ fn extra_custom_tool_reserved_names() -> &'static [&'static str] {
     ]
 }
 
-fn is_reserved_custom_tool_name(name: &str) -> bool {
+pub fn is_reserved_custom_tool_name(name: &str) -> bool {
     known_agent_tool_names().contains(&name) || extra_custom_tool_reserved_names().contains(&name)
 }
 
 fn validate_configured_custom_tools(cwd: &Path) -> Result<()> {
     let cfg = crate::config::extended::load_for_cwd(cwd);
+    crate::config::extended::validate_web_custom_placeholders(&cfg.web)?;
     for name in cfg.tools.keys() {
-        if crate::tools::custom::is_builtin_web_tool(name) {
-            continue;
-        }
         if is_reserved_custom_tool_name(name) {
             bail!(
                 "custom tool `{name}` collides with a reserved cockpit tool name; choose a different custom tool name"
@@ -523,6 +846,15 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::question::QuestionTool),
         Arc::new(tools::defer::DeferTool),
         Arc::new(tools::schedule::ScheduleTool),
+        Arc::new(tools::schedule::ForkScheduleTool::new(Arc::new(
+            tools::schedule::ForkScheduleState::new("test".to_string()),
+        ))),
+        Arc::new(tools::schedule::NoteTool::new(
+            Arc::new(tools::schedule::ForkScheduleState::new("test".to_string())),
+            tokio::sync::mpsc::channel(1).0,
+        )),
+        Arc::new(tools::web::WebSearchTool),
+        Arc::new(tools::web::WebFetchTool),
         Arc::new(tools::mcp_tool::McpTool),
         Arc::new(tools::lsp::LspTool),
         Arc::new(tools::handoff::HandoffTool),
@@ -540,8 +872,19 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::goal::CreateGoalTool),
         Arc::new(tools::goal::GetGoalTool),
         Arc::new(tools::goal::UpdateGoalTool),
+        Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
+        Arc::new(tools::seed::SeedEmitTool),
         Arc::new(tools::grep::GrepTool),
         Arc::new(tools::glob::GlobTool),
+        Arc::new(tools::docs::ListPackagesTool::new(
+            tools::docs::DocsResolution::new(),
+            "pkg".to_string(),
+        )),
+        Arc::new(tools::docs::AddPackageTool::new(
+            tools::docs::DocsResolution::new(),
+            None,
+            None,
+        )),
         Arc::new(tools::harness::HarnessListTool),
         Arc::new(tools::harness::HarnessInvokeTool),
         Arc::new(tools::task::TaskTool::with_subagents(&[
@@ -574,6 +917,7 @@ fn materialize_tool_by_name(
         "hot" => tb.with(Arc::new(tools::intel::HotTool)),
         "circular" => tb.with(Arc::new(tools::intel::CircularTool)),
         "search" => tb.with(Arc::new(tools::intel::SearchTool)),
+        "impact" => tb.with(Arc::new(tools::intel::ImpactTool)),
         "change_impact" => tb.with(Arc::new(tools::intel::ChangeImpactTool)),
         "skill" => tb.with(Arc::new(tools::skill::SkillTool)),
         "skill_manage" => tb.with(Arc::new(tools::skill_manage::SkillManageTool)),
@@ -611,6 +955,12 @@ fn materialize_tool_by_name(
             let subs = reachable_subagents(def, &args.cwd);
             let sub_refs: Vec<&str> = subs.iter().map(String::as_str).collect();
             with_task_for_targets(tb, args, &sub_refs)
+        }
+        "grep" if def.is_some_and(|def| def.name == "docs-answerer") => {
+            tb.with(Arc::new(tools::grep::GrepTool))
+        }
+        "glob" if def.is_some_and(|def| def.name == "docs-answerer") => {
+            tb.with(Arc::new(tools::glob::GlobTool))
         }
         "grep" | "glob" => {
             bail!("tool `{name}` is docs-answerer-only and cannot be materialized for user agents")
@@ -849,23 +1199,59 @@ fn find_agent_guidance(cwd: &Path, names: &[String]) -> Option<(std::path::PathB
 }
 
 /// Load user-defined custom-bash tools from the effective layered config and
-/// append them to `tb`. Falls back to the shipped defaults for any built-in
-/// tool name the user hasn't configured.
+/// append them to `tb`. Web provider config is the only source for the
+/// built-in web tools; the `tools` map is only user-defined tools.
 /// Disabled rows and empty commands are skipped.
-fn with_custom_tools(mut tb: ToolBox, cwd: &Path) -> ToolBox {
+fn with_custom_tools(
+    mut tb: ToolBox,
+    cwd: &Path,
+    disabled_tools: &std::collections::BTreeSet<String>,
+) -> ToolBox {
     let cfg = crate::config::extended::load_for_cwd(cwd);
-    let custom_web = cfg.web.provider == crate::config::extended::WebProvider::Custom;
 
-    if !custom_web {
+    if cfg.web.provider != crate::config::extended::WebProvider::Custom {
         tb = tb.with(Arc::new(crate::tools::web::WebFetchTool));
         tb = tb.with(Arc::new(crate::tools::web::WebSearchTool));
+    } else {
+        for (name, command) in [
+            (
+                crate::tools::custom::WEBFETCH,
+                cfg.web.custom.fetch_command.as_deref(),
+            ),
+            (
+                crate::tools::custom::WEBSEARCH,
+                cfg.web.custom.search_command.as_deref(),
+            ),
+        ] {
+            if disabled_tools.contains(name) {
+                continue;
+            }
+            let Some(command) = command.map(str::trim).filter(|command| !command.is_empty()) else {
+                continue;
+            };
+            let tpl = crate::config::extended::ToolCommandTemplate {
+                enabled: true,
+                command: command.to_string(),
+                description: None,
+            };
+            tb = tb.with(Arc::new(CustomBashTool::from_template_with_provenance(
+                name,
+                &tpl,
+                ToolTemplateProvenance::Configured {
+                    source: format!(
+                        "web.custom command in effective config for {}",
+                        cwd.display()
+                    ),
+                },
+            )));
+        }
     }
 
     for (name, tpl) in cfg.tools.iter() {
-        if !tpl.enabled || tpl.command.trim().is_empty() {
+        if disabled_tools.contains(name) {
             continue;
         }
-        if crate::tools::custom::is_builtin_web_tool(name) && !custom_web {
+        if !tpl.enabled || tpl.command.trim().is_empty() {
             continue;
         }
         tb = tb.with(Arc::new(CustomBashTool::from_template_with_provenance(
@@ -876,23 +1262,98 @@ fn with_custom_tools(mut tb: ToolBox, cwd: &Path) -> ToolBox {
             },
         )));
     }
-    for name in crate::tools::custom_templates::builtin_tool_names() {
-        if crate::tools::custom::is_builtin_web_tool(name) && !custom_web {
-            continue;
-        }
-        if cfg.tools.contains_key(*name) {
-            continue;
-        }
-        let tpl: ToolCommandTemplate = crate::tools::custom_templates::default_template_for(name);
-        if tpl.enabled && !tpl.command.trim().is_empty() {
-            tb = tb.with(Arc::new(CustomBashTool::from_template_with_provenance(
-                name,
-                &tpl,
-                ToolTemplateProvenance::ShippedDefault,
-            )));
-        }
-    }
     tb
+}
+
+fn disabled_tier_names(def: &crate::agents::AgentDef) -> std::collections::BTreeSet<String> {
+    def.tool_tiers
+        .iter()
+        .filter(|(_name, tier)| **tier == crate::agents::ToolTier::Disabled)
+        .map(|(name, _tier)| name.clone())
+        .collect()
+}
+
+fn default_discoverable_tools_for(name: &str) -> &'static [&'static str] {
+    match name {
+        "Build" | "builder" | "Plan" | "Swarm" | "bee" | "scout" => &[
+            "word",
+            "hot",
+            "circular",
+            "impact",
+            "change_impact",
+            "harness_list",
+            "harness_invoke",
+            "session_search",
+            "session_read",
+            "create_goal",
+            "get_goal",
+            "update_goal",
+            "lsp",
+        ],
+        "explore" => &["word", "hot", "circular", "impact", "change_impact"],
+        "Auto" | "Multireview" => &[
+            "harness_list",
+            "harness_invoke",
+            "session_search",
+            "session_read",
+            "create_goal",
+            "get_goal",
+            "update_goal",
+            "lsp",
+        ],
+        _ => &[],
+    }
+}
+
+fn default_disabled_tools_for(name: &str) -> &'static [&'static str] {
+    match name {
+        "Build" | "builder" | "Plan" | "Swarm" | "bee" | "scout" | "explore" | "Auto"
+        | "Multireview" => &["skill_manage"],
+        _ => &[],
+    }
+}
+
+fn default_assistant_discoverable_tools() -> &'static [&'static str] {
+    &[
+        "session_search",
+        "session_read",
+        "create_goal",
+        "get_goal",
+        "update_goal",
+    ]
+}
+
+fn effective_tool_tier(
+    def: &crate::agents::AgentDef,
+    tool: &str,
+    is_assistant: bool,
+) -> crate::agents::ToolTier {
+    if let Some(tier) = def.tool_tiers.get(tool) {
+        return *tier;
+    }
+    if is_assistant && default_assistant_discoverable_tools().contains(&tool) {
+        return crate::agents::ToolTier::Discoverable;
+    }
+    if default_disabled_tools_for(&def.name).contains(&tool) {
+        return crate::agents::ToolTier::Disabled;
+    }
+    if default_discoverable_tools_for(&def.name).contains(&tool) {
+        return crate::agents::ToolTier::Discoverable;
+    }
+    crate::agents::ToolTier::Builtin
+}
+
+fn add_discoverable_tool_by_name(
+    tb: ToolBox,
+    name: &str,
+    def: &crate::agents::AgentDef,
+    args: &SpawnArgs,
+) -> Result<ToolBox> {
+    let scratch = materialize_tool_by_name(ToolBox::new(), name, Some(def), args)?;
+    let Some(tool) = scratch.get_cloned(name) else {
+        return Ok(tb);
+    };
+    Ok(tb.with_discoverable_mcp(tool))
 }
 
 /// Build an agent by name. Resolution order (overlay model, prompt
@@ -925,36 +1386,11 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
     // takes precedence over the embedded factory. A malformed override
     // fails loudly here (naming its source) rather than silently falling
     // back to the embedded default.
-    let mut agent = match crate::agents::resolve(&args.cwd, name)? {
-        // A genuine on-disk file (override of a built-in, or a custom
-        // agent): build generically from the resolved definition so the
-        // user's edited tools/model/prompt take effect.
-        Some(def) if !def.source.as_os_str().is_empty() => agent_from_def(&def, args)?,
-        // An embedded default came back (no override): use the hardcoded
-        // factory, which is byte-identical and cache-stable.
-        Some(_) => {
-            let mut agent = match name {
-                "Auto" => auto(args),
-                "Build" => build(args),
-                "builder" => builder(args),
-                "explore" => explore(args),
-                "deepthink" => deepthink(args),
-                "scout" => scout(args),
-                "Plan" => plan(args),
-                "Swarm" => swarm(args),
-                "bee" => bee(args),
-                "Multireview" => multireview(args),
-                other => bail!("unknown built-in agent `{other}`"),
-            };
-            let def = crate::agents::embedded_default(name)
-                .expect("resolved embedded built-in must have embedded default");
-            agent.model = resolve_agent_model(&def, args)?;
-            agent.system = compose_system_prompt_for_model(&agent.role_prompt, &agent.model, args);
-            agent
-        }
+    let Some(def) = crate::agents::resolve(&args.cwd, name)? else {
         // Not a built-in and no file on disk: unknown agent.
-        None => bail!("unknown agent `{name}`"),
+        bail!("unknown agent `{name}`");
     };
+    let mut agent = agent_from_def(&def, args)?;
 
     // Per-delegation tool grants (prompt `parent-granted-tools.md`): append the
     // parent's granted tools onto the just-built base surface, for this run
@@ -964,10 +1400,24 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
     // — the cache-safety rule holds per child-run, and grants can't persist or
     // leak because each spawn passes a fresh `SpawnArgs.granted_tools`.
     if !args.granted_tools.is_empty() && name != "deepthink" {
+        let is_assistant = args.assistant_identity_prefix.is_some()
+            && crate::agents::embedded_default(&def.name).is_none();
+        for grant in &args.granted_tools {
+            if effective_tool_tier(&def, grant, is_assistant) == crate::agents::ToolTier::Disabled {
+                bail!(
+                    "delegation to `{name}` may not grant tool `{grant}` because `{name}` tiers it as `disabled`"
+                );
+            }
+        }
         agent.tools = apply_grants(agent.tools, &args.granted_tools, args)?;
     }
     agent.params = params_with_direct_computer(args, &agent.model);
     Ok(agent)
+}
+
+pub fn default_build(args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default("Build").expect("Build has an embedded default");
+    agent_from_def(&def, args).expect("Build embedded default constructs")
 }
 
 /// Append the parent-granted tools onto a built agent's base toolbox (prompt
@@ -1009,6 +1459,14 @@ pub fn is_noninteractive(name: &str) -> bool {
 /// feature (GOALS §3c): their transcript is never persisted as a handle.
 pub(crate) fn is_docs_pipeline(name: &str) -> bool {
     matches!(name, "docs" | "docs-resolver" | "docs-answerer")
+}
+
+fn is_internal_agent_def_name(name: &str) -> bool {
+    matches!(name, "computer" | "docs-resolver" | "docs-answerer")
+}
+
+fn internal_agent_def_uses_custom_tools(name: &str) -> bool {
+    name == "docs-resolver"
 }
 
 /// True when a delegated subagent named `name` is **follow-up eligible** — its
@@ -1094,7 +1552,7 @@ fn with_return_tool(tb: ToolBox, name: &str) -> ToolBox {
 /// to exclude primaries from the delegated-subagent `return` tool: a primary is
 /// never delegated to and finishes via `Done`/`handoff`.
 fn is_primary(name: &str) -> bool {
-    matches!(name, "Auto" | "Build" | "Plan" | "Swarm")
+    matches!(name, "Auto" | "Build" | "Plan" | "Swarm" | "Multireview")
 }
 
 /// Register the `seed` tool (GOALS §3c) on `tb` when this is a read-only
@@ -1139,6 +1597,8 @@ fn maybe_with_seed_tool(
 /// right tools); a custom agent with no grant gets the read-only
 /// investigator surface.
 fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Agent> {
+    let is_assistant = args.assistant_identity_prefix.is_some()
+        && crate::agents::embedded_default(&def.name).is_none();
     if def.name == "deepthink" {
         let model = resolve_agent_model(def, args)?;
         let mut params = args.params.clone();
@@ -1169,6 +1629,7 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
     // Resolve the tool-name grant: explicit list, else the role default.
     let grant: Vec<String> = match &def.tools {
         Some(t) => t.clone(),
+        None if is_assistant => default_assistant_tools(),
         None => crate::agents::embedded_default(&def.name)
             .and_then(|d| d.tools)
             .unwrap_or_else(default_custom_tools),
@@ -1176,26 +1637,36 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
 
     let mut tb = ToolBox::new();
     for name in &grant {
-        tb = add_tool_by_name(tb, name, def, args)?;
+        tb = match effective_tool_tier(def, name, is_assistant) {
+            crate::agents::ToolTier::Builtin => add_tool_by_name(tb, name, def, args)?,
+            crate::agents::ToolTier::Discoverable => {
+                add_discoverable_tool_by_name(tb, name, def, args)?
+            }
+            crate::agents::ToolTier::Disabled => tb,
+        };
     }
-    // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
-    // of the named grant — attach them like the built-in factories do.
-    tb = with_custom_tools(tb, &args.cwd);
-    // Cross-session recall tools, gated on interactive spawn.
-    tb = with_recall_tools(tb, args);
-    // `seed` (GOALS §3c): a custom read-only noninteractive subagent in
-    // normal mode may emit seeds to its caller. The helper re-checks the
-    // (now-built) tool surface for write/lock tools, so only a genuinely
-    // read-only custom subagent gets it.
-    tb = maybe_with_seed_tool(tb, &def.name, args.llm_mode);
-    // `return` (structured-summary envelope, `structured-subagent
-    // -return-summary.md`): a delegated subagent finishes by returning a
-    // structured summary. An on-disk override of a bundled agent keeps its name,
-    // so `with_return_tool`'s name guards exclude a bundled primary/docs
-    // override; a custom agent is gated on its `mode` here (a `Primary`-only
-    // custom agent is chat-owning, never delegated to, so it gets no `return`).
-    if crate::agents::embedded_default(&def.name).is_some() || def.mode.is_subagent() {
-        tb = with_return_tool(tb, &def.name);
+    if !is_internal_agent_def_name(&def.name) || internal_agent_def_uses_custom_tools(&def.name) {
+        // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
+        // of the named grant — attach them like the built-in factories do.
+        tb = with_custom_tools(tb, &args.cwd, &disabled_tier_names(def));
+    }
+    if !is_internal_agent_def_name(&def.name) {
+        // Cross-session recall tools, gated on interactive spawn.
+        tb = with_tiered_recall_tools(tb, args, def, is_assistant)?;
+        // `seed` (GOALS §3c): a custom read-only noninteractive subagent in
+        // normal mode may emit seeds to its caller. The helper re-checks the
+        // (now-built) tool surface for write/lock tools, so only a genuinely
+        // read-only custom subagent gets it.
+        tb = maybe_with_seed_tool(tb, &def.name, args.llm_mode);
+        // `return` (structured-summary envelope, `structured-subagent
+        // -return-summary.md`): a delegated subagent finishes by returning a
+        // structured summary. An on-disk override of a bundled agent keeps its name,
+        // so `with_return_tool`'s name guards exclude a bundled primary/docs
+        // override; a custom agent is gated on its `mode` here (a `Primary`-only
+        // custom agent is chat-owning, never delegated to, so it gets no `return`).
+        if crate::agents::embedded_default(&def.name).is_some() || def.mode.is_subagent() {
+            tb = with_return_tool(tb, &def.name);
+        }
     }
     // Per-agent tool-description overrides (prompt
     // `per-agent-tool-definitions.md`): re-word a granted tool's description
@@ -1255,6 +1726,23 @@ fn default_custom_tools() -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+fn default_assistant_tools() -> Vec<String> {
+    let mut tools = default_custom_tools();
+    tools.extend(
+        [
+            "session_search",
+            "session_read",
+            "create_goal",
+            "get_goal",
+            "update_goal",
+            "skill_manage",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    tools
 }
 
 /// Append the tool named `name` to `tb`. Structural tools (`task`) are
@@ -1400,6 +1888,7 @@ pub fn auto(args: &SpawnArgs) -> Agent {
                 // MCP (GOALS §18a): `mcp` runs the Monty Python sandbox.
                 .with(Arc::new(crate::tools::mcp_tool::McpTool)),
             &args.cwd,
+            &std::collections::BTreeSet::new(),
         ),
         args,
     );
@@ -1462,6 +1951,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
         with_custom_tools(
             with_task_for_targets(base_tools, args, &sub_refs),
             &args.cwd,
+            &std::collections::BTreeSet::new(),
         ),
         args,
     );
@@ -1555,6 +2045,7 @@ pub fn builder(args: &SpawnArgs) -> Agent {
             // when its spawn context has remaining budget.
             with_task_for_targets(base_tools, args, &recursive_refs),
             &args.cwd,
+            &std::collections::BTreeSet::new(),
         ),
         args,
     );
@@ -1635,7 +2126,10 @@ pub fn explore(args: &SpawnArgs) -> Agent {
     } else {
         base_tools
     };
-    let tools = with_recall_tools(with_custom_tools(base_tools, &args.cwd), args);
+    let tools = with_recall_tools(
+        with_custom_tools(base_tools, &args.cwd, &std::collections::BTreeSet::new()),
+        args,
+    );
     // `seed` (GOALS §3c): only on a read-only noninteractive subagent in
     // normal mode. Gated by the behavioral capability check, not just the
     // description text.
@@ -1718,26 +2212,19 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
             model.model_id_ref()
         );
     }
-    let mut params = args.params.clone();
-    params.native_computer = Some(native_computer);
-    Ok(Agent {
-        name: "computer".to_string(),
-        system: compose_system_prompt_for_model(COMPUTER_PROMPT, &model, args),
-        role_prompt: COMPUTER_PROMPT.to_string(),
-        tools: with_return_tool(ToolBox::new(), "computer"),
-        model,
-        params,
-        scan_tool_results: false,
-        llm_mode: args.llm_mode,
-        delegated: args.delegated,
-        delegation_recursion: DelegationRecursionContext {
-            enabled: args.delegation_recursion.enabled,
-            remaining_depth: 0,
-            allowed_targets: Vec::new(),
-            same_model_only: false,
-        },
-        env_overlay: args.env_overlay.clone(),
-    })
+    let mut child_args = args.clone();
+    child_args.model = model;
+    child_args.params.native_computer = Some(native_computer);
+    let def = crate::agents::embedded_internal_default("computer")
+        .expect("computer has an internal agent definition");
+    let mut agent = agent_from_def(&def, &child_args)?;
+    agent.delegation_recursion = DelegationRecursionContext {
+        enabled: args.delegation_recursion.enabled,
+        remaining_depth: 0,
+        allowed_targets: Vec::new(),
+        same_model_only: false,
+    };
+    Ok(agent)
 }
 
 /// `scout` — read-only recursive review worker. Its base surface mirrors
@@ -1757,6 +2244,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
                 args.swarm_max_depth,
             ))),
             &args.cwd,
+            &std::collections::BTreeSet::new(),
         ),
         args,
     );
@@ -1801,6 +2289,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         with_custom_tools(
             with_task_for_targets(base_tools, args, &["explore"]),
             &args.cwd,
+            &std::collections::BTreeSet::new(),
         ),
         args,
     );
@@ -1863,6 +2352,7 @@ pub fn swarm(args: &SpawnArgs) -> Agent {
                     args.swarm_max_depth,
                 ))),
             &args.cwd,
+            &std::collections::BTreeSet::new(),
         ),
         args,
     );
@@ -1910,6 +2400,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
             .with(Arc::new(crate::tools::schedule::ScheduleTool))
             .with(Arc::new(crate::tools::question::QuestionTool)),
             &args.cwd,
+            &std::collections::BTreeSet::new(),
         ),
         args,
     );
@@ -1969,6 +2460,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
                     args.swarm_max_depth,
                 ))),
             &args.cwd,
+            &std::collections::BTreeSet::new(),
         ),
         args,
     );
@@ -2012,37 +2504,24 @@ pub fn docs_resolver(
     approver: Option<Arc<crate::approval::Approver>>,
     interrupts: Option<Arc<crate::engine::interrupt::InterruptHub>>,
 ) -> Agent {
-    let tools = with_custom_tools(
-        ToolBox::new()
-            .with(Arc::new(crate::tools::docs::ListPackagesTool::new(
-                resolution.clone(),
-                target,
-            )))
-            // The package-add gate's approver + interrupt hub are threaded
-            // straight into the tool — independent of the noninteractive
-            // `ToolCtx::approver` the pipeline leaves `None` (so the
-            // filesystem-confine path raises no escalation), per
-            // implementation note.
-            .with(Arc::new(crate::tools::docs::AddPackageTool::new(
-                resolution, approver, interrupts,
-            )))
-            .with(Arc::new(crate::tools::bash::BashTool::new())),
-        &args.cwd,
-    );
-
-    Agent {
-        name: "docs-resolver".to_string(),
-        system: compose_system_prompt_for_effective_model(DOCS_RESOLVER_PROMPT, args),
-        role_prompt: DOCS_RESOLVER_PROMPT.to_string(),
-        tools,
-        model: args.effective_model(),
-        params: args.params.clone(),
-        scan_tool_results: true,
-        llm_mode: args.llm_mode,
-        delegated: args.delegated,
-        delegation_recursion: args.delegation_recursion.clone(),
-        env_overlay: args.env_overlay.clone(),
-    }
+    let def = crate::agents::embedded_internal_default("docs-resolver")
+        .expect("docs-resolver has an internal agent definition");
+    let mut agent = agent_from_def(&def, args).expect("docs-resolver internal def is valid");
+    agent.tools = agent
+        .tools
+        .with(Arc::new(crate::tools::docs::ListPackagesTool::new(
+            resolution.clone(),
+            target,
+        )))
+        // The package-add gate's approver + interrupt hub are threaded
+        // straight into the tool — independent of the noninteractive
+        // `ToolCtx::approver` the pipeline leaves `None` (so the
+        // filesystem-confine path raises no escalation), per
+        // implementation note.
+        .with(Arc::new(crate::tools::docs::AddPackageTool::new(
+            resolution, approver, interrupts,
+        )));
+    agent
 }
 
 /// Docs.2 — the answerer stage of the `docs` pipeline. Runs in the
@@ -2052,24 +2531,9 @@ pub fn docs_resolver(
 /// every path to `args.cwd`, which is why bash can be denied: Docs.2 runs
 /// inside untrusted third-party source.
 pub fn docs_answerer(args: &SpawnArgs) -> Agent {
-    let tools = ToolBox::new()
-        .with(Arc::new(crate::tools::read::ReadTool))
-        .with(Arc::new(crate::tools::grep::GrepTool))
-        .with(Arc::new(crate::tools::glob::GlobTool));
-
-    Agent {
-        name: "docs-answerer".to_string(),
-        system: compose_system_prompt_for_effective_model(DOCS_ANSWERER_PROMPT, args),
-        role_prompt: DOCS_ANSWERER_PROMPT.to_string(),
-        tools,
-        model: args.effective_model(),
-        params: args.params.clone(),
-        scan_tool_results: false,
-        llm_mode: args.llm_mode,
-        delegated: args.delegated,
-        delegation_recursion: args.delegation_recursion.clone(),
-        env_overlay: args.env_overlay.clone(),
-    }
+    let def = crate::agents::embedded_internal_default("docs-answerer")
+        .expect("docs-answerer has an internal agent definition");
+    agent_from_def(&def, args).expect("docs-answerer internal def is valid")
 }
 
 #[cfg(test)]
@@ -2077,6 +2541,7 @@ mod tests {
     use super::*;
 
     use crate::config::extended::ExtendedConfig;
+    use crate::engine::tool::Tool;
 
     /// A keyless localhost model + [`SpawnArgs`] for exercising the agent
     /// factories. The model is never actually called — these tests only
@@ -2135,6 +2600,528 @@ mod tests {
             swarm_depth: 0,
             swarm_max_depth: crate::config::extended::DEFAULT_SWARM_MAX_DEPTH,
             granted_tools: Vec::new(),
+        }
+    }
+
+    fn sorted_tool_names(agent: &Agent) -> Vec<String> {
+        let mut names: Vec<String> = agent
+            .tools
+            .names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn host_for_agent(agent: &Agent, cwd: &Path) -> crate::mcp::builtin::HostContext {
+        let mut ctx = crate::tools::common::test_ctx(cwd);
+        ctx.mcp_builtin_registry = agent.tools.mcp_builtin_registry();
+        crate::mcp::builtin::HostContext::from_tool_ctx(&ctx)
+    }
+
+    #[test]
+    fn builtin_agent_grant_equivalence_to_embedded_defs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            let loaded = load(name, &args).unwrap();
+            let def = crate::agents::embedded_default(name).unwrap();
+            let expected = agent_from_def(&def, &args).unwrap();
+            assert_eq!(
+                sorted_tool_names(&loaded),
+                sorted_tool_names(&expected),
+                "{name} loaded from AgentDef must match embedded construction"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_agent_grant_internal_defs_exist_and_construct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+
+        for name in ["computer", "docs-resolver", "docs-answerer"] {
+            assert!(
+                crate::agents::embedded_internal_default(name).is_some(),
+                "{name} must have an internal AgentDef"
+            );
+        }
+
+        let resolution = crate::tools::docs::DocsResolution::new();
+        let resolver = docs_resolver(&args, resolution, "pkg".to_string(), None, None);
+        assert_eq!(
+            sorted_tool_names(&resolver),
+            vec![
+                "add-package",
+                "bash",
+                "list-packages",
+                "webfetch",
+                "websearch"
+            ]
+        );
+
+        let answerer = docs_answerer(&args);
+        assert_eq!(sorted_tool_names(&answerer), vec!["glob", "grep", "read"]);
+    }
+
+    #[test]
+    fn builtin_agent_grant_impact_is_grantable_and_on_explore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let def = crate::agents::AgentDef {
+            name: "impact-user".to_string(),
+            description: "custom".to_string(),
+            mode: crate::agents::AgentMode::Subagent,
+            model: None,
+            temperature: None,
+            tools: Some(vec!["impact".to_string()]),
+            tool_tiers: std::collections::BTreeMap::new(),
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: None,
+            permission: None,
+            prompt: "body".to_string(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: tmp.path().join("impact-user.md"),
+        };
+
+        crate::agents::validate_invariants(&def).expect("impact is a known grantable tool");
+        let agent = agent_from_def(&def, &args).expect("impact materializes");
+
+        assert!(agent.tools.names().contains(&"impact"));
+        assert!(
+            crate::mcp::builtin::describe(
+                &host_for_agent(&load("explore", &args).unwrap(), tmp.path()),
+                "impact"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn tool_tier_builtin_discoverable_disabled_place_tools_and_catalog_entries() {
+        use crate::agents::{AgentDef, AgentMode, ToolTier};
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let mut tool_tiers = std::collections::BTreeMap::new();
+        tool_tiers.insert("word".to_string(), ToolTier::Discoverable);
+        tool_tiers.insert("search".to_string(), ToolTier::Disabled);
+        let def = AgentDef {
+            name: "custom-tiered".to_string(),
+            description: "custom".to_string(),
+            mode: AgentMode::Primary,
+            model: None,
+            temperature: None,
+            tools: Some(vec![
+                "read".to_string(),
+                "word".to_string(),
+                "search".to_string(),
+            ]),
+            tool_tiers,
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: Some(true),
+            permission: None,
+            prompt: "body".to_string(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: tmp.path().join("custom-tiered.md"),
+        };
+        let agent = agent_from_def(&def, &args).unwrap();
+        let names = agent.tools.names();
+        assert!(names.contains(&"read"), "{names:?}");
+        assert!(!names.contains(&"word"), "{names:?}");
+        assert!(!names.contains(&"search"), "{names:?}");
+
+        let host = host_for_agent(&agent, tmp.path());
+        assert!(
+            crate::mcp::builtin::describe(&host, "read")
+                .unwrap()
+                .description
+                .contains("direct builtin tool")
+        );
+        assert!(
+            !crate::mcp::builtin::describe(&host, "word")
+                .unwrap()
+                .description
+                .contains("direct builtin tool")
+        );
+        assert!(crate::mcp::builtin::describe(&host, "search").is_err());
+        assert!(
+            crate::mcp::builtin::search(&host, "word")
+                .iter()
+                .any(|hit| hit.tool == "word")
+        );
+        assert!(
+            crate::mcp::builtin::search(&host, "search")
+                .iter()
+                .all(|hit| hit.tool != "search")
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_tier_builtin_tool_is_invocable_from_mcp_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("sample.txt"), "hello from mcp\n").unwrap();
+        let agent = default_build(&test_spawn_args(tmp.path()));
+        let host = host_for_agent(&agent, tmp.path());
+
+        let out = crate::mcp::sandbox::run_with_host(
+            "mcp.invoke('cockpit', 'read', {'path': 'sample.txt'})",
+            &crate::mcp::config::McpConfig::default(),
+            &host,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("hello from mcp"), "{out}");
+    }
+
+    #[test]
+    fn tool_tier_structural_tools_are_absent_from_monty_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = swarm(&test_spawn_args(tmp.path()));
+        let host = host_for_agent(&agent, tmp.path());
+        for tool in [
+            "question",
+            "handoff",
+            "return",
+            "schedule",
+            "task",
+            "spawn",
+            "defer_to_orchestrator",
+            "start_build",
+        ] {
+            assert!(
+                crate::mcp::builtin::describe(&host, tool).is_err(),
+                "{tool} must not be served through monty"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_tier_disabled_custom_bash_tool_is_filtered() {
+        use crate::agents::{AgentDef, AgentMode, ToolTier};
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_project_config(
+            tmp.path(),
+            r#"{
+                "tools": {
+                    "my_tool": {
+                        "enabled": true,
+                        "command": "echo {value}"
+                    }
+                }
+            }"#,
+        );
+        let mut tool_tiers = std::collections::BTreeMap::new();
+        tool_tiers.insert("my_tool".to_string(), ToolTier::Disabled);
+        let def = AgentDef {
+            name: "custom-with-disabled-tool".to_string(),
+            description: "custom".to_string(),
+            mode: AgentMode::Primary,
+            model: None,
+            temperature: None,
+            tools: None,
+            tool_tiers,
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: Some(true),
+            permission: None,
+            prompt: "body".to_string(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: tmp.path().join("custom-with-disabled-tool.md"),
+        };
+
+        let agent = agent_from_def(&def, &test_spawn_args(tmp.path())).unwrap();
+        let names = agent.tools.names();
+        assert!(!names.contains(&"my_tool"), "{names:?}");
+    }
+
+    #[test]
+    fn tool_tier_stock_build_defaults_move_tail_to_monty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = default_build(&test_spawn_args(tmp.path()));
+        let names = agent.tools.names();
+        let host = host_for_agent(&agent, tmp.path());
+
+        for tool in [
+            "word",
+            "hot",
+            "circular",
+            "impact",
+            "change_impact",
+            "harness_list",
+            "harness_invoke",
+            "session_search",
+            "session_read",
+            "create_goal",
+            "get_goal",
+            "update_goal",
+        ] {
+            assert!(
+                !names.contains(&tool),
+                "{tool} should not be directly injected"
+            );
+            assert!(
+                crate::mcp::builtin::describe(&host, tool).is_ok(),
+                "{tool} should be discoverable through monty"
+            );
+        }
+
+        for tool in [
+            "read",
+            "bash",
+            "readlock",
+            "writeunlock",
+            "editunlock",
+            "unlock",
+            "search",
+            "tree",
+            "outline",
+            "symbol_find",
+            "deps",
+            "context_pack",
+            "todo",
+            "todo_read",
+        ] {
+            assert!(names.contains(&tool), "{tool} should be directly injected");
+        }
+    }
+
+    #[test]
+    fn tool_tier_lsp_and_skill_manage_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let explore_agent = load("explore", &args).unwrap();
+        let build_agent = default_build(&args);
+
+        assert!(explore_agent.tools.names().contains(&"lsp"));
+        assert!(!build_agent.tools.names().contains(&"lsp"));
+        assert!(
+            crate::mcp::builtin::describe(&host_for_agent(&build_agent, tmp.path()), "lsp").is_ok()
+        );
+        assert!(!build_agent.tools.names().contains(&"skill_manage"));
+    }
+
+    #[test]
+    fn tool_tier_assistant_defaults_make_episodic_tools_discoverable() {
+        use crate::agents::{AgentDef, AgentMode};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.assistant_identity_prefix = Some("assistant identity".to_string());
+        let def = AgentDef {
+            name: "helper".to_string(),
+            description: "assistant".to_string(),
+            mode: AgentMode::Primary,
+            model: None,
+            temperature: None,
+            tools: None,
+            tool_tiers: std::collections::BTreeMap::new(),
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: Some(true),
+            permission: None,
+            prompt: "body".to_string(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: tmp.path().join("helper.md"),
+        };
+
+        let agent = agent_from_def(&def, &args).unwrap();
+        let names = agent.tools.names();
+        assert!(names.contains(&"skill_manage"), "{names:?}");
+        let host = host_for_agent(&agent, tmp.path());
+        for tool in [
+            "session_search",
+            "session_read",
+            "create_goal",
+            "get_goal",
+            "update_goal",
+        ] {
+            assert!(
+                !names.contains(&tool),
+                "{tool} should not be directly injected"
+            );
+            assert!(crate::mcp::builtin::describe(&host, tool).is_ok());
+        }
+    }
+
+    #[test]
+    fn tool_tier_parent_grant_of_disabled_child_tool_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_dir = tmp.path().join(".cockpit").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("disabled-child.md"),
+            "---\ndescription: child\nmode: subagent\ntools: [read, search]\ntoolTiers:\n  search: disabled\n---\nbody\n",
+        )
+        .unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.granted_tools = vec!["search".to_string()];
+
+        let err = match load("disabled-child", &args) {
+            Ok(_) => panic!("disabled child grant unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("disabled-child"), "{msg}");
+        assert!(msg.contains("search"), "{msg}");
+
+        std::fs::write(
+            agents_dir.join("discoverable-child.md"),
+            "---\ndescription: child\nmode: subagent\ntools: [read, search]\ntoolTiers:\n  search: discoverable\n---\nbody\n",
+        )
+        .unwrap();
+        let promoted = load("discoverable-child", &args).unwrap();
+        assert!(promoted.tools.names().contains(&"search"));
+    }
+
+    #[test]
+    fn tool_tier_assignments_are_fixed_in_constructed_agent() {
+        use crate::agents::{AgentDef, AgentMode, ToolTier};
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let mut tool_tiers = std::collections::BTreeMap::new();
+        tool_tiers.insert("word".to_string(), ToolTier::Discoverable);
+        let mut def = AgentDef {
+            name: "custom-tiered".to_string(),
+            description: "custom".to_string(),
+            mode: AgentMode::Primary,
+            model: None,
+            temperature: None,
+            tools: Some(vec!["read".to_string(), "word".to_string()]),
+            tool_tiers,
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: Some(true),
+            permission: None,
+            prompt: "body".to_string(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: tmp.path().join("custom-tiered.md"),
+        };
+        let agent = agent_from_def(&def, &args).unwrap();
+        def.tool_tiers.insert("word".to_string(), ToolTier::Builtin);
+
+        assert!(!agent.tools.names().contains(&"word"));
+        assert!(crate::mcp::builtin::describe(&host_for_agent(&agent, tmp.path()), "word").is_ok());
+    }
+
+    #[test]
+    fn grep_glob_base_text_is_neutral_docs_answerer_restores_docs_phrasing() {
+        let grep = crate::tools::grep::GrepTool;
+        let glob = crate::tools::glob::GlobTool;
+        for desc in [
+            grep.description().to_string(),
+            grep.defensive_description().unwrap(),
+            glob.description().to_string(),
+            glob.defensive_description().unwrap(),
+        ] {
+            assert!(!desc.contains("dependency you're inspecting"), "{desc}");
+            assert!(!desc.contains("You have no shell here"), "{desc}");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let answerer = docs_answerer(&test_spawn_args(tmp.path()));
+        for tool in ["grep", "glob"] {
+            let desc = answerer
+                .tools
+                .definitions(crate::config::extended::LlmMode::Normal)
+                .into_iter()
+                .find(|definition| definition.name == tool)
+                .unwrap()
+                .description;
+            assert!(desc.contains("dependency package"), "{desc}");
+            assert!(desc.contains("no shell here"), "{desc}");
+        }
+    }
+
+    #[test]
+    fn tool_tier_prompt_files_do_not_name_moved_tools_as_direct() {
+        let explore = include_str!("explore.md");
+        let explore_normal = include_str!("explore.normal.md");
+        for body in [explore, explore_normal] {
+            for direct_list_line in body
+                .lines()
+                .filter(|line| line.contains("tools") || line.starts_with("- `"))
+            {
+                for moved in ["`word`", "`hot`", "`circular`", "`impact`"] {
+                    assert!(
+                        !direct_list_line.contains(moved),
+                        "moved tool {moved} appears in direct-list line: {direct_list_line}"
+                    );
+                }
+            }
+        }
+
+        for body in [
+            include_str!("multireview.md"),
+            include_str!("multireview.normal.md"),
+        ] {
+            assert!(
+                !body.contains("`harness_invoke`"),
+                "multireview prompt must refer to the MCP harness advert"
+            );
+        }
+    }
+
+    #[test]
+    fn advert_discoverability_invariant_covers_default_discoverable_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            let agent = load(name, &args).unwrap();
+            let advert_text =
+                crate::tools::mcp_tool::discoverable_tool_adverts(&agent.tools).join("\n");
+            for tool in agent.tools.discoverable_mcp_tool_names() {
+                assert!(
+                    advert_text.contains(&tool) || agent.role_prompt.contains(&tool),
+                    "`{name}` discoverable tool `{tool}` is not named by an advert or role prompt"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_agent_grant_embedded_defs_validate_invariants() {
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            let def = crate::agents::embedded_default(name).expect("embedded builtin");
+            crate::agents::validate_invariants(&def)
+                .unwrap_or_else(|err| panic!("{name} embedded def violates invariants: {err}"));
+        }
+    }
+
+    #[test]
+    fn builtin_agent_grant_parent_grants_still_compose() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.interactive = false;
+        args.granted_tools = vec!["harness_list".to_string()];
+
+        let agent = load("explore", &args).unwrap();
+
+        assert!(agent.tools.names().contains(&"harness_list"));
+    }
+
+    #[test]
+    fn builtin_agent_grant_docs_answerer_only_tools_stay_ungrantable() {
+        let tmp = tempfile::tempdir().unwrap();
+        for tool in ["grep", "glob"] {
+            let def = crate::agents::AgentDef {
+                name: format!("user-{tool}"),
+                description: "custom".to_string(),
+                mode: crate::agents::AgentMode::Subagent,
+                model: None,
+                temperature: None,
+                tools: Some(vec![tool.to_string()]),
+                tool_tiers: std::collections::BTreeMap::new(),
+                tool_descriptions: std::collections::BTreeMap::new(),
+                scan_tool_results: None,
+                permission: None,
+                prompt: "body".to_string(),
+                prompt_variants: std::collections::HashMap::new(),
+                source: tmp.path().join(format!("user-{tool}.md")),
+            };
+            let err = crate::agents::validate_invariants(&def)
+                .expect_err("sandbox-only docs tools must be rejected for user defs");
+            assert!(err.to_string().contains("docs-answerer-only"), "{err}");
+            assert!(err.to_string().contains("sandboxed tool"), "{err}");
         }
     }
 
@@ -2797,21 +3784,133 @@ mod tests {
         }
     }
 
-    /// Web tools (`webfetch`/`websearch`) note the prefer-`docs`-for-dependency-
-    /// API guidance (implementation note): web stays
-    /// available for what `docs` can't answer (news, non-package info).
     #[test]
-    fn web_tool_defaults_note_prefer_docs_for_dependency_api() {
-        for name in ["webfetch", "websearch"] {
-            let tpl = crate::tools::custom_templates::default_template_for(name);
-            let desc = tpl.description.unwrap_or_default().to_lowercase();
+    fn with_custom_tools_keeps_native_web_tools_and_user_tool_for_firecrawl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_project_config(
+            tmp.path(),
+            r#"{
+                "web": { "provider": "firecrawl" },
+                "tools": {
+                    "my_tool": {
+                        "enabled": true,
+                        "command": "echo {value}"
+                    }
+                }
+            }"#,
+        );
+
+        let tb = with_custom_tools(
+            ToolBox::new(),
+            tmp.path(),
+            &std::collections::BTreeSet::new(),
+        );
+        let names = tb.names();
+        assert!(names.contains(&"webfetch"), "{names:?}");
+        assert!(names.contains(&"websearch"), "{names:?}");
+        assert!(names.contains(&"my_tool"), "{names:?}");
+    }
+
+    #[test]
+    fn with_custom_tools_registers_typed_custom_web_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_project_config(
+            tmp.path(),
+            r#"{
+                "web": {
+                    "provider": "custom",
+                    "custom": {
+                        "fetch_command": "fetch-cli {url}",
+                        "search_command": "search-cli {query}"
+                    }
+                }
+            }"#,
+        );
+
+        let tb = with_custom_tools(
+            ToolBox::new(),
+            tmp.path(),
+            &std::collections::BTreeSet::new(),
+        );
+        let names = tb.names();
+        assert!(names.contains(&"webfetch"), "{names:?}");
+        assert!(names.contains(&"websearch"), "{names:?}");
+        let webfetch = tb.get("webfetch").unwrap();
+        assert_eq!(
+            webfetch.description(),
+            crate::tools::custom::neutral_web_description("webfetch").unwrap()
+        );
+    }
+
+    #[test]
+    fn with_custom_tools_registers_only_nonblank_custom_web_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_project_config(
+            tmp.path(),
+            r#"{
+                "web": {
+                    "provider": "custom",
+                    "custom": {
+                        "fetch_command": "fetch-cli {url}",
+                        "search_command": "   "
+                    }
+                }
+            }"#,
+        );
+
+        let tb = with_custom_tools(
+            ToolBox::new(),
+            tmp.path(),
+            &std::collections::BTreeSet::new(),
+        );
+        let names = tb.names();
+        assert!(names.contains(&"webfetch"), "{names:?}");
+        assert!(!names.contains(&"websearch"), "{names:?}");
+    }
+
+    #[test]
+    fn with_custom_tools_allows_blank_custom_web_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_project_config(tmp.path(), r#"{"web":{"provider":"custom"}}"#);
+
+        let tb = with_custom_tools(
+            ToolBox::new(),
+            tmp.path(),
+            &std::collections::BTreeSet::new(),
+        );
+        let names = tb.names();
+        assert!(!names.contains(&"webfetch"), "{names:?}");
+        assert!(!names.contains(&"websearch"), "{names:?}");
+    }
+
+    #[test]
+    fn reserved_custom_tool_name_includes_typed_web_tools() {
+        assert!(is_reserved_custom_tool_name("webfetch"));
+        assert!(is_reserved_custom_tool_name("websearch"));
+    }
+
+    #[test]
+    fn builtin_inventory_tracks_grantable_tool_names() {
+        let inventory = builtin_tool_inventory()
+            .iter()
+            .map(|tool| tool.name)
+            .collect::<std::collections::HashSet<_>>();
+        let intentionally_web_section = ["webfetch", "websearch"];
+        for name in known_agent_tool_names() {
             assert!(
-                desc.contains("docs"),
-                "`{name}` default description must mention preferring `docs`"
+                inventory.contains(name) || intentionally_web_section.contains(name),
+                "`{name}` is grantable but absent from the builtin inventory"
             );
+        }
+        for name in inventory {
             assert!(
-                desc.contains("can't answer") || desc.contains("cannot answer"),
-                "`{name}` default description must note web is for what `docs` can't answer"
+                known_agent_tool_names().contains(&name)
+                    || extra_custom_tool_reserved_names().contains(&name),
+                "`{name}` is inventoried but not backed by a runtime/reserved tool name"
             );
         }
     }
@@ -3250,9 +4349,14 @@ mod tests {
         let mut args = test_spawn_args(tmp.path());
         args.llm_mode = crate::config::extended::LlmMode::Normal;
 
-        let build_task = task_definition(&build(&args), crate::config::extended::LlmMode::Normal);
-        let builder_task =
-            task_definition(&builder(&args), crate::config::extended::LlmMode::Normal);
+        let build_task = task_definition(
+            &load("Build", &args).unwrap(),
+            crate::config::extended::LlmMode::Normal,
+        );
+        let builder_task = task_definition(
+            &load("builder", &args).unwrap(),
+            crate::config::extended::LlmMode::Normal,
+        );
 
         assert!(build_task.description.contains("substantive feature work"));
         assert!(build_task.description.contains("backgrounded JSON"));
@@ -3318,6 +4422,7 @@ mod tests {
             model: None,
             temperature: None,
             tools: Some(vec!["read".to_string(), "bash".to_string()]),
+            tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions,
             scan_tool_results: Some(true),
             permission: None,
@@ -3363,6 +4468,7 @@ mod tests {
             model: None,
             temperature: None,
             tools: None,
+            tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: Some(true),
             permission: None,
@@ -3568,6 +4674,7 @@ mod tests {
             model: model.map(str::to_string),
             temperature: None,
             tools: None,
+            tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: None,
             permission: None,

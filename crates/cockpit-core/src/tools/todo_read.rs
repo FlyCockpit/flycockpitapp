@@ -20,7 +20,7 @@ impl Tool for TodoReadTool {
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some("Read full details for a current-session todo/task by id or unambiguous content fragment, including status, assigned subagents, structured notes, artifacts, blockers, and handoff notes. Use after compaction when the overview says details exist.".to_string())
+        Some("Read full details for a current-session todo/task by id or unambiguous content fragment, including status, assigned subagents, structured notes, artifacts, blockers, and handoff notes. Use after compaction when the overview says details exist; do not use it to mutate todos, and provide an id when a name fragment could match more than one row.".to_string())
     }
 
     fn parameters(&self) -> Value {

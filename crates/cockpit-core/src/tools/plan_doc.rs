@@ -22,7 +22,7 @@ impl Tool for PlanReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read the current virtual plan document"
+        "Read the current virtual plan document before `plan_edit`/`plan_write`; use `todo` for task tracking and `get_goal`/`update_goal` for session objective"
     }
 
     fn defensive_description(&self) -> Option<String> {
@@ -46,11 +46,11 @@ impl Tool for PlanWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Create or replace the virtual plan document"
+        "Create or replace the full virtual plan document; use `plan_edit` for small revisions, `todo` for tasks, `create_goal`/`update_goal` for objective status"
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some("Replace the entire session-scoped virtual plan document. Use this for the first draft or full rewrites; for small revisions prefer plan_edit.".to_string())
+        Some("Replace the entire session-scoped virtual plan document with complete standalone content. Use this for the first draft or full rewrites; for small revisions prefer `plan_edit`, and read with `plan_read` first if you need to preserve existing sections.".to_string())
     }
 
     fn parameters(&self) -> Value {
@@ -99,11 +99,11 @@ impl Tool for PlanEditTool {
     }
 
     fn description(&self) -> &str {
-        "Replace one exact string in the virtual plan document"
+        "Replace one exact string in the virtual plan document after `plan_read`; use `plan_write` for full rewrites"
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some("Make a targeted edit to the virtual plan document. `old_string` must appear exactly once; include enough surrounding context to make it unique.".to_string())
+        Some("Make a targeted edit to the virtual plan document after reading it with `plan_read`. `old_string` must appear exactly once; include enough surrounding context to make it unique. Use `plan_write` instead for full rewrites, and do not use plan tools as a todo list or goal-status store.".to_string())
     }
 
     fn parameters(&self) -> Value {
@@ -184,7 +184,7 @@ impl Tool for StartBuildTool {
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some("After the user agrees with the plan, create a fresh Build session whose first user message is the virtual plan document.".to_string())
+        Some("Use `start_build` only after the user agrees with the plan: it creates a fresh Build session whose first user message is the virtual plan document. Do not call it for drafting, editing, or todo tracking; keep using `plan_read`/`plan_write`/`plan_edit` until the plan is accepted.".to_string())
     }
 
     fn parameters(&self) -> Value {

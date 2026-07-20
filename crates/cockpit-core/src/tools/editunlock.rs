@@ -43,7 +43,7 @@ impl Tool for EditunlockTool {
     }
 
     fn description(&self) -> &str {
-        "Replace old_string with new_string in a file (8-stage match cascade) and release the lock"
+        "Replace `old_string` with `new_string` in a locked file and release; use `writeunlock` for full rewrites or `unlock` to abandon"
     }
 
     fn defensive_description(&self) -> Option<String> {

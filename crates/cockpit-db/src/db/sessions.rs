@@ -1187,6 +1187,27 @@ impl Db {
         })
     }
 
+    /// Set a generated title only if the session is still unnamed. This is
+    /// used by daemon RPCs where competing callers may generate concurrently;
+    /// the storage layer decides the single winner.
+    pub fn set_explicit_auto_title_if_untitled(
+        &self,
+        session_id: Uuid,
+        title: &str,
+    ) -> Result<bool> {
+        let title = title.to_owned();
+        self.write_blocking(move |conn| {
+            let affected = conn
+                .execute(
+                    "UPDATE sessions SET title = ?1, user_renamed = 0
+                 WHERE session_id = ?2 AND ephemeral = 0 AND title IS NULL",
+                    params![title, session_id.to_string()],
+                )
+                .context("setting explicit auto title if untitled")?;
+            Ok(affected > 0)
+        })
+    }
+
     /// Persist auto-title progress (migration 0037): the running raw-user
     /// token estimate and last consumed schedule slot. Called from
     /// [`crate::session::Session::note_user_content`] so automatic refresh
@@ -2737,6 +2758,23 @@ mod tests {
         let row = db.get_session(s.session_id).unwrap().unwrap();
         assert!(!row.user_renamed);
         assert_eq!(row.title.as_deref(), Some("generated-name"));
+    }
+
+    #[test]
+    fn explicit_auto_title_if_untitled_has_single_winner() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "a").unwrap();
+        let first = db
+            .set_explicit_auto_title_if_untitled(s.session_id, "first-name")
+            .unwrap();
+        let second = db
+            .set_explicit_auto_title_if_untitled(s.session_id, "second-name")
+            .unwrap();
+        assert!(first);
+        assert!(!second);
+        let row = db.get_session(s.session_id).unwrap().unwrap();
+        assert!(!row.user_renamed);
+        assert_eq!(row.title.as_deref(), Some("first-name"));
     }
 
     #[test]

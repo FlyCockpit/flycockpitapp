@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use super::*;
 
 fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> String {
@@ -34,6 +36,28 @@ impl Session {
         let mut row = db
             .new_session_row(&project_id, &project_root_str, active_agent)
             .context("building deferred session row")?;
+        row.model_system_prompt_snapshot_json =
+            capture_model_system_prompt_snapshot_json(&project_root);
+        let session = Self::from_row(db, project_root, row.clone())?;
+        *session.pending_row.lock().unwrap() = Some(row);
+        Ok(session)
+    }
+
+    /// Create a brand-new assistant session held in memory only. Mirrors
+    /// [`Self::create_deferred`], but carries `assistant_name` in the pending
+    /// row so the eventual first user message persists the assistant session
+    /// atomically with the rest of the deferred session metadata.
+    pub fn create_assistant_deferred(
+        db: Db,
+        project_root: PathBuf,
+        active_agent: &str,
+        assistant_name: &str,
+    ) -> Result<Self> {
+        let project_id = project_id_for(&project_root);
+        let project_root_str = project_root.to_string_lossy().into_owned();
+        let mut row = db
+            .new_assistant_session_row(&project_id, &project_root_str, active_agent, assistant_name)
+            .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
         let session = Self::from_row(db, project_root, row.clone())?;
@@ -173,6 +197,7 @@ impl Session {
             pinned_messages: Mutex::new(Vec::new()),
             calibrator: Mutex::new(crate::tokens::Calibrator::new()),
             tmp_dir: Mutex::new(None),
+            host_shim_dir: Mutex::new(None),
             sandbox_mode: AtomicU8::new(sandbox_mode_to_u8(
                 crate::tools::sandbox_mode::SandboxMode::Sandbox,
             )),
@@ -222,6 +247,33 @@ impl Session {
             }
             Err(e) => {
                 tracing::warn!(error = %e, dir = %dir.display(), "creating session tmp dir failed");
+                None
+            }
+        }
+    }
+
+    /// Per-session host shim directory under the Cockpit data dir. Used for
+    /// small executable aliases that should be visible to host shells but
+    /// removed when the session ends.
+    pub fn host_shim_dir(&self) -> Option<PathBuf> {
+        let mut slot = self.host_shim_dir.lock().unwrap();
+        if let Some(dir) = slot.as_ref() {
+            return Some(dir.clone());
+        }
+        let dir = match crate::config::resolve::cockpit_data_dir() {
+            Ok(data_dir) => host_shim_bin_dir_for_data_dir(&data_dir, self.id),
+            Err(e) => {
+                tracing::warn!(error = %e, "resolving cockpit data dir for host shims failed");
+                return None;
+            }
+        };
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                *slot = Some(dir.clone());
+                Some(dir)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, dir = %dir.display(), "creating session host shim dir failed");
                 None
             }
         }
@@ -309,5 +361,20 @@ impl Session {
         {
             tracing::warn!(error = %e, dir = %dir.display(), "removing session tmp dir failed");
         }
+        if let Some(dir) = self.host_shim_dir.lock().unwrap().take() {
+            let cleanup_dir = dir.parent().unwrap_or(&dir);
+            if let Err(e) = std::fs::remove_dir_all(cleanup_dir)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(error = %e, dir = %cleanup_dir.display(), "removing session host shim dir failed");
+            }
+        }
     }
+}
+
+pub(crate) fn host_shim_bin_dir_for_data_dir(data_dir: &Path, session_id: Uuid) -> PathBuf {
+    data_dir
+        .join("session-shims")
+        .join(session_id.to_string())
+        .join("bin")
 }

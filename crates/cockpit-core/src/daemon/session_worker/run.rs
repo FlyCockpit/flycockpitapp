@@ -201,17 +201,23 @@ async fn run_worker(
     env_overlay: Arc<RwLock<HashMap<String, String>>>,
     repair_required: Arc<RwLock<Option<proto::ResumeRepairState>>>,
     foreground: Arc<Mutex<LiveForegroundState>>,
+    config_snapshot: Arc<RwLock<SessionConfigSnapshot>>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     _global_bus: Option<EventSender>,
 ) {
     let session_id = session.id;
 
-    // The layered `config.json` resolved once at session start.
-    // The active LLM mode (implementation note) and the
-    // default primary agent (the auto-router feature) both read it; the live
-    // `/llm-mode` switch overrides the mode in place via `DriverControl`.
-    let extended_cfg = crate::config::extended::load_for_cwd(&project_root);
+    // Session config is resolved by the registry/ConfigSource, then held as a
+    // generationed snapshot. Live-safe keys are read from the current snapshot
+    // at turn boundaries; agent/model construction uses the snapshot captured
+    // for that boundary.
+    let start_config = config_snapshot
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let extended_cfg = start_config.extended.clone();
     // Effective LLM mode = active model `mode` override → active provider
     // `mode` override → the persisted global `llm_mode`
     // (implementation note). Re-resolved here so a
@@ -219,12 +225,15 @@ async fn run_worker(
     // `/model` change, which restarts the worker on the new active model). A
     // live `/llm-mode` toggle still overrides this for the running session via
     // `DriverControl::SetLlmMode`.
-    let llm_mode = resolve_effective_llm_mode(&session, &project_root, extended_cfg.llm_mode);
+    let llm_mode = resolve_effective_llm_mode(&session, &start_config.providers, extended_cfg.llm_mode);
     // Root primary: the session's stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap or whichever primary `Auto` handed off
     // to, `plan.md §4.6.d`), falling back to the configured default
     // (`Auto` unless the user pinned another) when it's unset/unknown.
-    let root_agent_name = resolve_root_agent(session_id, &session.db, &extended_cfg);
+    let root_agent_name = session
+        .assistant_name
+        .clone()
+        .unwrap_or_else(|| resolve_root_agent(session_id, &session.db, &extended_cfg));
     let assistant_identity_prefix =
         match session.assistant_name.as_deref().and_then(|name| match session.db.get_assistant(name)
         {
@@ -319,7 +328,7 @@ async fn run_worker(
     };
     let root = Arc::new(
         builtin::load(&root_agent_name, &spawn_args)
-            .unwrap_or_else(|_| builtin::build(&spawn_args)),
+            .unwrap_or_else(|_| builtin::default_build(&spawn_args)),
     );
 
     // Snapshot the resolved agent-guidance file body that just went into
@@ -501,7 +510,7 @@ async fn run_worker(
     // Build the driver, then capture its async-job command sender (GOALS
     // §22) so a human-initiated `/schedule cancel` reaches the single
     // authority before moving the driver into its task.
-    let max_concurrent_schedules = max_concurrent_schedules_for(&project_root);
+    let max_concurrent_schedules = max_concurrent_schedules_for(&extended_cfg);
     let mut driver = Driver::with_max_schedules(
         session.clone(),
         locks.clone(),
@@ -527,6 +536,7 @@ async fn run_worker(
     if let Some(scheduler) = resource_scheduler {
         driver.set_resource_scheduler(scheduler);
     }
+    driver.set_daemon_scheduler_source(scheduler);
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into
     // its task, so a user ctrl+c (`SessionWork::Cancel`) can abort the
@@ -573,8 +583,8 @@ async fn run_worker(
 
     // Loop-guard threshold (GOALS §1/§12) from the layered config, same
     // discovery the jobs cap uses. Clamped to ≥ 2 by the setter.
-    driver.set_loop_guard_threshold(loop_guard_threshold_for(&project_root));
-    driver.set_max_primary_rounds(max_primary_rounds_for(&project_root));
+    driver.set_loop_guard_threshold(loop_guard_threshold_for(&extended_cfg));
+    driver.set_max_primary_rounds(max_primary_rounds_for(&extended_cfg));
     driver.set_allow_unbounded_schedule_loops(extended_cfg.schedule.allow_unbounded_loops);
 
     // Resume rehydration (implementation note): on a
@@ -587,7 +597,7 @@ async fn run_worker(
     // history (which a freshly-built driver never does). A hard rebuild
     // failure (corrupt/unpairable rows) is surfaced as a clear error rather
     // than sending a malformed or silently-fresh context (priority #1).
-    let (_, _, active_wire_api) = active_wire_api_for_session(&session, &project_root);
+    let (_, _, active_wire_api) = active_wire_api_for_session(&session, &start_config.providers);
     let responses_strict_replay = matches!(
         active_wire_api,
         crate::config::providers::WireApi::Responses
@@ -606,7 +616,7 @@ async fn run_worker(
                 && let Some(repair) =
                     e.downcast_ref::<crate::engine::rehydrate::RehydrateRepairRequired>()
             {
-                let state = build_resume_repair_state(&session, &project_root, repair);
+                let state = build_resume_repair_state(&session, &start_config.providers, repair);
                 tracing::error!(
                     session_id = %session_id,
                     failure_kind = %state.failure_kind,
@@ -942,10 +952,17 @@ async fn run_worker(
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
+                let base_redact = {
+                    let snapshot = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    snapshot.extended.redact.clone()
+                };
                 if !refresh_redaction_for_turn(
                     &session,
                     session_id,
                     &project_root,
+                    base_redact,
                     &redaction_overrides,
                     &mut unsupported_redaction_notified,
                     &redaction,
@@ -974,7 +991,12 @@ async fn run_worker(
                     ));
                     break WorkerStop::DriverFailed;
                 }
-                let max_rounds = max_primary_rounds_for(&project_root);
+                let max_rounds = {
+                    let snapshot = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    max_primary_rounds_for(&snapshot.extended)
+                };
                 if !send_driver_control_or_fail(
                     &driver_control_tx,
                     crate::engine::driver::DriverControl::SetMaxPrimaryRounds { max_rounds },
@@ -1342,6 +1364,25 @@ async fn run_worker(
                     break WorkerStop::DriverFailed;
                 }
             }
+            SessionWork::ReplaceConfigSnapshot {
+                snapshot,
+                respond_to,
+            } => {
+                let generation = replace_config_snapshot(&config_snapshot, *snapshot);
+                send_current_event(
+                    &event_tx,
+                    &redaction,
+                    proto::Event::ConfigSnapshot {
+                        snapshot: Box::new(
+                            config_snapshot
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .to_proto(session_id),
+                        ),
+                    },
+                );
+                let _ = respond_to.send(generation);
+            }
             SessionWork::SetAgent { name } => {
                 // Persist the active-agent choice so a resume restarts on it,
                 // then swap the live primary in place at the idle boundary
@@ -1368,7 +1409,11 @@ async fn run_worker(
                 // config file), persist the resolved value so a resume keeps
                 // it, then route the explicit mode to the driver to rebuild
                 // the root agent in place.
-                let current = crate::config::extended::load_for_cwd(&project_root).llm_mode;
+                let current = config_snapshot
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extended
+                    .llm_mode;
                 let resolved = mode.unwrap_or_else(|| current.cycled());
                 if let Err(e) = persist_llm_mode(&project_root, resolved) {
                     tracing::warn!(error = %e, "persisting llm_mode failed");
@@ -1442,8 +1487,12 @@ async fn run_worker(
                 // deterministic/byte-stable turn-to-turn (see
                 // `redact::tests::scrub_is_deterministic_within_a_session`),
                 // so it never silently varies the prefix between turns.
-                let mut effective_redact =
-                    crate::config::extended::load_for_cwd(&project_root).redact;
+                let mut effective_redact = config_snapshot
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extended
+                    .redact
+                    .clone();
                 redaction_overrides.apply_to(&mut effective_redact);
                 if let Some(v) = scan_environment {
                     redaction_overrides.scan_environment = Some(v);
@@ -1568,7 +1617,11 @@ async fn run_worker(
                 // and broadcast the resulting state (+ a one-line token-burn
                 // warning when non-empty). Empty disables the feature.
                 // Session-only — never persisted (mirrors `/toggle-redaction`).
-                let (_, providers_cfg) = crate::auto_title::load_configs_for(&project_root);
+                let providers_cfg = config_snapshot
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .providers
+                    .clone();
                 // Reuse the session redaction table the registry already
                 // built successfully. Tandem models must never install an
                 // empty fail-open table after a redaction rebuild error.

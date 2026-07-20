@@ -30,21 +30,18 @@ pub(crate) const WEBSEARCH: &str = "websearch";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolTemplateProvenance {
     Configured { source: String },
-    ShippedDefault,
 }
 
 impl ToolTemplateProvenance {
     fn kind(&self) -> &'static str {
         match self {
             ToolTemplateProvenance::Configured { .. } => "configured",
-            ToolTemplateProvenance::ShippedDefault => "shipped_default",
         }
     }
 
     fn source(&self) -> String {
         match self {
             ToolTemplateProvenance::Configured { source } => source.clone(),
-            ToolTemplateProvenance::ShippedDefault => "shipped default".to_string(),
         }
     }
 }
@@ -60,7 +57,6 @@ pub struct CustomBashTool {
     description: String,
     template: String,
     build_provenance: ToolTemplateProvenance,
-    resolve_runtime_web_template: bool,
     /// Stable-ordered list of placeholder names the template uses.
     params: Vec<String>,
 }
@@ -81,7 +77,6 @@ impl CustomBashTool {
             description,
             template: tpl.command.clone(),
             build_provenance: provenance,
-            resolve_runtime_web_template: is_builtin_web_tool(name),
             params,
         }
     }
@@ -112,10 +107,7 @@ impl CustomBashTool {
         }
     }
 
-    fn selected_template(&self, ctx: &ToolCtx) -> SelectedTemplate {
-        if self.resolve_runtime_web_template {
-            return resolve_builtin_web_template(&self.name, &ctx.cwd);
-        }
+    fn selected_template(&self) -> SelectedTemplate {
         SelectedTemplate {
             tpl: ToolCommandTemplate {
                 enabled: true,
@@ -141,8 +133,21 @@ impl Tool for CustomBashTool {
         self.build_schema()
     }
 
+    fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
+        first_template_program(&self.template)
+            .filter(|program| !program.contains('/') && !program.contains('\\'))
+            .filter(|program| !program.contains('{') && !program.contains('}'))
+            .map(|program| {
+                vec![crate::capabilities::BinaryRequirement::required(
+                    program,
+                    crate::capabilities::common_remedy(program),
+                )]
+            })
+            .unwrap_or_default()
+    }
+
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let selected = self.selected_template(ctx);
+        let selected = self.selected_template();
         if !selected.tpl.enabled || selected.tpl.command.trim().is_empty() {
             return Ok(ToolOutput::text(format!(
                 "Error: tool `{}` is disabled or has no command in the current effective config.\nprovenance: {}\nsource: {}",
@@ -176,19 +181,36 @@ impl Tool for CustomBashTool {
         let mut combined = String::new();
         combined.push_str(&String::from_utf8_lossy(&output.stdout));
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let missing_binary = output.status.code().and_then(|code| {
+                crate::tools::bash::missing_binary_from_shell_failure(code, &stderr)
+            });
             combined.push_str(&render_failure_diagnostic(
                 &self.name,
                 &selected,
                 output.status.code(),
                 ctx,
             ));
+            combined.push_str(
+                &crate::tools::bash::cockpit_command_environment_block_with_requirements(
+                    &cmd,
+                    &ctx.cwd,
+                    output
+                        .status
+                        .code()
+                        .as_ref()
+                        .map(|code| code.to_string())
+                        .as_deref(),
+                    None,
+                    missing_binary.as_deref(),
+                    self.binary_requirements(),
+                ),
+            );
             combined.push_str("\n[stderr]\n");
-            combined.push_str(&String::from_utf8_lossy(&output.stderr));
+            combined.push_str(&stderr);
         }
 
-        let changed_after_build = selected.tpl.command != self.template
-            || selected.provenance.kind() != self.build_provenance.kind()
-            || selected.provenance.source() != self.build_provenance.source();
+        let changed_after_build = false;
         if combined.len() > OUTPUT_BYTE_CAP {
             // Byte-boundary-safe; `String::truncate` would panic on a
             // multibyte boundary. Head+tail keeps any appended stderr.
@@ -236,22 +258,6 @@ impl CustomBashTool {
     }
 }
 
-fn resolve_builtin_web_template(name: &str, cwd: &std::path::Path) -> SelectedTemplate {
-    let cfg = crate::config::extended::load_for_cwd(cwd);
-    if let Some(tpl) = cfg.tools.get(name) {
-        return SelectedTemplate {
-            tpl: tpl.clone(),
-            provenance: ToolTemplateProvenance::Configured {
-                source: format!("effective config for {}", cwd.display()),
-            },
-        };
-    }
-    SelectedTemplate {
-        tpl: crate::tools::custom_templates::default_template_for(name),
-        provenance: ToolTemplateProvenance::ShippedDefault,
-    }
-}
-
 fn render_failure_diagnostic(
     name: &str,
     selected: &SelectedTemplate,
@@ -269,11 +275,11 @@ fn render_failure_diagnostic(
     )
 }
 
-pub(crate) fn is_builtin_web_tool(name: &str) -> bool {
-    matches!(name, WEBFETCH | WEBSEARCH)
+fn first_template_program(template: &str) -> Option<&str> {
+    template.split_whitespace().next().filter(|s| !s.is_empty())
 }
 
-fn neutral_web_description(name: &str) -> Option<&'static str> {
+pub(crate) fn neutral_web_description(name: &str) -> Option<&'static str> {
     match name {
         WEBFETCH => Some(
             "Fetch a URL. Returns page content. Prefer docs for dependency APIs when available.",
@@ -382,6 +388,31 @@ mod tests {
     }
 
     #[test]
+    fn custom_bash_declares_first_template_program_as_required_binary() {
+        let tpl = ToolCommandTemplate {
+            enabled: true,
+            command: "firecrawl search {query}".into(),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            "websearch",
+            &tpl,
+            ToolTemplateProvenance::Configured {
+                source: "test".to_string(),
+            },
+        );
+
+        let requirements = tool.binary_requirements();
+
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].name, "firecrawl");
+        assert_eq!(
+            requirements[0].kind,
+            crate::capabilities::BinaryRequirementKind::Required
+        );
+    }
+
+    #[test]
     fn shell_quote_passes_through_safe_chars() {
         assert_eq!(shell_quote("hello"), "hello");
         assert_eq!(shell_quote("path/to-file.rs"), "path/to-file.rs");
@@ -431,7 +462,6 @@ mod tests {
         let desc = tool.description().to_lowercase();
         assert!(!desc.contains("firecrawl"));
         assert!(!desc.contains("duckduckgo"));
-        assert!(!desc.contains("ddgr"));
         assert!(!desc.contains("curl"));
 
         let schema = tool.parameters();
@@ -445,17 +475,24 @@ mod tests {
     }
 
     #[test]
-    fn web_tool_schema_is_backend_neutral_for_fallback_template() {
-        let tpl = crate::tools::custom_templates::default_template_for("websearch");
+    fn web_tool_schema_is_backend_neutral_for_registered_web_template() {
+        let tpl = ToolCommandTemplate {
+            enabled: true,
+            command: "custom-search {query}".into(),
+            description: None,
+        };
         let tool = CustomBashTool::from_template_with_provenance(
             "websearch",
             &tpl,
-            ToolTemplateProvenance::ShippedDefault,
+            ToolTemplateProvenance::Configured {
+                source: "web.custom.search_command".to_string(),
+            },
         );
         let desc = tool.description().to_lowercase();
-        assert!(!desc.contains("duckduckgo"));
-        assert!(!desc.contains("ddgr"));
-        assert!(!desc.contains("curl"));
+        assert_eq!(
+            desc,
+            neutral_web_description("websearch").unwrap().to_lowercase()
+        );
         assert_eq!(
             tool.parameters()["properties"]["query"]["description"],
             serde_json::json!("Search query.")
@@ -463,42 +500,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_web_call_refreshes_config_after_toolbox_build() {
+    async fn custom_web_call_uses_registered_template_without_runtime_refresh() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         let ctx = crate::tools::common::test_ctx(cwd);
-        let default = crate::tools::custom_templates::default_template_for("webfetch");
-        let tool = CustomBashTool::from_template_with_provenance(
-            "webfetch",
-            &default,
-            ToolTemplateProvenance::ShippedDefault,
-        );
-
         let bin_dir = cwd.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let firecrawl = bin_dir.join("firecrawl");
-        std::fs::write(
-            &firecrawl,
-            "#!/bin/sh\nprintf 'fake-firecrawl:%s\\n' \"$*\"\n",
-        )
-        .unwrap();
+        let registered = bin_dir.join("registered-fetch");
+        std::fs::write(&registered, "#!/bin/sh\nprintf 'registered:%s\\n' \"$*\"\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&firecrawl).unwrap().permissions();
+            let mut perms = std::fs::metadata(&registered).unwrap().permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&firecrawl, perms).unwrap();
+            std::fs::set_permissions(&registered, perms).unwrap();
         }
+        let tpl = ToolCommandTemplate {
+            enabled: true,
+            command: format!("{} {{url}}", registered.display()),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            "webfetch",
+            &tpl,
+            ToolTemplateProvenance::Configured {
+                source: "web.custom.fetch_command".to_string(),
+            },
+        );
+
         let cockpit = cwd.join(".cockpit");
         std::fs::create_dir_all(&cockpit).unwrap();
         std::fs::write(
             cockpit.join("config.json"),
             serde_json::to_string_pretty(&serde_json::json!({
-                "tools": {
-                    "webfetch": {
-                        "enabled": true,
-                        "command": format!("{} scrape --format markdown {{url}}", firecrawl.display()),
-                        "description": "Fetch using Firecrawl"
+                "web": {
+                    "provider": "custom",
+                    "custom": {
+                        "fetch_command": "different-fetch {url}"
                     }
                 }
             }))
@@ -511,15 +549,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(out.content.contains("fake-firecrawl:"));
-        assert!(out.content.contains("scrape --format markdown"));
+        assert!(out.content.contains("registered:"));
         let sidecar = out.output_sidecar.unwrap().payload;
         assert_eq!(sidecar["provenance"], "configured");
-        assert_eq!(sidecar["settings_changed_after_toolbox_build"], true);
-        assert!(
-            !tool.description().to_lowercase().contains("firecrawl"),
-            "model-facing description must stay neutral after runtime refresh"
-        );
+        assert_eq!(sidecar["settings_changed_after_toolbox_build"], false);
     }
 
     #[tokio::test]
@@ -527,17 +560,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         let ctx = crate::tools::common::test_ctx(cwd);
-        std::fs::create_dir_all(cwd.join(".cockpit")).unwrap();
-        std::fs::write(
-            cwd.join(".cockpit/config.json"),
-            r#"{"tools":{"websearch":{"enabled":true,"command":"cockpit-definitely-missing-websearch {query}","description":"Search using provider"}}}"#,
-        )
-        .unwrap();
-        let default = crate::tools::custom_templates::default_template_for("websearch");
+        let tpl = ToolCommandTemplate {
+            enabled: true,
+            command: "cockpit-definitely-missing-websearch {query}".into(),
+            description: None,
+        };
         let tool = CustomBashTool::from_template_with_provenance(
             "websearch",
-            &default,
-            ToolTemplateProvenance::ShippedDefault,
+            &tpl,
+            ToolTemplateProvenance::Configured {
+                source: "web.custom.search_command".to_string(),
+            },
         );
 
         let out = tool
@@ -553,36 +586,14 @@ mod tests {
             )
         );
         assert!(out.content.contains("provenance: configured"));
+        assert!(
+            out.content
+                .contains("missing_binary: cockpit-definitely-missing-websearch")
+        );
+        assert!(out.content.contains(
+            "remedy: Install `cockpit-definitely-missing-websearch` and ensure it is on PATH."
+        ));
         assert!(out.content.contains("[stderr]"));
         assert!(out.content.contains("cockpit-definitely-missing-websearch"));
-    }
-
-    #[tokio::test]
-    async fn missing_shipped_default_executable_reports_default_provenance() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ctx = crate::tools::common::test_ctx(tmp.path());
-        let tpl = ToolCommandTemplate {
-            enabled: true,
-            command: "cockpit-definitely-missing-default-tool {query}".into(),
-            description: None,
-        };
-        let tool = CustomBashTool::from_template_with_provenance(
-            "custom_missing_default",
-            &tpl,
-            ToolTemplateProvenance::ShippedDefault,
-        );
-
-        let out = tool
-            .call(serde_json::json!({"query": "x"}), &ctx)
-            .await
-            .unwrap();
-
-        assert!(out.content.contains("[tool diagnostic]"));
-        assert!(out.content.contains("tool: custom_missing_default"));
-        assert!(out.content.contains(
-            "selected_command_template: cockpit-definitely-missing-default-tool {query}"
-        ));
-        assert!(out.content.contains("provenance: shipped_default"));
-        assert!(out.content.contains("[stderr]"));
     }
 }

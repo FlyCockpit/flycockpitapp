@@ -292,6 +292,7 @@ async fn refresh_redaction_for_turn(
     session: &Session,
     session_id: Uuid,
     project_root: &Path,
+    base_redact: crate::config::extended::RedactConfig,
     overrides: &RedactionSourceOverrides,
     unsupported_notified: &mut HashSet<PathBuf>,
     accumulated_redact: &SharedRedactionTable,
@@ -299,7 +300,7 @@ async fn refresh_redaction_for_turn(
     driver_control_tx: &mpsc::Sender<crate::engine::driver::DriverControl>,
     env: &HashMap<String, String>,
 ) -> bool {
-    let mut cfg = crate::config::extended::load_for_cwd(project_root).redact;
+    let mut cfg = base_redact;
     overrides.apply_to(&mut cfg);
     match crate::redact::RedactionTable::build_with_env_and_store(&cfg, project_root, env) {
         Ok(new_table) => {

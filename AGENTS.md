@@ -11,7 +11,34 @@ Flycockpit is a pnpm/Turborepo monorepo with a React web app, Hono API server, B
 
 Apps under `apps/`: `apps/cli` (Rust Cockpit CLI), `apps/docs` (documentation site), `apps/native` (Expo app), `apps/relay` (TypeScript relay), `apps/relay-rs` (Rust relay replacing the TypeScript relay during the transition), `apps/server` (Hono API), `apps/web` (React app), and `apps/worker` (BullMQ worker).
 
-Rust code lives in the Cargo workspace rooted at this repo's `Cargo.toml`. Current members are `apps/cli` (Cockpit CLI binary, commands, terminal host, and TUI), `apps/relay-rs` (Rust relay), `crates/cockpit-core` (UI-free Cockpit application layer), `crates/cockpit-config` (config types/loading), `crates/cockpit-db` (SQLite layer and migrations), `crates/cockpit-proto` (daemon wire protocol), and `crates/relay-protocol` (relay wire protocol). pnpm/turbo commands do not build or test Rust. Run cargo checks from the repo root: `cargo fmt --check`, `cargo test --locked`, and `cargo clippy --locked -- -D warnings`. CLI CI is `.github/workflows/cli-ci.yml` and releases go through `.github/workflows/release.yml` (cargo-dist + Homebrew tap).
+Rust code lives in the Cargo workspace rooted at this repo's `Cargo.toml`. Current members are `apps/cli` (Cockpit CLI binary, commands, and terminal host), `apps/relay-rs` (Rust relay), `crates/cockpit-tui` (ratatui terminal interface), `crates/cockpit-core` (UI-free Cockpit application layer), `crates/cockpit-config` (config types/loading), `crates/cockpit-db` (SQLite layer and migrations), `crates/cockpit-proto` (daemon wire protocol), and `crates/relay-protocol` (relay wire protocol). pnpm/turbo commands do not build or test Rust. Run cargo checks from the repo root: `cargo fmt --check`, `cargo test --locked`, and `cargo clippy --locked -- -D warnings`. CLI CI is `.github/workflows/cli-ci.yml` and releases go through `.github/workflows/release.yml` (cargo-dist + Homebrew tap).
+
+### Rust crate graph
+
+Dependencies run strictly downward; there are no upward or circular edges. This graph is authoritative — do not duplicate it elsewhere.
+
+```
+apps/cli            -> cockpit-tui, cockpit-core, cockpit-proto, cockpit-config,
+                       cockpit-db, relay-protocol
+crates/cockpit-tui  -> cockpit-core, cockpit-proto, cockpit-config, cockpit-db,
+                       relay-protocol
+crates/cockpit-core -> cockpit-proto, cockpit-config, cockpit-db, relay-protocol
+crates/cockpit-proto-> cockpit-config, cockpit-db
+crates/cockpit-config -> cockpit-db
+crates/cockpit-db   -> (none)
+crates/relay-protocol -> (none)
+
+apps/relay-rs       -> relay-protocol
+```
+
+Layered, the chain is `apps/cli -> cockpit-tui -> cockpit-core -> cockpit-proto -> cockpit-config -> cockpit-db`, with upper crates also depending directly on lower ones.
+
+Rules that follow from the graph:
+
+- `apps/cli` is the only crate that may depend on `crates/cockpit-tui`. Nothing else does, and nothing else should.
+- `crates/cockpit-core` and everything below it must stay free of ratatui, crossterm, and any terminal-UI dependency.
+- `crates/cockpit-db` is the base of the chain and depends on no other workspace crate.
+- Fix a discovered inversion by moving the symbol to its correct crate — never with a shim or a circular dev-dependency.
 
 ## Default Workflow
 

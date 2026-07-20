@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use uuid::Uuid;
 
 /// Sentinel emitted in wire text by
-/// [`crate::tui::paste::PasteRegistry::build_wire`] at each real-image
+/// the TUI paste registry at each real-image
 /// position. We split on it here to interleave text and image content
 /// parts in order when assembling the outbound user [`Message`].
 pub use crate::daemon::proto::IMAGE_PART_SENTINEL;

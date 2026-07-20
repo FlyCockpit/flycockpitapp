@@ -4,7 +4,7 @@
 //! Only the raw-stdout splash and the `LaunchInfo` struct that the TUI
 //! reads on boot live here. Config-directory discovery lives in
 //! `config::dirs`; provider/model detection lives in `config::provider`;
-//! the ratatui-side chrome lives in `tui::chrome`.
+//! the ratatui-side chrome lives in the TUI crate's chrome module.
 
 use std::env;
 use std::path::{Path, PathBuf};

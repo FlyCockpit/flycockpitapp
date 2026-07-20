@@ -96,8 +96,8 @@ pub fn detect_runtime() -> (Option<ContainerRuntime>, ContainerAvailability) {
     #[cfg(any(test, feature = "test-support"))]
     DETECT_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
     let harness = harness_in_container();
-    let docker = which::which("docker").ok();
-    let podman = which::which("podman").ok();
+    let docker = crate::capabilities::resolve_binary("docker");
+    let podman = crate::capabilities::resolve_binary("podman");
     let runtime = docker
         .map(|binary| ContainerRuntime {
             kind: ContainerRuntimeKind::Docker,
@@ -931,6 +931,16 @@ mod tests {
         assert!(!out.contains_key("PATH"));
         assert!(!out.contains_key("API_TOKEN"));
         assert!(!out.contains_key("SCRUB"));
+    }
+
+    #[test]
+    fn default_container_image_keeps_jq_installed() {
+        assert!(
+            DEFAULT_DOCKERFILE
+                .split_whitespace()
+                .any(|token| token == "jq"),
+            "jq is required in the default sandbox image"
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub struct SessionWorkerHandle {
     env_overlay: Arc<RwLock<HashMap<String, String>>>,
     repair_required: Arc<RwLock<Option<proto::ResumeRepairState>>>,
     foreground: Arc<Mutex<LiveForegroundState>>,
+    config_snapshot: Arc<RwLock<SessionConfigSnapshot>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +136,100 @@ fn send_sandbox_unavailable_notice(
     );
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionConfigSnapshot {
+    pub generation: u64,
+    pub providers: crate::config::providers::ProvidersConfig,
+    pub extended: crate::config::extended::ExtendedConfig,
+}
+
+impl SessionConfigSnapshot {
+    pub fn new(
+        generation: u64,
+        providers: crate::config::providers::ProvidersConfig,
+        extended: crate::config::extended::ExtendedConfig,
+    ) -> Self {
+        Self {
+            generation,
+            providers,
+            extended,
+        }
+    }
+
+    pub fn to_proto(&self, session_id: Uuid) -> proto::ConfigSnapshot {
+        proto::ConfigSnapshot {
+            session_id,
+            generation: self.generation,
+            extended: redacted_extended_config(&self.extended),
+            providers: redacted_provider_view(&self.providers),
+        }
+    }
+}
+
+fn redacted_extended_config(
+    extended: &crate::config::extended::ExtendedConfig,
+) -> crate::config::extended::ExtendedConfig {
+    let mut extended = extended.clone();
+    extended.redact.denylist = extended
+        .redact
+        .denylist
+        .iter()
+        .map(|_| "[redacted]".to_string())
+        .collect();
+    extended
+}
+
+fn redacted_provider_view(
+    providers: &crate::config::providers::ProvidersConfig,
+) -> proto::ProviderConfigView {
+    proto::ProviderConfigView {
+        providers: providers
+            .providers
+            .iter()
+            .map(|(id, entry)| {
+                let credential_configured =
+                    entry.credential_ref.is_some() || !entry.headers.is_empty();
+                let headers = entry
+                    .headers
+                    .iter()
+                    .map(|header| proto::ProviderHeaderView {
+                        name: header.name.clone(),
+                        value: "[redacted]".to_string(),
+                        redacted: true,
+                    })
+                    .collect();
+                let mut entry = entry.clone();
+                entry.credential_ref = None;
+                entry.headers.clear();
+                (
+                    id.clone(),
+                    proto::ProviderEntryView {
+                        entry,
+                        headers,
+                        credential_configured,
+                    },
+                )
+            })
+            .collect(),
+        category_defaults: providers.category_defaults.clone(),
+        on_unlisted_models_fetch: providers.on_unlisted_models_fetch,
+        active_model: providers.active_model.clone(),
+    }
+}
+
+fn replace_config_snapshot(
+    config_snapshot: &Arc<RwLock<SessionConfigSnapshot>>,
+    replacement: SessionConfigSnapshot,
+) -> u64 {
+    let mut snapshot = config_snapshot
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    snapshot.generation = snapshot.generation.saturating_add(1);
+    snapshot.providers = replacement.providers;
+    snapshot.extended = replacement.extended;
+    snapshot.generation
+}
+
 fn sandbox_unavailable_notice_from_availability(
     availability: &crate::tools::shell_sandbox::SandboxAvailability,
 ) -> Option<SandboxUnavailableNotice> {
@@ -166,7 +261,11 @@ fn emit_session_driver_failed_once(
     send_current_event(
         event_tx,
         redaction,
-        proto::Event::SessionDriverFailed { session_id, error },
+        proto::Event::SessionDriverFailed {
+            session_id,
+            turn_id: None,
+            error,
+        },
     );
 }
 
@@ -194,11 +293,10 @@ async fn send_driver_control_or_fail(
 
 fn active_wire_api_for_session(
     session: &Session,
-    project_root: &Path,
+    providers: &crate::config::providers::ProvidersConfig,
 ) -> (String, String, crate::config::providers::WireApi) {
     let provider = session.active_provider().unwrap_or_default();
     let model = session.active_model().unwrap_or_default();
-    let providers = crate::secret_ref::load_effective(project_root);
     let configured = providers.resolve_wire_api(&provider, &model);
     let resolved = if configured.is_auto() {
         crate::config::providers::WireApi::detect_for_provider(&provider, &model)
@@ -218,10 +316,10 @@ fn wire_api_label(wire_api: crate::config::providers::WireApi) -> &'static str {
 
 fn build_resume_repair_state(
     session: &Session,
-    project_root: &Path,
+    providers: &crate::config::providers::ProvidersConfig,
     repair: &crate::engine::rehydrate::RehydrateRepairRequired,
 ) -> proto::ResumeRepairState {
-    let (provider, model, wire_api) = active_wire_api_for_session(session, project_root);
+    let (provider, model, wire_api) = active_wire_api_for_session(session, providers);
     proto::ResumeRepairState {
         session_id: session.id,
         short_id: session.short_id.clone(),
@@ -282,6 +380,11 @@ impl SessionWorkerHandle {
             env_overlay: Arc::new(RwLock::new(HashMap::new())),
             repair_required: Arc::new(RwLock::new(None)),
             foreground: Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string()))),
+            config_snapshot: Arc::new(RwLock::new(SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig::default(),
+            ))),
         };
         (handle, work_rx)
     }
@@ -513,6 +616,10 @@ impl SessionWorkerHandle {
         current_redaction(&self.redaction)
     }
 
+    pub fn session(&self) -> Arc<Session> {
+        self.session.clone()
+    }
+
     pub fn broadcast_notice(&self, text: String) {
         send_current_session_event_with_agent(
             &self.session,
@@ -552,6 +659,24 @@ impl SessionWorkerHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .snapshot()
+    }
+
+    pub fn config_snapshot(&self) -> SessionConfigSnapshot {
+        self.config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn broadcast_config_snapshot(&self) {
+        let snapshot = self.config_snapshot().to_proto(self.session_id);
+        send_current_event(
+            &self.event_tx,
+            &self.redaction,
+            proto::Event::ConfigSnapshot {
+                snapshot: Box::new(snapshot),
+            },
+        );
     }
 
     pub fn active_tool_names(&self) -> Vec<String> {
@@ -756,6 +881,10 @@ pub enum SessionWork {
     RepairResume {
         respond_to: oneshot::Sender<std::result::Result<(), String>>,
     },
+    ReplaceConfigSnapshot {
+        snapshot: Box<SessionConfigSnapshot>,
+        respond_to: oneshot::Sender<u64>,
+    },
     SetActiveModel {
         provider: String,
         model: String,
@@ -851,17 +980,22 @@ pub fn spawn(
     extended_cfg: &crate::config::extended::ExtendedConfig,
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     global_bus: Option<EventSender>,
     trust_policy: crate::config::trust::WorkspaceTrustPolicy,
     cleanup: Option<Box<dyn FnOnce() + Send + 'static>>,
     env_snapshot: EnvSnapshot,
+    config_snapshot: SessionConfigSnapshot,
 ) -> (SessionWorkerHandle, tokio::task::JoinHandle<()>) {
     let session_id = session.id;
     // The primary the chrome's active-agent slot opens on: the stored agent
     // (resume) or the configured default (`Auto` unless pinned). The worker
     // re-derives the same value via `resolve_root_agent` and emits
     // `PrimarySwapped` on any later swap, so this is purely the start state.
-    let initial_agent = resolve_root_agent(session_id, &session.db, extended_cfg);
+    let initial_agent = session
+        .assistant_name
+        .clone()
+        .unwrap_or_else(|| resolve_root_agent(session_id, &session.db, extended_cfg));
     // Resolve the new-session sandbox default (highest wins):
     //   (a) daemon launched `--no-sandbox` → OFF for ALL sessions.
     //   (b) else this client passed `--no-sandbox` → OFF for the
@@ -914,6 +1048,7 @@ pub fn spawn(
     let env_overlay = Arc::new(RwLock::new(env_snapshot.into_vars()));
     let repair_required = Arc::new(RwLock::new(None));
     let foreground = Arc::new(Mutex::new(LiveForegroundState::new(initial_agent.clone())));
+    let config_snapshot = Arc::new(RwLock::new(config_snapshot));
 
     let handle = SessionWorkerHandle {
         session_id,
@@ -932,6 +1067,7 @@ pub fn spawn(
         env_overlay: env_overlay.clone(),
         repair_required: repair_required.clone(),
         foreground: foreground.clone(),
+        config_snapshot: config_snapshot.clone(),
     };
 
     handle.probe_sandbox_unavailable();
@@ -960,8 +1096,10 @@ pub fn spawn(
             env_overlay,
             repair_required,
             foreground,
+            config_snapshot,
             lsp,
             resource_scheduler,
+            scheduler,
             global_bus,
         ));
         crate::config::trust::scope_workspace_trust_policy(

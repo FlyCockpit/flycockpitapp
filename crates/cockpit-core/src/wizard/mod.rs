@@ -8,6 +8,13 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow};
 
+mod apply;
+
+pub use apply::{
+    apply_model_answers, apply_security_answers, descriptor_for_cwd, model_descriptor_for_cwd,
+    security_config_path,
+};
+
 pub const PROVIDER_WIZARD_ID: &str = "provider";
 pub const SECURITY_WIZARD_ID: &str = "security";
 pub const MODEL_WIZARD_ID: &str = "model";
@@ -23,6 +30,7 @@ pub struct SelectOption {
 pub enum StepKind {
     Select { options: Vec<SelectOption> },
     MultiToggle { options: Vec<SelectOption> },
+    ToolSurface,
     Text,
     Secret,
     Info,
@@ -34,6 +42,7 @@ pub enum StepKind {
 pub enum WizardAnswer {
     Select(String),
     MultiToggle(Vec<String>),
+    ToolSurface(crate::agents::ToolSurfaceSelection),
     Text(String),
     Secret(String),
     Confirm(bool),

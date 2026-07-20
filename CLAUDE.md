@@ -8,7 +8,7 @@ Also read `AGENTS.md` — it is the authoritative workspace map and contains the
 
 Flycockpit is a pnpm + Turborepo monorepo of TypeScript apps and packages, plus a Cargo workspace rooted at `Cargo.toml`. `AGENTS.md` is authoritative for workspace shape; keep this short map in sync with it. Apps under `apps/`: `apps/cli`, `apps/docs`, `apps/native`, `apps/relay`, `apps/relay-rs`, `apps/server`, `apps/web`, and `apps/worker`.
 
-Current Rust members are `apps/cli` (the `cockpit` CLI binary, commands, terminal host, and TUI), `apps/relay-rs` (Rust relay), `crates/cockpit-core` (UI-free Cockpit application layer), `crates/cockpit-config` (config types/loading), `crates/cockpit-db` (SQLite layer and migrations), `crates/cockpit-proto` (daemon wire protocol), and `crates/relay-protocol` (relay wire protocol). Rust crates are NOT pnpm workspace packages: pnpm/turbo commands never build or test them — run cargo from the repo root.
+Current Rust members are `apps/cli` (the `cockpit` CLI binary, commands, and terminal host), `apps/relay-rs` (Rust relay), `crates/cockpit-tui` (ratatui terminal interface), `crates/cockpit-core` (UI-free Cockpit application layer), `crates/cockpit-config` (config types/loading), `crates/cockpit-db` (SQLite layer and migrations), `crates/cockpit-proto` (daemon wire protocol), and `crates/relay-protocol` (relay wire protocol). See the Rust crate graph in `AGENTS.md` for the authoritative dependency direction. Rust crates are NOT pnpm workspace packages: pnpm/turbo commands never build or test them — run cargo from the repo root.
 
 ### TypeScript side
 
@@ -28,7 +28,7 @@ Data flow: web/native → oRPC client (React Query options) → routers in `pack
 
 ### Rust (`apps/cli`, `crates/*`)
 
-`apps/cli` is the Rust `cockpit` AI coding harness binary. It owns CLI argument parsing, subcommand wiring, terminal host integration, and `apps/cli/src/tui/`. Reusable application logic lives in `crates/cockpit-core`, including daemon, engine, providers, auth, tools, agents, skills, session, redaction, packages, and wizard modules. SQLite storage and migrations live in `crates/cockpit-db`; config types/loading live in `crates/cockpit-config`; daemon protocol types live in `crates/cockpit-proto`.
+`apps/cli` is the Rust `cockpit` AI coding harness binary. It owns CLI argument parsing, subcommand wiring, and terminal host integration; `commands/tui.rs` launches `cockpit_tui::tui::app::App`, the one sanctioned binary-to-UI edge. The ratatui terminal interface, panes, overlays, and clipboard helpers live in `crates/cockpit-tui`. Reusable application logic lives in `crates/cockpit-core`, including daemon, engine, providers, auth, tools, agents, skills, session, redaction, packages, and wizard modules. SQLite storage and migrations live in `crates/cockpit-db`; config types/loading live in `crates/cockpit-config`; daemon protocol types live in `crates/cockpit-proto`.
 
 `apps/relay-rs` is the Rust relay that is replacing `apps/relay`; both relay implementations exist during the transition tracked by the `retire-typescript-relay` prompt. Relay wire types live in `crates/relay-protocol`.
 

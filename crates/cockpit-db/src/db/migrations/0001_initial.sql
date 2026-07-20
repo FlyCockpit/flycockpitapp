@@ -609,6 +609,17 @@ CREATE TABLE compaction_handoffs (
 
 CREATE INDEX idx_compaction_handoffs_session ON compaction_handoffs(session_id);
 
+-- One durable speculative compaction shadow per non-ephemeral session. The
+-- payload is owned by cockpit-core so it can evolve from a ready shadow brief
+-- to a prepared compaction without another schema change.
+CREATE TABLE compaction_shadows (
+    session_id   TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
 -- ---- approval_grants (sandboxing part 1, §2) -------------------------------------
 -- Session-scope command/path approval grants; a present row skips the
 -- approval prompt. Project- and Global-scope grants persist outside the

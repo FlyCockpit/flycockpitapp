@@ -28,8 +28,7 @@
 //! [`Db::raise_interrupt_questions`], [`InterruptHub::register`] a
 //! wakeup, [`InterruptHub::emit_raised`] to attached clients, then block
 //! on [`PendingInterrupt::wait`]. The TUI renders it with
-//! [`crate::tui::dialog::question::QuestionDialog`] over the shared
-//! [`crate::tui::dialog::DialogState`]. The resolved option id maps back
+//! TUI question dialog over the shared dialog state. The resolved option id maps back
 //! to a [`Scope`]; a non-`Once` choice records the grant *before* the
 //! decision returns.
 //!

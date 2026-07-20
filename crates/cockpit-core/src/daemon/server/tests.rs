@@ -140,6 +140,932 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn goal_rpc_reads_sets_and_clears() {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        ctx.db
+            .create_session_goal(
+                session.session_id,
+                &session.project_id,
+                "ship daemon goal rpc",
+                Some("context secret"),
+                Some(100),
+            )
+            .unwrap();
+        let mut state = owner_state();
+
+        let response = handle_request(
+            Request::GoalStatus {
+                session_id: session.session_id,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("goal status");
+        let Response::GoalStatus { goal: Some(goal) } = response else {
+            panic!("expected goal status response");
+        };
+        assert_eq!(goal.session_id, session.session_id);
+        assert_eq!(goal.objective, "ship daemon goal rpc");
+        assert_eq!(goal.status, proto::GoalStatus::Active);
+
+        let response = handle_request(
+            Request::SetGoalStatus {
+                session_id: session.session_id,
+                status: proto::GoalStatus::Paused,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("pause goal");
+        let Response::GoalUpdated { goal } = response else {
+            panic!("expected goal updated response");
+        };
+        assert_eq!(goal.status, proto::GoalStatus::Paused);
+
+        let response = handle_request(
+            Request::SetGoalStatus {
+                session_id: session.session_id,
+                status: proto::GoalStatus::Active,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("resume goal");
+        let Response::GoalUpdated { goal } = response else {
+            panic!("expected goal updated response");
+        };
+        assert_eq!(goal.status, proto::GoalStatus::Active);
+
+        let response = handle_request(
+            Request::ClearGoal {
+                session_id: session.session_id,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("clear goal");
+        assert!(matches!(response, Response::GoalCleared { cleared: true }));
+
+        let response = handle_request(
+            Request::GoalStatus {
+                session_id: session.session_id,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("goal status after clear");
+        assert!(matches!(response, Response::GoalStatus { goal: None }));
+    }
+
+    #[tokio::test]
+    async fn goal_change_is_visible_to_live_worker() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, session_id, _work_rx) =
+            attached_state_with_worker_receiver(&ctx, tmp.path());
+        let session = ctx.db.get_session(session_id).unwrap().unwrap();
+        ctx.db
+            .create_session_goal(
+                session_id,
+                &session.project_id,
+                "ship live goal coherence",
+                None,
+                Some(100),
+            )
+            .unwrap();
+        let live_before = state
+            .attached
+            .as_ref()
+            .expect("attached live worker")
+            .handle
+            .session();
+
+        let response = handle_request(
+            Request::SetGoalStatus {
+                session_id,
+                status: proto::GoalStatus::Paused,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("pause live goal");
+        assert!(matches!(
+            response,
+            Response::GoalUpdated {
+                goal: proto::GoalSummary {
+                    status: proto::GoalStatus::Paused,
+                    ..
+                }
+            }
+        ));
+
+        let live_after = state
+            .attached
+            .as_ref()
+            .expect("attached live worker")
+            .handle
+            .session();
+        assert!(
+            Arc::ptr_eq(&live_before, &live_after),
+            "goal change must not require replacing the live session"
+        );
+        let goal = live_after
+            .db
+            .current_session_goal(live_after.id, false)
+            .unwrap()
+            .expect("goal visible through live worker session handle");
+        assert_eq!(goal.status, proto::GoalStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, session_id, mut work_rx) =
+            attached_state_with_worker_receiver(&ctx, tmp.path());
+        let session = ctx.db.get_session(session_id).unwrap().unwrap();
+        ctx.db
+            .create_session_goal(
+                session_id,
+                &session.project_id,
+                "ship midturn goal boundary",
+                None,
+                Some(100),
+            )
+            .unwrap();
+
+        let first_ctx = ctx.clone();
+        let first = tokio::spawn(async move {
+            let mut state = state;
+            let result = handle_request(
+                Request::SendUserMessage {
+                    text: "first turn".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    image_refs: Vec::new(),
+                    forced_skill: None,
+                },
+                &mut state,
+                &first_ctx,
+            )
+            .await;
+            (state, result)
+        });
+        let first_work = tokio::time::timeout(std::time::Duration::from_secs(2), work_rx.recv())
+            .await
+            .expect("first turn delivered")
+            .expect("first turn work");
+        let SessionWork::UserMessage {
+            submission,
+            respond_to,
+        } = first_work
+        else {
+            panic!("expected first user message work");
+        };
+        assert_eq!(submission.text, "first turn");
+        assert_eq!(
+            ctx.db
+                .current_session_goal(session_id, false)
+                .unwrap()
+                .expect("goal exists")
+                .status,
+            crate::db::session_goals::GoalStatus::Active
+        );
+
+        let mut rpc_state = owner_state();
+        handle_request(
+            Request::SetGoalStatus {
+                session_id,
+                status: proto::GoalStatus::Paused,
+            },
+            &mut rpc_state,
+            &ctx,
+        )
+        .await
+        .expect("midturn pause persists");
+        assert_eq!(
+            ctx.db
+                .current_session_goal(session_id, false)
+                .unwrap()
+                .expect("goal persists immediately")
+                .status,
+            crate::db::session_goals::GoalStatus::Paused
+        );
+
+        let item = proto::QueueItem {
+            id: Uuid::new_v4(),
+            status: proto::QueueItemStatus::Queued,
+            text: submission.text.clone(),
+            display_text: None,
+            target: proto::QueueTarget::default(),
+        };
+        respond_to.send((item.clone(), vec![item])).unwrap();
+        let (state, first_response) = first.await.expect("first turn request joins");
+        assert!(matches!(
+            first_response.expect("first turn completes"),
+            Response::UserMessageQueued { .. }
+        ));
+
+        let second_ctx = ctx.clone();
+        let second = tokio::spawn(async move {
+            let mut state = state;
+            let result = handle_request(
+                Request::SendUserMessage {
+                    text: "second turn".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    image_refs: Vec::new(),
+                    forced_skill: None,
+                },
+                &mut state,
+                &second_ctx,
+            )
+            .await;
+            result
+        });
+        let second_work = tokio::time::timeout(std::time::Duration::from_secs(2), work_rx.recv())
+            .await
+            .expect("second turn delivered")
+            .expect("second turn work");
+        let SessionWork::UserMessage {
+            submission,
+            respond_to,
+        } = second_work
+        else {
+            panic!("expected second user message work");
+        };
+        assert_eq!(submission.text, "second turn");
+        assert_eq!(
+            ctx.db
+                .current_session_goal(session_id, false)
+                .unwrap()
+                .expect("next turn reads paused goal")
+                .status,
+            crate::db::session_goals::GoalStatus::Paused
+        );
+        let item = proto::QueueItem {
+            id: Uuid::new_v4(),
+            status: proto::QueueItemStatus::Queued,
+            text: submission.text.clone(),
+            display_text: None,
+            target: proto::QueueTarget::default(),
+        };
+        respond_to.send((item.clone(), vec![item])).unwrap();
+        assert!(matches!(
+            second.await.expect("second turn joins").expect("second turn completes"),
+            Response::UserMessageQueued { .. }
+        ));
+    }
+
+    #[test]
+    fn new_session_state_requests_are_classified() {
+        let session_id = Uuid::from_u128(42);
+        let state = owner_state();
+        let cases = [
+            (
+                Request::GoalStatus { session_id },
+                "goal_status",
+                Some(session_id),
+                false,
+                None,
+            ),
+            (
+                Request::SetGoalStatus {
+                    session_id,
+                    status: proto::GoalStatus::Paused,
+                },
+                "set_goal_status",
+                Some(session_id),
+                true,
+                None,
+            ),
+            (
+                Request::ClearGoal { session_id },
+                "clear_goal",
+                Some(session_id),
+                true,
+                None,
+            ),
+            (Request::ListAssistants, "list_assistants", None, false, None),
+            (
+                Request::CreateAssistantSession {
+                    name: "helper".into(),
+                    project_root: "/repo".into(),
+                    no_sandbox: false,
+                    env_snapshot: None,
+                },
+                "create_assistant_session",
+                None,
+                true,
+                None,
+            ),
+            (
+                Request::StatsRollup {
+                    project_id: None,
+                    range: proto::StatsRange::AllTime,
+                    by_role: false,
+                },
+                "stats_rollup",
+                None,
+                false,
+                None,
+            ),
+            (
+                Request::ExportSessionData {
+                    session_id,
+                    kind: proto::ExportSessionKind::TranscriptJson,
+                    include_generated_artifacts: false,
+                    include_sensitive: false,
+                },
+                "export_session_data",
+                Some(session_id),
+                false,
+                None,
+            ),
+            (
+                Request::AutoTitle { session_id },
+                "auto_title",
+                Some(session_id),
+                true,
+                None,
+            ),
+            (
+                Request::Curator {
+                    project_root: "/repo".into(),
+                    action: proto::CuratorAction::Status,
+                },
+                "curator",
+                None,
+                true,
+                Some("/repo"),
+            ),
+        ];
+
+        for (request, kind, session, mutating, audit_path) in cases {
+            assert_eq!(principal::request_kind(&request), kind);
+            assert_eq!(request_session_id(&request, &state), session, "{kind}");
+            assert_eq!(
+                is_remote_mutating_request(&request),
+                mutating,
+                "{kind}"
+            );
+            assert_eq!(request_audit_path(&request).as_deref(), audit_path, "{kind}");
+        }
+    }
+
+    #[test]
+    fn new_session_state_requests_enforce_authorization() {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        let session_id = session.session_id;
+        let state = remote_state_with_grants(Vec::new());
+        let requests = [
+            Request::GoalStatus { session_id },
+            Request::SetGoalStatus {
+                session_id,
+                status: proto::GoalStatus::Paused,
+            },
+            Request::ClearGoal { session_id },
+            Request::ListAssistants,
+            Request::CreateAssistantSession {
+                name: "helper".into(),
+                project_root: "/repo".into(),
+                no_sandbox: false,
+                env_snapshot: None,
+            },
+            Request::StatsRollup {
+                project_id: None,
+                range: proto::StatsRange::AllTime,
+                by_role: false,
+            },
+            Request::ExportSessionData {
+                session_id,
+                kind: proto::ExportSessionKind::TranscriptJson,
+                include_generated_artifacts: false,
+                include_sensitive: false,
+            },
+            Request::AutoTitle { session_id },
+            Request::Curator {
+                project_root: "/repo".into(),
+                action: proto::CuratorAction::Status,
+            },
+        ];
+
+        for request in requests {
+            let kind = principal::request_kind(&request);
+            let err = authorize_request(&request, &state, &ctx)
+                .err()
+                .unwrap_or_else(|| panic!("{kind} unexpectedly authorized"));
+            assert_eq!(err.code, ErrorCode::Authorization, "{kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stats_rpc_returns_rollup() {
+        let ctx = test_ctx();
+        let mut state = owner_state();
+        let response = handle_request(
+            Request::StatsRollup {
+                project_id: Some("project-1".to_string()),
+                range: proto::StatsRange::Last7Days,
+                by_role: true,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("stats rollup");
+        let Response::StatsRollup { rollup } = response else {
+            panic!("expected StatsRollup response");
+        };
+        assert_eq!(rollup.project_id.as_deref(), Some("project-1"));
+        assert_eq!(rollup.range, "7d");
+        assert!(rollup.tokens.by_model.is_empty());
+        assert!(matches!(rollup.tokens.by_role, Some(rows) if rows.is_empty()));
+        assert!(rollup.recovery.by_model.is_empty());
+        assert!(rollup.language.languages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stats_rollup_runs_off_request_loop() {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("project-1", "/repo", "Build").unwrap();
+        ctx.db
+            .insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
+                call_id: Uuid::new_v4(),
+                session_id: session.session_id,
+                project_id: "project-1".to_string(),
+                project_root: "/repo".to_string(),
+                model: "gpt-5".to_string(),
+                provider: "openai".to_string(),
+                timestamp: chrono::Utc::now().timestamp(),
+                input_tokens: 10,
+                output_tokens: 20,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd_micros: None,
+                is_utility: false,
+            })
+            .unwrap();
+        let mut state = owner_state();
+
+        let response = handle_request(
+            Request::StatsRollup {
+                project_id: Some("project-1".to_string()),
+                range: proto::StatsRange::AllTime,
+                by_role: true,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("stats rollup");
+
+        let Response::StatsRollup { rollup } = response else {
+            panic!("expected StatsRollup response");
+        };
+        assert_eq!(rollup.project_id.as_deref(), Some("project-1"));
+        assert_eq!(rollup.range, "all");
+        assert_eq!(rollup.tokens.by_model.len(), 1);
+        assert_eq!(rollup.tokens.by_model[0].model, "gpt-5");
+        assert_eq!(rollup.tokens.by_model[0].provider, "openai");
+        assert_eq!(rollup.tokens.by_model[0].input_tokens, 10);
+        assert_eq!(rollup.tokens.by_model[0].output_tokens, 20);
+    }
+
+    #[tokio::test]
+    async fn assistant_rpc_creates_session_via_registry() {
+        let ctx = test_ctx();
+        let assistant_home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        create_test_assistant(&ctx, &assistant_home, "helper-bot");
+        let mut state = owner_state();
+
+        let response = handle_request(Request::ListAssistants, &mut state, &ctx)
+            .await
+            .expect("list assistants");
+        let Response::Assistants { assistants } = response else {
+            panic!("expected Assistants response");
+        };
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0].name, "helper-bot");
+
+        let response = handle_request(
+            Request::CreateAssistantSession {
+                name: "helper-bot".into(),
+                project_root: project.path().to_string_lossy().into_owned(),
+                no_sandbox: false,
+                env_snapshot: None,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("create assistant session");
+        let Response::AssistantSessionCreated { session } = response else {
+            panic!("expected AssistantSessionCreated response");
+        };
+        assert_eq!(session.assistant_name, "helper-bot");
+        assert_eq!(session.active_agent, "helper-bot");
+        assert!(
+            ctx.registry
+                .active_session_ids()
+                .contains(&session.session_id),
+            "created assistant session is live in the registry"
+        );
+        assert!(
+            ctx.db.get_session(session.session_id).unwrap().is_none(),
+            "created assistant session is deferred until first user message"
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_session_creation_is_atomic() {
+        let ctx = test_ctx();
+        let assistant_home = tempfile::tempdir().unwrap();
+        let untrusted_project = tempfile::tempdir().unwrap();
+        create_test_assistant(&ctx, &assistant_home, "helper-bot");
+        let mut state = owner_state();
+
+        let err = handle_request(
+            Request::CreateAssistantSession {
+                name: "helper-bot".into(),
+                project_root: untrusted_project.path().to_string_lossy().into_owned(),
+                no_sandbox: false,
+                env_snapshot: None,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect_err("untrusted workspace rejects assistant session creation");
+
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            ctx.registry.active_session_ids().is_empty(),
+            "failed assistant session creation must not register a live worker"
+        );
+        assert!(
+            ctx.db.list_sessions(false, 100).unwrap().is_empty(),
+            "failed assistant session creation must not persist a session row"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_title_rpc_generates_title() {
+        let project = tempfile::tempdir().unwrap();
+        let url = auto_title_model_server(Some("Codex Model Fetch".to_string())).await;
+        let ctx = test_ctx_with_config_source(auto_title_config_source(&url));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", project.path().to_str().unwrap(), "Build")
+            .unwrap();
+        ctx.db
+            .insert_session_event(
+                session.session_id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "fetch the codex model list"}),
+            )
+            .unwrap();
+        let mut state = owner_state();
+
+        let response = handle_request(
+            Request::AutoTitle {
+                session_id: session.session_id,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("auto title");
+
+        let Response::AutoTitle { session_id, title } = response else {
+            panic!("expected AutoTitle response");
+        };
+        assert_eq!(session_id, session.session_id);
+        assert_eq!(title, "codex-model-fetch");
+        let row = ctx.db.get_session(session.session_id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("codex-model-fetch"));
+        assert!(!row.user_renamed);
+    }
+
+    #[tokio::test]
+    async fn auto_title_failure_leaves_session_unrenamed() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", project.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let mut state = owner_state();
+
+        let err = handle_request(
+            Request::AutoTitle {
+                session_id: session.session_id,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect_err("missing utility model rejects");
+
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        let row = ctx.db.get_session(session.session_id).unwrap().unwrap();
+        assert!(row.title.is_none());
+        assert!(!row.user_renamed);
+    }
+
+    #[tokio::test]
+    async fn concurrent_auto_title_second_attempt_is_rejected() {
+        let project = tempfile::tempdir().unwrap();
+        let url = auto_title_model_server(Some("Concurrent Title".to_string())).await;
+        let ctx = test_ctx_with_config_source(auto_title_config_source(&url));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", project.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let mut first_state = owner_state();
+        let mut second_state = owner_state();
+        let first_request = Request::AutoTitle {
+            session_id: session.session_id,
+        };
+        let second_request = first_request.clone();
+
+        let (first, second) = tokio::join!(
+            handle_request(first_request, &mut first_state, &ctx),
+            handle_request(second_request, &mut second_state, &ctx),
+        );
+
+        let mut successes = 0;
+        let mut rejections = 0;
+        for result in [first, second] {
+            match result {
+                Ok(Response::AutoTitle { title, .. }) => {
+                    successes += 1;
+                    assert_eq!(title, "concurrent-title");
+                }
+                Err(err)
+                    if err.code == ErrorCode::BadRequest
+                        && err.message.contains("already has a title") =>
+                {
+                    rejections += 1;
+                }
+                other => panic!("unexpected auto-title result: {other:?}"),
+            }
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(rejections, 1);
+        let row = ctx.db.get_session(session.session_id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("concurrent-title"));
+        assert!(!row.user_renamed);
+    }
+
+    #[tokio::test]
+    async fn export_rpc_returns_redacted_data() {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        let call_id = Uuid::new_v4().to_string();
+        ctx.db
+            .insert_session_event(
+                session.session_id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "hello [redacted]"}),
+            )
+            .unwrap();
+        ctx.db
+            .insert_inference_request(
+                &call_id,
+                session.session_id,
+                &serde_json::json!({
+                    "model": "m",
+                    "system": "visible [redacted]",
+                    "tools": [],
+                    "history": []
+                }),
+                crate::db::session_log::InferenceRequestStatus::Completed,
+            )
+            .unwrap();
+        ctx.db
+            .insert_session_event(
+                session.session_id,
+                crate::db::session_log::SessionEventKind::InferenceRequest,
+                Some("Build"),
+                Some(&call_id),
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        let mut state = owner_state();
+
+        let response = handle_request(
+            Request::ExportSessionData {
+                session_id: session.session_id,
+                kind: proto::ExportSessionKind::TranscriptJson,
+                include_generated_artifacts: false,
+                include_sensitive: false,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("transcript export");
+        let Response::ExportSessionData { data } = response else {
+            panic!("expected ExportSessionData response");
+        };
+        assert_eq!(data.kind, proto::ExportSessionKind::TranscriptJson);
+        assert_eq!(data.filename_extension, "json");
+        assert!(data.redacted);
+        let transcript = base64::engine::general_purpose::STANDARD
+            .decode(data.content_base64.as_bytes())
+            .unwrap();
+        let transcript_json: serde_json::Value = serde_json::from_slice(&transcript).unwrap();
+        assert!(transcript_json.to_string().contains("[redacted]"));
+        assert!(!transcript_json.to_string().contains("sk-"));
+
+        let response = handle_request(
+            Request::ExportSessionData {
+                session_id: session.session_id,
+                kind: proto::ExportSessionKind::DebugBundle,
+                include_generated_artifacts: false,
+                include_sensitive: false,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("debug bundle export");
+        let Response::ExportSessionData { data } = response else {
+            panic!("expected ExportSessionData response");
+        };
+        assert_eq!(data.kind, proto::ExportSessionKind::DebugBundle);
+        assert_eq!(data.filename_extension, "zip");
+        assert_eq!(data.mime, "application/zip");
+        assert_eq!(data.session_count, Some(1));
+        assert_eq!(data.byte_len, base64::engine::general_purpose::STANDARD
+            .decode(data.content_base64.as_bytes())
+            .unwrap()
+            .len());
+        assert!(data.redacted);
+    }
+
+    #[tokio::test]
+    async fn curator_rpc_performs_curation() {
+        let project = tempfile::tempdir().unwrap();
+        let skill_root = project.path().join(".agents").join("skills");
+        write_curator_skill(&skill_root, "curated");
+        let ctx = test_ctx_with_config_source(curator_config_source(&skill_root));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let mut state = owner_state();
+
+        let response = handle_request(
+            Request::Curator {
+                project_root: project.path().to_string_lossy().into_owned(),
+                action: proto::CuratorAction::Status,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("curator status");
+        let Response::Curator {
+            result: proto::CuratorResult::Status { status },
+        } = response
+        else {
+            panic!("expected curator status");
+        };
+        assert_eq!(status.skills.len(), 1);
+        assert_eq!(status.skills[0].name, "curated");
+
+        let response = handle_request(
+            Request::Curator {
+                project_root: project.path().to_string_lossy().into_owned(),
+                action: proto::CuratorAction::Run {
+                    dry_run: true,
+                    consolidate: false,
+                },
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("curator dry run");
+        let Response::Curator {
+            result: proto::CuratorResult::Run { report },
+        } = response
+        else {
+            panic!("expected curator run");
+        };
+        assert!(report.dry_run);
+        assert_eq!(report.scanned, 1);
+
+        handle_request(
+            Request::Curator {
+                project_root: project.path().to_string_lossy().into_owned(),
+                action: proto::CuratorAction::Pin {
+                    name: "curated".to_string(),
+                },
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("curator pin");
+        assert!(
+            ctx.db
+                .get_skill_usage("curated")
+                .unwrap()
+                .expect("skill usage row")
+                .pinned
+        );
+    }
+
+    #[tokio::test]
+    async fn curator_rpc_failure_leaves_skills_unchanged() {
+        let project = tempfile::tempdir().unwrap();
+        let skill_root = project.path().join(".agents").join("skills");
+        write_curator_skill(&skill_root, "curated");
+        let ctx = test_ctx_with_config_source(curator_config_source(&skill_root));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let mut state = owner_state();
+
+        handle_request(
+            Request::Curator {
+                project_root: project.path().to_string_lossy().into_owned(),
+                action: proto::CuratorAction::Status,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("seed curator status");
+        let before = ctx.db.list_skill_usage().unwrap();
+
+        let err = handle_request(
+            Request::Curator {
+                project_root: project.path().to_string_lossy().into_owned(),
+                action: proto::CuratorAction::Pin {
+                    name: "missing".to_string(),
+                },
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect_err("unknown skill rejects");
+
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert_eq!(ctx.db.list_skill_usage().unwrap(), before);
+        assert!(skill_root.join("curated").join("SKILL.md").is_file());
+    }
+
     #[test]
     fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
         let table = table_for("client-boundary-secret");
@@ -372,6 +1298,122 @@ mod tests {
             crate::daemon::terminal::test_host_factory(),
             config_source,
         ))
+    }
+
+    fn curator_config_source(skill_root: &Path) -> crate::daemon::config_source::ConfigSource {
+        let extended = crate::config::extended::ExtendedConfig {
+            skills: crate::config::extended::SkillsConfig {
+                scan_dirs: vec![skill_root.to_string_lossy().into_owned()],
+                ..crate::config::extended::SkillsConfig::default()
+            },
+            ..crate::config::extended::ExtendedConfig::default()
+        };
+        crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            extended,
+        )
+    }
+
+    fn auto_title_config_source(base_url: &str) -> crate::daemon::config_source::ConfigSource {
+        use crate::config::providers::ProviderEntry;
+
+        let extended = crate::config::extended::ExtendedConfig {
+            utility_model: Some("p:m".to_string()),
+            ..crate::config::extended::ExtendedConfig::default()
+        };
+        let mut providers = crate::config::providers::ProvidersConfig::default();
+        providers.providers.insert(
+            "p".to_string(),
+            ProviderEntry {
+                url: base_url.to_string(),
+                ..ProviderEntry::default()
+            },
+        );
+        crate::daemon::config_source::ConfigSource::fixed(providers, extended)
+    }
+
+    async fn auto_title_model_server(content: Option<String>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let n = match stream.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                    let s = String::from_utf8_lossy(&buf);
+                    if let Some(idx) = s.find("\r\n\r\n") {
+                        let header = &s[..idx];
+                        let content_len = header
+                            .lines()
+                            .find_map(|line| {
+                                let line = line.to_ascii_lowercase();
+                                line.strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= idx + 4 + content_len {
+                            break;
+                        }
+                    }
+                }
+                let Some(content) = &content else {
+                    let resp = "HTTP/1.1 500 Internal Server Error\r\n\
+                                Content-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    continue;
+                };
+                let escaped = content
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r");
+                let payload = format!(
+                    "{{\"id\":\"c\",\"object\":\"chat.completion\",\"created\":0,\
+                     \"model\":\"m\",\"system_fingerprint\":null,\
+                     \"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\
+                     \"content\":[{{\"type\":\"text\",\"text\":\"{escaped}\"}}]}},\
+                     \"logprobs\":null,\"finish_reason\":\"stop\"}}],\
+                     \"usage\":{{\"prompt_tokens\":1,\"total_tokens\":2,\
+                     \"prompt_tokens_details\":{{\"cached_tokens\":0}}}}}}"
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn write_curator_skill(skill_root: &Path, name: &str) {
+        let dir = skill_root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill\n---\n\nUse it.\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".cockpit-provenance.json"),
+            r#"{
+  "created_origin": "background_review",
+  "writes": [{"action":"create","origin":"background_review","unix_seconds":1}],
+  "pinned": false
+}"#,
+        )
+        .unwrap();
     }
 
     fn persistent_test_ctx() -> Arc<DaemonContext> {
@@ -608,6 +1650,18 @@ mod tests {
         let root_b = tmp.path().join("b");
         std::fs::create_dir_all(&root_a).unwrap();
         std::fs::create_dir_all(&root_b).unwrap();
+        ctx.db
+            .set_workspace_trust(
+                &root_a,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        ctx.db
+            .set_workspace_trust(
+                &root_b,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
         std::fs::write(root_a.join("readme.md"), "ok").unwrap();
         std::fs::write(root_b.join("readme.md"), "no").unwrap();
 
@@ -952,6 +2006,20 @@ mod tests {
         ctx: &Arc<DaemonContext>,
         project_root: &std::path::Path,
     ) -> (ClientState, Uuid) {
+        let (state, session_id, _work_rx) = attached_state_with_worker_receiver(ctx, project_root);
+        (state, session_id)
+    }
+
+    fn attached_state_with_worker_receiver(
+        ctx: &Arc<DaemonContext>,
+        project_root: &std::path::Path,
+    ) -> (ClientState, Uuid, tokio::sync::mpsc::Receiver<SessionWork>) {
+        ctx.db
+            .set_workspace_trust(
+                project_root,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
         let session_row = ctx
             .db
             .create_session("p", project_root.to_str().unwrap(), "Build")
@@ -962,7 +2030,7 @@ mod tests {
                 .unwrap(),
         );
         let locks = Arc::new(LockManager::from_db(ctx.db.clone()).expect("locks"));
-        let handle = SessionWorkerHandle::test_handle(session, locks);
+        let (handle, work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
         let event_rx = handle.subscribe();
         (
             ClientState {
@@ -981,6 +2049,7 @@ mod tests {
                 terminal_host: test_terminal_host(),
             },
             session_row.session_id,
+            work_rx,
         )
     }
 
@@ -1031,6 +2100,7 @@ mod tests {
             | ("list_sessions", "public_read", false)
             | ("read_session_messages", "custom", false)
             | ("session_live_status", "public_read", false)
+            | ("goal_status", "session_row_reader", false)
             | ("list_skills", "project_read", false)
             | ("daemon_status", "public_read", false)
             | ("guidance_estimate", "project_read", false) => DispatchMatrixClass::Readonly,
@@ -1042,7 +2112,10 @@ mod tests {
             | ("list_scheduled_jobs", "owner_only", false)
             | ("list_agents", "owner_only", false)
             | ("list_models", "owner_only", false)
-            | ("get_usage_counts", "owner_only", false) => DispatchMatrixClass::AccessControlled,
+            | ("list_assistants", "owner_only", false)
+            | ("export_session_data", "owner_only", false)
+            | ("get_usage_counts", "owner_only", false)
+            | ("stats_rollup", "owner_only", false) => DispatchMatrixClass::AccessControlled,
             (_, _, true) => DispatchMatrixClass::Mutating,
             other => panic!("dispatch matrix request kind is unclassified: {other:?}"),
         }
@@ -1064,6 +2137,7 @@ mod tests {
         ListSessions,
         ReadSessionMessages,
         SessionLiveStatus,
+        GoalStatus,
         ListSkills,
         DaemonStatus,
         GuidanceEstimate,
@@ -1110,6 +2184,10 @@ mod tests {
             ReadonlyDispatchCase {
                 kind: "session_live_status",
                 case: ReadonlyDispatchCaseKind::SessionLiveStatus,
+            },
+            ReadonlyDispatchCase {
+                kind: "goal_status",
+                case: ReadonlyDispatchCaseKind::GoalStatus,
             },
             ReadonlyDispatchCase {
                 kind: "list_skills",
@@ -1164,6 +2242,11 @@ mod tests {
             MutatingDispatchCase { kind: "resume_paused_work", effect_class: Durable, observation: "paused_session_work status becomes resumed" },
             MutatingDispatchCase { kind: "cancel_paused_work", effect_class: Durable, observation: "paused_session_work status becomes cancelled" },
             MutatingDispatchCase { kind: "repair_resume", effect_class: DriverForwarded, observation: "SessionWork::RepairResume delivered to attached worker" },
+            MutatingDispatchCase { kind: "set_goal_status", effect_class: Durable, observation: "session goal status changes" },
+            MutatingDispatchCase { kind: "clear_goal", effect_class: Durable, observation: "session goal is closed" },
+            MutatingDispatchCase { kind: "create_assistant_session", effect_class: Durable, observation: "deferred assistant session worker is registered" },
+            MutatingDispatchCase { kind: "auto_title", effect_class: Durable, observation: "untitled session row receives generated title" },
+            MutatingDispatchCase { kind: "curator", effect_class: Durable, observation: "skill curator state changes through daemon-owned DB/filesystem path" },
             MutatingDispatchCase { kind: "cancel_turn", effect_class: DriverForwarded, observation: "SessionWork::Cancel delivered to attached worker" },
             MutatingDispatchCase { kind: "fs_write", effect_class: Durable, observation: "file contents written under project root" },
             MutatingDispatchCase { kind: "fs_create_dir", effect_class: Durable, observation: "directory created under project root" },
@@ -1208,6 +2291,7 @@ mod tests {
             MutatingDispatchCase { kind: "store_flycockpit_credential", effect_class: Durable, observation: "credential file is written" },
             MutatingDispatchCase { kind: "clear_flycockpit_credential", effect_class: Durable, observation: "credential store no longer loads a credential" },
             MutatingDispatchCase { kind: "refresh_env", effect_class: InMemory, observation: "attached worker env overlay changes" },
+            MutatingDispatchCase { kind: "refresh_config", effect_class: InMemory, observation: "attached worker config snapshot generation changes" },
             MutatingDispatchCase { kind: "record_usage", effect_class: Durable, observation: "usage count appears in subsequent usage_counts query" },
             MutatingDispatchCase { kind: "stop_daemon", effect_class: InMemory, observation: "shutdown context enters draining phase" },
         ]
@@ -1357,6 +2441,11 @@ mod tests {
             "attach"
             | "subagent_transcript"
             | "cancel_attachment_upload"
+            | "goal_status"
+            | "clear_goal"
+            | "list_assistants"
+            | "export_session_data"
+            | "curator"
             | "resume_paused_work"
             | "cancel_paused_work"
             | "fs_list"
@@ -1381,6 +2470,7 @@ mod tests {
             | "refresh_env"
             | "record_usage"
             | "get_usage_counts"
+            | "stats_rollup"
             | "guidance_estimate"
             | "stop_daemon" => AuthzAllowedOutcome::Response,
             "begin_attachment_upload"
@@ -1401,9 +2491,13 @@ mod tests {
             | "delete_scheduled_job"
             | "set_scheduled_job_enabled"
             | "run_scheduled_job"
+            | "auto_title"
+            | "create_assistant_session"
             | "store_flycockpit_credential"
-            | "clear_flycockpit_credential" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+            | "clear_flycockpit_credential"
+            | "set_goal_status" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
             "open_terminal" => AuthzAllowedOutcome::Error(ErrorCode::RootMissing),
+            "list_agents" | "list_models" => AuthzAllowedOutcome::Error(ErrorCode::NotAttached),
             "send_user_message"
             | "steer_delegation"
             | "remove_queued_user_message"
@@ -1415,8 +2509,6 @@ mod tests {
             | "archive_session"
             | "discard_session"
             | "delete_session"
-            | "list_agents"
-            | "list_models"
             | "set_active_model"
             | "set_agent"
             | "set_llm_mode"
@@ -1426,6 +2518,7 @@ mod tests {
             | "set_trusted_only"
             | "set_redaction"
             | "set_tandem_models"
+            | "refresh_config"
             | "cancel_schedule"
             | "prune"
             | "compact"
@@ -1450,6 +2543,14 @@ mod tests {
             authz_session_writer("resume_paused_work"),
             authz_session_writer("cancel_paused_work"),
             authz_session_writer("repair_resume"),
+            authz_session_reader("goal_status"),
+            authz_session_writer("set_goal_status"),
+            authz_session_writer("clear_goal"),
+            authz_owner_only("list_assistants"),
+            authz_owner_only("create_assistant_session"),
+            authz_session_writer("auto_title"),
+            authz_owner_only("export_session_data"),
+            authz_owner_only("curator"),
             authz_session_writer("cancel_turn"),
             authz_project_files("fs_list"),
             authz_project_files("fs_stat"),
@@ -1508,8 +2609,10 @@ mod tests {
             authz_owner_only("store_flycockpit_credential"),
             authz_owner_only("clear_flycockpit_credential"),
             authz_session_writer("refresh_env"),
+            authz_session_writer("refresh_config"),
             authz_owner_only("record_usage"),
             authz_owner_only("get_usage_counts"),
+            authz_owner_only("stats_rollup"),
             authz_project_read("guidance_estimate"),
             authz_owner_only("stop_daemon"),
         ]
@@ -2138,6 +3241,7 @@ mod tests {
                 | "compact"
                 | "pin"
                 | "refresh_env"
+                | "refresh_config"
         ) || (kind == "list_skills" && level != AuthzLevel::NoAccess)
             || (kind == "lsp_control" && matches!(level, AuthzLevel::Owner | AuthzLevel::Writer))
     }
@@ -2194,6 +3298,30 @@ mod tests {
             "resume_paused_work" => Request::ResumePausedWork { session_id },
             "cancel_paused_work" => Request::CancelPausedWork { session_id },
             "repair_resume" => Request::RepairResume { session_id },
+            "goal_status" => Request::GoalStatus { session_id },
+            "set_goal_status" => Request::SetGoalStatus {
+                session_id,
+                status: proto::GoalStatus::Paused,
+            },
+            "clear_goal" => Request::ClearGoal { session_id },
+            "list_assistants" => Request::ListAssistants,
+            "create_assistant_session" => Request::CreateAssistantSession {
+                name: "missing-assistant".into(),
+                project_root: root,
+                no_sandbox: false,
+                env_snapshot: None,
+            },
+            "auto_title" => Request::AutoTitle { session_id },
+            "export_session_data" => Request::ExportSessionData {
+                session_id,
+                kind: proto::ExportSessionKind::TranscriptJson,
+                include_generated_artifacts: false,
+                include_sensitive: false,
+            },
+            "curator" => Request::Curator {
+                project_root: root,
+                action: proto::CuratorAction::Status,
+            },
             "cancel_turn" => Request::CancelTurn,
             "fs_list" => Request::FsList {
                 project_root: root,
@@ -2386,12 +3514,18 @@ mod tests {
             "refresh_env" => Request::RefreshEnv {
                 vars: HashMap::from([("COCKPIT_AUTHZ_MATRIX".into(), "1".into())]),
             },
+            "refresh_config" => Request::RefreshConfig,
             "record_usage" => Request::RecordUsage {
                 kind: proto::UsageKind::Slash,
                 key: "/authz".into(),
                 project_id: None,
             },
             "get_usage_counts" => Request::GetUsageCounts { project_id: None },
+            "stats_rollup" => Request::StatsRollup {
+                project_id: None,
+                range: proto::StatsRange::Last7Days,
+                by_role: false,
+            },
             "guidance_estimate" => Request::GuidanceEstimate {
                 project_root: root,
                 provider: None,
@@ -2569,6 +3703,33 @@ mod tests {
                     };
                     assert_eq!(statuses.len(), 1);
                     assert_eq!(statuses[0].session_id, session.session_id);
+                }
+                Self::GoalStatus => {
+                    let ctx = test_ctx();
+                    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                    ctx.db
+                        .create_session_goal(
+                            session.session_id,
+                            &session.project_id,
+                            "ship status rpc",
+                            Some("context"),
+                            Some(100),
+                        )
+                        .unwrap();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::GoalStatus {
+                            session_id: session.session_id,
+                        },
+                    )
+                    .await
+                    .expect("goal_status happy");
+                    let Response::GoalStatus { goal: Some(goal) } = response else {
+                        panic!("expected GoalStatus with goal");
+                    };
+                    assert_eq!(goal.session_id, session.session_id);
+                    assert_eq!(goal.objective, "ship status rpc");
+                    assert_eq!(goal.status, proto::GoalStatus::Active);
                 }
                 Self::ListSkills => {
                     let ctx = test_ctx();
@@ -2769,6 +3930,19 @@ mod tests {
                     };
                     assert!(statuses.is_empty());
                 }
+                Self::GoalStatus => {
+                    let ctx = test_ctx();
+                    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                    let response = dispatch_matrix_request(
+                        &ctx,
+                        Request::GoalStatus {
+                            session_id: session.session_id,
+                        },
+                    )
+                    .await
+                    .expect("goal_status without an open goal is typed none");
+                    assert!(matches!(response, Response::GoalStatus { goal: None }));
+                }
                 Self::ListSkills => {
                     let ctx = test_ctx();
                     let tmp = tempfile::tempdir().unwrap();
@@ -2938,6 +4112,10 @@ mod tests {
             "resume_paused_work" | "cancel_paused_work" => {
                 assert_paused_work_mutating_happy(case.kind).await;
             }
+            "set_goal_status" | "clear_goal" => assert_goal_mutating_happy(case.kind).await,
+            "create_assistant_session" => assert_create_assistant_session_happy().await,
+            "auto_title" => assert_auto_title_mutating_happy().await,
+            "curator" => assert_curator_mutating_happy().await,
             "archive_session"
             | "unarchive_session"
             | "fork_session"
@@ -2952,7 +4130,7 @@ mod tests {
             "create_scheduled_job"
             | "delete_scheduled_job"
             | "set_scheduled_job_enabled"
-            | "run_scheduled_job" => assert_scheduler_shared_only_dispatch(case.kind).await,
+            | "run_scheduled_job" => assert_scheduler_dispatch_happy(case.kind).await,
             "set_approval_mode"
             | "set_sandbox"
             | "set_sandbox_escalation"
@@ -2980,6 +4158,7 @@ mod tests {
             | "set_trusted_only"
             | "set_redaction"
             | "set_tandem_models"
+            | "refresh_config"
             | "cancel_schedule"
             | "prune"
             | "compact"
@@ -3043,6 +4222,38 @@ mod tests {
                 assert!(matches!(response, Response::Ack));
                 assert!(ctx.db.paused_session_work_all().unwrap().is_empty());
             }
+            "set_goal_status" | "clear_goal" => assert_goal_mutating_malformed(case.kind).await,
+            "create_assistant_session" => {
+                let ctx = test_ctx();
+                let err = dispatch_matrix_request(
+                    &ctx,
+                    Request::CreateAssistantSession {
+                        name: "missing-assistant".into(),
+                        project_root: "/repo".into(),
+                        no_sandbox: false,
+                        env_snapshot: None,
+                    },
+                )
+                .await
+                .expect_err("missing assistant rejects session creation");
+                assert_eq!(err.code, ErrorCode::BadRequest);
+                assert!(ctx.registry.active_session_ids().is_empty());
+            }
+            "auto_title" => assert_auto_title_mutating_malformed().await,
+            "curator" => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let err = dispatch_matrix_request(
+                    &ctx,
+                    Request::Curator {
+                        project_root: tmp.path().to_string_lossy().into_owned(),
+                        action: proto::CuratorAction::Status,
+                    },
+                )
+                .await
+                .expect_err("curator rejects untrusted project");
+                assert_eq!(err.code, ErrorCode::WorkspaceTrust);
+            }
             "archive_session"
             | "unarchive_session"
             | "fork_session"
@@ -3077,6 +4288,7 @@ mod tests {
             | "set_sandbox"
             | "set_sandbox_escalation"
             | "refresh_env"
+            | "refresh_config"
             | "lsp_control"
             | "send_user_message"
             | "remove_queued_user_message"
@@ -3338,6 +4550,7 @@ mod tests {
             "set_tandem_models" => Request::SetTandemModels {
                 models: vec![("openai".into(), "gpt-5".into())],
             },
+            "refresh_config" => Request::RefreshConfig,
             "cancel_schedule" => Request::CancelSchedule {
                 job_id: "job-1".into(),
             },
@@ -3509,6 +4722,10 @@ mod tests {
                     ("set_tandem_models", SessionWork::SetTandemModels { models }) => {
                         assert_eq!(models, vec![("openai".to_string(), "gpt-5".to_string())]);
                     }
+                    ("refresh_config", SessionWork::ReplaceConfigSnapshot { snapshot, respond_to }) => {
+                        assert_eq!(snapshot.generation, 0);
+                        respond_to.send(1).unwrap();
+                    }
                     ("cancel_schedule", SessionWork::CancelSchedule { job_id }) => {
                         assert_eq!(job_id, "job-1");
                     }
@@ -3608,6 +4825,7 @@ mod tests {
             "refresh_env" => Request::RefreshEnv {
                 vars: HashMap::from([("PATH".into(), "/bin".into())]),
             },
+            "refresh_config" => Request::RefreshConfig,
             "lsp_control" => Request::LspControl {
                 project_root: std::env::temp_dir().to_string_lossy().into_owned(),
                 server_id: "rust-analyzer".into(),
@@ -3992,6 +5210,252 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn assert_goal_mutating_happy(kind: &str) {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        ctx.db
+            .create_session_goal(
+                session.session_id,
+                &session.project_id,
+                "ship goal rpc",
+                None,
+                Some(100),
+            )
+            .unwrap();
+        let response = dispatch_matrix_request(
+            &ctx,
+            match kind {
+                "set_goal_status" => Request::SetGoalStatus {
+                    session_id: session.session_id,
+                    status: proto::GoalStatus::Paused,
+                },
+                "clear_goal" => Request::ClearGoal {
+                    session_id: session.session_id,
+                },
+                _ => unreachable!(),
+            },
+        )
+        .await
+        .expect("goal mutation");
+        match (kind, response) {
+            ("set_goal_status", Response::GoalUpdated { goal }) => {
+                assert_eq!(goal.session_id, session.session_id);
+                assert_eq!(goal.status, proto::GoalStatus::Paused);
+            }
+            ("clear_goal", Response::GoalCleared { cleared }) => {
+                assert!(cleared);
+                assert!(
+                    ctx.db
+                        .current_session_goal(session.session_id, false)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            _ => panic!("unexpected goal mutation response"),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_goal_mutating_malformed(kind: &str) {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        match kind {
+            "set_goal_status" => {
+                let err = dispatch_matrix_request(
+                    &ctx,
+                    Request::SetGoalStatus {
+                        session_id: session.session_id,
+                        status: proto::GoalStatus::Paused,
+                    },
+                )
+                .await
+                .expect_err("missing open goal rejects status change");
+                assert_eq!(err.code, ErrorCode::BadRequest);
+            }
+            "clear_goal" => {
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::ClearGoal {
+                        session_id: session.session_id,
+                    },
+                )
+                .await
+                .expect("missing open goal is a typed no-op");
+                assert!(matches!(response, Response::GoalCleared { cleared: false }));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn create_test_assistant(
+        ctx: &Arc<DaemonContext>,
+        tmp: &tempfile::TempDir,
+        name: &str,
+    ) -> crate::db::assistants::AssistantRow {
+        crate::assistants::create_assistant(
+            &ctx.db,
+            crate::assistants::CreateAssistantSpec {
+                name: name.to_string(),
+                description: "test assistant".to_string(),
+                mode: crate::agents::AgentMode::Primary,
+                tools: None,
+                tool_tiers: std::collections::BTreeMap::new(),
+                model: None,
+                prompt: "You are a test assistant.".to_string(),
+                home_dir: tmp.path().join(name),
+            },
+        )
+        .expect("create assistant")
+    }
+
+    #[cfg(unix)]
+    async fn assert_create_assistant_session_happy() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        create_test_assistant(&ctx, &tmp, "helper-bot");
+        let response = dispatch_matrix_request(
+            &ctx,
+            Request::CreateAssistantSession {
+                name: "helper-bot".into(),
+                project_root: project.path().to_string_lossy().into_owned(),
+                no_sandbox: false,
+                env_snapshot: None,
+            },
+        )
+        .await
+        .expect("create assistant session");
+        let Response::AssistantSessionCreated { session } = response else {
+            panic!("expected AssistantSessionCreated");
+        };
+        assert_eq!(session.assistant_name, "helper-bot");
+        assert_eq!(session.active_agent, "helper-bot");
+        assert!(
+            ctx.registry
+                .active_session_ids()
+                .contains(&session.session_id),
+            "assistant session is started through the registry"
+        );
+        assert!(
+            ctx.db.get_session(session.session_id).unwrap().is_none(),
+            "assistant session remains deferred until first user message"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn assert_auto_title_mutating_happy() {
+        let project = tempfile::tempdir().unwrap();
+        let url = auto_title_model_server(Some("Matrix Title".to_string())).await;
+        let ctx = test_ctx_with_config_source(auto_title_config_source(&url));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", project.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let response = dispatch_matrix_request(
+            &ctx,
+            Request::AutoTitle {
+                session_id: session.session_id,
+            },
+        )
+        .await
+        .expect("auto-title happy");
+        let Response::AutoTitle { title, .. } = response else {
+            panic!("expected AutoTitle");
+        };
+        assert_eq!(title, "matrix-title");
+        assert_eq!(
+            ctx.db
+                .get_session(session.session_id)
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("matrix-title")
+        );
+    }
+
+    #[cfg(unix)]
+    async fn assert_auto_title_mutating_malformed() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", project.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let err = dispatch_matrix_request(
+            &ctx,
+            Request::AutoTitle {
+                session_id: session.session_id,
+            },
+        )
+        .await
+        .expect_err("auto-title missing utility model rejects");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        let row = ctx.db.get_session(session.session_id).unwrap().unwrap();
+        assert!(row.title.is_none());
+        assert!(!row.user_renamed);
+    }
+
+    #[cfg(unix)]
+    async fn assert_curator_mutating_happy() {
+        let project = tempfile::tempdir().unwrap();
+        let skill_root = project.path().join(".agents").join("skills");
+        write_curator_skill(&skill_root, "matrix-skill");
+        let ctx = test_ctx_with_config_source(curator_config_source(&skill_root));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let response = dispatch_matrix_request(
+            &ctx,
+            Request::Curator {
+                project_root: project.path().to_string_lossy().into_owned(),
+                action: proto::CuratorAction::Pin {
+                    name: "matrix-skill".to_string(),
+                },
+            },
+        )
+        .await
+        .expect("curator happy");
+        assert!(matches!(
+            response,
+            Response::Curator {
+                result: proto::CuratorResult::Pinned { pinned: true, .. }
+            }
+        ));
+        assert!(
+            ctx.db
+                .get_skill_usage("matrix-skill")
+                .unwrap()
+                .expect("skill usage row")
+                .pinned
+        );
+    }
+
+    #[cfg(unix)]
     async fn assert_session_db_mutating_happy(kind: &str) {
         let ctx = test_ctx();
         let tmp = tempfile::tempdir().unwrap();
@@ -4301,6 +5765,63 @@ mod tests {
             "unexpected scheduler error: {}",
             err.message
         );
+    }
+
+    #[cfg(unix)]
+    async fn assert_scheduler_dispatch_happy(kind: &str) {
+        let ctx = persistent_test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let scheduler = ctx.scheduler.as_ref().expect("persistent scheduler");
+        if kind != "create_scheduled_job" {
+            dispatch_matrix_request(&ctx, authz_matrix_request(
+                "create_scheduled_job",
+                Uuid::new_v4(),
+                tmp.path(),
+            ))
+            .await
+            .expect("seed scheduled job");
+        }
+        let response = dispatch_matrix_request(
+            &ctx,
+            authz_matrix_request(kind, Uuid::new_v4(), tmp.path()),
+        )
+        .await
+        .expect("scheduler happy path");
+        match kind {
+            "create_scheduled_job" => {
+                assert!(matches!(response, Response::ScheduledJob { .. }));
+                assert!(
+                    scheduler
+                        .list_jobs(None)
+                        .unwrap()
+                        .iter()
+                        .any(|job| job.id == "job-authz")
+                );
+            }
+            "delete_scheduled_job" => {
+                assert!(matches!(
+                    response,
+                    Response::ScheduledJobDeleted { deleted: true, .. }
+                ));
+                assert!(
+                    scheduler
+                        .list_jobs(None)
+                        .unwrap()
+                        .iter()
+                        .all(|job| job.id != "job-authz")
+                );
+            }
+            "set_scheduled_job_enabled" => {
+                let Response::ScheduledJob { job } = response else {
+                    panic!("expected scheduled job response");
+                };
+                assert!(job.enabled);
+            }
+            "run_scheduled_job" => {
+                assert!(matches!(response, Response::ScheduledJobRunQueued { .. }));
+            }
+            other => panic!("unexpected scheduler dispatch kind {other}"),
+        }
     }
 
     #[cfg(unix)]
@@ -4722,6 +6243,84 @@ mod tests {
                 kind: "repair_resume",
                 session_id: Some(paused_session_id),
                 audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::GoalStatus {
+                    session_id: attached_session_id,
+                },
+                kind: "goal_status",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::SetGoalStatus {
+                    session_id: attached_session_id,
+                    status: proto::GoalStatus::Paused,
+                },
+                kind: "set_goal_status",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ClearGoal {
+                    session_id: attached_session_id,
+                },
+                kind: "clear_goal",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ListAssistants,
+                kind: "list_assistants",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::CreateAssistantSession {
+                    name: "helper-bot".into(),
+                    project_root: project_root.clone(),
+                    no_sandbox: false,
+                    env_snapshot: None,
+                },
+                kind: "create_assistant_session",
+                session_id: None,
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::AutoTitle {
+                    session_id: attached_session_id,
+                },
+                kind: "auto_title",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
+                request: Request::ExportSessionData {
+                    session_id: attached_session_id,
+                    kind: proto::ExportSessionKind::DebugBundle,
+                    include_generated_artifacts: false,
+                    include_sensitive: false,
+                },
+                kind: "export_session_data",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::Curator {
+                    project_root: project_root.clone(),
+                    action: proto::CuratorAction::Status,
+                },
+                kind: "curator",
+                session_id: None,
+                audit_path: Some("/repo"),
                 mutating: true,
             },
             CommandMetadataCase {
@@ -5286,6 +6885,13 @@ mod tests {
                 mutating: true,
             },
             CommandMetadataCase {
+                request: Request::RefreshConfig,
+                kind: "refresh_config",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: true,
+            },
+            CommandMetadataCase {
                 request: Request::RecordUsage {
                     kind: proto::UsageKind::Slash,
                     key: "/help".into(),
@@ -5301,6 +6907,17 @@ mod tests {
                     project_id: Some("proj".into()),
                 },
                 kind: "get_usage_counts",
+                session_id: None,
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
+                request: Request::StatsRollup {
+                    project_id: Some("proj".into()),
+                    range: proto::StatsRange::Last7Days,
+                    by_role: true,
+                },
+                kind: "stats_rollup",
                 session_id: None,
                 audit_path: None,
                 mutating: false,
@@ -5356,6 +6973,14 @@ mod tests {
             ResumePausedWork,
             CancelPausedWork,
             RepairResume,
+            GoalStatus,
+            SetGoalStatus,
+            ClearGoal,
+            ListAssistants,
+            CreateAssistantSession,
+            AutoTitle,
+            ExportSessionData,
+            Curator,
             CancelTurn,
             FsList,
             FsStat,
@@ -5417,8 +7042,10 @@ mod tests {
             ClearFlycockpitCredential,
             DaemonStatus,
             RefreshEnv,
+            RefreshConfig,
             RecordUsage,
             GetUsageCounts,
+            StatsRollup,
             GuidanceEstimate,
             StopDaemon,
         );
@@ -6304,6 +7931,405 @@ mod tests {
 
         validate_set_agent_name("Build", false, &ownable)
             .expect("Build remains a chat-ownable primary without experimental mode");
+    }
+
+    #[tokio::test]
+    async fn list_agents_returns_chat_ownable_primaries() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let response = handle_request(Request::ListAgents, &mut state, &ctx)
+            .await
+            .expect("list agents is implemented");
+        let Response::Agents { agents } = response else {
+            panic!("expected agents response");
+        };
+
+        assert_eq!(
+            agents.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
+            vec!["Build"]
+        );
+        assert!(agents[0].builtin);
+        assert_eq!(agents[0].mode, "primary");
+    }
+
+    #[tokio::test]
+    async fn list_agents_agrees_with_validate_set_agent() {
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.experimental_mode = true;
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            extended,
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let response = handle_request(Request::ListAgents, &mut state, &ctx)
+            .await
+            .expect("list agents succeeds");
+        let Response::Agents { agents } = response else {
+            panic!("expected agents response");
+        };
+
+        for agent in &agents {
+            validate_set_agent(
+                &ctx,
+                state.attached.as_ref().expect("attached"),
+                &agent.name,
+            )
+            .expect("listed agent is accepted by SetAgent validation");
+        }
+        let omitted = ["builder", "explore", "bee", "Multireview"];
+        for name in omitted {
+            assert!(
+                !agents.iter().any(|agent| agent.name == name),
+                "{name} must not be listed as chat-ownable"
+            );
+            validate_set_agent(&ctx, state.attached.as_ref().expect("attached"), name)
+                .expect_err("omitted agent is rejected by SetAgent validation");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_agents_respects_workspace_trust() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cockpit").join("agents")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit").join("agents").join("Custom.md"),
+            "---\ndescription: custom primary\nmode: primary\n---\nBody\n",
+        )
+        .unwrap();
+        let ctx = test_ctx();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+        ctx.db
+            .set_workspace_trust(
+                tmp.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            )
+            .unwrap();
+        state.attached.as_mut().expect("attached").handle.trust_policy =
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            };
+
+        let response = handle_request(Request::ListAgents, &mut state, &ctx)
+            .await
+            .expect("list agents succeeds under ignore-config trust");
+        let Response::Agents { agents } = response else {
+            panic!("expected agents response");
+        };
+
+        assert!(
+            !agents.iter().any(|agent| agent.name == "Custom"),
+            "repo-local custom agents are hidden under ignore-config trust"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_resolved_models() {
+        use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry};
+
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderEntry {
+                url: "https://api.openai.example/v1".to_string(),
+                models: vec![
+                    ModelEntry {
+                        id: "gpt-b".to_string(),
+                        name: Some("GPT B".to_string()),
+                        favorite: false,
+                        ..ModelEntry::default()
+                    },
+                    ModelEntry {
+                        id: "gpt-a".to_string(),
+                        name: Some("GPT A".to_string()),
+                        favorite: true,
+                        ..ModelEntry::default()
+                    },
+                ],
+                ..ProviderEntry::default()
+            },
+        );
+        providers.insert(
+            "anthropic".to_string(),
+            ProviderEntry {
+                url: "https://api.anthropic.example/v1".to_string(),
+                models: vec![ModelEntry {
+                    id: "claude".to_string(),
+                    name: Some("Claude".to_string()),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let providers_cfg = crate::config::providers::ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "openai".to_string(),
+                model: "gpt-a".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+            ..crate::config::providers::ProvidersConfig::default()
+        };
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            providers_cfg,
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let response = handle_request(
+            Request::ListModels { provider: None },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("list models succeeds");
+        let Response::Models { models } = response else {
+            panic!("expected models response");
+        };
+
+        assert_eq!(
+            models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            vec!["gpt-a", "gpt-b"]
+        );
+        assert_eq!(models[0].provider, "openai");
+        assert_eq!(models[0].display_name.as_deref(), Some("GPT A"));
+        assert!(models[0].favorite);
+    }
+
+    #[tokio::test]
+    async fn list_models_response_contains_no_secrets() {
+        use crate::config::providers::{ActiveModelRef, HeaderSpec, ModelEntry, ProviderEntry};
+
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "secret-provider".to_string(),
+            ProviderEntry {
+                url: "https://secret-host.example/v1".to_string(),
+                headers: vec![HeaderSpec {
+                    name: "Authorization".to_string(),
+                    value: "Bearer super-secret-token".to_string(),
+                }],
+                credential_ref: Some("credential-secret-ref".to_string()),
+                models: vec![ModelEntry {
+                    id: "safe-model".to_string(),
+                    name: Some("Safe Model".to_string()),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let providers_cfg = crate::config::providers::ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "secret-provider".to_string(),
+                model: "safe-model".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+            ..crate::config::providers::ProvidersConfig::default()
+        };
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            providers_cfg,
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let response = handle_request(
+            Request::ListModels { provider: None },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("list models succeeds");
+        let rendered = serde_json::to_string(&response).unwrap();
+
+        assert!(rendered.contains("safe-model"));
+        assert!(!rendered.contains("super-secret-token"), "{rendered}");
+        assert!(!rendered.contains("credential-secret-ref"), "{rendered}");
+        assert!(!rendered.contains("secret-host"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn list_models_respects_workspace_trust() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "repo-provider".to_string(),
+            crate::config::providers::ProviderEntry {
+                url: "https://repo.example/v1".to_string(),
+                models: vec![crate::config::providers::ModelEntry {
+                    id: "repo-model".to_string(),
+                    ..crate::config::providers::ModelEntry::default()
+                }],
+                ..crate::config::providers::ProviderEntry::default()
+            },
+        );
+        let source = crate::daemon::config_source::ConfigSource::new(
+            move |_cwd| {
+                let policy = crate::config::trust::runtime_policy();
+                let cfg = if policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig)
+                {
+                    crate::config::providers::ProvidersConfig::default()
+                } else {
+                    crate::config::providers::ProvidersConfig {
+                        providers: providers.clone(),
+                        ..crate::config::providers::ProvidersConfig::default()
+                    }
+                };
+                Ok((cfg, crate::config::extended::ExtendedConfig::default()))
+            },
+            |_cwd, _provider_id| None,
+        );
+        let ctx = test_ctx_with_config_source(source);
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+        ctx.db
+            .set_workspace_trust(
+                tmp.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            )
+            .unwrap();
+        state.attached.as_mut().expect("attached").handle.trust_policy =
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            };
+
+        let response = handle_request(
+            Request::ListModels { provider: None },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("list models succeeds");
+        let Response::Models { models } = response else {
+            panic!("expected models response");
+        };
+
+        assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn skill_summary_carries_user_invocable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(skills_dir.join("hidden")).unwrap();
+        std::fs::write(
+            skills_dir.join("hidden").join("SKILL.md"),
+            "---\nname: hidden\ndescription: Hidden from slash\nuser-invocable: false\n---\nBody\n",
+        )
+        .unwrap();
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.skills.scan_dirs = vec![skills_dir.to_string_lossy().into_owned()];
+        extended.skills.external_dirs = Vec::new();
+        extended.skills.ancestor_walk = false;
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            extended,
+        ));
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let response = handle_request(
+            Request::ListSkills {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("list skills succeeds");
+        let Response::Skills { skills } = response else {
+            panic!("expected skills response");
+        };
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "hidden");
+        assert!(!skills[0].user_invocable);
+        let encoded = serde_json::to_value(&skills[0]).unwrap();
+        assert!(
+            encoded.get("user_invocable").is_some(),
+            "field is required on the serialized wire shape: {encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_inventories_return_ok_not_error() {
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let models = handle_request(
+            Request::ListModels { provider: None },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("empty model inventory is ok");
+        assert!(matches!(models, Response::Models { models } if models.is_empty()));
+
+        let agents = handle_request(Request::ListAgents, &mut state, &ctx)
+            .await
+            .expect("builtin fallback agent inventory is ok");
+        assert!(matches!(agents, Response::Agents { agents } if !agents.is_empty()));
+
+        let skills = handle_request(
+            Request::ListSkills {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("empty skill inventory is ok");
+        assert!(matches!(skills, Response::Skills { skills } if skills.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn inventory_ordering_is_stable() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let first = handle_request(Request::ListAgents, &mut state, &ctx)
+            .await
+            .expect("first list agents succeeds");
+        let second = handle_request(Request::ListAgents, &mut state, &ctx)
+            .await
+            .expect("second list agents succeeds");
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+
+        let first = handle_request(
+            Request::ListModels { provider: None },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("first list models succeeds");
+        let second = handle_request(
+            Request::ListModels { provider: None },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("second list models succeeds");
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
     }
 
     #[test]

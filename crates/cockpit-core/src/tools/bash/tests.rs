@@ -46,6 +46,25 @@ fn bash_description_mentions_cap_and_tmpdir_redirection() {
     assert!(defensive.contains("Display output caps at 8 KB"));
     assert!(defensive.contains("$TMPDIR"));
     assert!(defensive.contains("persistent workspace artifact"));
+    assert!(!tool.description().contains("jaq"));
+    assert!(!tool.description().contains("diverg"));
+    assert!(!defensive.contains("jaq"));
+    assert!(!defensive.contains("diverg"));
+}
+
+#[test]
+fn jq_shim_is_skipped_only_for_actual_container_runs() {
+    use crate::tools::sandbox_mode::SandboxMode;
+
+    assert!(!should_prepare_jq_shim(false, SandboxMode::Container));
+    assert!(!should_prepare_jq_shim(
+        false,
+        SandboxMode::ContainerReadonly
+    ));
+    assert!(should_prepare_jq_shim(true, SandboxMode::Container));
+    assert!(should_prepare_jq_shim(true, SandboxMode::ContainerReadonly));
+    assert!(should_prepare_jq_shim(false, SandboxMode::Sandbox));
+    assert!(should_prepare_jq_shim(false, SandboxMode::Off));
 }
 
 #[test]
@@ -404,6 +423,9 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
         review_cage: None,
         context_usage: None,
         available_tools: Arc::new(std::collections::HashSet::new()),
+        mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
+            Vec::new(),
+        )),
         has_tree: false,
         has_bash: false,
         events: None,
@@ -1733,6 +1755,35 @@ fn missing_binary_diagnostic_names_cockpit_environment() {
     assert!(body.contains("missing_binary: npm"));
     assert!(body.contains("not found in cockpit's command environment"));
     assert!(body.contains("does not establish that it is absent from the host system"));
+}
+
+#[test]
+fn missing_binary_diagnostic_adds_remedy_for_declared_binary_only() {
+    let declared = cockpit_command_environment_block_with_requirements(
+        "jq . package.json",
+        Path::new("/repo"),
+        Some("127"),
+        None,
+        Some("jq"),
+        vec![crate::capabilities::BinaryRequirement::required(
+            "jq",
+            crate::capabilities::common_remedy("jq"),
+        )],
+    );
+    assert!(declared.contains("missing_binary: jq"));
+    assert!(declared.contains("remedy:"));
+    assert!(declared.contains("cockpit jq"));
+
+    let undeclared = cockpit_command_environment_block_with_requirements(
+        "mystery",
+        Path::new("/repo"),
+        Some("127"),
+        None,
+        Some("mystery"),
+        Vec::new(),
+    );
+    assert!(undeclared.contains("missing_binary: mystery"));
+    assert!(!undeclared.contains("remedy:"));
 }
 
 #[test]

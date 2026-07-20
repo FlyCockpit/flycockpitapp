@@ -38,7 +38,7 @@ pub fn hash_contents(body: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Injection {
     /// A unified diff (old → new), matching the inline `-`/`+`/context
-    /// style of [`crate::tui::diff`]. The default.
+    /// style of the TUI diff renderer. The default.
     Diff(String),
     /// The full new contents — the fallback when a diff would be useless
     /// (no usable baseline, or a near-total rewrite).
@@ -101,7 +101,7 @@ fn is_near_total(old: &str, new: &str) -> bool {
 }
 
 /// Unified diff (old → new), line-granular, matching the inline style in
-/// [`crate::tui::diff`]: `- ` removed, `+ ` added, `  ` context, with
+/// the TUI diff renderer: `- ` removed, `+ ` added, `  ` context, with
 /// [`CONTEXT_LINES`] of context per hunk and a `…` separator between
 /// hunks. Reuses `similar` (already a dependency).
 pub fn unified_diff(old: &str, new: &str) -> String {

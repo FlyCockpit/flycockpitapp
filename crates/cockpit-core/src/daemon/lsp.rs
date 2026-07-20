@@ -140,7 +140,7 @@ impl LspManager {
                     LspServerStatus::Disabled
                 } else if let Some(s) = statuses.get(recipe.id) {
                     *s
-                } else if command_exists(&recipe.command[0]) {
+                } else if program_on_path(&recipe.command[0]) {
                     LspServerStatus::Installed
                 } else {
                     LspServerStatus::Missing
@@ -240,7 +240,7 @@ impl LspManager {
             crate::daemon::proto::LspControlAction::Check => {
                 let status = if recipe.disabled {
                     LspServerStatus::Disabled
-                } else if command_exists(&recipe.command[0]) {
+                } else if program_on_path(&recipe.command[0]) {
                     LspServerStatus::Installed
                 } else {
                     LspServerStatus::Missing
@@ -279,7 +279,7 @@ impl LspManager {
             .insert(recipe.id.to_string(), LspServerStatus::Installing);
         let outcome = run_command_capture(&install.argv).await;
         match outcome {
-            CommandOutcome::Success { .. } if command_exists(&recipe.command[0]) => {
+            CommandOutcome::Success { .. } if program_on_path(&recipe.command[0]) => {
                 self.inner.installed.write().await.insert(
                     recipe.id.to_string(),
                     InstalledRecord {
@@ -431,7 +431,7 @@ impl LspManager {
             client.touch();
             return Some(client);
         }
-        if !command_exists(&recipe.command[0]) {
+        if !program_on_path(&recipe.command[0]) {
             self.handle_missing(&recipe, cwd, config).await;
             return None;
         }
@@ -499,7 +499,7 @@ impl LspManager {
                     .await
                     .insert(recipe.id.to_string(), LspServerStatus::Installing);
                 match run_command_capture(&install.argv).await {
-                    CommandOutcome::Success { .. } if command_exists(&recipe.command[0]) => {
+                    CommandOutcome::Success { .. } if program_on_path(&recipe.command[0]) => {
                         self.inner.installed.write().await.insert(
                             recipe.id.to_string(),
                             InstalledRecord {
@@ -572,7 +572,7 @@ pub fn builtin_server_views(cwd: &Path, config: &ExtendedConfig) -> Vec<LspServe
             let recipe = recipe.with_config(config);
             let status = if recipe.disabled {
                 LspServerStatus::Disabled
-            } else if command_exists(&recipe.command[0]) {
+            } else if program_on_path(&recipe.command[0]) {
                 LspServerStatus::Installed
             } else {
                 LspServerStatus::Missing
@@ -1152,14 +1152,14 @@ impl Recipe {
     fn install_command(&self, _cwd: &Path) -> Option<InstallRecipe> {
         self.install
             .iter()
-            .find(|r| command_exists(&r.prerequisite))
+            .find(|r| program_on_path(&r.prerequisite))
             .cloned()
     }
 
     fn uninstall_command(&self, _cwd: &Path) -> Option<InstallRecipe> {
         self.uninstall
             .iter()
-            .find(|r| command_exists(&r.prerequisite))
+            .find(|r| program_on_path(&r.prerequisite))
             .cloned()
     }
 }
@@ -1360,8 +1360,8 @@ fn find_root(file: &Path, cwd: &Path, markers: &[String]) -> PathBuf {
     }
 }
 
-fn command_exists(cmd: &str) -> bool {
-    which::which(cmd).is_ok()
+fn program_on_path(cmd: &str) -> bool {
+    crate::capabilities::resolve_binary(cmd).is_some()
 }
 
 enum CommandOutcome {

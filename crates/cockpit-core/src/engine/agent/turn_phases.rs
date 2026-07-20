@@ -1336,6 +1336,7 @@ pub(crate) async fn run_turn(
                 .map(str::to_string)
                 .collect(),
         ),
+        mcp_builtin_registry: active_tools.mcp_builtin_registry(),
         has_tree: agent.tools.get("tree").is_some(),
         has_bash: agent.tools.get("bash").is_some(),
         // The blocked-`readlock` waiting indicator routes its

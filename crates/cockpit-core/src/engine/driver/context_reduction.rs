@@ -1,5 +1,58 @@
 use super::*;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreparedCompactionCoverage {
+    pub history_len: usize,
+    pub complete_exchange_count: usize,
+    pub history_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PreparedCompaction {
+    pub agent_name: String,
+    pub source: String,
+    pub prepared_at_unix_seconds: i64,
+    pub coverage: PreparedCompactionCoverage,
+    pub history: Vec<Message>,
+    pub brief: String,
+    pub handoff: String,
+    pub tail_message_positions: Vec<usize>,
+    pub turns_summarized: usize,
+    pub tail_kept: usize,
+    pub tail_trimmed: usize,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub trigger_ctx_pct: Option<f64>,
+    pub seed_tools: Vec<crate::db::seed_tools::SeedTool>,
+    pub seed_tool_tokens: u64,
+    pub compressed_entries: Vec<crate::db::compressed_results::CompressedToolResultEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DurableCompactionShadow {
+    ReadyBrief(DurableShadowBrief),
+    PreparedCompaction(Box<PreparedCompaction>),
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DurableShadowBrief {
+    pub generation: u64,
+    pub snapshot_history: Vec<Message>,
+    pub snapshot_turns: usize,
+    pub snapshot_tail_turns: usize,
+    pub brief: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::engine::driver) enum PreparedCompactionApplyError {
+    Stale {
+        expected: PreparedCompactionCoverage,
+        actual: PreparedCompactionCoverage,
+    },
+    StoreCompressedResults(String),
+}
+
 struct CompactBriefDraft {
     session: Arc<Session>,
     model: Arc<crate::engine::model::Model>,
@@ -12,7 +65,141 @@ struct CompactBriefDraft {
     test_calls: Option<Arc<std::sync::Mutex<Vec<TestCompactBriefCall>>>>,
 }
 
+fn prepared_compaction_coverage(history: &[Message]) -> PreparedCompactionCoverage {
+    use sha2::{Digest, Sha256};
+
+    let serialized = serde_json::to_vec(history).unwrap_or_default();
+    let digest = Sha256::digest(&serialized);
+    PreparedCompactionCoverage {
+        history_len: history.len(),
+        complete_exchange_count: crate::engine::compact::complete_exchange_count(history),
+        history_hash: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+    }
+}
+
+fn normalize_prepared_history_for_serde(history: Vec<Message>) -> Vec<Message> {
+    serde_json::to_value(&history)
+        .and_then(serde_json::from_value)
+        .unwrap_or(history)
+}
+
+pub(in crate::engine::driver) fn shadow_stale_after_turns(keep_recent_turns: usize) -> usize {
+    std::cmp::max(8, keep_recent_turns.saturating_add(4))
+}
+
+impl From<&ShadowBriefReady> for DurableShadowBrief {
+    fn from(ready: &ShadowBriefReady) -> Self {
+        Self {
+            generation: ready.generation,
+            snapshot_history: ready.snapshot_history.clone(),
+            snapshot_turns: ready.snapshot_turns,
+            snapshot_tail_turns: ready.snapshot_tail_turns,
+            brief: ready.brief.clone(),
+        }
+    }
+}
+
+impl From<DurableShadowBrief> for ShadowBriefReady {
+    fn from(record: DurableShadowBrief) -> Self {
+        Self {
+            generation: record.generation,
+            snapshot_history: record.snapshot_history,
+            snapshot_turns: record.snapshot_turns,
+            snapshot_tail_turns: record.snapshot_tail_turns,
+            brief: record.brief,
+        }
+    }
+}
+
 impl Driver {
+    #[cfg(test)]
+    fn trace_compaction_apply(&self, step: &'static str) {
+        if let Some(trace) = &self.test_compaction_apply_trace {
+            trace.lock().unwrap().push(step);
+        }
+    }
+
+    fn shadow_ready_is_stale(&self, ready: &ShadowBriefReady, keep_recent_turns: usize) -> bool {
+        let current = self.compact_brief_history(&self.stack[0].history);
+        let current_turns = crate::engine::compact::complete_exchange_count(&current);
+        current_turns.saturating_sub(ready.snapshot_turns)
+            > shadow_stale_after_turns(keep_recent_turns)
+    }
+
+    fn delete_durable_shadow_brief(&self) {
+        if let Err(error) = self.session.db.delete_compaction_shadow(self.session.id) {
+            tracing::warn!(error = %error, "compact shadow: deleting durable shadow failed");
+        }
+    }
+
+    fn persist_ready_shadow_brief(&self, ready: &ShadowBriefReady) {
+        if !self.resolve_context_config().compact_shadow {
+            self.delete_durable_shadow_brief();
+            return;
+        }
+        let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief::from(ready));
+        let payload_json = match serde_json::to_string(&payload) {
+            Ok(payload_json) => payload_json,
+            Err(error) => {
+                tracing::warn!(error = %error, "compact shadow: serializing durable shadow failed");
+                return;
+            }
+        };
+        if let Err(error) = self
+            .session
+            .db
+            .upsert_compaction_shadow(self.session.id, &payload_json)
+        {
+            tracing::warn!(error = %error, "compact shadow: persisting durable shadow failed");
+        }
+    }
+
+    pub(in crate::engine::driver) fn load_compaction_shadow_from_store(&mut self) {
+        let ctx_cfg = self.resolve_context_config();
+        if !ctx_cfg.compact_shadow {
+            self.shadow_brief = None;
+            self.delete_durable_shadow_brief();
+            return;
+        }
+        let row = match self.session.db.compaction_shadow(self.session.id) {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::warn!(error = %error, "compact shadow: loading durable shadow failed");
+                return;
+            }
+        };
+        let Some(row) = row else {
+            self.shadow_brief = None;
+            return;
+        };
+        let payload = match serde_json::from_str::<DurableCompactionShadow>(&row.payload_json) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(error = %error, "compact shadow: deserializing durable shadow failed");
+                self.shadow_brief = None;
+                self.delete_durable_shadow_brief();
+                return;
+            }
+        };
+        let DurableCompactionShadow::ReadyBrief(record) = payload else {
+            self.shadow_brief = None;
+            return;
+        };
+        if record.generation < self.shadow_brief_generation {
+            self.shadow_brief = None;
+            self.delete_durable_shadow_brief();
+            return;
+        }
+        self.shadow_brief_generation = record.generation;
+        let ready = ShadowBriefReady::from(record);
+        if self.shadow_ready_is_stale(&ready, ctx_cfg.compact_keep_recent_turns) {
+            self.shadow_brief = None;
+            self.delete_durable_shadow_brief();
+            return;
+        }
+        self.shadow_brief = Some(ShadowBriefState::Ready(ready));
+    }
+
     /// `/compact` drafts a new-thread brief from a filtered view of history:
     /// non-steering user-invoked skill pairs are deliberately omitted because
     /// they would be stripped on any primary swap and must not survive inside
@@ -460,13 +647,15 @@ impl Driver {
             && !task.cancel.is_cancelled()
             && let Some(brief) = result
         {
-            self.shadow_brief = Some(ShadowBriefState::Ready(ShadowBriefReady {
+            let ready = ShadowBriefReady {
                 generation: task.generation,
                 snapshot_history: task.snapshot_history,
                 snapshot_turns: task.snapshot_turns,
                 snapshot_tail_turns: task.snapshot_tail_turns,
                 brief,
-            }));
+            };
+            self.persist_ready_shadow_brief(&ready);
+            self.shadow_brief = Some(ShadowBriefState::Ready(ready));
         }
     }
 
@@ -510,18 +699,20 @@ impl Driver {
         if !ctx_cfg.compact_shadow {
             self.cancel_shadow_brief_inflight().await;
             self.shadow_brief = None;
+            self.delete_durable_shadow_brief();
             return false;
         }
 
         let snapshot_history = self.compact_brief_history(&self.stack[0].history);
         let snapshot_turns = crate::engine::compact::complete_exchange_count(&snapshot_history);
-        let stale_after = std::cmp::max(8, ctx_cfg.compact_keep_recent_turns.saturating_add(4));
         if matches!(
             &self.shadow_brief,
             Some(ShadowBriefState::Ready(ready))
-                if snapshot_turns.saturating_sub(ready.snapshot_turns) > stale_after
+                if snapshot_turns.saturating_sub(ready.snapshot_turns)
+                    > shadow_stale_after_turns(ctx_cfg.compact_keep_recent_turns)
         ) {
             self.shadow_brief = None;
+            self.delete_durable_shadow_brief();
         }
         if self.shadow_brief.is_some() {
             return false;
@@ -579,7 +770,7 @@ impl Driver {
         true
     }
 
-    async fn take_fresh_shadow_brief(
+    pub(in crate::engine::driver) async fn take_fresh_shadow_brief(
         &mut self,
         keep_recent_turns: usize,
     ) -> Option<ShadowBriefReady> {
@@ -594,12 +785,15 @@ impl Driver {
                 None
             }
             ShadowBriefState::Ready(ready) => {
-                let current = self.compact_brief_history(&self.stack[0].history);
-                let current_turns = crate::engine::compact::complete_exchange_count(&current);
-                let stale_after = std::cmp::max(8, keep_recent_turns.saturating_add(4));
-                (ready.generation == self.shadow_brief_generation
-                    && current_turns.saturating_sub(ready.snapshot_turns) <= stale_after)
-                    .then_some(ready)
+                if ready.generation == self.shadow_brief_generation
+                    && !self.shadow_ready_is_stale(&ready, keep_recent_turns)
+                {
+                    self.delete_durable_shadow_brief();
+                    Some(ready)
+                } else {
+                    self.delete_durable_shadow_brief();
+                    None
+                }
             }
         }
     }
@@ -672,15 +866,42 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
         source: &'static str,
     ) {
+        let prepared = match self.prepare_compaction_with_source(tx, source).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!("/compact: {error}; history was left unchanged"),
+                    })
+                    .await;
+                return;
+            }
+        };
+        if let Err(error) = self.apply_prepared_compaction(prepared, tx).await {
+            let text = match error {
+                PreparedCompactionApplyError::Stale { .. } => {
+                    "/compact: prepared compaction is stale; history was left unchanged".to_string()
+                }
+                PreparedCompactionApplyError::StoreCompressedResults(error) => {
+                    format!(
+                        "/compact: storing recoverable pruned results failed: {error}; history was left unchanged"
+                    )
+                }
+            };
+            let _ = tx.send(TurnEvent::Notice { text }).await;
+        }
+    }
+
+    pub(in crate::engine::driver) async fn prepare_compaction_with_source(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+        source: &'static str,
+    ) -> Result<PreparedCompaction, crate::engine::compact::CompactBudgetError> {
         use crate::engine::compact;
 
-        let original_history = self
-            .stack
-            .last()
-            .expect("stack never empty")
-            .history
-            .clone();
-        let tokens_before = wire_token_total(&original_history);
+        let live_history = &self.stack.last().expect("stack never empty").history;
+        let coverage = prepared_compaction_coverage(live_history);
+        let tokens_before = wire_token_total(live_history);
         let context_window = self.active_model_context_length();
         let ctx_cfg = self.resolve_context_config();
         // Resolve shadow ownership before mutating history with the private
@@ -692,6 +913,7 @@ impl Driver {
         } else {
             self.cancel_shadow_brief_inflight().await;
             self.shadow_brief = None;
+            self.delete_durable_shadow_brief();
             None
         };
         let trigger_ctx_pct = match (self.context_input_tokens(context_window), context_window) {
@@ -704,50 +926,36 @@ impl Driver {
         // 0. Prune-first (lossless; denser transcript → tighter brief). This
         // intermediate form is deliberately private to compaction: publishing
         // a normal prune event/ledger here would leave a false durable trail if
-        // the assembled handoff later proves too large and we roll back.
+        // the assembled handoff later proves too large. Keep it as a derived
+        // history until the normal compaction reset commits the final plan.
         let compact_prune =
             prune::dedup_plan(&self.stack.last().expect("stack never empty").history);
-        prune::apply_plan(
-            &mut self.stack.last_mut().expect("stack never empty").history,
+        let mut pruned_history = prune::apply_plan_to(
+            &self.stack.last().expect("stack never empty").history,
             &compact_prune,
         );
-        let compact_condensations =
-            prune::condense_candidates(&self.stack.last().expect("stack never empty").history)
+        let compact_condense_plan = prune::CondensePlan {
+            targets: prune::condense_candidates(&pruned_history)
                 .into_iter()
                 .map(|candidate| {
                     let hash = crate::db::compressed_results::compressed_result_hash(
                         &candidate.original_body,
                     );
-                    prune::apply_condensed_tool_result(
-                        &mut self.stack.last_mut().expect("stack never empty").history,
-                        &candidate,
-                        &hash,
-                    );
-                    (candidate, hash)
+                    prune::CondenseTarget { candidate, hash }
                 })
-                .collect::<Vec<_>>();
+                .collect(),
+        };
+        pruned_history = prune::apply_condense_plan_to(&pruned_history, &compact_condense_plan);
 
         // 1. Model brief from the foreground agent's current history.
-        let filtered_history =
-            self.compact_brief_history(&self.stack.last().expect("stack never empty").history);
-        let candidate_tail = match compact::plan_compacted_history(
+        let filtered_history = self.compact_brief_history(&pruned_history);
+        let candidate_tail = compact::plan_compacted_history(
             &filtered_history,
             "",
             ctx_cfg.compact_keep_recent_turns,
             context_window,
             100,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.stack.last_mut().expect("stack never empty").history = original_history;
-                let _ = tx
-                    .send(TurnEvent::Notice {
-                        text: format!("/compact: {error}; history was left unchanged"),
-                    })
-                    .await;
-                return;
-            }
-        };
+        )?;
         // 2. Deterministic appendix from the runtime ledger.
         let calls = self
             .session
@@ -803,7 +1011,8 @@ impl Driver {
                 self.draft_brief_delta(tx, &tail_message_seqs, &ready.brief, revision_history)
                     .await
             } else {
-                self.draft_brief(tx, &tail_message_seqs).await
+                self.draft_brief(tx, &tail_message_seqs, filtered_history.clone())
+                    .await
             };
             let handoff = compact::assemble_handoff(&brief, &appendix);
             let plan = match compact::plan_compacted_history(
@@ -814,18 +1023,7 @@ impl Driver {
                 ctx_cfg.auto_compact_pct,
             ) {
                 Ok(plan) => plan,
-                Err(error) => {
-                    // Prune-first operated only on the live frame, so roll it
-                    // back too: an over-budget handoff must not partially
-                    // mutate history or its durable/UI trail.
-                    self.stack.last_mut().expect("stack never empty").history = original_history;
-                    let _ = tx
-                        .send(TurnEvent::Notice {
-                            text: format!("/compact: {error}; history was left unchanged"),
-                        })
-                        .await;
-                    return;
-                }
+                Err(error) => return Err(error),
             };
             if plan.tail_message_positions == tail_positions {
                 break (brief, handoff, plan);
@@ -838,89 +1036,143 @@ impl Driver {
         // Persist every recoverable original for the private prune transform
         // atomically, but only after the handoff is proven to fit. A storage
         // failure aborts before model history or timeline state changes.
-        let compressed_entries = compact_condensations
+        let compressed_entries = compact_condense_plan
+            .targets
             .into_iter()
             .map(
-                |(candidate, hash)| crate::db::compressed_results::CompressedToolResultEntry {
-                    hash,
+                |target| crate::db::compressed_results::CompressedToolResultEntry {
+                    hash: target.hash,
                     session_id: self.session.id,
                     agent_id: self.active_agent().to_string(),
-                    tool: candidate.tool,
-                    call_id: candidate.call_id,
-                    original_byte_len: candidate.original_body.len(),
-                    compressed_byte_len: Some(candidate.condensed_body.len()),
+                    tool: target.candidate.tool,
+                    call_id: target.candidate.call_id,
+                    original_byte_len: target.candidate.original_body.len(),
+                    compressed_byte_len: Some(target.candidate.condensed_body.len()),
                     created_at: chrono::Utc::now().timestamp(),
                     kind: "prune-boundary".to_string(),
-                    content: candidate.original_body,
+                    content: target.candidate.original_body,
                 },
             )
             .collect();
+        let history = normalize_prepared_history_for_serde(plan.history);
+        Ok(PreparedCompaction {
+            agent_name: self.active_agent().to_string(),
+            source: source.to_string(),
+            prepared_at_unix_seconds: chrono::Utc::now().timestamp(),
+            coverage,
+            history,
+            brief,
+            handoff,
+            tail_message_positions: plan.tail_message_positions,
+            turns_summarized: plan.turns_summarized,
+            tail_kept: plan.tail_kept,
+            tail_trimmed: plan.tail_trimmed,
+            tokens_before,
+            tokens_after: plan.tokens_after,
+            trigger_ctx_pct,
+            seed_tool_tokens,
+            seed_tools: seeds,
+            compressed_entries,
+        })
+    }
+
+    /// Commit a prepared compaction without drafting. This remains a
+    /// `Driver` method because seed-tool re-execution needs the live tool
+    /// context and `pending_seed_context`; the injected inference test pins
+    /// the zero-model-call guarantee for this apply path.
+    pub(in crate::engine::driver) async fn apply_prepared_compaction(
+        &mut self,
+        prepared: PreparedCompaction,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<(), PreparedCompactionApplyError> {
+        let actual =
+            prepared_compaction_coverage(&self.stack.last().expect("stack never empty").history);
+        if actual != prepared.coverage {
+            return Err(PreparedCompactionApplyError::Stale {
+                expected: prepared.coverage,
+                actual,
+            });
+        }
+
         if let Err(error) = self
             .session
             .db
-            .insert_compressed_tool_results(compressed_entries)
+            .insert_compressed_tool_results(prepared.compressed_entries.clone())
         {
-            self.stack.last_mut().expect("stack never empty").history = original_history;
-            let _ = tx
-                .send(TurnEvent::Notice {
-                    text: format!(
-                        "/compact: storing recoverable pruned results failed: {error}; history was left unchanged"
-                    ),
-                })
-                .await;
-            return;
+            return Err(PreparedCompactionApplyError::StoreCompressedResults(
+                error.to_string(),
+            ));
         }
+        #[cfg(test)]
+        self.trace_compaction_apply("compressed_results_persisted");
 
         // 5. Reset the foreground model context in place.
-        self.stack.last_mut().expect("stack never empty").history = plan.history.clone();
+        self.stack.last_mut().expect("stack never empty").history = prepared.history.clone();
         self.drop_stale_owner_ledgers();
+        #[cfg(test)]
+        self.trace_compaction_apply("live_history_swapped");
 
         // Persist the seed-tool plan on this session for the follow-up
         // prompt's re-execution kickoff.
-        if let Err(e) = self.session.db.set_seed_tools(self.session.id, &seeds) {
+        if let Err(e) = self
+            .session
+            .db
+            .set_seed_tools(self.session.id, &prepared.seed_tools)
+        {
             tracing::warn!(error = %e, "compact: persisting seed tools failed");
+        } else {
+            #[cfg(test)]
+            self.trace_compaction_apply("seed_tools_persisted");
         }
 
         // Timeline boundary: `/compact` reset this session in place.
         if let Err(e) = self.session.record_session_compacted_with_source(
-            self.active_agent(),
+            &prepared.agent_name,
             crate::session::SessionCompactionRecord {
                 successor_session_id: self.session.id,
                 successor_short_id: &self.session.short_id,
-                seed_tool_count: seeds.len(),
-                brief_text: &brief,
-                handoff_text: &handoff,
-                source,
-                trigger_ctx_pct,
-                tokens_before,
-                tokens_after: plan.tokens_after,
-                turns_summarized: plan.turns_summarized,
-                tail_kept: plan.tail_kept,
-                tail_trimmed: plan.tail_trimmed,
-                tail_messages: &plan.history[1..],
+                seed_tool_count: prepared.seed_tools.len(),
+                brief_text: &prepared.brief,
+                handoff_text: &prepared.handoff,
+                source: &prepared.source,
+                trigger_ctx_pct: prepared.trigger_ctx_pct,
+                tokens_before: prepared.tokens_before,
+                tokens_after: prepared.tokens_after,
+                turns_summarized: prepared.turns_summarized,
+                tail_kept: prepared.tail_kept,
+                tail_trimmed: prepared.tail_trimmed,
+                tail_messages: &prepared.history[1..],
             },
         ) {
             tracing::warn!(error = %e, "record session_compacted event failed");
+        } else {
+            #[cfg(test)]
+            self.trace_compaction_apply("timeline_recorded");
         }
 
-        self.run_seed_tools(&seeds, tx).await;
+        self.run_seed_tools(&prepared.seed_tools, tx).await;
+        #[cfg(test)]
+        self.trace_compaction_apply("seed_tools_ran");
 
         let _ = tx
             .send(TurnEvent::CompactReady {
                 new_session_id: self.session.id,
-                handoff,
-                brief,
-                source: source.to_string(),
-                trigger_ctx_pct,
-                tokens_before,
-                tokens_after: plan.tokens_after,
-                turns_summarized: plan.turns_summarized,
-                tail_kept: plan.tail_kept,
-                tail_trimmed: plan.tail_trimmed,
-                seed_tool_count: seeds.len(),
-                seed_tool_tokens,
+                handoff: prepared.handoff,
+                brief: prepared.brief,
+                source: prepared.source,
+                trigger_ctx_pct: prepared.trigger_ctx_pct,
+                tokens_before: prepared.tokens_before,
+                tokens_after: prepared.tokens_after,
+                turns_summarized: prepared.turns_summarized,
+                tail_kept: prepared.tail_kept,
+                tail_trimmed: prepared.tail_trimmed,
+                seed_tool_count: prepared.seed_tools.len(),
+                seed_tool_tokens: prepared.seed_tool_tokens,
             })
             .await;
+        #[cfg(test)]
+        self.trace_compaction_apply("compact_ready_emitted");
+        Ok(())
     }
 
     async fn compact_brief_draft(
@@ -987,15 +1239,12 @@ impl Driver {
         }
     }
 
-    /// Run one model round-trip asking the foreground agent to draft the
-    /// self-contained handoff brief (T6.e step 1).
-    pub(in crate::engine::driver) async fn draft_brief(
+    async fn draft_brief(
         &self,
         tx: &mpsc::Sender<TurnEvent>,
         tail_message_seqs: &[i64],
+        history: Vec<Message>,
     ) -> String {
-        let history =
-            self.compact_brief_history(&self.stack.last().expect("stack never empty").history);
         let draft = self.compact_brief_draft(tx, history).await;
         let mut prompt_text =
             crate::engine::compact::brief_prompt(draft.prompt_override.as_deref());

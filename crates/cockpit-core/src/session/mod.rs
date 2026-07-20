@@ -36,6 +36,7 @@ use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::ToolCallEvent;
 use crate::model_system_prompt::ModelSystemPromptSnapshot;
 
+pub mod export;
 mod gitignore;
 mod lifecycle;
 mod recording;
@@ -122,6 +123,10 @@ pub struct Session {
     /// [`Self::tmp_dir`] access; removed on [`Self::end`] and on drop.
     /// `Mutex<Option<…>>` so creation is one-shot and `end()` can take it.
     tmp_dir: Mutex<Option<PathBuf>>,
+    /// Per-session host executable shims under the Cockpit data dir. These
+    /// are separate from [`Self::tmp_dir`] so shell PATH shims live in a
+    /// stable user-data location, but they share the same end/drop cleanup.
+    host_shim_dir: Mutex<Option<PathBuf>>,
     /// Live sandbox mode for this session. Resolved at spawn time by the
     /// daemon/client `--no-sandbox` precedence and flipped at runtime by
     /// `/sandbox`. In-memory only; resumed sessions re-resolve defaults.
@@ -1375,6 +1380,41 @@ mod tests {
         assert!(dir.exists());
         s.end().unwrap();
         assert!(!dir.exists(), "tmp dir must be cleaned up on session end");
+    }
+
+    #[test]
+    fn host_shim_dir_is_under_data_dir() {
+        let data_dir = PathBuf::from("/data/cockpit");
+        let session_id = uuid::Uuid::new_v4();
+
+        let dir = lifecycle::host_shim_bin_dir_for_data_dir(&data_dir, session_id);
+
+        assert!(dir.starts_with(&data_dir));
+        assert_eq!(
+            dir,
+            data_dir
+                .join("session-shims")
+                .join(session_id.to_string())
+                .join("bin")
+        );
+    }
+
+    #[test]
+    fn host_shim_dir_removed_on_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        let dir = temp.path().join("data/cockpit/session-shims/session/bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("jq"), "shim").unwrap();
+        *s.host_shim_dir.lock().unwrap() = Some(dir.clone());
+
+        s.end().unwrap();
+
+        assert!(
+            !dir.parent().unwrap().exists(),
+            "host shim session dir must be cleaned up on session end"
+        );
     }
 
     #[test]

@@ -61,6 +61,43 @@ pub struct EnvSnapshotWire {
     pub vars: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSnapshot {
+    pub session_id: Uuid,
+    pub generation: u64,
+    pub extended: cockpit_config::config::extended::ExtendedConfig,
+    pub providers: ProviderConfigView,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderConfigView {
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderEntryView>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub category_defaults: BTreeMap<String, cockpit_config::config::providers::ProviderModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_unlisted_models_fetch: Option<cockpit_config::config::providers::OnUnlistedModelsFetch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderHeaderView {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderEntryView {
+    pub entry: cockpit_config::config::providers::ProviderEntry,
+    #[serde(default)]
+    pub headers: Vec<ProviderHeaderView>,
+    #[serde(default)]
+    pub credential_configured: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum EnvDriftPolicy {
@@ -978,6 +1015,167 @@ pub use cockpit_db::wire::{
     SessionActivityState, SessionMessage, SessionSummary, WriteContentPreview,
 };
 
+pub use cockpit_db::db::session_goals::GoalStatus;
+pub use cockpit_db::stats::StatsRollup;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoalSummary {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub project_id: String,
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    pub status: GoalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<i64>,
+    pub tokens_used: i64,
+    pub blocked_attempts: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_read_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssistantSummary {
+    pub name: String,
+    pub created_at: i64,
+    pub home_dir: String,
+    pub config_json: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssistantSessionCreated {
+    pub session_id: Uuid,
+    pub short_id: String,
+    pub project_root: String,
+    pub project_id: String,
+    pub assistant_name: String,
+    pub active_agent: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportSessionKind {
+    TranscriptJson,
+    DebugBundle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportSessionData {
+    pub session_id: Uuid,
+    pub kind: ExportSessionKind,
+    pub filename_extension: String,
+    pub mime: String,
+    pub content_base64: String,
+    pub byte_len: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_count: Option<usize>,
+    #[serde(default)]
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum CuratorAction {
+    Status,
+    Run {
+        #[serde(default)]
+        dry_run: bool,
+        #[serde(default)]
+        consolidate: bool,
+    },
+    Pin {
+        name: String,
+    },
+    Unpin {
+        name: String,
+    },
+    Restore {
+        name: String,
+    },
+    Rollback {
+        #[serde(default)]
+        list: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum CuratorResult {
+    Status {
+        status: CuratorStatus,
+    },
+    Run {
+        report: CuratorRunReport,
+    },
+    Pinned {
+        name: String,
+        pinned: bool,
+    },
+    Restored {
+        name: String,
+    },
+    Snapshots {
+        snapshots: Vec<CuratorSnapshotStatus>,
+    },
+    RolledBack {
+        snapshot: CuratorSnapshotStatus,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CuratorRunReport {
+    pub dry_run: bool,
+    pub scanned: usize,
+    pub stale: Vec<String>,
+    pub archived: Vec<String>,
+    pub reactivated: Vec<String>,
+    pub skipped: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consolidation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CuratorStatus {
+    pub skills: Vec<CuratorSkillStatus>,
+    pub snapshots: Vec<CuratorSnapshotStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CuratorSkillStatus {
+    pub name: String,
+    pub state: String,
+    pub created_by: String,
+    pub use_count: u64,
+    pub view_count: u64,
+    pub pinned: bool,
+    pub source_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CuratorSnapshotStatus {
+    pub id: String,
+    pub path: String,
+    pub reason: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatsRange {
+    Last7Days,
+    AllTime,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PausedWorkSummary {
     pub session_id: Uuid,
@@ -1064,6 +1262,7 @@ pub struct SkillSummary {
     pub name: String,
     pub description: String,
     pub source: String,
+    pub user_invocable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1636,6 +1835,34 @@ mod tests {
                 );
             }
             other => panic!("expected SandboxUnavailable event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_capability_unavailable_event_round_trips_with_fix_command() {
+        let sid = Uuid::new_v4();
+        let text = "Required command capability unavailable: `demo` missing for `tool`.";
+        let fix_command = "sudo apt-get install demo";
+        let evt = Envelope::event(Event::CommandCapabilityUnavailable {
+            session_id: sid,
+            text: text.to_string(),
+            fix_command: Some(fix_command.to_string()),
+        });
+        let back: Envelope = serde_json::from_str(&serde_json::to_string(&evt).unwrap()).unwrap();
+        match back.body {
+            Body::Event {
+                event:
+                    Event::CommandCapabilityUnavailable {
+                        session_id,
+                        text: got_text,
+                        fix_command: got_fix_command,
+                    },
+            } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(got_text, text);
+                assert_eq!(got_fix_command.as_deref(), Some(fix_command));
+            }
+            other => panic!("expected CommandCapabilityUnavailable event, got {other:?}"),
         }
     }
 

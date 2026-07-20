@@ -39,11 +39,11 @@ impl Tool for CreateGoalTool {
     }
 
     fn description(&self) -> &str {
-        "Persist one session goal after clarification"
+        "Persist one session goal only after the clarified objective is accepted; fails if another open goal exists"
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some("Create the session goal only after the user accepts the clarified objective/context; fails when another open goal exists.".to_string())
+        Some("Create the session goal only after the user accepts the clarified objective/context; fails when another open goal exists. Do not create a goal for ordinary one-turn work, speculative plans, or private notes; use `todo` for task lists and `get_goal` before later terminal updates.".to_string())
     }
 
     fn parameters(&self) -> Value {
@@ -84,11 +84,11 @@ impl Tool for GetGoalTool {
     }
 
     fn description(&self) -> &str {
-        "Read current goal status and budget"
+        "Read current goal status and budget before terminal `update_goal` decisions; include context only when needed"
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some("Read the current goal before terminal updates; include_context only when detailed settled context is needed.".to_string())
+        Some("Read the current goal before terminal `update_goal` calls so completion/blocking decisions use the latest status and budget. Use `include_context` only when detailed settled context is needed; do not use this as a todo/detail reader.".to_string())
     }
 
     fn parameters(&self) -> Value {
@@ -136,11 +136,11 @@ impl Tool for UpdateGoalTool {
     }
 
     fn description(&self) -> &str {
-        "Update goal status or append context"
+        "Update goal status or append context; complete only after `get_goal` plus evidence, blocked only after repeated true blockers"
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some("Set complete only after get_goal plus evidence; set blocked only after repeated true blockers; context_delta appends without erasing settled context.".to_string())
+        Some("Update the persisted session goal at a defined boundary. Set complete only after `get_goal` plus concrete evidence; set blocked only after repeated true blockers; use `context_delta` to append without erasing settled context. Do not mark terminal states just because a budget is near or work is hard.".to_string())
     }
 
     fn parameters(&self) -> Value {

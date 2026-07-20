@@ -1,4 +1,5 @@
 use super::*;
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 /// Consolidation (GOALS §2a): a single `config.json` holding BOTH
@@ -74,6 +75,10 @@ fn fully_populated_config_json_round_trips_byte_identically() {
     cfg.web = WebConfig {
         provider: WebProvider::Tinyfish,
         firecrawl_base_url: Some("https://firecrawl.test".into()),
+        custom: WebCustomConfig {
+            fetch_command: Some("custom-fetch {url}".into()),
+            search_command: Some("custom-search {query}".into()),
+        },
     };
     cfg.trusted_only = true;
     cfg.allow_remote_config = true;
@@ -1571,6 +1576,170 @@ fn skills_config_round_trips_through_extended_doc() {
         ]
     );
     assert!(cfg2.skills.auto_bang_commands);
+}
+
+#[test]
+fn config_resolution_reads_each_layer_once() {
+    let tmp = TempDir::new().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let project = tmp.path().join("repo");
+    let child = project.join("child");
+    std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+    std::fs::create_dir_all(child.join(".cockpit")).unwrap();
+    std::fs::write(
+        project.join(".cockpit/config.json"),
+        r#"{"redact":{"denylist":["home-secret"]},"gitignore_allow":["home.log"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        child.join(".cockpit/config.json"),
+        r#"{"redact":{"allowlist":["project-ok"]},"gitignore_allow":["project.log"]}"#,
+    )
+    .unwrap();
+
+    reset_config_layer_read_count();
+    let cfg = load_for_cwd(&child);
+
+    assert_eq!(config_layer_read_count(), 2);
+    assert_eq!(cfg.redact.denylist, vec!["home-secret"]);
+    assert_eq!(cfg.redact.allowlist, vec!["project-ok"]);
+    assert_eq!(cfg.gitignore_allow, vec!["home.log", "project.log"]);
+}
+
+#[test]
+fn config_resolution_result_unchanged_after_single_pass_rewrite() {
+    let tmp = TempDir::new().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let project = tmp.path().join("repo");
+    let child = project.join("child");
+    std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+    std::fs::create_dir_all(child.join(".cockpit")).unwrap();
+    std::fs::write(
+        project.join(".cockpit/config.json"),
+        r#"{
+            "name":"Home",
+            "redact":{"denylist":["shared-secret"],"extra_dotenv_paths":[".env.shared"]},
+            "gitignore_allow":["home.log"],
+            "llm_mode":"normal"
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        child.join(".cockpit/config.json"),
+        r#"{
+            "name":"Project",
+            "redact":{"denylist":["project-secret"],"allowlist":["safe"]},
+            "gitignore_allow":["home.log","project.log"]
+        }"#,
+    )
+    .unwrap();
+
+    let cfg = load_for_cwd(&child);
+
+    assert_eq!(cfg.name.as_deref(), Some("Project"));
+    assert_eq!(
+        cfg.redact.denylist,
+        vec!["shared-secret".to_string(), "project-secret".to_string()]
+    );
+    assert_eq!(cfg.redact.allowlist, vec!["safe"]);
+    assert_eq!(
+        cfg.redact.extra_dotenv_paths,
+        vec![PathBuf::from(".env.shared")]
+    );
+    assert_eq!(
+        cfg.gitignore_allow,
+        vec!["home.log".to_string(), "project.log".to_string()]
+    );
+    assert_eq!(cfg.llm_mode, LlmMode::Normal);
+}
+
+#[test]
+fn web_custom_migrates_legacy_webfetch_tool_command() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "tools": {
+                "webfetch": {
+                    "enabled": false,
+                    "command": "curl {url}",
+                    "description": "Legacy fetch description"
+                },
+                "my_tool": {
+                    "enabled": true,
+                    "command": "echo {value}"
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
+
+    assert_eq!(cfg.web.custom.fetch_command.as_deref(), Some("curl {url}"));
+    assert!(!cfg.tools.contains_key("webfetch"));
+    assert!(cfg.tools.contains_key("my_tool"));
+}
+
+#[test]
+fn web_custom_migration_preserves_existing_typed_value() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "web": {
+                "provider": "custom",
+                "custom": {
+                    "fetch_command": "existing {url}"
+                }
+            },
+            "tools": {
+                "webfetch": {
+                    "enabled": true,
+                    "command": "legacy {url}"
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
+
+    assert_eq!(
+        cfg.web.custom.fetch_command.as_deref(),
+        Some("existing {url}")
+    );
+    assert!(!cfg.tools.contains_key("webfetch"));
+}
+
+#[test]
+fn web_custom_migration_drops_legacy_descriptions() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "tools": {
+                "webfetch": {
+                    "enabled": true,
+                    "command": "curl {url}",
+                    "description": "do not preserve this"
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
+
+    assert_eq!(cfg.web.custom.fetch_command.as_deref(), Some("curl {url}"));
+    assert!(cfg.tools.values().all(|tool| {
+        tool.description
+            .as_deref()
+            .is_none_or(|description| !description.contains("do not preserve this"))
+    }));
 }
 
 mod guards_and_resolvers;

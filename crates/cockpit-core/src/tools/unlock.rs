@@ -16,7 +16,7 @@ impl Tool for UnlockTool {
     }
 
     fn description(&self) -> &str {
-        "Release the lock on a file without writing"
+        "Release a `readlock` without writing; use `writeunlock` or `editunlock` when you want to save"
     }
 
     fn defensive_description(&self) -> Option<String> {

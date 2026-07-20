@@ -31,6 +31,7 @@
 use anyhow::{Result, bail};
 
 use super::AgentDef;
+use super::ToolTier;
 
 /// The file-mutating + lock tools. Any agent that holds these is a
 /// **write-capable** agent (the definition of "writer" is structural —
@@ -60,6 +61,17 @@ const SPAWN_AGENTS: &[&str] = &["Swarm", "bee", "Multireview", "scout"];
 /// own subagents (`task`) or hand off the conversation (`handoff`). The
 /// recursive-`Swarm` exception is [`SPAWN_TOOL`], gated separately.
 pub const DELEGATION_TOOLS: &[&str] = &["task", "handoff", "start_build"];
+
+pub const STRUCTURAL_TOOLS: &[&str] = &[
+    "question",
+    "handoff",
+    "return",
+    "schedule",
+    "task",
+    "spawn",
+    "defer_to_orchestrator",
+    "start_build",
+];
 
 /// Tools that may be granted **only to primary (chat-owning) agents** —
 /// the external-harness delegation tools (GOALS §6,
@@ -187,11 +199,38 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
                 def.name
             );
         }
-        if let Some(grant) = &def.tools
+        if known.contains(&tool.as_str())
+            && let Some(grant) = &def.tools
             && !grant.iter().any(|g| g == tool)
         {
             bail!(
                 "agent `{}` overrides the description of tool `{tool}` it does not grant in `tools:`",
+                def.name
+            );
+        }
+    }
+
+    for (tool, tier) in &def.tool_tiers {
+        if !known.contains(&tool.as_str()) && *tier != ToolTier::Disabled {
+            bail!("agent `{}` tiers unknown tool `{tool}`", def.name);
+        }
+        if let Some(grant) = &def.tools
+            && !grant.iter().any(|g| g == tool)
+        {
+            bail!(
+                "agent `{}` tiers tool `{tool}` it does not grant in `tools:`",
+                def.name
+            );
+        }
+        if *tier == ToolTier::Discoverable && STRUCTURAL_TOOLS.contains(&tool.as_str()) {
+            bail!(
+                "agent `{}` may not tier structural tool `{tool}` as `discoverable`",
+                def.name
+            );
+        }
+        if *tier == ToolTier::Discoverable && LOCK_WRITE_TOOLS.contains(&tool.as_str()) {
+            bail!(
+                "agent `{}` may not tier write/lock tool `{tool}` as `discoverable`",
                 def.name
             );
         }

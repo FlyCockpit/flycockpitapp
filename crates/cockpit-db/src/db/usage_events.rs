@@ -2,8 +2,8 @@
 //!
 //! A 30-day rolling count of accepted picks — models, slash commands,
 //! and `@` tags — used purely as a tie-breaker in the three autocomplete
-//! surfaces (see `tui::app::slash_matches`, `tui::model_picker`,
-//! `tui::file_tag::suggestions`). The daemon owns this table; clients
+//! surfaces in the TUI crate: slash-command matching, the model picker,
+//! and `@` file-tag suggestions. The daemon owns this table; clients
 //! emit `RecordUsage` on accept and read the aggregated maps at session
 //! start.
 //!

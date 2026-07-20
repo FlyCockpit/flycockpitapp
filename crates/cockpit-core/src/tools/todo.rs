@@ -30,11 +30,11 @@ impl Tool for TodoTool {
     }
 
     fn description(&self) -> &str {
-        "Create/list/update session todos and append structured task notes"
+        "Create/list/update long-horizon session todos and structured notes; use before delegating with `task`, not for the current session goal"
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some("Maintain the durable todo list for this session: create planning rows, list current state, update parent-owned status/content/priority, and append structured notes (summary/finding/decision/artifact/blocker/handoff). Use todos for long-horizon work before delegating with task.".to_string())
+        Some("Maintain the durable todo list for this session: create planning rows, list current state, update parent-owned status/content/priority, and append structured notes (summary/finding/decision/artifact/blocker/handoff). Use todos for long-horizon work before delegating with `task`; do not use them for the immediate next command or for terminal goal status, which belongs in `update_goal`.".to_string())
     }
 
     fn parameters(&self) -> Value {

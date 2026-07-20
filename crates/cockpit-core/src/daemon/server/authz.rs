@@ -401,6 +401,26 @@ fn authorize_session_row_writer(
     }
 }
 
+fn authorize_session_row_reader(
+    principal: &ClientPrincipal,
+    ctx: &DaemonContext,
+    session_id: Uuid,
+) -> std::result::Result<(), ErrorPayload> {
+    match ctx.db.get_session(session_id) {
+        Ok(Some(row)) => match session_access_for_row(principal, &row) {
+            SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => Ok(()),
+            SessionAccess::None => Err(authorization_error(
+                "remote principal cannot access this session",
+            )),
+        },
+        Ok(None) => Err(ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("unknown session {session_id}"),
+        }),
+        Err(e) => Err(internal(e)),
+    }
+}
+
 macro_rules! command_authorize_value {
     ($principal:expr, $state:expr, $ctx:expr, $request:expr, owner_only) => {
         Err(authorization_error("request requires the local owner"))
@@ -442,6 +462,9 @@ macro_rules! command_authorize_value {
     }};
     ($principal:expr, $state:expr, $ctx:expr, $request:expr, session_row_writer($session_id:ident)) => {
         authorize_session_row_writer($principal, $ctx, *$session_id)
+    };
+    ($principal:expr, $state:expr, $ctx:expr, $request:expr, session_row_reader($session_id:ident)) => {
+        authorize_session_row_reader($principal, $ctx, *$session_id)
     };
     ($principal:expr, $state:expr, $ctx:expr, $request:expr, custom($handler:ident)) => {
         $handler($request, $state, $ctx)

@@ -319,8 +319,8 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
     // workers via `spawn`. The interactive `Swarm` primary holds `spawn`; each
     // background child it fans out is a `bee`.
     Ok(match spec.worker {
-        SpawnWorkerKind::Bee => crate::engine::builtin::bee(&args),
-        SpawnWorkerKind::Scout => crate::engine::builtin::scout(&args),
+        SpawnWorkerKind::Bee => crate::engine::builtin::load("bee", &args)?,
+        SpawnWorkerKind::Scout => crate::engine::builtin::load("scout", &args)?,
     })
 }
 

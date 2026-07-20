@@ -35,6 +35,12 @@
     },
     "request": "attach_terminal"
   },
+  "auto_title": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "auto_title"
+  },
   "begin_attachment_upload": {
     "params": {
       "byte_len": 7,
@@ -72,6 +78,12 @@
   "clear_flycockpit_credential": {
     "request": "clear_flycockpit_credential"
   },
+  "clear_goal": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "clear_goal"
+  },
   "close_terminal": {
     "params": {
       "terminal_id": "11111111-1111-4111-8111-111111111111"
@@ -80,6 +92,21 @@
   },
   "compact": {
     "request": "compact"
+  },
+  "create_assistant_session": {
+    "params": {
+      "env_snapshot": {
+        "digest": "digest-fixture",
+        "source": "explicit_cli",
+        "vars": {
+          "PATH": "/usr/bin"
+        }
+      },
+      "name": "helper-bot",
+      "no_sandbox": true,
+      "project_root": "/tmp/project"
+    },
+    "request": "create_assistant_session"
   },
   "create_btw_fork": {
     "params": {
@@ -109,6 +136,17 @@
     },
     "request": "create_scheduled_job"
   },
+  "curator": {
+    "params": {
+      "action": {
+        "dry_run": true,
+        "consolidate": true,
+        "action": "run"
+      },
+      "project_root": "/tmp/project"
+    },
+    "request": "curator"
+  },
   "daemon_status": {
     "request": "daemon_status"
   },
@@ -136,6 +174,15 @@
       "parent_session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "end_btw_fork"
+  },
+  "export_session_data": {
+    "params": {
+      "include_generated_artifacts": true,
+      "include_sensitive": true,
+      "kind": "debug_bundle",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "export_session_data"
   },
   "finish_attachment_upload": {
     "params": {
@@ -224,6 +271,12 @@
     },
     "request": "git_status"
   },
+  "goal_status": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "goal_status"
+  },
   "guidance_estimate": {
     "params": {
       "model": "model-fixture",
@@ -234,6 +287,9 @@
   },
   "list_agents": {
     "request": "list_agents"
+  },
+  "list_assistants": {
+    "request": "list_assistants"
   },
   "list_models": {
     "params": {
@@ -322,6 +378,9 @@
       }
     },
     "request": "refresh_env"
+  },
+  "refresh_config": {
+    "request": "refresh_config"
   },
   "remove_editable_queued_user_messages": {
     "params": {
@@ -454,6 +513,13 @@
     },
     "request": "set_delegation_recursion"
   },
+  "set_goal_status": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "status": "paused"
+    },
+    "request": "set_goal_status"
+  },
   "set_llm_mode": {
     "params": {
       "mode": "normal"
@@ -518,6 +584,14 @@
       "shared": true
     },
     "request": "share_session"
+  },
+  "stats_rollup": {
+    "params": {
+      "by_role": true,
+      "project_id": "project_id-fixture",
+      "range": "all_time"
+    },
+    "request": "stats_rollup"
   },
   "steer_delegation": {
     "params": {

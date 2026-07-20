@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::config::extended::{DaemonUploadLimitsConfig, ExtendedConfig, RetentionConfig};
 use crate::daemon::DaemonPaths;
+use crate::daemon::config_source::ConfigSource;
 use crate::daemon::principal::{self, ClientPrincipal, SessionAccess};
 use crate::daemon::proto::{
     self, Body, Envelope, ErrorCode, ErrorPayload, ProtoStream, RecvFrame, Request, Response,
@@ -54,7 +55,10 @@ static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, Weak<DaemonContex
 
 fn build_daemon_redaction_table() -> Arc<RedactionTable> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let cfg = crate::config::extended::load_for_cwd(&cwd).redact;
+    let cfg = ConfigSource::production()
+        .load(&cwd)
+        .map(|(_, extended)| extended.redact)
+        .unwrap_or_default();
     Arc::new(RedactionTable::build(&cfg, &cwd).unwrap_or_else(|error| {
         tracing::warn!(error = %error, "building daemon redaction table failed");
         RedactionTable::empty()
@@ -273,6 +277,27 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 scrub_session_message(message, redact);
             }
         }
+        proto::Response::GoalStatus { goal } => {
+            if let Some(goal) = goal {
+                scrub_goal_summary(goal, redact);
+            }
+        }
+        proto::Response::GoalUpdated { goal } => scrub_goal_summary(goal, redact),
+        proto::Response::GoalCleared { cleared: _ } => {}
+        proto::Response::Assistants { assistants } => {
+            for assistant in assistants {
+                scrub_assistant_summary(assistant, redact);
+            }
+        }
+        proto::Response::AssistantSessionCreated { session } => {
+            scrub_assistant_session_created(session, redact);
+        }
+        proto::Response::AutoTitle {
+            session_id: _,
+            title,
+        } => scrub_string(title, redact),
+        proto::Response::ExportSessionData { data } => scrub_export_session_data(data, redact),
+        proto::Response::Curator { result } => scrub_curator_result(result, redact),
         proto::Response::Forked {
             session_id: _,
             short_id: _,
@@ -306,9 +331,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             }
         }
         proto::Response::ScheduledJobDeleted { id: _, deleted: _ } => {}
-        proto::Response::ScheduledJobRun { id: _, result } => {
-            scrub_scheduled_job_last_result(result, redact);
-        }
+        proto::Response::ScheduledJobRunQueued { id: _ } => {}
         proto::Response::Agents { agents } => {
             for agent in agents {
                 scrub_agent_summary(agent, redact);
@@ -361,6 +384,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             system_tokens: _,
             model_instruction_tokens: _,
         } => scrub_option_string(file, redact),
+        proto::Response::StatsRollup { rollup } => scrub_stats_rollup(rollup, redact),
         proto::Response::CaffeinateState {
             active: _,
             lid_close_guaranteed: _,
@@ -378,6 +402,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             diff,
             policy: _,
         } => scrub_env_diff_summary(diff, redact),
+        proto::Event::ConfigSnapshot { snapshot: _ } => {}
         proto::Event::QueueUpdated {
             session_id: _,
             queue,
@@ -540,6 +565,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         }
         | proto::Event::SessionDriverFailed {
             session_id: _,
+            turn_id: _,
             error,
         } => scrub_string(error, redact),
         proto::Event::Notice {
@@ -783,6 +809,14 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             fix_command,
         } => {
             scrub_string(remedy, redact);
+            scrub_option_string(fix_command, redact);
+        }
+        proto::Event::CommandCapabilityUnavailable {
+            session_id: _,
+            text,
+            fix_command,
+        } => {
+            scrub_string(text, redact);
             scrub_option_string(fix_command, redact);
         }
         proto::Event::PreflightState {
@@ -1037,6 +1071,139 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
     scrub_option_string(title, redact);
 }
 
+fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
+    let proto::GoalSummary {
+        id: _,
+        session_id: _,
+        project_id,
+        objective,
+        context,
+        status: _,
+        token_budget: _,
+        tokens_used: _,
+        blocked_attempts: _,
+        last_read_at: _,
+        created_at: _,
+        updated_at: _,
+    } = goal;
+    scrub_string(project_id, redact);
+    scrub_string(objective, redact);
+    scrub_option_string(context, redact);
+}
+
+fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &RedactionTable) {
+    let proto::AssistantSummary {
+        name,
+        created_at: _,
+        home_dir,
+        config_json,
+        content_hash,
+    } = assistant;
+    scrub_string(name, redact);
+    scrub_string(home_dir, redact);
+    scrub_string(config_json, redact);
+    scrub_string(content_hash, redact);
+}
+
+fn scrub_assistant_session_created(
+    session: &mut proto::AssistantSessionCreated,
+    redact: &RedactionTable,
+) {
+    let proto::AssistantSessionCreated {
+        session_id: _,
+        short_id: _,
+        project_root,
+        project_id,
+        assistant_name,
+        active_agent,
+    } = session;
+    scrub_string(project_root, redact);
+    scrub_string(project_id, redact);
+    scrub_string(assistant_name, redact);
+    scrub_string(active_agent, redact);
+}
+
+fn scrub_export_session_data(data: &mut proto::ExportSessionData, redact: &RedactionTable) {
+    scrub_string(&mut data.filename_extension, redact);
+    scrub_string(&mut data.mime, redact);
+}
+
+fn scrub_curator_result(result: &mut proto::CuratorResult, redact: &RedactionTable) {
+    match result {
+        proto::CuratorResult::Status { status } => scrub_curator_status(status, redact),
+        proto::CuratorResult::Run { report } => scrub_curator_run_report(report, redact),
+        proto::CuratorResult::Pinned { name, pinned: _ }
+        | proto::CuratorResult::Restored { name } => scrub_string(name, redact),
+        proto::CuratorResult::Snapshots { snapshots } => {
+            for snapshot in snapshots {
+                scrub_curator_snapshot(snapshot, redact);
+            }
+        }
+        proto::CuratorResult::RolledBack { snapshot } => scrub_curator_snapshot(snapshot, redact),
+    }
+}
+
+fn scrub_curator_status(status: &mut proto::CuratorStatus, redact: &RedactionTable) {
+    for skill in &mut status.skills {
+        scrub_string(&mut skill.name, redact);
+        scrub_string(&mut skill.state, redact);
+        scrub_string(&mut skill.created_by, redact);
+        scrub_string(&mut skill.source_path, redact);
+        scrub_option_string(&mut skill.archive_path, redact);
+    }
+    for snapshot in &mut status.snapshots {
+        scrub_curator_snapshot(snapshot, redact);
+    }
+}
+
+fn scrub_curator_snapshot(snapshot: &mut proto::CuratorSnapshotStatus, redact: &RedactionTable) {
+    scrub_string(&mut snapshot.id, redact);
+    scrub_string(&mut snapshot.path, redact);
+    scrub_string(&mut snapshot.reason, redact);
+}
+
+fn scrub_curator_run_report(report: &mut proto::CuratorRunReport, redact: &RedactionTable) {
+    scrub_strings(&mut report.stale, redact);
+    scrub_strings(&mut report.archived, redact);
+    scrub_strings(&mut report.reactivated, redact);
+    scrub_strings(&mut report.skipped, redact);
+    scrub_option_string(&mut report.snapshot_id, redact);
+    scrub_option_string(&mut report.consolidation, redact);
+}
+
+fn scrub_stats_rollup(rollup: &mut proto::StatsRollup, redact: &RedactionTable) {
+    scrub_option_string(&mut rollup.project_id, redact);
+    for row in &mut rollup.tokens.by_model {
+        scrub_string(&mut row.model, redact);
+        scrub_string(&mut row.provider, redact);
+    }
+    if let Some(rows) = &mut rollup.tokens.by_role {
+        for row in rows {
+            scrub_string(&mut row.model, redact);
+            scrub_string(&mut row.provider, redact);
+            scrub_string(&mut row.agent, redact);
+        }
+    }
+    for row in &mut rollup.recovery.by_model {
+        scrub_string(&mut row.model, redact);
+    }
+    for row in &mut rollup.recovery.by_tool {
+        scrub_string(&mut row.model, redact);
+        scrub_string(&mut row.tool, redact);
+    }
+    for row in &mut rollup.recovery.by_stage {
+        scrub_string(&mut row.model, redact);
+        scrub_string(&mut row.recovery_kind, redact);
+        scrub_string(&mut row.recovery_stage, redact);
+    }
+    for row in &mut rollup.language.languages {
+        scrub_string(&mut row.language, redact);
+    }
+    for row in &mut rollup.language.non_file {
+        scrub_string(&mut row.tool, redact);
+    }
+}
+
 fn scrub_session_message(message: &mut proto::SessionMessage, redact: &RedactionTable) {
     let proto::SessionMessage {
         seq: _,
@@ -1052,6 +1219,7 @@ fn scrub_skill_summary(skill: &mut proto::SkillSummary, redact: &RedactionTable)
         name: _,
         description,
         source,
+        user_invocable: _,
     } = skill;
     scrub_string(description, redact);
     scrub_string(source, redact);
@@ -1483,6 +1651,9 @@ impl DaemonContext {
             ))
             .start_with_callbacks(shutdown.clone(), callbacks)
         });
+        if let Some(handle) = &scheduler {
+            registry.set_scheduler(handle.clone());
+        }
         if let Some(handle) = &scheduler
             && let Err(error) = crate::skills::curator::register_scheduler(handle, db.clone())
         {
@@ -1830,7 +2001,10 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
 
 fn retention_config() -> RetentionConfig {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    crate::config::extended::load_for_cwd(&cwd).retention
+    ConfigSource::production()
+        .load(&cwd)
+        .map(|(_, extended)| extended.retention)
+        .unwrap_or_default()
 }
 
 fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {

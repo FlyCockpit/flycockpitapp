@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::agents::{AgentDef, AgentMode};
+use crate::agents::{AgentDef, AgentMode, ToolSurfaceSelection, ToolTier};
 use crate::db::Db;
 use crate::db::assistants::AssistantRow;
 use crate::wizard::{
@@ -65,6 +65,7 @@ pub struct CreateAssistantSpec {
     pub description: String,
     pub mode: AgentMode,
     pub tools: Option<Vec<String>>,
+    pub tool_tiers: std::collections::BTreeMap<String, ToolTier>,
     pub model: Option<String>,
     pub prompt: String,
     pub home_dir: PathBuf,
@@ -136,6 +137,7 @@ pub fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<AssistantR
         model: spec.model,
         temperature: None,
         tools: spec.tools,
+        tool_tiers: spec.tool_tiers,
         tool_descriptions: std::collections::BTreeMap::new(),
         scan_tool_results: None,
         permission: None,
@@ -228,13 +230,13 @@ pub fn descriptor() -> WizardDescriptor {
             },
             StepDescriptor {
                 id: "tools",
-                prompt: "Tool grants (comma-separated, blank to inherit)",
-                help: "Optional list such as bash,read.",
+                prompt: "Tool surface",
+                help: "Choose granted tools and per-tool tiers.",
                 help_hook: None,
-                kind: StepKind::Text,
-                default_answer: Some(WizardAnswer::Text(String::new())),
+                kind: StepKind::ToolSurface,
+                default_answer: Some(WizardAnswer::ToolSurface(ToolSurfaceSelection::default())),
                 prefill: None,
-                validate: None,
+                validate: Some(validate_tool_surface),
                 write: None,
                 branch: None,
             },
@@ -283,22 +285,15 @@ pub fn spec_from_wizard(
         _ => AgentMode::Primary,
     };
     let model = text_answer(run, "model").and_then(non_blank);
-    let tools = text_answer(run, "tools")
-        .and_then(non_blank)
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .filter(|tools| !tools.is_empty());
+    let surface = tool_surface_answer(run, "tools").unwrap_or_default();
+    let tools = (!surface.tools.is_empty()).then_some(surface.tools);
     let prompt = text_answer(run, "prompt").context("assistant prompt missing")?;
     Ok(CreateAssistantSpec {
         name: name.to_string(),
         description,
         mode,
         tools,
+        tool_tiers: surface.tool_tiers,
         model,
         prompt,
         home_dir,
@@ -326,6 +321,46 @@ fn select_answer(run: &WizardRun, step: &str) -> Option<String> {
     }
 }
 
+fn tool_surface_answer(run: &WizardRun, step: &str) -> Option<ToolSurfaceSelection> {
+    match run.answer(step) {
+        Some(WizardAnswer::ToolSurface(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn validate_tool_surface(
+    run: &WizardRun,
+    answer: &WizardAnswer,
+) -> std::result::Result<(), String> {
+    let WizardAnswer::ToolSurface(surface) = answer else {
+        return Err("tool surface answer required".to_string());
+    };
+    let mode = match select_answer(run, "mode").as_deref() {
+        Some("all") => AgentMode::All,
+        Some("subagent") => AgentMode::Subagent,
+        _ => AgentMode::Primary,
+    };
+    let mut def = AgentDef {
+        name: "__assistant_draft__".to_string(),
+        description: "draft".to_string(),
+        mode,
+        model: None,
+        temperature: None,
+        tools: (!surface.tools.is_empty()).then_some(surface.tools.clone()),
+        tool_tiers: surface.tool_tiers.clone(),
+        tool_descriptions: std::collections::BTreeMap::new(),
+        scan_tool_results: None,
+        permission: None,
+        prompt: "draft".to_string(),
+        prompt_variants: std::collections::HashMap::new(),
+        source: PathBuf::new(),
+    };
+    if surface.tools.iter().any(|tool| tool == "spawn") {
+        def.name = "assistant-draft".to_string();
+    }
+    crate::agents::validate_invariants(&def).map_err(|e| e.to_string())
+}
+
 fn non_blank(value: String) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -333,6 +368,10 @@ fn non_blank(value: String) -> Option<String> {
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     crate::intel::hex_lower(&Sha256::digest(bytes))
+}
+
+pub fn markdown_content_hash(markdown: &str) -> String {
+    sha256_hex(markdown.as_bytes())
 }
 
 #[cfg(test)]

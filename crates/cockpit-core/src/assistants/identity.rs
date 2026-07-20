@@ -443,6 +443,9 @@ mod tests {
                 review_cage: None,
                 context_usage: None,
                 available_tools: Arc::new(std::collections::HashSet::new()),
+                mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
+                    Vec::new(),
+                )),
                 has_tree: false,
                 has_bash: false,
                 events: None,

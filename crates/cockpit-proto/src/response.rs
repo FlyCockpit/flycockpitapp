@@ -124,6 +124,40 @@ pub enum Response {
         seq: i64,
     },
 
+    GoalStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<GoalSummary>,
+    },
+
+    GoalUpdated {
+        goal: GoalSummary,
+    },
+
+    GoalCleared {
+        cleared: bool,
+    },
+
+    Assistants {
+        assistants: Vec<AssistantSummary>,
+    },
+
+    AssistantSessionCreated {
+        session: AssistantSessionCreated,
+    },
+
+    AutoTitle {
+        session_id: Uuid,
+        title: String,
+    },
+
+    ExportSessionData {
+        data: ExportSessionData,
+    },
+
+    Curator {
+        result: CuratorResult,
+    },
+
     /// Per-session live status. Answer to [`Request::SessionLiveStatus`].
     /// Only sessions with a live worker appear; everything else is
     /// implicitly not-processing / no-jobs.
@@ -175,9 +209,8 @@ pub enum Response {
         deleted: bool,
     },
 
-    ScheduledJobRun {
+    ScheduledJobRunQueued {
         id: String,
-        result: ScheduledJobLastResult,
     },
 
     Agents {
@@ -254,6 +287,10 @@ pub enum Response {
         models: HashMap<String, u64>,
         slash: HashMap<String, u64>,
         tags: HashMap<String, u64>,
+    },
+
+    StatsRollup {
+        rollup: StatsRollup,
     },
 
     /// Pre-flight sizing for the fresh-chat context indicator. `file` is

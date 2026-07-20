@@ -10,7 +10,7 @@ impl Tool for WordTool {
         "word"
     }
     fn description(&self) -> &str {
-        "List files and lines where an identifier token appears, from the index"
+        "List whole-token identifier uses from the index; use `symbol_find` for definitions and `search`/`grep` for regex text"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(

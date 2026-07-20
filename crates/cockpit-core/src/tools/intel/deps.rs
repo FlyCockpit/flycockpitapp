@@ -10,7 +10,7 @@ impl Tool for DepsTool {
         "deps"
     }
     fn description(&self) -> &str {
-        "Show a file's resolved import dependencies forward/reverse within a hop limit"
+        "Show one file's import dependency graph; use `impact` for one symbol's calls and `change_impact` for current diff risk"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(

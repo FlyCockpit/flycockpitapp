@@ -4,9 +4,7 @@
 //! target exists so process-boundary tests can exercise the daemon protocol
 //! without duplicating wire types.
 
-mod banner;
 mod cli;
-mod clipboard;
 mod commands;
 pub use cockpit_config as config;
 #[cfg(test)]
@@ -20,9 +18,9 @@ pub use cockpit_core::{
 };
 pub use cockpit_db as db;
 mod terminal_host;
-mod tui;
 
 use clap::Parser;
+use std::path::Path;
 use std::process::ExitCode;
 
 use crate::cli::{Cli, Command};
@@ -490,6 +488,9 @@ pub mod integration {
             crate::daemon::proto::Event::Notice { session_id, text } => {
                 DaemonEvent::Notice { session_id, text }
             }
+            crate::daemon::proto::Event::CommandCapabilityUnavailable {
+                session_id, text, ..
+            } => DaemonEvent::Notice { session_id, text },
             crate::daemon::proto::Event::PausedWorkAvailable { session_id, items } => {
                 DaemonEvent::PausedWorkAvailable {
                     session_id,
@@ -546,6 +547,10 @@ pub mod integration {
 }
 
 pub fn main_entry() -> ExitCode {
+    if invoked_as_jq() {
+        return commands::jq::run_from_argv0();
+    }
+
     // Sandboxing part 2: dispatch the zerobox Linux sandbox helper and
     // install the PATH-prepend alias BEFORE the tokio runtime starts.
     tools::shell_sandbox::init();
@@ -566,6 +571,18 @@ pub fn main_entry() -> ExitCode {
             ExitCode::from(error_exit_code(&err))
         }
     }
+}
+
+fn invoked_as_jq() -> bool {
+    std::env::args_os()
+        .next()
+        .and_then(|arg0| {
+            Path::new(&arg0)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .as_deref()
+        == Some("jq")
 }
 
 fn error_exit_code(err: &anyhow::Error) -> u8 {
@@ -621,6 +638,7 @@ async fn async_main() -> anyhow::Result<()> {
             commands::models::run_provider_catalog_status(args).await
         }
         Some(Command::FetchModels(args)) => commands::fetch_models::run(args).await,
+        Some(Command::Jq(args)) => commands::jq::run(args).await,
         Some(Command::Daemon(sub)) => commands::daemon::run(sub).await,
         Some(Command::Doctor(args)) => commands::doctor::run(args, cli.no_sandbox).await,
         Some(Command::Session(sub)) => commands::session::run(sub).await,

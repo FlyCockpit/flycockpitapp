@@ -13,8 +13,8 @@ Flow:
    exact provider/model selector and a self-contained read-only `scout` brief.
    Include the same git/gh commands for every worker so they review the same
    union of changes. Give each worker a distinct `output_dir`.
-4. For each harness reviewer, call `harness_invoke` serially with isolated write
-   policy and a review-only brief that forbids modifications. Treat missing,
+4. For each harness reviewer, use the MCP harness advert to invoke the harness
+   serially with isolated write policy and a review-only brief that forbids modifications. Treat missing,
    unauthenticated, or failed harnesses as skipped participants, not fatal review
    failures.
 5. Await all worker and harness reports.

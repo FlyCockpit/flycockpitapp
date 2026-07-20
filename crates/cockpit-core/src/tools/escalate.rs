@@ -48,15 +48,11 @@ impl Tool for EscalateTool {
     }
 
     fn description(&self) -> &str {
-        "Escalate a sandbox-failed bash call_id; optionally include suggested_paths"
+        "Re-run a sandbox-failed bash call after approval; prefer suggested_paths so future commands keep working inside the sandbox, and escalate without paths only when a durable grant would not help."
     }
 
     fn defensive_description(&self) -> Option<String> {
         Some("Use only with the call_id of a prior failed bash call from this session that failed while sandboxed or because the sandbox could not start; optionally include suggested_paths so the user can grant path access and retry inside the sandbox.".to_string())
-    }
-
-    fn frontier_description(&self) -> Option<String> {
-        Some("Re-run a sandbox-failed bash call after approval; prefer suggested_paths so future commands keep working inside the sandbox, and escalate without paths only when a durable grant would not help.".to_string())
     }
 
     fn parameters(&self) -> Value {
@@ -556,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_and_frontier_descriptions_are_distinct() {
+    fn base_description_carries_suggested_paths_guidance() {
         let tool = EscalateTool;
         let normal = crate::engine::tool::definition_of(
             &tool,
@@ -568,12 +564,7 @@ mod tests {
             crate::config::extended::LlmMode::Frontier,
             None,
         );
-        assert!(
-            normal
-                .description
-                .contains("optionally include suggested_paths")
-        );
-        assert!(frontier.description.contains("prefer suggested_paths"));
-        assert_ne!(normal.description, frontier.description);
+        assert!(normal.description.contains("prefer suggested_paths"));
+        assert_eq!(normal.description, frontier.description);
     }
 }

@@ -47,15 +47,13 @@ pub(crate) const SHELL_WRITE_NATIVE_TOOL_HINT: &str = "Use `writeunlock` to crea
 static WINDOWS_NOTICE_SHOWN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Configured at construction time from a `$PATH` probe. `description`
-/// is the cached string returned by [`Tool::description`]; `prelude`
-/// is prepended to every shell command (currently used only for the
-/// macOS `sed → gsed` alias).
+/// `description` is the cached string returned by [`Tool::description`].
+/// Binary-specific availability hints are appended by the capability layer
+/// when a toolbox is rebuilt with the effective `PATH`.
 pub struct BashTool {
     description: String,
     /// The explicit, steering [`LlmMode::Defensive`] description
-    /// (implementation note). Built at construction
-    /// alongside `description` so it carries the same PATH-probe hints.
+    /// (implementation note).
     defensive_description: String,
     prelude: String,
 }
@@ -68,38 +66,12 @@ impl Default for BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        let has_rg = which::which("rg").is_ok();
-        let has_fd = which::which("fd").is_ok();
-        let has_gsed = which::which("gsed").is_ok();
-        let alias_sed = cfg!(target_os = "macos") && has_gsed;
-
-        // Build the description. GOALS §10 says: one sentence,
-        // terse. We append a short suffix listing the search binaries
-        // that are actually on PATH — saves the model a probe step.
-        let mut hints: Vec<&str> = Vec::new();
-        if has_rg {
-            hints.push("rg");
-        }
-        if has_fd {
-            hints.push("fd");
-        }
-        let search_hint = if hints.is_empty() {
-            String::new()
-        } else {
-            format!("; prefer {} over grep/find", hints.join("/"))
-        };
-        let sed_hint = if alias_sed {
-            "; `sed` is wired to gsed (GNU)".to_string()
-        } else {
-            String::new()
-        };
-        let description = format!(
-            "Execute shell command; stdout/stderr/exit display is capped at 8 KB; declare resources for expensive builds/tests; redirect verbose logs to $TMPDIR (120s default timeout){search_hint}{sed_hint}"
-        );
+        let description = "Execute shell command; stdout/stderr/exit display is capped at 8 KB; declare resources for expensive builds/tests; redirect verbose logs to $TMPDIR (120s default timeout)"
+            .to_string();
 
         // The defensive, explicitly-steering form (`llm-modes-
         // defensive-normal.md`). Same PATH-probe hints, more guidance.
-        let defensive_description = format!(
+        let defensive_description =
             "Run a single shell command — builds, tests, git, package managers, \
              process/binary inspection — and get back combined stdout, stderr, and exit code. \
              Use `bash` ONLY to *run* things. For working with files the dedicated tools are \
@@ -111,29 +83,51 @@ impl BashTool {
              `cat`, `rg`, `grep`, `ls`, or `find` through bash, stop and use the tool above \
              instead. Each call is its own shell: `cd`/env changes do NOT persist — chain with \
              `&&` or set `cwd`. For expensive builds/tests, declare `resources` such as \
-             {{\"cpu\":1,\"memory\":1}}; `queue_timeout_ms` limits scheduler wait only. \
+             {\"cpu\":1,\"memory\":1}; `queue_timeout_ms` limits scheduler wait only. \
              Display output caps at 8 KB (head+tail kept); redirect verbose \
              build/test logs to a file under the session temp dir (`$TMPDIR`/`$TMP`/`$TEMP`) \
              unless the user explicitly wants a persistent workspace artifact, then inspect \
              focused slices or searches from that file. Never edit a file you intend to keep via bash — use \
-             `readlock`+`writeunlock`/`editunlock`.{search_hint}{sed_hint}"
-        );
-
-        // Prepend a `sed` shell function on macOS so the model can use
-        // its standard Linux-style flags without having to remember to
-        // type `gsed` itself. `command gsed` bypasses the function on
-        // recursion (no infinite-loop hazard).
-        let prelude = if alias_sed {
-            "sed() { command gsed \"$@\"; }; ".to_string()
-        } else {
-            String::new()
-        };
+             `readlock`+`writeunlock`/`editunlock`."
+                .to_string();
 
         Self {
             description,
             defensive_description,
-            prelude,
+            prelude: macos_sed_prelude(),
         }
+    }
+
+    fn declared_binary_requirements() -> Vec<crate::capabilities::BinaryRequirement> {
+        let mut requirements = vec![
+            crate::capabilities::BinaryRequirement::optional(
+                "rg",
+                crate::capabilities::common_remedy("rg"),
+            ),
+            crate::capabilities::BinaryRequirement::optional(
+                "fd",
+                crate::capabilities::common_remedy("fd"),
+            ),
+            crate::capabilities::BinaryRequirement::optional(
+                "jq",
+                crate::capabilities::common_remedy("jq"),
+            ),
+        ];
+        if cfg!(target_os = "macos") {
+            requirements.push(crate::capabilities::BinaryRequirement::optional(
+                "gsed",
+                crate::capabilities::common_remedy("gsed"),
+            ));
+        }
+        requirements
+    }
+}
+
+fn macos_sed_prelude() -> String {
+    if cfg!(target_os = "macos") {
+        "sed() { if command -v gsed >/dev/null 2>&1; then command gsed \"$@\"; else command sed \"$@\"; fi; }; ".to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -149,6 +143,10 @@ impl Tool for BashTool {
 
     fn defensive_description(&self) -> Option<String> {
         Some(self.defensive_description.clone())
+    }
+
+    fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
+        Self::declared_binary_requirements()
     }
 
     fn parameters(&self) -> Value {
@@ -348,11 +346,18 @@ async fn call_bash_inner(
         false
     };
 
-    let session_env = ctx
+    let is_container_run = !options.force_unconfined && ctx.session.sandbox_mode().is_container();
+    let mut session_env = ctx
         .env_overlay
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let jq_shim_paths =
+        if should_prepare_jq_shim(options.force_unconfined, ctx.session.sandbox_mode()) {
+            crate::tools::jq_shim::prepare_host_jq_shim(&ctx.session, &mut session_env)
+        } else {
+            Vec::new()
+        };
     let tmp_dir = ctx.session.tmp_dir();
     let scrub = scrub_overrides(&session_env);
     let command_classification = crate::approval::classify::classify(command);
@@ -380,7 +385,7 @@ async fn call_bash_inner(
         queue_timeout_ms,
     );
 
-    if !options.force_unconfined && ctx.session.sandbox_mode().is_container() {
+    if is_container_run {
         return run_container_bash(
             command,
             &prefixed,
@@ -497,6 +502,8 @@ async fn call_bash_inner(
             Ok(acquired) => acquired,
             Err(output) => return Ok(output),
         };
+    let extra_sandbox_paths =
+        merged_extra_sandbox_paths(&command_resource_plan.allow_paths, &jq_shim_paths);
 
     // First attempt: sandboxed (confined) or broadened/unconfined.
     let attempt = run_shell(
@@ -506,7 +513,7 @@ async fn call_bash_inner(
         tmp_dir.as_deref(),
         &scrub,
         &session_env,
-        &command_resource_plan.allow_paths,
+        &extra_sandbox_paths,
         ctx,
         timeout_ms,
     )
@@ -572,7 +579,7 @@ async fn call_bash_inner(
                 tmp_dir.as_deref(),
                 &scrub,
                 &session_env,
-                &command_resource_plan.allow_paths,
+                &extra_sandbox_paths,
                 ctx,
                 timeout_ms,
             )
@@ -1677,6 +1684,24 @@ fn cockpit_command_environment_block(
     spawn_error: Option<&str>,
     missing_binary: Option<&str>,
 ) -> String {
+    cockpit_command_environment_block_with_requirements(
+        command,
+        cwd,
+        exit_status,
+        spawn_error,
+        missing_binary,
+        BashTool::declared_binary_requirements(),
+    )
+}
+
+pub(crate) fn cockpit_command_environment_block_with_requirements(
+    command: &str,
+    cwd: &Path,
+    exit_status: Option<&str>,
+    spawn_error: Option<&str>,
+    missing_binary: Option<&str>,
+    declared_requirements: Vec<crate::capabilities::BinaryRequirement>,
+) -> String {
     let mut out = String::new();
     out.push_str("cockpit_command_environment:\n");
     out.push_str(&format!("attempted_command: {command}\n"));
@@ -1689,6 +1714,13 @@ fn cockpit_command_environment_block(
     }
     if let Some(binary) = missing_binary {
         out.push_str(&format!("missing_binary: {binary}\n"));
+        if let Some(remedy) = crate::capabilities::declared_missing_binary_remedy(
+            binary,
+            declared_requirements,
+            crate::capabilities::RemedyPlatform::current(),
+        ) {
+            out.push_str(&format!("remedy: {remedy}\n"));
+        }
         out.push_str(&format!(
             "diagnostic: `{binary}` was not found in cockpit's command environment (PATH inherited from cockpit launch); this does not establish that it is absent from the host system.\n"
         ));
@@ -1700,7 +1732,7 @@ fn cockpit_command_environment_block(
     out
 }
 
-fn missing_binary_from_shell_failure(exit: i32, stderr: &str) -> Option<String> {
+pub(crate) fn missing_binary_from_shell_failure(exit: i32, stderr: &str) -> Option<String> {
     if exit != 127 {
         return None;
     }
@@ -1989,6 +2021,22 @@ fn render_bash_outcome(
         Some(code) => out.with_exit_code(code),
         None => out,
     }
+}
+
+fn merged_extra_sandbox_paths(
+    resource_paths: &[crate::tools::shell_sandbox::ExtraSandboxPath],
+    jq_shim_paths: &[crate::tools::shell_sandbox::ExtraSandboxPath],
+) -> Vec<crate::tools::shell_sandbox::ExtraSandboxPath> {
+    let mut paths = resource_paths.to_vec();
+    paths.extend_from_slice(jq_shim_paths);
+    paths
+}
+
+fn should_prepare_jq_shim(
+    force_unconfined: bool,
+    sandbox_mode: crate::tools::sandbox_mode::SandboxMode,
+) -> bool {
+    force_unconfined || !sandbox_mode.is_container()
 }
 
 /// Spawn `sh -c <command>` — confined via zerobox when `confine`, else

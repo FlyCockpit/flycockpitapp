@@ -467,6 +467,10 @@ pub struct Driver {
     /// byte-stable tools array. We append the hint the first time the
     /// gating job kind appears.
     appended_hints: std::collections::HashSet<&'static str>,
+    /// Command-capability startup notices already emitted for this driver.
+    /// Keyed by rendered text so agent/toolbox/PATH changes can surface a new
+    /// state without spamming every turn.
+    emitted_command_capability_notices: HashSet<String>,
     /// Per-foreground-agent "last prune watermark" (GOALS §10): the
     /// foreground history length at the last auto-prune. The cache-aware
     /// auto-prune short-circuits when the foreground history hasn't grown
@@ -574,6 +578,10 @@ pub struct Driver {
     /// Daemon-owned runtime resource scheduler. Persistent daemons install a
     /// shared handle; ephemeral/test/replay contexts may leave it absent.
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    /// Shared daemon scheduler handle cell. The worker installs the registry's
+    /// cell rather than a snapshot so late `set_scheduler` calls are visible.
+    daemon_scheduler:
+        Option<Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>>,
     /// Compact-after-delegation trackers for **interactive** subagent
     /// delegations (`SpawnSubagent`), keyed by the paused parent frame's
     /// stack depth (its index in `self.stack`). The lazy shrink for the
@@ -702,6 +710,8 @@ pub struct Driver {
     /// prompt, and revision history without opening a socket.
     #[cfg(test)]
     test_compact_brief_calls: Option<Arc<std::sync::Mutex<Vec<TestCompactBriefCall>>>>,
+    #[cfg(test)]
+    test_compaction_apply_trace: Option<Arc<std::sync::Mutex<Vec<&'static str>>>>,
     redaction_scan_environment_override: Option<bool>,
     redaction_scan_dotenv_override: Option<bool>,
     redaction_scan_ssh_keys_override: Option<bool>,
@@ -1118,6 +1128,7 @@ impl Driver {
             pending_noninteractive_completions: std::collections::VecDeque::new(),
             noninteractive_jobs: std::collections::HashMap::new(),
             appended_hints: self.appended_hints.clone(),
+            emitted_command_capability_notices: self.emitted_command_capability_notices.clone(),
             prune_watermark: self.prune_watermark.clone(),
             auto_compacted: self.auto_compacted,
             prune_effectiveness: self.prune_effectiveness.clone(),
@@ -1149,6 +1160,7 @@ impl Driver {
             approver: self.approver.clone(),
             lsp: self.lsp.clone(),
             resource_scheduler: self.resource_scheduler.clone(),
+            daemon_scheduler: self.daemon_scheduler.clone(),
             deleg_shrinks: std::collections::HashMap::new(),
             model_override: self.model_override.clone(),
             swarm_max_depth: self.swarm_max_depth,
@@ -1171,6 +1183,8 @@ impl Driver {
             test_fail_next_model_switch_audit_record: self.test_fail_next_model_switch_audit_record,
             #[cfg(test)]
             test_compact_brief_calls: self.test_compact_brief_calls.clone(),
+            #[cfg(test)]
+            test_compaction_apply_trace: self.test_compaction_apply_trace.clone(),
             redaction_scan_environment_override: self.redaction_scan_environment_override,
             redaction_scan_dotenv_override: self.redaction_scan_dotenv_override,
             redaction_scan_ssh_keys_override: self.redaction_scan_ssh_keys_override,
@@ -1379,7 +1393,7 @@ impl Driver {
             initial_tools.names(),
             crate::engine::tool::Capability::SandboxEscalate.enabled(root.llm_mode),
         );
-        Self {
+        let mut driver = Self {
             session,
             locks,
             redact,
@@ -1408,6 +1422,7 @@ impl Driver {
             pending_noninteractive_completions: std::collections::VecDeque::new(),
             noninteractive_jobs: std::collections::HashMap::new(),
             appended_hints: std::collections::HashSet::new(),
+            emitted_command_capability_notices: HashSet::new(),
             prune_watermark: std::collections::HashMap::new(),
             auto_compacted: false,
             prune_effectiveness: std::collections::VecDeque::new(),
@@ -1439,6 +1454,7 @@ impl Driver {
             approver: None,
             lsp: None,
             resource_scheduler: None,
+            daemon_scheduler: None,
             deleg_shrinks: std::collections::HashMap::new(),
             model_override: None,
             swarm_max_depth: crate::config::extended::DEFAULT_SWARM_MAX_DEPTH,
@@ -1460,11 +1476,15 @@ impl Driver {
             test_fail_next_model_switch_audit_record: false,
             #[cfg(test)]
             test_compact_brief_calls: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            #[cfg(test)]
+            test_compaction_apply_trace: None,
             redaction_scan_environment_override: None,
             redaction_scan_dotenv_override: None,
             redaction_scan_ssh_keys_override: None,
             redaction_unsupported_notified: HashSet::new(),
-        }
+        };
+        driver.load_compaction_shadow_from_store();
+        driver
     }
 
     /// Install the plan-level model override (prompt
@@ -1686,6 +1706,20 @@ impl Driver {
         self.resource_scheduler = Some(scheduler);
     }
 
+    pub fn set_daemon_scheduler_source(
+        &mut self,
+        scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
+    ) {
+        self.daemon_scheduler = Some(scheduler);
+    }
+
+    pub fn daemon_scheduler_handle(
+        &self,
+    ) -> Option<crate::daemon::scheduler::DaemonSchedulerHandle> {
+        let scheduler = self.daemon_scheduler.as_ref()?;
+        crate::sync::lock_or_recover(scheduler).clone()
+    }
+
     /// Rehydrate the root foreground agent's model history from the durable
     /// transcript + prune ledger on a fresh worker spin-up
     /// (implementation note). This is the session-level
@@ -1760,6 +1794,7 @@ impl Driver {
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             });
+        self.load_compaction_shadow_from_store();
         Ok(Some(rehydrated))
     }
 
@@ -2145,6 +2180,23 @@ impl Driver {
         }
     }
 
+    async fn emit_command_capability_notice_if_new(&mut self, tx: &mpsc::Sender<TurnEvent>) {
+        let Some(frame) = self.stack.last() else {
+            return;
+        };
+        let tools = crate::engine::agent::turn_toolbox(&frame.agent, &self.session, &self.cwd);
+        let Some(text) = tools.capability_notice_text() else {
+            return;
+        };
+        if !self.emitted_command_capability_notices.insert(text.clone()) {
+            return;
+        }
+        let fix_command = tools.capability_notice_fix_command();
+        let _ = tx
+            .send(TurnEvent::CommandCapabilityUnavailable { text, fix_command })
+            .await;
+    }
+
     fn active_queue_target(&self) -> crate::engine::message::QueueTarget {
         self.stack
             .last()
@@ -2240,6 +2292,7 @@ impl Driver {
                     .map(str::to_string)
                     .collect(),
             ),
+            mcp_builtin_registry: active_tools.mcp_builtin_registry(),
             has_tree: agent.tools.get("tree").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             events: Some(tx.clone()),
@@ -2322,6 +2375,7 @@ impl Driver {
                 top.agent.clone()
             };
             self.publish_active_tool_names();
+            self.emit_command_capability_notice_if_new(tx).await;
             let is_root = self.stack.len() == 1;
             let backup_model = self.resolve_backup_model(&agent.model);
             let fallback_models = self.resolve_failover_models(&agent.model);
@@ -2570,6 +2624,7 @@ impl Driver {
         // have `tx`. Done before the first message so no job can start
         // (and thus emit a started/progress signal) beforehand.
         self.schedule.set_turn_tx(tx.clone());
+        self.emit_command_capability_notice_if_new(tx).await;
 
         // Resume rehydration (implementation note): if a
         // prior conversation was rebuilt for this worker, emit its context
@@ -3852,7 +3907,7 @@ impl Driver {
         // to the same agent name's default build on a load failure so the swap
         // never strands the session without a primary.
         crate::engine::builtin::load(&name, &args)
-            .unwrap_or_else(|_| crate::engine::builtin::build(&args))
+            .unwrap_or_else(|_| crate::engine::builtin::default_build(&args))
     }
 
     /// Re-resolve the reasoning-param fragment for `model` from the config's
@@ -4528,6 +4583,7 @@ impl Driver {
         let popped_depth = self.stack.len();
         let child = self.stack.pop().expect("pop_child requires a child frame");
         self.publish_active_tool_names();
+        self.emit_command_capability_notice_if_new(tx).await;
         self.prune_watermark.remove(&popped_depth);
         // Drop any locks the child still held — the §3c invariant doesn't
         // extend across the child's lifetime, and lingering locks would block
@@ -5112,6 +5168,7 @@ impl Driver {
 
             let attempted_prompt = next_prompt.clone();
             self.publish_active_tool_names();
+            self.emit_command_capability_notice_if_new(tx).await;
             let mut turn_metadata = BackupTurnMetadata::default();
             let fallback_models = self.resolve_failover_models(&agent.model);
             let turn_result = {
@@ -5633,6 +5690,7 @@ impl Driver {
                         fallback_decision: None,
                     });
                     self.publish_active_tool_names();
+                    self.emit_command_capability_notice_if_new(tx).await;
                     let _ = tx
                         .send(TurnEvent::ForegroundInputTarget {
                             target: self.active_queue_target(),

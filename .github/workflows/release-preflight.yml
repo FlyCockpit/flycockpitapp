@@ -31,6 +31,6 @@ jobs:
       # package-scoped preflight would silently skip most of the shipped code.
       # Matches the workspace-scoped gate in cli-ci.yml.
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked
+      - run: cargo clippy --workspace --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
       - run: cargo test --workspace --doc --locked

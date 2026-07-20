@@ -225,6 +225,350 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_change_is_visible_to_live_worker() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, session_id, _work_rx) =
+            attached_state_with_worker_receiver(&ctx, tmp.path());
+        let session = ctx.db.get_session(session_id).unwrap().unwrap();
+        ctx.db
+            .create_session_goal(
+                session_id,
+                &session.project_id,
+                "ship live goal coherence",
+                None,
+                Some(100),
+            )
+            .unwrap();
+        let live_before = state
+            .attached
+            .as_ref()
+            .expect("attached live worker")
+            .handle
+            .session();
+
+        let response = handle_request(
+            Request::SetGoalStatus {
+                session_id,
+                status: proto::GoalStatus::Paused,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("pause live goal");
+        assert!(matches!(
+            response,
+            Response::GoalUpdated {
+                goal: proto::GoalSummary {
+                    status: proto::GoalStatus::Paused,
+                    ..
+                }
+            }
+        ));
+
+        let live_after = state
+            .attached
+            .as_ref()
+            .expect("attached live worker")
+            .handle
+            .session();
+        assert!(
+            Arc::ptr_eq(&live_before, &live_after),
+            "goal change must not require replacing the live session"
+        );
+        let goal = live_after
+            .db
+            .current_session_goal(live_after.id, false)
+            .unwrap()
+            .expect("goal visible through live worker session handle");
+        assert_eq!(goal.status, proto::GoalStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, session_id, mut work_rx) =
+            attached_state_with_worker_receiver(&ctx, tmp.path());
+        let session = ctx.db.get_session(session_id).unwrap().unwrap();
+        ctx.db
+            .create_session_goal(
+                session_id,
+                &session.project_id,
+                "ship midturn goal boundary",
+                None,
+                Some(100),
+            )
+            .unwrap();
+
+        let first_ctx = ctx.clone();
+        let first = tokio::spawn(async move {
+            let mut state = state;
+            let result = handle_request(
+                Request::SendUserMessage {
+                    text: "first turn".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    image_refs: Vec::new(),
+                    forced_skill: None,
+                },
+                &mut state,
+                &first_ctx,
+            )
+            .await;
+            (state, result)
+        });
+        let first_work = tokio::time::timeout(std::time::Duration::from_secs(2), work_rx.recv())
+            .await
+            .expect("first turn delivered")
+            .expect("first turn work");
+        let SessionWork::UserMessage {
+            submission,
+            respond_to,
+        } = first_work
+        else {
+            panic!("expected first user message work");
+        };
+        assert_eq!(submission.text, "first turn");
+        assert_eq!(
+            ctx.db
+                .current_session_goal(session_id, false)
+                .unwrap()
+                .expect("goal exists")
+                .status,
+            crate::db::session_goals::GoalStatus::Active
+        );
+
+        let mut rpc_state = owner_state();
+        handle_request(
+            Request::SetGoalStatus {
+                session_id,
+                status: proto::GoalStatus::Paused,
+            },
+            &mut rpc_state,
+            &ctx,
+        )
+        .await
+        .expect("midturn pause persists");
+        assert_eq!(
+            ctx.db
+                .current_session_goal(session_id, false)
+                .unwrap()
+                .expect("goal persists immediately")
+                .status,
+            crate::db::session_goals::GoalStatus::Paused
+        );
+
+        let item = proto::QueueItem {
+            id: Uuid::new_v4(),
+            status: proto::QueueItemStatus::Queued,
+            text: submission.text.clone(),
+            display_text: None,
+            target: proto::QueueTarget::default(),
+        };
+        respond_to.send((item.clone(), vec![item])).unwrap();
+        let (state, first_response) = first.await.expect("first turn request joins");
+        assert!(matches!(
+            first_response.expect("first turn completes"),
+            Response::UserMessageQueued { .. }
+        ));
+
+        let second_ctx = ctx.clone();
+        let second = tokio::spawn(async move {
+            let mut state = state;
+            let result = handle_request(
+                Request::SendUserMessage {
+                    text: "second turn".into(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    image_refs: Vec::new(),
+                    forced_skill: None,
+                },
+                &mut state,
+                &second_ctx,
+            )
+            .await;
+            result
+        });
+        let second_work = tokio::time::timeout(std::time::Duration::from_secs(2), work_rx.recv())
+            .await
+            .expect("second turn delivered")
+            .expect("second turn work");
+        let SessionWork::UserMessage {
+            submission,
+            respond_to,
+        } = second_work
+        else {
+            panic!("expected second user message work");
+        };
+        assert_eq!(submission.text, "second turn");
+        assert_eq!(
+            ctx.db
+                .current_session_goal(session_id, false)
+                .unwrap()
+                .expect("next turn reads paused goal")
+                .status,
+            crate::db::session_goals::GoalStatus::Paused
+        );
+        let item = proto::QueueItem {
+            id: Uuid::new_v4(),
+            status: proto::QueueItemStatus::Queued,
+            text: submission.text.clone(),
+            display_text: None,
+            target: proto::QueueTarget::default(),
+        };
+        respond_to.send((item.clone(), vec![item])).unwrap();
+        assert!(matches!(
+            second.await.expect("second turn joins").expect("second turn completes"),
+            Response::UserMessageQueued { .. }
+        ));
+    }
+
+    #[test]
+    fn new_session_state_requests_are_classified() {
+        let session_id = Uuid::from_u128(42);
+        let state = owner_state();
+        let cases = [
+            (
+                Request::GoalStatus { session_id },
+                "goal_status",
+                Some(session_id),
+                false,
+                None,
+            ),
+            (
+                Request::SetGoalStatus {
+                    session_id,
+                    status: proto::GoalStatus::Paused,
+                },
+                "set_goal_status",
+                Some(session_id),
+                true,
+                None,
+            ),
+            (
+                Request::ClearGoal { session_id },
+                "clear_goal",
+                Some(session_id),
+                true,
+                None,
+            ),
+            (Request::ListAssistants, "list_assistants", None, false, None),
+            (
+                Request::CreateAssistantSession {
+                    name: "helper".into(),
+                    project_root: "/repo".into(),
+                    no_sandbox: false,
+                    env_snapshot: None,
+                },
+                "create_assistant_session",
+                None,
+                true,
+                None,
+            ),
+            (
+                Request::StatsRollup {
+                    project_id: None,
+                    range: proto::StatsRange::AllTime,
+                    by_role: false,
+                },
+                "stats_rollup",
+                None,
+                false,
+                None,
+            ),
+            (
+                Request::ExportSessionData {
+                    session_id,
+                    kind: proto::ExportSessionKind::TranscriptJson,
+                    include_generated_artifacts: false,
+                    include_sensitive: false,
+                },
+                "export_session_data",
+                Some(session_id),
+                false,
+                None,
+            ),
+            (
+                Request::AutoTitle { session_id },
+                "auto_title",
+                Some(session_id),
+                true,
+                None,
+            ),
+            (
+                Request::Curator {
+                    project_root: "/repo".into(),
+                    action: proto::CuratorAction::Status,
+                },
+                "curator",
+                None,
+                true,
+                Some("/repo"),
+            ),
+        ];
+
+        for (request, kind, session, mutating, audit_path) in cases {
+            assert_eq!(principal::request_kind(&request), kind);
+            assert_eq!(request_session_id(&request, &state), session, "{kind}");
+            assert_eq!(
+                is_remote_mutating_request(&request),
+                mutating,
+                "{kind}"
+            );
+            assert_eq!(request_audit_path(&request).as_deref(), audit_path, "{kind}");
+        }
+    }
+
+    #[test]
+    fn new_session_state_requests_enforce_authorization() {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        let session_id = session.session_id;
+        let state = remote_state_with_grants(Vec::new());
+        let requests = [
+            Request::GoalStatus { session_id },
+            Request::SetGoalStatus {
+                session_id,
+                status: proto::GoalStatus::Paused,
+            },
+            Request::ClearGoal { session_id },
+            Request::ListAssistants,
+            Request::CreateAssistantSession {
+                name: "helper".into(),
+                project_root: "/repo".into(),
+                no_sandbox: false,
+                env_snapshot: None,
+            },
+            Request::StatsRollup {
+                project_id: None,
+                range: proto::StatsRange::AllTime,
+                by_role: false,
+            },
+            Request::ExportSessionData {
+                session_id,
+                kind: proto::ExportSessionKind::TranscriptJson,
+                include_generated_artifacts: false,
+                include_sensitive: false,
+            },
+            Request::AutoTitle { session_id },
+            Request::Curator {
+                project_root: "/repo".into(),
+                action: proto::CuratorAction::Status,
+            },
+        ];
+
+        for request in requests {
+            let kind = principal::request_kind(&request);
+            let err = authorize_request(&request, &state, &ctx)
+                .err()
+                .unwrap_or_else(|| panic!("{kind} unexpectedly authorized"));
+            assert_eq!(err.code, ErrorCode::Authorization, "{kind}");
+        }
+    }
+
+    #[tokio::test]
     async fn stats_rpc_returns_rollup() {
         let ctx = test_ctx();
         let mut state = owner_state();
@@ -1662,6 +2006,14 @@ mod tests {
         ctx: &Arc<DaemonContext>,
         project_root: &std::path::Path,
     ) -> (ClientState, Uuid) {
+        let (state, session_id, _work_rx) = attached_state_with_worker_receiver(ctx, project_root);
+        (state, session_id)
+    }
+
+    fn attached_state_with_worker_receiver(
+        ctx: &Arc<DaemonContext>,
+        project_root: &std::path::Path,
+    ) -> (ClientState, Uuid, tokio::sync::mpsc::Receiver<SessionWork>) {
         ctx.db
             .set_workspace_trust(
                 project_root,
@@ -1678,7 +2030,7 @@ mod tests {
                 .unwrap(),
         );
         let locks = Arc::new(LockManager::from_db(ctx.db.clone()).expect("locks"));
-        let handle = SessionWorkerHandle::test_handle(session, locks);
+        let (handle, work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
         let event_rx = handle.subscribe();
         (
             ClientState {
@@ -1697,6 +2049,7 @@ mod tests {
                 terminal_host: test_terminal_host(),
             },
             session_row.session_id,
+            work_rx,
         )
     }
 

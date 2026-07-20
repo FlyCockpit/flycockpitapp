@@ -2,7 +2,7 @@
 //! (implementation note).
 //!
 //! The codebase-intelligence index walk (`crate::intel`) and the composer
-//! `@`-tag popup (`crate::tui::file_tag`) both reach gitignore status through
+//! `@`-tag popup (in the TUI file-tag module) both reach gitignore status through
 //! the `ignore` crate's [`ignore::WalkBuilder`], which answers "is this whole
 //! tree filtered" but not "is this *one* path ignored". This module provides
 //! that single-path predicate over the same `ignore`-crate machinery, plus the

@@ -90,6 +90,7 @@ cockpit-core = { path = "../../crates/cockpit-core" }
 cockpit-config = { path = "../../crates/cockpit-config" }
 cockpit-db = { path = "../../crates/cockpit-db" }
 cockpit-proto = { path = "../../crates/cockpit-proto" }
+cockpit-tui = { path = "../../crates/cockpit-tui" }
 # rusqlite 0.40 has no separate `fts5` feature; bundled SQLite includes FTS5
 # and the knowledge sidecar tests create/query an FTS5 virtual table.
 rusqlite = { workspace = true }

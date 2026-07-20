@@ -1,0 +1,71 @@
+[package]
+name = "cockpit-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Ratatui terminal interface for the Cockpit CLI"
+license = "Apache-2.0"
+repository = "https://github.com/FlyCockpit/flycockpitapp"
+homepage = "https://github.com/FlyCockpit/flycockpitapp"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+cockpit-config = { path = "../cockpit-config" }
+cockpit-core = { path = "../cockpit-core" }
+cockpit-db = { path = "../cockpit-db" }
+cockpit-proto = { path = "../cockpit-proto" }
+flycockpit-relay-protocol = { path = "../relay-protocol" }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+image = { workspace = true }
+ignore = { workspace = true }
+dirs = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shellexpand = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tiktoken-rs = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread", "macros", "process", "io-util", "fs",
+    "net", "signal", "time", "sync",
+] }
+tracing = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-highlight = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+unicode-width = { workspace = true }
+uuid = { workspace = true }
+
+arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+notify-rust = "4.11"
+portable-pty = "0.9"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+ratatui = "0.30"
+similar = { workspace = true }
+tui-term = { version = "0.3", default-features = false, features = ["vt100"] }
+vt100 = "0.16"
+
+[dev-dependencies]
+cockpit-core = { path = "../cockpit-core", features = ["test-support"] }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

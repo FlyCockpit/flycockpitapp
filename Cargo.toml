@@ -6,6 +6,7 @@ members = [
     "crates/cockpit-core",
     "crates/cockpit-db",
     "crates/cockpit-proto",
+    "crates/cockpit-tui",
     "crates/relay-protocol",
 ]
 resolver = "3"

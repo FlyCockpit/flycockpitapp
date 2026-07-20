@@ -1427,7 +1427,10 @@ mod tests {
 
         assert_no_internal_jargon("README", README);
         assert_no_internal_jargon("providers doc", include_str!("../docs/providers.md"));
-        assert_no_internal_jargon("keybindings doc", include_str!("../docs/keybindings.md"));
+        assert_no_internal_jargon(
+            "keybindings doc",
+            include_str!("../../../crates/cockpit-tui/docs/keybindings.md"),
+        );
     }
 
     #[test]

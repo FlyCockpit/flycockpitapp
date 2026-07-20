@@ -15,9 +15,9 @@
 //! and glyph table apply to either. Result: a 6-row × 18-col rendered
 //! banner.
 //!
-//! Terminal UI rendering lives in the binary crate. Core owns the art
+//! Terminal UI rendering lives in the TUI crate. Core owns the art
 //! data, selection, cell resolution, and the ANSI path used by startup
-//! welcome text; the binary's ratatui `Span` renderer imports the
+//! welcome text; the TUI's ratatui `Span` renderer imports the
 //! resolved cell grid ([`active_cells`]) from here.
 
 /// A pixel-art plane plus its palette. Selected once per render
@@ -131,7 +131,7 @@ pub type ResolvedCell = Option<(&'static str, u8, Option<u8>)>;
 /// P-51) as a resolved cell grid: [`RENDERED_HEIGHT`] rows of
 /// [`RENDERED_WIDTH`] cells. This is the shared data surface every
 /// renderer draws from — the raw-stdout ANSI path here and the
-/// ratatui `Span` path in the binary crate — so they cannot disagree
+/// ratatui `Span` path in the TUI crate — so they cannot disagree
 /// about art selection, glyphs, or colors.
 pub fn active_cells() -> Vec<Vec<ResolvedCell>> {
     let art = active_art();

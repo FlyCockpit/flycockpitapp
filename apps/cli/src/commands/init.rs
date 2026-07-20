@@ -27,6 +27,7 @@ pub enum InitMode {
     /// The file does not exist yet — write it fresh.
     Create,
     /// The file exists — revise/extend it, preserving useful content.
+    #[allow(dead_code)]
     Update,
     /// The file exists — replace it from scratch.
     Overwrite,

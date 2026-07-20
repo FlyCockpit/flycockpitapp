@@ -4,9 +4,7 @@
 //! target exists so process-boundary tests can exercise the daemon protocol
 //! without duplicating wire types.
 
-mod banner;
 mod cli;
-mod clipboard;
 mod commands;
 pub use cockpit_config as config;
 #[cfg(test)]
@@ -19,8 +17,8 @@ pub use cockpit_core::{
     wizard,
 };
 pub use cockpit_db as db;
+pub use cockpit_tui::clipboard;
 mod terminal_host;
-mod tui;
 
 use clap::Parser;
 use std::process::ExitCode;

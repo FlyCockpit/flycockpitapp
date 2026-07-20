@@ -26,7 +26,11 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: apps/cli -> target
+      # Scoped to the whole workspace, not just the `cockpit-cli` package: the
+      # released binary links `cockpit-tui` and the `crates/*` layers, so a
+      # package-scoped preflight would silently skip most of the shipped code.
+      # Matches the workspace-scoped gate in cli-ci.yml.
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --locked
-      - run: cargo test --all-targets --locked
-      - run: cargo test --doc --locked
+      - run: cargo clippy --workspace --all-targets --locked
+      - run: cargo test --workspace --all-targets --locked
+      - run: cargo test --workspace --doc --locked

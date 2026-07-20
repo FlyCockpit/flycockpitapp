@@ -1056,20 +1056,24 @@ impl Dialog {
         }
     }
 
-    pub fn take_oauth_action(&mut self) -> Option<OAuthFlowRequest> {
+    pub(crate) fn take_oauth_action(&mut self) -> Option<OAuthFlowRequest> {
         match self {
             Dialog::Settings(s) => s.pending_oauth_action.take(),
             _ => None,
         }
     }
 
-    pub fn apply_oauth_begin(&mut self, provider: OAuthProvider, result: OAuthBeginResult) {
+    pub(crate) fn apply_oauth_begin(&mut self, provider: OAuthProvider, result: OAuthBeginResult) {
         if let Dialog::Settings(s) = self {
             s.apply_oauth_begin(provider, result);
         }
     }
 
-    pub fn apply_oauth_complete(&mut self, provider: OAuthProvider, result: Result<bool, String>) {
+    pub(crate) fn apply_oauth_complete(
+        &mut self,
+        provider: OAuthProvider,
+        result: Result<bool, String>,
+    ) {
         if let Dialog::Settings(s) = self {
             s.apply_oauth_complete(provider, result);
         }

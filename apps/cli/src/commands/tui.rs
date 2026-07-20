@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use crate::db::workspace_trust::WorkspaceTrustMode;
-use crate::tui::app::{App, StartupWorkspaceTrust};
 use crate::welcome;
+use cockpit_tui::tui::app::{App, StartupWorkspaceTrust};
 
 pub async fn run(project: Option<&Path>, no_sandbox: bool) -> Result<()> {
     if !stdin().is_terminal() || !stdout().is_terminal() {

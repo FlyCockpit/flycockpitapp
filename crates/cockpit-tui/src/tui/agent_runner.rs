@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use cockpit_core::daemon::client::{DaemonClient, LifecycleMode, probe_or_spawn};
 use cockpit_core::daemon::image_upload::upload_submission_images;
-use cockpit_core::daemon::proto::{self, ErrorCode, Request, Response};
+use cockpit_core::daemon::proto::{self, ErrorCode, ErrorPayload, Request, Response};
 use cockpit_core::engine::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
@@ -394,6 +394,35 @@ async fn switch_session_inner(
     active_agent_path: Arc<Mutex<Vec<String>>>,
     target: SessionTarget,
 ) -> Result<SessionSwitchOutcome, String> {
+    let current_client = current_client.read().await.clone();
+    switch_session_with_attach_request(
+        attach_context,
+        last_applied_seq,
+        session_id_state,
+        active_agent,
+        active_agent_path,
+        target,
+        move |request| {
+            let current_client = current_client.clone();
+            async move { current_client.request(request).await }
+        },
+    )
+    .await
+}
+
+async fn switch_session_with_attach_request<F, Fut>(
+    attach_context: Arc<RwLock<AttachRequestContext>>,
+    last_applied_seq: Arc<Mutex<Option<i64>>>,
+    session_id_state: Arc<Mutex<Uuid>>,
+    active_agent: Arc<Mutex<String>>,
+    active_agent_path: Arc<Mutex<Vec<String>>>,
+    target: SessionTarget,
+    send_request: F,
+) -> Result<SessionSwitchOutcome, String>
+where
+    F: FnOnce(Request) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<std::result::Result<Response, ErrorPayload>>>,
+{
     let ctx = attach_context.read().await.clone();
     let requested_target = target;
     let (target_session_id, since_seq) = match target {
@@ -403,23 +432,19 @@ async fn switch_session_inner(
             since_seq,
         } => (Some(session_id), since_seq),
     };
-    let response = current_client
-        .read()
-        .await
-        .clone()
-        .request(Request::Attach {
-            session_id: target_session_id,
-            since_seq,
-            project_root: Some(ctx.project_root.clone()),
-            no_sandbox: ctx.no_sandbox,
-            interactive: true,
-            model_override: None,
-            client_protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
-            env_snapshot: Some(ctx.env_snapshot.clone()),
-            env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
-        })
-        .await
-        .map_err(|e| format!("attach: {e}"))?;
+    let response = send_request(Request::Attach {
+        session_id: target_session_id,
+        since_seq,
+        project_root: Some(ctx.project_root.clone()),
+        no_sandbox: ctx.no_sandbox,
+        interactive: true,
+        model_override: None,
+        client_protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
+        env_snapshot: Some(ctx.env_snapshot.clone()),
+        env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+    })
+    .await
+    .map_err(|e| format!("attach: {e}"))?;
     match response {
         Ok(Response::Attached {
             session_id,
@@ -2540,6 +2565,86 @@ mod tests {
             &vec!["Plan".to_string()]
         );
         assert_eq!(*last_applied_seq.lock().unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn new_session_swap_sends_single_attach_request() {
+        let initial_session_id = uuid::Uuid::new_v4();
+        let new_session_id = uuid::Uuid::new_v4();
+        let attach_context = Arc::new(RwLock::new(AttachRequestContext {
+            project_root: "/tmp/project".to_string(),
+            no_sandbox: true,
+            env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire {
+                source: cockpit_core::env_snapshot::EnvSnapshotSource::TuiShell,
+                digest: String::new(),
+                vars: std::collections::HashMap::new(),
+            },
+        }));
+        let last_applied_seq = Arc::new(Mutex::new(Some(9)));
+        let session_id_state = Arc::new(Mutex::new(initial_session_id));
+        let active_agent = Arc::new(Mutex::new("Build".to_string()));
+        let active_agent_path = Arc::new(Mutex::new(vec!["Build".to_string()]));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let outcome = switch_session_with_attach_request(
+            attach_context,
+            last_applied_seq,
+            session_id_state.clone(),
+            active_agent,
+            active_agent_path,
+            SessionTarget::New,
+            move |request| {
+                captured.lock().unwrap().push(request);
+                async move {
+                    Ok(Ok(Response::Attached {
+                        session_id: new_session_id,
+                        short_id: "fresh1".to_string(),
+                        project_root: "/tmp/project".to_string(),
+                        project_id: "project".to_string(),
+                        active_agent: "Build".to_string(),
+                        active_agent_path: vec!["Build".to_string()],
+                        foreground_target: None,
+                        active_subagent: None,
+                        active_model_state: None,
+                        history: Vec::new(),
+                        paused_work: Vec::new(),
+                        repair_required: None,
+                        daemon_version: "test".to_string(),
+                        compatible: true,
+                        env_baseline: None,
+                        env_session: None,
+                        env_drift: None,
+                        env_policy_applied: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+                        btw_fork: None,
+                    }))
+                }
+            },
+        )
+        .await
+        .expect("switch should attach");
+
+        assert_eq!(outcome.session_id, new_session_id);
+        assert_eq!(*session_id_state.lock().unwrap(), new_session_id);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        match &requests[0] {
+            Request::Attach {
+                session_id,
+                since_seq,
+                project_root,
+                no_sandbox,
+                interactive,
+                ..
+            } => {
+                assert_eq!(*session_id, None);
+                assert_eq!(*since_seq, None);
+                assert_eq!(project_root.as_deref(), Some("/tmp/project"));
+                assert!(*no_sandbox);
+                assert!(*interactive);
+            }
+            other => panic!("expected one attach request, got {other:?}"),
+        }
     }
 
     #[test]

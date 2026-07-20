@@ -990,15 +990,16 @@ pub(crate) async fn inject_knowledge_for_turn(
     history: &mut Vec<Message>,
     session: &Session,
     cwd: &Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
     query: &str,
     redact: Arc<RedactionTable>,
 ) {
-    let extended = crate::config::extended::load_for_cwd(cwd);
+    let extended = config.extended();
     let bundles = attached_bundles(session, cwd, &extended);
     if bundles.is_empty() {
         return;
     }
-    match production_embedder(cwd, &extended, redact.clone()).await {
+    match production_embedder(&extended, config, redact.clone()).await {
         Ok(Some(embedder)) => {
             match search_bundles(&bundles, embedder, query, DEFAULT_SEARCH_LIMIT).await {
                 Ok(results) => {
@@ -1019,11 +1020,11 @@ pub(crate) async fn inject_knowledge_for_turn(
 }
 
 async fn production_embedder(
-    cwd: &Path,
     extended: &ExtendedConfig,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<RedactionTable>,
 ) -> Result<Option<Arc<dyn Embedder>>> {
-    let (_effective, providers) = crate::auto_title::load_configs_for(cwd);
+    let providers = config.providers();
     let resolved = match providers.resolve_embedding_model(extended) {
         Ok(resolved) => resolved,
         Err(error) if extended.embedding_model_ref().is_none() => {
@@ -1069,8 +1070,12 @@ async fn search_bundles(
     Ok(all)
 }
 
-pub(crate) fn attached_bundles_available(session: &Session, cwd: &Path) -> bool {
-    let extended = crate::config::extended::load_for_cwd(cwd);
+pub(crate) fn attached_bundles_available(
+    session: &Session,
+    cwd: &Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) -> bool {
+    let extended = config.extended();
     !attached_bundles(session, cwd, &extended).is_empty()
 }
 
@@ -1111,8 +1116,9 @@ pub(crate) fn with_memory_search_if_attached(
     toolbox: crate::engine::tool::ToolBox,
     session: &Session,
     cwd: &Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> crate::engine::tool::ToolBox {
-    if attached_bundles_available(session, cwd) {
+    if attached_bundles_available(session, cwd, config) {
         toolbox.with(Arc::new(MemorySearchTool))
     } else {
         toolbox.without("memory_search")
@@ -1162,14 +1168,15 @@ impl Tool for MemorySearchTool {
         if args.query.trim().is_empty() {
             return Err(invalid_input("memory_search query must not be empty"));
         }
-        let extended = crate::config::extended::load_for_cwd(&ctx.cwd);
+        let extended = ctx.config.extended();
         let bundles = attached_bundles(&ctx.session, &ctx.cwd, &extended);
         if bundles.is_empty() {
             return Ok(ToolOutput::text(
                 "No attached knowledge bundles are available.",
             ));
         }
-        let Some(embedder) = production_embedder(&ctx.cwd, &extended, ctx.redact.clone()).await?
+        let Some(embedder) =
+            production_embedder(&extended, &ctx.config, ctx.redact.clone()).await?
         else {
             return Ok(ToolOutput::text(
                 "No embedding_model is configured, so memory_search cannot build the knowledge index.",
@@ -1559,9 +1566,16 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         let session = test_session(tmp.path());
         let base = crate::engine::tool::ToolBox::new();
         assert!(
-            !with_memory_search_if_attached(base.clone(), &session, tmp.path())
-                .names()
-                .contains(&"memory_search")
+            !with_memory_search_if_attached(
+                base.clone(),
+                &session,
+                tmp.path(),
+                &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
+                    tmp.path()
+                )
+            )
+            .names()
+            .contains(&"memory_search")
         );
 
         write_bundle(&tmp.path().join(".cockpit/knowledge"));
@@ -1573,9 +1587,16 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         .unwrap();
         crate::config::trust::set_runtime_policy(trust_root(tmp.path()), WorkspaceTrustMode::Trust);
         assert!(
-            with_memory_search_if_attached(base, &session, tmp.path())
-                .names()
-                .contains(&"memory_search")
+            with_memory_search_if_attached(
+                base,
+                &session,
+                tmp.path(),
+                &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
+                    tmp.path()
+                )
+            )
+            .names()
+            .contains(&"memory_search")
         );
         crate::config::trust::clear_runtime_policy_for_tests();
     }

@@ -6043,6 +6043,132 @@ mod tests {
     }
 
 
+    /// Criterion 4 (`engine-config-snapshot-adoption`): a client attached
+    /// through the real dispatch path receives the `ConfigSnapshot` event
+    /// without a separate request — the attach flow broadcasts it and the
+    /// event traverses the socket to the client.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_attach_delivers_config_snapshot_event() {
+        let project = tempfile::tempdir().unwrap();
+        let mut providers = crate::config::providers::ProvidersConfig::default();
+        providers.providers.insert(
+            "p".to_string(),
+            crate::config::providers::ProviderEntry {
+                url: "http://localhost:1/v1".to_string(),
+                ..crate::config::providers::ProviderEntry::default()
+            },
+        );
+        providers.active_model = Some(crate::config::providers::ActiveModelRef {
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+        });
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            providers,
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", project.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let (result, events) = dispatch_matrix_request_after_collect_events(
+            &ctx,
+            vec![],
+            attach_existing_request(session.session_id, project.path()),
+        )
+        .await;
+        assert!(result.is_ok(), "attach through dispatch: {result:?}");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                proto::Event::ConfigSnapshot { snapshot }
+                    if snapshot.session_id == session.session_id
+            )),
+            "attach must deliver a ConfigSnapshot event over dispatch, got {events:?}"
+        );
+    }
+
+    /// Criterion 6 (`engine-config-snapshot-adoption`): after a re-resolution
+    /// over a malformed layer, a dispatched client still holds the last good
+    /// snapshot (no new `ConfigSnapshot` event) and receives a `Notice`. Driven
+    /// through the real `RefreshConfig` dispatch path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let project = tempfile::tempdir().unwrap();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let calls_for_load = calls.clone();
+        let source = crate::daemon::config_source::ConfigSource::new(
+            move |_cwd| {
+                // First load (worker spawn) succeeds with a good snapshot; the
+                // re-resolution triggered by RefreshConfig fails.
+                if calls_for_load.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let mut providers = crate::config::providers::ProvidersConfig::default();
+                    providers.providers.insert(
+                        "p".to_string(),
+                        crate::config::providers::ProviderEntry {
+                            url: "http://localhost:1/v1".to_string(),
+                            ..crate::config::providers::ProviderEntry::default()
+                        },
+                    );
+                    providers.active_model = Some(crate::config::providers::ActiveModelRef {
+                        provider: "p".to_string(),
+                        model: "m".to_string(),
+                        reasoning_effort: None,
+                        thinking_mode: None,
+                    });
+                    Ok((providers, crate::config::extended::ExtendedConfig::default()))
+                } else {
+                    Err(anyhow::anyhow!("malformed config layer"))
+                }
+            },
+            |_cwd, _provider_id| None,
+        );
+        let ctx = test_ctx_with_config_source(source);
+        ctx.db
+            .set_workspace_trust(
+                project.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+        let session = ctx
+            .db
+            .create_session("p", project.path().to_str().unwrap(), "Build")
+            .unwrap();
+        let (result, events) = dispatch_matrix_request_after_collect_events(
+            &ctx,
+            vec![attach_existing_request(session.session_id, project.path())],
+            Request::RefreshConfig,
+        )
+        .await;
+        assert!(result.is_ok(), "refresh config dispatch: {result:?}");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                proto::Event::Notice { text, .. } if text.contains("last good snapshot")
+            )),
+            "invalid re-resolution must notify the client, got {events:?}"
+        );
+        // The only ConfigSnapshot delivered is the attach hydration at the last
+        // good generation (0); the malformed re-resolution pushes no new one.
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                proto::Event::ConfigSnapshot { snapshot } if snapshot.generation >= 1
+            )),
+            "invalid re-resolution must not push a new-generation snapshot, got {events:?}"
+        );
+    }
+
     #[cfg(unix)]
     fn git_repo() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();

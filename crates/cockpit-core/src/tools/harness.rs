@@ -93,7 +93,7 @@ impl Tool for HarnessListTool {
         let refresh = args
             .refresh
             .as_deref()
-            .map(|raw| normalize_harness_selector(raw, &cwd))
+            .map(|raw| normalize_harness_selector(raw, &ctx.config))
             .transpose()?;
         require_workspace_trust_for_harness_spawn()?;
         let env_overlay = ctx
@@ -318,7 +318,7 @@ impl Tool for HarnessInvokeTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let args: HarnessInvokeArgs = typed_args(args)?;
-        let harness_name = normalize_harness_selector(&args.harness, &ctx.cwd)?;
+        let harness_name = normalize_harness_selector(&args.harness, &ctx.config)?;
         if args.prompt.trim().is_empty() {
             return Err(invalid_input("`prompt` is required (the task brief)"));
         }
@@ -384,7 +384,7 @@ impl Tool for HarnessInvokeTool {
             && !hc.models.is_empty()
             && !hc.models.iter().any(|known| known == m)
         {
-            if let Some(provider_id) = provider_ref_in_harness_model(m, &cwd) {
+            if let Some(provider_id) = provider_ref_in_harness_model(m, &ctx.config) {
                 let correction = ValidationCorrection::harness_model_is_provider_ref(
                     m,
                     &harness_name,
@@ -406,7 +406,7 @@ impl Tool for HarnessInvokeTool {
 
         // Load the utility-model ref + providers for over-cap summarization
         // (reusing the auto_title-style path).
-        let (extended, providers) = crate::auto_title::load_configs_for(&cwd);
+        let (extended, providers) = ctx.config.configs();
 
         let result = run_harness(RunContext {
             harness_name: &harness_name,
@@ -461,13 +461,16 @@ fn provider_id_error(provider_id: &str) -> anyhow::Error {
     ))
 }
 
-fn normalize_harness_selector(raw: &str, cwd: &std::path::Path) -> Result<String> {
+fn normalize_harness_selector(
+    raw: &str,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(invalid_input("external harness selector is required"));
     }
 
-    let providers = crate::secret_ref::load_effective(cwd);
+    let providers = config.providers();
     if let Some(provider_id) = trimmed.strip_prefix("provider:") {
         let provider_id = provider_id.trim();
         if providers.providers.contains_key(provider_id) {
@@ -492,8 +495,11 @@ fn normalize_harness_selector(raw: &str, cwd: &std::path::Path) -> Result<String
     Ok(harness_id.to_string())
 }
 
-fn provider_ref_in_harness_model(model: &str, cwd: &std::path::Path) -> Option<String> {
-    let providers = crate::secret_ref::load_effective(cwd);
+fn provider_ref_in_harness_model(
+    model: &str,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) -> Option<String> {
+    let providers = config.providers();
     if providers.providers.contains_key(model) {
         return Some(model.to_string());
     }

@@ -262,7 +262,7 @@ impl Tool for WebSearchTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let query = required_non_empty_string(&args, "query")?;
         let limit = search_limit(args.get("limit"));
-        let cfg = crate::config::extended::load_for_cwd(&ctx.cwd);
+        let cfg = ctx.config.extended();
         let selected = select_backend(&cfg.web, ctx);
         let out = match selected.kind {
             SelectedBackendKind::Custom => {
@@ -279,7 +279,7 @@ impl Tool for WebSearchTool {
             Ok(results) => capped_text(render_search_results(&results)),
             Err(err) => {
                 if maybe_capture_web_key(ctx, &err, WEBSEARCH).await? {
-                    let cfg = crate::config::extended::load_for_cwd(&ctx.cwd);
+                    let cfg = ctx.config.extended();
                     let selected = select_backend(&cfg.web, ctx);
                     let retry = match selected.kind {
                         SelectedBackendKind::Firecrawl => {
@@ -348,7 +348,7 @@ impl Tool for WebFetchTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let url = required_non_empty_string(&args, "url")?;
         validate_http_url(url)?;
-        let cfg = crate::config::extended::load_for_cwd(&ctx.cwd);
+        let cfg = ctx.config.extended();
         let selected = select_backend(&cfg.web, ctx);
         let out = match selected.kind {
             SelectedBackendKind::Custom => {
@@ -363,7 +363,7 @@ impl Tool for WebFetchTool {
             Ok(page) => capped_text(page.markdown),
             Err(err) => {
                 if maybe_capture_web_key(ctx, &err, WEBFETCH).await? {
-                    let cfg = crate::config::extended::load_for_cwd(&ctx.cwd);
+                    let cfg = ctx.config.extended();
                     let selected = select_backend(&cfg.web, ctx);
                     let retry = match selected.kind {
                         SelectedBackendKind::Firecrawl => {
@@ -388,9 +388,10 @@ impl Tool for WebFetchTool {
 
 pub(crate) fn materialize_web_tool(
     name: &str,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
     cwd: &std::path::Path,
 ) -> Result<std::sync::Arc<dyn Tool>> {
-    let cfg = crate::config::extended::load_for_cwd(cwd);
+    let cfg = config.extended();
     if cfg.web.provider == WebProvider::Custom {
         let command = match name {
             WEBFETCH => cfg.web.custom.fetch_command.as_deref(),
@@ -425,14 +426,19 @@ pub(crate) fn materialize_web_tool(
     }
 }
 
-pub(crate) fn is_custom_web_provider(cwd: &std::path::Path) -> bool {
-    crate::config::extended::load_for_cwd(cwd).web.provider == WebProvider::Custom
+pub(crate) fn is_custom_web_provider(
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) -> bool {
+    config.extended().web.provider == WebProvider::Custom
 }
 
-pub(crate) fn web_tool_requires_gate(name: &str, cwd: &std::path::Path) -> bool {
+pub(crate) fn web_tool_requires_gate(
+    name: &str,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) -> bool {
     match name {
         WEBFETCH => true,
-        WEBSEARCH => is_custom_web_provider(cwd),
+        WEBSEARCH => is_custom_web_provider(config),
         _ => false,
     }
 }

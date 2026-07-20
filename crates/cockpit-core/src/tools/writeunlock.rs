@@ -131,7 +131,7 @@ impl Tool for WriteunlockTool {
             normalized.len(),
             if want_crlf { "CRLF" } else { "LF" }
         );
-        let config = crate::config::extended::load_for_cwd(&ctx.cwd);
+        let config = ctx.config.extended();
         if let Some(lsp) = &ctx.lsp {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }

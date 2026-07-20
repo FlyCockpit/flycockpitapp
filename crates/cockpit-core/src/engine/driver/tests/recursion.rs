@@ -87,6 +87,7 @@ fn task_recursion_rejects_deepthink_depth() {
 async fn quick_recursion_override_off_rejects_root_recursive_depth() {
     let (mut driver, tmp) = test_driver(1);
     write_recursion_policy(tmp.path());
+    driver.refresh_config_from_disk_for_tests();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
 
     driver
@@ -110,6 +111,7 @@ async fn quick_recursion_override_depths_apply_without_bypassing_policy() {
     for depth in 1..=6 {
         let (mut driver, tmp) = test_driver(1);
         write_recursion_policy(tmp.path());
+        driver.refresh_config_from_disk_for_tests();
         let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
 
         driver

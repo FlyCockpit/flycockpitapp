@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::extended::ExtendedConfig;
@@ -326,10 +325,10 @@ pub fn resolve_delegated_model(
     Ok(session_model.clone())
 }
 
-pub fn load_model_role_config(cwd: &Path) -> (ExtendedConfig, ProvidersConfig) {
-    let extended = crate::config::extended::load_for_cwd(cwd);
-    let providers = crate::secret_ref::load_effective(cwd);
-    (extended, providers)
+pub fn load_model_role_config(
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) -> (ExtendedConfig, ProvidersConfig) {
+    config.configs()
 }
 
 fn build_model(

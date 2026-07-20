@@ -139,6 +139,11 @@ pub struct SpawnArgs {
     /// so user-defined custom-bash tools (`webfetch`, `websearch`, …)
     /// land on the toolbox for agents that should see them.
     pub cwd: std::path::PathBuf,
+    /// Session config reader (`engine-config-snapshot-adoption`). Agent
+    /// factories resolve web/custom-tool, computer, delegation-model, and
+    /// deepthink config from this snapshot rather than re-reading disk, so a
+    /// delegated child built mid-turn sees the same generation as the turn.
+    pub config: crate::daemon::session_worker::SessionConfigHandle,
     /// 6-char session display id (GOALS §17b). Appended to the cached
     /// system prompt (§17g) so the model knows which conversation it
     /// is participating in. Empty string is acceptable for legacy /
@@ -277,7 +282,7 @@ fn resolved_computer_use_for_model(
 
 fn params_with_direct_computer(args: &SpawnArgs, model: &Model) -> ModelParams {
     let mut params = args.params.clone();
-    let providers = crate::config::providers::ConfigDoc::load_effective(&args.cwd);
+    let providers = args.config.providers();
     params.native_computer =
         resolved_computer_use_for_model(&providers, &args.cwd, model).native_computer;
     params
@@ -320,8 +325,11 @@ fn computer_subagent_candidate(
     None
 }
 
-fn computer_subagent_reachable(cwd: &Path) -> bool {
-    let providers = crate::config::providers::ConfigDoc::load_effective(cwd);
+fn computer_subagent_reachable(
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    cwd: &Path,
+) -> bool {
+    let providers = config.providers();
     computer_subagent_candidate(&providers, cwd).is_some()
 }
 
@@ -800,8 +808,10 @@ pub fn is_reserved_custom_tool_name(name: &str) -> bool {
     known_agent_tool_names().contains(&name) || extra_custom_tool_reserved_names().contains(&name)
 }
 
-fn validate_configured_custom_tools(cwd: &Path) -> Result<()> {
-    let cfg = crate::config::extended::load_for_cwd(cwd);
+fn validate_configured_custom_tools(
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) -> Result<()> {
+    let cfg = config.extended();
     crate::config::extended::validate_web_custom_placeholders(&cfg.web)?;
     for name in cfg.tools.keys() {
         if is_reserved_custom_tool_name(name) {
@@ -924,7 +934,11 @@ fn materialize_tool_by_name(
         "question" => tb.with(Arc::new(tools::question::QuestionTool)),
         "schedule" => tb.with(Arc::new(tools::schedule::ScheduleTool)),
         "mcp" => tb.with(Arc::new(tools::mcp_tool::McpTool)),
-        "webfetch" | "websearch" => tb.with(tools::web::materialize_web_tool(name, &args.cwd)?),
+        "webfetch" | "websearch" => tb.with(tools::web::materialize_web_tool(
+            name,
+            &args.config,
+            &args.cwd,
+        )?),
         "lsp" => tb.with(Arc::new(tools::lsp::LspTool)),
         "handoff" => tb.with(Arc::new(tools::handoff::HandoffTool)),
         "return" => tb.with(Arc::new(tools::return_tool::ReturnTool)),
@@ -952,7 +966,7 @@ fn materialize_tool_by_name(
                     "tool `task` requires an agent definition to materialize reachable subagents"
                 );
             };
-            let subs = reachable_subagents(def, &args.cwd);
+            let subs = reachable_subagents(def, &args.config, &args.cwd);
             let sub_refs: Vec<&str> = subs.iter().map(String::as_str).collect();
             with_task_for_targets(tb, args, &sub_refs)
         }
@@ -1204,10 +1218,11 @@ fn find_agent_guidance(cwd: &Path, names: &[String]) -> Option<(std::path::PathB
 /// Disabled rows and empty commands are skipped.
 fn with_custom_tools(
     mut tb: ToolBox,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
     cwd: &Path,
     disabled_tools: &std::collections::BTreeSet<String>,
 ) -> ToolBox {
-    let cfg = crate::config::extended::load_for_cwd(cwd);
+    let cfg = config.extended();
 
     if cfg.web.provider != crate::config::extended::WebProvider::Custom {
         tb = tb.with(Arc::new(crate::tools::web::WebFetchTool));
@@ -1368,7 +1383,7 @@ fn add_discoverable_tool_by_name(
 /// Returns `Err` for unknown names so the `task` tool can surface
 /// "unknown agent" loudly rather than silently spawning the wrong one.
 pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
-    validate_configured_custom_tools(&args.cwd)?;
+    validate_configured_custom_tools(&args.config)?;
 
     // The docs pipeline stages are routed by the driver and never reach
     // here through a name; guard them before any disk resolution so a
@@ -1648,7 +1663,7 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
     if !is_internal_agent_def_name(&def.name) || internal_agent_def_uses_custom_tools(&def.name) {
         // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
         // of the named grant — attach them like the built-in factories do.
-        tb = with_custom_tools(tb, &args.cwd, &disabled_tier_names(def));
+        tb = with_custom_tools(tb, &args.config, &args.cwd, &disabled_tier_names(def));
     }
     if !is_internal_agent_def_name(&def.name) {
         // Cross-session recall tools, gated on interactive spawn.
@@ -1766,11 +1781,15 @@ fn add_tool_by_name(
 /// appended. Each is listed once, minus the caller itself to avoid a
 /// self-delegation loop. Honors the `mode` field for reachability per
 /// implementation note.
-fn reachable_subagents(def: &crate::agents::AgentDef, cwd: &Path) -> Vec<String> {
+fn reachable_subagents(
+    def: &crate::agents::AgentDef,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    cwd: &Path,
+) -> Vec<String> {
     let mut out = if def.name == "Plan" {
         plan_subagents(cwd)
     } else {
-        build_subagents(cwd)
+        build_subagents(config, cwd)
     };
     out.retain(|s| *s != def.name);
     out
@@ -1791,34 +1810,43 @@ fn plan_subagents(cwd: &Path) -> Vec<String> {
 /// reachability (implementation note). Each name appears
 /// once; the bundled set leads so the cached prefix stays stable when no
 /// custom agents are present.
-fn build_subagents(cwd: &Path) -> Vec<String> {
+fn build_subagents(
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    cwd: &Path,
+) -> Vec<String> {
     let mut out: Vec<String> = vec![
         "builder".to_string(),
         "explore".to_string(),
         "docs".to_string(),
     ];
-    if computer_subagent_reachable(cwd) {
+    if computer_subagent_reachable(config, cwd) {
         out.push("computer".to_string());
     }
-    if load_extended_config(cwd).deepthink.enabled {
+    if config.extended().deepthink.enabled {
         out.push("deepthink".to_string());
     }
     append_custom_subagents(&mut out, cwd);
     out
 }
 
-fn add_deepthink_if_enabled(out: &mut Vec<String>, cwd: &Path) {
-    if load_extended_config(cwd).deepthink.enabled && !out.iter().any(|name| name == "deepthink") {
+fn add_deepthink_if_enabled(
+    out: &mut Vec<String>,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) {
+    if config.extended().deepthink.enabled && !out.iter().any(|name| name == "deepthink") {
         out.push("deepthink".to_string());
     }
 }
 
-fn recursive_targets(cwd: &Path, base: &[&str]) -> Vec<String> {
+fn recursive_targets(
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    base: &[&str],
+) -> Vec<String> {
     let mut out = base
         .iter()
         .map(|target| target.to_string())
         .collect::<Vec<_>>();
-    add_deepthink_if_enabled(&mut out, cwd);
+    add_deepthink_if_enabled(&mut out, config);
     out
 }
 
@@ -1847,7 +1875,7 @@ fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Resul
     if let Some(model) = &args.model_override {
         return Ok(model.clone());
     }
-    let (extended, providers) = crate::engine::model_roles::load_model_role_config(&args.cwd);
+    let (extended, providers) = crate::engine::model_roles::load_model_role_config(&args.config);
     match crate::engine::model_roles::resolve_delegated_model(
         &def.name,
         def.model.as_deref(),
@@ -1887,6 +1915,7 @@ pub fn auto(args: &SpawnArgs) -> Agent {
                 .with(Arc::new(crate::tools::handoff::HandoffTool))
                 // MCP (GOALS §18a): `mcp` runs the Monty Python sandbox.
                 .with(Arc::new(crate::tools::mcp_tool::McpTool)),
+            &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
         ),
@@ -1917,7 +1946,7 @@ pub fn auto(args: &SpawnArgs) -> Agent {
 pub fn build(args: &SpawnArgs) -> Agent {
     // Reachable subagents: the bundled set plus any custom subagent the
     // user has added (implementation note discoverability).
-    let subs = build_subagents(&args.cwd);
+    let subs = build_subagents(&args.config, &args.cwd);
     let sub_refs: Vec<&str> = subs.iter().map(String::as_str).collect();
     let base_tools = with_write_tools(with_full_intel(
         ToolBox::new()
@@ -1950,6 +1979,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
     let tools = with_recall_tools(
         with_custom_tools(
             with_task_for_targets(base_tools, args, &sub_refs),
+            &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
         ),
@@ -2026,7 +2056,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
 /// structured-return envelope. Caller-determined interactivity: interactive
 /// when spawned from `Build` (GOALS §3a/§3b).
 pub fn builder(args: &SpawnArgs) -> Agent {
-    let recursive_targets = recursive_targets(&args.cwd, &["docs"]);
+    let recursive_targets = recursive_targets(&args.config, &["docs"]);
     let recursive_refs: Vec<&str> = recursive_targets.iter().map(String::as_str).collect();
     let base_tools = with_write_tools(with_full_intel(
         ToolBox::new()
@@ -2044,6 +2074,7 @@ pub fn builder(args: &SpawnArgs) -> Agent {
             // `builder` may receive recursive delegation affordances only
             // when its spawn context has remaining budget.
             with_task_for_targets(base_tools, args, &recursive_refs),
+            &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
         ),
@@ -2114,7 +2145,7 @@ pub fn builder(args: &SpawnArgs) -> Agent {
 /// as the tool result. The user sees the call rendered like any other
 /// tool in the primary agent's history.
 pub fn explore(args: &SpawnArgs) -> Agent {
-    let recursive_targets = recursive_targets(&args.cwd, &["explore"]);
+    let recursive_targets = recursive_targets(&args.config, &["explore"]);
     let recursive_refs: Vec<&str> = recursive_targets.iter().map(String::as_str).collect();
     let base_tools = with_lsp_nav(with_full_intel(
         ToolBox::new()
@@ -2127,7 +2158,12 @@ pub fn explore(args: &SpawnArgs) -> Agent {
         base_tools
     };
     let tools = with_recall_tools(
-        with_custom_tools(base_tools, &args.cwd, &std::collections::BTreeSet::new()),
+        with_custom_tools(
+            base_tools,
+            &args.config,
+            &args.cwd,
+            &std::collections::BTreeSet::new(),
+        ),
         args,
     );
     // `seed` (GOALS §3c): only on a read-only noninteractive subagent in
@@ -2189,7 +2225,7 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
 /// vision-capable, subagent-invokable model with a native computer contract
 /// and refuses loudly when none exists.
 pub fn computer(args: &SpawnArgs) -> Result<Agent> {
-    let providers = crate::config::providers::ConfigDoc::load_effective(&args.cwd);
+    let providers = args.config.providers();
     let Some((provider_id, model_id, native_computer)) =
         computer_subagent_candidate(&providers, &args.cwd)
     else {
@@ -2243,6 +2279,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
                 args.swarm_depth,
                 args.swarm_max_depth,
             ))),
+            &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
         ),
@@ -2288,6 +2325,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
     let tools = with_recall_tools(
         with_custom_tools(
             with_task_for_targets(base_tools, args, &["explore"]),
+            &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
         ),
@@ -2322,7 +2360,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
 /// branch does the work itself (clamp, don't crash). Intent: general parallel
 /// fan-out for any wide task, not just research.
 pub fn swarm(args: &SpawnArgs) -> Agent {
-    let subs = build_subagents(&args.cwd);
+    let subs = build_subagents(&args.config, &args.cwd);
     let sub_refs: Vec<&str> = subs.iter().map(String::as_str).collect();
     let base_tools = with_write_tools(with_full_intel(
         ToolBox::new()
@@ -2351,6 +2389,7 @@ pub fn swarm(args: &SpawnArgs) -> Agent {
                     args.swarm_depth,
                     args.swarm_max_depth,
                 ))),
+            &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
         ),
@@ -2399,6 +2438,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
             .with(Arc::new(crate::tools::harness::HarnessInvokeTool))
             .with(Arc::new(crate::tools::schedule::ScheduleTool))
             .with(Arc::new(crate::tools::question::QuestionTool)),
+            &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
         ),
@@ -2440,7 +2480,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
 /// effective depth (`args.swarm_depth`) + ceiling so the model self-limits;
 /// a spawn over the ceiling is refused and the branch does the slice itself.
 pub fn bee(args: &SpawnArgs) -> Agent {
-    let recursive_targets = recursive_targets(&args.cwd, &["docs"]);
+    let recursive_targets = recursive_targets(&args.config, &["docs"]);
     let recursive_refs: Vec<&str> = recursive_targets.iter().map(String::as_str).collect();
     let base_tools = with_write_tools(with_full_intel(
         ToolBox::new()
@@ -2459,6 +2499,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
                     args.swarm_depth,
                     args.swarm_max_depth,
                 ))),
+            &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
         ),
@@ -2588,6 +2629,7 @@ mod tests {
             params: ModelParams::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             cwd: cwd.to_path_buf(),
+            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
             session_short_id: String::new(),
             assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
@@ -3352,6 +3394,9 @@ mod tests {
         assert!(!targets.iter().any(|value| value == "deepthink"));
 
         write_project_config(tmp.path(), r#"{"deepthink":{"enabled":true}}"#);
+        // Config is snapshotted onto `SpawnArgs` when built, so re-read it after
+        // changing the config on disk (`engine-config-snapshot-adoption`).
+        let args = test_spawn_args(tmp.path());
         let task = task_definition(&build(&args), crate::config::extended::LlmMode::Normal);
         let targets = task.parameters["properties"]["payload"]["properties"]["agent"]["enum"]
             .as_array()
@@ -3414,6 +3459,9 @@ mod tests {
                 ]
             }"#,
         );
+        // Re-snapshot the config after adding the vision-capable model on disk
+        // (`engine-config-snapshot-adoption`).
+        let text_args = disk_model_spawn_args(tmp.path(), "text");
         let agent = load("computer", &text_args).unwrap();
         assert_eq!(agent.model.provider_id(), "p");
         assert_eq!(agent.model.model_id_ref(), "vision");
@@ -3803,6 +3851,7 @@ mod tests {
 
         let tb = with_custom_tools(
             ToolBox::new(),
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
             tmp.path(),
             &std::collections::BTreeSet::new(),
         );
@@ -3831,6 +3880,7 @@ mod tests {
 
         let tb = with_custom_tools(
             ToolBox::new(),
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
             tmp.path(),
             &std::collections::BTreeSet::new(),
         );
@@ -3863,6 +3913,7 @@ mod tests {
 
         let tb = with_custom_tools(
             ToolBox::new(),
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
             tmp.path(),
             &std::collections::BTreeSet::new(),
         );
@@ -3879,6 +3930,7 @@ mod tests {
 
         let tb = with_custom_tools(
             ToolBox::new(),
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
             tmp.path(),
             &std::collections::BTreeSet::new(),
         );
@@ -4145,10 +4197,15 @@ mod tests {
         // SCHEMA is identical to the un-overridden `task` tool: same ID + same
         // parameters. The override never touched the schema.
         let base = crate::tools::task::TaskTool::with_subagents(
-            &build_subagents(tmp.path())
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
+            &build_subagents(
+                &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
+                    tmp.path(),
+                ),
+                tmp.path(),
+            )
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
         );
         let base_def = crate::engine::tool::definition_of(
             &base,
@@ -4518,7 +4575,12 @@ mod tests {
         )
         .unwrap();
 
-        let toolbox = crate::engine::agent::turn_toolbox(&agent, &session, tmp.path());
+        let toolbox = crate::engine::agent::turn_toolbox(
+            &agent,
+            &session,
+            tmp.path(),
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+        );
         let names = toolbox.names();
 
         assert!(!names.contains(&"task"), "{names:?}");
@@ -4537,7 +4599,12 @@ mod tests {
         )
         .unwrap();
 
-        let toolbox = crate::engine::agent::turn_toolbox(&agent, &session, tmp.path());
+        let toolbox = crate::engine::agent::turn_toolbox(
+            &agent,
+            &session,
+            tmp.path(),
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+        );
         let names = toolbox.names();
 
         assert!(names.contains(&"task"), "{names:?}");
@@ -4559,7 +4626,12 @@ mod tests {
         )
         .unwrap();
 
-        let toolbox = crate::engine::agent::turn_toolbox(&agent, &session, tmp.path());
+        let toolbox = crate::engine::agent::turn_toolbox(
+            &agent,
+            &session,
+            tmp.path(),
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+        );
         let names = toolbox.names();
 
         assert!(!names.contains(&"task"), "{names:?}");

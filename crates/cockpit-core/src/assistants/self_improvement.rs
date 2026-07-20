@@ -70,6 +70,7 @@ pub fn spawn_review(
     root_agent: Agent,
     recent_history: Vec<Message>,
     cwd: std::path::PathBuf,
+    config: crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<crate::redact::RedactionTable>,
     tx: mpsc::Sender<TurnEvent>,
 ) -> Option<RunningReview> {
@@ -78,7 +79,7 @@ pub fn spawn_review(
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let handle = tokio::spawn(async move {
-        match run_review_turn(root_agent, cwd, redact, prompt, task_cancel, &tx).await {
+        match run_review_turn(root_agent, cwd, config, redact, prompt, task_cancel, &tx).await {
             Ok(Some(summary)) => {
                 let _ = tx
                     .send(TurnEvent::Notice {
@@ -146,6 +147,7 @@ pub fn should_skip_capture(digest: &str) -> bool {
 async fn run_review_turn(
     root_agent: Agent,
     cwd: std::path::PathBuf,
+    config: crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<crate::redact::RedactionTable>,
     prompt: String,
     cancel: CancellationToken,
@@ -172,6 +174,7 @@ async fn run_review_turn(
             locks.clone(),
             redact.clone(),
             cwd.clone(),
+            config.clone(),
             Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             cancel.clone(),
             None,

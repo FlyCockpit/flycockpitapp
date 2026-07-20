@@ -300,6 +300,7 @@ async fn run_worker(
             ..ModelParams::default()
         },
         cwd: project_root.clone(),
+        config: SessionConfigHandle::new(config_snapshot.clone()),
         session_short_id: session.short_id.clone(),
         assistant_identity_prefix,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
@@ -519,6 +520,10 @@ async fn run_worker(
         root,
         max_concurrent_schedules,
     );
+    // Install the session config reader before the loop starts so the driver
+    // and every `ToolCtx` it builds read config through the generationed
+    // snapshot rather than from disk (`engine-config-snapshot-adoption`).
+    driver.set_config_handle(SessionConfigHandle::new(config_snapshot.clone()));
     driver.set_assistant_identity_prefix(spawn_args.assistant_identity_prefix.clone());
     // Propagate any plan-level model override to the whole delegation tree
     // (`plan-duplication-and-model-override.md`): the root already runs under

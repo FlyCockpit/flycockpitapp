@@ -1037,6 +1037,7 @@ impl Driver {
                     self.session.clone(),
                     self.locks.clone(),
                     self.redact.clone(),
+                    self.config.clone(),
                     self.approver.clone(),
                     self.interrupts.clone(),
                     cancel.clone(),
@@ -1164,6 +1165,7 @@ impl Driver {
                         self.locks.clone(),
                         self.redact.clone(),
                         child_cwd.resolved.clone(),
+                        self.config.clone(),
                         self.interrupts.clone(),
                         cancel,
                         self.approver.clone(),
@@ -1468,6 +1470,7 @@ impl Driver {
             agent_id: child_agent.to_string(),
             session: self.session.clone(),
             cwd: self.cwd.clone(),
+            config: self.config.clone(),
             redact: self.redact.clone(),
             interrupts: self.interrupts.clone(),
         };
@@ -2628,6 +2631,7 @@ impl Driver {
                                 driver.session.clone(),
                                 driver.locks.clone(),
                                 driver.redact.clone(),
+                                driver.config.clone(),
                                 driver.approver.clone(),
                                 driver.interrupts.clone(),
                                 child_cancel.clone(),
@@ -2717,6 +2721,7 @@ impl Driver {
                             driver.locks.clone(),
                             driver.redact.clone(),
                             child_cwd.resolved.clone(),
+                            driver.config.clone(),
                             driver.interrupts.clone(),
                             child_cancel.clone(),
                             driver.approver.clone(),
@@ -3333,6 +3338,7 @@ pub(crate) async fn run_noninteractive(
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
+    config: crate::daemon::session_worker::SessionConfigHandle,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
@@ -3357,6 +3363,7 @@ pub(crate) async fn run_noninteractive(
         locks,
         redact,
         cwd,
+        config,
         interrupts,
         cancel,
         approver,
@@ -3623,6 +3630,7 @@ pub(crate) async fn run_noninteractive_resumable(
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
+    config: crate::daemon::session_worker::SessionConfigHandle,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
@@ -3649,8 +3657,8 @@ pub(crate) async fn run_noninteractive_resumable(
     // (here, its own `agent.model`). Resolved once for the run — the model is
     // fixed for the subagent's lifetime, and resolution is per-turn-equivalent
     // (the subagent always tries its primary model first each turn).
-    let backup_model = resolve_backup_model_for(&cwd, &agent.model);
-    let fallback_models = resolve_failover_models_for(&cwd, &agent.model);
+    let backup_model = resolve_backup_model_for(&config, &agent.model);
+    let fallback_models = resolve_failover_models_for(&config, &agent.model);
     // Rehydration: a follow-up starts from the subagent's prior transcript,
     // so it answers with full knowledge of what it already did (GOALS §3c).
     let mut history: Vec<Message> = prior_history;
@@ -3702,6 +3710,7 @@ pub(crate) async fn run_noninteractive_resumable(
             locks.clone(),
             redact.clone(),
             cwd.clone(),
+            config.clone(),
             interrupts.clone(),
             cancel.clone(),
             approver.clone(),

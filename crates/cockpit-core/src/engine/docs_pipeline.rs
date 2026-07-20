@@ -76,6 +76,7 @@ pub async fn run(
     session: Arc<Session>,
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
+    config: crate::daemon::session_worker::SessionConfigHandle,
     approver: Option<Arc<crate::approval::Approver>>,
     package_add_interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
@@ -116,6 +117,7 @@ pub async fn run(
         locks.clone(),
         redact.clone(),
         spawn_args.cwd.clone(),
+        config.clone(),
         interrupts.clone(),
         cancel.clone(),
         // The docs pipeline has no human on the other end (detached hub)
@@ -163,6 +165,7 @@ pub async fn run(
         locks,
         redact,
         resolved.path,
+        config,
         interrupts,
         cancel,
         // Docs answerer: hard-deny `confine()` path, no human — no

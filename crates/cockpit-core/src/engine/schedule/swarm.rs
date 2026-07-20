@@ -130,9 +130,9 @@ async fn run_swarm_loop(
     // Per-turn backup-model fallback for the background `Swarm` child
     // (implementation note): `Swarm` is in scope, so the
     // child inherits the same mechanism, resolved against the model it runs on.
-    let backup_model = crate::engine::driver::resolve_backup_model_for(&ctx.cwd, &agent.model);
+    let backup_model = crate::engine::driver::resolve_backup_model_for(&ctx.config, &agent.model);
     let fallback_models =
-        crate::engine::driver::resolve_failover_models_for(&ctx.cwd, &agent.model);
+        crate::engine::driver::resolve_failover_models_for(&ctx.config, &agent.model);
 
     for _ in 0..SWARM_MAX_TURNS {
         let outcome = crate::engine::agent::turn_with_backup(
@@ -145,6 +145,7 @@ async fn run_swarm_loop(
             ctx.locks.clone(),
             ctx.redact.clone(),
             ctx.cwd.clone(),
+            ctx.config.clone(),
             interrupts.clone(),
             cancel.clone(),
             None,
@@ -282,7 +283,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
     let model = match spec.model.as_deref() {
         Some(selector) => {
             let (extended, providers) =
-                crate::engine::model_roles::load_model_role_config(&ctx.cwd);
+                crate::engine::model_roles::load_model_role_config(&ctx.config);
             crate::engine::model_roles::resolve_selector(
                 selector,
                 &extended,
@@ -298,6 +299,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         params: ctx.agent.params.clone(),
         env_overlay: ctx.agent.env_overlay.clone(),
         cwd: ctx.cwd.clone(),
+        config: ctx.config.clone(),
         session_short_id: ctx.session.short_id.clone(),
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: ctx.session.model_system_prompt_snapshot(),

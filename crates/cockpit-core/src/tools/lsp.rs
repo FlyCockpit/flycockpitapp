@@ -71,7 +71,7 @@ impl Tool for LspTool {
         let Some(lsp) = &ctx.lsp else {
             return Ok(ToolOutput::text("LSP is unavailable in this context."));
         };
-        let config = crate::config::extended::load_for_cwd(&ctx.cwd);
+        let config = ctx.config.extended();
         let out = lsp
             .navigate(
                 &ctx.cwd,

@@ -74,7 +74,7 @@ impl Tool for SkillTool {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let extended = load_extended(&ctx.cwd);
+        let extended = ctx.config.extended();
         let activation = crate::skills::ActivationContext::from_tool_names(
             ctx.available_tools.iter().map(String::as_str),
         );
@@ -220,13 +220,6 @@ fn hydrate_required_environment(
         }
     }
     missing
-}
-
-/// Load the effective `config.json` for `cwd` (first existing on
-/// the layered-config path; seeded skills defaults on a fresh install with
-/// none on disk). See [`crate::config::extended::load_for_cwd`].
-fn load_extended(cwd: &std::path::Path) -> ExtendedConfig {
-    crate::config::extended::load_for_cwd(cwd)
 }
 
 #[cfg(test)]

@@ -54,7 +54,7 @@ impl Tool for SkillManageTool {
                 args.name, args.action
             )));
         }
-        let extended = crate::config::extended::load_for_cwd(&ctx.cwd);
+        let extended = ctx.config.extended();
         let approval_required = extended.skills.write_approval
             || crate::engine::interrupt::pre_resolved_interrupt_pending();
         if approval_required
@@ -349,7 +349,7 @@ mod tests {
             db.clone(),
             ctx.session.id,
         ));
-        let ctx = Arc::new(ctx);
+        let mut ctx = Arc::new(ctx);
         let args = create_value("gated-skill");
         let payload = InterruptParkPayload {
             tool: "skill_manage".to_string(),
@@ -400,6 +400,13 @@ mod tests {
         assert!(root.join("gated-skill/SKILL.md").is_file());
 
         write_config(tmp.path(), &root, false);
+        // Config is snapshotted onto the ctx handle; refresh it after rewriting
+        // the write-approval config on disk (`engine-config-snapshot-adoption`).
+        // The spawned task has joined, so this is the sole `Arc` owner.
+        Arc::get_mut(&mut ctx)
+            .expect("sole ctx owner after task join")
+            .config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
         let denied_args = create_value("denied-after-config-drift");
         let denied = crate::engine::interrupt::with_pre_resolved_interrupt(
             uuid::Uuid::new_v4(),

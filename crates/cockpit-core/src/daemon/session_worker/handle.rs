@@ -166,6 +166,147 @@ impl SessionConfigSnapshot {
     }
 }
 
+/// Generation-aware reader over a session's [`SessionConfigSnapshot`].
+///
+/// This is the single, session-scoped access path to resolved config for
+/// turn-scoped code. It is placed on the driver/agent environment
+/// ([`crate::engine::Driver`]) and threaded to engine components and
+/// built-in tools ([`crate::engine::tool::ToolCtx`]); nothing below the
+/// worker re-reads config from disk. It is also the seam future consumers
+/// (e.g. `approval-policy-live-reload`'s `GrantStore`) attach to.
+///
+/// **Turn isolation.** A handle carries an optional *pinned* view. The
+/// driver re-pins at each turn boundary ([`Self::repin`]); the pinned handle
+/// threaded into the turn reads a consistent snapshot for the whole turn even
+/// if the worker re-resolves config (bumping the generation) mid-turn. A
+/// re-resolution therefore takes effect at the next turn boundary — the
+/// safe-live vs turn-boundary classification the foundation prompt
+/// established. A handle with no pin (`None`) observes the live shared
+/// snapshot; the worker holds such a live handle to answer between-turn reads.
+#[derive(Clone)]
+pub struct SessionConfigHandle {
+    shared: Arc<RwLock<SessionConfigSnapshot>>,
+    /// `Some` → reads return this fixed snapshot (turn-pinned). `None` →
+    /// reads observe the live shared snapshot.
+    pinned: Option<Arc<SessionConfigSnapshot>>,
+}
+
+impl SessionConfigHandle {
+    /// A live handle over the worker's shared snapshot cell. Reads observe
+    /// the current generation until [`Self::repin`] freezes a turn view.
+    pub fn new(shared: Arc<RwLock<SessionConfigSnapshot>>) -> Self {
+        Self {
+            shared,
+            pinned: None,
+        }
+    }
+
+    /// A detached, pinned handle over a fixed snapshot — for standalone/
+    /// tool contexts with no worker behind them and for tests.
+    pub fn detached(snapshot: SessionConfigSnapshot) -> Self {
+        Self {
+            shared: Arc::new(RwLock::new(snapshot.clone())),
+            pinned: Some(Arc::new(snapshot)),
+        }
+    }
+
+    /// A detached handle over default config. Test/replay contexts that never
+    /// exercise config-dependent behavior.
+    pub fn detached_default() -> Self {
+        Self::detached(SessionConfigSnapshot::new(
+            0,
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ))
+    }
+
+    /// A pinned handle resolving the layered config on disk for `cwd`. Tests
+    /// that write config into a tempdir and exercise config-dependent turn
+    /// behavior use this to feed that config through the handle exactly as the
+    /// production `ConfigSource` would — the same values the pre-adoption
+    /// direct disk reads produced.
+    #[cfg(test)]
+    pub fn from_disk_for_tests(cwd: &std::path::Path) -> Self {
+        // Resolve the layered configs directly (no credential-migration side
+        // effect, so widespread test use does not mutate the process-global
+        // migration latch and cause cross-test interference), under an explicit
+        // Trust policy for `cwd` so the tempdir's project layer is always
+        // loaded regardless of any workspace-trust state leaked by a concurrent
+        // test — the read is deterministic, matching what the production
+        // ConfigSource resolves for a trusted session root.
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(cwd).unwrap_or_else(|_| {
+                crate::config::trust::TrustRoot {
+                    opened_path: cwd.to_path_buf(),
+                    root: cwd.to_path_buf(),
+                    kind: crate::config::trust::TrustRootKind::Directory,
+                }
+            }),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let (providers, extended) = crate::config::trust::with_workspace_trust_policy(policy, || {
+            (
+                crate::config::providers::ConfigDoc::load_effective(cwd),
+                crate::config::extended::load_for_cwd(cwd),
+            )
+        });
+        Self::detached(SessionConfigSnapshot::new(0, providers, extended))
+    }
+
+    fn read_shared(&self) -> SessionConfigSnapshot {
+        self.shared
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// The snapshot this handle reads: the pinned view if pinned, else the
+    /// current shared snapshot.
+    pub fn snapshot(&self) -> Arc<SessionConfigSnapshot> {
+        match &self.pinned {
+            Some(pinned) => pinned.clone(),
+            None => Arc::new(self.read_shared()),
+        }
+    }
+
+    /// Re-pin to the current shared generation. The driver calls this at each
+    /// turn boundary so the in-flight turn reads a consistent view while the
+    /// next turn observes any re-resolution that landed in between.
+    pub fn repin(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            pinned: Some(Arc::new(self.read_shared())),
+        }
+    }
+
+    /// Generation of the snapshot this handle reads.
+    pub fn generation(&self) -> u64 {
+        self.snapshot().generation
+    }
+
+    /// The effective extended config this handle reads.
+    pub fn extended(&self) -> crate::config::extended::ExtendedConfig {
+        self.snapshot().extended.clone()
+    }
+
+    /// The effective provider config this handle reads.
+    pub fn providers(&self) -> crate::config::providers::ProvidersConfig {
+        self.snapshot().providers.clone()
+    }
+
+    /// Both resolved configs as one pair — mirrors the shape turn-scoped call
+    /// sites previously got from [`crate::auto_title::load_configs_for`].
+    pub fn configs(
+        &self,
+    ) -> (
+        crate::config::extended::ExtendedConfig,
+        crate::config::providers::ProvidersConfig,
+    ) {
+        let snapshot = self.snapshot();
+        (snapshot.extended.clone(), snapshot.providers.clone())
+    }
+}
+
 fn redacted_extended_config(
     extended: &crate::config::extended::ExtendedConfig,
 ) -> crate::config::extended::ExtendedConfig {

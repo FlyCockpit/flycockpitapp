@@ -9,6 +9,9 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) locks: &'a Arc<crate::locks::LockManager>,
     pub(crate) redact: &'a Arc<RedactionTable>,
     pub(crate) cwd: &'a std::path::Path,
+    /// Turn-pinned session config reader, threaded onto every `ToolCtx` this
+    /// turn builds (`engine-config-snapshot-adoption`).
+    pub(crate) config: &'a crate::daemon::session_worker::SessionConfigHandle,
     pub(crate) interrupts: &'a Arc<crate::engine::interrupt::InterruptHub>,
     pub(crate) cancel: &'a tokio_util::sync::CancellationToken,
     pub(crate) approver: Option<&'a Arc<crate::approval::Approver>>,
@@ -42,7 +45,7 @@ pub(crate) fn phase_09_terminal_text_emit() {}
 pub(crate) async fn phase_10_dispatch_one_call(
     agent: &Agent,
     session: &Arc<Session>,
-    cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
     tx: &mpsc::Sender<TurnEvent>,
     tc: &ToolCall,
     resolved_name: &str,
@@ -154,10 +157,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                 why,
                 notes: repair_notes,
             } => {
-                let max_parallel = crate::config::extended::load_for_cwd(cwd)
-                    .delegation
-                    .max_parallel
-                    .max(1);
+                let max_parallel = config.extended().delegation.max_parallel.max(1);
                 if items.is_empty() || items.len() > max_parallel {
                     return_structural!(task_refusal(
                         &tc.id,
@@ -582,6 +582,7 @@ pub(crate) async fn run_turn(
     let locks = Arc::clone(ctx.locks);
     let redact = Arc::clone(ctx.redact);
     let cwd = ctx.cwd.to_path_buf();
+    let config = ctx.config.clone();
     let interrupts = Arc::clone(ctx.interrupts);
     let cancel = ctx.cancel.clone();
     let approver = ctx.approver.cloned();
@@ -610,7 +611,7 @@ pub(crate) async fn run_turn(
     phase_08_text_embedded_tool_call_recovery();
     phase_09_terminal_text_emit();
 
-    let active_tools = turn_toolbox(agent, &session, &cwd);
+    let active_tools = turn_toolbox(agent, &session, &cwd, &config);
     let tools = active_tools.definitions(agent.llm_mode);
 
     inject_turn_start_system_messages(&session, &active_tools, is_root, history);
@@ -630,12 +631,13 @@ pub(crate) async fn run_turn(
     // prefix.
     session.note_send();
 
-    inject_initial_project_guidance(&agent.name, history, &cwd, redact.clone(), tx).await;
+    inject_initial_project_guidance(&agent.name, history, &cwd, &config, redact.clone(), tx).await;
     let knowledge_query = crate::knowledge::retrieval_query_from_turn(history, &prompt);
     crate::knowledge::inject_knowledge_for_turn(
         history,
         &session,
         &cwd,
+        &config,
         &knowledge_query,
         redact.clone(),
     )
@@ -648,7 +650,8 @@ pub(crate) async fn run_turn(
     // guidance once when their first model turn starts. The baseline advances
     // on inject, so each distinct change is injected exactly once.
     if is_root && let Some(message) = session.guidance_change_injection(&cwd) {
-        inject_live_project_guidance_change(history, &cwd, redact.clone(), tx, &message).await;
+        inject_live_project_guidance_change(history, &cwd, &config, redact.clone(), tx, &message)
+            .await;
     }
 
     // Live pre-send pairing heal (implementation note).
@@ -953,7 +956,7 @@ pub(crate) async fn run_turn(
     //     OFF: the block COUNTS AS RESPONSE BODY — left inline in the body,
     //       shown as ordinary response text, carried forward like any other
     //       body text (rule 1 doesn't touch it; no chip).
-    let inline_think = inline_think_enabled(&session, &cwd);
+    let inline_think = inline_think_enabled(&session, &config);
     let channel_reasoning = extract_reasoning(&choice);
     let (split_body, inline_reasoning) = crate::engine::think::split_think(&raw_text);
     // How the toggle CLASSIFIES a leading inline `<think>…</think>` block
@@ -1132,7 +1135,7 @@ pub(crate) async fn run_turn(
     // user before the system nudge. `Some((notice, nudge))`.
     let mut available_nudge: Option<(String, String)> = None;
     if should_attempt_text_recovery(calls.is_empty(), reasoning_rescue) {
-        let mode = text_embedded_recovery_mode(&session, &cwd);
+        let mode = text_embedded_recovery_mode(&session, &config);
         match decide_text_recovery(&agent.tools, &text, mode) {
             TextRecoveryDecision::None => {}
             TextRecoveryDecision::Recovered(rec) => {
@@ -1224,7 +1227,7 @@ pub(crate) async fn run_turn(
         let shown = if is_root && calls.is_empty() && !text.trim().is_empty() {
             translate_final_response(
                 &text,
-                &cwd,
+                &config,
                 redact.clone(),
                 session.trusted_only_flag(),
                 Some(agent.model.shutdown_gate()),
@@ -1345,6 +1348,7 @@ pub(crate) async fn run_turn(
         events: Some(tx.clone()),
         lsp,
         resource_scheduler,
+        config: config.clone(),
     };
 
     // Per-call dispatch repair pipeline (fixed order, idempotent — a reorder
@@ -1361,7 +1365,7 @@ pub(crate) async fn run_turn(
     // off, behavior is exactly as before (silent canonical rewrite + user
     // chip). The user-facing transcript is never altered by this — only the
     // wire form the model reads.
-    let hint_corrections = hint_tool_call_corrections_enabled(&session, &ctx.cwd);
+    let hint_corrections = hint_tool_call_corrections_enabled(&session, &config);
     for tc in &calls {
         // Tool-NAME repair (implementation note), run BEFORE
         // the registry lookup and the args validate-then-repair (§12). Two
@@ -1382,7 +1386,7 @@ pub(crate) async fn run_turn(
         let resolved_name = name_repair.name.as_str();
         let name_recovery = name_repair.recovery;
 
-        match phase_10_dispatch_one_call(agent, &session, &cwd, tx, tc, resolved_name).await? {
+        match phase_10_dispatch_one_call(agent, &session, &config, tx, tc, resolved_name).await? {
             ControlFlow::Break(outcome) => return Ok(outcome),
             ControlFlow::Continue(()) => {}
         }
@@ -1586,9 +1590,16 @@ mod tests {
             serde_json::json!({ "summary": "done", "result": "ok" }),
         );
 
-        let flow = phase_10_dispatch_one_call(&agent, &session, tmp.path(), &tx, &call, "return")
-            .await
-            .unwrap();
+        let flow = phase_10_dispatch_one_call(
+            &agent,
+            &session,
+            &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            &tx,
+            &call,
+            "return",
+        )
+        .await
+        .unwrap();
 
         match flow {
             ControlFlow::Break(TurnOutcome::Return { fields }) => {
@@ -1607,9 +1618,16 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let call = tool_call("read", serde_json::json!({ "path": "README.md" }));
 
-        let flow = phase_10_dispatch_one_call(&agent, &session, tmp.path(), &tx, &call, "read")
-            .await
-            .unwrap();
+        let flow = phase_10_dispatch_one_call(
+            &agent,
+            &session,
+            &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            &tx,
+            &call,
+            "read",
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(flow, ControlFlow::Continue(())));
     }

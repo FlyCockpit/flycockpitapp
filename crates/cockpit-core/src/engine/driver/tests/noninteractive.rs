@@ -157,7 +157,7 @@ fn root_child_cwd(driver: &Driver) -> ChildCwd {
     }
 }
 
-fn write_delegated_model_config(driver: &Driver, models: &[&str]) {
+fn write_delegated_model_config(driver: &mut Driver, models: &[&str]) {
     let config_dir = driver.cwd.join(".cockpit");
     let providers_dir = config_dir.join("providers");
     std::fs::create_dir_all(&providers_dir).unwrap();
@@ -187,6 +187,12 @@ fn write_delegated_model_config(driver: &Driver, models: &[&str]) {
         .to_string(),
     )
     .unwrap();
+    // The driver now reads config through its snapshot handle, so refresh it
+    // from the config just written (`engine-config-snapshot-adoption`).
+    let cwd = driver.cwd.clone();
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(&cwd),
+    );
 }
 
 fn failing_provider_base_url() -> String {
@@ -210,7 +216,11 @@ fn failing_provider_base_url() -> String {
     format!("http://{addr}/v1")
 }
 
-fn write_delegated_model_config_with_backup(driver: &Driver, primary_url: &str, backup_url: &str) {
+fn write_delegated_model_config_with_backup(
+    driver: &mut Driver,
+    primary_url: &str,
+    backup_url: &str,
+) {
     let config_dir = driver.cwd.join(".cockpit");
     let providers_dir = config_dir.join("providers");
     std::fs::create_dir_all(&providers_dir).unwrap();
@@ -250,6 +260,10 @@ fn write_delegated_model_config_with_backup(driver: &Driver, primary_url: &str, 
         .to_string(),
     )
     .unwrap();
+    let cwd = driver.cwd.clone();
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(&cwd),
+    );
 }
 
 fn seed_task_payload(driver: &Driver, task_call_id: &str, label: &str, child_agent: &str) {
@@ -399,7 +413,7 @@ async fn noninteractive_event_forwarder_wraps_child_events() {
 #[tokio::test]
 async fn noninteractive_single_spawn_amends_with_child_routing() {
     let (mut driver, _tmp) = test_driver(8);
-    write_delegated_model_config(&driver, &["local", "child-single"]);
+    write_delegated_model_config(&mut driver, &["local", "child-single"]);
     seed_task_delegation(&driver, "task-single-routing", "default");
     seed_task_payload(&driver, "task-single-routing", "default", "explore");
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
@@ -465,7 +479,11 @@ fn delegated_child_succeeds_via_fallback_chain_and_export_records_it() {
                     let (mut driver, _tmp) = test_driver(8);
                     let primary_url = failing_provider_base_url();
                     let backup_url = test_provider_base_url();
-                    write_delegated_model_config_with_backup(&driver, &primary_url, &backup_url);
+                    write_delegated_model_config_with_backup(
+                        &mut driver,
+                        &primary_url,
+                        &backup_url,
+                    );
                     seed_task_delegation(&driver, "task-single-fallback", "default");
                     seed_task_payload(&driver, "task-single-fallback", "default", "explore");
                     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
@@ -559,7 +577,7 @@ fn delegated_child_succeeds_via_fallback_chain_and_export_records_it() {
 #[tokio::test]
 async fn noninteractive_batch_spawn_amends_each_child_routing() {
     let (mut driver, _tmp) = test_driver(8);
-    write_delegated_model_config(&driver, &["local", "child-first", "child-second"]);
+    write_delegated_model_config(&mut driver, &["local", "child-first", "child-second"]);
     seed_batch_task_delegation(&driver, "task-batch-routing", &["first", "second"]);
     seed_task_payload(&driver, "task-batch-routing", "first", "explore");
     seed_task_payload(&driver, "task-batch-routing", "second", "scout");
@@ -625,8 +643,8 @@ async fn noninteractive_batch_spawn_amends_each_child_routing() {
 
 #[tokio::test]
 async fn interactive_spawn_amends_with_child_routing() {
-    let (driver, _tmp) = test_driver(8);
-    write_delegated_model_config(&driver, &["local", "interactive-child"]);
+    let (mut driver, _tmp) = test_driver(8);
+    write_delegated_model_config(&mut driver, &["local", "interactive-child"]);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
     let child = driver
         .load_interactive_child_or_tool_error(InteractiveChildLoadRequest {
@@ -1163,7 +1181,7 @@ async fn noninteractive_report_stamps_child_model() {
 #[tokio::test]
 async fn noninteractive_batch_report_stamps_child_model() {
     let (mut driver, _tmp) = test_driver(8);
-    write_delegated_model_config(&driver, &["local", "batch-child-report"]);
+    write_delegated_model_config(&mut driver, &["local", "batch-child-report"]);
     seed_batch_task_delegation(&driver, "task-batch-child-report", &["first"]);
     seed_task_payload(&driver, "task-batch-child-report", "first", "explore");
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);

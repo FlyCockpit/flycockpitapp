@@ -684,6 +684,12 @@ pub struct ToolCtx {
     pub locks: Arc<crate::locks::LockManager>,
     pub session: Arc<crate::session::Session>,
     pub cwd: std::path::PathBuf,
+    /// Session-scoped, turn-pinned config reader. The single access path to
+    /// resolved config for turn-scoped tools — tools read `config.extended()`
+    /// / `config.providers()` instead of re-loading config from disk, so they
+    /// observe the same generationed snapshot (and turn-boundary semantics) as
+    /// the rest of the turn (`engine-config-snapshot-adoption`).
+    pub config: crate::daemon::session_worker::SessionConfigHandle,
     /// The redaction chokepoint (GOALS §7). Tools that return strings
     /// destined for the model context don't have to call this
     /// themselves — `engine::agent::turn` scrubs every tool result

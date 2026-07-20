@@ -251,7 +251,7 @@ async fn approval_for_escalation(
         ApprovalMode::Yolo => Ok(EscalationApproval::RunUnconfinedOnce),
         ApprovalMode::Manual => prompt_user(ctx, command, row, grant_offer).await,
         ApprovalMode::Auto => {
-            let (extended, providers) = crate::auto_title::load_configs_for(&ctx.cwd);
+            let (extended, providers) = ctx.config.configs();
             let outcome = evaluate(
                 extended.guard_model_ref(),
                 &providers,

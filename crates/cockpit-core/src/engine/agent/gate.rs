@@ -59,7 +59,7 @@ pub(super) async fn safety_gate_decision(
     if let Some(outcome) = SAFETY_GATE_TEST_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return outcome;
     }
-    let (extended, providers) = crate::auto_title::load_configs_for(&ctx.cwd);
+    let (extended, providers) = ctx.config.configs();
     safety_gate_decision_with_configs(tool, args, ctx, tx, extended.guard_model_ref(), &providers)
         .await
 }
@@ -75,7 +75,7 @@ pub(super) async fn safety_gate_decision_with_configs(
     use crate::config::extended::ApprovalMode;
     use crate::engine::safety_gate::{SafetyOutcome, evaluate};
 
-    if !is_gated_tool(tool, &ctx.cwd) {
+    if !is_gated_tool(tool, &ctx.config) {
         return GateOutcome::Run { recheck: false };
     }
     match ctx.session.approval_mode() {
@@ -293,6 +293,7 @@ mod safety_gate_tests {
             events: None,
             lsp: None,
             resource_scheduler: None,
+            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
@@ -301,14 +302,16 @@ mod safety_gate_tests {
     fn gate_scope_covers_shell_mcp_fetch_and_custom_websearch() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
-        assert!(is_gated_tool("bash", cwd));
-        assert!(is_gated_tool("webfetch", cwd));
-        assert!(is_gated_tool("mcp", cwd));
-        assert!(!is_gated_tool("websearch", cwd));
-        assert!(!is_gated_tool("read", cwd));
-        assert!(!is_gated_tool("editunlock", cwd));
-        assert!(!is_gated_tool("search", cwd));
-        assert!(!is_gated_tool("task", cwd));
+        let default_config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd);
+        assert!(is_gated_tool("bash", &default_config));
+        assert!(is_gated_tool("webfetch", &default_config));
+        assert!(is_gated_tool("mcp", &default_config));
+        assert!(!is_gated_tool("websearch", &default_config));
+        assert!(!is_gated_tool("read", &default_config));
+        assert!(!is_gated_tool("editunlock", &default_config));
+        assert!(!is_gated_tool("search", &default_config));
+        assert!(!is_gated_tool("task", &default_config));
 
         std::fs::create_dir_all(cwd.join(".cockpit")).unwrap();
         std::fs::write(
@@ -316,7 +319,9 @@ mod safety_gate_tests {
             r#"{"web":{"provider":"custom"}}"#,
         )
         .unwrap();
-        assert!(is_gated_tool("websearch", cwd));
+        let custom_config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd);
+        assert!(is_gated_tool("websearch", &custom_config));
     }
 
     #[tokio::test]

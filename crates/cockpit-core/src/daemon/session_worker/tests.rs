@@ -678,6 +678,7 @@ mod tests {
             params: crate::engine::model::ModelParams::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             cwd: cwd.to_path_buf(),
+            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
             session_short_id: "abc123".to_string(),
             assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(
@@ -1571,8 +1572,148 @@ mod tests {
         SessionConfigSnapshot::new(0, provider_snapshot_config(), extended)
     }
 
+    /// Criterion 2: engine components read config through the session handle,
+    /// and the value read matches the worker's current snapshot and generation.
     #[test]
-    fn config_snapshot_push_contains_no_secrets() {
+    fn engine_reads_config_through_session_handle() {
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.llm_mode = crate::config::extended::LlmMode::Frontier;
+        extended.max_primary_rounds = 9;
+        let shared = Arc::new(RwLock::new(SessionConfigSnapshot::new(
+            0,
+            provider_snapshot_config(),
+            extended,
+        )));
+        let handle = SessionConfigHandle::new(shared.clone());
+        // The value the engine reads through the handle == the worker snapshot.
+        assert_eq!(handle.generation(), 0);
+        assert_eq!(
+            handle.extended().llm_mode,
+            crate::config::extended::LlmMode::Frontier
+        );
+        assert_eq!(handle.extended().max_primary_rounds, 9);
+        assert_eq!(
+            handle.providers().active_model.as_ref().unwrap().model,
+            shared.read().unwrap().providers.active_model.as_ref().unwrap().model
+        );
+        // A re-resolution bumps the generation the live handle observes.
+        let generation = replace_config_snapshot(
+            &shared,
+            SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        );
+        assert_eq!(generation, 1);
+        assert_eq!(handle.generation(), 1);
+    }
+
+    /// Criterion 3: a turn that started under generation N reads a consistent
+    /// view for its whole duration; a mid-turn re-resolution does not change
+    /// what the in-flight turn's (pinned) handle reads, and the next turn's
+    /// re-pin observes the new generation.
+    #[test]
+    fn turn_pinned_handle_view_survives_reresolve() {
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.llm_mode = crate::config::extended::LlmMode::Defensive;
+        let shared = Arc::new(RwLock::new(SessionConfigSnapshot::new(
+            0,
+            crate::config::providers::ProvidersConfig::default(),
+            extended,
+        )));
+        // Turn start: pin the current generation.
+        let turn_handle = SessionConfigHandle::new(shared.clone()).repin();
+        assert_eq!(turn_handle.generation(), 0);
+        assert_eq!(
+            turn_handle.extended().llm_mode,
+            crate::config::extended::LlmMode::Defensive
+        );
+
+        // Mid-turn re-resolution over a new config (Frontier, generation 1).
+        let mut updated = crate::config::extended::ExtendedConfig::default();
+        updated.llm_mode = crate::config::extended::LlmMode::Frontier;
+        replace_config_snapshot(
+            &shared,
+            SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                updated,
+            ),
+        );
+
+        // The in-flight turn's pinned handle is unchanged.
+        assert_eq!(turn_handle.generation(), 0);
+        assert_eq!(
+            turn_handle.extended().llm_mode,
+            crate::config::extended::LlmMode::Defensive
+        );
+
+        // The next turn re-pins and sees the new generation/value.
+        let next_turn = turn_handle.repin();
+        assert_eq!(next_turn.generation(), 1);
+        assert_eq!(
+            next_turn.extended().llm_mode,
+            crate::config::extended::LlmMode::Frontier
+        );
+    }
+
+    /// Criterion 9 (behavior parity): for a fixed on-disk config tree, the
+    /// production `ConfigSource` resolution — the exact path the daemon uses to
+    /// build the snapshot the handle now serves — yields the same turn-relevant
+    /// values the pre-adoption direct disk reads produced. The expected values
+    /// are pinned here (captured from the fixture) so a resolution regression
+    /// fails this test.
+    #[test]
+    fn turn_config_values_match_pre_adoption_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cockpit = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(cockpit.join("providers")).unwrap();
+        std::fs::write(
+            cockpit.join("config.json"),
+            r#"{
+                "llm_mode": "defensive",
+                "maxPrimaryRounds": 7,
+                "redact": { "denylist": ["fixture-parity-secret"] },
+                "delegation": { "maxParallel": 3 },
+                "active_model": { "provider": "openai", "model": "gpt-parity" }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cockpit.join("providers/openai.json"),
+            r#"{"url":"https://api.openai.example/v1","models":[{"id":"gpt-parity"}]}"#,
+        )
+        .unwrap();
+
+        // Resolve through the production ConfigSource (secret_ref::load_effective
+        // + extended::load_for_cwd), then serve it through the handle.
+        let (providers, extended) = crate::daemon::config_source::ConfigSource::production()
+            .load(tmp.path())
+            .expect("production config resolution");
+        let handle =
+            SessionConfigHandle::detached(SessionConfigSnapshot::new(0, providers, extended));
+
+        let extended = handle.extended();
+        assert_eq!(extended.llm_mode, crate::config::extended::LlmMode::Defensive);
+        assert_eq!(extended.max_primary_rounds, 7);
+        assert!(
+            extended
+                .redact
+                .denylist
+                .iter()
+                .any(|entry| entry == "fixture-parity-secret"),
+            "redact denylist should carry the fixture literal, got {:?}",
+            extended.redact.denylist
+        );
+        assert_eq!(extended.delegation.max_parallel, 3);
+        let active = handle.providers().active_model.expect("active model resolved");
+        assert_eq!(active.provider, "openai");
+        assert_eq!(active.model, "gpt-parity");
+    }
+
+    #[test]
+    fn config_snapshot_event_still_carries_no_secrets() {
         let mut snapshot = snapshot_for_tests();
         snapshot
             .extended
@@ -1605,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_view_covers_all_client_read_fields() {
+    fn provider_view_covers_enumerated_tui_consumer_fields() {
         let wire = snapshot_for_tests().to_proto(Uuid::new_v4());
         let provider = wire.providers.providers.get("openai").unwrap();
         assert!(wire.providers.active_model.is_some());
@@ -1719,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_delivers_config_snapshot() {
+    fn worker_broadcast_delivers_config_snapshot_to_subscriber() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
@@ -1743,7 +1884,7 @@ mod tests {
     }
 
     #[test]
-    fn config_reresolve_pushes_to_all_attached_clients() {
+    fn dispatch_reresolve_fans_out_to_all_attached_clients() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
@@ -1770,8 +1911,18 @@ mod tests {
         ));
     }
 
+    /// Guard (`engine-config-snapshot-adoption`, criterion 1): no session- or
+    /// turn-scoped code re-reads config from disk. Every direct call to
+    /// `extended::load_for_cwd`, `secret_ref::load_effective`, or
+    /// `ConfigDoc::load_effective` must live in `#[cfg(test)]` code, in the
+    /// trust-aware `ConfigSource`, or in one of the explicitly enumerated
+    /// session-less files below (each of which runs outside any session — a
+    /// one-shot subcommand, a daemon RPC handler, the scheduler callback, the
+    /// session-creation snapshot, or the definition site — and resolves config
+    /// once at its own boundary). Any other occurrence is a turn-scoped read
+    /// that bypasses the session snapshot and fails this guard.
     #[test]
-    fn daemon_config_resolution_goes_through_config_source() {
+    fn session_scoped_code_has_no_direct_config_reads() {
         fn collect_rs(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
@@ -1783,30 +1934,96 @@ mod tests {
             }
         }
 
-        let daemon_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon");
+        // Session-less surfaces that legitimately keep direct config reads.
+        // Enumerated, never silently exempted (criterion 4). `config_source.rs`
+        // is the trust-aware resolution seam itself; `approval/store.rs` is
+        // carved out for sibling `approval-policy-live-reload`.
+        const SESSION_LESS_FILES: &[&str] = &[
+            "daemon/config_source.rs",
+            "secret_ref.rs",
+            "wizard/apply.rs",
+            "init.rs",
+            "welcome.rs",
+            "diagnostics.rs",
+            "packages/clone.rs",
+            "agents/mod.rs",
+            "session/export/mod.rs",
+            "skills/curator.rs",
+            "auto_title.rs",
+            "engine/builtin/mod.rs",
+            "approval/store.rs",
+            // Session bootstrap: captures a config-derived snapshot on the row
+            // before any worker/handle exists.
+            "session/lifecycle.rs",
+        ];
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
-        collect_rs(&daemon_dir, &mut files);
+        collect_rs(&src_dir, &mut files);
+
+        // The primitive disk loaders plus the `auto_title::load_configs_for`
+        // convenience that pairs them: a turn-scoped call to any of these
+        // bypasses the session snapshot.
+        let banned = [
+            "load_for_cwd(",
+            "secret_ref::load_effective(",
+            "ConfigDoc::load_effective(",
+            "load_configs_for(",
+        ];
+
         let offenders: Vec<String> = files
             .into_iter()
             .filter(|path| {
-                path.file_name().and_then(|name| name.to_str()) != Some("tests.rs")
-                    && !path.ends_with("config_source.rs")
+                let rel = path.strip_prefix(&src_dir).unwrap();
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                // Skip test files/dirs and the enumerated session-less files.
+                let is_test_file = rel
+                    .components()
+                    .any(|c| c.as_os_str() == "tests" || c.as_os_str() == "tests.rs");
+                !is_test_file && !SESSION_LESS_FILES.contains(&rel_str.as_str())
             })
             .flat_map(|path| {
                 let text = std::fs::read_to_string(&path).unwrap();
-                text.lines()
-                    .enumerate()
-                    .filter(|(_, line)| {
-                        let trimmed = line.trim_start();
-                        !trimmed.starts_with("//")
-                            && (line.contains("load_for_cwd(")
-                                || line.contains("secret_ref::load_effective("))
-                    })
-                    .map(move |(idx, line)| format!("{}:{}:{line}", path.display(), idx + 1))
-                    .collect::<Vec<_>>()
+                // Track `#[cfg(test)]`-guarded items by brace depth so test-only
+                // code (e.g. `SessionConfigHandle::from_disk_for_tests`) is not
+                // flagged.
+                let mut depth: i32 = 0;
+                let mut cfg_test_pending = false;
+                let mut cfg_test_depth: Option<i32> = None;
+                let mut hits = Vec::new();
+                for (idx, line) in text.lines().enumerate() {
+                    let trimmed = line.trim_start();
+                    let in_cfg_test = cfg_test_depth.is_some();
+                    if !in_cfg_test
+                        && !trimmed.starts_with("//")
+                        && banned.iter().any(|needle| line.contains(needle))
+                    {
+                        hits.push(format!("{}:{}:{}", path.display(), idx + 1, line.trim()));
+                    }
+                    if trimmed.contains("#[cfg(test)]") {
+                        cfg_test_pending = true;
+                    }
+                    let opens = line.matches('{').count() as i32;
+                    let closes = line.matches('}').count() as i32;
+                    if cfg_test_pending && opens > 0 {
+                        cfg_test_depth = Some(depth);
+                        cfg_test_pending = false;
+                    }
+                    depth += opens - closes;
+                    if let Some(start) = cfg_test_depth
+                        && depth <= start
+                    {
+                        cfg_test_depth = None;
+                    }
+                }
+                hits
             })
             .collect();
-        assert!(offenders.is_empty(), "{offenders:#?}");
+        assert!(
+            offenders.is_empty(),
+            "turn-scoped code must read config through the session snapshot handle, \
+             not directly from disk:\n{offenders:#?}"
+        );
     }
 
     #[test]

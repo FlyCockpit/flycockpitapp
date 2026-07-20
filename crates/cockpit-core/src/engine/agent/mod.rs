@@ -93,16 +93,21 @@ pub struct Agent {
     pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
 }
 
-pub(crate) fn turn_toolbox(agent: &Agent, session: &Session, cwd: &std::path::Path) -> ToolBox {
+pub(crate) fn turn_toolbox(
+    agent: &Agent,
+    session: &Session,
+    cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) -> ToolBox {
     let mut toolbox =
         toolbox_with_retrieval_if_needed(agent.tools.clone(), session, agent.llm_mode);
     if !agent.model.can_delegate() {
         toolbox = toolbox.without("task").without("spawn");
     }
-    toolbox = crate::knowledge::with_memory_search_if_attached(toolbox, session, cwd);
+    toolbox = crate::knowledge::with_memory_search_if_attached(toolbox, session, cwd, config);
     let mut adverts = crate::tools::mcp_tool::discoverable_tool_adverts(&toolbox);
     adverts.extend(crate::tools::mcp_tool::current_mcp_description_adverts(
-        session, cwd,
+        session, cwd, config,
     ));
     crate::tools::mcp_tool::apply_mcp_description_adverts(&mut toolbox, &adverts);
     let env = agent
@@ -154,6 +159,7 @@ async fn inject_initial_project_guidance(
     agent_name: &str,
     history: &mut Vec<Message>,
     cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<RedactionTable>,
     tx: &mpsc::Sender<TurnEvent>,
 ) {
@@ -174,7 +180,7 @@ async fn inject_initial_project_guidance(
             history.push(guidance_user_message(&body, Some(label.as_str())));
             return;
         }
-        let (extended, providers) = crate::auto_title::load_configs_for(cwd);
+        let (extended, providers) = config.configs();
         let outcome = crate::engine::injection_check::check(
             extended.guard_model_ref(),
             &providers,
@@ -217,6 +223,7 @@ async fn inject_initial_project_guidance(
 async fn inject_live_project_guidance_change(
     history: &mut Vec<Message>,
     cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<RedactionTable>,
     tx: &mpsc::Sender<TurnEvent>,
     message: &str,
@@ -235,7 +242,7 @@ async fn inject_live_project_guidance_change(
             ));
             return;
         }
-        let (extended, providers) = crate::auto_title::load_configs_for(cwd);
+        let (extended, providers) = config.configs();
         let outcome = crate::engine::injection_check::check(
             extended.guard_model_ref(),
             &providers,
@@ -451,6 +458,7 @@ pub async fn turn(
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
+    config: crate::daemon::session_worker::SessionConfigHandle,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
@@ -488,6 +496,7 @@ pub async fn turn(
         locks: &locks,
         redact: &redact,
         cwd: cwd.as_path(),
+        config: &config,
         interrupts: &interrupts,
         cancel: &cancel,
         approver: approver.as_ref(),
@@ -556,8 +565,11 @@ fn stored_assistant_choice(
 /// unresolvable config falls through to the global. ON (default): the block
 /// is thinking — shown as the chip and dropped from later turns. OFF: the
 /// block is response body — left inline and carried forward (no chip).
-fn inline_think_enabled(session: &Session, cwd: &std::path::Path) -> bool {
-    let (extended, providers) = crate::auto_title::load_configs_for(cwd);
+fn inline_think_enabled(
+    session: &Session,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) -> bool {
+    let (extended, providers) = config.configs();
     let (Some(provider), Some(model)) = (session.active_provider(), session.active_model()) else {
         return extended.inline_think;
     };
@@ -571,8 +583,11 @@ fn inline_think_enabled(session: &Session, cwd: &std::path::Path) -> bool {
 /// default (off). An unset override, an unknown model, or an unresolvable
 /// config falls through to the global, so default behavior is unchanged
 /// (silent canonical rewrite + user chip). Mirrors [`inline_think_enabled`].
-pub(crate) fn hint_tool_call_corrections_enabled(session: &Session, cwd: &std::path::Path) -> bool {
-    let (extended, providers) = crate::auto_title::load_configs_for(cwd);
+pub(crate) fn hint_tool_call_corrections_enabled(
+    session: &Session,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) -> bool {
+    let (extended, providers) = config.configs();
     let (Some(provider), Some(model)) = (session.active_provider(), session.active_model()) else {
         return extended.hint_tool_call_corrections;
     };
@@ -591,9 +606,9 @@ pub(crate) fn hint_tool_call_corrections_enabled(session: &Session, cwd: &std::p
 /// [`inline_think_enabled`].
 fn text_embedded_recovery_mode(
     session: &Session,
-    cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> crate::config::extended::TextEmbeddedRecovery {
-    let (extended, providers) = crate::auto_title::load_configs_for(cwd);
+    let (extended, providers) = config.configs();
     let (Some(provider), Some(model)) = (session.active_provider(), session.active_model()) else {
         return extended.text_embedded_recovery;
     };
@@ -610,12 +625,12 @@ fn text_embedded_recovery_mode(
 /// reasoning rides the separate reasoning channel).
 async fn translate_final_response(
     text: &str,
-    cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<RedactionTable>,
     trusted_only: Arc<std::sync::atomic::AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> String {
-    let Some((extended, providers)) = crate::engine::translate::load_if_active(cwd) else {
+    let Some((extended, providers)) = crate::engine::translate::load_if_active(config) else {
         return text.to_string();
     };
     let stripped = crate::engine::translate::strip_think_blocks(text);
@@ -633,8 +648,8 @@ async fn translate_final_response(
 /// The tools the command-safety gate (`auto` approval mode) covers. Native
 /// websearch runs ungated; custom websearch is gated because it executes an
 /// arbitrary shell template.
-fn is_gated_tool(name: &str, cwd: &std::path::Path) -> bool {
-    matches!(name, "bash" | "mcp") || crate::tools::web::web_tool_requires_gate(name, cwd)
+fn is_gated_tool(name: &str, config: &crate::daemon::session_worker::SessionConfigHandle) -> bool {
+    matches!(name, "bash" | "mcp") || crate::tools::web::web_tool_requires_gate(name, config)
 }
 
 pub(crate) fn result_scan_tool_candidate(name: &str) -> bool {
@@ -1736,6 +1751,7 @@ mod project_guidance_injection_tests {
             "Build",
             &mut history,
             tmp.path(),
+            &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             Arc::new(RedactionTable::empty()),
             &tx,
         )
@@ -1782,6 +1798,7 @@ mod project_guidance_injection_tests {
             "Build",
             &mut history,
             tmp.path(),
+            &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             Arc::new(RedactionTable::empty()),
             &tx,
         )
@@ -1811,6 +1828,7 @@ mod project_guidance_injection_tests {
             "Build",
             &mut history,
             tmp.path(),
+            &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             Arc::new(RedactionTable::empty()),
             &tx,
         )
@@ -1840,6 +1858,7 @@ mod project_guidance_injection_tests {
         inject_live_project_guidance_change(
             &mut history,
             tmp.path(),
+            &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             Arc::new(RedactionTable::empty()),
             &tx,
             "CHANGED\n",
@@ -1867,6 +1886,7 @@ mod project_guidance_injection_tests {
             "docs-answerer",
             &mut history,
             tmp.path(),
+            &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             Arc::new(RedactionTable::empty()),
             &tx,
         )

@@ -684,7 +684,7 @@ pub(crate) async fn execute_ordinary_call(
     // tool_use↔tool_result pairing valid and can't 400 the provider. The
     // original (malformed) name rides the `recovery` (`NameRepair.original`)
     // for the §14 wire-vs-user split.
-    let providers = crate::secret_ref::load_effective(env.cwd);
+    let providers = env.ctx.config.providers();
     let active_provider = env.session.active_provider();
     let active_model = env.session.active_model();
     if let Err(e) = env.session.record_tool_call(ToolCallRow {
@@ -1369,6 +1369,7 @@ mod tests {
             events: Some(tx.clone()),
             lsp: None,
             resource_scheduler: None,
+            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
         }
     }
 

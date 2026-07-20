@@ -48,18 +48,18 @@ pub(super) fn redacted_bounded_snippet(
 /// loaded, or the backup `(provider, model)` can't be built (each ⇒ no
 /// fallback / hard-fail, never a crash).
 pub(crate) fn resolve_backup_model_for(
-    cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
     model: &crate::engine::model::Model,
 ) -> Option<Arc<crate::engine::model::Model>> {
-    let providers = crate::secret_ref::load_effective(cwd);
+    let providers = config.providers();
     build_backup_model(&providers, model)
 }
 
 pub(crate) fn resolve_failover_models_for(
-    cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
     model: &crate::engine::model::Model,
 ) -> Vec<Arc<crate::engine::model::Model>> {
-    let providers = crate::secret_ref::load_effective(cwd);
+    let providers = config.providers();
     build_failover_models(&providers, model)
 }
 

@@ -168,6 +168,10 @@ pub struct ScheduleContext {
     pub locks: Arc<crate::locks::LockManager>,
     pub redact: Arc<RedactionTable>,
     pub cwd: std::path::PathBuf,
+    /// Session config reader for the async-job's turns, captured from the
+    /// driver so loop/swarm iterations read the same snapshot as the
+    /// foreground turn (`engine-config-snapshot-adoption`).
+    pub config: crate::daemon::session_worker::SessionConfigHandle,
     /// The main agent — ephemeral-fork loop iterations run on the same
     /// agent/model/provider config (GOALS §22).
     pub agent: Arc<Agent>,
@@ -286,6 +290,18 @@ impl ScheduleAuthority {
     /// new one.
     pub fn set_redaction_table(&mut self, table: Arc<RedactionTable>) {
         self.ctx.redact = table;
+    }
+
+    /// Refresh the session config reader handed to async-job turns. In-flight
+    /// tasks keep the handle they started with; jobs spawned after this
+    /// boundary read the new (re-pinned) snapshot — the same turn-boundary
+    /// semantics as [`Self::set_redaction_table`]
+    /// (`engine-config-snapshot-adoption`).
+    pub fn set_config_handle(
+        &mut self,
+        config: crate::daemon::session_worker::SessionConfigHandle,
+    ) {
+        self.ctx.config = config;
     }
 
     #[cfg(test)]
@@ -854,6 +870,7 @@ mod tests {
             locks,
             redact,
             cwd: root,
+            config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             agent,
         };
         let authority = ScheduleAuthority::new(event_tx, cmd_tx, turn_tx, ctx, max);

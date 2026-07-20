@@ -222,6 +222,7 @@ impl Driver {
             events: Some(tx.clone()),
             lsp: None,
             resource_scheduler: self.resource_scheduler.clone(),
+            config: self.config.clone(),
             env_overlay: agent.env_overlay.clone(),
         };
         let mut blocks: Vec<String> = Vec::new();
@@ -519,6 +520,7 @@ impl Driver {
             events: tx.cloned(),
             lsp: None,
             resource_scheduler: self.resource_scheduler.clone(),
+            config: self.config.clone(),
             env_overlay: child.env_overlay.clone(),
         };
         let mut budget = crate::intel::budget::BudgetedWriter::new(SEED_INJECTION_TOKEN_CAP);
@@ -600,6 +602,7 @@ impl Driver {
             events: Some(tx.clone()),
             lsp: None,
             resource_scheduler: self.resource_scheduler.clone(),
+            config: self.config.clone(),
             env_overlay: agent.env_overlay.clone(),
         };
 
@@ -800,6 +803,7 @@ impl Driver {
             events: Some(tx.clone()),
             lsp: None,
             resource_scheduler: self.resource_scheduler.clone(),
+            config: self.config.clone(),
             env_overlay: agent.env_overlay.clone(),
         };
 

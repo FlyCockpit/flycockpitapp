@@ -611,6 +611,7 @@ fn model_switch_driver_with_disk_config() -> (Driver, tempfile::TempDir) {
     let (mut driver, tmp) = model_switch_driver();
     write_two_model_config(tmp.path(), "provider-a", "model-a");
     driver.test_providers_override = None;
+    driver.refresh_config_from_disk_for_tests();
     (driver, tmp)
 }
 

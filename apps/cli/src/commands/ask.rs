@@ -62,6 +62,17 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
         .context("resolving active model")?,
     );
     let reasoning_params = model.resolve_reasoning_params(&providers);
+    // Session-less command: resolve config once here (the trust-aware entry
+    // point already ran to produce `extended`/`providers`) and serve it to the
+    // docs pipeline through a detached config handle
+    // (`engine-config-snapshot-adoption`).
+    let config = crate::daemon::session_worker::SessionConfigHandle::detached(
+        crate::daemon::session_worker::SessionConfigSnapshot::new(
+            0,
+            providers.clone(),
+            extended.clone(),
+        ),
+    );
     let spawn_args = SpawnArgs {
         model,
         params: ModelParams {
@@ -71,6 +82,7 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
         },
         env_overlay: Arc::new(RwLock::new(Default::default())),
         cwd: cwd.clone(),
+        config: config.clone(),
         session_short_id: session.short_id.clone(),
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
@@ -92,6 +104,7 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
         Arc::new(session),
         locks,
         redact,
+        config,
         None,
         Arc::new(crate::engine::interrupt::InterruptHub::detached()),
         tokio_util::sync::CancellationToken::new(),

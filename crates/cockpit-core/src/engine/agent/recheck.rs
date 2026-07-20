@@ -5,6 +5,7 @@ pub(crate) struct ResultRecheckCtx {
     pub agent_id: String,
     pub session: Arc<Session>,
     pub cwd: std::path::PathBuf,
+    pub config: crate::daemon::session_worker::SessionConfigHandle,
     pub redact: Arc<RedactionTable>,
     pub interrupts: Arc<crate::engine::interrupt::InterruptHub>,
 }
@@ -15,6 +16,7 @@ impl ResultRecheckCtx {
             agent_id: ctx.agent_id.clone(),
             session: ctx.session.clone(),
             cwd: ctx.cwd.clone(),
+            config: ctx.config.clone(),
             redact: ctx.redact.clone(),
             interrupts: ctx.interrupts.clone(),
         }
@@ -80,7 +82,7 @@ pub(crate) async fn result_recheck(
     use crate::config::extended::resolve_injection_guard;
     use crate::engine::injection_check::check;
 
-    let (extended, providers) = crate::auto_title::load_configs_for(&ctx.cwd);
+    let (extended, providers) = ctx.config.configs();
     let guard = resolve_injection_guard(&ctx.cwd);
     if guard.threshold == crate::config::extended::InjectionThreshold::Off
         || ctx.session.approval_mode() == crate::config::extended::ApprovalMode::Yolo

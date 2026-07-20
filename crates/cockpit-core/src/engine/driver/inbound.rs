@@ -50,7 +50,7 @@ impl Driver {
         user_text: &str,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> String {
-        let (extended, providers) = crate::auto_title::load_configs_for(&self.cwd);
+        let (extended, providers) = self.config.configs();
 
         if extended.skill_injection_model_ref().is_none() {
             if !self.skills_no_utility_model_logged {
@@ -70,12 +70,16 @@ impl Driver {
             agent: String::new(),
         });
 
-        let active_tools: Vec<String> =
-            crate::engine::agent::turn_toolbox(&self.stack[0].agent, &self.session, &self.cwd)
-                .names()
-                .into_iter()
-                .map(str::to_string)
-                .collect();
+        let active_tools: Vec<String> = crate::engine::agent::turn_toolbox(
+            &self.stack[0].agent,
+            &self.session,
+            &self.cwd,
+            &self.config,
+        )
+        .names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         let (selection, diagnostics) = crate::skills::auto_select::select_with_diagnostics(
             &self.cwd,
             &extended,
@@ -149,7 +153,7 @@ impl Driver {
     /// degrade, never block the turn. Called between the injection scan
     /// (which sees the raw text) and outbound redaction.
     pub(in crate::engine::driver) async fn translate_inbound(&self, text: &str) -> String {
-        match crate::engine::translate::load_if_active(&self.cwd) {
+        match crate::engine::translate::load_if_active(&self.config) {
             Some((extended, providers)) => {
                 crate::engine::translate::inbound(
                     text,
@@ -190,7 +194,7 @@ impl Driver {
         use crate::config::extended::{InjectionThreshold, resolve_injection_guard};
         use crate::engine::injection_check::check;
 
-        let (extended, providers) = crate::auto_title::load_configs_for(&self.cwd);
+        let (extended, providers) = self.config.configs();
         let guard = resolve_injection_guard(&self.cwd);
         if guard.threshold == InjectionThreshold::Off {
             return None; // scanning disabled

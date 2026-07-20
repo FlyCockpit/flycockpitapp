@@ -1192,10 +1192,10 @@ impl Driver {
                 providers.clone(),
             )
         } else {
-            crate::auto_title::load_configs_for(&self.cwd)
+            self.config.configs()
         };
         #[cfg(not(test))]
-        let (extended, providers) = crate::auto_title::load_configs_for(&self.cwd);
+        let (extended, providers) = self.config.configs();
         // Two-level model precedence: a configured `compact_model` (when it
         // resolves) drafts the brief; otherwise the active agent's own model.
         // A configured-but-unresolvable `compact_model` falls back to the

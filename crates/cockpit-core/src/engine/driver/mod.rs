@@ -412,6 +412,11 @@ pub struct Driver {
     pub locks: Arc<crate::locks::LockManager>,
     pub redact: Arc<RedactionTable>,
     pub cwd: std::path::PathBuf,
+    /// Session-scoped config reader, re-pinned at each turn boundary
+    /// (`engine-config-snapshot-adoption`). The single access path to resolved
+    /// config for the driver and every `ToolCtx` it builds; installed by the
+    /// worker via [`Self::set_config_handle`] before the loop starts.
+    config: crate::daemon::session_worker::SessionConfigHandle,
     pub stack: Vec<AgentSession>,
     assistant_identity_prefix: Option<String>,
     /// Minutes between `[time: ...]` preludes injected on user
@@ -1086,6 +1091,7 @@ impl Driver {
             locks: self.locks.clone(),
             redact: self.redact.clone(),
             cwd: self.cwd.clone(),
+            config: self.config.clone(),
             agent: self.stack[0].agent.clone(),
         };
         let schedule = ScheduleAuthority::new(
@@ -1100,6 +1106,7 @@ impl Driver {
             locks: self.locks.clone(),
             redact: self.redact.clone(),
             cwd: self.cwd.clone(),
+            config: self.config.clone(),
             stack: self
                 .stack
                 .iter()
@@ -1373,6 +1380,7 @@ impl Driver {
             locks: locks.clone(),
             redact: redact.clone(),
             cwd: cwd.clone(),
+            config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             agent: root.clone(),
         };
         // The authority needs the engine UI-event channel (`tx`) to emit
@@ -1388,7 +1396,12 @@ impl Driver {
             ctx,
             max_concurrent_schedules,
         );
-        let initial_tools = crate::engine::agent::turn_toolbox(&root, &session, &cwd);
+        let initial_tools = crate::engine::agent::turn_toolbox(
+            &root,
+            &session,
+            &cwd,
+            &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+        );
         session.set_active_tool_names(
             initial_tools.names(),
             crate::engine::tool::Capability::SandboxEscalate.enabled(root.llm_mode),
@@ -1398,6 +1411,7 @@ impl Driver {
             locks,
             redact,
             cwd,
+            config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             stack: vec![AgentSession {
                 queue_target: crate::engine::message::QueueTarget::root(root.name.clone()),
                 agent: root,
@@ -1589,15 +1603,9 @@ impl Driver {
     }
 
     async fn load_max_primary_rounds_for_turn(&self) -> u32 {
-        let cwd = self.cwd.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::config::extended::load_for_cwd(&cwd).max_primary_rounds
-        })
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "loading max_primary_rounds task join failed");
-            crate::config::extended::ExtendedConfig::default().max_primary_rounds
-        })
+        // Read from the turn-pinned config snapshot rather than re-reading disk
+        // (`engine-config-snapshot-adoption`).
+        self.config.extended().max_primary_rounds
     }
 
     async fn refresh_redaction_table_for_turn(&mut self, tx: &mpsc::Sender<TurnEvent>) {
@@ -1611,17 +1619,20 @@ impl Driver {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        // The redact config comes from the turn-pinned snapshot; only the
+        // table build (which scans .env / ssh keys on disk) stays on the
+        // blocking pool (`engine-config-snapshot-adoption`).
+        let mut cfg = self.config.extended().redact;
+        if let Some(v) = scan_environment_override {
+            cfg.scan_environment = v;
+        }
+        if let Some(v) = scan_dotenv_override {
+            cfg.scan_dotenv = v;
+        }
+        if let Some(v) = scan_ssh_keys_override {
+            cfg.scan_ssh_keys = v;
+        }
         match tokio::task::spawn_blocking(move || {
-            let mut cfg = crate::config::extended::load_for_cwd(&cwd).redact;
-            if let Some(v) = scan_environment_override {
-                cfg.scan_environment = v;
-            }
-            if let Some(v) = scan_dotenv_override {
-                cfg.scan_dotenv = v;
-            }
-            if let Some(v) = scan_ssh_keys_override {
-                cfg.scan_ssh_keys = v;
-            }
             RedactionTable::build_with_env_and_store(&cfg, &cwd, &session_env)
         })
         .await
@@ -1697,6 +1708,38 @@ impl Driver {
 
     pub fn set_lsp_manager(&mut self, lsp: Arc<crate::daemon::lsp::LspManager>) {
         self.lsp = Some(lsp);
+    }
+
+    /// Install the session's config reader. The worker calls this before the
+    /// loop starts so the driver and every `ToolCtx` it builds read config
+    /// through the generationed snapshot rather than from disk
+    /// (`engine-config-snapshot-adoption`).
+    pub fn set_config_handle(
+        &mut self,
+        config: crate::daemon::session_worker::SessionConfigHandle,
+    ) {
+        self.schedule.set_config_handle(config.clone());
+        self.config = config;
+    }
+
+    /// Refresh the driver's config handle from the layered config on disk for
+    /// its cwd. Tests that write config into the driver's tempdir and then
+    /// exercise config-dependent behavior call this so the change is observed
+    /// through the snapshot handle exactly as a worker re-resolution would.
+    #[cfg(test)]
+    pub(crate) fn refresh_config_from_disk_for_tests(&mut self) {
+        let cwd = self.cwd.clone();
+        self.set_config_handle(
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(&cwd),
+        );
+    }
+
+    /// The session config reader, re-pinned to the current generation for a
+    /// fresh turn. Callers use this at a turn boundary. The async-job authority
+    /// is refreshed too so a loop/timer spawned this turn reads the same view.
+    fn repin_config_for_turn(&mut self) {
+        self.config = self.config.repin();
+        self.schedule.set_config_handle(self.config.clone());
     }
 
     pub fn set_resource_scheduler(
@@ -1869,7 +1912,7 @@ impl Driver {
         if !enabled {
             return crate::engine::preflight::PreflightOutcome::Skipped;
         }
-        let (extended, providers) = crate::auto_title::load_configs_for(&self.cwd);
+        let (extended, providers) = self.config.configs();
         let resolved = crate::config::extended::resolve_preflight(&self.cwd);
         let model_ref = extended.preflight_model_ref();
         // Resolve the strip-`<think>` toggle for the *preflight* model
@@ -2172,7 +2215,12 @@ impl Driver {
 
     fn publish_active_tool_names(&self) {
         if let Some(frame) = self.stack.last() {
-            let tools = crate::engine::agent::turn_toolbox(&frame.agent, &self.session, &self.cwd);
+            let tools = crate::engine::agent::turn_toolbox(
+                &frame.agent,
+                &self.session,
+                &self.cwd,
+                &self.config,
+            );
             self.session.set_active_tool_names(
                 tools.names(),
                 crate::engine::tool::Capability::SandboxEscalate.enabled(frame.agent.llm_mode),
@@ -2184,7 +2232,12 @@ impl Driver {
         let Some(frame) = self.stack.last() else {
             return;
         };
-        let tools = crate::engine::agent::turn_toolbox(&frame.agent, &self.session, &self.cwd);
+        let tools = crate::engine::agent::turn_toolbox(
+            &frame.agent,
+            &self.session,
+            &self.cwd,
+            &self.config,
+        );
         let Some(text) = tools.capability_notice_text() else {
             return;
         };
@@ -2249,7 +2302,8 @@ impl Driver {
                 agent.name
             );
         }
-        let active_tools = crate::engine::agent::turn_toolbox(&agent, &self.session, &self.cwd);
+        let active_tools =
+            crate::engine::agent::turn_toolbox(&agent, &self.session, &self.cwd, &self.config);
         if active_tools.get(&payload.tool).is_none() {
             bail!("parked interrupt tool `{}` is not registered", payload.tool);
         }
@@ -2299,6 +2353,7 @@ impl Driver {
             lsp: self.lsp.clone(),
             resource_scheduler: self.resource_scheduler.clone(),
             env_overlay: agent.env_overlay.clone(),
+            config: self.config.clone(),
         };
         let call = crate::engine::message::ToolCall {
             id: payload.call_id.clone(),
@@ -2319,7 +2374,7 @@ impl Driver {
             tx,
             hint_corrections: crate::engine::agent::hint_tool_call_corrections_enabled(
                 &self.session,
-                &self.cwd,
+                &self.config,
             ),
             loop_guard_threshold: self.loop_guard_threshold,
             cwd: &self.cwd,
@@ -2353,6 +2408,10 @@ impl Driver {
         };
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
+        // Pin the session config snapshot for this turn's duration: a
+        // re-resolution that lands mid-turn is observed only at the next turn
+        // boundary (`engine-config-snapshot-adoption`).
+        self.repin_config_for_turn();
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
         self.reset_delegation_retry_budget();
         self.refresh_redaction_table_for_turn(tx).await;
@@ -2399,6 +2458,7 @@ impl Driver {
                     self.locks.clone(),
                     self.redact.clone(),
                     self.cwd.clone(),
+                    self.config.clone(),
                     self.interrupts.clone(),
                     cancel.clone(),
                     self.approver.clone(),
@@ -2593,6 +2653,7 @@ impl Driver {
             (*root.agent).clone(),
             root.history.clone(),
             self.cwd.clone(),
+            self.config.clone(),
             self.redact.clone(),
             tx.clone(),
         ) else {
@@ -3870,7 +3931,7 @@ impl Driver {
         if let Some((providers, _, _)) = &self.test_providers_override {
             return Ok(providers.clone());
         }
-        Ok(crate::secret_ref::load_effective(&self.cwd))
+        Ok(self.config.providers())
     }
 
     /// Re-load a foreground frame under `new_model` (live model switch),
@@ -4222,7 +4283,7 @@ impl Driver {
         if let Some((providers, _, _)) = &self.test_providers_override {
             return build_backup_model(providers, model);
         }
-        resolve_backup_model_for(&self.cwd, model)
+        resolve_backup_model_for(&self.config, model)
     }
 
     fn resolve_failover_models(
@@ -4233,7 +4294,7 @@ impl Driver {
         if let Some((providers, _, _)) = &self.test_providers_override {
             return build_failover_models(providers, model);
         }
-        resolve_failover_models_for(&self.cwd, model)
+        resolve_failover_models_for(&self.config, model)
     }
 
     /// Load the layered providers config plus the session's active
@@ -4250,7 +4311,7 @@ impl Driver {
         }
         let provider = self.session.active_provider()?;
         let model = self.session.active_model()?;
-        let providers = crate::secret_ref::load_effective(&self.cwd);
+        let providers = self.config.providers();
         Some((providers, provider, model))
     }
 
@@ -4423,9 +4484,7 @@ impl Driver {
         // Resolve the `extended.compact_prompt` brief-prompt override from the
         // config chain so delegation-shrink reuses the same brief prompt as
         // `/compact` (implementation note).
-        let compact_prompt = crate::auto_title::load_configs_for(&self.cwd)
-            .0
-            .compact_prompt;
+        let compact_prompt = self.config.extended().compact_prompt;
 
         let handle = tokio::spawn(async move {
             // Lazy: wait until `ttl - margin`. If the child returns first,
@@ -4887,6 +4946,10 @@ impl Driver {
         self.preempt_self_improvement_review_for_foreground();
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
+        // Pin the session config snapshot for this turn's duration: a
+        // re-resolution that lands mid-turn is observed only at the next turn
+        // boundary (`engine-config-snapshot-adoption`).
+        self.repin_config_for_turn();
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
         self.reset_delegation_retry_budget();
         self.refresh_redaction_table_for_turn(tx).await;
@@ -5000,8 +5063,11 @@ impl Driver {
         let title_action = self.session.note_user_content(&user_text);
         if !matches!(title_action, crate::session::TitleAction::None) {
             let session = self.session.clone();
-            let cwd = self.cwd.clone();
             let content_prefix = user_text.clone();
+            // Resolve auto-title config from the turn-pinned snapshot before the
+            // detached task spawns, rather than re-reading disk inside it
+            // (`engine-config-snapshot-adoption`).
+            let (extended, providers) = self.config.configs();
             // Thread the session's effective redaction table so the detached
             // auto-title call routes through the same non-bypassable scrub
             // chokepoint as the foreground turn (GOALS §7).
@@ -5009,7 +5075,6 @@ impl Driver {
             let tx = tx.clone();
             let shutdown_gate = self.stack[0].agent.model.shutdown_gate();
             tokio::spawn(async move {
-                let (extended, providers) = crate::auto_title::load_configs_for(&cwd);
                 crate::auto_title::generate_session_title(
                     session,
                     extended,
@@ -5187,6 +5252,7 @@ impl Driver {
                     self.locks.clone(),
                     self.redact.clone(),
                     self.cwd.clone(),
+                    self.config.clone(),
                     self.interrupts.clone(),
                     cancel.clone(),
                     self.approver.clone(),
@@ -6149,6 +6215,7 @@ impl Driver {
             params: self.stack[0].agent.params.clone(),
             env_overlay: self.stack[0].agent.env_overlay.clone(),
             cwd: self.cwd.clone(),
+            config: self.config.clone(),
             session_short_id: self.session.short_id.clone(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
@@ -6228,7 +6295,7 @@ impl Driver {
         model: &Option<crate::engine::model_roles::DelegationModelSelector>,
     ) -> Result<crate::engine::builtin::DelegationRecursionContext, String> {
         let parent = self.stack.last().expect("stack never empty").agent.as_ref();
-        let cfg = crate::config::extended::load_for_cwd(&self.cwd).delegation;
+        let cfg = self.config.extended().delegation;
         let root_parent_ctx = if parent.delegated {
             None
         } else {

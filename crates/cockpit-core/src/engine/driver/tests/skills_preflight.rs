@@ -858,6 +858,10 @@ fn seed_skills_block_empty_when_nothing_requested() {
 async fn user_invoked_skill_enters_the_seedable_set() {
     let (mut driver, tmp) = driver_with_skill_caller();
     let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    // Refresh the driver's config snapshot now that the isolated home is in
+    // place, so it carries the seeded default skills scan dir
+    // (`engine-config-snapshot-adoption`).
+    driver.refresh_config_from_disk_for_tests();
     // The seeded default scan dir `./.agents/skills` resolves against cwd
     // (= the driver's tmp root, with no config.json on disk).
     let skill_dir = tmp

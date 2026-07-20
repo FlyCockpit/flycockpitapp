@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn interactive_child_load_failure_returns_tool_error_without_pushing_child() {
-    let (driver, tmp) = test_driver(8);
+    let (mut driver, tmp) = test_driver(8);
     let cockpit = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit).unwrap();
     std::fs::write(
@@ -10,6 +10,7 @@ fn interactive_child_load_failure_returns_tool_error_without_pushing_child() {
         r#"{"tools":{"read":{"enabled":true,"command":"echo hi"}}}"#,
     )
     .unwrap();
+    driver.refresh_config_from_disk_for_tests();
 
     let message = match driver.load_interactive_child_or_tool_error(InteractiveChildLoadRequest {
         child_agent: "builder",

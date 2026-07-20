@@ -451,6 +451,9 @@ mod tests {
                 events: None,
                 lsp: None,
                 resource_scheduler: None,
+                config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
+                    project,
+                ),
                 env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             },
             row,

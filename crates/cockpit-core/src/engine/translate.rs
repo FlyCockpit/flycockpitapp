@@ -200,8 +200,10 @@ pub fn strip_think_blocks(text: &str) -> String {
 /// translate when the feature is on (so they can skip the config load on
 /// the common path). Returns the loaded configs alongside the flag so the
 /// caller reuses them for the actual call.
-pub fn load_if_active(cwd: &std::path::Path) -> Option<(ExtendedConfig, ProvidersConfig)> {
-    let (extended, providers) = crate::auto_title::load_configs_for(cwd);
+pub fn load_if_active(
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) -> Option<(ExtendedConfig, ProvidersConfig)> {
+    let (extended, providers) = config.configs();
     if extended.translation.is_active() {
         Some((extended, providers))
     } else {

@@ -361,7 +361,7 @@ async fn call_bash_inner(
     let tmp_dir = ctx.session.tmp_dir();
     let scrub = scrub_overrides(&session_env);
     let command_classification = crate::approval::classify::classify(command);
-    let extended_config = crate::config::extended::load_for_cwd(&cwd);
+    let extended_config = ctx.config.extended();
     let profile_introspector =
         crate::tools::command_resource_profiles::ProductionProfileIntrospector::new(
             true,

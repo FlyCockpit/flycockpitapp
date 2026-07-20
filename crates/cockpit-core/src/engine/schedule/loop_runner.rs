@@ -195,6 +195,7 @@ async fn run_iteration(
             ctx.locks.clone(),
             ctx.redact.clone(),
             ctx.cwd.clone(),
+            ctx.config.clone(),
             interrupts.clone(),
             cancel.clone(),
             // A loop fork is a leaf with no human on the other end, so it

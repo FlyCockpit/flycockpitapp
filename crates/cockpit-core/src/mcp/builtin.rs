@@ -41,6 +41,9 @@ pub struct HostContext {
     pub session_id: Option<uuid::Uuid>,
     #[allow(dead_code)]
     pub cwd: PathBuf,
+    /// Session config reader for host-function availability checks
+    /// (`engine-config-snapshot-adoption`).
+    pub config: crate::daemon::session_worker::SessionConfigHandle,
     pub session: Option<Arc<Session>>,
     pub root_agent_frame: bool,
     pub context_usage: Option<ContextUsageSnapshot>,
@@ -70,6 +73,7 @@ impl HostContext {
             db: Some(ctx.session.db.clone()),
             session_id: Some(ctx.session.id),
             cwd: ctx.cwd.clone(),
+            config: ctx.config.clone(),
             session: Some(ctx.session.clone()),
             root_agent_frame: ctx.root_agent_frame,
             context_usage: ctx.context_usage,
@@ -90,6 +94,7 @@ impl HostContext {
             db: None,
             session_id: None,
             cwd: PathBuf::new(),
+            config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             session: None,
             root_agent_frame: true,
             context_usage: None,
@@ -951,9 +956,7 @@ fn rename_session_availability(ctx: &HostContext) -> Availability {
 }
 
 fn auto_title_model_configured(ctx: &HostContext) -> bool {
-    crate::config::extended::load_for_cwd(&ctx.cwd)
-        .auto_title_model_ref()
-        .is_some()
+    ctx.config.extended().auto_title_model_ref().is_some()
 }
 
 fn rename_session<'a>(
@@ -1594,7 +1597,7 @@ mod tests {
             tmp.path(),
             r#"{ "utility_model": null, "auto_title": null }"#,
         );
-        let host = host(tmp.path());
+        let mut host = host(tmp.path());
         assert!(
             search(&host, "rename_session")
                 .iter()
@@ -1604,6 +1607,10 @@ mod tests {
         assert_eq!(desc.name, "rename_session");
 
         write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
+        // Config is snapshotted onto the host; refresh it after rewriting the
+        // config on disk (`engine-config-snapshot-adoption`).
+        host.config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
         let session = host.session.as_ref().unwrap();
         advance_title_turns(session, 3);
         assert!(
@@ -1704,6 +1711,9 @@ mod tests {
             db: Some(session.db.clone()),
             session_id: Some(session.id),
             cwd: tmp.path().to_path_buf(),
+            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
+                tmp.path(),
+            ),
             session: Some(session),
             root_agent_frame: true,
             context_usage: None,
@@ -1783,6 +1793,9 @@ mod tests {
             db: Some(session.db.clone()),
             session_id: Some(session.id),
             cwd: tmp.path().to_path_buf(),
+            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
+                tmp.path(),
+            ),
             session: Some(session),
             root_agent_frame: true,
             context_usage: None,

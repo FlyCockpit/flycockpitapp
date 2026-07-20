@@ -104,11 +104,10 @@ fn push_family_advert(
 
 pub(crate) fn current_mcp_description_adverts(
     session: &crate::session::Session,
-    cwd: &std::path::Path,
+    _cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> Vec<String> {
-    let auto_title_configured = crate::config::extended::load_for_cwd(cwd)
-        .auto_title_model_ref()
-        .is_some();
+    let auto_title_configured = config.extended().auto_title_model_ref().is_some();
     mcp_description_adverts_for_session(session, auto_title_configured)
 }
 
@@ -472,7 +471,11 @@ mod tests {
             let _ = ctx.session.note_user_content(&format!("turn {turn}"));
         }
 
-        let adverts = current_mcp_description_adverts(&ctx.session, tmp.path());
+        let adverts = current_mcp_description_adverts(
+            &ctx.session,
+            tmp.path(),
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+        );
         assert!(
             !adverts
                 .iter()
@@ -522,14 +525,22 @@ mod tests {
                 None,
             )
             .unwrap();
-        let adverts = current_mcp_description_adverts(&ctx.session, tmp.path());
+        let adverts = current_mcp_description_adverts(
+            &ctx.session,
+            tmp.path(),
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+        );
         assert!(apply_mcp_description_adverts(&mut toolbox, &adverts));
         let desc = mcp_description(&toolbox);
         assert!(desc.contains("request_compact"), "{desc}");
         assert!(desc.contains("context_usage"), "{desc}");
 
         ctx.session.db.clear_session_goal(ctx.session.id).unwrap();
-        let adverts = current_mcp_description_adverts(&ctx.session, tmp.path());
+        let adverts = current_mcp_description_adverts(
+            &ctx.session,
+            tmp.path(),
+            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+        );
         assert!(apply_mcp_description_adverts(&mut toolbox, &adverts));
         let desc = mcp_description(&toolbox);
         assert!(!desc.contains("request_compact"), "{desc}");

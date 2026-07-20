@@ -787,13 +787,6 @@ fn should_attempt_display_attach(
 /// set narrows. Keeps layout pinned to a 6-row reservation.
 pub(crate) const AUTOCOMPLETE_ROWS: u16 = 6;
 
-fn attach_to_session_retry_once<T, E>(mut attach: impl FnMut() -> Result<T, E>) -> Result<T, E> {
-    match attach() {
-        Ok(value) => Ok(value),
-        Err(_) => attach(),
-    }
-}
-
 const DISPLAY_ATTACH_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const DISPLAY_ATTACH_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
@@ -3180,8 +3173,6 @@ mod event_loop_redraw_tests;
 mod failed_dispatch_reconciliation_tests;
 #[cfg(test)]
 mod footer_selector_tests;
-#[cfg(test)]
-mod fork_attach_retry_tests;
 #[cfg(test)]
 mod fresh_queue_ack_tests;
 #[cfg(test)]

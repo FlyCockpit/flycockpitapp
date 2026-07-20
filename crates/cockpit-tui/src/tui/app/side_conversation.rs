@@ -48,37 +48,11 @@ impl App {
             );
             return;
         }
-        match attach_to_session_retry_once(|| {
-            agent_runner::attach_to_session(
-                &self.launch.cwd,
-                fork_session_id,
-                self.no_sandbox,
-                self.lifecycle_mode(),
-            )
-        }) {
-            Ok(mut runner) => {
-                self.arm_daemon_guard(&runner);
-                self.project_id = Some(runner.project_id.clone());
-                self.launch.session_id = Some(runner.session_id());
-                self.launch.session_short_id = Some(runner.short_id.clone());
-                self.current_session_persisted = true;
-                self.history.clear();
-                self.reset_session_live_state();
-                let restored = wire_history_to_entries(std::mem::take(&mut runner.history));
-                self.history.extend(restored);
-                self.agent_runner = Some(Ok(runner));
-                self.push_plain(format!("/fork: switched to fork {fork_short_id}."));
-                if let Some(seed) = seed_composer {
-                    self.composer.set(seed);
-                    self.composer.set_vim_mode(VimMode::Insert);
-                }
-            }
-            Err(e) => {
-                self.history.push(HistoryEntry::CommandError {
-                    line: format!("/fork: created {fork_short_id}, but could not attach: {e}"),
-                });
-            }
-        }
+        self.history.push(HistoryEntry::CommandError {
+            line: format!(
+                "/fork: created {fork_short_id}, but the active runner cannot switch sessions"
+            ),
+        });
     }
 
     /// Fork the current (main) session into an ephemeral throwaway and switch
@@ -203,77 +177,18 @@ impl App {
             );
             return;
         }
-        // Attach to the ephemeral fork. On failure, discard the orphan fork
-        // we just created and stay in the main session, untouched.
-        let runner = match agent_runner::attach_to_session(
-            &self.launch.cwd,
-            side_session_id,
-            self.no_sandbox,
-            self.lifecycle_mode(),
-        ) {
-            Ok(runner) => runner,
-            Err(e) => {
-                let discard_socket = socket.clone();
-                self.async_actions.start_blocking(
-                    AsyncActionKind::DaemonRpc("side.discard"),
-                    AsyncActionPolicy::AllowConcurrent,
-                    move || {
-                        agent_runner::discard_session_blocking(&discard_socket, side_session_id)
-                            .map(|_| AsyncActionPayload::Unit)
-                    },
-                );
-                self.history.push(HistoryEntry::CommandError {
-                    line: format!("/side: could not enter side conversation: {e}"),
-                });
-                return;
-            }
-        };
-        self.arm_daemon_guard(&runner);
-
-        // Snapshot the main-session view, then swap onto the side fork. We
-        // keep `history` (prior scrollback stays visible) but take everything
-        // else into the snapshot so `end` restores it exactly.
-        let side = SideConversation {
-            side_session_id,
-            socket,
-            saved_runner: self.agent_runner.take(),
-            saved_history: self.history.clone(),
-            saved_queue: std::mem::take(&mut self.queue),
-            saved_pending: self.pending.take(),
-            saved_prunable_tokens: self.prunable_tokens,
-            saved_cache_cold: self.cache_cold,
-            saved_elided_event_ids: std::mem::take(&mut self.elided_event_ids),
-            saved_active_schedules: std::mem::take(&mut self.active_schedules),
-            saved_pending_stop_confirm: self.pending_stop_confirm.take(),
-            saved_chat_scroll_offset: self.chat_scroll_offset,
-            saved_project_id: self.project_id.clone(),
-            saved_session_id: self.launch.session_id,
-            saved_session_short_id: self.launch.session_short_id.clone(),
-            saved_current_session_persisted: self.current_session_persisted,
-        };
-
-        self.project_id = Some(runner.project_id.clone());
-        self.launch.session_id = Some(runner.session_id());
-        self.launch.session_short_id = Some(runner.short_id.clone());
-        // The ephemeral fork is never surfaced as resumable — keep
-        // `current_session_persisted = false` so the exit-tail never prints
-        // its id, even though the fork has a (throwaway) DB row.
-        self.current_session_persisted = false;
-        // Reset the live-view fields the side conversation tracks on its own;
-        // the visible scrollback (history) is intentionally preserved.
-        self.queue.clear();
-        self.pending = None;
-        self.pending_render_cache = None;
-        self.prunable_tokens = 0;
-        self.cache_cold = true;
-        self.elided_event_ids.clear();
-        self.active_schedules.clear();
-        self.pending_stop_confirm = None;
-        self.chat_scroll_offset = 0;
-        self.agent_runner = Some(Ok(runner));
-        self.side_conversation = Some(side);
-
-        self.push_plain(Self::side_entry_banner(&side_short_id));
+        let discard_socket = socket.clone();
+        self.async_actions.start_blocking(
+            AsyncActionKind::DaemonRpc("side.discard"),
+            AsyncActionPolicy::AllowConcurrent,
+            move || {
+                agent_runner::discard_session_blocking(&discard_socket, side_session_id)
+                    .map(|_| AsyncActionPayload::Unit)
+            },
+        );
+        self.history.push(HistoryEntry::CommandError {
+            line: "/side: active runner cannot switch sessions".to_string(),
+        });
     }
 
     pub(super) fn restore_side_snapshot(&mut self, side: SideConversation) {

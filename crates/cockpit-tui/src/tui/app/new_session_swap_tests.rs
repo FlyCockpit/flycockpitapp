@@ -2,6 +2,7 @@ use super::{App, Dialog, SESSION_SWITCH_SPINNER_THRESHOLD};
 use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
 };
+use crate::tui::history::HistoryEntry;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -50,6 +51,18 @@ fn app_with_only_session_switch_pending(started_at: Instant) -> App {
     app
 }
 
+async fn drain_async_actions_until_idle(app: &mut App) {
+    for _ in 0..20 {
+        app.drain_async_actions();
+        if app.async_actions.pending_count() == 0 {
+            app.drain_async_actions();
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("async action did not complete");
+}
+
 #[tokio::test]
 async fn swap_below_threshold_shows_no_spinner() {
     let started_at = Instant::now()
@@ -68,4 +81,39 @@ async fn swap_above_threshold_shows_spinner() {
     let app = app_with_only_session_switch_pending(started_at);
 
     assert!(app.animation_tick_active());
+}
+
+#[tokio::test]
+async fn new_session_swap_failure_keeps_cleared_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new_with_db(
+        Some(tmp.path()),
+        false,
+        cockpit_db::Db::open_in_memory().unwrap(),
+    );
+    app.history.push(HistoryEntry::Plain {
+        line: "old transcript".to_string(),
+    });
+    app.history.clear();
+
+    app.async_actions.start(
+        AsyncActionKind::Internal("session.switch"),
+        AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
+        async move { Err("attach failed".to_string()) },
+    );
+    drain_async_actions_until_idle(&mut app).await;
+
+    assert!(
+        !app.history.iter().any(|entry| {
+            matches!(entry, HistoryEntry::Plain { line } if line == "old transcript")
+        }),
+        "failed swap must not restore the previous transcript"
+    );
+    assert!(app.history.iter().any(|entry| {
+        matches!(entry, HistoryEntry::CommandError { line } if line == "/new: attach failed")
+    }));
+    assert!(matches!(
+        app.agent_runner.as_ref(),
+        Some(Err(error)) if error == "attach failed"
+    ));
 }

@@ -1483,10 +1483,18 @@ mod tests {
 
     #[test]
     fn config_snapshot_push_contains_no_secrets() {
-        let wire = snapshot_for_tests().to_proto(Uuid::new_v4());
+        let mut snapshot = snapshot_for_tests();
+        snapshot
+            .extended
+            .redact
+            .denylist
+            .push("literal-config-secret".to_string());
+        let wire = snapshot.to_proto(Uuid::new_v4());
         let encoded = serde_json::to_string(&wire).unwrap();
         assert!(!encoded.contains("sk-session-secret"), "{encoded}");
         assert!(!encoded.contains("openai-oauth"), "{encoded}");
+        assert!(!encoded.contains("literal-config-secret"), "{encoded}");
+        assert_eq!(wire.extended.redact.denylist, vec!["[redacted]"]);
         let provider = wire.providers.providers.get("openai").unwrap();
         assert!(provider.credential_configured);
         assert_eq!(provider.headers[0].value, "[redacted]");

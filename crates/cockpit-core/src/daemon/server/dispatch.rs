@@ -430,9 +430,10 @@ async fn handle_request(
         } => {
             let att = require_attached(state)?;
             let cwd = Path::new(&project_root);
+            let trust_policy = attached_trust_policy(ctx, att)?;
             let (_, config) = ctx
                 .config_source()
-                .load_with_trust(cwd, &att.handle.trust_policy)
+                .load_with_trust(cwd, &trust_policy)
                 .map_err(internal)?;
             let message = ctx
                 .registry
@@ -569,9 +570,10 @@ async fn handle_request(
             // discovery used by the `skill` tool and auto-select path.
             let att = require_attached(state)?;
             let cwd = Path::new(&project_root);
+            let trust_policy = attached_trust_policy(ctx, att)?;
             let (_, extended) = ctx
                 .config_source()
-                .load_with_trust(cwd, &att.handle.trust_policy)
+                .load_with_trust(cwd, &trust_policy)
                 .map_err(internal)?;
             let active_tools = att.handle.active_tool_names();
             let activation = crate::skills::ActivationContext::from_tool_names(
@@ -1026,26 +1028,36 @@ async fn handle_request(
     }
 }
 
+fn attached_trust_policy(
+    ctx: &DaemonContext,
+    att: &AttachedSession,
+) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
+    crate::config::trust::resolve_workspace_trust_policy_from_db(
+        &ctx.db,
+        &att.handle.project_root,
+    )
+    .map_err(internal)
+}
+
 fn list_agents(
     ctx: &DaemonContext,
     state: &ClientState,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_attached(state)?;
+    let trust_policy = attached_trust_policy(ctx, att)?;
     let (_, cfg) = ctx
         .config_source()
-        .load_with_trust(&att.handle.project_root, &att.handle.trust_policy)
+        .load_with_trust(&att.handle.project_root, &trust_policy)
         .map_err(internal)?;
-    let ownable =
-        crate::config::trust::with_workspace_trust_policy(att.handle.trust_policy.clone(), || {
-            crate::agents::chat_ownable_primaries(&att.handle.project_root)
-        });
+    let ownable = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        crate::agents::chat_ownable_primaries(&att.handle.project_root)
+    });
     let mut agents = Vec::with_capacity(ownable.len());
     for name in &ownable {
         validate_set_agent_name(name, cfg.experimental_mode, &ownable)?;
-        let def =
-            crate::config::trust::with_workspace_trust_policy(att.handle.trust_policy.clone(), || {
-                crate::agents::resolve(&att.handle.project_root, name)
-            })
+        let def = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            crate::agents::resolve(&att.handle.project_root, name)
+        })
             .map_err(internal)?
             .ok_or_else(|| ErrorPayload {
                 code: ErrorCode::Internal,
@@ -1068,9 +1080,10 @@ fn list_models(
     requested_provider: Option<&str>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_attached(state)?;
+    let trust_policy = attached_trust_policy(ctx, att)?;
     let (providers, _) = ctx
         .config_source()
-        .load_with_trust(&att.handle.project_root, &att.handle.trust_policy)
+        .load_with_trust(&att.handle.project_root, &trust_policy)
         .map_err(internal)?;
     let active_provider = providers
         .active_model

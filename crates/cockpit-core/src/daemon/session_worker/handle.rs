@@ -160,10 +160,23 @@ impl SessionConfigSnapshot {
         proto::ConfigSnapshot {
             session_id,
             generation: self.generation,
-            extended: self.extended.clone(),
+            extended: redacted_extended_config(&self.extended),
             providers: redacted_provider_view(&self.providers),
         }
     }
+}
+
+fn redacted_extended_config(
+    extended: &crate::config::extended::ExtendedConfig,
+) -> crate::config::extended::ExtendedConfig {
+    let mut extended = extended.clone();
+    extended.redact.denylist = extended
+        .redact
+        .denylist
+        .iter()
+        .map(|_| "[redacted]".to_string())
+        .collect();
+    extended
 }
 
 fn redacted_provider_view(

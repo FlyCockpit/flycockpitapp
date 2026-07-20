@@ -964,6 +964,12 @@ mod tests {
         ctx: &Arc<DaemonContext>,
         project_root: &std::path::Path,
     ) -> (ClientState, Uuid) {
+        ctx.db
+            .set_workspace_trust(
+                project_root,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
         let session_row = ctx
             .db
             .create_session("p", project_root.to_str().unwrap(), "Build")
@@ -6407,6 +6413,12 @@ mod tests {
         .unwrap();
         let ctx = test_ctx();
         let (mut state, _) = attached_state(&ctx, tmp.path());
+        ctx.db
+            .set_workspace_trust(
+                tmp.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            )
+            .unwrap();
         state.attached.as_mut().expect("attached").handle.trust_policy =
             crate::config::trust::WorkspaceTrustPolicy {
                 root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -6590,6 +6602,12 @@ mod tests {
         let ctx = test_ctx_with_config_source(source);
         let tmp = tempfile::tempdir().unwrap();
         let (mut state, _) = attached_state(&ctx, tmp.path());
+        ctx.db
+            .set_workspace_trust(
+                tmp.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            )
+            .unwrap();
         state.attached.as_mut().expect("attached").handle.trust_policy =
             crate::config::trust::WorkspaceTrustPolicy {
                 root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),

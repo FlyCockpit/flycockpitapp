@@ -103,7 +103,7 @@ impl App {
         } else {
             // No live runner exists, so the next submit/attach path still
             // creates a fresh session with `session_id: None`.
-            self.agent_runner = None;
+            self.agent_runner.take();
             self.reset_display_attach_backoff();
         }
         // The fresh session is deferred-persistence until its first message

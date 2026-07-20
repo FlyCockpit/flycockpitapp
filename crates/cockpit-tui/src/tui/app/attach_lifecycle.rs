@@ -208,7 +208,7 @@ impl App {
     /// welcome box can show its short id before the first message, but —
     /// unlike [`Self::ensure_agent_runner`] — **never latch a failure**. A
     /// transient `try_spawn` error (e.g. the just-started daemon's socket
-    /// isn't bound yet) leaves `agent_runner = None` so the next event-loop
+    /// isn't bound yet) leaves no latched runner so the next event-loop
     /// tick retries, rather than poisoning the runner to `Some(Err)` and
     /// permanently disabling the eager display. On success the runner is
     /// the same one the first-message path then reuses (it early-returns on

@@ -302,6 +302,95 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn export_rpc_returns_redacted_data() {
+        let ctx = test_ctx();
+        let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+        let call_id = Uuid::new_v4().to_string();
+        ctx.db
+            .insert_session_event(
+                session.session_id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "hello [redacted]"}),
+            )
+            .unwrap();
+        ctx.db
+            .insert_inference_request(
+                &call_id,
+                session.session_id,
+                &serde_json::json!({
+                    "model": "m",
+                    "system": "visible [redacted]",
+                    "tools": [],
+                    "history": []
+                }),
+                crate::db::session_log::InferenceRequestStatus::Completed,
+            )
+            .unwrap();
+        ctx.db
+            .insert_session_event(
+                session.session_id,
+                crate::db::session_log::SessionEventKind::InferenceRequest,
+                Some("Build"),
+                Some(&call_id),
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        let mut state = owner_state();
+
+        let response = handle_request(
+            Request::ExportSessionData {
+                session_id: session.session_id,
+                kind: proto::ExportSessionKind::TranscriptJson,
+                include_generated_artifacts: false,
+                include_sensitive: false,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("transcript export");
+        let Response::ExportSessionData { data } = response else {
+            panic!("expected ExportSessionData response");
+        };
+        assert_eq!(data.kind, proto::ExportSessionKind::TranscriptJson);
+        assert_eq!(data.filename_extension, "json");
+        assert!(data.redacted);
+        let transcript = base64::engine::general_purpose::STANDARD
+            .decode(data.content_base64.as_bytes())
+            .unwrap();
+        let transcript_json: serde_json::Value = serde_json::from_slice(&transcript).unwrap();
+        assert!(transcript_json.to_string().contains("[redacted]"));
+        assert!(!transcript_json.to_string().contains("sk-"));
+
+        let response = handle_request(
+            Request::ExportSessionData {
+                session_id: session.session_id,
+                kind: proto::ExportSessionKind::DebugBundle,
+                include_generated_artifacts: false,
+                include_sensitive: false,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("debug bundle export");
+        let Response::ExportSessionData { data } = response else {
+            panic!("expected ExportSessionData response");
+        };
+        assert_eq!(data.kind, proto::ExportSessionKind::DebugBundle);
+        assert_eq!(data.filename_extension, "zip");
+        assert_eq!(data.mime, "application/zip");
+        assert_eq!(data.session_count, Some(1));
+        assert_eq!(data.byte_len, base64::engine::general_purpose::STANDARD
+            .decode(data.content_base64.as_bytes())
+            .unwrap()
+            .len());
+        assert!(data.redacted);
+    }
+
     #[test]
     fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
         let table = table_for("client-boundary-secret");
@@ -1224,6 +1313,7 @@ mod tests {
             | ("list_agents", "owner_only", false)
             | ("list_models", "owner_only", false)
             | ("list_assistants", "owner_only", false)
+            | ("export_session_data", "owner_only", false)
             | ("get_usage_counts", "owner_only", false)
             | ("stats_rollup", "owner_only", false) => DispatchMatrixClass::AccessControlled,
             (_, _, true) => DispatchMatrixClass::Mutating,
@@ -1552,6 +1642,7 @@ mod tests {
             | "goal_status"
             | "clear_goal"
             | "list_assistants"
+            | "export_session_data"
             | "resume_paused_work"
             | "cancel_paused_work"
             | "fs_list"
@@ -1653,6 +1744,7 @@ mod tests {
             authz_session_writer("clear_goal"),
             authz_owner_only("list_assistants"),
             authz_owner_only("create_assistant_session"),
+            authz_owner_only("export_session_data"),
             authz_session_writer("cancel_turn"),
             authz_project_files("fs_list"),
             authz_project_files("fs_stat"),
@@ -2412,6 +2504,12 @@ mod tests {
                 project_root: root,
                 no_sandbox: false,
                 env_snapshot: None,
+            },
+            "export_session_data" => Request::ExportSessionData {
+                session_id,
+                kind: proto::ExportSessionKind::TranscriptJson,
+                include_generated_artifacts: false,
+                include_sensitive: false,
             },
             "cancel_turn" => Request::CancelTurn,
             "fs_list" => Request::FsList {
@@ -5202,6 +5300,18 @@ mod tests {
                 mutating: true,
             },
             CommandMetadataCase {
+                request: Request::ExportSessionData {
+                    session_id: attached_session_id,
+                    kind: proto::ExportSessionKind::DebugBundle,
+                    include_generated_artifacts: false,
+                    include_sensitive: false,
+                },
+                kind: "export_session_data",
+                session_id: Some(attached_session_id),
+                audit_path: None,
+                mutating: false,
+            },
+            CommandMetadataCase {
                 request: Request::CancelTurn,
                 kind: "cancel_turn",
                 session_id: Some(attached_session_id),
@@ -5856,6 +5966,7 @@ mod tests {
             ClearGoal,
             ListAssistants,
             CreateAssistantSession,
+            ExportSessionData,
             CancelTurn,
             FsList,
             FsStat,

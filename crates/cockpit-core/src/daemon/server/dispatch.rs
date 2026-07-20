@@ -401,6 +401,20 @@ async fn handle_request(
             })
         }
 
+        Request::ExportSessionData {
+            session_id,
+            kind,
+            include_generated_artifacts,
+            include_sensitive,
+        } => export_session_data(
+            ctx,
+            session_id,
+            kind,
+            include_generated_artifacts,
+            include_sensitive,
+        )
+        .await,
+
         Request::CancelTurn => {
             let att = require_attached(state)?;
             att.handle
@@ -1782,6 +1796,83 @@ fn stats_range_from_proto(range: proto::StatsRange) -> crate::db::stats::StatsRa
         proto::StatsRange::Last7Days => crate::db::stats::StatsRange::Last7Days,
         proto::StatsRange::AllTime => crate::db::stats::StatsRange::AllTime,
     }
+}
+
+async fn export_session_data(
+    ctx: &Arc<DaemonContext>,
+    session_id: Uuid,
+    kind: proto::ExportSessionKind,
+    include_generated_artifacts: bool,
+    include_sensitive: bool,
+) -> std::result::Result<Response, ErrorPayload> {
+    let db = ctx.db.clone();
+    let data = tokio::task::spawn_blocking(move || -> Result<proto::ExportSessionData> {
+        let Some(target) = db.get_session(session_id)? else {
+            anyhow::bail!("unknown session {session_id}");
+        };
+        match kind {
+            proto::ExportSessionKind::TranscriptJson => {
+                let mut messages = Vec::new();
+                let mut before_seq = None;
+                loop {
+                    let (mut page, has_more) =
+                        db.read_session_messages(session_id, before_seq, u32::MAX)?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    before_seq = page.first().map(|message| message.seq);
+                    messages.append(&mut page);
+                    if !has_more {
+                        break;
+                    }
+                }
+                messages.sort_by_key(|message| message.seq);
+                let bytes = serde_json::to_vec_pretty(&messages)?;
+                Ok(proto::ExportSessionData {
+                    session_id,
+                    kind,
+                    filename_extension: "json".to_string(),
+                    mime: "application/json".to_string(),
+                    content_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    byte_len: bytes.len(),
+                    session_count: Some(1),
+                    redacted: true,
+                })
+            }
+            proto::ExportSessionKind::DebugBundle => {
+                let bundle = crate::session::export::build_bundle_zip_bytes(
+                    &db,
+                    &target,
+                    include_generated_artifacts,
+                    include_sensitive,
+                )?;
+                Ok(proto::ExportSessionData {
+                    session_id,
+                    kind,
+                    filename_extension: "zip".to_string(),
+                    mime: "application/zip".to_string(),
+                    content_base64: base64::engine::general_purpose::STANDARD.encode(&bundle.bytes),
+                    byte_len: bundle.summary.byte_len,
+                    session_count: Some(bundle.summary.session_count),
+                    redacted: !include_sensitive,
+                })
+            }
+        }
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|error| {
+        let message = error.to_string();
+        if message.contains("unknown session") {
+            ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message,
+            }
+        } else {
+            internal(error)
+        }
+    })?;
+    Ok(Response::ExportSessionData { data })
 }
 
 fn paused_work_to_proto(row: crate::db::paused_work::PausedWorkRow) -> proto::PausedWorkSummary {

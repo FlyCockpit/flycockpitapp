@@ -292,6 +292,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::AssistantSessionCreated { session } => {
             scrub_assistant_session_created(session, redact);
         }
+        proto::Response::ExportSessionData { data } => scrub_export_session_data(data, redact),
         proto::Response::Forked {
             session_id: _,
             short_id: _,
@@ -1108,6 +1109,11 @@ fn scrub_assistant_session_created(
     scrub_string(project_id, redact);
     scrub_string(assistant_name, redact);
     scrub_string(active_agent, redact);
+}
+
+fn scrub_export_session_data(data: &mut proto::ExportSessionData, redact: &RedactionTable) {
+    scrub_string(&mut data.filename_extension, redact);
+    scrub_string(&mut data.mime, redact);
 }
 
 fn scrub_stats_rollup(rollup: &mut proto::StatsRollup, redact: &RedactionTable) {

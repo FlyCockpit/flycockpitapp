@@ -145,6 +145,10 @@ pub enum Response {
         session: AssistantSessionCreated,
     },
 
+    ExportSessionData {
+        data: ExportSessionData,
+    },
+
     /// Per-session live status. Answer to [`Request::SessionLiveStatus`].
     /// Only sessions with a live worker appear; everything else is
     /// implicitly not-processing / no-jobs.

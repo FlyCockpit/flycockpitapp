@@ -1058,6 +1058,27 @@ pub struct AssistantSessionCreated {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ExportSessionKind {
+    TranscriptJson,
+    DebugBundle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportSessionData {
+    pub session_id: Uuid,
+    pub kind: ExportSessionKind,
+    pub filename_extension: String,
+    pub mime: String,
+    pub content_base64: String,
+    pub byte_len: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_count: Option<usize>,
+    #[serde(default)]
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StatsRange {
     Last7Days,
     AllTime,

@@ -95,6 +95,39 @@ pub struct BundleSummary {
     pub byte_len: usize,
 }
 
+#[derive(Debug)]
+pub struct BundleBytes {
+    pub bytes: Vec<u8>,
+    pub summary: BundleSummary,
+}
+
+/// Assemble the full debug bundle for `target` and return the zip bytes
+/// instead of writing them to a caller-selected path.
+pub fn build_bundle_zip_bytes(
+    db: &Db,
+    target: &SessionRow,
+    include_generated_artifacts: bool,
+    include_sensitive: bool,
+) -> Result<BundleBytes> {
+    // The walk is cheap point-lookups per session; the read is bounded
+    // by each session's history.
+    let bundle = collect_bundle(db, target.session_id)?;
+    let bytes = build_zip_with_options(
+        db,
+        target,
+        &bundle,
+        ExportBundleOptions {
+            include_generated_artifacts,
+            include_sensitive,
+        },
+    )?;
+    let summary = BundleSummary {
+        session_count: bundle.len(),
+        byte_len: bytes.len(),
+    };
+    Ok(BundleBytes { bytes, summary })
+}
+
 /// Assemble the full debug bundle for `target` (the session plus its
 /// descendant forks and `/compact` successors) and write it to
 /// `out_path`. This is the single zip-assembly implementation behind
@@ -120,18 +153,8 @@ pub fn write_bundle_zip(
         );
     }
 
-    // The walk is cheap point-lookups per session; the read is bounded
-    // by each session's history.
-    let bundle = collect_bundle(db, target.session_id)?;
-    let zip_bytes = build_zip_with_options(
-        db,
-        target,
-        &bundle,
-        ExportBundleOptions {
-            include_generated_artifacts,
-            include_sensitive,
-        },
-    )?;
+    let bundle =
+        build_bundle_zip_bytes(db, target, include_generated_artifacts, include_sensitive)?;
 
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
@@ -139,13 +162,10 @@ pub fn write_bundle_zip(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating export directory `{}`", parent.display()))?;
     }
-    std::fs::write(out_path, &zip_bytes)
+    std::fs::write(out_path, &bundle.bytes)
         .with_context(|| format!("writing export to `{}`", out_path.display()))?;
 
-    Ok(BundleSummary {
-        session_count: bundle.len(),
-        byte_len: zip_bytes.len(),
-    })
+    Ok(bundle.summary)
 }
 
 /// Resolve a user-supplied identifier to a session row. `Ok(Ok(row))` on

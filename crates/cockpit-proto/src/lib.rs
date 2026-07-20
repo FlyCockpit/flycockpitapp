@@ -1064,6 +1064,7 @@ pub struct SkillSummary {
     pub name: String,
     pub description: String,
     pub source: String,
+    pub user_invocable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

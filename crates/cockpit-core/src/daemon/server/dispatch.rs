@@ -583,6 +583,7 @@ async fn handle_request(
                     name: s.frontmatter.name,
                     description: s.frontmatter.description,
                     source: s.source.display().to_string(),
+                    user_invocable: s.frontmatter.user_invocable,
                 })
                 .collect();
             Ok(Response::Skills { skills })
@@ -629,8 +630,8 @@ async fn handle_request(
             Ok(Response::ScheduledJobRun { id, result })
         }
 
-        Request::ListAgents => Err(not_implemented("ListAgents")),
-        Request::ListModels { .. } => Err(not_implemented("ListModels")),
+        Request::ListAgents => list_agents(ctx, state),
+        Request::ListModels { provider } => list_models(ctx, state, provider.as_deref()),
 
         Request::SetActiveModel {
             provider,
@@ -982,6 +983,88 @@ async fn handle_request(
             request_shutdown(ctx);
             Ok(Response::Ack)
         }
+    }
+}
+
+fn list_agents(
+    ctx: &DaemonContext,
+    state: &ClientState,
+) -> std::result::Result<Response, ErrorPayload> {
+    let att = require_attached(state)?;
+    let (_, cfg) = ctx
+        .config_source()
+        .load_with_trust(&att.handle.project_root, &att.handle.trust_policy)
+        .map_err(internal)?;
+    let ownable =
+        crate::config::trust::with_workspace_trust_policy(att.handle.trust_policy.clone(), || {
+            crate::agents::chat_ownable_primaries(&att.handle.project_root)
+        });
+    let mut agents = Vec::with_capacity(ownable.len());
+    for name in &ownable {
+        validate_set_agent_name(name, cfg.experimental_mode, &ownable)?;
+        let def =
+            crate::config::trust::with_workspace_trust_policy(att.handle.trust_policy.clone(), || {
+                crate::agents::resolve(&att.handle.project_root, name)
+            })
+            .map_err(internal)?
+            .ok_or_else(|| ErrorPayload {
+                code: ErrorCode::Internal,
+                message: format!("chat-ownable agent `{name}` did not resolve"),
+            })?;
+        agents.push(proto::AgentSummary {
+            builtin: crate::agents::is_builtin_agent(name),
+            name: name.clone(),
+            description: def.description,
+            mode: agent_mode_summary(def.mode).to_string(),
+            source: def.source.display().to_string(),
+        });
+    }
+    Ok(Response::Agents { agents })
+}
+
+fn list_models(
+    ctx: &DaemonContext,
+    state: &ClientState,
+    requested_provider: Option<&str>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let att = require_attached(state)?;
+    let (providers, _) = ctx
+        .config_source()
+        .load_with_trust(&att.handle.project_root, &att.handle.trust_policy)
+        .map_err(internal)?;
+    let active_provider = providers
+        .active_model
+        .as_ref()
+        .map(|model| model.provider.as_str());
+    let provider_filter = requested_provider.or(active_provider);
+    let mut models = Vec::new();
+    for (provider_id, provider) in &providers.providers {
+        if provider_filter.is_some_and(|wanted| wanted != provider_id) {
+            continue;
+        }
+        for model in &provider.models {
+            models.push(proto::ModelSummary {
+                provider: provider_id.clone(),
+                id: model.id.clone(),
+                display_name: model.name.clone(),
+                favorite: model.favorite,
+            });
+        }
+    }
+    models.sort_by(|a, b| {
+        a.provider
+            .cmp(&b.provider)
+            .then_with(|| b.favorite.cmp(&a.favorite))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(Response::Models { models })
+}
+
+fn agent_mode_summary(mode: crate::agents::AgentMode) -> &'static str {
+    match mode {
+        crate::agents::AgentMode::All => "all",
+        crate::agents::AgentMode::Primary => "primary",
+        crate::agents::AgentMode::Subagent => "subagent",
     }
 }
 

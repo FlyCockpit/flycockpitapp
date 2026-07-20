@@ -57,6 +57,7 @@ const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
 const MAX_CATALOG_DESCRIPTION_CHARS: usize = 60;
 const SUPPORT_DIRS: [&str; 4] = ["references", "templates", "scripts", "assets"];
 static CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
+static DISCOVERY_WALK_CALLS: AtomicU64 = AtomicU64::new(0);
 static CATALOG_CACHE: OnceLock<Mutex<HashMap<Vec<PathBuf>, CatalogCacheEntry>>> = OnceLock::new();
 
 pub fn subject_from_parts(parts: &[String]) -> String {
@@ -101,15 +102,17 @@ pub fn build_learn_prompt(subject: &str) -> String {
 
 #[derive(Clone)]
 struct CatalogCacheEntry {
-    fingerprint: Vec<ManifestFingerprint>,
     skills: Vec<Skill>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct ManifestFingerprint {
-    path: PathBuf,
-    len: u64,
-    modified_nanos: Option<u128>,
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn reset_discovery_walk_call_count() {
+    DISCOVERY_WALK_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn discovery_walk_call_count() -> u64 {
+    DISCOVERY_WALK_CALLS.load(Ordering::Relaxed)
 }
 
 /// Monotonic invalidation generation for consumers that retain a discovered
@@ -317,27 +320,11 @@ fn current_platform() -> &'static str {
 /// scan-dir order is the precedence order.
 pub fn discover(cwd: &Path, cfg: &SkillsConfig) -> Result<Vec<Skill>> {
     let dirs = resolve_scan_dirs(cwd, cfg);
-    let manifests: Vec<PathBuf> = dirs.iter().flat_map(|dir| manifests_under(dir)).collect();
-    let fingerprint: Vec<ManifestFingerprint> = manifests
-        .iter()
-        .map(|path| {
-            let metadata = std::fs::metadata(path).ok();
-            ManifestFingerprint {
-                path: path.clone(),
-                len: metadata.as_ref().map_or(0, std::fs::Metadata::len),
-                modified_nanos: metadata
-                    .and_then(|metadata| metadata.modified().ok())
-                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_nanos()),
-            }
-        })
-        .collect();
     let cache = CATALOG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(entry) = cache.lock().unwrap().get(&dirs)
-        && entry.fingerprint == fingerprint
-    {
+    if let Some(entry) = cache.lock().unwrap().get(&dirs) {
         return Ok(entry.skills.clone());
     }
+    let manifests: Vec<PathBuf> = dirs.iter().flat_map(|dir| manifests_under(dir)).collect();
     let mut skills: Vec<Skill> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -357,7 +344,6 @@ pub fn discover(cwd: &Path, cfg: &SkillsConfig) -> Result<Vec<Skill>> {
     cache.lock().unwrap().insert(
         dirs,
         CatalogCacheEntry {
-            fingerprint,
             skills: skills.clone(),
         },
     );
@@ -370,6 +356,7 @@ pub fn discover(cwd: &Path, cfg: &SkillsConfig) -> Result<Vec<Skill>> {
 /// for nested packages. Canonical-root checks plus a visited set prevent
 /// symlink escapes and loops.
 fn manifests_under(root: &Path) -> Vec<PathBuf> {
+    DISCOVERY_WALK_CALLS.fetch_add(1, Ordering::Relaxed);
     let Ok(root) = root.canonicalize() else {
         return Vec::new();
     };
@@ -1162,6 +1149,108 @@ mod tests {
         let found = discover(tmp.path(), &cfg).unwrap();
         let names: Vec<&str> = found.iter().map(|s| s.frontmatter.name.as_str()).collect();
         assert_eq!(names, vec!["ok"], "only the well-formed skill survives");
+    }
+
+    #[test]
+    fn malformed_skill_manifest_is_skipped_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        write_skill(
+            &scan,
+            "good",
+            "---\nname: good\ndescription: survives\n---\n",
+            "B",
+        );
+        write_skill(&scan, "bad", "---\nname: bad\n---\n", "B");
+        let cfg = SkillsConfig {
+            scan_dirs: vec![scan.to_string_lossy().into_owned()],
+            external_dirs: Vec::new(),
+            auto_bang_commands: false,
+            ancestor_walk: false,
+            write_approval: false,
+            prune_builtins: false,
+            consolidate: false,
+        };
+
+        let found = discover(tmp.path(), &cfg).unwrap();
+
+        assert_eq!(
+            found
+                .iter()
+                .map(|s| s.frontmatter.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["good"]
+        );
+    }
+
+    #[test]
+    fn skill_discovery_cache_hit_performs_no_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        write_skill(&scan, "one", "---\nname: one\ndescription: d\n---\n", "B");
+        let cfg = SkillsConfig {
+            scan_dirs: vec![scan.to_string_lossy().into_owned()],
+            external_dirs: Vec::new(),
+            auto_bang_commands: false,
+            ancestor_walk: false,
+            write_approval: false,
+            prune_builtins: false,
+            consolidate: false,
+        };
+        invalidate_catalog_cache(tmp.path(), &cfg);
+        reset_discovery_walk_call_count();
+
+        let first = discover(tmp.path(), &cfg).unwrap();
+        let first_walks = discovery_walk_call_count();
+        reset_discovery_walk_call_count();
+        let second = discover(tmp.path(), &cfg).unwrap();
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert!(first_walks > 0, "cold discovery must walk");
+        assert_eq!(
+            discovery_walk_call_count(),
+            0,
+            "cache hit must return before walking scan dirs"
+        );
+    }
+
+    #[test]
+    fn skill_discovery_walks_after_invalidation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        write_skill(&scan, "one", "---\nname: one\ndescription: d\n---\n", "B");
+        let cfg = SkillsConfig {
+            scan_dirs: vec![scan.to_string_lossy().into_owned()],
+            external_dirs: Vec::new(),
+            auto_bang_commands: false,
+            ancestor_walk: false,
+            write_approval: false,
+            prune_builtins: false,
+            consolidate: false,
+        };
+        invalidate_catalog_cache(tmp.path(), &cfg);
+        discover(tmp.path(), &cfg).unwrap();
+        write_skill(&scan, "two", "---\nname: two\ndescription: d\n---\n", "B");
+        reset_discovery_walk_call_count();
+
+        invalidate_catalog_cache(tmp.path(), &cfg);
+        let found = discover(tmp.path(), &cfg).unwrap();
+
+        assert!(
+            discovery_walk_call_count() > 0,
+            "explicit invalidation makes the next discovery walk"
+        );
+        assert_eq!(
+            found
+                .iter()
+                .map(|s| s.frontmatter.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
     }
 
     #[test]

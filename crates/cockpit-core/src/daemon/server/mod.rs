@@ -1052,6 +1052,7 @@ fn scrub_skill_summary(skill: &mut proto::SkillSummary, redact: &RedactionTable)
         name: _,
         description,
         source,
+        user_invocable: _,
     } = skill;
     scrub_string(description, redact);
     scrub_string(source, redact);

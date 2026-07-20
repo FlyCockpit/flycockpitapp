@@ -547,16 +547,6 @@ fn workspace_trust_error(err: anyhow::Error) -> ErrorPayload {
     }
 }
 
-fn not_implemented(what: &str) -> ErrorPayload {
-    ErrorPayload {
-        code: ErrorCode::Internal,
-        // `{:#}` for consistency with `internal()`; `what` is a plain
-        // slug here, so the alternate form is identical, but keeping the
-        // same form means a future error-typed arg would print its chain.
-        message: format!("{what:#} not yet implemented in v1"),
-    }
-}
-
 #[cfg(test)]
 mod sessions_activity_tests {
     use super::*;

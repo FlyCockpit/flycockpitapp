@@ -221,6 +221,7 @@ mod tests {
             name: name.into(),
             description: desc.into(),
             source: source.into(),
+            user_invocable: true,
         }
     }
 

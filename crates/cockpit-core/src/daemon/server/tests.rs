@@ -6306,6 +6306,393 @@ mod tests {
             .expect("Build remains a chat-ownable primary without experimental mode");
     }
 
+    #[tokio::test]
+    async fn list_agents_returns_chat_ownable_primaries() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let response = handle_request(Request::ListAgents, &mut state, &ctx)
+            .await
+            .expect("list agents is implemented");
+        let Response::Agents { agents } = response else {
+            panic!("expected agents response");
+        };
+
+        assert_eq!(
+            agents.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
+            vec!["Build"]
+        );
+        assert!(agents[0].builtin);
+        assert_eq!(agents[0].mode, "primary");
+    }
+
+    #[tokio::test]
+    async fn list_agents_agrees_with_validate_set_agent() {
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.experimental_mode = true;
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            extended,
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let response = handle_request(Request::ListAgents, &mut state, &ctx)
+            .await
+            .expect("list agents succeeds");
+        let Response::Agents { agents } = response else {
+            panic!("expected agents response");
+        };
+
+        for agent in &agents {
+            validate_set_agent(
+                &ctx,
+                state.attached.as_ref().expect("attached"),
+                &agent.name,
+            )
+            .expect("listed agent is accepted by SetAgent validation");
+        }
+        let omitted = ["builder", "explore", "bee", "Multireview"];
+        for name in omitted {
+            assert!(
+                !agents.iter().any(|agent| agent.name == name),
+                "{name} must not be listed as chat-ownable"
+            );
+            validate_set_agent(&ctx, state.attached.as_ref().expect("attached"), name)
+                .expect_err("omitted agent is rejected by SetAgent validation");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_agents_respects_workspace_trust() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cockpit").join("agents")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit").join("agents").join("Custom.md"),
+            "---\ndescription: custom primary\nmode: primary\n---\nBody\n",
+        )
+        .unwrap();
+        let ctx = test_ctx();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+        state.attached.as_mut().expect("attached").handle.trust_policy =
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            };
+
+        let response = handle_request(Request::ListAgents, &mut state, &ctx)
+            .await
+            .expect("list agents succeeds under ignore-config trust");
+        let Response::Agents { agents } = response else {
+            panic!("expected agents response");
+        };
+
+        assert!(
+            !agents.iter().any(|agent| agent.name == "Custom"),
+            "repo-local custom agents are hidden under ignore-config trust"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_resolved_models() {
+        use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry};
+
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderEntry {
+                url: "https://api.openai.example/v1".to_string(),
+                models: vec![
+                    ModelEntry {
+                        id: "gpt-b".to_string(),
+                        name: Some("GPT B".to_string()),
+                        favorite: false,
+                        ..ModelEntry::default()
+                    },
+                    ModelEntry {
+                        id: "gpt-a".to_string(),
+                        name: Some("GPT A".to_string()),
+                        favorite: true,
+                        ..ModelEntry::default()
+                    },
+                ],
+                ..ProviderEntry::default()
+            },
+        );
+        providers.insert(
+            "anthropic".to_string(),
+            ProviderEntry {
+                url: "https://api.anthropic.example/v1".to_string(),
+                models: vec![ModelEntry {
+                    id: "claude".to_string(),
+                    name: Some("Claude".to_string()),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let providers_cfg = crate::config::providers::ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "openai".to_string(),
+                model: "gpt-a".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+            ..crate::config::providers::ProvidersConfig::default()
+        };
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            providers_cfg,
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let response = handle_request(
+            Request::ListModels { provider: None },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("list models succeeds");
+        let Response::Models { models } = response else {
+            panic!("expected models response");
+        };
+
+        assert_eq!(
+            models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            vec!["gpt-a", "gpt-b"]
+        );
+        assert_eq!(models[0].provider, "openai");
+        assert_eq!(models[0].display_name.as_deref(), Some("GPT A"));
+        assert!(models[0].favorite);
+    }
+
+    #[tokio::test]
+    async fn list_models_response_contains_no_secrets() {
+        use crate::config::providers::{ActiveModelRef, HeaderSpec, ModelEntry, ProviderEntry};
+
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "secret-provider".to_string(),
+            ProviderEntry {
+                url: "https://secret-host.example/v1".to_string(),
+                headers: vec![HeaderSpec {
+                    name: "Authorization".to_string(),
+                    value: "Bearer super-secret-token".to_string(),
+                }],
+                credential_ref: Some("credential-secret-ref".to_string()),
+                models: vec![ModelEntry {
+                    id: "safe-model".to_string(),
+                    name: Some("Safe Model".to_string()),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let providers_cfg = crate::config::providers::ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "secret-provider".to_string(),
+                model: "safe-model".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+            ..crate::config::providers::ProvidersConfig::default()
+        };
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            providers_cfg,
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let response = handle_request(
+            Request::ListModels { provider: None },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("list models succeeds");
+        let rendered = serde_json::to_string(&response).unwrap();
+
+        assert!(rendered.contains("safe-model"));
+        assert!(!rendered.contains("super-secret-token"), "{rendered}");
+        assert!(!rendered.contains("credential-secret-ref"), "{rendered}");
+        assert!(!rendered.contains("secret-host"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn list_models_respects_workspace_trust() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "repo-provider".to_string(),
+            crate::config::providers::ProviderEntry {
+                url: "https://repo.example/v1".to_string(),
+                models: vec![crate::config::providers::ModelEntry {
+                    id: "repo-model".to_string(),
+                    ..crate::config::providers::ModelEntry::default()
+                }],
+                ..crate::config::providers::ProviderEntry::default()
+            },
+        );
+        let source = crate::daemon::config_source::ConfigSource::new(
+            move |_cwd| {
+                let policy = crate::config::trust::runtime_policy();
+                let cfg = if policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig)
+                {
+                    crate::config::providers::ProvidersConfig::default()
+                } else {
+                    crate::config::providers::ProvidersConfig {
+                        providers: providers.clone(),
+                        ..crate::config::providers::ProvidersConfig::default()
+                    }
+                };
+                Ok((cfg, crate::config::extended::ExtendedConfig::default()))
+            },
+            |_cwd, _provider_id| None,
+        );
+        let ctx = test_ctx_with_config_source(source);
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+        state.attached.as_mut().expect("attached").handle.trust_policy =
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            };
+
+        let response = handle_request(
+            Request::ListModels { provider: None },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("list models succeeds");
+        let Response::Models { models } = response else {
+            panic!("expected models response");
+        };
+
+        assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn skill_summary_carries_user_invocable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(skills_dir.join("hidden")).unwrap();
+        std::fs::write(
+            skills_dir.join("hidden").join("SKILL.md"),
+            "---\nname: hidden\ndescription: Hidden from slash\nuser-invocable: false\n---\nBody\n",
+        )
+        .unwrap();
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.skills.scan_dirs = vec![skills_dir.to_string_lossy().into_owned()];
+        extended.skills.external_dirs = Vec::new();
+        extended.skills.ancestor_walk = false;
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            extended,
+        ));
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let response = handle_request(
+            Request::ListSkills {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("list skills succeeds");
+        let Response::Skills { skills } = response else {
+            panic!("expected skills response");
+        };
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "hidden");
+        assert!(!skills[0].user_invocable);
+        let encoded = serde_json::to_value(&skills[0]).unwrap();
+        assert!(
+            encoded.get("user_invocable").is_some(),
+            "field is required on the serialized wire shape: {encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_inventories_return_ok_not_error() {
+        let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let models = handle_request(
+            Request::ListModels { provider: None },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("empty model inventory is ok");
+        assert!(matches!(models, Response::Models { models } if models.is_empty()));
+
+        let agents = handle_request(Request::ListAgents, &mut state, &ctx)
+            .await
+            .expect("builtin fallback agent inventory is ok");
+        assert!(matches!(agents, Response::Agents { agents } if !agents.is_empty()));
+
+        let skills = handle_request(
+            Request::ListSkills {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("empty skill inventory is ok");
+        assert!(matches!(skills, Response::Skills { skills } if skills.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn inventory_ordering_is_stable() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _) = attached_state(&ctx, tmp.path());
+
+        let first = handle_request(Request::ListAgents, &mut state, &ctx)
+            .await
+            .expect("first list agents succeeds");
+        let second = handle_request(Request::ListAgents, &mut state, &ctx)
+            .await
+            .expect("second list agents succeeds");
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+
+        let first = handle_request(
+            Request::ListModels { provider: None },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("first list models succeeds");
+        let second = handle_request(
+            Request::ListModels { provider: None },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("second list models succeeds");
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+    }
+
     #[test]
     fn response_send_failure_warns_with_request_id_and_no_payload() {
         let request_id = Uuid::new_v4();

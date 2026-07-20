@@ -59,6 +59,7 @@ struct Inner {
     locks: Arc<LockManager>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    scheduler: Arc<Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     workers: Mutex<WorkerState>,
     /// Live `JoinHandle` per worker, so a graceful drain can *await* the
     /// in-flight turn finishing (and `abort()` it past the deadline).
@@ -336,6 +337,7 @@ impl SessionRegistry {
                 locks,
                 lsp: Arc::new(crate::daemon::lsp::LspManager::new()),
                 resource_scheduler,
+                scheduler: Arc::new(Mutex::new(None)),
                 workers: Mutex::new(WorkerState {
                     live: HashMap::new(),
                     starting: HashMap::new(),
@@ -362,6 +364,20 @@ impl SessionRegistry {
 
     pub fn set_global_bus(&self, tx: EventSender) {
         *crate::sync::lock_or_recover(&self.inner.global_bus) = Some(tx);
+    }
+
+    pub fn set_scheduler(&self, handle: crate::daemon::scheduler::DaemonSchedulerHandle) {
+        *crate::sync::lock_or_recover(&self.inner.scheduler) = Some(handle);
+    }
+
+    pub fn scheduler(&self) -> Option<crate::daemon::scheduler::DaemonSchedulerHandle> {
+        crate::sync::lock_or_recover(&self.inner.scheduler).clone()
+    }
+
+    fn scheduler_source(
+        &self,
+    ) -> Arc<Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>> {
+        self.inner.scheduler.clone()
     }
 
     /// Spawn (or look up) the worker for a session. Live workers retain their
@@ -736,6 +752,7 @@ impl SessionRegistry {
             extended_cfg,
             self.inner.lsp.clone(),
             self.inner.resource_scheduler.clone(),
+            self.scheduler_source(),
             crate::sync::lock_or_recover(&self.inner.global_bus).clone(),
             trust_policy,
             Some(cleanup),
@@ -1173,6 +1190,7 @@ impl SessionRegistry {
 mod tests {
     use super::*;
     use crate::daemon::proto;
+    use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1209,6 +1227,84 @@ mod tests {
 
     fn test_handle(reg: &SessionRegistry, session: Arc<Session>) -> SessionWorkerHandle {
         session_worker::SessionWorkerHandle::test_handle(session, reg.inner.locks.clone())
+    }
+
+    struct NoopSchedulerExecutor;
+
+    #[async_trait]
+    impl crate::daemon::scheduler::JobExecutor for NoopSchedulerExecutor {
+        async fn execute(&self, _job: crate::daemon::scheduler::ScheduledJob) -> Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    struct PendingSchedulerSleeper;
+
+    #[async_trait]
+    impl crate::daemon::scheduler::SchedulerSleeper for PendingSchedulerSleeper {
+        async fn sleep_until(&self, _now: i64, _wake_at: Option<i64>) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    fn test_scheduler_handle() -> crate::daemon::scheduler::DaemonSchedulerHandle {
+        let scheduler = Arc::new(crate::daemon::scheduler::DaemonScheduler::new(
+            Db::open_in_memory().expect("scheduler db"),
+            Arc::new(crate::daemon::scheduler::SystemClock),
+            Arc::new(NoopSchedulerExecutor),
+        ));
+        scheduler.start_with_sleeper(
+            ShutdownSignal::new(),
+            Arc::new(PendingSchedulerSleeper),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn set_scheduler_round_trips() {
+        let reg = test_registry();
+        assert!(reg.scheduler().is_none());
+
+        let first = test_scheduler_handle();
+        reg.set_scheduler(first.clone());
+        let got = reg.scheduler().expect("scheduler set");
+        assert!(Arc::ptr_eq(got.scheduler(), first.scheduler()));
+
+        let second = test_scheduler_handle();
+        reg.set_scheduler(second.clone());
+        let got = reg.scheduler().expect("scheduler replaced");
+        assert!(Arc::ptr_eq(got.scheduler(), second.scheduler()));
+        assert!(!Arc::ptr_eq(got.scheduler(), first.scheduler()));
+    }
+
+    #[tokio::test]
+    async fn late_set_is_visible_to_already_started_workers() {
+        let reg = test_registry();
+        let worker_source = reg.scheduler_source();
+        assert!(crate::sync::lock_or_recover(&worker_source).is_none());
+
+        let handle = test_scheduler_handle();
+        reg.set_scheduler(handle.clone());
+
+        let observed = crate::sync::lock_or_recover(&worker_source)
+            .clone()
+            .expect("late scheduler visible through worker source");
+        assert!(Arc::ptr_eq(observed.scheduler(), handle.scheduler()));
+    }
+
+    #[tokio::test]
+    async fn worker_receives_scheduler_handle() {
+        let reg = test_registry();
+        let empty_worker_source = reg.scheduler_source();
+        assert!(crate::sync::lock_or_recover(&empty_worker_source).is_none());
+
+        let handle = test_scheduler_handle();
+        reg.set_scheduler(handle.clone());
+        let worker_source = reg.scheduler_source();
+        let observed = crate::sync::lock_or_recover(&worker_source)
+            .clone()
+            .expect("scheduler visible through worker source");
+        assert!(Arc::ptr_eq(observed.scheduler(), handle.scheduler()));
     }
 
     fn providers_for_btw_model_tests() -> ProvidersConfig {

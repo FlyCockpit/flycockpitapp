@@ -1651,6 +1651,9 @@ impl DaemonContext {
             ))
             .start_with_callbacks(shutdown.clone(), callbacks)
         });
+        if let Some(handle) = &scheduler {
+            registry.set_scheduler(handle.clone());
+        }
         if let Some(handle) = &scheduler
             && let Err(error) = crate::skills::curator::register_scheduler(handle, db.clone())
         {

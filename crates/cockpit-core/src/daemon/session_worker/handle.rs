@@ -980,6 +980,7 @@ pub fn spawn(
     extended_cfg: &crate::config::extended::ExtendedConfig,
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     global_bus: Option<EventSender>,
     trust_policy: crate::config::trust::WorkspaceTrustPolicy,
     cleanup: Option<Box<dyn FnOnce() + Send + 'static>>,
@@ -1098,6 +1099,7 @@ pub fn spawn(
             config_snapshot,
             lsp,
             resource_scheduler,
+            scheduler,
             global_bus,
         ));
         crate::config::trust::scope_workspace_trust_policy(

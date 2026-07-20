@@ -578,6 +578,10 @@ pub struct Driver {
     /// Daemon-owned runtime resource scheduler. Persistent daemons install a
     /// shared handle; ephemeral/test/replay contexts may leave it absent.
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    /// Shared daemon scheduler handle cell. The worker installs the registry's
+    /// cell rather than a snapshot so late `set_scheduler` calls are visible.
+    daemon_scheduler:
+        Option<Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>>,
     /// Compact-after-delegation trackers for **interactive** subagent
     /// delegations (`SpawnSubagent`), keyed by the paused parent frame's
     /// stack depth (its index in `self.stack`). The lazy shrink for the
@@ -1156,6 +1160,7 @@ impl Driver {
             approver: self.approver.clone(),
             lsp: self.lsp.clone(),
             resource_scheduler: self.resource_scheduler.clone(),
+            daemon_scheduler: self.daemon_scheduler.clone(),
             deleg_shrinks: std::collections::HashMap::new(),
             model_override: self.model_override.clone(),
             swarm_max_depth: self.swarm_max_depth,
@@ -1449,6 +1454,7 @@ impl Driver {
             approver: None,
             lsp: None,
             resource_scheduler: None,
+            daemon_scheduler: None,
             deleg_shrinks: std::collections::HashMap::new(),
             model_override: None,
             swarm_max_depth: crate::config::extended::DEFAULT_SWARM_MAX_DEPTH,
@@ -1698,6 +1704,20 @@ impl Driver {
         scheduler: Arc<crate::engine::resource_scheduler::ResourceScheduler>,
     ) {
         self.resource_scheduler = Some(scheduler);
+    }
+
+    pub fn set_daemon_scheduler_source(
+        &mut self,
+        scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
+    ) {
+        self.daemon_scheduler = Some(scheduler);
+    }
+
+    pub fn daemon_scheduler_handle(
+        &self,
+    ) -> Option<crate::daemon::scheduler::DaemonSchedulerHandle> {
+        let scheduler = self.daemon_scheduler.as_ref()?;
+        crate::sync::lock_or_recover(scheduler).clone()
     }
 
     /// Rehydrate the root foreground agent's model history from the durable

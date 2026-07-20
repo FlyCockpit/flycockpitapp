@@ -501,6 +501,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn absent_scheduler_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let locks = Arc::new(LockManager::from_db(db.clone()).unwrap());
+        let session = Arc::new(Session::create(db, tmp.path().to_path_buf(), "Build").unwrap());
+        let providers = lmstudio_test_providers();
+        let redact = Arc::new(RedactionTable::empty());
+        let model = Arc::new(
+            crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap(),
+        );
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+        let trust_policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::TrustRoot {
+                opened_path: tmp.path().to_path_buf(),
+                root: tmp.path().to_path_buf(),
+                kind: crate::config::trust::TrustRootKind::Directory,
+            },
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+
+        let (handle, join) = spawn(
+            session,
+            locks,
+            redact,
+            model,
+            None,
+            None,
+            tmp.path().to_path_buf(),
+            false,
+            &extended,
+            Arc::new(crate::daemon::lsp::LspManager::new()),
+            None,
+            Arc::new(StdMutex::new(None)),
+            None,
+            trust_policy,
+            None,
+            EnvSnapshot::new(
+                crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                Default::default(),
+            ),
+            SessionConfigSnapshot::new(0, providers, extended.clone()),
+        );
+
+        handle
+            .send_work(SessionWork::Shutdown {
+                pause_for_resume: false,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), join)
+            .await
+            .expect("worker shuts down")
+            .expect("worker task does not panic");
+    }
+
     /// An [`ExtendedConfig`] pinning `defaultPrimaryAgent` + the
     /// experimental flag, for the gate tests.
     fn cfg_with(
@@ -572,12 +629,10 @@ mod tests {
         .unwrap();
     }
 
-    fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
+    fn lmstudio_test_providers() -> crate::config::providers::ProvidersConfig {
         use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry, ProvidersConfig};
-        use std::collections::BTreeMap;
-        use std::sync::Arc;
 
-        let mut providers = BTreeMap::new();
+        let mut providers = std::collections::BTreeMap::new();
         providers.insert(
             "lmstudio".to_string(),
             ProviderEntry {
@@ -595,7 +650,7 @@ mod tests {
                 ..ProviderEntry::default()
             },
         );
-        let providers = ProvidersConfig {
+        ProvidersConfig {
             providers,
             active_model: Some(ActiveModelRef {
                 provider: "lmstudio".to_string(),
@@ -604,7 +659,13 @@ mod tests {
                 thinking_mode: None,
             }),
             ..ProvidersConfig::default()
-        };
+        }
+    }
+
+    fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
+        use std::sync::Arc;
+
+        let providers = lmstudio_test_providers();
         let model = Arc::new(
             crate::engine::model::Model::from_config(
                 &providers,

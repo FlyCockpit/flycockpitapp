@@ -204,6 +204,7 @@ async fn run_worker(
     config_snapshot: Arc<RwLock<SessionConfigSnapshot>>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+    scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     _global_bus: Option<EventSender>,
 ) {
     let session_id = session.id;
@@ -535,6 +536,7 @@ async fn run_worker(
     if let Some(scheduler) = resource_scheduler {
         driver.set_resource_scheduler(scheduler);
     }
+    driver.set_daemon_scheduler_source(scheduler);
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into
     // its task, so a user ctrl+c (`SessionWork::Cancel`) can abort the

@@ -1,13 +1,9 @@
-#![cfg(unix)]
-
-mod support;
-
 use std::process::Stdio;
 use std::time::Duration;
 
+use crate::support::{IsolatedHome, SpawnedDaemon, assert_failure, assert_success, output_text};
 use cockpit_cli::integration::{DaemonClient, DaemonEvent};
 use rusqlite::{Connection, params};
-use support::{IsolatedHome, SpawnedDaemon, assert_failure, assert_success, output_text};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone)]

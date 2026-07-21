@@ -113,7 +113,7 @@ async fn cancel_kills_process_group_promptly() {
     let cancel = ctx.cancel.clone();
     // Fire the cancel shortly after the command starts.
     let canceller = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         cancel.cancel();
     });
 
@@ -136,13 +136,14 @@ async fn cancel_kills_process_group_promptly() {
         out.content
     );
 
-    // Give the SIGTERM→SIGKILL window time to land, then confirm the
-    // descendant heartbeat has stopped (process group was killed).
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Give the 200ms SIGTERM→SIGKILL window time to land, then confirm the
+    // descendant heartbeat has stopped (process group was killed). The second
+    // sample only needs to exceed the 100ms heartbeat interval.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let mtime_after_kill = std::fs::metadata(&heartbeat)
         .ok()
         .and_then(|m| m.modified().ok());
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
     let mtime_later = std::fs::metadata(&heartbeat)
         .ok()
         .and_then(|m| m.modified().ok());

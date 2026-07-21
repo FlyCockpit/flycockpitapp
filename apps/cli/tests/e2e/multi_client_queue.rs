@@ -1,15 +1,11 @@
-#![cfg(unix)]
-
-mod support;
-
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
+use crate::support::{IsolatedHome, SpawnedDaemon};
 use cockpit_cli::integration::{DaemonClient, DaemonEvent};
-use support::{IsolatedHome, SpawnedDaemon};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 

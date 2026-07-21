@@ -1,12 +1,10 @@
-mod support;
-
 use std::io::Write;
 use std::process::Command;
 use std::process::Stdio;
 
+use crate::support::{IsolatedHome, assert_failure, output_text};
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
-use support::{IsolatedHome, assert_failure, output_text};
 
 #[test]
 fn help_runs_from_built_binary() {

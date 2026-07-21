@@ -2296,11 +2296,24 @@ mod tests {
         );
     }
 
+    /// Push a session's `last_active_at` into the past so recency ordering is
+    /// deterministic without sleeping across a whole-second timestamp boundary.
+    fn backdate_session(db: &Db, session_id: Uuid, seconds: i64) {
+        db.write_blocking(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET last_active_at = last_active_at - ?1 WHERE session_id = ?2",
+                params![seconds, session_id.to_string()],
+            )
+            .context("backdating session")?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn touch_updates_last_active() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         db.touch_session(s.session_id).unwrap();
         let g = db.get_session(s.session_id).unwrap().unwrap();
         assert!(g.last_active_at >= s.last_active_at);
@@ -2712,9 +2725,9 @@ mod tests {
     fn list_forks_returns_children_most_recent_first() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/x", "a").unwrap();
-        let _f1 = db.create_fork(parent.session_id, None).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let f1 = db.create_fork(parent.session_id, None).unwrap();
         let f2 = db.create_fork(parent.session_id, None).unwrap();
+        backdate_session(&db, f1.session_id, 10);
         let forks = db.list_forks(parent.session_id).unwrap();
         assert_eq!(forks.len(), 2);
         assert_eq!(forks[0].session_id, f2.session_id);
@@ -2983,8 +2996,8 @@ mod tests {
         // parent, fork/descendant counts, and the all-projects fallback.
         let db = Db::open_in_memory().unwrap();
         let root_a = db.create_session("pid", "/proj", "builder").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         let root_b = db.create_session("pid", "/proj", "builder").unwrap();
+        backdate_session(&db, root_a.session_id, 10);
         // A session in a different project must not leak into `pid` scope.
         let _other = db.create_session("pid2", "/other", "builder").unwrap();
         // Two forks under root_a (one of them with its own descendant).

@@ -1,7 +1,3 @@
-#![cfg(unix)]
-
-mod support;
-
 use std::future::Future;
 use std::path::Path;
 use std::sync::{
@@ -10,9 +6,9 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use crate::support::{IsolatedHome, SpawnedDaemon, log_tail, output_text, wait_until};
 use cockpit_cli::integration::{AttachedSession, DaemonEvent};
 use rusqlite::{Connection, params};
-use support::{IsolatedHome, SpawnedDaemon, log_tail, output_text, wait_until};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 

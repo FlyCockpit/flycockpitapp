@@ -24,6 +24,12 @@ workspace = true
 name = "cockpit"
 path = "src/main.rs"
 
+# Single merged e2e/integration test binary: one full-dependency-graph link
+# instead of one per test file. Modules live in tests/e2e/.
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+
 [dependencies]
 # CLI parsing
 clap = { version = "4.6", features = ["derive", "wrap_help", "string"] }

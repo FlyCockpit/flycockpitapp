@@ -1,10 +1,6 @@
-#![cfg(unix)]
-
-mod support;
-
 use std::time::Duration;
 
-use support::{SpawnedDaemon, output_text, wait_until};
+use crate::support::{SpawnedDaemon, output_text, wait_until};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_daemon_start_status_stop_round_trip() {

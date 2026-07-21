@@ -66,7 +66,8 @@ Pre-commit (lefthook) runs biome, `pnpm check-types`, and prisma validation — 
 ```bash
 cargo fmt --check
 cargo clippy --locked -- -D warnings
-cargo test --locked           # all tests; single test: cargo test <name>
+cargo nextest run --locked --workspace   # all tests; single test: cargo nextest run <name>
+cargo nextest run --locked --workspace --profile quick  # inner-loop: skips apps/cli e2e binary; full run required before completion/commit
 cargo run                     # launches the cockpit TUI
 ```
 

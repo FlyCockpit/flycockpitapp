@@ -923,7 +923,7 @@ mod tests {
                 .write(move |conn| {
                     conn.execute_batch("BEGIN IMMEDIATE;")?;
                     let _ = entered_tx.send(());
-                    std::thread::sleep(Duration::from_millis(250));
+                    std::thread::sleep(Duration::from_millis(100));
                     conn.execute("INSERT INTO wal_probe (value) VALUES (2)", [])?;
                     conn.execute_batch("COMMIT;")?;
                     Ok(())
@@ -943,7 +943,7 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "reader should see the pre-commit snapshot");
         assert!(
-            start.elapsed() < Duration::from_millis(200),
+            start.elapsed() < Duration::from_millis(75),
             "read waited for slow writer: {:?}",
             start.elapsed()
         );
@@ -982,7 +982,7 @@ mod tests {
             tx.send((started.elapsed(), result)).unwrap();
         });
 
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(30));
         assert!(
             rx.try_recv().is_err(),
             "second writer returned immediately instead of waiting for busy timeout"
@@ -998,7 +998,7 @@ mod tests {
         writer.join().unwrap();
         result.unwrap();
         assert!(
-            elapsed >= Duration::from_millis(100),
+            elapsed >= Duration::from_millis(30),
             "second writer did not wait for the held write lock: {elapsed:?}"
         );
 
@@ -1040,7 +1040,7 @@ mod tests {
             tx.send((started.elapsed(), result)).unwrap();
         });
 
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(30));
         assert!(
             rx.try_recv().is_err(),
             "second migrator returned before the migration lock was released"
@@ -1051,7 +1051,7 @@ mod tests {
         waiter.join().unwrap();
         result.unwrap();
         assert!(
-            elapsed >= Duration::from_millis(100),
+            elapsed >= Duration::from_millis(30),
             "second migrator did not wait for the held migration lock: {elapsed:?}"
         );
 

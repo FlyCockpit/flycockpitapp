@@ -1,13 +1,9 @@
-#![cfg(unix)]
-
-mod support;
-
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use support::{IsolatedHome, output_text};
+use crate::support::{IsolatedHome, output_text};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TOOL_CALL_ID: &str = "run-approval-call";

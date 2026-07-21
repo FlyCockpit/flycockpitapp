@@ -404,7 +404,7 @@ mod safety_gate_tests {
         let ctx = gate_ctx(tmp.path(), ApprovalMode::Manual, false);
         let tools = ToolBox::new().with(Arc::new(SleepTool));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
         let (result, duration_ms) =
             dispatch_one_timed(&tools, "sleepy", serde_json::json!({}), &ctx, None).await;
 

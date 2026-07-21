@@ -1004,76 +1004,33 @@ mod tests {
         page_mut(d).cursor = idx;
     }
 
-    /// `$EDITOR` is process-global, so the editor-precedence tests must not
-    /// run concurrently or they'd observe each other's mutations. This lock
-    /// serializes them; the [`EditorEnv`] guard holds it for the test's
-    /// duration and restores the prior value on drop.
-    static EDITOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct EditorEnv {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        prev: Option<std::ffi::OsString>,
+        _guard: cockpit_test_support::TestEnvGuard,
     }
     impl EditorEnv {
         /// Take the lock and set `$EDITOR` to `value` (or unset it for `None`).
         fn with(value: Option<&str>) -> Self {
-            let guard = EDITOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var_os("EDITOR");
-            unsafe {
-                match value {
-                    Some(v) => std::env::set_var("EDITOR", v),
-                    None => std::env::remove_var("EDITOR"),
-                }
+            let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
+            match value {
+                Some(v) => guard.set_var("EDITOR", v),
+                None => guard.remove_var("EDITOR"),
             }
-            EditorEnv {
-                _guard: guard,
-                prev,
-            }
+            EditorEnv { _guard: guard }
         }
         fn unset() -> Self {
             Self::with(None)
         }
     }
-    impl Drop for EditorEnv {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("EDITOR", v),
-                    None => std::env::remove_var("EDITOR"),
-                }
-            }
-        }
-    }
-
-    static XDG_DATA_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct XdgDataEnv {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        prev: Option<std::ffi::OsString>,
+        _guard: cockpit_test_support::TestEnvGuard,
     }
 
     impl XdgDataEnv {
         fn new(path: &std::path::Path) -> Self {
-            let guard = XDG_DATA_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var_os("XDG_DATA_HOME");
-            unsafe {
-                std::env::set_var("XDG_DATA_HOME", path);
-            }
-            Self {
-                _guard: guard,
-                prev,
-            }
-        }
-    }
-
-    impl Drop for XdgDataEnv {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.prev {
-                    Some(value) => std::env::set_var("XDG_DATA_HOME", value),
-                    None => std::env::remove_var("XDG_DATA_HOME"),
-                }
-            }
+            let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
+            guard.set_var("XDG_DATA_HOME", path);
+            Self { _guard: guard }
         }
     }
 

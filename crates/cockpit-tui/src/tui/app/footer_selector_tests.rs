@@ -132,7 +132,7 @@ fn plain_lines(app: &App) -> Vec<&str> {
 #[test]
 fn footer_enter_opens_selector_for_each_axis() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_model_config(tmp.path());
     let mut app = app(&tmp);
 
@@ -155,7 +155,7 @@ fn footer_enter_opens_selector_for_each_axis() {
 #[test]
 fn quick_dialog_space_stages_without_daemon_request_enter_commits() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_favorite_model_config(tmp.path());
     let (mut app, mut rx) = app_with_runner(&tmp);
     let config_path = tmp.path().join(".cockpit").join("config.json");

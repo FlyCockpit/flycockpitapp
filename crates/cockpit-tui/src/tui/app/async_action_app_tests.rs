@@ -5,8 +5,12 @@ use std::sync::mpsc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
-fn configured_app(tmp: &tempfile::TempDir) -> App {
-    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+async fn configured_app_async(tmp: &tempfile::TempDir) -> App {
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    configured_app_body(tmp)
+}
+
+fn configured_app_body(tmp: &tempfile::TempDir) -> App {
     let cockpit = tmp.path().join(".cockpit");
     fs::create_dir(&cockpit).unwrap();
     fs::write(cockpit.join("config.json"), "{}").unwrap();
@@ -35,7 +39,7 @@ async fn drain_until_idle(app: &mut App) {
 #[tokio::test]
 async fn local_command_records_pending_without_final_output_until_completion() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = configured_app(&tmp);
+    let mut app = configured_app_async(&tmp).await;
     let (release_tx, release_rx) = mpsc::channel();
 
     app.start_local_command_action("! slow".to_string(), None, move || {
@@ -74,7 +78,7 @@ async fn local_command_records_pending_without_final_output_until_completion() {
 #[tokio::test(flavor = "current_thread")]
 async fn local_command_work_runs_off_event_loop_thread() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = configured_app(&tmp);
+    let mut app = configured_app_async(&tmp).await;
     let event_loop_thread = std::thread::current().id();
 
     app.start_local_command_action("! thread-check".to_string(), None, move || {
@@ -98,7 +102,7 @@ async fn local_command_work_runs_off_event_loop_thread() {
 #[tokio::test]
 async fn local_command_completion_preserves_failure_and_display_cleanup() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = configured_app(&tmp);
+    let mut app = configured_app_async(&tmp).await;
     let mut raw = String::new();
     for idx in 0..(LOCAL_CMD_DISPLAY_LINES + 2) {
         raw.push_str(&format!("\x1b[31mline-{idx}\x1b[0m\n"));
@@ -128,7 +132,7 @@ async fn local_command_completion_preserves_failure_and_display_cleanup() {
 #[tokio::test]
 async fn git_command_completion_appends_local_entry_and_git_context() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = configured_app(&tmp);
+    let mut app = configured_app_async(&tmp).await;
 
     app.start_local_command_action(
         "/git status --short".to_string(),
@@ -154,7 +158,7 @@ async fn git_command_completion_appends_local_entry_and_git_context() {
 #[tokio::test]
 async fn display_daemon_probe_dedupes_and_does_not_block_input() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = configured_app(&tmp);
+    let mut app = configured_app_async(&tmp).await;
     let (release_tx, release_rx) = mpsc::channel();
 
     app.start_display_daemon_probe_action(move || {
@@ -176,7 +180,7 @@ async fn display_daemon_probe_dedupes_and_does_not_block_input() {
 #[tokio::test]
 async fn stale_display_daemon_probe_result_is_ignored_after_context_changes() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = configured_app(&tmp);
+    let mut app = configured_app_async(&tmp).await;
 
     app.start_display_daemon_probe_action(|| cockpit_core::daemon::DaemonStatus::Running);
     app.launch.cwd = tmp.path().join("different-root");
@@ -188,7 +192,7 @@ async fn stale_display_daemon_probe_result_is_ignored_after_context_changes() {
 #[tokio::test]
 async fn display_daemon_probe_non_running_status_degrades_quietly() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = configured_app(&tmp);
+    let mut app = configured_app_async(&tmp).await;
 
     app.start_display_daemon_probe_action(|| cockpit_core::daemon::DaemonStatus::Stale);
     drain_until_idle(&mut app).await;
@@ -200,7 +204,7 @@ async fn display_daemon_probe_non_running_status_degrades_quietly() {
 #[tokio::test]
 async fn app_drop_does_not_panic_with_in_flight_async_action() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = configured_app(&tmp);
+    let mut app = configured_app_async(&tmp).await;
     let (_tx, rx) = oneshot::channel::<()>();
 
     app.async_actions.start(
@@ -218,7 +222,7 @@ async fn app_drop_does_not_panic_with_in_flight_async_action() {
 #[tokio::test]
 async fn rename_and_note_errors_surface_from_async_results() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = configured_app(&tmp);
+    let mut app = configured_app_async(&tmp).await;
 
     app.async_actions.start(
         AsyncActionKind::DaemonRpc("rename"),
@@ -247,7 +251,7 @@ async fn rename_and_note_errors_surface_from_async_results() {
 #[tokio::test]
 async fn stale_fork_result_is_ignored_after_context_changes() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = configured_app(&tmp);
+    let mut app = configured_app_async(&tmp).await;
 
     app.async_actions.start(
         AsyncActionKind::DaemonRpc("fork.create"),

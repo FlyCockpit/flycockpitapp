@@ -405,14 +405,9 @@ fn ignore_config_filters_configured_agent_dirs_inside_trust_root() {
     };
 
     let dirs = crate::config::trust::with_workspace_trust_policy(policy, || {
-        // SAFETY: test-scoped config override restored before returning.
-        unsafe {
-            std::env::set_var(crate::config::dirs::COCKPIT_CONFIG_ENV, &cfg_path);
-        }
+        let env = crate::test_env::lock();
+        env.set_cockpit_config(&cfg_path);
         let dirs = agent_search_dirs(tmp.path());
-        unsafe {
-            std::env::remove_var(crate::config::dirs::COCKPIT_CONFIG_ENV);
-        }
         dirs
     });
 

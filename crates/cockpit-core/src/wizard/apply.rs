@@ -409,17 +409,12 @@ fn numeric_capability_override(
 mod tests {
     use super::*;
 
-    use crate::config::dirs::{COCKPIT_CONFIG_ENV, test_support::IsolatedCockpitHome};
+    use crate::config::dirs::COCKPIT_CONFIG_ENV;
     use crate::wizard::WizardAnswer;
-
-    struct EnvSnapshot {
-        name: &'static str,
-        old: Option<std::ffi::OsString>,
-    }
+    use cockpit_test_support::TestEnvGuard;
 
     struct CockpitConfigEnvGuard {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        vars: Vec<EnvSnapshot>,
+        _guard: crate::test_env::TestEnvGuard,
     }
 
     impl CockpitConfigEnvGuard {
@@ -433,45 +428,16 @@ mod tests {
 
         fn set_with_state(path: &std::path::Path, state_home: &std::path::Path) -> Self {
             let guard = crate::test_env::lock();
-            let vars = snapshot_vars(&[COCKPIT_CONFIG_ENV, "XDG_STATE_HOME"]);
-            unsafe { std::env::set_var(COCKPIT_CONFIG_ENV, path) };
-            unsafe { std::env::set_var("XDG_STATE_HOME", state_home) };
-            Self {
-                _guard: guard,
-                vars,
-            }
+            guard.set_var(COCKPIT_CONFIG_ENV, path);
+            guard.set_var("XDG_STATE_HOME", state_home);
+            Self { _guard: guard }
         }
 
         fn clear_config() -> Self {
             let guard = crate::test_env::lock();
-            let vars = snapshot_vars(&[COCKPIT_CONFIG_ENV]);
-            unsafe { std::env::remove_var(COCKPIT_CONFIG_ENV) };
-            Self {
-                _guard: guard,
-                vars,
-            }
+            guard.remove_var(COCKPIT_CONFIG_ENV);
+            Self { _guard: guard }
         }
-    }
-
-    impl Drop for CockpitConfigEnvGuard {
-        fn drop(&mut self) {
-            for snapshot in self.vars.iter().rev() {
-                match &snapshot.old {
-                    Some(value) => unsafe { std::env::set_var(snapshot.name, value) },
-                    None => unsafe { std::env::remove_var(snapshot.name) },
-                }
-            }
-        }
-    }
-
-    fn snapshot_vars(names: &[&'static str]) -> Vec<EnvSnapshot> {
-        names
-            .iter()
-            .map(|name| EnvSnapshot {
-                name,
-                old: std::env::var_os(name),
-            })
-            .collect()
     }
 
     fn write_model_wizard_provider(cwd: &std::path::Path) -> PathBuf {
@@ -1024,8 +990,7 @@ mod tests {
     #[test]
     fn model_wizard_saves_model_from_outer_layer() {
         let tmp = tempfile::tempdir().unwrap();
-        let _setup_env_lock = crate::test_env::lock();
-        let _env = IsolatedCockpitHome::new(tmp.path());
+        let _env = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         crate::config::trust::clear_runtime_policy_for_tests();
         let project = tmp.path().join("repo");
         let project_config = project.join(".cockpit/config.json");
@@ -1067,8 +1032,7 @@ mod tests {
     #[test]
     fn model_wizard_partial_overlay_layer_write() {
         let tmp = tempfile::tempdir().unwrap();
-        let _setup_env_lock = crate::test_env::lock();
-        let _env = IsolatedCockpitHome::new(tmp.path());
+        let _env = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         crate::config::trust::clear_runtime_policy_for_tests();
         let project = tmp.path().join("repo");
         let project_config = project.join(".cockpit/config.json");

@@ -213,9 +213,8 @@ fn non_unicode_env_values_are_lossy_scanned_without_panic() {
     let key = "COCKPIT_TEST_NONUNICODE_SECRET";
     let value = OsString::from_vec(b"nonunicode-secret-\xFF-value-1234".to_vec());
     let lossy = value.to_string_lossy().into_owned();
-    unsafe {
-        std::env::set_var(key, &value);
-    }
+    let env = crate::test_env::lock();
+    env.set_var(key, &value);
 
     let mut cfg = enabled_cfg();
     cfg.scan_environment = true;
@@ -224,10 +223,6 @@ fn non_unicode_env_values_are_lossy_scanned_without_panic() {
     let scrubbed = table.scrub(&format!("value={lossy}"));
     assert!(!scrubbed.contains(&lossy));
     assert!(scrubbed.contains(&cfg.placeholder));
-
-    unsafe {
-        std::env::remove_var(key);
-    }
 }
 
 #[test]
@@ -372,12 +367,8 @@ fn env_var_value_redacted_with_default_placeholder() {
     // unique enough that prior env state can't fight us.
     let key = "COCKPIT_TEST_SECRET_TOKEN_XYZ";
     let val = "supersecret-token-value-1234";
-    // SAFETY: tests run single-threaded enough that env mutation
-    // here is acceptable; the same pattern is used elsewhere in the
-    // test suite.
-    unsafe {
-        std::env::set_var(key, val);
-    }
+    let env = crate::test_env::lock();
+    env.set_var(key, val);
     let cfg = RedactConfig {
         enabled: true,
         scan_environment: true,
@@ -396,18 +387,14 @@ fn env_var_value_redacted_with_default_placeholder() {
     let scrubbed = t.scrub(&format!("the token is {val} ok"));
     assert!(scrubbed.contains("**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**"));
     assert!(!scrubbed.contains(val));
-    unsafe {
-        std::env::remove_var(key);
-    }
 }
 
 #[test]
 fn build_with_env_redacts_env_only_secret_without_process_env() {
     let key = "COCKPIT_TEST_SESSION_ONLY_SECRET";
     let val = "session-only-secret-value-1234";
-    unsafe {
-        std::env::remove_var(key);
-    }
+    let env = crate::test_env::lock();
+    env.remove_var(key);
     let mut cfg = enabled_cfg();
     cfg.scan_environment = true;
     cfg.scan_dotenv = false;
@@ -476,9 +463,8 @@ fn store_secrets_join_redaction_table() {
 fn short_env_values_not_redacted() {
     let key = "COCKPIT_TEST_SHORT_VALUE";
     let val = "abc";
-    unsafe {
-        std::env::set_var(key, val);
-    }
+    let env = crate::test_env::lock();
+    env.set_var(key, val);
     let mut cfg = enabled_cfg();
     cfg.scan_environment = true;
     cfg.min_secret_length = 8;
@@ -486,9 +472,6 @@ fn short_env_values_not_redacted() {
     let t = RedactionTable::build(&cfg, dir.path()).unwrap();
     // The 3-char value must not contribute a pattern.
     assert_eq!(t.scrub("the value is abc here"), "the value is abc here");
-    unsafe {
-        std::env::remove_var(key);
-    }
 }
 
 #[test]
@@ -671,17 +654,11 @@ fn long_numeric_env_value_is_redacted() {
     };
     let key = "COCKPIT_TEST_NUMERIC_SECRET";
     let val = "98765432109876543210";
-    // SAFETY: this mirrors the existing env-mutation tests in this
-    // module; the key is unique to this test and removed before return.
-    unsafe {
-        std::env::set_var(key, val);
-    }
+    let env = crate::test_env::lock();
+    env.set_var(key, val);
     let t = RedactionTable::build(&cfg, dir.path()).unwrap();
 
     assert_eq!(t.scrub(&format!("token={val}")), "token=***REDACT***");
-    unsafe {
-        std::env::remove_var(key);
-    }
 }
 
 // ── Format auto-detection (§4) ───────────────────────────────────────

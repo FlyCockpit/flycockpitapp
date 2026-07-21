@@ -1538,6 +1538,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
 
     #[test]
     fn project_bundle_trust_gated() {
+        let _env = crate::test_env::lock();
         crate::config::trust::clear_runtime_policy_for_tests();
         let tmp = TempDir::new().unwrap();
         let project_bundle = tmp.path().join(".cockpit/knowledge");
@@ -1561,6 +1562,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
 
     #[test]
     fn memory_search_tool_gated() {
+        let _env = crate::test_env::lock();
         crate::config::trust::clear_runtime_policy_for_tests();
         let tmp = TempDir::new().unwrap();
         let session = test_session(tmp.path());

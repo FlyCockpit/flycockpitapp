@@ -172,47 +172,6 @@ mod tests {
     use crate::config::extended::{ArgvOverflowBehavior, PromptInputMode};
 
     #[cfg(unix)]
-    struct PathEnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        old_path: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(unix)]
-    impl PathEnvGuard {
-        fn set(path: &Path) -> Self {
-            static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-            let lock = LOCK
-                .get_or_init(|| std::sync::Mutex::new(()))
-                .lock()
-                .unwrap();
-            let old_path = std::env::var_os("PATH");
-            unsafe { std::env::set_var("PATH", path) };
-            Self {
-                _lock: lock,
-                old_path,
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for PathEnvGuard {
-        fn drop(&mut self) {
-            match &self.old_path {
-                Some(path) => unsafe { std::env::set_var("PATH", path) },
-                None => unsafe { std::env::remove_var("PATH") },
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap()
-    }
-
-    #[cfg(unix)]
     fn write_file(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -258,7 +217,8 @@ mod tests {
     fn which_on_path_rejects_non_executable_path_entry() {
         let temp = tempfile::tempdir().unwrap();
         write_file(&temp.path().join("shadowed"), 0o644);
-        let _guard = PathEnvGuard::set(temp.path());
+        let guard = crate::test_env::lock();
+        guard.set_var("PATH", temp.path());
 
         assert_eq!(which_on_path("shadowed"), None);
     }
@@ -269,7 +229,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("runner");
         write_file(&executable, 0o755);
-        let _guard = PathEnvGuard::set(temp.path());
+        let guard = crate::test_env::lock();
+        guard.set_var("PATH", temp.path());
 
         assert_eq!(
             which_on_path("runner").as_deref(),
@@ -280,7 +241,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn which_on_path_rejects_non_executable_explicit_path() {
-        let _guard = env_lock();
+        let _guard = crate::test_env::lock();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("tool");
         write_file(&path, 0o644);
@@ -290,6 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_path_no_auth_hint_is_ok() {
+        let _env = crate::test_env::lock_async().await;
         // `sh` is on PATH and has no auth hint → authenticated by policy.
         let cfg = base("sh");
         assert!(
@@ -322,6 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_probe_uses_curated_env() {
+        let env = crate::test_env::lock_async().await;
         let mut cfg = base("sh");
         cfg.auth_env_vars.clear();
         cfg.auth_probe_args = vec![
@@ -329,26 +292,7 @@ mod tests {
             "test \"${SECRET_API_KEY-unset}\" = unset && test \"$ALLOWED_AUTH_TOKEN\" = visible"
                 .to_string(),
         ];
-        struct EnvGuard {
-            key: &'static str,
-            old: Option<std::ffi::OsString>,
-        }
-        impl EnvGuard {
-            fn set(key: &'static str, value: &str) -> Self {
-                let old = std::env::var_os(key);
-                unsafe { std::env::set_var(key, value) };
-                Self { key, old }
-            }
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.old {
-                    Some(value) => unsafe { std::env::set_var(self.key, value) },
-                    None => unsafe { std::env::remove_var(self.key) },
-                }
-            }
-        }
-        let _secret = EnvGuard::set("SECRET_API_KEY", "hidden");
+        env.set_var("SECRET_API_KEY", "hidden");
         let mut overlay = std::collections::HashMap::new();
         overlay.insert("ALLOWED_AUTH_TOKEN".to_string(), "visible".to_string());
 

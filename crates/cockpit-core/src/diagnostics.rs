@@ -788,6 +788,7 @@ mod tests {
 
     #[test]
     fn unresolved_trust_marks_harness_probe_blocked() {
+        let _env = crate::test_env::lock();
         crate::config::trust::clear_runtime_policy_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let cockpit = tmp.path().join(".cockpit");

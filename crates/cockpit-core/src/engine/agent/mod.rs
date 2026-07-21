@@ -1739,7 +1739,8 @@ mod project_guidance_injection_tests {
     #[tokio::test]
     async fn trusted_workspace_injects_guidance_as_user_message_with_nonce_fence() {
         let tmp = tempfile::tempdir().unwrap();
-        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _env =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
         crate::config::trust::clear_runtime_policy_for_tests();
         std::fs::write(tmp.path().join("AGENTS.md"), "RULES\n").unwrap();
         let root = crate::config::trust::resolve_trust_root(tmp.path()).unwrap();
@@ -1774,7 +1775,8 @@ mod project_guidance_injection_tests {
     #[tokio::test]
     async fn untrusted_workspace_strips_guidance_when_scan_unavailable() {
         let tmp = tempfile::tempdir().unwrap();
-        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _env =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
         crate::config::trust::clear_runtime_policy_for_tests();
         write_project_config(
             tmp.path(),
@@ -1816,7 +1818,8 @@ mod project_guidance_injection_tests {
     #[tokio::test]
     async fn threshold_off_initial_guidance_injects_when_scan_unavailable() {
         let tmp = tempfile::tempdir().unwrap();
-        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _env =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
         crate::config::trust::clear_runtime_policy_for_tests();
         std::fs::write(tmp.path().join("AGENTS.md"), "RULES\n").unwrap();
         let root = crate::config::trust::resolve_trust_root(tmp.path()).unwrap();
@@ -1847,7 +1850,8 @@ mod project_guidance_injection_tests {
     #[tokio::test]
     async fn threshold_off_live_guidance_change_injects_when_scan_unavailable() {
         let tmp = tempfile::tempdir().unwrap();
-        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _env =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
         crate::config::trust::clear_runtime_policy_for_tests();
         std::fs::write(tmp.path().join("AGENTS.md"), "ORIGINAL\n").unwrap();
         let root = crate::config::trust::resolve_trust_root(tmp.path()).unwrap();

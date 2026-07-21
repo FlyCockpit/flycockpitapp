@@ -221,42 +221,22 @@ fn ctrl(ch: char) -> KeyEvent {
     }
 }
 
-static EDITOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 struct EditorEnv {
-    _guard: std::sync::MutexGuard<'static, ()>,
-    prev: Option<std::ffi::OsString>,
+    _guard: cockpit_test_support::TestEnvGuard,
 }
 
 impl EditorEnv {
     fn with(value: Option<&str>) -> Self {
-        let guard = EDITOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("EDITOR");
-        unsafe {
-            match value {
-                Some(v) => std::env::set_var("EDITOR", v),
-                None => std::env::remove_var("EDITOR"),
-            }
+        let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
+        match value {
+            Some(v) => guard.set_var("EDITOR", v),
+            None => guard.remove_var("EDITOR"),
         }
-        Self {
-            _guard: guard,
-            prev,
-        }
+        Self { _guard: guard }
     }
 
     fn unset() -> Self {
         Self::with(None)
-    }
-}
-
-impl Drop for EditorEnv {
-    fn drop(&mut self) {
-        unsafe {
-            match &self.prev {
-                Some(v) => std::env::set_var("EDITOR", v),
-                None => std::env::remove_var("EDITOR"),
-            }
-        }
     }
 }
 

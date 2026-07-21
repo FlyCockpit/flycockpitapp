@@ -327,47 +327,25 @@ fn status_label(status: &ConnectionStatus) -> String {
 mod tests {
     use super::*;
     use crate::auth::flycockpit::AccountInfo;
-    use std::ffi::OsString;
 
     struct EnvRestore {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        old_state_home: Option<OsString>,
-        old_runtime_dir: Option<OsString>,
+        _guard: crate::test_env::TestEnvGuard,
     }
 
     impl EnvRestore {
-        fn isolate_daemon_and_credentials(root: &std::path::Path) -> Self {
-            let guard = crate::test_env::lock();
+        async fn isolate_daemon_and_credentials_async(root: &std::path::Path) -> Self {
+            let guard = crate::test_env::lock_async().await;
+            Self::from_guard(root, guard)
+        }
+
+        fn from_guard(root: &std::path::Path, guard: crate::test_env::TestEnvGuard) -> Self {
             let state_home = root.join("state");
             let runtime_dir = root.join("runtime");
             std::fs::create_dir_all(&state_home).unwrap();
             std::fs::create_dir_all(&runtime_dir).unwrap();
-            let old_state_home = std::env::var_os("XDG_STATE_HOME");
-            let old_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
-            unsafe {
-                std::env::set_var("XDG_STATE_HOME", state_home);
-                std::env::set_var("XDG_RUNTIME_DIR", runtime_dir);
-            }
-            Self {
-                _guard: guard,
-                old_state_home,
-                old_runtime_dir,
-            }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.old_state_home {
-                    Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-                    None => std::env::remove_var("XDG_STATE_HOME"),
-                }
-                match &self.old_runtime_dir {
-                    Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
-                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
-                }
-            }
+            guard.set_var("XDG_STATE_HOME", state_home);
+            guard.set_var("XDG_RUNTIME_DIR", runtime_dir);
+            Self { _guard: guard }
         }
     }
 
@@ -388,7 +366,7 @@ mod tests {
     #[tokio::test]
     async fn store_and_clear_credential_fall_back_to_direct_write_without_daemon() {
         let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvRestore::isolate_daemon_and_credentials(tmp.path());
+        let _env = EnvRestore::isolate_daemon_and_credentials_async(tmp.path()).await;
         let credential_path = tmp.path().join("state/cockpit/credentials.json");
         let credential = credential();
 

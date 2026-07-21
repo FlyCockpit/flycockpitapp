@@ -523,7 +523,7 @@ mod tests {
     #[test]
     fn cockpit_config_env_does_not_redirect_mcp_discovery() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         let project = tmp.path().join("repo");
         std::fs::create_dir_all(project.join(".cockpit")).unwrap();
         std::fs::write(

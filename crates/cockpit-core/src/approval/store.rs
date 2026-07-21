@@ -1371,7 +1371,7 @@ mod tests {
     #[test]
     fn project_grant_writes_machine_local_not_repo() {
         let env = tempfile::tempdir().unwrap();
-        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(env.path());
+        let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(env.path());
         let project = tempfile::tempdir_in(env.path()).unwrap();
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -1459,6 +1459,7 @@ mod tests {
 
     #[test]
     fn ignore_cfg_blocks_project_approval_file_reads_and_writes() {
+        let _env = crate::test_env::lock();
         let tmp = tempfile::tempdir().unwrap();
         let status = std::process::Command::new("git")
             .args(["init", "-q"])

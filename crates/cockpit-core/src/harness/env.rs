@@ -71,28 +71,6 @@ mod tests {
     use super::*;
     use crate::config::extended::{ArgvOverflowBehavior, PromptInputMode};
 
-    struct EnvVarGuard {
-        key: &'static str,
-        old: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let old = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, old }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.old {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
     fn cfg(auth_env_vars: Vec<&str>) -> HarnessConfig {
         HarnessConfig {
             command: "sh".to_string(),
@@ -116,14 +94,16 @@ mod tests {
 
     #[test]
     fn excludes_process_secret_unless_declared() {
-        let _guard = EnvVarGuard::set("SECRET_API_KEY", "secret");
+        let guard = crate::test_env::lock();
+        guard.set_var("SECRET_API_KEY", "secret");
         let env = harness_child_env(&cfg(vec![]), None);
         assert!(!env.iter().any(|(key, _)| key == "SECRET_API_KEY"));
     }
 
     #[test]
     fn declared_auth_var_is_included() {
-        let _guard = EnvVarGuard::set("SECRET_API_KEY", "secret");
+        let guard = crate::test_env::lock();
+        guard.set_var("SECRET_API_KEY", "secret");
         let env = harness_child_env(&cfg(vec!["SECRET_API_KEY"]), None);
         assert!(
             env.iter()
@@ -133,7 +113,8 @@ mod tests {
 
     #[test]
     fn session_overlay_overrides_process_env() {
-        let _guard = EnvVarGuard::set("TOKEN", "process");
+        let guard = crate::test_env::lock();
+        guard.set_var("TOKEN", "process");
         let mut overlay = HashMap::new();
         overlay.insert("TOKEN".to_string(), "overlay".to_string());
         let env = harness_child_env(&cfg(vec!["TOKEN"]), Some(&overlay));

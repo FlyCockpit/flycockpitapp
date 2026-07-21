@@ -58,8 +58,8 @@ fn prepare_tui_workspace_trust(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::dirs::test_support::IsolatedCockpitHome;
     use crate::config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersConfig};
+    use cockpit_test_support::TestEnvGuard;
 
     fn write_provider_config(cwd: &Path) {
         let cockpit = cwd.join(".cockpit");
@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn trust_gate_excludes_project_config_until_decided() {
         let tmp = tempfile::tempdir().unwrap();
-        let _home = IsolatedCockpitHome::new(tmp.path());
+        let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         crate::config::trust::clear_runtime_policy_for_tests();
         write_provider_config(tmp.path());
 

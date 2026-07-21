@@ -1,6 +1,6 @@
 use super::*;
-use cockpit_config::dirs::test_support::IsolatedCockpitHome;
 use cockpit_config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersConfig};
+use cockpit_test_support::TestEnvGuard;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn daemon_paths(tmp: &tempfile::TempDir) -> cockpit_core::daemon::DaemonPaths {
@@ -100,7 +100,7 @@ fn daemon_autostart_notice_shows_once() {
 #[test]
 fn first_run_chains_provider_then_model() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = IsolatedCockpitHome::new(tmp.path());
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new_with_db(
         Some(tmp.path()),
@@ -139,7 +139,7 @@ fn first_run_chains_provider_then_model() {
 #[test]
 fn no_model_send_opens_wizard_preserves_input() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = IsolatedCockpitHome::new(tmp.path());
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new_with_db(
         Some(tmp.path()),
@@ -161,7 +161,7 @@ fn no_model_send_opens_wizard_preserves_input() {
 #[test]
 fn trust_dialog_persists_decision() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = IsolatedCockpitHome::new(tmp.path());
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_raw_config(tmp.path(), r#"{"daemon":{"autostart":"ask"}}"#);
     let db = cockpit_db::Db::open_in_memory().unwrap();
     let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();

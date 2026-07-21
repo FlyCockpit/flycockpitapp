@@ -50,7 +50,7 @@ pub mod skills;
 pub mod startup;
 pub mod sync;
 pub mod sysinfo;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub mod test_env;
 pub mod text;
 pub mod tokens;

@@ -317,28 +317,9 @@ mod tests {
 
     #[tokio::test]
     async fn child_receives_only_curated_env() {
-        struct EnvGuard {
-            key: &'static str,
-            old: Option<std::ffi::OsString>,
-        }
-        impl EnvGuard {
-            fn set(key: &'static str, value: &str) -> Self {
-                let old = std::env::var_os(key);
-                unsafe { std::env::set_var(key, value) };
-                Self { key, old }
-            }
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.old {
-                    Some(value) => unsafe { std::env::set_var(self.key, value) },
-                    None => unsafe { std::env::remove_var(self.key) },
-                }
-            }
-        }
-
-        let _secret = EnvGuard::set("SECRET_API_KEY", "hidden");
-        let _auth = EnvGuard::set("ALLOWED_AUTH_TOKEN", "visible");
+        let env = crate::test_env::lock_async().await;
+        env.set_var("SECRET_API_KEY", "hidden");
+        env.set_var("ALLOWED_AUTH_TOKEN", "visible");
         let cfg = crate::config::extended::HarnessConfig {
             command: "sh".to_string(),
             args: vec![],

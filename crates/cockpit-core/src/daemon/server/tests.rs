@@ -9431,6 +9431,7 @@ mod tests {
 
     #[test]
     fn daemon_load_configs_uses_session_policy_over_global_policy() {
+        let _env = crate::test_env::lock();
         let trusted = tempfile::tempdir().unwrap();
         let ignored = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(trusted.path().join(".cockpit")).unwrap();

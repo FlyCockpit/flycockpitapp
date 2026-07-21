@@ -588,13 +588,12 @@ fn strip_reasoning_dropped_turn_preserves_pairing() {
     assert_eq!(tool_use_ids, vec!["tc-keep".to_string()]);
 }
 
-static ENDPOINT_PROBE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+fn endpoint_probe_test_guard() -> crate::test_env::TestEnvGuard {
+    crate::test_env::lock()
+}
 
-fn endpoint_probe_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    ENDPOINT_PROBE_TEST_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
+async fn endpoint_probe_test_guard_async() -> crate::test_env::TestEnvGuard {
+    crate::test_env::lock_async().await
 }
 
 /// Idempotence: stripping an already-stripped wire history is a no-op.
@@ -1503,8 +1502,8 @@ fn build_model_routes_anthropic_host_to_native_arm() {
     use crate::config::providers::{CacheConfig, HeaderSpec, ProviderCapabilities};
 
     // Set the key the anthropic template reads so the build succeeds.
-    // SAFETY: single-threaded test; restored at end.
-    unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-test") };
+    let env = crate::test_env::lock();
+    env.set_var("ANTHROPIC_API_KEY", "sk-test");
 
     let native = ProviderEntry {
         url: "https://api.anthropic.com/v1".into(),
@@ -1586,8 +1585,6 @@ fn build_model_routes_anthropic_host_to_native_arm() {
         matches!(model, Model::OpenAi { .. }),
         "non-anthropic host must stay on the OpenAI-compat arm"
     );
-
-    unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
 }
 
 /// The OpenAI-compat path injects `prompt_cache_key` as a top-level key
@@ -3890,7 +3887,7 @@ fn with_live_wire_api_preserves_session_confirmed_and_reseeds_config() {
 #[tokio::test]
 async fn confirmed_swap_suppresses_prompt_on_later_turns() {
     use crate::config::providers::WireApi;
-    let _guard = endpoint_probe_test_guard();
+    let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
     let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(3).await;
     let resolved = resolved_local_request(url.clone());
@@ -3960,7 +3957,7 @@ async fn confirmed_swap_suppresses_prompt_on_later_turns() {
 #[tokio::test]
 async fn confirmed_endpoint_survives_probe_cache_expiry() {
     use crate::config::providers::WireApi;
-    let _guard = endpoint_probe_test_guard();
+    let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
     let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(3).await;
     let resolved = resolved_local_request(url.clone());
@@ -4024,7 +4021,7 @@ async fn confirmed_endpoint_survives_probe_cache_expiry() {
 #[tokio::test]
 async fn works_recorded_per_documented_contract() {
     use crate::config::providers::WireApi;
-    let _guard = endpoint_probe_test_guard();
+    let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
     let (url, _rx) = sse_capture_server().await;
     let model = build_openai_model_from_resolved(
@@ -4113,7 +4110,7 @@ async fn works_recorded_per_documented_contract() {
 #[tokio::test]
 async fn explicit_wire_api_pin_wins_over_learned() {
     use crate::config::providers::WireApi;
-    let _guard = endpoint_probe_test_guard();
+    let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
     let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(1).await;
     record_endpoint_observation(
@@ -4228,7 +4225,7 @@ fn wire_api_config_change_applies_without_rebuild() {
 #[tokio::test]
 async fn declined_swap_does_not_confirm_or_pin() {
     use crate::config::providers::WireApi;
-    let _guard = endpoint_probe_test_guard();
+    let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
     let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(1).await;
     let tmp = tempfile::TempDir::new().unwrap();
@@ -4291,7 +4288,7 @@ async fn declined_swap_does_not_confirm_or_pin() {
 #[tokio::test]
 async fn utility_model_resolves_without_recovery_context() {
     use crate::config::providers::WireApi;
-    let _guard = endpoint_probe_test_guard();
+    let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
     let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(1).await;
     record_endpoint_observation(
@@ -4339,7 +4336,7 @@ async fn utility_model_resolves_without_recovery_context() {
 
 #[tokio::test]
 async fn utility_and_streaming_share_endpoint_resolution() {
-    let _guard = endpoint_probe_test_guard();
+    let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
     let (url, mut requests) = utility_json_capture_server(3).await;
     record_endpoint_observation(
@@ -4678,7 +4675,7 @@ fn utility_params_seam_covers_all_arms() {
 
 #[tokio::test]
 async fn utility_never_prompts_or_pins() {
-    let _guard = endpoint_probe_test_guard();
+    let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
     let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(1).await;
     let tmp = tempfile::TempDir::new().unwrap();
@@ -4721,7 +4718,7 @@ async fn utility_never_prompts_or_pins() {
 
 #[tokio::test]
 async fn utility_consumes_learned_endpoint() {
-    let _guard = endpoint_probe_test_guard();
+    let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
     let (url, mut requests) = utility_json_capture_server(1).await;
     record_endpoint_observation(

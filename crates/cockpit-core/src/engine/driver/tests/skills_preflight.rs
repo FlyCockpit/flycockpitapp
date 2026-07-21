@@ -857,7 +857,7 @@ fn seed_skills_block_empty_when_nothing_requested() {
 #[tokio::test(flavor = "current_thread")]
 async fn user_invoked_skill_enters_the_seedable_set() {
     let (mut driver, tmp) = driver_with_skill_caller();
-    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
     // Refresh the driver's config snapshot now that the isolated home is in
     // place, so it carries the seeded default skills scan dir
     // (`engine-config-snapshot-adoption`).
@@ -905,7 +905,7 @@ async fn user_invoked_skill_enters_the_seedable_set() {
 #[tokio::test(flavor = "current_thread")]
 async fn failed_user_invoked_skill_does_not_enter_seedable_set() {
     let (mut driver, tmp) = driver_with_skill_caller();
-    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
 
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     driver.seed_forced_skill("missing-skill", &tx).await;

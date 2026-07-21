@@ -57,16 +57,9 @@ mod tests {
 
     #[test]
     fn no_color_suppresses_tui_box() {
-        // SAFETY: NO_COLOR is read-only-ish in tests but we set/unset
-        // around the assertion. unsafe-block satisfies the
-        // edition-2024 set_var/remove_var contract.
-        let prev = std::env::var_os("NO_COLOR");
-        unsafe { std::env::set_var("NO_COLOR", "1") };
+        let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+        env.set_var("NO_COLOR", "1");
         let suppressed = suppressed_for_tui(true);
-        match prev {
-            Some(v) => unsafe { std::env::set_var("NO_COLOR", v) },
-            None => unsafe { std::env::remove_var("NO_COLOR") },
-        }
         assert!(suppressed);
     }
 

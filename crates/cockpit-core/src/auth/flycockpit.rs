@@ -892,7 +892,8 @@ mod tests {
             response(200, r#"{"json":{"instanceId":"inst-1","instanceToken":"fci_instance_secret","account":{"userId":"user-1","email":"user@example.test"}}}"#),
         ]).await;
         let tmp = tempfile::TempDir::new().unwrap();
-        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _env =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
 
         let client = FlycockpitClient::new(&server).unwrap();
         let login = client.begin_device_code_login().await.unwrap();
@@ -968,7 +969,8 @@ mod tests {
     #[tokio::test]
     async fn logout_clear_preserves_unrelated_credentials() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _env =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
         let mut store = CredentialStore::open_default().unwrap();
         store.set_api_key("other", "keep");
         store.set(

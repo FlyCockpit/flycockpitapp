@@ -766,13 +766,11 @@ async fn bash_child_receives_session_env_overlay() {
 
 #[tokio::test]
 async fn bash_child_does_not_receive_aws_access_key_from_parent_env() {
+    let env = crate::test_env::lock_async().await;
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     ctx.session.set_sandbox_enabled(false);
-    let previous = std::env::var("AWS_ACCESS_KEY_ID").ok();
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIATESTSECRET");
-    }
+    env.set_var("AWS_ACCESS_KEY_ID", "AKIATESTSECRET");
     let out = BashTool::new()
             .call(
                 serde_json::json!({
@@ -782,14 +780,6 @@ async fn bash_child_does_not_receive_aws_access_key_from_parent_env() {
             )
             .await
             .expect("bash call returns");
-    match previous {
-        Some(value) => unsafe {
-            std::env::set_var("AWS_ACCESS_KEY_ID", value);
-        },
-        None => unsafe {
-            std::env::remove_var("AWS_ACCESS_KEY_ID");
-        },
-    }
     assert!(out.content.contains("scrubbed"), "{}", out.content);
     assert!(!out.content.contains("AKIATESTSECRET"), "{}", out.content);
 }

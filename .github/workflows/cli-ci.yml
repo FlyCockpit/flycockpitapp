@@ -73,8 +73,14 @@ jobs:
       - name: Build
         run: cargo build --locked --workspace
 
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Test
-        run: cargo test --locked --workspace
+        run: cargo nextest run --locked --workspace
+
+      - name: Doc tests
+        run: cargo test --locked --workspace --doc
 
       - name: Clippy
         run: cargo clippy --locked --workspace -- -D warnings

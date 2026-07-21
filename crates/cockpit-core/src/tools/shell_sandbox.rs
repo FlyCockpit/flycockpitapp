@@ -726,22 +726,11 @@ mod tests {
 
     #[test]
     fn runtime_manager_paths_are_derived_from_path_without_home_root() {
-        let old_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", "/home/alice");
-        }
+        let env = crate::test_env::lock();
+        env.set_var("HOME", "/home/alice");
         let paths = crate::env_snapshot::user_runtime_read_paths_from_path(Some(
             "/usr/bin:/home/alice/.nvm/versions/node/v20/bin:/home/alice/.asdf/shims",
         ));
-        if let Some(old_home) = old_home {
-            unsafe {
-                std::env::set_var("HOME", old_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("HOME");
-            }
-        }
         assert!(paths.contains(&std::path::PathBuf::from("/home/alice/.nvm")));
         assert!(paths.contains(&std::path::PathBuf::from("/home/alice/.asdf")));
         assert!(!paths.contains(&std::path::PathBuf::from("/home/alice")));

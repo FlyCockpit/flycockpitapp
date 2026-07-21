@@ -753,10 +753,8 @@ mod tests {
     #[test]
     fn open_default_creates_private_data_dir_and_db_file() {
         let tmp = TempDir::new().unwrap();
-        let old_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path());
-        }
+        let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+        env.set_var("XDG_DATA_HOME", tmp.path());
 
         let db = Db::open_default().unwrap();
         drop(db);
@@ -765,13 +763,6 @@ mod tests {
         let db_path = data_dir.join("cockpit.db");
         assert_eq!(mode(&data_dir), 0o700);
         assert_eq!(mode(&db_path), 0o600);
-
-        unsafe {
-            match old_xdg_data_home {
-                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
     }
 
     #[cfg(unix)]

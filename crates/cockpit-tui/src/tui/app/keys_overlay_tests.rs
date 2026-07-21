@@ -29,7 +29,16 @@ fn press(code: KeyCode) -> KeyEvent {
 }
 
 fn configured_app(tmp: &tempfile::TempDir) -> App {
-    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    configured_app_body(tmp)
+}
+
+async fn configured_app_async(tmp: &tempfile::TempDir) -> App {
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    configured_app_body(tmp)
+}
+
+fn configured_app_body(tmp: &tempfile::TempDir) -> App {
     let cockpit = tmp.path().join(".cockpit");
     fs::create_dir(&cockpit).unwrap();
     fs::write(cockpit.join("config.json"), "{}").unwrap();
@@ -127,6 +136,17 @@ fn single_question_dialog() -> crate::tui::dialog::question::QuestionDialog {
 
 fn app_with_sessions_preview_pane(tmp: &tempfile::TempDir) -> App {
     let mut app = configured_app(tmp);
+    app_with_sessions_preview_pane_body(tmp, &mut app);
+    app
+}
+
+async fn app_with_sessions_preview_pane_async(tmp: &tempfile::TempDir) -> App {
+    let mut app = configured_app_async(tmp).await;
+    app_with_sessions_preview_pane_body(tmp, &mut app);
+    app
+}
+
+fn app_with_sessions_preview_pane_body(tmp: &tempfile::TempDir, app: &mut App) {
     let dead_socket = tmp.path().join("no-daemon.sock");
     app.daemon_prompt = None;
     app.daemon_connected = true;
@@ -143,7 +163,6 @@ fn app_with_sessions_preview_pane(tmp: &tempfile::TempDir) -> App {
         app.launch.cwd.display().to_string(),
     )]));
     app.overlay = Overlay::Sessions(pane);
-    app
 }
 
 async fn drain_async_actions_until_idle(app: &mut App) {
@@ -210,7 +229,7 @@ fn sessions_preview_action_enqueued_on_split_render() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_preview_rpc_failure_sets_preview_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_sessions_preview_pane(&tmp);
+    let mut app = app_with_sessions_preview_pane_async(&tmp).await;
 
     let backend = TestBackend::new(120, 30);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -457,7 +476,7 @@ fn esc_on_empty_composer_in_side_conversation_is_non_destructive() {
 #[tokio::test]
 async fn side_end_restores_main_session_snapshot_and_discards_side_state() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = configured_app(&tmp);
+    let mut app = configured_app_async(&tmp).await;
     let side = fake_side_conversation(tmp.path());
     let saved_session_id = side.saved_session_id;
     app.side_conversation = Some(side);

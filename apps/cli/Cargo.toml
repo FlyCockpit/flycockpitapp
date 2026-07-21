@@ -263,7 +263,9 @@ libc = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
+cockpit-config = { path = "../../crates/cockpit-config" }
 cockpit-core = { path = "../../crates/cockpit-core", features = ["test-support"] }
+cockpit-test-support = { path = "../../crates/cockpit-test-support" }
 predicates = { workspace = true }
 tempfile = { workspace = true }
 # `test-util` enables `tokio::time::{pause, advance}` for deterministic

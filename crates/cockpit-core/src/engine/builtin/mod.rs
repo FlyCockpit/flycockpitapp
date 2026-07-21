@@ -2844,7 +2844,7 @@ mod tests {
     fn tool_tier_disabled_custom_bash_tool_is_filtered() {
         use crate::agents::{AgentDef, AgentMode, ToolTier};
         let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         write_project_config(
             tmp.path(),
             r#"{
@@ -3835,7 +3835,7 @@ mod tests {
     #[test]
     fn with_custom_tools_keeps_native_web_tools_and_user_tool_for_firecrawl() {
         let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         write_project_config(
             tmp.path(),
             r#"{
@@ -3864,7 +3864,7 @@ mod tests {
     #[test]
     fn with_custom_tools_registers_typed_custom_web_tools() {
         let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         write_project_config(
             tmp.path(),
             r#"{
@@ -3897,7 +3897,7 @@ mod tests {
     #[test]
     fn with_custom_tools_registers_only_nonblank_custom_web_commands() {
         let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         write_project_config(
             tmp.path(),
             r#"{
@@ -3925,7 +3925,7 @@ mod tests {
     #[test]
     fn with_custom_tools_allows_blank_custom_web_provider() {
         let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         write_project_config(tmp.path(), r#"{"web":{"provider":"custom"}}"#);
 
         let tb = with_custom_tools(

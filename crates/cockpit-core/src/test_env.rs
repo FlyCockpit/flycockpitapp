@@ -1,9 +1,9 @@
-use std::sync::{Mutex, MutexGuard};
+pub use cockpit_test_support::TestEnvGuard;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+pub fn lock() -> TestEnvGuard {
+    TestEnvGuard::blocking_lock()
+}
 
-pub fn lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+pub async fn lock_async() -> TestEnvGuard {
+    TestEnvGuard::lock().await
 }

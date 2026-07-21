@@ -1799,20 +1799,14 @@ fn provider_test_choice_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
     static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static WRITE_COUNT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn write_count_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        WRITE_COUNT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn write_count_test_lock() -> crate::test_env::TestEnvGuard {
+        crate::test_env::lock()
     }
 
     fn count_write(_: &WizardRun, _: &WizardAnswer) -> std::result::Result<(), String> {

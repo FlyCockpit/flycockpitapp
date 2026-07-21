@@ -26,7 +26,7 @@ fn write_config(path: &std::path::Path) {
 #[test]
 fn model_picker_selection_closes_without_local_config_write() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let cockpit = tmp.path().join(".cockpit");
     fs::create_dir(&cockpit).unwrap();
     let config_path = cockpit.join("config.json");
@@ -58,7 +58,7 @@ fn model_picker_selection_closes_without_local_config_write() {
 #[test]
 fn chrome_active_model_unchanged_on_rejected_switch() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let cockpit = tmp.path().join(".cockpit");
     fs::create_dir(&cockpit).unwrap();
     let config_path = cockpit.join("config.json");
@@ -89,7 +89,7 @@ fn chrome_active_model_unchanged_on_rejected_switch() {
 #[test]
 fn model_picker_selection_records_summary() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let cockpit = tmp.path().join(".cockpit");
     fs::create_dir(&cockpit).unwrap();
     let config_path = cockpit.join("config.json");
@@ -129,7 +129,7 @@ fn model_picker_selection_records_summary() {
 #[test]
 fn chrome_renders_session_derived_active_model() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let cockpit = tmp.path().join(".cockpit");
     fs::create_dir(&cockpit).unwrap();
     write_config(&cockpit.join("config.json"));

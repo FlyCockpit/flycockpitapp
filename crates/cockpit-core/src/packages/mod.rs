@@ -787,7 +787,8 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(clone_dir.join("pkg-a/.git")).unwrap();
         std::fs::create_dir_all(clone_dir.join("pkg-b/.git")).unwrap();
-        let _override = crate::config::dirs::test_support::CockpitConfigOverride::new(&config_path);
+        let config_override = crate::test_env::lock();
+        config_override.set_cockpit_config(&config_path);
 
         let db = Db::open_in_memory().unwrap();
         let result = import_kcl_manifest(
@@ -860,16 +861,10 @@ mod tests {
     fn legacy_import_missing_kcl_db_is_clean() {
         // Point XDG_DATA_HOME at an empty dir so kcl.db is absent.
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var("XDG_DATA_HOME").ok();
-        unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path()) };
+        let env = crate::test_env::lock();
+        env.set_var("XDG_DATA_HOME", tmp.path());
         let db = Db::open_in_memory().unwrap();
         let result = import_from_legacy_kcl_db(&db).unwrap();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
         assert!(matches!(result, KclImport::NoKclDb(_)));
     }
 }

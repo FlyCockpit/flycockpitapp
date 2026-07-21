@@ -64,7 +64,9 @@ tui-term = { version = "0.3", default-features = false, features = ["vt100"] }
 vt100 = "0.16"
 
 [dev-dependencies]
+cockpit-config = { path = "../cockpit-config" }
 cockpit-core = { path = "../cockpit-core", features = ["test-support"] }
+cockpit-test-support = { path = "../cockpit-test-support" }
 predicates = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

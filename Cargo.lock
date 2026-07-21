@@ -960,6 +960,7 @@ dependencies = [
  "cockpit-core",
  "cockpit-db",
  "cockpit-proto",
+ "cockpit-test-support",
  "cockpit-tui",
  "csv",
  "dirs",
@@ -1032,6 +1033,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "cockpit-db",
+ "cockpit-test-support",
  "dirs",
  "libc",
  "reqwest 0.13.4",
@@ -1059,6 +1061,7 @@ dependencies = [
  "cockpit-config",
  "cockpit-db",
  "cockpit-proto",
+ "cockpit-test-support",
  "croner",
  "csv",
  "dirs",
@@ -1127,6 +1130,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "cockpit-test-support",
  "dirs",
  "libc",
  "rand 0.10.2",
@@ -1158,6 +1162,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-test-support"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "cockpit-tui"
 version = "0.1.0"
 dependencies = [
@@ -1171,6 +1183,7 @@ dependencies = [
  "cockpit-core",
  "cockpit-db",
  "cockpit-proto",
+ "cockpit-test-support",
  "crossterm",
  "dirs",
  "futures",

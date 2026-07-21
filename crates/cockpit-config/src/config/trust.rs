@@ -374,6 +374,7 @@ mod tests {
 
     #[test]
     fn noninteractive_trust_enforcement_fails_without_decision() {
+        let _env = crate::test_env::lock();
         clear_runtime_policy_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -384,6 +385,7 @@ mod tests {
 
     #[test]
     fn noninteractive_trust_enforcement_rejects_untrusted() {
+        let _env = crate::test_env::lock();
         clear_runtime_policy_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -397,6 +399,7 @@ mod tests {
 
     #[test]
     fn noninteractive_trust_enforcement_accepts_ignore_config() {
+        let _env = crate::test_env::lock();
         clear_runtime_policy_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -414,12 +417,11 @@ mod tests {
 
     #[test]
     fn runtime_policy_ignores_ambient_env_without_process_cell() {
+        let env = crate::test_env::lock();
         clear_runtime_policy_for_tests();
         let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var(COCKPIT_TRUST_ROOT_ENV, tmp.path());
-            std::env::set_var(COCKPIT_TRUST_MODE_ENV, "trust");
-        }
+        env.set_var(COCKPIT_TRUST_ROOT_ENV, tmp.path());
+        env.set_var(COCKPIT_TRUST_MODE_ENV, "trust");
 
         assert!(
             runtime_policy().is_none(),

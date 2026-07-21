@@ -4,10 +4,13 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-#[cfg(unix)]
+#[cfg(all(unix, not(test)))]
 struct UmaskGuard(libc::mode_t);
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
+struct UmaskGuard;
+
+#[cfg(all(unix, not(test)))]
 impl UmaskGuard {
     fn set(mask: libc::mode_t) -> Self {
         // SAFETY: `umask` is process-global but atomic at the libc boundary.
@@ -17,7 +20,14 @@ impl UmaskGuard {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
+impl UmaskGuard {
+    fn set(_mask: libc::mode_t) -> Self {
+        Self
+    }
+}
+
+#[cfg(all(unix, not(test)))]
 impl Drop for UmaskGuard {
     fn drop(&mut self) {
         // SAFETY: Restores the process umask captured by `set`.

@@ -1416,16 +1416,11 @@ mod tests {
 
     #[test]
     fn resolve_scan_dirs_expands_dollar_var() {
-        // SAFETY: single-threaded test; we set then read a unique var.
-        unsafe {
-            std::env::set_var("COCKPIT_TEST_SKILLS_ROOT", "/var/skills");
-        }
+        let env = crate::test_env::lock();
+        env.set_var("COCKPIT_TEST_SKILLS_ROOT", "/var/skills");
         let cfg = skills_cfg(vec!["$COCKPIT_TEST_SKILLS_ROOT/sub"], false);
         let dirs = resolve_scan_dirs(Path::new("/cwd"), &cfg);
         assert_eq!(dirs, vec![PathBuf::from("/var/skills/sub")]);
-        unsafe {
-            std::env::remove_var("COCKPIT_TEST_SKILLS_ROOT");
-        }
     }
 
     #[test]

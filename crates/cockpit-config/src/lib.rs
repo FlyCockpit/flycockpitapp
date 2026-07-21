@@ -8,6 +8,7 @@
 
 pub use cockpit_db as db;
 
+#[cfg(test)]
 mod test_env;
 
 pub mod config;

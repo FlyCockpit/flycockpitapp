@@ -50,38 +50,19 @@ pub fn cockpit_state_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_env::lock()
-    }
-
     #[test]
     fn data_dir_respects_xdg() {
-        let _env = env_lock();
-        // Save and restore so other tests don't see our env change.
-        let prev = std::env::var("XDG_DATA_HOME").ok();
-        unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/xdg-data-test") };
+        let env = crate::test_env::lock();
+        env.set_var("XDG_DATA_HOME", "/tmp/xdg-data-test");
         let p = cockpit_data_dir().unwrap();
         assert_eq!(p, PathBuf::from("/tmp/xdg-data-test/cockpit"));
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
     }
 
     #[test]
     fn state_dir_respects_xdg() {
-        let _env = env_lock();
-        let prev = std::env::var("XDG_STATE_HOME").ok();
-        unsafe { std::env::set_var("XDG_STATE_HOME", "/tmp/xdg-state-test") };
+        let env = crate::test_env::lock();
+        env.set_var("XDG_STATE_HOME", "/tmp/xdg-state-test");
         let p = cockpit_state_dir().unwrap();
         assert_eq!(p, PathBuf::from("/tmp/xdg-state-test/cockpit"));
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-        }
     }
 }

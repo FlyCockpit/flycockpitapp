@@ -335,133 +335,60 @@ pub fn walk_up_to_stops(cwd: &Path) -> Vec<PathBuf> {
     out
 }
 
+#[cfg(test)]
 pub mod test_support {
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_env::lock()
-    }
-
     pub struct CockpitConfigOverride {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        old_cockpit_config: Option<std::ffi::OsString>,
+        _guard: crate::test_env::TestEnvGuard,
     }
 
     impl CockpitConfigOverride {
         pub fn new(path: &std::path::Path) -> Self {
-            let guard = env_lock();
-            let old_cockpit_config = std::env::var_os(super::COCKPIT_CONFIG_ENV);
-            // SAFETY: protected by the shared process-global test env lock.
-            unsafe {
-                std::env::set_var(super::COCKPIT_CONFIG_ENV, path);
-            }
-            Self {
-                _guard: guard,
-                old_cockpit_config,
-            }
-        }
-    }
-
-    impl Drop for CockpitConfigOverride {
-        fn drop(&mut self) {
-            // SAFETY: protected by the shared process-global test env lock.
-            unsafe {
-                match &self.old_cockpit_config {
-                    Some(v) => std::env::set_var(super::COCKPIT_CONFIG_ENV, v),
-                    None => std::env::remove_var(super::COCKPIT_CONFIG_ENV),
-                }
-            }
+            let guard = crate::test_env::lock();
+            guard.set_cockpit_config(path);
+            Self { _guard: guard }
         }
     }
 
     pub struct IsolatedCockpitHome {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        old_home: Option<std::ffi::OsString>,
-        old_xdg_data_home: Option<std::ffi::OsString>,
-        old_xdg_state_home: Option<std::ffi::OsString>,
-        old_cockpit_config: Option<std::ffi::OsString>,
+        guard: crate::test_env::TestEnvGuard,
     }
 
-    pub struct IsolatedCockpitConfigOverride {
+    pub struct IsolatedCockpitConfigOverride<'a> {
+        guard: &'a crate::test_env::TestEnvGuard,
         old_cockpit_config: Option<std::ffi::OsString>,
     }
 
     impl IsolatedCockpitHome {
         pub fn new(root: &std::path::Path) -> Self {
-            let guard = env_lock();
-            let home = root.join("home");
-            let data = root.join("data");
-            let state = root.join("state");
-            std::fs::create_dir_all(&home).unwrap();
-            std::fs::create_dir_all(&data).unwrap();
-            std::fs::create_dir_all(&state).unwrap();
-            let old_home = std::env::var_os("HOME");
-            let old_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
-            let old_xdg_state_home = std::env::var_os("XDG_STATE_HOME");
-            let old_cockpit_config = std::env::var_os(super::COCKPIT_CONFIG_ENV);
-            // SAFETY: this test-only guard serializes environment changes for
-            // tests that need a genuinely fresh cockpit config path.
-            unsafe {
-                std::env::set_var("HOME", &home);
-                std::env::set_var("XDG_DATA_HOME", &data);
-                std::env::set_var("XDG_STATE_HOME", &state);
-                std::env::remove_var(super::COCKPIT_CONFIG_ENV);
-            }
             Self {
-                _guard: guard,
-                old_home,
-                old_xdg_data_home,
-                old_xdg_state_home,
-                old_cockpit_config,
+                guard: crate::test_env::TestEnvGuard::isolate_cockpit_home_at(root),
             }
+        }
+
+        pub async fn new_async(root: &std::path::Path) -> Self {
+            let guard = crate::test_env::TestEnvGuard::lock().await;
+            guard.set_isolated_home(root);
+            Self { guard }
         }
 
         pub fn override_cockpit_config(
             &self,
             path: &std::path::Path,
-        ) -> IsolatedCockpitConfigOverride {
+        ) -> IsolatedCockpitConfigOverride<'_> {
             let old_cockpit_config = std::env::var_os(super::COCKPIT_CONFIG_ENV);
-            // SAFETY: the owning IsolatedCockpitHome already holds the shared
-            // process-global env lock for this scope.
-            unsafe {
-                std::env::set_var(super::COCKPIT_CONFIG_ENV, path);
-            }
-            IsolatedCockpitConfigOverride { old_cockpit_config }
-        }
-    }
-
-    impl Drop for IsolatedCockpitConfigOverride {
-        fn drop(&mut self) {
-            // SAFETY: the corresponding IsolatedCockpitHome still holds the
-            // shared process-global env lock while this scoped override lives.
-            unsafe {
-                match &self.old_cockpit_config {
-                    Some(v) => std::env::set_var(super::COCKPIT_CONFIG_ENV, v),
-                    None => std::env::remove_var(super::COCKPIT_CONFIG_ENV),
-                }
+            self.guard.set_cockpit_config(path);
+            IsolatedCockpitConfigOverride {
+                guard: &self.guard,
+                old_cockpit_config,
             }
         }
     }
 
-    impl Drop for IsolatedCockpitHome {
+    impl Drop for IsolatedCockpitConfigOverride<'_> {
         fn drop(&mut self) {
-            // SAFETY: protected by the same process-global test lock held by
-            // this guard.
-            unsafe {
-                match &self.old_home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-                match &self.old_xdg_data_home {
-                    Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                    None => std::env::remove_var("XDG_DATA_HOME"),
-                }
-                match &self.old_xdg_state_home {
-                    Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                    None => std::env::remove_var("XDG_STATE_HOME"),
-                }
-                match &self.old_cockpit_config {
-                    Some(v) => std::env::set_var(super::COCKPIT_CONFIG_ENV, v),
-                    None => std::env::remove_var(super::COCKPIT_CONFIG_ENV),
-                }
+            match &self.old_cockpit_config {
+                Some(v) => self.guard.set_var(super::COCKPIT_CONFIG_ENV, v),
+                None => self.guard.remove_cockpit_config(),
             }
         }
     }

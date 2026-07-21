@@ -17,7 +17,7 @@ fn press(code: KeyCode) -> KeyEvent {
 }
 
 fn configured_app(tmp: &tempfile::TempDir) -> App {
-    let _env = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let cockpit = tmp.path().join(".cockpit");
     fs::create_dir(&cockpit).unwrap();
     fs::write(cockpit.join("config.json"), "{}").unwrap();

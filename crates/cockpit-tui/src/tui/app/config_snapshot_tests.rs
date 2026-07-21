@@ -131,7 +131,7 @@ fn app_for_tree(tree: &Path) -> App {
 #[test]
 fn config_snapshot_values_match_previous_resolution() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_fixture_tree(tmp.path());
     let cwd = tmp.path();
 
@@ -229,7 +229,7 @@ fn tui_has_no_config_disk_reads_outside_bootstrap() {
 #[test]
 fn tui_bootstrap_config_load_happens_once() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_fixture_tree(tmp.path());
     reset_config_counters();
 
@@ -250,7 +250,7 @@ fn tui_bootstrap_config_load_happens_once() {
 #[test]
 fn tui_config_count_stable_across_interactions() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_fixture_tree(tmp.path());
     let mut app = app_for_tree(tmp.path());
     // Attached: `resync` signals the daemon instead of reading disk.
@@ -292,7 +292,7 @@ fn tui_config_count_stable_across_interactions() {
 #[test]
 fn attach_seeds_tui_config_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_fixture_tree(tmp.path());
     let mut app = app_for_tree(tmp.path());
     assert!(
@@ -315,7 +315,7 @@ fn attach_seeds_tui_config_snapshot() {
 #[test]
 fn pushed_config_snapshot_replaces_held_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_fixture_tree(tmp.path());
     let mut app = app_for_tree(tmp.path());
     app.apply_config_snapshot(snapshot_from_tree(tmp.path(), 3));
@@ -334,7 +334,7 @@ fn pushed_config_snapshot_replaces_held_snapshot() {
 #[test]
 fn stale_config_snapshot_push_is_ignored() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_fixture_tree(tmp.path());
     let mut app = app_for_tree(tmp.path());
     app.apply_config_snapshot(snapshot_from_tree(tmp.path(), 5));
@@ -358,7 +358,7 @@ fn stale_config_snapshot_push_is_ignored() {
 #[test]
 fn settings_write_does_not_optimistically_render() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_fixture_tree(tmp.path());
     let mut app = app_for_tree(tmp.path());
     // Seed a known held snapshot, then attach so `resync` signals the daemon.
@@ -390,7 +390,7 @@ fn settings_write_does_not_optimistically_render() {
 #[test]
 fn detached_tui_renders_from_bootstrap_without_disk_reads() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_fixture_tree(tmp.path());
     let app = app_for_tree(tmp.path());
     // Detached: no runner attached.

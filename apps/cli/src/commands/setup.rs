@@ -782,44 +782,27 @@ mod tests {
     }
 
     struct CockpitConfigEnvGuard {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        old: Option<std::ffi::OsString>,
-        old_state_home: Option<std::ffi::OsString>,
+        _guard: crate::test_env::TestEnvGuard,
     }
 
     impl CockpitConfigEnvGuard {
-        fn set(path: &std::path::Path) -> Self {
-            Self::set_with_state(
+        async fn set_async(path: &std::path::Path) -> Self {
+            Self::set_with_state_async(
                 path,
                 path.parent()
                     .unwrap_or_else(|| std::path::Path::new("/tmp")),
             )
+            .await
         }
 
-        fn set_with_state(path: &std::path::Path, state_home: &std::path::Path) -> Self {
-            let guard = crate::test_env::lock();
-            let old = std::env::var_os(COCKPIT_CONFIG_ENV);
-            let old_state_home = std::env::var_os("XDG_STATE_HOME");
-            unsafe { std::env::set_var(COCKPIT_CONFIG_ENV, path) };
-            unsafe { std::env::set_var("XDG_STATE_HOME", state_home) };
-            Self {
-                _guard: guard,
-                old,
-                old_state_home,
-            }
-        }
-    }
-
-    impl Drop for CockpitConfigEnvGuard {
-        fn drop(&mut self) {
-            match &self.old {
-                Some(value) => unsafe { std::env::set_var(COCKPIT_CONFIG_ENV, value) },
-                None => unsafe { std::env::remove_var(COCKPIT_CONFIG_ENV) },
-            }
-            match &self.old_state_home {
-                Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
-                None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
-            }
+        async fn set_with_state_async(
+            path: &std::path::Path,
+            state_home: &std::path::Path,
+        ) -> Self {
+            let guard = crate::test_env::lock_async().await;
+            guard.set_var(COCKPIT_CONFIG_ENV, path);
+            guard.set_var("XDG_STATE_HOME", state_home);
+            Self { _guard: guard }
         }
     }
 
@@ -855,7 +838,7 @@ mod tests {
     #[tokio::test]
     async fn model_wizard_terminal_end_to_end() {
         let tmp = tempfile::tempdir().unwrap();
-        let _guard = CockpitConfigEnvGuard::set(&tmp.path().join("global-config.json"));
+        let _guard = CockpitConfigEnvGuard::set_async(&tmp.path().join("global-config.json")).await;
         write_model_wizard_provider(tmp.path());
         let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, tmp.path()).unwrap();
         let mut io = ScriptIo::new(&[
@@ -979,7 +962,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_path = tmp.path().join("config/config.json");
         let state_home = tmp.path().join("state");
-        let _env = CockpitConfigEnvGuard::set_with_state(&config_path, &state_home);
+        let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         let secret = "sk-provider-secret-abcdefghijklmnopqrstuvwxyz";
         let mut io = ScriptIo::new(&["openai", "", "", "", secret, "skip-test"]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
@@ -1016,7 +999,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_path = tmp.path().join("config/config.json");
         let state_home = tmp.path().join("state");
-        let _env = CockpitConfigEnvGuard::set_with_state(&config_path, &state_home);
+        let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         let mut io = ScriptIo::new(&[
             "openai",
             "",
@@ -1053,7 +1036,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_path = tmp.path().join("config/config.json");
         let state_home = tmp.path().join("state");
-        let _env = CockpitConfigEnvGuard::set_with_state(&config_path, &state_home);
+        let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         let mut io = ScriptIo::new(&["openai", "", "", "env-var", "OPENAI_API_KEY", "skip-test"]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
@@ -1117,7 +1100,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn security_wizard_terminal_end_to_end() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _env = CockpitConfigEnvGuard::set(&tmp.path().join("config.json"));
+        let _env = CockpitConfigEnvGuard::set_async(&tmp.path().join("config.json")).await;
 
         let (run, io, _) = run_security_script(tmp.path(), &["", "", "", ""]).await;
 
@@ -1134,7 +1117,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_path = tmp.path().join("config.json");
         std::fs::write(&config_path, "{}\n").expect("write config");
-        let _env = CockpitConfigEnvGuard::set(&config_path);
+        let _env = CockpitConfigEnvGuard::set_async(&config_path).await;
 
         let (_, _, actions) = run_security_script(tmp.path(), &["", "", "", ""]).await;
 
@@ -1148,7 +1131,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn sandbox_step_writes_mode() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _env = CockpitConfigEnvGuard::set(&tmp.path().join("config.json"));
+        let _env = CockpitConfigEnvGuard::set_async(&tmp.path().join("config.json")).await;
 
         let (_, _, actions) = run_security_script(tmp.path(), &["3", "", "", ""]).await;
 
@@ -1163,7 +1146,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn trusted_only_step_toggles_policy() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _env = CockpitConfigEnvGuard::set(&tmp.path().join("config.json"));
+        let _env = CockpitConfigEnvGuard::set_async(&tmp.path().join("config.json")).await;
 
         let (_, _, actions) = run_security_script(tmp.path(), &["", "", "y", ""]).await;
 
@@ -1177,7 +1160,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn redaction_step_validates_numeric() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _env = CockpitConfigEnvGuard::set(&tmp.path().join("config.json"));
+        let _env = CockpitConfigEnvGuard::set_async(&tmp.path().join("config.json")).await;
 
         let (_, io, actions) = run_security_script(tmp.path(), &["", "", "", "0", "12"]).await;
 

@@ -572,38 +572,13 @@ mod tests {
     }
 
     struct IsolatedCockpitEnv {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _guard: crate::test_env::TestEnvGuard,
     }
 
     impl IsolatedCockpitEnv {
         fn new(root: &std::path::Path) -> Self {
-            let lock = crate::test_env::lock();
-            let vars = vec![
-                ("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME")),
-                ("XDG_CONFIG_HOME", std::env::var_os("XDG_CONFIG_HOME")),
-                ("XDG_STATE_HOME", std::env::var_os("XDG_STATE_HOME")),
-                ("COCKPIT_CONFIG", std::env::var_os("COCKPIT_CONFIG")),
-            ];
-            unsafe {
-                std::env::set_var("XDG_DATA_HOME", root.join("data"));
-                std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
-                std::env::set_var("XDG_STATE_HOME", root.join("state"));
-                std::env::remove_var("COCKPIT_CONFIG");
-            }
-            Self { _lock: lock, vars }
-        }
-    }
-
-    impl Drop for IsolatedCockpitEnv {
-        fn drop(&mut self) {
-            for (name, value) in self.vars.iter().rev() {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(name, value),
-                        None => std::env::remove_var(name),
-                    }
-                }
+            Self {
+                _guard: crate::test_env::TestEnvGuard::isolate_cockpit_home_at(root),
             }
         }
     }

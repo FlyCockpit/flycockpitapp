@@ -1073,10 +1073,6 @@ fn format_pairs_for_edit(
 mod tests {
     use super::*;
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        cockpit_core::test_env::lock()
-    }
-
     fn server(auth: Auth, enabled: bool) -> ServerConfig {
         ServerConfig {
             transport: Transport::Streamable,
@@ -1197,9 +1193,8 @@ mod tests {
     #[test]
     fn editor_masks_stored_header_secret_and_preserves_ref_when_unchanged() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _env = env_lock();
-        let old_xdg = std::env::var_os("XDG_STATE_HOME");
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+        env.set_var("XDG_STATE_HOME", tmp.path());
         let store = cockpit_core::credentials::CredentialStore::open_default().unwrap();
         store
             .save_record_merged(
@@ -1240,18 +1235,13 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("Bearer decrypted-token")
         );
-        match old_xdg {
-            Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
-        }
     }
 
     #[test]
     fn editor_replaces_stored_header_secret_only_when_new_value_typed() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _env = env_lock();
-        let old_xdg = std::env::var_os("XDG_STATE_HOME");
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+        env.set_var("XDG_STATE_HOME", tmp.path());
         let store = cockpit_core::credentials::CredentialStore::open_default().unwrap();
         store
             .save_record_merged(
@@ -1290,20 +1280,13 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("Bearer replacement-token")
         );
-        match old_xdg {
-            Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
-        }
     }
 
     #[test]
     fn editor_header_secret_builds_credential_ref_without_raw_value() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _env = env_lock();
-        let old_xdg = std::env::var_os("XDG_STATE_HOME");
-        // SAFETY: settings tests in this module run synchronously here and only
-        // need XDG_STATE_HOME isolated for this store write/read.
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+        env.set_var("XDG_STATE_HOME", tmp.path());
         let mut state = AddState::new();
         state.name.set("typefully");
         state.endpoint.set("https://api.example.com/mcp");
@@ -1326,10 +1309,6 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("Bearer secret-token")
         );
-        match old_xdg {
-            Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
-        }
     }
 }
 

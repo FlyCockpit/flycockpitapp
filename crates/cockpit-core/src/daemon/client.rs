@@ -608,8 +608,6 @@ mod tests {
     use super::*;
     use crate::daemon::DaemonPaths;
 
-    static OWN_EPHEMERAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn temp_ephemeral_paths(root: &std::path::Path, stem: &str) -> DaemonPaths {
         DaemonPaths {
             socket: root.join(format!("{stem}.sock")),
@@ -740,7 +738,7 @@ mod tests {
     /// the spawn branch (which would launch a child) is never taken.
     #[tokio::test]
     async fn connect_uses_registered_in_process_context_without_socket() {
-        let _guard = OWN_EPHEMERAL_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_env::lock_async().await;
         reset_own_ephemeral_paths_for_test();
         let root = tempfile::tempdir().expect("daemon path tempdir");
 
@@ -776,7 +774,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_own_ephemeral_uses_in_process_context() {
-        let _guard = OWN_EPHEMERAL_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_env::lock_async().await;
         reset_own_ephemeral_paths_for_test();
         let root = tempfile::tempdir().expect("daemon path tempdir");
 
@@ -812,7 +810,7 @@ mod tests {
 
     #[test]
     fn attach_own_ephemeral_reuses_cached_path() {
-        let _guard = OWN_EPHEMERAL_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_env::lock();
         let root = tempfile::tempdir().expect("daemon path tempdir");
         let own = temp_ephemeral_paths(root.path(), "cockpit-eph-test-cache");
         reset_own_ephemeral_paths_for_test();

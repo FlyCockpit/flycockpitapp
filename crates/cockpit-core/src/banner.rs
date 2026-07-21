@@ -334,26 +334,16 @@ mod tests {
         }
     }
 
-    /// Serializes every test that mutates `COCKPIT_ROOSTER` so they
-    /// don't race each other's set/restore (tests run in parallel by
-    /// default). Each guarded test saves and restores the prior value.
-    static ROOSTER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Run `f` with `COCKPIT_ROOSTER` set to `value` (or removed when
     /// `None`), serialized against other rooster-env tests, restoring
     /// the prior value afterward — even on panic.
     fn with_rooster_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
-        let guard = ROOSTER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("COCKPIT_ROOSTER");
+        let guard = crate::test_env::lock();
         match value {
-            Some(v) => unsafe { std::env::set_var("COCKPIT_ROOSTER", v) },
-            None => unsafe { std::env::remove_var("COCKPIT_ROOSTER") },
+            Some(v) => guard.set_var("COCKPIT_ROOSTER", v),
+            None => guard.remove_var("COCKPIT_ROOSTER"),
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        match prev {
-            Some(v) => unsafe { std::env::set_var("COCKPIT_ROOSTER", v) },
-            None => unsafe { std::env::remove_var("COCKPIT_ROOSTER") },
-        }
         drop(guard);
         match result {
             Ok(r) => r,

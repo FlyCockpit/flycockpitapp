@@ -1161,7 +1161,7 @@ mod tests {
     #[test]
     fn picker_annotates_last_failure() {
         let tmp = tempfile::tempdir().unwrap();
-        let _home = cockpit_config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         let cockpit = tmp.path().join(".cockpit");
         fs::create_dir(&cockpit).unwrap();
         let config_path = cockpit.join("config.json");

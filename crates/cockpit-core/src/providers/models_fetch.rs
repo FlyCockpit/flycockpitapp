@@ -1380,22 +1380,12 @@ mod tests {
     use super::*;
     use crate::config::providers::AuthKind;
 
-    /// Cargo runs tests in parallel by default. Several tests below
-    /// mutate process-wide env vars (`COPILOT_GITHUB_TOKEN`,
-    /// `XDG_STATE_HOME`, and friends) to exercise resolver fallbacks, so
-    /// they must serialize against every other test that touches those vars.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_env::lock()
-    }
-
-    fn clear_copilot_env() {
-        unsafe {
-            std::env::remove_var("COPILOT_GITHUB_TOKEN");
-            std::env::remove_var("GH_TOKEN");
-            std::env::remove_var("GITHUB_TOKEN");
-            std::env::remove_var("GITHUB_COPILOT_API_TOKEN");
-            std::env::remove_var("COPILOT_API_URL");
-        }
+    fn clear_copilot_env(env: &crate::test_env::TestEnvGuard) {
+        env.remove_var("COPILOT_GITHUB_TOKEN");
+        env.remove_var("GH_TOKEN");
+        env.remove_var("GITHUB_TOKEN");
+        env.remove_var("GITHUB_COPILOT_API_TOKEN");
+        env.remove_var("COPILOT_API_URL");
     }
 
     #[test]
@@ -1845,8 +1835,8 @@ mod tests {
 
     #[test]
     fn copilot_falls_back_to_gh_token_when_default_header_var_is_missing() {
-        let _g = env_lock();
-        clear_copilot_env();
+        let env = crate::test_env::lock();
+        clear_copilot_env(&env);
         let entry = ProviderEntry {
             url: "https://api.githubcopilot.com".into(),
             headers: vec![HeaderSpec {
@@ -1855,9 +1845,7 @@ mod tests {
             }],
             ..ProviderEntry::default()
         };
-        unsafe {
-            std::env::set_var("GH_TOKEN", "ghu_test");
-        }
+        env.set_var("GH_TOKEN", "ghu_test");
         let resolved = resolve_provider_request("copilot", &entry).unwrap();
         let auth = resolved
             .headers
@@ -1865,58 +1853,49 @@ mod tests {
             .find(|h| h.name.eq_ignore_ascii_case("authorization"))
             .unwrap();
         assert_eq!(auth.value, "Bearer ghu_test");
-        clear_copilot_env();
     }
 
     #[test]
     fn copilot_uses_direct_api_url_override() {
-        let _g = env_lock();
-        clear_copilot_env();
+        let env = crate::test_env::lock();
+        clear_copilot_env(&env);
         let entry = ProviderEntry {
             url: "https://api.githubcopilot.com".into(),
             headers: vec![],
             ..ProviderEntry::default()
         };
-        unsafe {
-            std::env::set_var("GITHUB_COPILOT_API_TOKEN", "token");
-            std::env::set_var("COPILOT_API_URL", "https://copilot-proxy.example/v1/");
-        }
+        env.set_var("GITHUB_COPILOT_API_TOKEN", "token");
+        env.set_var("COPILOT_API_URL", "https://copilot-proxy.example/v1/");
         let resolved = resolve_provider_request("copilot", &entry).unwrap();
         assert_eq!(resolved.base_url, "https://copilot-proxy.example/v1");
-        clear_copilot_env();
     }
 
     #[test]
     fn copilot_rejects_classic_pat() {
-        let _g = env_lock();
-        clear_copilot_env();
+        let env = crate::test_env::lock();
+        clear_copilot_env(&env);
         let entry = ProviderEntry {
             url: "https://api.githubcopilot.com".into(),
             headers: vec![],
             ..ProviderEntry::default()
         };
-        unsafe {
-            std::env::set_var("COPILOT_GITHUB_TOKEN", "ghp_legacy");
-        }
+        env.set_var("COPILOT_GITHUB_TOKEN", "ghp_legacy");
         let err = resolve_provider_request("copilot", &entry).unwrap_err();
         assert!(err.to_string().contains("classic GitHub PAT"));
-        clear_copilot_env();
     }
 
     #[test]
     fn copilot_detected_via_url_when_provider_id_differs() {
         // A user might add a Copilot endpoint under a custom id; the
         // resolver still picks up the documented env-var fallbacks.
-        let _g = env_lock();
-        clear_copilot_env();
+        let env = crate::test_env::lock();
+        clear_copilot_env(&env);
         let entry = ProviderEntry {
             url: "https://api.githubcopilot.com".into(),
             headers: vec![],
             ..ProviderEntry::default()
         };
-        unsafe {
-            std::env::set_var("COPILOT_GITHUB_TOKEN", "gho_via_url");
-        }
+        env.set_var("COPILOT_GITHUB_TOKEN", "gho_via_url");
         let resolved = resolve_provider_request("my-copilot", &entry).unwrap();
         let auth = resolved
             .headers
@@ -1924,24 +1903,21 @@ mod tests {
             .find(|h| h.name.eq_ignore_ascii_case("authorization"))
             .unwrap();
         assert_eq!(auth.value, "Bearer gho_via_url");
-        clear_copilot_env();
     }
 
     #[test]
     fn copilot_priority_prefers_copilot_github_token_over_gh_token() {
         // With both vars set the highest-priority source wins.
-        let _g = env_lock();
-        clear_copilot_env();
+        let env = crate::test_env::lock();
+        clear_copilot_env(&env);
         let entry = ProviderEntry {
             url: "https://api.githubcopilot.com".into(),
             headers: vec![],
             ..ProviderEntry::default()
         };
-        unsafe {
-            std::env::set_var("COPILOT_GITHUB_TOKEN", "gho_primary");
-            std::env::set_var("GH_TOKEN", "gho_secondary");
-            std::env::set_var("GITHUB_TOKEN", "gho_tertiary");
-        }
+        env.set_var("COPILOT_GITHUB_TOKEN", "gho_primary");
+        env.set_var("GH_TOKEN", "gho_secondary");
+        env.set_var("GITHUB_TOKEN", "gho_tertiary");
         let resolved = resolve_provider_request("copilot", &entry).unwrap();
         let auth = resolved
             .headers
@@ -1949,7 +1925,6 @@ mod tests {
             .find(|h| h.name.eq_ignore_ascii_case("authorization"))
             .unwrap();
         assert_eq!(auth.value, "Bearer gho_primary");
-        clear_copilot_env();
     }
 
     #[test]
@@ -1957,8 +1932,8 @@ mod tests {
         // Sanity check: with no headers and no env vars, the resolver
         // emits the documented-token guidance instead of falling back
         // to the legacy device-code path.
-        let _g = env_lock();
-        clear_copilot_env();
+        let env = crate::test_env::lock();
+        clear_copilot_env(&env);
         let entry = ProviderEntry {
             url: "https://api.githubcopilot.com".into(),
             headers: vec![],
@@ -1979,8 +1954,8 @@ mod tests {
     fn non_copilot_provider_with_missing_auth_env_errors() {
         // A non-Copilot provider whose `Authorization` references an
         // unset var must NOT silently fall back to Copilot env vars.
-        let _g = env_lock();
-        clear_copilot_env();
+        let env = crate::test_env::lock();
+        clear_copilot_env(&env);
         let entry = ProviderEntry {
             url: "https://api.example.com/v1".into(),
             headers: vec![HeaderSpec {
@@ -1989,15 +1964,11 @@ mod tests {
             }],
             ..ProviderEntry::default()
         };
-        unsafe {
-            std::env::remove_var("TOTALLY_UNSET_VAR_PROBE");
-            // Even if a Copilot fallback is set, a non-Copilot
-            // provider must not pick it up.
-            std::env::set_var("COPILOT_GITHUB_TOKEN", "gho_should_not_leak");
-        }
+        env.remove_var("TOTALLY_UNSET_VAR_PROBE");
+        // Even if a Copilot fallback is set, a non-Copilot provider must not pick it up.
+        env.set_var("COPILOT_GITHUB_TOKEN", "gho_should_not_leak");
         let err = resolve_provider_request("some-vendor", &entry).unwrap_err();
         assert!(err.to_string().contains("TOTALLY_UNSET_VAR_PROBE"));
-        clear_copilot_env();
     }
 
     #[test]
@@ -2005,8 +1976,8 @@ mod tests {
         // A fully-local endpoint (e.g. LM Studio) has no Authorization
         // header. That must resolve cleanly so /models can be fetched
         // unauthenticated rather than erroring out.
-        let _g = env_lock();
-        clear_copilot_env();
+        let env = crate::test_env::lock();
+        clear_copilot_env(&env);
         let entry = ProviderEntry {
             url: "http://localhost:1234/v1".into(),
             headers: vec![],
@@ -2040,11 +2011,9 @@ mod tests {
 
     #[tokio::test]
     async fn grok_oauth_async_resolver_injects_stored_bearer() {
-        let _g = env_lock();
+        let env = crate::test_env::lock_async().await;
         let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", tmp.path());
-        }
+        env.set_var("XDG_STATE_HOME", tmp.path());
         let mut store = crate::credentials::CredentialStore::open_default().unwrap();
         store.set(
             crate::auth::xai_oauth::CREDENTIAL_KEY,
@@ -2070,9 +2039,6 @@ mod tests {
             .find(|h| h.name.eq_ignore_ascii_case("authorization"))
             .unwrap();
         assert_eq!(auth.value, "Bearer access-1");
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-        }
     }
 
     #[test]
@@ -2094,11 +2060,9 @@ mod tests {
 
     #[tokio::test]
     async fn codex_oauth_async_resolver_injects_stored_bearer_and_codex_headers() {
-        let _g = env_lock();
+        let env = crate::test_env::lock_async().await;
         let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", tmp.path());
-        }
+        env.set_var("XDG_STATE_HOME", tmp.path());
         let mut store = crate::credentials::CredentialStore::open_default().unwrap();
         store.set(
             crate::auth::codex_oauth::CREDENTIAL_KEY,
@@ -2151,9 +2115,6 @@ mod tests {
                 .iter()
                 .any(|h| h.name.eq_ignore_ascii_case("session_id") && !h.value.is_empty())
         );
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-        }
     }
 
     fn codex_tokens(account_id: Option<&str>) -> crate::auth::codex_oauth::StoredTokens {
@@ -2166,10 +2127,8 @@ mod tests {
         }
     }
 
-    fn install_codex_tokens(tmp: &tempfile::TempDir) {
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", tmp.path());
-        }
+    fn install_codex_tokens(env: &crate::test_env::TestEnvGuard, tmp: &tempfile::TempDir) {
+        env.set_var("XDG_STATE_HOME", tmp.path());
         let mut store = crate::credentials::CredentialStore::open_default().unwrap();
         store.set(
             crate::auth::codex_oauth::CREDENTIAL_KEY,
@@ -2373,9 +2332,9 @@ mod tests {
 
     #[tokio::test]
     async fn codex_empty_success_responses_offer_fallback_catalog() {
-        let _g = env_lock();
+        let env = crate::test_env::lock_async().await;
         let tmp = tempfile::tempdir().unwrap();
-        install_codex_tokens(&tmp);
+        install_codex_tokens(&env, &tmp);
 
         for body in [r#"{"data":[]}"#, r#"{"models":[]}"#, "[]"] {
             let (base_url, request_handle) = serve_models_once(body).await;
@@ -2427,10 +2386,6 @@ mod tests {
                 other => panic!("expected fallback for empty Codex response, got {other:?}"),
             }
         }
-
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-        }
     }
 
     #[tokio::test]
@@ -2466,9 +2421,9 @@ mod tests {
 
     #[tokio::test]
     async fn codex_nonempty_slug_response_remains_live_catalog() {
-        let _g = env_lock();
+        let env = crate::test_env::lock_async().await;
         let tmp = tempfile::tempdir().unwrap();
-        install_codex_tokens(&tmp);
+        install_codex_tokens(&env, &tmp);
         let (base_url, request_handle) =
             serve_models_once(r#"{"models":[{"slug":"gpt-5.5","display_name":"GPT-5.5"}]}"#).await;
         let entry = codex_entry(base_url.clone());
@@ -2492,17 +2447,13 @@ mod tests {
             }
             other => panic!("expected live Codex catalog, got {other:?}"),
         }
-
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-        }
     }
 
     #[tokio::test]
     async fn codex_auth_failures_do_not_offer_fallback_catalog() {
-        let _g = env_lock();
+        let env = crate::test_env::lock_async().await;
         let tmp = tempfile::tempdir().unwrap();
-        install_codex_tokens(&tmp);
+        install_codex_tokens(&env, &tmp);
 
         for status in [401, 403] {
             let (base_url, request_handle) =
@@ -2523,10 +2474,6 @@ mod tests {
                     .unwrap_err();
             assert!(err.to_string().contains(&format!("returned {status}")));
             assert_eq!(request_handle.await.unwrap().len(), 1);
-        }
-
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
         }
     }
 

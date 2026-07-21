@@ -8,7 +8,17 @@ mod cli;
 mod commands;
 pub use cockpit_config as config;
 #[cfg(test)]
-pub use cockpit_core::test_env;
+pub mod test_env {
+    pub use cockpit_test_support::TestEnvGuard;
+
+    pub fn lock() -> TestEnvGuard {
+        TestEnvGuard::blocking_lock()
+    }
+
+    pub async fn lock_async() -> TestEnvGuard {
+        TestEnvGuard::lock().await
+    }
+}
 pub use cockpit_core::{
     agents, approval, assistants, auth, auto_title, browser, computer, container, credentials,
     daemon, diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,
@@ -36,9 +46,11 @@ use crate::cli::{Cli, Command};
 /// spawn boundaries (`Box::pin` in `daemon/session_worker/{handle,run}.rs`);
 /// the overflow is poll-stack depth, not future size. Probe runs
 /// (`thread_stack_size` at 2/2.5/3/4/8 MiB) show the suite fails at 2 MiB
-/// and passes at >= 2.5 MiB, so 4 MiB is the smallest sufficient
-/// power-of-two, with ~60% headroom over the observed requirement.
-const TOKIO_WORKER_STACK_SIZE: usize = 4 * 1024 * 1024;
+/// and passes at >= 2.5 MiB. Repeated full-workspace stress later still
+/// exposed load-dependent `daemon connection closed` replay failures at
+/// 4 MiB, so keep the measured 8 MiB ceiling for stable daemon integration
+/// coverage.
+const TOKIO_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 pub mod manpages {
     use std::fs;

@@ -47,6 +47,46 @@ fn explore_report_envelope_has_empty_files_and_fallback_wraps_final_text() {
     );
 }
 
+#[test]
+fn explore_deferred_items_appear_in_subagent_report() {
+    let (driver, _tmp) = test_driver(1);
+    let explore = crate::engine::builtin::load("explore", &driver.spawn_args(false)).unwrap();
+    assert!(explore.tools.names().contains(&"defer_to_orchestrator"));
+    let history = vec![Message::assistant("the assigned search is complete")];
+    let deferred = crate::engine::deferred::DeferredLog::new();
+    deferred.push("follow up on the unrelated config mismatch");
+
+    let report = assemble_subagent_report(&explore, &history, &deferred, None);
+
+    assert!(report.contains("the assigned search is complete"));
+    assert!(report.contains("[deferred to orchestrator"));
+    assert!(report.contains("- follow up on the unrelated config mismatch"));
+    assert!(deferred.is_empty(), "report assembly drains deferred items");
+}
+
+#[test]
+fn empty_deferred_log_leaves_subagent_report_unchanged() {
+    let (driver, _tmp) = test_driver(1);
+    let explore = crate::engine::builtin::load("explore", &driver.spawn_args(false)).unwrap();
+    let history = vec![Message::assistant("the bug is in foo.rs line 10")];
+    let baseline = assemble_subagent_report(
+        &explore,
+        &history,
+        &crate::engine::deferred::DeferredLog::new(),
+        None,
+    );
+
+    let report = assemble_subagent_report(
+        &explore,
+        &history,
+        &crate::engine::deferred::DeferredLog::new(),
+        None,
+    );
+
+    assert_eq!(report, baseline);
+    assert!(!report.contains("[deferred to orchestrator"));
+}
+
 /// The `docs` pipeline is exempt: a `docs`-style agent holds no `return`
 /// tool, so `assemble_subagent_report` returns its plain answer unchanged
 /// (no envelope headers).

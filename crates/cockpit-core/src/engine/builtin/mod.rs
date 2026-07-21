@@ -89,6 +89,7 @@ pub(crate) const BUILD_PROMPT_NORMAL: &str = include_str!("build.normal.md");
 pub(crate) const BUILD_PROMPT_FRONTIER: &str = include_str!("build.frontier.md");
 pub(crate) const BUILDER_PROMPT: &str = include_str!("builder.md");
 pub(crate) const BUILDER_PROMPT_NORMAL: &str = include_str!("builder.normal.md");
+#[allow(dead_code)]
 pub(crate) const BUILDER_PROMPT_FRONTIER: &str = include_str!("builder.frontier.md");
 pub(crate) const EXPLORE_PROMPT: &str = include_str!("explore.md");
 pub(crate) const EXPLORE_PROMPT_NORMAL: &str = include_str!("explore.normal.md");
@@ -2048,6 +2049,11 @@ pub fn build(args: &SpawnArgs) -> Agent {
     }
 }
 
+fn embedded_agent(name: &str, args: &SpawnArgs) -> Agent {
+    let def = crate::agents::embedded_default(name).expect("embedded agent definition exists");
+    agent_from_def(&def, args).expect("embedded agent definition materializes")
+}
+
 /// `builder` — a **write-capable** worker subagent. Holds file locks; runs
 /// bash; applies edits. Its surface mirrors `Build`'s write + full-intel +
 /// bash + skill + MCP + web, **minus** general feature-delegation: it
@@ -2056,86 +2062,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
 /// structured-return envelope. Caller-determined interactivity: interactive
 /// when spawned from `Build` (GOALS §3a/§3b).
 pub fn builder(args: &SpawnArgs) -> Agent {
-    let recursive_targets = recursive_targets(&args.config, &["docs"]);
-    let recursive_refs: Vec<&str> = recursive_targets.iter().map(String::as_str).collect();
-    let base_tools = with_write_tools(with_full_intel(
-        ToolBox::new()
-            .with(Arc::new(crate::tools::read::ReadTool))
-            .with(Arc::new(crate::tools::bash::BashTool::new())),
-    ))
-    // `question` (GOALS §3b): blocks the turn until the user answers.
-    .with(Arc::new(crate::tools::question::QuestionTool))
-    // `skill` (GOALS §5): manual on-demand skill loading.
-    .with(Arc::new(crate::tools::skill::SkillTool))
-    // MCP (GOALS §18a): Monty Python sandbox.
-    .with(Arc::new(crate::tools::mcp_tool::McpTool));
-    let tools = with_recall_tools(
-        with_custom_tools(
-            // `builder` may receive recursive delegation affordances only
-            // when its spawn context has remaining budget.
-            with_task_for_targets(base_tools, args, &recursive_refs),
-            &args.config,
-            &args.cwd,
-            &std::collections::BTreeSet::new(),
-        ),
-        args,
-    );
-    // Per-agent intent (prompt `per-agent-tool-definitions.md`): `builder` is
-    // do-it-yourself — its only `task` target is the `docs` pipeline, so the
-    // override frames `task` as "look up a dependency's usage", never general
-    // delegation. The override re-words only the description; the schema is
-    // unchanged.
-    let tools = tools.with_override(
-        "task",
-        crate::engine::tool::ToolDescOverride {
-            normal: Some(
-                "Use `task` only for docs by default for unfamiliar APIs; if docs backgrounds, the call is closed but detached/result-pending, so use the async result or task_call_id controls rather than guess or retry; otherwise do the assigned code work yourself"
-                    .to_string(),
-            ),
-            frontier: Some(
-                "Use `task` only for docs when APIs are unfamiliar; if docs backgrounds, the call is closed but detached/result-pending, so use the async result or task_call_id controls rather than guess or retry; otherwise do the assigned code work yourself"
-                    .to_string(),
-            ),
-            defensive: Some(
-                "Do the assigned code work yourself — read, lock, edit, and verify in this context. \
-                 Use `task` only to ask the `docs` pipeline how a third-party dependency's API \
-                 works — and when you need that API, asking `docs` is your first move, not a guess \
-                 or a web search, unless the exact usage pattern is clearly established in \
-                 already-read local code: a source-cited answer is worth the tokens. Do exactly \
-                 one assigned implementation slice. Do not try to delegate the feature itself or \
-                 accept new feature work outside the brief. If the request turns out to be out of \
-                 your assigned scope, return the out-of-scope ask to your caller via the structured \
-                 `return` report rather than expanding it. If a docs task returns backgrounded \
-                 task_delegation JSON, the call is closed but detached/result-pending; wait for \
-                 the async result or query/list/status by task_call_id, and read child status/error \
-                 because docs can fail, be cancelled, or be lost."
-                    .to_string(),
-            ),
-        },
-    );
-    // `return` (structured-summary envelope): `builder` is a delegated subagent,
-    // so it finishes by reporting a structured summary to its caller.
-    let tools = with_return_tool(tools, "builder");
-
-    let role = builtin_prompt_for(
-        BUILDER_PROMPT,
-        Some(BUILDER_PROMPT_NORMAL),
-        Some(BUILDER_PROMPT_FRONTIER),
-        args.llm_mode,
-    );
-    Agent {
-        name: "builder".to_string(),
-        system: compose_system_prompt_for_effective_model(role, args),
-        role_prompt: role.to_string(),
-        tools,
-        model: args.effective_model(),
-        params: args.params.clone(),
-        scan_tool_results: true,
-        llm_mode: args.llm_mode,
-        delegated: args.delegated,
-        delegation_recursion: args.delegation_recursion.clone(),
-        env_overlay: args.env_overlay.clone(),
-    }
+    embedded_agent("builder", args)
 }
 
 /// `explore` — read-only investigator. Leaf in the invocation tree
@@ -2145,54 +2072,7 @@ pub fn builder(args: &SpawnArgs) -> Agent {
 /// as the tool result. The user sees the call rendered like any other
 /// tool in the primary agent's history.
 pub fn explore(args: &SpawnArgs) -> Agent {
-    let recursive_targets = recursive_targets(&args.config, &["explore"]);
-    let recursive_refs: Vec<&str> = recursive_targets.iter().map(String::as_str).collect();
-    let base_tools = with_lsp_nav(with_full_intel(
-        ToolBox::new()
-            .with(Arc::new(crate::tools::read::ReadTool))
-            .with(Arc::new(crate::tools::bash::BashTool::new())),
-    ));
-    let base_tools = if args.delegated {
-        with_task_for_targets(base_tools, args, &recursive_refs)
-    } else {
-        base_tools
-    };
-    let tools = with_recall_tools(
-        with_custom_tools(
-            base_tools,
-            &args.config,
-            &args.cwd,
-            &std::collections::BTreeSet::new(),
-        ),
-        args,
-    );
-    // `seed` (GOALS §3c): only on a read-only noninteractive subagent in
-    // normal mode. Gated by the behavioral capability check, not just the
-    // description text.
-    let tools = maybe_with_seed_tool(tools, "explore", args.llm_mode);
-    // `return` (structured-summary envelope): `explore` is a delegated subagent.
-    // Its `files_changed` self-empties — it issues no write/edit/unlock calls.
-    let tools = with_return_tool(tools, "explore");
-
-    let role = builtin_prompt_for(
-        EXPLORE_PROMPT,
-        Some(EXPLORE_PROMPT_NORMAL),
-        None,
-        args.llm_mode,
-    );
-    Agent {
-        name: "explore".to_string(),
-        system: compose_system_prompt_for_effective_model(role, args),
-        role_prompt: role.to_string(),
-        tools,
-        model: args.effective_model(),
-        params: args.params.clone(),
-        scan_tool_results: false,
-        llm_mode: args.llm_mode,
-        delegated: args.delegated,
-        delegation_recursion: args.delegation_recursion.clone(),
-        env_overlay: args.env_overlay.clone(),
-    }
+    embedded_agent("explore", args)
 }
 
 /// `deepthink` — optional tool-free reasoning worker. It is intentionally a
@@ -2680,6 +2560,72 @@ mod tests {
     }
 
     #[test]
+    fn loaded_builder_has_defer_to_orchestrator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let agent = load("builder", &args).unwrap();
+
+        assert!(agent.tools.names().contains(&"defer_to_orchestrator"));
+    }
+
+    #[test]
+    fn loaded_explore_has_defer_to_orchestrator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let agent = load("explore", &args).unwrap();
+
+        assert!(agent.tools.names().contains(&"defer_to_orchestrator"));
+    }
+
+    #[test]
+    fn bundled_agents_without_defer_to_orchestrator_stay_without_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+
+        for name in ["bee", "scout", "deepthink", "Auto", "Build", "Plan"] {
+            let agent = load(name, &args).unwrap();
+            assert!(
+                !agent.tools.names().contains(&"defer_to_orchestrator"),
+                "{name} must not carry defer_to_orchestrator"
+            );
+        }
+    }
+
+    #[test]
+    fn defer_to_orchestrator_is_last_in_builder_and_explore_defs() {
+        for name in ["builder", "explore"] {
+            let def = crate::agents::embedded_default(name).unwrap();
+            let tools = def.tools.as_ref().expect("built-in def has tools");
+
+            assert_eq!(
+                tools.last().map(String::as_str),
+                Some("defer_to_orchestrator"),
+                "{name} must append defer_to_orchestrator last"
+            );
+        }
+    }
+
+    #[test]
+    fn factory_and_def_tool_surfaces_agree_for_builder_and_explore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+
+        for (name, factory) in [
+            ("builder", builder as fn(&SpawnArgs) -> Agent),
+            ("explore", explore as fn(&SpawnArgs) -> Agent),
+        ] {
+            let loaded = load(name, &args).unwrap();
+            let factory_agent = factory(&args);
+
+            assert_eq!(
+                sorted_tool_names(&loaded),
+                sorted_tool_names(&factory_agent),
+                "{name} factory and AgentDef surfaces must agree"
+            );
+        }
+    }
+
+    #[test]
     fn builtin_agent_grant_internal_defs_exist_and_construct() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
@@ -2819,7 +2765,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_tier_structural_tools_are_absent_from_monty_registry() {
+    fn tool_tier_structural_tools_including_defer_to_orchestrator_are_absent_from_monty_registry() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = swarm(&test_spawn_args(tmp.path()));
         let host = host_for_agent(&agent, tmp.path());
@@ -4120,7 +4066,7 @@ mod tests {
     }
 
     #[test]
-    fn delegated_explore_recursion_is_same_model_explore_only() {
+    fn delegated_explore_stays_leaf_without_task_grant() {
         let tmp = tempfile::tempdir().unwrap();
         let mut args = test_spawn_args(tmp.path());
         args.delegated = true;
@@ -4132,16 +4078,8 @@ mod tests {
         };
 
         let agent = explore(&args);
-        let task = task_definition(&agent, crate::config::extended::LlmMode::Normal);
-        assert!(
-            task.description.contains("same resolved model"),
-            "{}",
-            task.description
-        );
-        let agent_enum = task.parameters["properties"]["payload"]["properties"]["agent"]["enum"]
-            .as_array()
-            .expect("agent enum");
-        assert_eq!(agent_enum, &vec![serde_json::json!("explore")]);
+        assert!(!agent.tools.names().contains(&"task"));
+        assert!(is_read_only_noninteractive(&agent));
     }
 
     #[test]
@@ -4340,7 +4278,7 @@ mod tests {
                 .iter()
                 .map(|value| value.as_str().expect("string enum value"))
                 .collect();
-        assert_eq!(enum_values, vec!["docs"]);
+        assert_eq!(enum_values, vec!["explore", "docs"]);
     }
 
     #[test]

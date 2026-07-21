@@ -3665,10 +3665,9 @@ pub(crate) async fn run_noninteractive_resumable(
     let mut next_prompt = Message::user(brief);
     let mut fallback_decision: Option<crate::engine::agent::BackupFallbackDecision> = None;
     let mut fallback_tried: Vec<crate::engine::agent::FailoverAttempt> = Vec::new();
-    // A noninteractive subagent's own deferred-log (`plan.md §3d`). The
-    // bundled leaves (explore/docs) lack `defer_to_orchestrator`, so this
-    // stays empty for them; a custom subagent that holds the tool gets its
-    // deferred items folded into the leaf report it returns up.
+    // A noninteractive subagent's own deferred-log (`plan.md §3d`). Agents
+    // that hold `defer_to_orchestrator` get their deferred items folded into
+    // the leaf report they return up; agents without it keep this buffer empty.
     let deferred_log = crate::engine::deferred::DeferredLog::new();
 
     for _ in 0..max_turns {

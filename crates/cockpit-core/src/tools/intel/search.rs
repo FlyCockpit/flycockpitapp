@@ -115,7 +115,7 @@ impl Tool for SearchTool {
             context: context.map(|n| n as usize),
             glob: glob.map(ToString::to_string),
             max_matches: MAX_SEARCH_MATCHES,
-            hidden: true,
+            hidden: false,
             parents: true,
         };
         let outcome = tokio::task::spawn_blocking(move || {

@@ -4,16 +4,15 @@
 //! `outline`, `symbol_find`, `word`, `deps`, `hot`, `circular`,
 //! `search`, `impact`, `change_impact`, and `context_pack`. Each index-backed tool calls
 //! [`crate::intel::Index::ensure_fresh`] first so it never answers from stale data.
-//! `hot` is pure-FS (no index). `search` and `symbol_find` additionally
+//! `hot` is pure-FS (no index). `search` uses the shared in-process text
+//! walker, honors gitignore, searches hidden files that gitignore permits, and
+//! prunes `.git/` directories. `search` and `symbol_find` additionally
 //! apply call-graph centrality ranking (additive, default-on,
 //! config-gated via `extended.intelCentralityRanking`); `impact` reports
 //! a symbol's high-precision-resolved callers and calls.
-//! `search` shells `rg --json` (falling back to `grep -rn`) and
-//! budget-caps its output via [`crate::intel::budget::BudgetedWriter`].
-//! The `rg --json`/`grep -rn` path emits `path:line:text`; the `grep`
-//! fallback's context case (`-C{n}`) is a known limitation — its context
-//! lines use a `path-line-text` (dash) separator that isn't carried
-//! through cleanly.
+//! `search` emits `path:line[:column]: text` matches and `path:line- text`
+//! context lines, then budget-caps its output via
+//! [`crate::intel::budget::BudgetedWriter`].
 //!
 //! Output never self-scrubs: `engine::agent::turn` runs every tool
 //! result through `redact::scrub` before it reaches the model.

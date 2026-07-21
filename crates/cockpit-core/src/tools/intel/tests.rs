@@ -81,6 +81,33 @@ async fn tree_and_hot_list_unknown_language_files() {
 }
 
 #[tokio::test]
+async fn hot_lists_recently_modified_hidden_files() {
+    clear_freshness_cache();
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
+    write(tmp.path(), ".github/workflows/ci.yml", "name: ci\n");
+    write(tmp.path(), ".git/COMMIT_EDITMSG", "hidden git noise\n");
+    let ctx = test_ctx(tmp.path());
+
+    let hot = HotTool
+        .call(serde_json::json!({ "limit": 20 }), &ctx)
+        .await
+        .unwrap();
+
+    assert!(
+        hot.content.contains(".github/workflows/ci.yml"),
+        "{}",
+        hot.content
+    );
+    assert!(
+        !hot.content.contains(".git/COMMIT_EDITMSG"),
+        "{}",
+        hot.content
+    );
+    clear_freshness_cache();
+}
+
+#[tokio::test]
 async fn tree_lists_files_including_unknown_language_files() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
@@ -499,6 +526,33 @@ async fn search_directory_unchanged() {
 }
 
 #[tokio::test]
+async fn search_matches_files_under_dot_github() {
+    clear_freshness_cache();
+    let tmp = tempfile::tempdir().unwrap();
+    let needle = "hidden_search_tool_needle";
+    write(tmp.path(), ".github/workflows/ci.yml", needle);
+    write(tmp.path(), ".git/COMMIT_EDITMSG", needle);
+    let ctx = test_ctx(tmp.path());
+
+    let out = SearchTool
+        .call(serde_json::json!({ "pattern": needle }), &ctx)
+        .await
+        .unwrap();
+
+    assert!(
+        out.content.contains(".github/workflows/ci.yml"),
+        "{}",
+        out.content
+    );
+    assert!(
+        !out.content.contains(".git/COMMIT_EDITMSG"),
+        "{}",
+        out.content
+    );
+    clear_freshness_cache();
+}
+
+#[tokio::test]
 async fn search_in_process_preserves_columns_context_glob_and_ignore_case() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/a.rs", "first\n  Alpha target\nthird\n");
@@ -631,6 +685,33 @@ async fn context_pack_overview_on_multifile_fixture() {
     assert!(out.content.contains("entry candidates:"), "{}", out.content);
     assert!(out.content.contains("src/lib.rs"), "{}", out.content);
     assert!(out.content.contains("next:"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn context_pack_overview_lists_hidden_files() {
+    clear_freshness_cache();
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
+    write(tmp.path(), ".github/workflows/ci.yml", "name: ci\n");
+    write(tmp.path(), ".git/COMMIT_EDITMSG", "hidden git noise\n");
+    let ctx = test_ctx(tmp.path());
+
+    let out = ContextPackTool
+        .call(serde_json::json!({ "kind": "overview", "limit": 20 }), &ctx)
+        .await
+        .unwrap();
+
+    assert!(
+        out.content.contains(".github/workflows/ci.yml"),
+        "{}",
+        out.content
+    );
+    assert!(
+        !out.content.contains(".git/COMMIT_EDITMSG"),
+        "{}",
+        out.content
+    );
+    clear_freshness_cache();
 }
 
 #[tokio::test]

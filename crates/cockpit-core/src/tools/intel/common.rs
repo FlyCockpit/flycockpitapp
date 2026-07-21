@@ -302,13 +302,14 @@ fn list_file_metas_from(root: &Path, walk_root: &Path) -> Vec<FsFileMeta> {
     let mut out = Vec::new();
     let mut walker = WalkBuilder::new(walk_root);
     walker
-        .hidden(true)
+        .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .parents(true)
         .require_git(false)
-        .follow_links(false);
+        .follow_links(false)
+        .filter_entry(crate::tools::text_search::is_not_dot_git_dir);
     for dent in walker.build().flatten() {
         if !dent.file_type().is_some_and(|t| t.is_file()) {
             continue;

@@ -18,15 +18,31 @@ pub struct SearchRecord {
     pub is_context: bool,
 }
 
+/// Options for the shared text-search walker.
+///
+/// The `ignore` crate uses several booleans with "skip" polarity. Keep these
+/// comments aligned with `ignore::WalkBuilder` so callers do not accidentally
+/// hide files they intend to search.
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
+    /// Regex pattern passed to `grep_regex`.
     pub pattern: String,
+    /// When true, search with a case-insensitive regex wrapper.
     pub case_insensitive: bool,
+    /// When true, include the first match column in non-context records.
     pub columns: bool,
+    /// Number of context lines before and after each match.
     pub context: Option<usize>,
+    /// Optional include glob, using `ignore::overrides` syntax.
     pub glob: Option<String>,
+    /// Maximum non-context matches before truncating the walk.
     pub max_matches: usize,
+    /// Mirrors `ignore::WalkBuilder::hidden`: true means hidden entries are
+    /// skipped. Current callers pass false so repo search covers hidden files
+    /// that gitignore permits.
     pub hidden: bool,
+    /// Mirrors `ignore::WalkBuilder::parents`: true means parent ignore files
+    /// are consulted.
     pub parents: bool,
 }
 
@@ -64,7 +80,8 @@ where
         .git_exclude(true)
         .parents(options.parents)
         .require_git(false)
-        .follow_links(false);
+        .follow_links(false)
+        .filter_entry(is_not_dot_git_dir);
     if let Some(glob) = &options.glob {
         let mut overrides = OverrideBuilder::new(search_root);
         overrides.add(glob).map_err(|e| {
@@ -208,11 +225,193 @@ fn first_match_column(matcher: &RegexMatcher, line: &[u8]) -> Option<usize> {
     matcher.find(line).ok().flatten().map(|mat| mat.start() + 1)
 }
 
+pub(crate) fn is_not_dot_git_dir(entry: &ignore::DirEntry) -> bool {
+    !(entry.file_type().is_some_and(|t| t.is_dir()) && entry.file_name() == ".git")
+}
+
 pub fn normalize_display_root(target: &Path) -> (PathBuf, PathBuf) {
     if target.is_file() {
         let parent = target.parent().unwrap_or(Path::new(".")).to_path_buf();
         (target.to_path_buf(), parent)
     } else {
         (target.to_path_buf(), target.to_path_buf())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NEEDLE: &str = "hidden_search_unique_needle";
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn options(pattern: &str) -> SearchOptions {
+        SearchOptions {
+            pattern: pattern.to_string(),
+            case_insensitive: false,
+            columns: true,
+            context: None,
+            glob: None,
+            max_matches: 100,
+            hidden: false,
+            parents: true,
+        }
+    }
+
+    fn search(root: &Path, options: &SearchOptions) -> SearchOutcome {
+        search_records_blocking(root, root, options, |_| true).unwrap()
+    }
+
+    fn paths(outcome: &SearchOutcome) -> Vec<&str> {
+        outcome
+            .records
+            .iter()
+            .filter(|record| !record.is_context)
+            .map(|record| record.path.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn search_records_never_descend_into_dot_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".git/COMMIT_EDITMSG", NEEDLE);
+        write(tmp.path(), "nested/.git/HEAD", NEEDLE);
+        write(tmp.path(), ".github/workflows/ci.yml", NEEDLE);
+        write(tmp.path(), ".gitignore", NEEDLE);
+
+        for hidden in [true, false] {
+            let mut opts = options(NEEDLE);
+            opts.hidden = hidden;
+            let outcome = search(tmp.path(), &opts);
+            let found = paths(&outcome);
+
+            assert!(!found.contains(&".git/COMMIT_EDITMSG"), "{found:?}");
+            assert!(!found.contains(&"nested/.git/HEAD"), "{found:?}");
+        }
+    }
+
+    #[test]
+    fn search_records_match_dot_github_and_dotfiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".git/COMMIT_EDITMSG", NEEDLE);
+        write(tmp.path(), "nested/.git/HEAD", NEEDLE);
+        write(tmp.path(), ".github/workflows/ci.yml", NEEDLE);
+        write(tmp.path(), ".gitignore", NEEDLE);
+        write(tmp.path(), ".gitattributes", NEEDLE);
+
+        let mut opts = options(NEEDLE);
+        opts.hidden = false;
+        let outcome = search(tmp.path(), &opts);
+        let found = paths(&outcome);
+
+        assert!(found.contains(&".github/workflows/ci.yml"), "{found:?}");
+        assert!(found.contains(&".gitignore"), "{found:?}");
+        assert!(found.contains(&".gitattributes"), "{found:?}");
+        assert!(!found.contains(&".git/COMMIT_EDITMSG"), "{found:?}");
+        assert!(!found.contains(&"nested/.git/HEAD"), "{found:?}");
+    }
+
+    #[test]
+    fn search_records_respect_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".gitignore", "ignored.txt\n");
+        write(tmp.path(), "ignored.txt", NEEDLE);
+        write(tmp.path(), "visible.txt", NEEDLE);
+
+        let outcome = search(tmp.path(), &options(NEEDLE));
+        let found = paths(&outcome);
+
+        assert!(found.contains(&"visible.txt"), "{found:?}");
+        assert!(!found.contains(&"ignored.txt"), "{found:?}");
+    }
+
+    #[test]
+    fn search_records_honor_allow_entry_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "allowed.txt", NEEDLE);
+        write(tmp.path(), "blocked.txt", NEEDLE);
+        let blocked = tmp.path().join("blocked.txt");
+
+        let outcome = search_records_blocking(tmp.path(), tmp.path(), &options(NEEDLE), |path| {
+            path != blocked
+        })
+        .unwrap();
+        let found = paths(&outcome);
+
+        assert!(found.contains(&"allowed.txt"), "{found:?}");
+        assert!(!found.contains(&"blocked.txt"), "{found:?}");
+    }
+
+    #[test]
+    fn search_records_case_insensitive_and_context_and_glob() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "src/a.rs", "before\nAlpha target\nafter\n");
+        write(
+            tmp.path(),
+            "src/b.txt",
+            "Alpha should be excluded by glob\n",
+        );
+
+        let mut opts = options("alpha");
+        assert!(search(tmp.path(), &opts).records.is_empty());
+
+        opts.case_insensitive = true;
+        opts.context = Some(1);
+        opts.glob = Some("*.rs".to_string());
+        let outcome = search(tmp.path(), &opts);
+
+        assert!(paths(&outcome).contains(&"src/a.rs"), "{outcome:?}");
+        assert!(!paths(&outcome).contains(&"src/b.txt"), "{outcome:?}");
+        assert!(
+            outcome.records.iter().any(|record| record.is_context
+                && record.path == "src/a.rs"
+                && record.text == "before"),
+            "{outcome:?}"
+        );
+        assert!(
+            outcome.records.iter().any(|record| !record.is_context
+                && record.path == "src/a.rs"
+                && record.column == Some(1)),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn search_records_report_hit_match_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "a.txt", &format!("{NEEDLE}\n{NEEDLE}\n"));
+
+        let mut opts = options(NEEDLE);
+        opts.max_matches = 1;
+        let outcome = search(tmp.path(), &opts);
+
+        assert!(outcome.hit_match_cap, "{outcome:?}");
+        assert_eq!(
+            outcome
+                .records
+                .iter()
+                .filter(|record| !record.is_context)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_records_invalid_regex_is_invalid_input() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let err = search_records_blocking(tmp.path(), tmp.path(), &options("["), |_| true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("invalid regex `[`"), "{err}");
+        assert!(err.contains("unbalanced brackets"), "{err}");
     }
 }

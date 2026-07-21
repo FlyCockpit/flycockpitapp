@@ -768,7 +768,7 @@ async fn in_process_text_hits(
         context: None,
         glob: None,
         max_matches: max_hits,
-        hidden: true,
+        hidden: false,
         parents: true,
     };
     let outcome = tokio::task::spawn_blocking(move || {

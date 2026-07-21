@@ -377,7 +377,7 @@ mod tests {
         let second_ctx = ctx.clone();
         let second = tokio::spawn(async move {
             let mut state = state;
-            let result = handle_request(
+            handle_request(
                 Request::SendUserMessage {
                     text: "second turn".into(),
                     display_text: None,
@@ -388,8 +388,7 @@ mod tests {
                 &mut state,
                 &second_ctx,
             )
-            .await;
-            result
+            .await
         });
         let second_work = tokio::time::timeout(std::time::Duration::from_secs(2), work_rx.recv())
             .await
@@ -420,7 +419,10 @@ mod tests {
         };
         respond_to.send((item.clone(), vec![item])).unwrap();
         assert!(matches!(
-            second.await.expect("second turn joins").expect("second turn completes"),
+            second
+                .await
+                .expect("second turn joins")
+                .expect("second turn completes"),
             Response::UserMessageQueued { .. }
         ));
     }
@@ -454,7 +456,13 @@ mod tests {
                 true,
                 None,
             ),
-            (Request::ListAssistants, "list_assistants", None, false, None),
+            (
+                Request::ListAssistants,
+                "list_assistants",
+                None,
+                false,
+                None,
+            ),
             (
                 Request::CreateAssistantSession {
                     name: "helper".into(),
@@ -512,12 +520,12 @@ mod tests {
         for (request, kind, session, mutating, audit_path) in cases {
             assert_eq!(principal::request_kind(&request), kind);
             assert_eq!(request_session_id(&request, &state), session, "{kind}");
+            assert_eq!(is_remote_mutating_request(&request), mutating, "{kind}");
             assert_eq!(
-                is_remote_mutating_request(&request),
-                mutating,
+                request_audit_path(&request).as_deref(),
+                audit_path,
                 "{kind}"
             );
-            assert_eq!(request_audit_path(&request).as_deref(), audit_path, "{kind}");
         }
     }
 
@@ -597,7 +605,10 @@ mod tests {
     #[tokio::test]
     async fn stats_rollup_runs_off_request_loop() {
         let ctx = test_ctx();
-        let session = ctx.db.create_session("project-1", "/repo", "Build").unwrap();
+        let session = ctx
+            .db
+            .create_session("project-1", "/repo", "Build")
+            .unwrap();
         ctx.db
             .insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
                 call_id: Uuid::new_v4(),
@@ -939,10 +950,13 @@ mod tests {
         assert_eq!(data.filename_extension, "zip");
         assert_eq!(data.mime, "application/zip");
         assert_eq!(data.session_count, Some(1));
-        assert_eq!(data.byte_len, base64::engine::general_purpose::STANDARD
-            .decode(data.content_base64.as_bytes())
-            .unwrap()
-            .len());
+        assert_eq!(
+            data.byte_len,
+            base64::engine::general_purpose::STANDARD
+                .decode(data.content_base64.as_bytes())
+                .unwrap()
+                .len()
+        );
         assert!(data.redacted);
     }
 
@@ -1570,7 +1584,8 @@ mod tests {
             .expect("connector wake delivered")
             .expect("wake sender alive");
 
-        let stored = crate::auth::flycockpit::load_credential_from_path(credential_path.clone()).unwrap();
+        let stored =
+            crate::auth::flycockpit::load_credential_from_path(credential_path.clone()).unwrap();
         assert_eq!(stored, credential);
 
         #[cfg(unix)]
@@ -2229,71 +2244,331 @@ mod tests {
     fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
         use DispatchEffectClass::{DriverForwarded, Durable, InMemory};
         vec![
-            MutatingDispatchCase { kind: "attach", effect_class: Durable, observation: "attached response plus live session registration" },
-            MutatingDispatchCase { kind: "send_user_message", effect_class: DriverForwarded, observation: "SessionWork::UserMessage delivered to attached worker" },
-            MutatingDispatchCase { kind: "steer_delegation", effect_class: DriverForwarded, observation: "SessionWork::SteerDelegation delivered to live target worker" },
-            MutatingDispatchCase { kind: "begin_attachment_upload", effect_class: InMemory, observation: "upload id accepted by later chunk request on same connection" },
-            MutatingDispatchCase { kind: "upload_attachment_chunk", effect_class: InMemory, observation: "chunk advances upload so finish succeeds" },
-            MutatingDispatchCase { kind: "finish_attachment_upload", effect_class: InMemory, observation: "ready image ref can be consumed by a later user message request" },
-            MutatingDispatchCase { kind: "cancel_attachment_upload", effect_class: InMemory, observation: "cancelled upload id cannot be finished" },
-            MutatingDispatchCase { kind: "remove_queued_user_message", effect_class: DriverForwarded, observation: "SessionWork::RemoveQueuedUserMessage delivered to attached worker" },
-            MutatingDispatchCase { kind: "remove_newest_queued_user_message", effect_class: DriverForwarded, observation: "SessionWork::RemoveNewestQueuedUserMessage delivered to attached worker" },
-            MutatingDispatchCase { kind: "remove_editable_queued_user_messages", effect_class: DriverForwarded, observation: "SessionWork::RemoveEditableQueuedUserMessages delivered to attached worker" },
-            MutatingDispatchCase { kind: "resume_paused_work", effect_class: Durable, observation: "paused_session_work status becomes resumed" },
-            MutatingDispatchCase { kind: "cancel_paused_work", effect_class: Durable, observation: "paused_session_work status becomes cancelled" },
-            MutatingDispatchCase { kind: "repair_resume", effect_class: DriverForwarded, observation: "SessionWork::RepairResume delivered to attached worker" },
-            MutatingDispatchCase { kind: "set_goal_status", effect_class: Durable, observation: "session goal status changes" },
-            MutatingDispatchCase { kind: "clear_goal", effect_class: Durable, observation: "session goal is closed" },
-            MutatingDispatchCase { kind: "create_assistant_session", effect_class: Durable, observation: "deferred assistant session worker is registered" },
-            MutatingDispatchCase { kind: "auto_title", effect_class: Durable, observation: "untitled session row receives generated title" },
-            MutatingDispatchCase { kind: "curator", effect_class: Durable, observation: "skill curator state changes through daemon-owned DB/filesystem path" },
-            MutatingDispatchCase { kind: "cancel_turn", effect_class: DriverForwarded, observation: "SessionWork::Cancel delivered to attached worker" },
-            MutatingDispatchCase { kind: "fs_write", effect_class: Durable, observation: "file contents written under project root" },
-            MutatingDispatchCase { kind: "fs_create_dir", effect_class: Durable, observation: "directory created under project root" },
-            MutatingDispatchCase { kind: "fs_rename", effect_class: Durable, observation: "file moves from source path to destination path" },
-            MutatingDispatchCase { kind: "fs_delete", effect_class: Durable, observation: "file removed under project root" },
-            MutatingDispatchCase { kind: "open_terminal", effect_class: InMemory, observation: "terminal id can be closed on same connection" },
-            MutatingDispatchCase { kind: "close_terminal", effect_class: InMemory, observation: "closed terminal rejects later attachment" },
-            MutatingDispatchCase { kind: "lsp_control", effect_class: InMemory, observation: "typed result and notice event emitted for attached session" },
-            MutatingDispatchCase { kind: "resolve_interrupt", effect_class: DriverForwarded, observation: "SessionWork::ResolveInterrupt delivered to attached worker" },
-            MutatingDispatchCase { kind: "archive_session", effect_class: Durable, observation: "session archived_at becomes set" },
-            MutatingDispatchCase { kind: "unarchive_session", effect_class: Durable, observation: "session archived_at is cleared" },
-            MutatingDispatchCase { kind: "fork_session", effect_class: Durable, observation: "fork session row references parent session" },
-            MutatingDispatchCase { kind: "discard_session", effect_class: Durable, observation: "ephemeral session row is deleted" },
-            MutatingDispatchCase { kind: "btw_create", effect_class: Durable, observation: "hidden persistent btw fork row references parent session" },
-            MutatingDispatchCase { kind: "btw_end", effect_class: Durable, observation: "hidden persistent btw fork row is deleted" },
-            MutatingDispatchCase { kind: "rename_session", effect_class: Durable, observation: "session title is updated" },
-            MutatingDispatchCase { kind: "share_session", effect_class: Durable, observation: "shared_with_collaborators flag changes" },
-            MutatingDispatchCase { kind: "record_session_note", effect_class: Durable, observation: "user_note session event is persisted" },
-            MutatingDispatchCase { kind: "delete_session", effect_class: Durable, observation: "session row is deleted" },
-            MutatingDispatchCase { kind: "promote_resource", effect_class: InMemory, observation: "queued resource request status changes to promoted response" },
-            MutatingDispatchCase { kind: "create_scheduled_job", effect_class: Durable, observation: "scheduled job row is persisted in the shared daemon" },
-            MutatingDispatchCase { kind: "delete_scheduled_job", effect_class: Durable, observation: "scheduled job row is deleted in the shared daemon" },
-            MutatingDispatchCase { kind: "set_scheduled_job_enabled", effect_class: Durable, observation: "scheduled job enabled state changes in the shared daemon" },
-            MutatingDispatchCase { kind: "run_scheduled_job", effect_class: Durable, observation: "scheduled job run result is recorded in the shared daemon" },
-            MutatingDispatchCase { kind: "set_active_model", effect_class: DriverForwarded, observation: "SessionWork::SetActiveModel delivered to attached worker" },
-            MutatingDispatchCase { kind: "set_agent", effect_class: DriverForwarded, observation: "SessionWork::SetAgent delivered to attached worker" },
-            MutatingDispatchCase { kind: "set_llm_mode", effect_class: DriverForwarded, observation: "SessionWork::SetLlmMode delivered to attached worker" },
-            MutatingDispatchCase { kind: "set_session_llm_mode", effect_class: DriverForwarded, observation: "SessionWork::SetSessionLlmMode delivered to attached worker" },
-            MutatingDispatchCase { kind: "set_approval_mode", effect_class: InMemory, observation: "approval mode response and broadcast event reflect new mode" },
-            MutatingDispatchCase { kind: "set_delegation_recursion", effect_class: DriverForwarded, observation: "SessionWork::SetDelegationRecursion delivered to attached worker" },
-            MutatingDispatchCase { kind: "set_sandbox", effect_class: InMemory, observation: "sandbox state response and broadcast event reflect new mode" },
-            MutatingDispatchCase { kind: "set_sandbox_escalation", effect_class: InMemory, observation: "sandbox escalation response and broadcast event reflect new state" },
-            MutatingDispatchCase { kind: "set_preflight", effect_class: DriverForwarded, observation: "SessionWork::SetPreflight delivered to attached worker" },
-            MutatingDispatchCase { kind: "set_trusted_only", effect_class: DriverForwarded, observation: "SessionWork::SetTrustedOnly delivered to attached worker" },
-            MutatingDispatchCase { kind: "set_redaction", effect_class: DriverForwarded, observation: "SessionWork::SetRedaction delivered to attached worker" },
-            MutatingDispatchCase { kind: "set_tandem_models", effect_class: DriverForwarded, observation: "SessionWork::SetTandemModels delivered to attached worker" },
-            MutatingDispatchCase { kind: "set_caffeinate", effect_class: InMemory, observation: "caffeinate response plus global state event" },
-            MutatingDispatchCase { kind: "cancel_schedule", effect_class: DriverForwarded, observation: "SessionWork::CancelSchedule delivered to attached worker" },
-            MutatingDispatchCase { kind: "prune", effect_class: DriverForwarded, observation: "SessionWork::Prune delivered to attached worker" },
-            MutatingDispatchCase { kind: "compact", effect_class: DriverForwarded, observation: "SessionWork::Compact delivered to attached worker" },
-            MutatingDispatchCase { kind: "pin", effect_class: DriverForwarded, observation: "SessionWork::Pin delivered to attached worker" },
-            MutatingDispatchCase { kind: "store_flycockpit_credential", effect_class: Durable, observation: "credential file is written" },
-            MutatingDispatchCase { kind: "clear_flycockpit_credential", effect_class: Durable, observation: "credential store no longer loads a credential" },
-            MutatingDispatchCase { kind: "refresh_env", effect_class: InMemory, observation: "attached worker env overlay changes" },
-            MutatingDispatchCase { kind: "refresh_config", effect_class: InMemory, observation: "attached worker config snapshot generation changes" },
-            MutatingDispatchCase { kind: "record_usage", effect_class: Durable, observation: "usage count appears in subsequent usage_counts query" },
-            MutatingDispatchCase { kind: "stop_daemon", effect_class: InMemory, observation: "shutdown context enters draining phase" },
+            MutatingDispatchCase {
+                kind: "attach",
+                effect_class: Durable,
+                observation: "attached response plus live session registration",
+            },
+            MutatingDispatchCase {
+                kind: "send_user_message",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::UserMessage delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "steer_delegation",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::SteerDelegation delivered to live target worker",
+            },
+            MutatingDispatchCase {
+                kind: "begin_attachment_upload",
+                effect_class: InMemory,
+                observation: "upload id accepted by later chunk request on same connection",
+            },
+            MutatingDispatchCase {
+                kind: "upload_attachment_chunk",
+                effect_class: InMemory,
+                observation: "chunk advances upload so finish succeeds",
+            },
+            MutatingDispatchCase {
+                kind: "finish_attachment_upload",
+                effect_class: InMemory,
+                observation: "ready image ref can be consumed by a later user message request",
+            },
+            MutatingDispatchCase {
+                kind: "cancel_attachment_upload",
+                effect_class: InMemory,
+                observation: "cancelled upload id cannot be finished",
+            },
+            MutatingDispatchCase {
+                kind: "remove_queued_user_message",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::RemoveQueuedUserMessage delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "remove_newest_queued_user_message",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::RemoveNewestQueuedUserMessage delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "remove_editable_queued_user_messages",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::RemoveEditableQueuedUserMessages delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "resume_paused_work",
+                effect_class: Durable,
+                observation: "paused_session_work status becomes resumed",
+            },
+            MutatingDispatchCase {
+                kind: "cancel_paused_work",
+                effect_class: Durable,
+                observation: "paused_session_work status becomes cancelled",
+            },
+            MutatingDispatchCase {
+                kind: "repair_resume",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::RepairResume delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "set_goal_status",
+                effect_class: Durable,
+                observation: "session goal status changes",
+            },
+            MutatingDispatchCase {
+                kind: "clear_goal",
+                effect_class: Durable,
+                observation: "session goal is closed",
+            },
+            MutatingDispatchCase {
+                kind: "create_assistant_session",
+                effect_class: Durable,
+                observation: "deferred assistant session worker is registered",
+            },
+            MutatingDispatchCase {
+                kind: "auto_title",
+                effect_class: Durable,
+                observation: "untitled session row receives generated title",
+            },
+            MutatingDispatchCase {
+                kind: "curator",
+                effect_class: Durable,
+                observation: "skill curator state changes through daemon-owned DB/filesystem path",
+            },
+            MutatingDispatchCase {
+                kind: "cancel_turn",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::Cancel delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "fs_write",
+                effect_class: Durable,
+                observation: "file contents written under project root",
+            },
+            MutatingDispatchCase {
+                kind: "fs_create_dir",
+                effect_class: Durable,
+                observation: "directory created under project root",
+            },
+            MutatingDispatchCase {
+                kind: "fs_rename",
+                effect_class: Durable,
+                observation: "file moves from source path to destination path",
+            },
+            MutatingDispatchCase {
+                kind: "fs_delete",
+                effect_class: Durable,
+                observation: "file removed under project root",
+            },
+            MutatingDispatchCase {
+                kind: "open_terminal",
+                effect_class: InMemory,
+                observation: "terminal id can be closed on same connection",
+            },
+            MutatingDispatchCase {
+                kind: "close_terminal",
+                effect_class: InMemory,
+                observation: "closed terminal rejects later attachment",
+            },
+            MutatingDispatchCase {
+                kind: "lsp_control",
+                effect_class: InMemory,
+                observation: "typed result and notice event emitted for attached session",
+            },
+            MutatingDispatchCase {
+                kind: "resolve_interrupt",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::ResolveInterrupt delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "archive_session",
+                effect_class: Durable,
+                observation: "session archived_at becomes set",
+            },
+            MutatingDispatchCase {
+                kind: "unarchive_session",
+                effect_class: Durable,
+                observation: "session archived_at is cleared",
+            },
+            MutatingDispatchCase {
+                kind: "fork_session",
+                effect_class: Durable,
+                observation: "fork session row references parent session",
+            },
+            MutatingDispatchCase {
+                kind: "discard_session",
+                effect_class: Durable,
+                observation: "ephemeral session row is deleted",
+            },
+            MutatingDispatchCase {
+                kind: "btw_create",
+                effect_class: Durable,
+                observation: "hidden persistent btw fork row references parent session",
+            },
+            MutatingDispatchCase {
+                kind: "btw_end",
+                effect_class: Durable,
+                observation: "hidden persistent btw fork row is deleted",
+            },
+            MutatingDispatchCase {
+                kind: "rename_session",
+                effect_class: Durable,
+                observation: "session title is updated",
+            },
+            MutatingDispatchCase {
+                kind: "share_session",
+                effect_class: Durable,
+                observation: "shared_with_collaborators flag changes",
+            },
+            MutatingDispatchCase {
+                kind: "record_session_note",
+                effect_class: Durable,
+                observation: "user_note session event is persisted",
+            },
+            MutatingDispatchCase {
+                kind: "delete_session",
+                effect_class: Durable,
+                observation: "session row is deleted",
+            },
+            MutatingDispatchCase {
+                kind: "promote_resource",
+                effect_class: InMemory,
+                observation: "queued resource request status changes to promoted response",
+            },
+            MutatingDispatchCase {
+                kind: "create_scheduled_job",
+                effect_class: Durable,
+                observation: "scheduled job row is persisted in the shared daemon",
+            },
+            MutatingDispatchCase {
+                kind: "delete_scheduled_job",
+                effect_class: Durable,
+                observation: "scheduled job row is deleted in the shared daemon",
+            },
+            MutatingDispatchCase {
+                kind: "set_scheduled_job_enabled",
+                effect_class: Durable,
+                observation: "scheduled job enabled state changes in the shared daemon",
+            },
+            MutatingDispatchCase {
+                kind: "run_scheduled_job",
+                effect_class: Durable,
+                observation: "scheduled job run result is recorded in the shared daemon",
+            },
+            MutatingDispatchCase {
+                kind: "set_active_model",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::SetActiveModel delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "set_agent",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::SetAgent delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "set_llm_mode",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::SetLlmMode delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "set_session_llm_mode",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::SetSessionLlmMode delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "set_approval_mode",
+                effect_class: InMemory,
+                observation: "approval mode response and broadcast event reflect new mode",
+            },
+            MutatingDispatchCase {
+                kind: "set_delegation_recursion",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::SetDelegationRecursion delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "set_sandbox",
+                effect_class: InMemory,
+                observation: "sandbox state response and broadcast event reflect new mode",
+            },
+            MutatingDispatchCase {
+                kind: "set_sandbox_escalation",
+                effect_class: InMemory,
+                observation: "sandbox escalation response and broadcast event reflect new state",
+            },
+            MutatingDispatchCase {
+                kind: "set_preflight",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::SetPreflight delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "set_trusted_only",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::SetTrustedOnly delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "set_redaction",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::SetRedaction delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "set_tandem_models",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::SetTandemModels delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "set_caffeinate",
+                effect_class: InMemory,
+                observation: "caffeinate response plus global state event",
+            },
+            MutatingDispatchCase {
+                kind: "cancel_schedule",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::CancelSchedule delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "prune",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::Prune delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "compact",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::Compact delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "pin",
+                effect_class: DriverForwarded,
+                observation: "SessionWork::Pin delivered to attached worker",
+            },
+            MutatingDispatchCase {
+                kind: "store_flycockpit_credential",
+                effect_class: Durable,
+                observation: "credential file is written",
+            },
+            MutatingDispatchCase {
+                kind: "clear_flycockpit_credential",
+                effect_class: Durable,
+                observation: "credential store no longer loads a credential",
+            },
+            MutatingDispatchCase {
+                kind: "refresh_env",
+                effect_class: InMemory,
+                observation: "attached worker env overlay changes",
+            },
+            MutatingDispatchCase {
+                kind: "refresh_config",
+                effect_class: InMemory,
+                observation: "attached worker config snapshot generation changes",
+            },
+            MutatingDispatchCase {
+                kind: "record_usage",
+                effect_class: Durable,
+                observation: "usage count appears in subsequent usage_counts query",
+            },
+            MutatingDispatchCase {
+                kind: "stop_daemon",
+                effect_class: InMemory,
+                observation: "shutdown context enters draining phase",
+            },
         ]
     }
 
@@ -2698,7 +2973,10 @@ mod tests {
         ctx: &Arc<DaemonContext>,
         prelude: Vec<Request>,
         request: Request,
-    ) -> (std::result::Result<Response, ErrorPayload>, Vec<proto::Event>) {
+    ) -> (
+        std::result::Result<Response, ErrorPayload>,
+        Vec<proto::Event>,
+    ) {
         let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
         let mut client = ProtoStream::new(client_stream);
         let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
@@ -2747,8 +3025,7 @@ mod tests {
         };
 
         while let Ok(body) =
-            tokio::time::timeout(std::time::Duration::from_millis(50), recv_body(&mut client))
-                .await
+            tokio::time::timeout(std::time::Duration::from_millis(50), recv_body(&mut client)).await
         {
             match body {
                 Body::Event { event } => events.push(event),
@@ -2856,8 +3133,10 @@ mod tests {
             .into_iter()
             .map(|case| case.kind)
             .collect();
-        let authz_declared: BTreeSet<_> =
-            authz_dispatch_cases().into_iter().map(|case| case.kind).collect();
+        let authz_declared: BTreeSet<_> = authz_dispatch_cases()
+            .into_iter()
+            .map(|case| case.kind)
+            .collect();
 
         assert_eq!(
             readonly, happy,
@@ -3033,7 +3312,12 @@ mod tests {
                 );
                 assert!(matches!(response, Response::Ack), "{kind}: {response:?}");
                 assert!(
-                    scenario.ctx.db.paused_session_work(scenario.target_session_id).unwrap().is_none(),
+                    scenario
+                        .ctx
+                        .db
+                        .paused_session_work(scenario.target_session_id)
+                        .unwrap()
+                        .is_none(),
                     "{} did not mutate the inaccessible paused-work target for {}",
                     known_hole.marker,
                     kind
@@ -3135,7 +3419,10 @@ mod tests {
         AuthzSocketScenario {
             ctx,
             principal: authz_matrix_principal(level, &accessible_root, kind),
-            prelude: vec![attach_existing_request(attached_session_id, &accessible_root)],
+            prelude: vec![attach_existing_request(
+                attached_session_id,
+                &accessible_root,
+            )],
             unshare_session_after_prelude: None,
             worker_rx_to_drop_after_prelude: Some(work_rx),
             request: authz_matrix_request(kind, target_session.session_id, &target_root),
@@ -3162,8 +3449,8 @@ mod tests {
                             project_root: Some(project_root),
                         }]
                     }
-                    "open_terminal" | "attach_terminal" | "terminal_input"
-                    | "terminal_resize" | "close_terminal" => {
+                    "open_terminal" | "attach_terminal" | "terminal_input" | "terminal_resize"
+                    | "close_terminal" => {
                         vec![principal::PrincipalGrant {
                             scope: principal::PrincipalScope::Terminal,
                             project_root: None,
@@ -3362,7 +3649,12 @@ mod tests {
                 path: "missing.txt".into(),
             },
             "open_terminal" => Request::OpenTerminal {
-                cwd: Some(project_root.join("missing-cwd").to_string_lossy().into_owned()),
+                cwd: Some(
+                    project_root
+                        .join("missing-cwd")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 cols: 80,
                 rows: 24,
             },
@@ -4057,7 +4349,10 @@ mod tests {
                 .await
                 .expect("fs_write happy");
                 assert!(matches!(response, Response::FsWrite { .. }));
-                assert_eq!(std::fs::read_to_string(tmp.path().join("file.txt")).unwrap(), "written");
+                assert_eq!(
+                    std::fs::read_to_string(tmp.path().join("file.txt")).unwrap(),
+                    "written"
+                );
             }
             "fs_create_dir" => {
                 let ctx = test_ctx();
@@ -4090,7 +4385,10 @@ mod tests {
                 .expect("fs_rename happy");
                 assert!(matches!(response, Response::Ack));
                 assert!(!tmp.path().join("old.txt").exists());
-                assert_eq!(std::fs::read_to_string(tmp.path().join("new.txt")).unwrap(), "move");
+                assert_eq!(
+                    std::fs::read_to_string(tmp.path().join("new.txt")).unwrap(),
+                    "move"
+                );
             }
             "fs_delete" => {
                 let ctx = test_ctx();
@@ -4358,15 +4656,23 @@ mod tests {
             }
             "stop_daemon" => {
                 let ctx = test_ctx();
-                let response =
-                    dispatch_matrix_request(&ctx, Request::StopDaemon { grace_secs: Some(1) })
-                        .await
-                        .expect("first stop starts drain");
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::StopDaemon {
+                        grace_secs: Some(1),
+                    },
+                )
+                .await
+                .expect("first stop starts drain");
                 assert!(matches!(response, Response::Ack));
-                let response =
-                    dispatch_matrix_request(&ctx, Request::StopDaemon { grace_secs: Some(0) })
-                        .await
-                        .expect("second stop forces drain");
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::StopDaemon {
+                        grace_secs: Some(0),
+                    },
+                )
+                .await
+                .expect("second stop forces drain");
                 assert!(matches!(response, Response::Ack));
                 assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Forced);
             }
@@ -4561,194 +4867,213 @@ mod tests {
             },
             other => panic!("unexpected worker case {other}"),
         };
-        let response =
-            dispatch_attached_worker_request(&ctx, tmp.path(), session_id, work_rx, request, |work| {
-                match (kind, work) {
-                    (
-                        "send_user_message",
-                        SessionWork::UserMessage {
-                            submission,
-                            respond_to,
-                        },
-                    ) => {
-                        assert_eq!(submission.text, "hello worker");
-                        let item = proto_queue_item(&submission.text);
-                        respond_to.send((item.clone(), vec![item])).unwrap();
-                    }
-                    (
-                        "steer_delegation",
-                        SessionWork::SteerDelegation {
+        let response = dispatch_attached_worker_request(
+            &ctx,
+            tmp.path(),
+            session_id,
+            work_rx,
+            request,
+            |work| match (kind, work) {
+                (
+                    "send_user_message",
+                    SessionWork::UserMessage {
+                        submission,
+                        respond_to,
+                    },
+                ) => {
+                    assert_eq!(submission.text, "hello worker");
+                    let item = proto_queue_item(&submission.text);
+                    respond_to.send((item.clone(), vec![item])).unwrap();
+                }
+                (
+                    "steer_delegation",
+                    SessionWork::SteerDelegation {
+                        task_call_id,
+                        label,
+                        message,
+                        respond_to,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(task_call_id, "task-1");
+                    assert_eq!(label, "child");
+                    assert_eq!(message, "steer");
+                    respond_to
+                        .send(proto::DelegationSteerResult::queued(
                             task_call_id,
                             label,
-                            message,
-                            respond_to,
-                            ..
-                        },
-                    ) => {
-                        assert_eq!(task_call_id, "task-1");
-                        assert_eq!(label, "child");
-                        assert_eq!(message, "steer");
-                        respond_to
-                            .send(proto::DelegationSteerResult::queued(
-                                task_call_id,
-                                label,
-                                1,
-                                "owner".into(),
-                                false,
-                            ))
-                            .unwrap();
-                    }
-                    (
-                        "remove_queued_user_message",
-                        SessionWork::RemoveQueuedUserMessage {
-                            queue_item_id,
-                            respond_to,
-                        },
-                    ) => {
-                        assert_eq!(queue_item_id, Uuid::from_u128(1));
-                        respond_to
-                            .send(proto::RemoveQueuedUserMessageResult {
-                                applied: true,
-                                reason: proto::RemoveQueuedUserMessageReason::Removed,
-                                removed_item: Some(proto_queue_item("removed")),
-                                queue: Vec::new(),
-                            })
-                            .unwrap();
-                    }
-                    (
-                        "remove_newest_queued_user_message",
-                        SessionWork::RemoveNewestQueuedUserMessage {
-                            target_id,
-                            respond_to,
-                        },
-                    ) => {
-                        assert_eq!(target_id.as_deref(), Some("root"));
-                        respond_to
-                            .send(proto::RemoveQueuedUserMessageResult {
-                                applied: false,
-                                reason: proto::RemoveQueuedUserMessageReason::NotFound,
-                                removed_item: None,
-                                queue: Vec::new(),
-                            })
-                            .unwrap();
-                    }
-                    (
-                        "remove_editable_queued_user_messages",
-                        SessionWork::RemoveEditableQueuedUserMessages {
-                            target_id,
-                            respond_to,
-                        },
-                    ) => {
-                        assert_eq!(target_id.as_deref(), Some("root"));
-                        respond_to
-                            .send(proto::RemoveQueuedUserMessagesResult {
-                                applied: true,
-                                reason: proto::RemoveQueuedUserMessageReason::Removed,
-                                removed_items: vec![proto_queue_item("removed")],
-                                queue: Vec::new(),
-                            })
-                            .unwrap();
-                    }
-                    ("repair_resume", SessionWork::RepairResume { respond_to }) => {
-                        respond_to.send(Ok(())).unwrap();
-                    }
-                    ("cancel_turn", SessionWork::Cancel) => {}
-                    (
-                        "resolve_interrupt",
-                        SessionWork::ResolveInterrupt {
-                            interrupt_id,
-                            response,
-                        },
-                    ) => {
-                        assert_eq!(interrupt_id, Uuid::from_u128(2));
-                        assert!(matches!(response, proto::ResolveResponse::Cancel));
-                    }
-                    (
-                        "set_active_model",
-                        SessionWork::SetActiveModel {
-                            provider,
-                            model,
-                            trigger,
-                            reasoning_effort,
-                            thinking_mode,
-                        },
-                    ) => {
-                        assert_eq!(provider, "openai");
-                        assert_eq!(model, "gpt-5");
-                        assert!(matches!(
-                            trigger,
-                            crate::session::ModelSwitchTrigger::Daemon
-                        ));
-                        assert_eq!(reasoning_effort, None);
-                        assert_eq!(thinking_mode, None);
-                    }
-                    ("set_agent", SessionWork::SetAgent { name }) => {
-                        assert_eq!(name, "Build");
-                    }
-                    ("set_llm_mode", SessionWork::SetLlmMode { mode }) => {
-                        assert_eq!(mode, Some(crate::config::extended::LlmMode::Defensive));
-                    }
-                    ("set_session_llm_mode", SessionWork::SetSessionLlmMode { mode }) => {
-                        assert_eq!(mode, crate::config::extended::LlmMode::Normal);
-                    }
-                    (
-                        "set_delegation_recursion",
-                        SessionWork::SetDelegationRecursion {
-                            enabled,
-                            default_depth,
-                        },
-                    ) => {
-                        assert!(enabled);
-                        assert_eq!(default_depth, 3);
-                    }
-                    ("set_preflight", SessionWork::SetPreflight { enabled }) => {
-                        assert_eq!(enabled, Some(true));
-                    }
-                    ("set_trusted_only", SessionWork::SetTrustedOnly { enabled }) => {
-                        assert_eq!(enabled, Some(true));
-                    }
-                    (
-                        "set_redaction",
-                        SessionWork::SetRedaction {
-                            scan_environment,
-                            scan_dotenv,
-                            scan_ssh_keys,
-                        },
-                    ) => {
-                        assert_eq!(scan_environment, Some(false));
-                        assert_eq!(scan_dotenv, Some(true));
-                        assert_eq!(scan_ssh_keys, None);
-                    }
-                    ("set_tandem_models", SessionWork::SetTandemModels { models }) => {
-                        assert_eq!(models, vec![("openai".to_string(), "gpt-5".to_string())]);
-                    }
-                    ("refresh_config", SessionWork::ReplaceConfigSnapshot { snapshot, respond_to }) => {
-                        assert_eq!(snapshot.generation, 0);
-                        respond_to.send(1).unwrap();
-                    }
-                    ("cancel_schedule", SessionWork::CancelSchedule { job_id }) => {
-                        assert_eq!(job_id, "job-1");
-                    }
-                    ("prune", SessionWork::Prune) | ("compact", SessionWork::Compact) => {}
-                    ("pin", SessionWork::Pin { text }) => {
-                        assert_eq!(text, "remember this");
-                    }
-                    (kind, work) => panic!("unexpected worker delivery for {kind}: {work:?}"),
+                            1,
+                            "owner".into(),
+                            false,
+                        ))
+                        .unwrap();
                 }
-            })
-            .await
-            .expect("worker dispatch succeeds");
+                (
+                    "remove_queued_user_message",
+                    SessionWork::RemoveQueuedUserMessage {
+                        queue_item_id,
+                        respond_to,
+                    },
+                ) => {
+                    assert_eq!(queue_item_id, Uuid::from_u128(1));
+                    respond_to
+                        .send(proto::RemoveQueuedUserMessageResult {
+                            applied: true,
+                            reason: proto::RemoveQueuedUserMessageReason::Removed,
+                            removed_item: Some(proto_queue_item("removed")),
+                            queue: Vec::new(),
+                        })
+                        .unwrap();
+                }
+                (
+                    "remove_newest_queued_user_message",
+                    SessionWork::RemoveNewestQueuedUserMessage {
+                        target_id,
+                        respond_to,
+                    },
+                ) => {
+                    assert_eq!(target_id.as_deref(), Some("root"));
+                    respond_to
+                        .send(proto::RemoveQueuedUserMessageResult {
+                            applied: false,
+                            reason: proto::RemoveQueuedUserMessageReason::NotFound,
+                            removed_item: None,
+                            queue: Vec::new(),
+                        })
+                        .unwrap();
+                }
+                (
+                    "remove_editable_queued_user_messages",
+                    SessionWork::RemoveEditableQueuedUserMessages {
+                        target_id,
+                        respond_to,
+                    },
+                ) => {
+                    assert_eq!(target_id.as_deref(), Some("root"));
+                    respond_to
+                        .send(proto::RemoveQueuedUserMessagesResult {
+                            applied: true,
+                            reason: proto::RemoveQueuedUserMessageReason::Removed,
+                            removed_items: vec![proto_queue_item("removed")],
+                            queue: Vec::new(),
+                        })
+                        .unwrap();
+                }
+                ("repair_resume", SessionWork::RepairResume { respond_to }) => {
+                    respond_to.send(Ok(())).unwrap();
+                }
+                ("cancel_turn", SessionWork::Cancel) => {}
+                (
+                    "resolve_interrupt",
+                    SessionWork::ResolveInterrupt {
+                        interrupt_id,
+                        response,
+                    },
+                ) => {
+                    assert_eq!(interrupt_id, Uuid::from_u128(2));
+                    assert!(matches!(response, proto::ResolveResponse::Cancel));
+                }
+                (
+                    "set_active_model",
+                    SessionWork::SetActiveModel {
+                        provider,
+                        model,
+                        trigger,
+                        reasoning_effort,
+                        thinking_mode,
+                    },
+                ) => {
+                    assert_eq!(provider, "openai");
+                    assert_eq!(model, "gpt-5");
+                    assert!(matches!(
+                        trigger,
+                        crate::session::ModelSwitchTrigger::Daemon
+                    ));
+                    assert_eq!(reasoning_effort, None);
+                    assert_eq!(thinking_mode, None);
+                }
+                ("set_agent", SessionWork::SetAgent { name }) => {
+                    assert_eq!(name, "Build");
+                }
+                ("set_llm_mode", SessionWork::SetLlmMode { mode }) => {
+                    assert_eq!(mode, Some(crate::config::extended::LlmMode::Defensive));
+                }
+                ("set_session_llm_mode", SessionWork::SetSessionLlmMode { mode }) => {
+                    assert_eq!(mode, crate::config::extended::LlmMode::Normal);
+                }
+                (
+                    "set_delegation_recursion",
+                    SessionWork::SetDelegationRecursion {
+                        enabled,
+                        default_depth,
+                    },
+                ) => {
+                    assert!(enabled);
+                    assert_eq!(default_depth, 3);
+                }
+                ("set_preflight", SessionWork::SetPreflight { enabled }) => {
+                    assert_eq!(enabled, Some(true));
+                }
+                ("set_trusted_only", SessionWork::SetTrustedOnly { enabled }) => {
+                    assert_eq!(enabled, Some(true));
+                }
+                (
+                    "set_redaction",
+                    SessionWork::SetRedaction {
+                        scan_environment,
+                        scan_dotenv,
+                        scan_ssh_keys,
+                    },
+                ) => {
+                    assert_eq!(scan_environment, Some(false));
+                    assert_eq!(scan_dotenv, Some(true));
+                    assert_eq!(scan_ssh_keys, None);
+                }
+                ("set_tandem_models", SessionWork::SetTandemModels { models }) => {
+                    assert_eq!(models, vec![("openai".to_string(), "gpt-5".to_string())]);
+                }
+                (
+                    "refresh_config",
+                    SessionWork::ReplaceConfigSnapshot {
+                        snapshot,
+                        respond_to,
+                    },
+                ) => {
+                    assert_eq!(snapshot.generation, 0);
+                    respond_to.send(1).unwrap();
+                }
+                ("cancel_schedule", SessionWork::CancelSchedule { job_id }) => {
+                    assert_eq!(job_id, "job-1");
+                }
+                ("prune", SessionWork::Prune) | ("compact", SessionWork::Compact) => {}
+                ("pin", SessionWork::Pin { text }) => {
+                    assert_eq!(text, "remember this");
+                }
+                (kind, work) => panic!("unexpected worker delivery for {kind}: {work:?}"),
+            },
+        )
+        .await
+        .expect("worker dispatch succeeds");
         match kind {
             "send_user_message" => assert!(matches!(response, Response::UserMessageQueued { .. })),
             "steer_delegation" => assert!(matches!(response, Response::DelegationSteer { .. })),
             "remove_queued_user_message" | "remove_newest_queued_user_message" => {
-                assert!(matches!(response, Response::RemoveQueuedUserMessageResult { .. }));
+                assert!(matches!(
+                    response,
+                    Response::RemoveQueuedUserMessageResult { .. }
+                ));
             }
             "remove_editable_queued_user_messages" => {
-                assert!(matches!(response, Response::RemoveQueuedUserMessagesResult { .. }));
+                assert!(matches!(
+                    response,
+                    Response::RemoveQueuedUserMessagesResult { .. }
+                ));
             }
             "set_delegation_recursion" => {
-                assert!(matches!(response, Response::DelegationRecursionState { .. }));
+                assert!(matches!(
+                    response,
+                    Response::DelegationRecursionState { .. }
+                ));
             }
             _ => assert!(matches!(response, Response::Ack), "{kind}: {response:?}"),
         }
@@ -5036,44 +5361,38 @@ mod tests {
         let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
         let prelude = vec![attach_existing_request(session_id, tmp.path())];
         let err = match kind {
-            "begin_attachment_upload" => {
-                dispatch_matrix_request_after(
-                    &ctx,
-                    prelude,
-                    Request::BeginAttachmentUpload {
-                        mime: "text/plain".into(),
-                        byte_len: 1,
-                        sha256: "0".repeat(64),
-                        purpose: proto::AttachmentPurpose::UserMessageImage,
-                    },
-                )
-                .await
-                .expect_err("unsupported attachment mime")
-            }
-            "upload_attachment_chunk" => {
-                dispatch_matrix_request_after(
-                    &ctx,
-                    prelude,
-                    Request::UploadAttachmentChunk {
-                        upload_id: Uuid::new_v4(),
-                        offset: 0,
-                        data_base64: String::new(),
-                    },
-                )
-                .await
-                .expect_err("unknown upload chunk")
-            }
-            "finish_attachment_upload" => {
-                dispatch_matrix_request_after(
-                    &ctx,
-                    prelude,
-                    Request::FinishAttachmentUpload {
-                        upload_id: Uuid::new_v4(),
-                    },
-                )
-                .await
-                .expect_err("unknown upload finish")
-            }
+            "begin_attachment_upload" => dispatch_matrix_request_after(
+                &ctx,
+                prelude,
+                Request::BeginAttachmentUpload {
+                    mime: "text/plain".into(),
+                    byte_len: 1,
+                    sha256: "0".repeat(64),
+                    purpose: proto::AttachmentPurpose::UserMessageImage,
+                },
+            )
+            .await
+            .expect_err("unsupported attachment mime"),
+            "upload_attachment_chunk" => dispatch_matrix_request_after(
+                &ctx,
+                prelude,
+                Request::UploadAttachmentChunk {
+                    upload_id: Uuid::new_v4(),
+                    offset: 0,
+                    data_base64: String::new(),
+                },
+            )
+            .await
+            .expect_err("unknown upload chunk"),
+            "finish_attachment_upload" => dispatch_matrix_request_after(
+                &ctx,
+                prelude,
+                Request::FinishAttachmentUpload {
+                    upload_id: Uuid::new_v4(),
+                },
+            )
+            .await
+            .expect_err("unknown upload finish"),
             "cancel_attachment_upload" => {
                 let response = dispatch_matrix_request_after(
                     &ctx,
@@ -5126,8 +5445,7 @@ mod tests {
                     },
                 )
                 .await
-                .expect("open terminal")
-                else {
+                .expect("open terminal") else {
                     panic!("expected TerminalOpened");
                 };
                 let response =
@@ -5168,7 +5486,10 @@ mod tests {
         let err = dispatch_matrix_request(&ctx, request)
             .await
             .expect_err("terminal invalid state rejected");
-        assert!(matches!(err.code, ErrorCode::BadRequest | ErrorCode::RootMissing));
+        assert!(matches!(
+            err.code,
+            ErrorCode::BadRequest | ErrorCode::RootMissing
+        ));
     }
 
     #[cfg(unix)]
@@ -5591,7 +5912,11 @@ mod tests {
                 .expect("rename session");
                 assert!(matches!(response, Response::Ack));
                 assert_eq!(
-                    ctx.db.get_session(session.session_id).unwrap().unwrap().title,
+                    ctx.db
+                        .get_session(session.session_id)
+                        .unwrap()
+                        .unwrap()
+                        .title,
                     Some("New title".into())
                 );
             }
@@ -5702,7 +6027,10 @@ mod tests {
             // `btw_end` is an idempotent no-op on a parent with no live fork
             // (`Db::end_btw_fork` returns `Ok(false)`), same as discard/share.
             "discard_session" | "share_session" | "btw_end" => {
-                assert!(matches!(result.expect("invalid state is typed no-op"), Response::Ack));
+                assert!(matches!(
+                    result.expect("invalid state is typed no-op"),
+                    Response::Ack
+                ));
             }
             _ => {
                 let err = result.expect_err("invalid session mutation rejected");
@@ -5773,20 +6101,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let scheduler = ctx.scheduler.as_ref().expect("persistent scheduler");
         if kind != "create_scheduled_job" {
-            dispatch_matrix_request(&ctx, authz_matrix_request(
-                "create_scheduled_job",
-                Uuid::new_v4(),
-                tmp.path(),
-            ))
+            dispatch_matrix_request(
+                &ctx,
+                authz_matrix_request("create_scheduled_job", Uuid::new_v4(), tmp.path()),
+            )
             .await
             .expect("seed scheduled job");
         }
-        let response = dispatch_matrix_request(
-            &ctx,
-            authz_matrix_request(kind, Uuid::new_v4(), tmp.path()),
-        )
-        .await
-        .expect("scheduler happy path");
+        let response =
+            dispatch_matrix_request(&ctx, authz_matrix_request(kind, Uuid::new_v4(), tmp.path()))
+                .await
+                .expect("scheduler happy path");
         match kind {
             "create_scheduled_job" => {
                 assert!(matches!(response, Response::ScheduledJob { .. }));
@@ -5912,8 +6237,7 @@ mod tests {
                         mode: crate::daemon::caffeinate::CaffeinateMode::On,
                     },
                 )
-                .await
-                ;
+                .await;
                 let response = response.expect("set caffeinate");
                 let Response::CaffeinateState { active, .. } = response else {
                     panic!("expected CaffeinateState");
@@ -5992,10 +6316,14 @@ mod tests {
             }
             "stop_daemon" => {
                 let ctx = test_ctx();
-                let response =
-                    dispatch_matrix_request(&ctx, Request::StopDaemon { grace_secs: Some(2) })
-                        .await
-                        .expect("stop daemon");
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::StopDaemon {
+                        grace_secs: Some(2),
+                    },
+                )
+                .await
+                .expect("stop daemon");
                 assert!(matches!(response, Response::Ack));
                 assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Draining);
             }
@@ -6041,7 +6369,6 @@ mod tests {
             env_policy: EnvDriftPolicy::Daemon,
         }
     }
-
 
     /// Criterion 4 (`engine-config-snapshot-adoption`): a client attached
     /// through the real dispatch path receives the `ConfigSnapshot` event
@@ -6126,7 +6453,10 @@ mod tests {
                         reasoning_effort: None,
                         thinking_mode: None,
                     });
-                    Ok((providers, crate::config::extended::ExtendedConfig::default()))
+                    Ok((
+                        providers,
+                        crate::config::extended::ExtendedConfig::default(),
+                    ))
                 } else {
                     Err(anyhow::anyhow!("malformed config layer"))
                 }
@@ -7330,7 +7660,7 @@ mod tests {
         let (_, session_b) = attached_state(&ctx, tmp_b.path());
         let image_ref = finish_upload_for(&mut state, &sample_png());
 
-        let err = consume_image_refs(&mut state, session_b, &[image_ref.clone()])
+        let err = consume_image_refs(&mut state, session_b, std::slice::from_ref(&image_ref))
             .expect_err("wrong session must fail");
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert!(err.message.contains("different session"));
@@ -8073,7 +8403,10 @@ mod tests {
         };
 
         assert_eq!(
-            agents.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
+            agents
+                .iter()
+                .map(|agent| agent.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["Build"]
         );
         assert!(agents[0].builtin);
@@ -8082,8 +8415,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_agents_agrees_with_validate_set_agent() {
-        let mut extended = crate::config::extended::ExtendedConfig::default();
-        extended.experimental_mode = true;
+        let extended = crate::config::extended::ExtendedConfig {
+            experimental_mode: true,
+            ..Default::default()
+        };
         let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
             crate::config::providers::ProvidersConfig::default(),
             extended,
@@ -8134,11 +8469,15 @@ mod tests {
                 crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
             )
             .unwrap();
-        state.attached.as_mut().expect("attached").handle.trust_policy =
-            crate::config::trust::WorkspaceTrustPolicy {
-                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
-                mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-            };
+        state
+            .attached
+            .as_mut()
+            .expect("attached")
+            .handle
+            .trust_policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        };
 
         let response = handle_request(Request::ListAgents, &mut state, &ctx)
             .await
@@ -8208,19 +8547,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (mut state, _) = attached_state(&ctx, tmp.path());
 
-        let response = handle_request(
-            Request::ListModels { provider: None },
-            &mut state,
-            &ctx,
-        )
-        .await
-        .expect("list models succeeds");
+        let response = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
+            .await
+            .expect("list models succeeds");
         let Response::Models { models } = response else {
             panic!("expected models response");
         };
 
         assert_eq!(
-            models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["gpt-a", "gpt-b"]
         );
         assert_eq!(models[0].provider, "openai");
@@ -8267,13 +8605,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (mut state, _) = attached_state(&ctx, tmp.path());
 
-        let response = handle_request(
-            Request::ListModels { provider: None },
-            &mut state,
-            &ctx,
-        )
-        .await
-        .expect("list models succeeds");
+        let response = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
+            .await
+            .expect("list models succeeds");
         let rendered = serde_json::to_string(&response).unwrap();
 
         assert!(rendered.contains("safe-model"));
@@ -8299,10 +8633,9 @@ mod tests {
         let source = crate::daemon::config_source::ConfigSource::new(
             move |_cwd| {
                 let policy = crate::config::trust::runtime_policy();
-                let cfg = if policy
-                    .as_ref()
-                    .is_some_and(|policy| policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig)
-                {
+                let cfg = if policy.as_ref().is_some_and(|policy| {
+                    policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
+                }) {
                     crate::config::providers::ProvidersConfig::default()
                 } else {
                     crate::config::providers::ProvidersConfig {
@@ -8323,19 +8656,19 @@ mod tests {
                 crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
             )
             .unwrap();
-        state.attached.as_mut().expect("attached").handle.trust_policy =
-            crate::config::trust::WorkspaceTrustPolicy {
-                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
-                mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-            };
+        state
+            .attached
+            .as_mut()
+            .expect("attached")
+            .handle
+            .trust_policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        };
 
-        let response = handle_request(
-            Request::ListModels { provider: None },
-            &mut state,
-            &ctx,
-        )
-        .await
-        .expect("list models succeeds");
+        let response = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
+            .await
+            .expect("list models succeeds");
         let Response::Models { models } = response else {
             panic!("expected models response");
         };
@@ -8395,13 +8728,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (mut state, _) = attached_state(&ctx, tmp.path());
 
-        let models = handle_request(
-            Request::ListModels { provider: None },
-            &mut state,
-            &ctx,
-        )
-        .await
-        .expect("empty model inventory is ok");
+        let models = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
+            .await
+            .expect("empty model inventory is ok");
         assert!(matches!(models, Response::Models { models } if models.is_empty()));
 
         let agents = handle_request(Request::ListAgents, &mut state, &ctx)
@@ -8438,20 +8767,12 @@ mod tests {
             serde_json::to_string(&second).unwrap()
         );
 
-        let first = handle_request(
-            Request::ListModels { provider: None },
-            &mut state,
-            &ctx,
-        )
-        .await
-        .expect("first list models succeeds");
-        let second = handle_request(
-            Request::ListModels { provider: None },
-            &mut state,
-            &ctx,
-        )
-        .await
-        .expect("second list models succeeds");
+        let first = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
+            .await
+            .expect("first list models succeeds");
+        let second = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
+            .await
+            .expect("second list models succeeds");
         assert_eq!(
             serde_json::to_string(&first).unwrap(),
             serde_json::to_string(&second).unwrap()
@@ -8666,10 +8987,7 @@ mod tests {
         };
         assert_eq!(parent_submission.text, "parent work");
 
-        let created = ctx
-            .db
-            .create_btw_fork(parent_row.session_id, true)
-            .unwrap();
+        let created = ctx.db.create_btw_fork(parent_row.session_id, true).unwrap();
         let btw_session = Arc::new(
             Session::resume(ctx.db.clone(), created.info.session_id)
                 .unwrap()
@@ -9389,7 +9707,7 @@ mod tests {
             }
             other => panic!("expected protocol version error, got {other:?}"),
         }
-        assert!(matches!(client.recv().await.unwrap(), None));
+        assert!(client.recv().await.unwrap().is_none());
         server.await.unwrap().unwrap();
     }
 
@@ -9463,35 +9781,32 @@ mod tests {
 }
 #[test]
 fn response_redaction_scrubs_queue_display_metadata() {
-    crate::auth::flycockpit::with_redaction_token_override(
-        "fci_response_secret_12345",
-        || {
-            let tmp = tempfile::tempdir().unwrap();
-            let table = crate::redact::RedactionTable::build(
-                &crate::config::extended::RedactConfig::default(),
-                tmp.path(),
-            )
-            .unwrap();
-            let item = proto::QueueItem {
-                id: Uuid::new_v4(),
-                status: proto::QueueItemStatus::Queued,
-                text: "wire fci_response_secret_12345".to_string(),
-                display_text: Some("review @fci_response_secret_12345".to_string()),
-                target: proto::QueueTarget::default(),
-            };
-            let response = scrub_proto_response(
-                Response::UserMessageQueued {
-                    item: item.clone(),
-                    queue: vec![item],
-                },
-                &table,
-            )
-            .expect("redacted response");
-            let encoded = serde_json::to_string(&response).unwrap();
-            assert!(!encoded.contains("fci_response_secret_12345"), "{encoded}");
-            assert!(encoded.contains("REDACT"), "{encoded}");
-        },
-    );
+    crate::auth::flycockpit::with_redaction_token_override("fci_response_secret_12345", || {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = crate::redact::RedactionTable::build(
+            &crate::config::extended::RedactConfig::default(),
+            tmp.path(),
+        )
+        .unwrap();
+        let item = proto::QueueItem {
+            id: Uuid::new_v4(),
+            status: proto::QueueItemStatus::Queued,
+            text: "wire fci_response_secret_12345".to_string(),
+            display_text: Some("review @fci_response_secret_12345".to_string()),
+            target: proto::QueueTarget::default(),
+        };
+        let response = scrub_proto_response(
+            Response::UserMessageQueued {
+                item: item.clone(),
+                queue: vec![item],
+            },
+            &table,
+        )
+        .expect("redacted response");
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(!encoded.contains("fci_response_secret_12345"), "{encoded}");
+        assert!(encoded.contains("REDACT"), "{encoded}");
+    });
 }
 
 #[test]
@@ -9563,13 +9878,22 @@ fn event_redaction_preserves_typed_fields() {
             }],
         };
 
-        let scrubbed = scrub_proto_event(event, &table).expect("overlap redaction must not drop event");
-        let proto::Event::QueueUpdated { session_id: got, queue } = scrubbed else {
+        let scrubbed =
+            scrub_proto_event(event, &table).expect("overlap redaction must not drop event");
+        let proto::Event::QueueUpdated {
+            session_id: got,
+            queue,
+        } = scrubbed
+        else {
             panic!("expected queue event");
         };
         assert_eq!(got, session_id);
         assert_eq!(queue[0].id, item_id);
-        let encoded = serde_json::to_string(&proto::Event::QueueUpdated { session_id: got, queue }).unwrap();
+        let encoded = serde_json::to_string(&proto::Event::QueueUpdated {
+            session_id: got,
+            queue,
+        })
+        .unwrap();
         assert!(!encoded.contains("wire 88c0e13f"), "{encoded}");
         assert!(!encoded.contains("review @88c0e13f"), "{encoded}");
         assert!(encoded.contains("REDACT"), "{encoded}");
@@ -9688,7 +10012,8 @@ fn history_redaction_preserves_typed_fields() {
             hint: Some("hint call-secret-123".to_string()),
         };
 
-        let scrubbed = scrub_history_entry(entry, &table).expect("overlap redaction must not drop history");
+        let scrubbed =
+            scrub_history_entry(entry, &table).expect("overlap redaction must not drop history");
         let proto::HistoryEntry::ToolCall {
             call_id: got,
             output,

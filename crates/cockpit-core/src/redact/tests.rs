@@ -195,8 +195,10 @@ fn short_credential_shaped_key_value_is_redacted() {
 fn stored_flycockpit_instance_token_is_forced_redaction_candidate() {
     let tmp = tempfile::TempDir::new().unwrap();
     crate::auth::flycockpit::with_redaction_token_override("fci_secret_token_12345", || {
-        let mut cfg = RedactConfig::default();
-        cfg.min_secret_length = 128;
+        let cfg = RedactConfig {
+            min_secret_length: 128,
+            ..Default::default()
+        };
         let table = RedactionTable::build(&cfg, tmp.path()).unwrap();
         let scrubbed = table.scrub("token=fci_secret_token_12345");
         assert!(!scrubbed.contains("fci_secret_token_12345"));

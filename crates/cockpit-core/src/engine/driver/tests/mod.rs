@@ -27,10 +27,7 @@ fn test_provider_base_url() -> String {
                     };
                     let mut request = Vec::new();
                     let mut buf = [0_u8; 512];
-                    loop {
-                        let Ok(n) = std::io::Read::read(&mut stream, &mut buf) else {
-                            break;
-                        };
+                    while let Ok(n) = std::io::Read::read(&mut stream, &mut buf) {
                         if n == 0 {
                             break;
                         }

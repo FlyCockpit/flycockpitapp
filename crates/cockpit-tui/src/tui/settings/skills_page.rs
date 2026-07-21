@@ -345,6 +345,42 @@ fn dir_index(cursor: usize, dir_count: usize) -> Option<usize> {
     if idx < dir_count { Some(idx) } else { None }
 }
 
+impl SettingsPage for SkillsPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        cx.handle_skills_page_key(key, self)
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_skills_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        format!(
+            "{} › Skills",
+            cockpit_core::welcome::display_path(&cx.config_path)
+        )
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        if self.grabbed.is_some() {
+            "type to edit dir  enter: save  esc: cancel"
+        } else {
+            "↑/↓/Tab/Shift+Tab  enter: toggle / edit  a: add dir  d: delete  esc/h: back  q: close"
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "Skills"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,41 +653,5 @@ mod tests {
             TestPageRef::Skills(p) => assert!(!p.reset.is_pending(), "navigation disarms reset"),
             other => panic!("expected Skills, got {other:?}"),
         }
-    }
-}
-
-impl SettingsPage for SkillsPage {
-    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
-        cx.handle_skills_page_key(key, self)
-    }
-
-    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        cx.render_skills_page(frame, area, self);
-    }
-
-    fn title(&self, cx: &SettingsCx) -> String {
-        format!(
-            "{} › Skills",
-            cockpit_core::welcome::display_path(&cx.config_path)
-        )
-    }
-
-    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
-        if self.grabbed.is_some() {
-            "type to edit dir  enter: save  esc: cancel"
-        } else {
-            "↑/↓/Tab/Shift+Tab  enter: toggle / edit  a: add dir  d: delete  esc/h: back  q: close"
-        }
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    #[cfg(test)]
-    fn test_name(&self) -> &'static str {
-        "Skills"
     }
 }

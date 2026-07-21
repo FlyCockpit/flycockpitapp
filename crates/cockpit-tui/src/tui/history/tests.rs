@@ -1050,6 +1050,7 @@ fn mcp_child_meta(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn child_call(
     parent_call_id: &str,
     index: i64,

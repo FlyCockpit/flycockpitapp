@@ -2692,7 +2692,7 @@ async fn utility_json_capture_server(
             let (header, body) = read_http_request(&mut stream).await;
             let request_line = header.lines().next().unwrap_or("").to_string();
             let body_json = serde_json::from_str::<serde_json::Value>(&body)
-                .unwrap_or_else(|_| serde_json::Value::String(body));
+                .unwrap_or(serde_json::Value::String(body));
             let _ = tx.send((request_line.clone(), body_json.clone())).await;
             let is_tool_request = body_json
                 .get("tools")

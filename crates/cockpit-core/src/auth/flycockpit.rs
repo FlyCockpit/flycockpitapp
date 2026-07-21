@@ -587,7 +587,7 @@ fn clear_credential_redaction_registration() {
 pub fn stored_instance_token_for_redaction() -> Option<String> {
     #[cfg(test)]
     {
-        return TEST_REDACTION_TOKEN.with(|token| token.borrow().clone());
+        TEST_REDACTION_TOKEN.with(|token| token.borrow().clone())
     }
 
     #[cfg(not(test))]

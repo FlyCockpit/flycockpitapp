@@ -33,7 +33,7 @@ fn configured_agent_dirs_resolve_relative_to_defining_config_file() {
     let config = config_dir.join("config.json");
     fs::write(&config, r#"{"agent_dirs":["relative-agents"]}"#).unwrap();
 
-    let dirs = configured_agent_dirs_for_paths(&[config.clone()]);
+    let dirs = configured_agent_dirs_for_paths(std::slice::from_ref(&config));
 
     assert_eq!(dirs, vec![config_dir.join("relative-agents")]);
 }
@@ -407,8 +407,7 @@ fn ignore_config_filters_configured_agent_dirs_inside_trust_root() {
     let dirs = crate::config::trust::with_workspace_trust_policy(policy, || {
         let env = crate::test_env::lock();
         env.set_cockpit_config(&cfg_path);
-        let dirs = agent_search_dirs(tmp.path());
-        dirs
+        agent_search_dirs(tmp.path())
     });
 
     assert!(

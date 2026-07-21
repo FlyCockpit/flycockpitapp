@@ -285,7 +285,7 @@ async fn prune_watermark_cleared_for_popped_child_depth() {
         driver.maybe_auto_prune(&tx).await,
         "child auto-prune establishes depth-2 watermark"
     );
-    assert!(driver.prune_watermark.get(&2).is_some());
+    assert!(driver.prune_watermark.contains_key(&2));
 
     let _ = driver.pop_child_with_envelope(None, &tx).await;
 
@@ -295,7 +295,7 @@ async fn prune_watermark_cleared_for_popped_child_depth() {
         "root watermark must not be cleared when the child pops"
     );
     assert!(
-        driver.prune_watermark.get(&2).is_none(),
+        !driver.prune_watermark.contains_key(&2),
         "popped child depth watermark must be cleared"
     );
     drop(tx);

@@ -1069,6 +1069,53 @@ fn format_pairs_for_edit(
     parts.join("\n")
 }
 
+impl SettingsPage for McpPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        match self {
+            McpPage::List(s) => cx.handle_mcp_list_key(key, s),
+            McpPage::Add(s) => cx.handle_mcp_add_key(key, s),
+        }
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_mcp_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        let crumbs = match self {
+            McpPage::List(_) => " › MCP",
+            McpPage::Add(_) => " › MCP › Add",
+        };
+        format!(
+            "{}{}",
+            cockpit_core::welcome::display_path(&cx.config_path),
+            crumbs
+        )
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        match self {
+            McpPage::List(_) => {
+                "↑/↓/Tab/Shift+Tab  space: toggle  m: mode  a: authenticate  d: delete (×2)  enter: add  esc/h: back  q: close"
+            }
+            McpPage::Add(_) => {
+                "↑/↓/Tab  enter: cycle / save  type to edit name/endpoint  esc: back"
+            }
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "MCP"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1309,52 +1356,5 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("Bearer secret-token")
         );
-    }
-}
-
-impl SettingsPage for McpPage {
-    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
-        match self {
-            McpPage::List(s) => cx.handle_mcp_list_key(key, s),
-            McpPage::Add(s) => cx.handle_mcp_add_key(key, s),
-        }
-    }
-
-    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        cx.render_mcp_page(frame, area, self);
-    }
-
-    fn title(&self, cx: &SettingsCx) -> String {
-        let crumbs = match self {
-            McpPage::List(_) => " › MCP",
-            McpPage::Add(_) => " › MCP › Add",
-        };
-        format!(
-            "{}{}",
-            cockpit_core::welcome::display_path(&cx.config_path),
-            crumbs
-        )
-    }
-
-    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
-        match self {
-            McpPage::List(_) => {
-                "↑/↓/Tab/Shift+Tab  space: toggle  m: mode  a: authenticate  d: delete (×2)  enter: add  esc/h: back  q: close"
-            }
-            McpPage::Add(_) => {
-                "↑/↓/Tab  enter: cycle / save  type to edit name/endpoint  esc: back"
-            }
-        }
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    #[cfg(test)]
-    fn test_name(&self) -> &'static str {
-        "MCP"
     }
 }

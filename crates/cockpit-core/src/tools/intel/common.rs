@@ -22,7 +22,10 @@ pub(super) const SEARCH_TOKEN_CAP: usize = 4000;
 pub(super) const STRUCT_TOKEN_CAP: usize = 3000;
 
 #[cfg(test)]
-static TEST_INDEX_ALLOWLIST: OnceLock<Mutex<Option<(String, Vec<String>)>>> = OnceLock::new();
+type TestIndexAllowlistCell = Mutex<Option<(String, Vec<String>)>>;
+
+#[cfg(test)]
+static TEST_INDEX_ALLOWLIST: OnceLock<TestIndexAllowlistCell> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) fn set_test_index_allowlist(root: Option<String>, allow: Option<Vec<String>>) {

@@ -956,6 +956,38 @@ impl AgentsPage {
     }
 }
 
+impl SettingsPage for AgentsPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        cx.handle_agents_page_key(key, self)
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_agents_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        format!(
+            "{} › Agents",
+            cockpit_core::welcome::display_path(&cx.config_path)
+        )
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        self.help_text()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "Agents"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1639,37 +1671,5 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         }
-    }
-}
-
-impl SettingsPage for AgentsPage {
-    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
-        cx.handle_agents_page_key(key, self)
-    }
-
-    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        cx.render_agents_page(frame, area, self);
-    }
-
-    fn title(&self, cx: &SettingsCx) -> String {
-        format!(
-            "{} › Agents",
-            cockpit_core::welcome::display_path(&cx.config_path)
-        )
-    }
-
-    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
-        self.help_text()
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    #[cfg(test)]
-    fn test_name(&self) -> &'static str {
-        "Agents"
     }
 }

@@ -862,10 +862,7 @@ fn behavior_command_resource_profile_rows_edit_and_persist() {
             .profile_enabled("rust_toolchain")
     );
     let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
-    assert_eq!(
-        reloaded.command_resource_profiles.enabled["rust_toolchain"],
-        false
-    );
+    assert!(!reloaded.command_resource_profiles.enabled["rust_toolchain"]);
 
     open_category_on(
         &mut d,

@@ -2388,6 +2388,14 @@ fn jitter_delay() -> Duration {
     Duration::from_millis(u64::from(Uuid::new_v4().as_bytes()[0] % 250))
 }
 
+fn log_info(args: std::fmt::Arguments<'_>) {
+    println!("[relay] {args}");
+}
+
+fn log_warn(args: std::fmt::Arguments<'_>) {
+    eprintln!("[relay] {args}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2702,12 +2710,4 @@ mod tests {
         state.heartbeat_bodies.lock().await.push(body);
         Json(serde_json::json!({ "ok": true })).into_response()
     }
-}
-
-fn log_info(args: std::fmt::Arguments<'_>) {
-    println!("[relay] {args}");
-}
-
-fn log_warn(args: std::fmt::Arguments<'_>) {
-    eprintln!("[relay] {args}");
 }

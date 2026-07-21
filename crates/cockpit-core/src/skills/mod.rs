@@ -1644,8 +1644,10 @@ mod tests {
         active.platform = "linux".into();
         assert!(skill_is_active(&skill, &active));
 
-        let mut missing_required = ActivationContext::default();
-        missing_required.platform = "linux".into();
+        let missing_required = ActivationContext {
+            platform: "linux".into(),
+            ..Default::default()
+        };
         assert!(!skill_is_active(&skill, &missing_required));
 
         active.toolsets.insert("browser".into());

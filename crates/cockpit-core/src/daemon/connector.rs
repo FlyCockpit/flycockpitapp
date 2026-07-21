@@ -1336,7 +1336,7 @@ mod tests {
         for _ in 0..100 {
             seen.push(backoff.next(&mut jitter));
         }
-        assert!(seen.iter().any(|duration| *duration == Duration::ZERO));
+        assert!(seen.contains(&Duration::ZERO));
         assert!(
             seen.iter()
                 .any(|duration| *duration == Duration::from_secs(60))

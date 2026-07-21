@@ -104,13 +104,11 @@ fn freshness_cache() -> &'static Mutex<HashMap<FreshnessCacheKey, FreshnessCache
 }
 
 #[cfg(test)]
-static TEST_WALK_COUNT: OnceLock<
-    Mutex<Option<(String, std::sync::Arc<std::sync::atomic::AtomicUsize>)>>,
-> = OnceLock::new();
+type TestCountCell = Mutex<Option<(String, std::sync::Arc<std::sync::atomic::AtomicUsize>)>>;
 #[cfg(test)]
-static TEST_RECOMPUTE_COUNT: OnceLock<
-    Mutex<Option<(String, std::sync::Arc<std::sync::atomic::AtomicUsize>)>>,
-> = OnceLock::new();
+static TEST_WALK_COUNT: OnceLock<TestCountCell> = OnceLock::new();
+#[cfg(test)]
+static TEST_RECOMPUTE_COUNT: OnceLock<TestCountCell> = OnceLock::new();
 #[cfg(test)]
 static TEST_NOW_SECS: OnceLock<Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicI64>>>> =
     OnceLock::new();

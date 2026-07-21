@@ -2564,9 +2564,8 @@ mod tests {
             let _ = action.to_backend();
         }
         let older_names = Anthropic20250124ComputerAction::action_names();
-        for newer_only in ["zoom"] {
-            assert!(!older_names.contains(&newer_only));
-        }
+        let newer_only = "zoom";
+        assert!(!older_names.contains(&newer_only));
         assert!(Anthropic20251124ComputerAction::action_names().contains(&"zoom"));
         assert!(Anthropic20251124ComputerAction::action_names().contains(&"hold_key"));
         assert!(Anthropic20250124ComputerAction::action_names().contains(&"hold_key"));

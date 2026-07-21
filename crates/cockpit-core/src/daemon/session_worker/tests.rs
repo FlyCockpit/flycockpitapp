@@ -188,8 +188,10 @@ mod tests {
                 }],
             )
             .unwrap();
-        let mut cfg = crate::config::extended::RedactConfig::default();
-        cfg.denylist = vec!["secret-user-steer-token".to_string()];
+        let cfg = crate::config::extended::RedactConfig {
+            denylist: vec!["secret-user-steer-token".to_string()],
+            ..Default::default()
+        };
         let table = RedactionTable::build(&cfg, tmp.path()).unwrap();
 
         let result = steer_delegation_side_channel(
@@ -424,8 +426,10 @@ mod tests {
     #[test]
     fn recorded_notice_text_is_redacted() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut cfg = crate::config::extended::RedactConfig::default();
-        cfg.denylist = vec!["session-secret-token".to_string()];
+        let cfg = crate::config::extended::RedactConfig {
+            denylist: vec!["session-secret-token".to_string()],
+            ..Default::default()
+        };
         let table = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
         let session = Session::create(
             Db::open_in_memory().unwrap(),
@@ -509,9 +513,8 @@ mod tests {
         let session = Arc::new(Session::create(db, tmp.path().to_path_buf(), "Build").unwrap());
         let providers = lmstudio_test_providers();
         let redact = Arc::new(RedactionTable::empty());
-        let model = Arc::new(
-            crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap(),
-        );
+        let model =
+            Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
         let mut extended = crate::config::extended::ExtendedConfig::default();
         extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
         let trust_policy = crate::config::trust::WorkspaceTrustPolicy {
@@ -605,7 +608,9 @@ mod tests {
     }
 
     fn lmstudio_test_providers() -> crate::config::providers::ProvidersConfig {
-        use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry, ProvidersConfig};
+        use crate::config::providers::{
+            ActiveModelRef, ModelEntry, ProviderEntry, ProvidersConfig,
+        };
 
         let mut providers = std::collections::BTreeMap::new();
         providers.insert(
@@ -723,13 +728,8 @@ mod tests {
     fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
         use crate::config::extended::DefaultPrimaryAgent as D;
         let db = crate::db::Db::open_in_memory().unwrap();
-        db.upsert_assistant(
-            "helper-bot",
-            "/tmp/helper-bot",
-            "{}",
-            "hash",
-        )
-        .unwrap();
+        db.upsert_assistant("helper-bot", "/tmp/helper-bot", "{}", "hash")
+            .unwrap();
         let row = db
             .create_assistant_session("proj", "/proj", "helper-bot", "helper-bot")
             .unwrap();
@@ -781,12 +781,7 @@ mod tests {
         )
         .unwrap();
         let row = db
-            .create_assistant_session(
-                "proj",
-                cwd.to_str().unwrap(),
-                "helper-bot",
-                "helper-bot",
-            )
+            .create_assistant_session("proj", cwd.to_str().unwrap(), "helper-bot", "helper-bot")
             .unwrap();
 
         let root_agent_name = resolve_root_agent(row.session_id, &db, &cfg_with(D::Auto, false));
@@ -1569,7 +1564,14 @@ mod tests {
         assert_eq!(handle.extended().max_primary_rounds, 9);
         assert_eq!(
             handle.providers().active_model.as_ref().unwrap().model,
-            shared.read().unwrap().providers.active_model.as_ref().unwrap().model
+            shared
+                .read()
+                .unwrap()
+                .providers
+                .active_model
+                .as_ref()
+                .unwrap()
+                .model
         );
         // A re-resolution bumps the generation the live handle observes.
         let generation = replace_config_snapshot(
@@ -1606,8 +1608,10 @@ mod tests {
         );
 
         // Mid-turn re-resolution over a new config (Frontier, generation 1).
-        let mut updated = crate::config::extended::ExtendedConfig::default();
-        updated.llm_mode = crate::config::extended::LlmMode::Frontier;
+        let updated = crate::config::extended::ExtendedConfig {
+            llm_mode: crate::config::extended::LlmMode::Frontier,
+            ..Default::default()
+        };
         replace_config_snapshot(
             &shared,
             SessionConfigSnapshot::new(
@@ -1670,7 +1674,10 @@ mod tests {
             SessionConfigHandle::detached(SessionConfigSnapshot::new(0, providers, extended));
 
         let extended = handle.extended();
-        assert_eq!(extended.llm_mode, crate::config::extended::LlmMode::Defensive);
+        assert_eq!(
+            extended.llm_mode,
+            crate::config::extended::LlmMode::Defensive
+        );
         assert_eq!(extended.max_primary_rounds, 7);
         assert!(
             extended
@@ -1682,7 +1689,10 @@ mod tests {
             extended.redact.denylist
         );
         assert_eq!(extended.delegation.max_parallel, 3);
-        let active = handle.providers().active_model.expect("active model resolved");
+        let active = handle
+            .providers()
+            .active_model
+            .expect("active model resolved");
         assert_eq!(active.provider, "openai");
         assert_eq!(active.model, "gpt-parity");
     }
@@ -1775,7 +1785,10 @@ mod tests {
             crate::config::extended::ExtendedConfig,
         )> = Err(anyhow::anyhow!("bad config"));
         if let Ok((providers, extended)) = failed {
-            replace_config_snapshot(&snapshot, SessionConfigSnapshot::new(0, providers, extended));
+            replace_config_snapshot(
+                &snapshot,
+                SessionConfigSnapshot::new(0, providers, extended),
+            );
         }
         let current = snapshot.read().unwrap();
         assert_eq!(current.generation, 0);
@@ -1812,7 +1825,12 @@ mod tests {
     fn llm_mode_reads_are_consistent_within_a_generation() {
         let tmp = tempfile::tempdir().unwrap();
         let snapshot = snapshot_for_tests();
-        let session = Session::create(Db::open_in_memory().unwrap(), tmp.path().to_path_buf(), "Build").unwrap();
+        let session = Session::create(
+            Db::open_in_memory().unwrap(),
+            tmp.path().to_path_buf(),
+            "Build",
+        )
+        .unwrap();
         session.set_active_model("openai", "gpt-test").unwrap();
         let first =
             resolve_effective_llm_mode(&session, &snapshot.providers, snapshot.extended.llm_mode);
@@ -1826,7 +1844,12 @@ mod tests {
     fn worker_uses_registry_resolved_config_snapshot() {
         let tmp = tempfile::tempdir().unwrap();
         let snapshot = snapshot_for_tests();
-        let session = Session::create(Db::open_in_memory().unwrap(), tmp.path().to_path_buf(), "Build").unwrap();
+        let session = Session::create(
+            Db::open_in_memory().unwrap(),
+            tmp.path().to_path_buf(),
+            "Build",
+        )
+        .unwrap();
         session.set_active_model("openai", "gpt-test").unwrap();
         crate::config::extended::reset_load_for_cwd_call_count();
         let _ =
@@ -1838,7 +1861,8 @@ mod tests {
     fn worker_broadcast_delivers_config_snapshot_to_subscriber() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+        let session =
+            Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
         let locks = Arc::new(LockManager::from_db(db).unwrap());
         let (handle, _rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
         replace_config_snapshot(
@@ -1862,7 +1886,8 @@ mod tests {
     fn dispatch_reresolve_fans_out_to_all_attached_clients() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+        let session =
+            Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
         let locks = Arc::new(LockManager::from_db(db).unwrap());
         let (handle, _rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
         let mut a = handle.subscribe();
@@ -2004,8 +2029,7 @@ mod tests {
     #[test]
     fn config_reresolve_rereads_trust_policy() {
         let dispatch = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/daemon/server/dispatch.rs"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/server/dispatch.rs"),
         )
         .unwrap();
         let refresh = dispatch
@@ -2019,7 +2043,10 @@ mod tests {
         let load_pos = refresh
             .find("load_with_trust")
             .expect("refresh loads through ConfigSource with trust");
-        assert!(trust_pos < load_pos, "trust must be re-read before config load");
+        assert!(
+            trust_pos < load_pos,
+            "trust must be re-read before config load"
+        );
     }
 }
 #[test]

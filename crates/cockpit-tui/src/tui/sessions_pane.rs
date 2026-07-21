@@ -2995,14 +2995,14 @@ mod tests {
             cards: vec![],
             list: ScrollList::new(),
         });
-        pane.loading = Some("Loading sessions...".into());
+        pane.loading = Some("Loading sessions...");
 
         assert!(matches!(
             pane.handle_key(press(KeyCode::Esc)),
             Some(SessionsOutcome::LoadList)
         ));
         assert_eq!(pane.levels.len(), 1, "Esc backs out one fork level");
-        assert_eq!(pane.loading.as_deref(), Some("Loading sessions..."));
+        assert_eq!(pane.loading, Some("Loading sessions..."));
         assert!(pane.current().cards.is_empty());
 
         let parent = summary(Uuid::new_v4(), 200);
@@ -3018,13 +3018,13 @@ mod tests {
             Some(SessionsOutcome::LoadList)
         ));
         assert_eq!(pane.levels.len(), 1, "Left backs out one fork level");
-        assert_eq!(pane.loading.as_deref(), Some("Loading sessions..."));
+        assert_eq!(pane.loading, Some("Loading sessions..."));
     }
 
     #[test]
     fn daemon_reload_error_clears_loading_and_surfaces_inline_error() {
         let mut pane = test_pane(vec![(summary(Uuid::new_v4(), 100), Tier::Idle)]);
-        pane.loading = Some("Loading sessions...".into());
+        pane.loading = Some("Loading sessions...");
 
         let ids = pane.apply_sessions_result(Err("daemon unavailable".into()));
 
@@ -3050,7 +3050,7 @@ mod tests {
             Some(SessionsOutcome::LoadList)
         ));
         assert_eq!(pane.step, Step::Browse);
-        assert_eq!(pane.loading.as_deref(), Some("Loading sessions..."));
+        assert_eq!(pane.loading, Some("Loading sessions..."));
 
         pane.loading = None;
         pane.step = Step::Confirm {
@@ -3064,7 +3064,7 @@ mod tests {
             pane.handle_key(press(KeyCode::Enter)),
             Some(SessionsOutcome::LoadList)
         ));
-        assert_eq!(pane.loading.as_deref(), Some("Loading sessions..."));
+        assert_eq!(pane.loading, Some("Loading sessions..."));
 
         let mut archived = summary(Uuid::new_v4(), 200);
         archived.archived_at = Some(300);
@@ -3074,7 +3074,7 @@ mod tests {
             pane.handle_key(press(KeyCode::Char('u'))),
             Some(SessionsOutcome::LoadList)
         ));
-        assert_eq!(pane.loading.as_deref(), Some("Loading sessions..."));
+        assert_eq!(pane.loading, Some("Loading sessions..."));
     }
 
     fn test_pane(cards: Vec<(SessionSummary, Tier)>) -> SessionsPane {

@@ -793,8 +793,10 @@ mod tests {
             omitted: 1,
             items: vec![completed, pending],
         };
-        let mut appendix = StateAppendix::default();
-        appendix.task_overview = render_task_todo_overview(&overview);
+        let appendix = StateAppendix {
+            task_overview: render_task_todo_overview(&overview),
+            ..Default::default()
+        };
         let rendered = appendix.render();
         assert!(rendered.contains("Completed: wire todo deltas - delta applied"));
         assert!(rendered.contains("Pending: finish retrieval"));

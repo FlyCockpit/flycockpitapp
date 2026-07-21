@@ -2224,7 +2224,9 @@ mod tests {
                 .contains("fake scheduled turn completed for `helper-bot`")
         );
         assert!(
-            db.list_session_events(session.session_id).unwrap().len() > 0,
+            !db.list_session_events(session.session_id)
+                .unwrap()
+                .is_empty(),
             "prompt runner should persist session events"
         );
     }

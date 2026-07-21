@@ -240,7 +240,7 @@ impl std::fmt::Debug for dyn SettingsPage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         #[cfg(test)]
         {
-            return f.write_str(self.test_name());
+            f.write_str(self.test_name())
         }
         #[cfg(not(test))]
         {

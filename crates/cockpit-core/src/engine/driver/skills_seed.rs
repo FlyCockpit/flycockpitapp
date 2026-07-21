@@ -31,21 +31,6 @@ impl From<crate::db::skill_pairs::SkillPairRow> for SkillPair {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    #[test]
-    fn seed_label_output_unchanged_except_escaping() {
-        let unchanged = crate::text::short_args(&json!({ "path": "src/lib.rs" }));
-        let unescaped = crate::text::short_args(&json!({ "name": "say \"hi\"" }));
-
-        assert_eq!(unchanged, "path=\"src/lib.rs\"");
-        assert_eq!(unescaped, "name=\"say \"hi\"\"");
-        assert!(!unescaped.contains("\\\""));
-    }
-}
-
 /// Remove from the root history the user-invoked skill pairs owned by the
 /// outgoing primary `owner` that are not flagged `intentional_steer`, so an
 /// abandoned skill the outgoing primary declined to follow does not cross a
@@ -959,5 +944,20 @@ impl Driver {
         {
             tracing::warn!(error = %e, "persisting skill-pair ownership failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn seed_label_output_unchanged_except_escaping() {
+        let unchanged = crate::text::short_args(&json!({ "path": "src/lib.rs" }));
+        let unescaped = crate::text::short_args(&json!({ "name": "say \"hi\"" }));
+
+        assert_eq!(unchanged, "path=\"src/lib.rs\"");
+        assert_eq!(unescaped, "name=\"say \"hi\"\"");
+        assert!(!unescaped.contains("\\\""));
     }
 }

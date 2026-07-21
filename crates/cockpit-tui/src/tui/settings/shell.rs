@@ -432,6 +432,32 @@ pub(super) fn text_area_lines(
     lines
 }
 
+fn wrap_chunks(value: &str, width: usize) -> Vec<String> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for ch in value.chars() {
+        if ch == '\n' {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+            continue;
+        }
+        let ch_width = ch.width().unwrap_or(0);
+        if current_width > 0 && current_width + ch_width > width {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+    chunks.push(current);
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,30 +526,4 @@ mod tests {
             "moving up within the visible padded window must not bottom-anchor"
         );
     }
-}
-
-fn wrap_chunks(value: &str, width: usize) -> Vec<String> {
-    if value.is_empty() {
-        return Vec::new();
-    }
-
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0usize;
-    for ch in value.chars() {
-        if ch == '\n' {
-            chunks.push(std::mem::take(&mut current));
-            current_width = 0;
-            continue;
-        }
-        let ch_width = ch.width().unwrap_or(0);
-        if current_width > 0 && current_width + ch_width > width {
-            chunks.push(std::mem::take(&mut current));
-            current_width = 0;
-        }
-        current.push(ch);
-        current_width += ch_width;
-    }
-    chunks.push(current);
-    chunks
 }

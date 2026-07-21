@@ -388,15 +388,15 @@ mod tests {
         tokio::spawn(async move {
             loop {
                 let open = db.list_open_interrupts(session_id).unwrap();
-                if let Some(row) = open.iter().find(|row| !initial.contains(&row.interrupt_id)) {
-                    if hub.resolve(
+                if let Some(row) = open.iter().find(|row| !initial.contains(&row.interrupt_id))
+                    && hub.resolve(
                         row.interrupt_id,
                         crate::daemon::proto::ResolveResponse::Single {
                             selected_id: selected_id.to_string(),
                         },
-                    ) {
-                        break;
-                    }
+                    )
+                {
+                    break;
                 }
                 tokio::task::yield_now().await;
             }

@@ -377,24 +377,28 @@ mod tests {
 
     #[test]
     fn replace_imported_policy_drops_local_providers_and_active_model() {
-        let mut current = ProvidersConfig::default();
-        current.active_model = Some(crate::config::providers::ActiveModelRef {
-            provider: "local".into(),
-            model: "old".into(),
-            reasoning_effort: None,
-            thinking_mode: None,
-        });
+        let mut current = ProvidersConfig {
+            active_model: Some(crate::config::providers::ActiveModelRef {
+                provider: "local".into(),
+                model: "old".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+            ..Default::default()
+        };
         current
             .providers
             .insert("local".into(), provider("https://local.example.test/v1"));
 
-        let mut imported = ProvidersConfig::default();
-        imported.active_model = Some(crate::config::providers::ActiveModelRef {
-            provider: "imported".into(),
-            model: "new".into(),
-            reasoning_effort: None,
-            thinking_mode: None,
-        });
+        let mut imported = ProvidersConfig {
+            active_model: Some(crate::config::providers::ActiveModelRef {
+                provider: "imported".into(),
+                model: "new".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+            ..Default::default()
+        };
         imported.providers.insert(
             "imported".into(),
             provider("https://imported.example.test/v1"),

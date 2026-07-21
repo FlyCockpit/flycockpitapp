@@ -1291,8 +1291,10 @@ mod tests {
     async fn monty_adapter_output_and_redaction_equivalence() {
         let tmp = tempfile::tempdir().unwrap();
         let secret = "adapter-secret-value";
-        let mut redaction_cfg = crate::config::extended::RedactConfig::default();
-        redaction_cfg.denylist = vec![secret.to_string()];
+        let redaction_cfg = crate::config::extended::RedactConfig {
+            denylist: vec![secret.to_string()],
+            ..Default::default()
+        };
         let mut ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.redact =
             Arc::new(crate::redact::RedactionTable::build(&redaction_cfg, tmp.path()).unwrap());

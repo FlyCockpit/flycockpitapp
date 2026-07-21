@@ -1475,10 +1475,7 @@ mod proto_fixture_tests {
                 && let Some(first) = trimmed.chars().next()
                 && first.is_ascii_uppercase()
             {
-                let name = trimmed
-                    .split(|c: char| c == ' ' || c == '{' || c == ',')
-                    .next()
-                    .expect("variant name");
+                let name = trimmed.split([' ', '{', ',']).next().expect("variant name");
                 out.push(to_snake_case(name));
             }
 

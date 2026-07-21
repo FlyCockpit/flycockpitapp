@@ -180,7 +180,7 @@ fn random_short_id() -> String {
 #[cfg(test)]
 thread_local! {
     static TEST_SHORT_IDS: std::cell::RefCell<std::collections::VecDeque<String>> =
-        std::cell::RefCell::new(std::collections::VecDeque::new());
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 #[cfg(test)]

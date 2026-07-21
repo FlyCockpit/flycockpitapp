@@ -1104,10 +1104,7 @@ except Exception:
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("fake-mcp.py");
         let mut file = std::fs::File::create(&script).unwrap();
-        writeln!(
-            file,
-            "{}",
-            r#"#!/usr/bin/env python3
+        let script_src = r#"#!/usr/bin/env python3
 import json
 import sys
 
@@ -1164,9 +1161,8 @@ for line in sys.stdin:
         }
     sys.stdout.write(json.dumps(resp) + "\n")
     sys.stdout.flush()
-"#
-        )
-        .unwrap();
+"#;
+        writeln!(file, "{script_src}").unwrap();
         let mut perms = file.metadata().unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();

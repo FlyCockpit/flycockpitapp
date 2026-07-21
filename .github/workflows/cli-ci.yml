@@ -83,7 +83,7 @@ jobs:
         run: cargo test --locked --workspace --doc
 
       - name: Clippy
-        run: cargo clippy --locked --workspace -- -D warnings
+        run: cargo clippy --locked --workspace --tests -- -D warnings
 
       - name: Format
         run: cargo fmt --all -- --check

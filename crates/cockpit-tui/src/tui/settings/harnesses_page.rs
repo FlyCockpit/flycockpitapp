@@ -671,6 +671,58 @@ fn synthetic_row(label: &str, selected: bool) -> Line<'static> {
     ])
 }
 
+impl SettingsPage for HarnessesPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        cx.handle_harnesses_page_key(key, self)
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        cx.render_harnesses_page(frame, area, self);
+    }
+
+    fn title(&self, cx: &SettingsCx) -> String {
+        let crumbs = match self {
+            HarnessesPage::List(_) => " › Harnesses".to_string(),
+            HarnessesPage::Edit(s) => format!(" › Harnesses › {}", s.name),
+        };
+        format!(
+            "{}{}",
+            cockpit_core::welcome::display_path(&cx.config_path),
+            crumbs
+        )
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        match self {
+            HarnessesPage::List(s) => {
+                if s.adding.is_some() {
+                    "type harness name  enter: create & edit  esc: cancel"
+                } else {
+                    "↑/↓/Tab/Shift+Tab  enter: edit/seed  a: add  d: delete (×2)  esc/h: back  q: close"
+                }
+            }
+            HarnessesPage::Edit(s) => {
+                if s.editing.is_some() {
+                    "type to edit  enter: apply  esc: cancel"
+                } else {
+                    "↑/↓/Tab/Shift+Tab  enter: edit / cycle  esc/h: back to list  q: close"
+                }
+            }
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "Harnesses"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,57 +790,5 @@ mod tests {
         assert_eq!(hc.prompt_input, PromptInputMode::Argv);
         Field::ArgvOverflow.cycle(&mut hc);
         assert_eq!(hc.argv_overflow, ArgvOverflowBehavior::SpillToStdin);
-    }
-}
-
-impl SettingsPage for HarnessesPage {
-    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
-        cx.handle_harnesses_page_key(key, self)
-    }
-
-    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        cx.render_harnesses_page(frame, area, self);
-    }
-
-    fn title(&self, cx: &SettingsCx) -> String {
-        let crumbs = match self {
-            HarnessesPage::List(_) => " › Harnesses".to_string(),
-            HarnessesPage::Edit(s) => format!(" › Harnesses › {}", s.name),
-        };
-        format!(
-            "{}{}",
-            cockpit_core::welcome::display_path(&cx.config_path),
-            crumbs
-        )
-    }
-
-    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
-        match self {
-            HarnessesPage::List(s) => {
-                if s.adding.is_some() {
-                    "type harness name  enter: create & edit  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  enter: edit/seed  a: add  d: delete (×2)  esc/h: back  q: close"
-                }
-            }
-            HarnessesPage::Edit(s) => {
-                if s.editing.is_some() {
-                    "type to edit  enter: apply  esc: cancel"
-                } else {
-                    "↑/↓/Tab/Shift+Tab  enter: edit / cycle  esc/h: back to list  q: close"
-                }
-            }
-        }
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    #[cfg(test)]
-    fn test_name(&self) -> &'static str {
-        "Harnesses"
     }
 }

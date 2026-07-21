@@ -831,9 +831,5 @@ async fn connection_loss_during_swap_keeps_runner_for_reconnect_and_fails_buffer
     );
     assert!(input_rx.try_recv().is_err());
     assert!(newest_user_failed(&app));
-    assert!(
-        error_lines(&app)
-            .iter()
-            .any(|line| *line == "/new: daemon connection lost; reconnecting")
-    );
+    assert!(error_lines(&app).contains(&"/new: daemon connection lost; reconnecting"));
 }

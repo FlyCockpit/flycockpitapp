@@ -3284,31 +3284,6 @@ impl CategoryPage {
     }
 }
 
-#[cfg(test)]
-mod descriptor_tests {
-    use super::*;
-
-    #[test]
-    fn every_setting_id_has_descriptor() {
-        for id in ALL_SETTING_IDS {
-            let descriptor = id.descriptor();
-            assert!(!descriptor.label.is_empty(), "missing label for {id:?}");
-            assert!(!descriptor.help.is_empty(), "missing help for {id:?}");
-            match descriptor.kind {
-                FieldKind::Cycle | FieldKind::EditText | FieldKind::Numeric | FieldKind::Drill => {}
-            }
-        }
-    }
-
-    #[test]
-    fn approval_mode_help_is_preserved() {
-        assert_eq!(
-            SettingId::ApprovalMode.descriptor().help,
-            "When a command, web fetch, or MCP call needs approval before it runs. `manual` (default) asks you every time — you are the gate; `auto` routes each call past the utility-model safety gate (safe runs, unsafe asks) and needs a utility model; `yolo` runs everything unprompted. Distinct from the `auto` *agent*."
-        );
-    }
-}
-
 impl SettingsPage for CategoryPage {
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_category_page_key(key, self)
@@ -3345,5 +3320,30 @@ impl SettingsPage for CategoryPage {
     #[cfg(test)]
     fn test_name(&self) -> &'static str {
         "Category"
+    }
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn every_setting_id_has_descriptor() {
+        for id in ALL_SETTING_IDS {
+            let descriptor = id.descriptor();
+            assert!(!descriptor.label.is_empty(), "missing label for {id:?}");
+            assert!(!descriptor.help.is_empty(), "missing help for {id:?}");
+            match descriptor.kind {
+                FieldKind::Cycle | FieldKind::EditText | FieldKind::Numeric | FieldKind::Drill => {}
+            }
+        }
+    }
+
+    #[test]
+    fn approval_mode_help_is_preserved() {
+        assert_eq!(
+            SettingId::ApprovalMode.descriptor().help,
+            "When a command, web fetch, or MCP call needs approval before it runs. `manual` (default) asks you every time — you are the gate; `auto` routes each call past the utility-model safety gate (safe runs, unsafe asks) and needs a utility model; `yolo` runs everything unprompted. Distinct from the `auto` *agent*."
+        );
     }
 }

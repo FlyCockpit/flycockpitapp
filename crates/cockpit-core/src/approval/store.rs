@@ -2254,8 +2254,10 @@ mod tests {
         generation: u64,
         policy: ApprovalPolicyConfig,
     ) -> SessionConfigSnapshot {
-        let mut extended = crate::config::extended::ExtendedConfig::default();
-        extended.approval_policy = policy;
+        let extended = crate::config::extended::ExtendedConfig {
+            approval_policy: policy,
+            ..Default::default()
+        };
         SessionConfigSnapshot::new(
             generation,
             crate::config::providers::ProvidersConfig::default(),

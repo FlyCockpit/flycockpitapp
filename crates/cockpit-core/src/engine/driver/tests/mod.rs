@@ -5,6 +5,7 @@ mod delegation;
 mod goals;
 mod inbound;
 mod learn;
+mod llm_mode;
 mod misc;
 mod model_switch;
 mod noninteractive;

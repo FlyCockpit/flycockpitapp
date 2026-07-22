@@ -5,6 +5,24 @@ use super::*;
 
 pub(super) const INTERRUPT_REDACTION_FAILED: &str = "[redaction failed]";
 
+pub(super) fn persistent_llm_mode_control(
+    mode: crate::config::extended::LlmMode,
+) -> crate::engine::driver::DriverControl {
+    crate::engine::driver::DriverControl::SetLlmMode {
+        mode: Some(mode),
+        prune_after_switch: true,
+    }
+}
+
+pub(super) fn session_llm_mode_control(
+    mode: crate::config::extended::LlmMode,
+) -> crate::engine::driver::DriverControl {
+    crate::engine::driver::DriverControl::SetLlmMode {
+        mode: Some(mode),
+        prune_after_switch: false,
+    }
+}
+
 pub(super) struct ParkedReplayCompletion {
     interrupt_id: uuid::Uuid,
     decision: Option<proto::InterruptDecision>,
@@ -1399,9 +1417,7 @@ pub(super) async fn run_worker(
                     }
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
-                        crate::engine::driver::DriverControl::SetLlmMode {
-                            mode: Some(resolved),
-                        },
+                        persistent_llm_mode_control(resolved),
                         &event_tx,
                         &redaction,
                         session_id,
@@ -1415,7 +1431,7 @@ pub(super) async fn run_worker(
                 SessionWork::SetSessionLlmMode { mode } => {
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
-                        crate::engine::driver::DriverControl::SetLlmMode { mode: Some(mode) },
+                        session_llm_mode_control(mode),
                         &event_tx,
                         &redaction,
                         session_id,

@@ -485,6 +485,11 @@ impl App {
                     self.push_plain(warning);
                 }
             }
+            ControlApplied::LlmModeSwitchWarning => {
+                if let Some(warning) = self.llm_mode_switch_warning() {
+                    self.push_plain(warning);
+                }
+            }
             ControlApplied::PrimaryAgentSwitch { name } => {
                 self.record_primary_switch_confirmation(&name);
             }

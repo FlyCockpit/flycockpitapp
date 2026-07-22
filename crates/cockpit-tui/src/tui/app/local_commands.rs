@@ -599,9 +599,7 @@ impl App {
     }
 
     /// Shared cache-break warning helper. Returns the one-line warning to
-    /// show when an action busts the cached system prefix (a `/llm-mode`
-    /// switch today; the shift+tab agent cycle and `/agent` — specced
-    /// elsewhere — reuse this verbatim). Returns `None` when the warning is
+    /// show when an action busts the cached system prefix. Returns `None` when the warning is
     /// meaningless because the active model/provider does not cache: reuses
     /// the pruning-policy no-cache predicate
     /// ([`cockpit_core::engine::prune::cache_state`] →
@@ -616,6 +614,18 @@ impl App {
             )
         } else {
             // No-cache provider: nothing to bust, so no warning.
+            None
+        }
+    }
+
+    pub(super) fn llm_mode_switch_warning(&self) -> Option<String> {
+        if self.active_provider_caches() {
+            Some(
+                "Heads up: switching LLM mode forces a prune, updates tool descriptions, \
+                 and busts the prompt cache — the next call re-sends the full prefix uncached."
+                    .to_string(),
+            )
+        } else {
             None
         }
     }

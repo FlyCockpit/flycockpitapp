@@ -39,6 +39,7 @@ impl Driver {
         let old_session_model = self.session.active_model();
         let active_idx = 0;
         let current = &self.stack[active_idx].agent.model;
+        let old_llm_mode = self.stack[active_idx].agent.llm_mode;
         if current.provider_id() == provider && current.model_id_ref() == model {
             self.record_model_switch_audit(crate::session::ModelSwitchAudit {
                 from_provider: old_session_provider.as_deref(),
@@ -80,7 +81,8 @@ impl Driver {
                 return;
             }
         };
-        let rebuilt = Arc::new(self.rebuild_frame_with_model(active_idx, new_model));
+        let llm_mode = self.effective_llm_mode_for(provider, model);
+        let rebuilt = Arc::new(self.rebuild_frame_with_model(active_idx, new_model, llm_mode));
         if let Err(e) = self.persist_active_model_session(provider, model) {
             let error = format!("{e:#}");
             self.session
@@ -181,6 +183,9 @@ impl Driver {
         // The job authority's fork context is rooted on the root agent;
         // rebind it when the root model changes.
         self.schedule.set_agent(self.stack[0].agent.clone());
+        if old_llm_mode != llm_mode {
+            let _ = tx.send(TurnEvent::LlmModeChanged { mode: llm_mode }).await;
+        }
         tracing::info!(provider, model, "active model switched live");
         // The model changed, so the prefix cache key changes — refresh the
         // prunable projection the chrome shows (cache-cold reflects the bust).

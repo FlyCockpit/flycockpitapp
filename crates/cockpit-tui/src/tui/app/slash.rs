@@ -1547,9 +1547,9 @@ impl App {
     /// `defensive → normal → frontier → defensive`; `defend` (advertised,
     /// shorter to type) and its silent alias `defensive` select defensive;
     /// `normal` and `frontier` select those modes. Switching busts the cached
-    /// system prefix, so we surface the shared cache-break warning (suppressed
-    /// on a no-cache provider). The actual rebuild happens daemon-side; the
-    /// `LlmModeChanged` event confirms it.
+    /// system prefix and forces a prune, so we surface the shared warning
+    /// (suppressed on a no-cache provider). The actual rebuild happens
+    /// daemon-side; the `LlmModeChanged` event confirms it.
     pub(super) fn handle_llm_mode_command(&mut self, arg: &str) {
         let requested = match parse_llm_mode_arg(arg) {
             Ok(r) => r,
@@ -1569,7 +1569,7 @@ impl App {
         self.send_daemon_request(
             "/llm-mode",
             cockpit_core::daemon::proto::Request::SetLlmMode { mode: requested },
-            ControlApplied::CacheBreakWarning,
+            ControlApplied::LlmModeSwitchWarning,
         );
         // The `LlmModeChanged` event pushes the "Switched to …" confirmation
         // once the daemon applies it.
@@ -2616,6 +2616,41 @@ mod table_tests {
         app.composer.set("/?".to_string());
         app.execute_slash(alias);
         assert!(matches!(app.overlay, Overlay::Help(_)));
+    }
+
+    #[test]
+    fn llm_mode_command_warning_names_prune_and_descriptions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.active_model = None;
+        let warning = app
+            .llm_mode_switch_warning()
+            .expect("default test provider should cache");
+
+        assert!(warning.contains("forces a prune"), "{warning}");
+        assert!(warning.contains("updates tool descriptions"), "{warning}");
+        assert!(warning.contains("prompt cache"), "{warning}");
+
+        let cache_only = app.cache_break_warning().expect("cache warning");
+        assert!(!cache_only.contains("prune"), "{cache_only}");
+        assert!(!cache_only.contains("tool descriptions"), "{cache_only}");
+    }
+
+    #[test]
+    fn llm_mode_command_noop_copy_unchanged() {
+        use cockpit_config::extended::LlmMode;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut app = App::new(Some(tmp.path()), false);
+        app.llm_mode = LlmMode::Defensive;
+
+        app.handle_llm_mode_command("defend");
+
+        assert!(app.history.iter().any(|entry| matches!(
+            entry,
+            crate::tui::history::HistoryEntry::Plain { line }
+                if line == "Already in `defensive` LLM mode"
+        )));
     }
 
     #[test]

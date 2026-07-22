@@ -143,6 +143,59 @@ async fn live_model_switch_routes_next_request_to_new_model() {
     assert_config_active_model(&driver, "provider-b", "model-b");
 }
 
+#[tokio::test]
+async fn llm_mode_reresolved_on_model_switch() {
+    use crate::config::extended::LlmMode;
+    use crate::config::providers::ModelEntry;
+
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    assert_eq!(driver.stack[0].agent.llm_mode, LlmMode::Defensive);
+    driver
+        .test_providers_override
+        .as_mut()
+        .unwrap()
+        .0
+        .providers
+        .get_mut("provider-b")
+        .unwrap()
+        .models
+        .push(ModelEntry {
+            id: "model-b".into(),
+            mode: Some(LlmMode::Normal),
+            ..ModelEntry::default()
+        });
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+    assert_eq!(driver.stack[0].agent.llm_mode, LlmMode::Normal);
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    assert!(events.iter().any(
+        |event| matches!(event, TurnEvent::LlmModeChanged { mode } if *mode == LlmMode::Normal)
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::Pruned { .. })),
+        "model-pin re-resolution is prune-free; only explicit /llm-mode warns and prunes"
+    );
+}
+
 /// A successful switch commits both durable authorities and routes the next
 /// inference through the newly selected root model.
 #[tokio::test]

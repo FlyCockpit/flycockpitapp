@@ -252,6 +252,7 @@ pub(crate) struct PendingControlRequest {
 pub(crate) enum ControlApplied {
     None,
     CacheBreakWarning,
+    LlmModeSwitchWarning,
     PrimaryAgentSwitch { name: String },
     Multireview { kickoff: String },
     QuickActiveModel { provider: String, model: String },

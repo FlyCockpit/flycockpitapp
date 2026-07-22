@@ -109,13 +109,17 @@ pub enum DriverControl {
     /// agent so its tool-description verbosity + per-mode prompt re-render;
     /// busts the cached system prefix (the TUI shows the cache-break warning
     /// via the shared helper, suppressed on a no-cache provider). Root
-    /// history is preserved — same conversation, new steering. A no-op when
-    /// an interactive subagent holds the foreground or the mode is unchanged.
+    /// history is preserved — same conversation, new steering. When
+    /// `prune_after_switch` is true, the successful rebuild immediately runs
+    /// through the ordinary prune path so stale mode-specific tool text is not
+    /// retained. A no-op when an interactive subagent holds the foreground or
+    /// the mode is unchanged.
     /// `mode = None` toggles against the driver's authoritative current value
     /// (the `/llm-mode` / `toggle` default action); `Some(_)` sets it
     /// explicitly.
     SetLlmMode {
         mode: Option<crate::config::extended::LlmMode>,
+        prune_after_switch: bool,
     },
     /// Swap the session's redaction table live (`/toggle-redaction`). The
     /// session worker rebuilds the table from the in-memory effective
@@ -1572,11 +1576,16 @@ impl Driver {
         let running = root_frame.agent.model.clone();
         let provider = running.provider_id().to_string();
         let model = running.model_id_ref().to_string();
+        let old_llm_mode = root_frame.agent.llm_mode;
         match self.build_live_model_for_running(&running, &provider, &model) {
             Ok(new_model) => {
-                let rebuilt = self.rebuild_frame_with_model(0, Arc::new(new_model));
+                let llm_mode = self.effective_llm_mode_for(&provider, &model);
+                let rebuilt = self.rebuild_frame_with_model(0, Arc::new(new_model), llm_mode);
                 self.stack[0].agent = Arc::new(rebuilt);
                 self.schedule.set_agent(self.stack[0].agent.clone());
+                if old_llm_mode != llm_mode {
+                    let _ = tx.send(TurnEvent::LlmModeChanged { mode: llm_mode }).await;
+                }
                 self.active_model_refresh_failure_notice = None;
             }
             Err(e) => {
@@ -2994,8 +3003,11 @@ impl Driver {
             DriverControl::SwapPrimary { name } => {
                 self.swap_primary(&name, tx).await;
             }
-            DriverControl::SetLlmMode { mode } => {
-                self.set_llm_mode(mode, tx).await;
+            DriverControl::SetLlmMode {
+                mode,
+                prune_after_switch,
+            } => {
+                self.set_llm_mode(mode, prune_after_switch, tx).await;
             }
             DriverControl::SetRedaction {
                 table,
@@ -3935,7 +3947,8 @@ impl Driver {
     }
 
     /// Re-load a foreground frame under `new_model` (live model switch),
-    /// preserving its name + LLM mode. The new model's reasoning params are
+    /// preserving its name and applying the caller's re-resolved LLM mode. The
+    /// new model's reasoning params are
     /// re-resolved from the config's active-model thinking mode so a switch to a
     /// model with different reasoning controls sends the right vendor params (and
     /// drops a prior model's params that the new one would reject — priority #1),
@@ -3944,6 +3957,7 @@ impl Driver {
         &self,
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
+        llm_mode: crate::config::extended::LlmMode,
     ) -> Agent {
         let name = self.stack[frame_idx].agent.name.clone();
         // Re-resolve the new model's reasoning params from the (freshly-written)
@@ -3955,6 +3969,7 @@ impl Driver {
         // noninteractive delegations run off-stack, so rebuilding a stack frame
         // must preserve the interactive recall/todo/goal tool surface.
         let mut args = self.spawn_args(true);
+        args.llm_mode = llm_mode;
         args.model = new_model;
         args.model_override = None;
         args.delegation_model = None;
@@ -3969,6 +3984,18 @@ impl Driver {
         // never strands the session without a primary.
         crate::engine::builtin::load(&name, &args)
             .unwrap_or_else(|_| crate::engine::builtin::default_build(&args))
+    }
+
+    fn effective_llm_mode_for(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> crate::config::extended::LlmMode {
+        self.live_providers_config()
+            .map(|providers| {
+                providers.resolve_mode(provider, model, self.config.extended().llm_mode)
+            })
+            .unwrap_or_else(|_| self.stack[0].agent.llm_mode)
     }
 
     /// Re-resolve the reasoning-param fragment for `model` from the config's
@@ -4092,13 +4119,15 @@ impl Driver {
     /// and per-mode prompt re-render, preserving the root history (same
     /// conversation, new steering). Busts the cached system prefix — the
     /// client warns the user (suppressed on a no-cache provider via the
-    /// shared cache-break helper) before sending the switch. Only the root
-    /// frame at idle is touched; a deeper interactive subagent frame is left
-    /// alone. No-op when the mode is unchanged or a subagent holds the
-    /// foreground.
+    /// shared cache-break helper) before sending the switch. When requested by
+    /// the control caller, a successful rebuild immediately runs the ordinary
+    /// prune path. Only the root frame at idle is touched; a deeper
+    /// interactive subagent frame is left alone. No-op when the mode is
+    /// unchanged or a subagent holds the foreground.
     async fn set_llm_mode(
         &mut self,
         requested: Option<crate::config::extended::LlmMode>,
+        prune_after_switch: bool,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
         // Resolve the target: an explicit mode, or a toggle against the
@@ -4110,14 +4139,22 @@ impl Driver {
                 requested = %mode.as_str(),
                 "llm_mode switch ignored: an interactive subagent holds the foreground"
             );
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: format!(
+                        "LLM mode switch to `{}` was refused because an interactive subagent holds the foreground.",
+                        mode.as_str()
+                    ),
+                })
+                .await;
             return;
         }
         if current == mode {
             return;
         }
         let name = self.stack[0].agent.name.clone();
-        // Spawn args carry the *new* mode (read from the root agent inside
-        // `spawn_args`), so set it on the root first, then reload.
+        // Spawn args start from the current root agent; override only the mode
+        // for the rebuilt root.
         let mut args = self.spawn_args(true);
         args.llm_mode = mode;
         match crate::engine::builtin::load(&name, &args) {
@@ -4129,9 +4166,20 @@ impl Driver {
                 tracing::info!(mode = %mode.as_str(), "llm_mode switched");
                 let _ = tx.send(TurnEvent::LlmModeChanged { mode }).await;
                 self.emit_context_projection(tx).await;
+                if prune_after_switch {
+                    self.do_prune(false, tx).await;
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, requested = %mode.as_str(), "llm_mode switch failed to reload agent");
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!(
+                            "LLM mode switch to `{}` failed — {e:#}. Keeping the current mode active.",
+                            mode.as_str()
+                        ),
+                    })
+                    .await;
             }
         }
     }

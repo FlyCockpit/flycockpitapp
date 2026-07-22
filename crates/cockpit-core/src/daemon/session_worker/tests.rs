@@ -1842,6 +1842,27 @@ fn llm_mode_reads_are_consistent_within_a_generation() {
 }
 
 #[test]
+fn session_llm_mode_stays_immediate_and_prune_free() {
+    use crate::config::extended::LlmMode;
+    use crate::engine::driver::DriverControl;
+
+    assert!(matches!(
+        persistent_llm_mode_control(LlmMode::Frontier),
+        DriverControl::SetLlmMode {
+            mode: Some(LlmMode::Frontier),
+            prune_after_switch: true
+        }
+    ));
+    assert!(matches!(
+        session_llm_mode_control(LlmMode::Frontier),
+        DriverControl::SetLlmMode {
+            mode: Some(LlmMode::Frontier),
+            prune_after_switch: false
+        }
+    ));
+}
+
+#[test]
 fn worker_uses_registry_resolved_config_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let snapshot = snapshot_for_tests();

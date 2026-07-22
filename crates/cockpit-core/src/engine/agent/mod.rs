@@ -645,11 +645,14 @@ async fn translate_final_response(
     .await
 }
 
-/// The tools the command-safety gate (`auto` approval mode) covers. Native
-/// websearch runs ungated; custom websearch is gated because it executes an
-/// arbitrary shell template.
-fn is_gated_tool(name: &str, config: &crate::daemon::session_worker::SessionConfigHandle) -> bool {
-    matches!(name, "bash" | "mcp") || crate::tools::web::web_tool_requires_gate(name, config)
+/// The tools the command-safety gate (`auto` approval mode) covers.
+///
+/// `webfetch` and `websearch` never require approval, even when
+/// `web.provider == custom` materializes them as configured shell-command
+/// shims. Under the settled approval model, configuring that custom web command
+/// is itself the approval; do not add a custom-provider carve-out here.
+fn is_gated_tool(name: &str) -> bool {
+    matches!(name, "bash" | "mcp")
 }
 
 pub(crate) fn result_scan_tool_candidate(name: &str) -> bool {

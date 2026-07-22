@@ -814,7 +814,7 @@ impl DefaultPrimaryAgent {
 }
 
 /// Command-approval mode (implementation note).
-/// Governs whether — and how — a gated tool call (`bash`, `webfetch`, `mcp`)
+/// Governs whether — and how — a gated tool call (`bash`, `mcp`)
 /// prompts the user before it runs.
 ///
 /// Deliberately distinct from the `auto`/`Auto` *router agent*

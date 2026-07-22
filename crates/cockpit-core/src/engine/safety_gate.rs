@@ -2,7 +2,7 @@
 //!
 //! The engine behind the `auto` *approval mode*
 //! ([`crate::config::extended::ApprovalMode::Auto`]). Each gated tool call
-//! (`bash`, `webfetch`, `mcp`) is sent — **with no conversation
+//! (`bash`, `mcp`) is sent — **with no conversation
 //! history** — to the utility model for a structured safety verdict before
 //! it runs: a `safe` verdict runs without prompting, an `unsafe` one
 //! escalates to the user through the existing approval prompt. The verdict
@@ -101,7 +101,7 @@ fn build_eval_message(tool: &str, payload: &str) -> String {
 /// Run one history-free safety evaluation on a single gated call.
 ///
 /// `provider_model` is the `"provider:model-id"` selector (the utility
-/// model). `tool` is the gated tool's name (`bash`/`webfetch`/`mcp`)
+/// model). `tool` is the gated tool's name (`bash`/`mcp`)
 /// and `payload` is the single command/call to judge — the model sees ONLY
 /// this, never conversation history. Returns [`SafetyOutcome::Unavailable`]
 /// for every failure path (unset/unparseable/unbuildable model, send error,

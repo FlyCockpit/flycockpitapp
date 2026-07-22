@@ -241,7 +241,7 @@ pub(crate) async fn execute_ordinary_call(
     };
 
     // Command-safety gate (implementation note):
-    // in `auto` approval mode each gated call (`bash`/`webfetch`/`mcp`)
+    // in `auto` approval mode each gated call (`bash`/`mcp`)
     // is judged by the utility model — with NO history —
     // before it runs. `safe` → run; `unsafe` (or utility model
     // unavailable → fail CLOSED) → escalate to the user; a denial skips

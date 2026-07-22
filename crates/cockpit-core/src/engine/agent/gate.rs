@@ -75,7 +75,7 @@ pub(super) async fn safety_gate_decision_with_configs(
     use crate::config::extended::ApprovalMode;
     use crate::engine::safety_gate::{SafetyOutcome, evaluate};
 
-    if !is_gated_tool(tool, &ctx.config) {
+    if !is_gated_tool(tool) {
         return GateOutcome::Run { recheck: false };
     }
     match ctx.session.approval_mode() {
@@ -146,8 +146,8 @@ pub(super) async fn safety_gate_decision_with_configs(
 }
 
 /// The single command/call text the safety evaluator judges. For `bash`
-/// it's the raw command line; for the network tools it's the call's
-/// arguments serialized compactly (the URL / server+tool+args).
+/// it's the raw command line; for other gated tools it's the call's
+/// arguments serialized compactly.
 pub(super) fn gate_payload(tool: &str, args: &Value) -> String {
     if tool == "bash" {
         return args
@@ -161,7 +161,7 @@ pub(super) fn gate_payload(tool: &str, args: &Value) -> String {
 
 /// Escalate a gated call to the user through the existing approval prompt.
 /// `bash` reuses [`Approver::approve_command`] (classify + command-detail
-/// UX); the network tools use the once-only [`Approver::approve_tool_call`].
+/// UX); non-bash gated tools use the once-only [`Approver::approve_tool_call`].
 /// `unavailable` tailors the surfaced reason (gate down vs. rated unsafe).
 /// With no approver wired (seed re-exec, tests) there is no client to ask —
 /// fail closed by treating it as denied.
@@ -304,19 +304,17 @@ mod safety_gate_tests {
     }
 
     #[test]
-    fn gate_scope_covers_shell_mcp_fetch_and_custom_websearch() {
+    fn gate_scope_covers_shell_and_mcp_only() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
-        let default_config =
-            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd);
-        assert!(is_gated_tool("bash", &default_config));
-        assert!(is_gated_tool("webfetch", &default_config));
-        assert!(is_gated_tool("mcp", &default_config));
-        assert!(!is_gated_tool("websearch", &default_config));
-        assert!(!is_gated_tool("read", &default_config));
-        assert!(!is_gated_tool("editunlock", &default_config));
-        assert!(!is_gated_tool("search", &default_config));
-        assert!(!is_gated_tool("task", &default_config));
+        assert!(is_gated_tool("bash"));
+        assert!(is_gated_tool("mcp"));
+        assert!(!is_gated_tool("webfetch"));
+        assert!(!is_gated_tool("websearch"));
+        assert!(!is_gated_tool("read"));
+        assert!(!is_gated_tool("editunlock"));
+        assert!(!is_gated_tool("search"));
+        assert!(!is_gated_tool("task"));
 
         std::fs::create_dir_all(cwd.join(".cockpit")).unwrap();
         std::fs::write(
@@ -324,9 +322,43 @@ mod safety_gate_tests {
             r#"{"web":{"provider":"custom"}}"#,
         )
         .unwrap();
-        let custom_config =
+        let _custom_config =
             crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd);
-        assert!(is_gated_tool("websearch", &custom_config));
+        assert!(!is_gated_tool("webfetch"));
+        assert!(!is_gated_tool("websearch"));
+    }
+
+    #[tokio::test]
+    async fn web_tools_are_never_gated_in_any_approval_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".cockpit")).unwrap();
+        std::fs::write(
+            root.join(".cockpit/config.json"),
+            r#"{"web":{"provider":"custom"}}"#,
+        )
+        .unwrap();
+        let providers = crate::config::providers::ProvidersConfig::default();
+        let (tx, _rx) = mpsc::channel(8);
+
+        for mode in [ApprovalMode::Manual, ApprovalMode::Auto, ApprovalMode::Yolo] {
+            let ctx = gate_ctx(root, mode, true);
+            for (tool, args) in [
+                (
+                    "webfetch",
+                    serde_json::json!({ "url": "https://example.com" }),
+                ),
+                ("websearch", serde_json::json!({ "query": "example" })),
+            ] {
+                let outcome =
+                    safety_gate_decision_with_configs(tool, &args, &ctx, &tx, None, &providers)
+                        .await;
+                assert!(
+                    matches!(outcome, GateOutcome::Run { recheck: false }),
+                    "{tool} should run ungated in {mode:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

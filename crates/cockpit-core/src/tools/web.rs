@@ -426,23 +426,6 @@ pub(crate) fn materialize_web_tool(
     }
 }
 
-pub(crate) fn is_custom_web_provider(
-    config: &crate::daemon::session_worker::SessionConfigHandle,
-) -> bool {
-    config.extended().web.provider == WebProvider::Custom
-}
-
-pub(crate) fn web_tool_requires_gate(
-    name: &str,
-    config: &crate::daemon::session_worker::SessionConfigHandle,
-) -> bool {
-    match name {
-        WEBFETCH => true,
-        WEBSEARCH => is_custom_web_provider(config),
-        _ => false,
-    }
-}
-
 fn required_non_empty_string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     let value = args
         .get(key)

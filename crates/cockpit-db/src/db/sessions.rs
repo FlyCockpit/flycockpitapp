@@ -824,6 +824,10 @@ impl Db {
     /// no DB trace. The short_id is checked against the live table at build
     /// time for a useful display value; the eventual INSERT is the reservation
     /// point and may retry with a different final short_id.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn new_session_row(
         &self,
         project_id: &str,
@@ -859,6 +863,10 @@ impl Db {
         self.insert_session_row(&row)
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn new_assistant_session_row(
         &self,
         project_id: &str,
@@ -882,6 +890,10 @@ impl Db {
     /// [`Self::new_session_row`] for the deferred-persistence path; also the
     /// second half of [`Self::create_session`]. Idempotent at the
     /// application layer is **not** assumed — callers persist exactly once.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn insert_session_row(&self, row: &SessionRow) -> Result<SessionRow> {
         let row = row.clone();
         self.write_blocking(move |conn| {
@@ -889,6 +901,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_session_created_by_principal(
         &self,
         session_id: Uuid,
@@ -933,6 +949,10 @@ impl Db {
     /// `parent_session_id`. The fork is hidden from session lists like an
     /// ephemeral `/side` fork, but it is not swept on boot because it carries
     /// typed BTW linkage.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn create_btw_fork(
         &self,
         parent_session_id: Uuid,
@@ -1002,6 +1022,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn live_btw_fork_info(&self, parent_session_id: Uuid) -> Result<Option<BtwForkInfo>> {
         self.read_blocking(|conn| live_btw_fork_info_conn(conn, parent_session_id))
     }
@@ -1015,6 +1039,10 @@ impl Db {
         Ok(true)
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn create_fork_inner(
         &self,
         parent_session_id: Uuid,
@@ -1074,6 +1102,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn get_session(&self, session_id: Uuid) -> Result<Option<SessionRow>> {
         self.read_blocking(|conn| Self::get_session_conn(conn, session_id))
     }
@@ -1084,6 +1116,10 @@ impl Db {
 
     /// Lookup by short id within a project. Used by CLI/RPC paths where
     /// the user types the 6-char display id rather than the full UUID.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn get_session_by_short_id(
         &self,
         project_id: &str,
@@ -1108,6 +1144,10 @@ impl Db {
     /// `cockpit export <session>`, which accepts a bare short_id without a
     /// project context. Returns all matches so the caller can report an
     /// ambiguous identifier (a short_id is unique only within a project).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn find_sessions_by_short_id_global(&self, short_id: &str) -> Result<Vec<SessionRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -1126,6 +1166,10 @@ impl Db {
 
     /// Ensure the session has a short_id (lazy backfill for rows
     /// migrated from pre-§17 schemas). Returns the resolved short_id.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn ensure_short_id(&self, session_id: Uuid) -> Result<String> {
         self.write_blocking(move |conn| {
             let row = get_session_inner(conn, session_id)?
@@ -1141,6 +1185,10 @@ impl Db {
 
     /// Set or replace the session's title. `user_renamed` flips to true
     /// to lock out the auto-titling pass (GOALS §17d).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn rename_session(&self, session_id: Uuid, title: &str) -> Result<()> {
         let title = title.to_owned();
         self.write_blocking(move |conn| {
@@ -1155,6 +1203,10 @@ impl Db {
 
     /// Set the title from the auto-titling pass. Refuses to overwrite a
     /// user-set title — auto-titling never clobbers manual labels.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_auto_title(&self, session_id: Uuid, title: &str) -> Result<bool> {
         let title = title.to_owned();
         self.write_blocking(move |conn| {
@@ -1173,6 +1225,10 @@ impl Db {
     /// title). This is still an auto-generated title, so it clears
     /// `user_renamed`; future scheduled auto-refreshes may replace it until the
     /// user manually names the session again.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_explicit_auto_title(&self, session_id: Uuid, title: &str) -> Result<bool> {
         let title = title.to_owned();
         self.write_blocking(move |conn| {
@@ -1190,6 +1246,10 @@ impl Db {
     /// Set a generated title only if the session is still unnamed. This is
     /// used by daemon RPCs where competing callers may generate concurrently;
     /// the storage layer decides the single winner.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_explicit_auto_title_if_untitled(
         &self,
         session_id: Uuid,
@@ -1213,6 +1273,10 @@ impl Db {
     /// [`crate::session::Session::note_user_content`] so automatic refresh
     /// progress survives resume / daemon restart. Best-effort at the call
     /// site; an erroring write never blocks a turn.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_title_progress(
         &self,
         session_id: Uuid,
@@ -1232,6 +1296,10 @@ impl Db {
     }
 
     /// Direct children of a session in the fork tree. Most-recent-first.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_forks(&self, parent_session_id: Uuid) -> Result<Vec<SessionRow>> {
         self.read_blocking(|conn| Self::list_forks_conn(conn, parent_session_id))
     }
@@ -1256,6 +1324,10 @@ impl Db {
     /// Cheap fork count for the `[N forks]` chip in the `/sessions`
     /// browser. Counts immediate children only (depth-1).
     #[allow(dead_code)]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn count_forks_for(&self, parent_session_id: Uuid) -> Result<u32> {
         self.read_blocking(|conn| Self::count_forks_for_conn(conn, parent_session_id))
     }
@@ -1275,6 +1347,10 @@ impl Db {
     /// This is what the top-level `/sessions` view shows; forks descend
     /// via [`Self::list_forks`].
     #[allow(dead_code)]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_root_sessions(&self, project_id: &str, limit: u32) -> Result<Vec<SessionRow>> {
         self.read_blocking(|conn| Self::list_root_sessions_conn(conn, project_id, limit))
     }
@@ -1304,6 +1380,10 @@ impl Db {
     /// Delete a session. With `cascade = true`, also deletes every
     /// descendant fork (depth-unbounded). FK CASCADE on tool_call_events
     /// / inference_calls / lock state takes care of dependent rows.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn delete_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
         self.write_blocking(move |conn| {
             let tx = conn
@@ -1354,6 +1434,10 @@ impl Db {
     /// whose owning process died uncatchably can leave an orphaned ephemeral
     /// row behind, and this clears it so ephemeral sessions never accumulate.
     /// Returns the number of root ephemeral sessions removed.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn sweep_ephemeral_sessions(&self) -> Result<usize> {
         let roots = self.read_blocking(|conn| {
             let mut stmt = conn
@@ -1397,6 +1481,10 @@ impl Db {
     /// client opens/resumes the session — everything the agent produced
     /// up to this instant counts as seen; later agent output reads as
     /// unread.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn mark_session_viewed(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
         self.write_blocking(move |conn| {
@@ -1416,6 +1504,10 @@ impl Db {
     /// session is unread when this is newer than `last_viewed_at` (or it
     /// has activity and was never viewed).
     #[allow(dead_code)]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn latest_agent_activity_at(&self, session_id: Uuid) -> Result<Option<i64>> {
         self.read_blocking(|conn| Self::latest_agent_activity_at_conn(conn, session_id))
     }
@@ -1440,6 +1532,10 @@ impl Db {
     /// via the same recursive walk `delete_session` uses, so the whole
     /// fork subtree disappears from the browser together. Idempotent —
     /// re-archiving an already-archived row just re-stamps `archived_at`.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn archive_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
         let now = Utc::now().timestamp();
         self.write_blocking(move |conn| {
@@ -1465,6 +1561,10 @@ impl Db {
 
     /// Clear a session's archive flag (recover). Single row only — the
     /// browser unarchives one session at a time from the archived view.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn unarchive_session(&self, session_id: Uuid) -> Result<()> {
         self.write_blocking(move |conn| {
             conn.execute(
@@ -1480,6 +1580,10 @@ impl Db {
     /// counting the session itself). Used by the archive/delete confirm
     /// dialog to state how many sessions the cascade will affect.
     #[allow(dead_code)]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn count_descendants(&self, session_id: Uuid) -> Result<u32> {
         self.read_blocking(|conn| Self::count_descendants_conn(conn, session_id))
     }
@@ -1495,6 +1599,10 @@ impl Db {
     /// cheap for the shallow trees forks produce, and bounded by a guard
     /// against cyclic/dangling parents. Used by the daemon to decide
     /// which live workers to interrupt before a cascading archive/delete.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn is_in_subtree(&self, root: Uuid, node: Uuid) -> Result<bool> {
         if root == node {
             return Ok(true);
@@ -1528,6 +1636,10 @@ impl Db {
 
     /// Move `last_active_at` to now. Called by the daemon on every
     /// interaction so `cockpit -c` resumes the actually-recent one.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn touch_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
         self.write_blocking(move |conn| {
@@ -1540,6 +1652,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_session_redaction_table_json(
         &self,
         session_id: Uuid,
@@ -1555,6 +1671,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_session_model(&self, session_id: Uuid, provider: &str, model: &str) -> Result<()> {
         let provider = provider.to_owned();
         let model = model.to_owned();
@@ -1568,6 +1688,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_session_agent(&self, session_id: Uuid, active_agent: &str) -> Result<()> {
         let active_agent = active_agent.to_owned();
         self.write_blocking(move |conn| {
@@ -1580,6 +1704,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn end_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
         self.write_blocking(move |conn| {
@@ -1594,6 +1722,10 @@ impl Db {
 
     /// Sessions newest-first. `only_open = true` filters out ended ones.
     #[allow(dead_code)]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_sessions(&self, only_open: bool, limit: u32) -> Result<Vec<SessionRow>> {
         self.read_blocking(|conn| Self::list_sessions_conn(conn, only_open, limit))
     }
@@ -1621,6 +1753,10 @@ impl Db {
         Ok(out)
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_sessions_for_assistant(
         &self,
         assistant_name: &str,
@@ -1652,6 +1788,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn most_recent_session_for_assistant(
         &self,
         assistant_name: &str,
@@ -1674,6 +1814,10 @@ impl Db {
     /// The most recent durable session for a canonical workspace root,
     /// ordered by its latest user/assistant message rather than incidental
     /// metadata activity. Used by noninteractive `run --continue`.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn most_recent_session_for_root_by_message(
         &self,
         project_root: &str,
@@ -1721,6 +1865,10 @@ impl Db {
     /// daemonless path not at all). A per-row auxiliary-query miss
     /// degrades that field to its empty default rather than failing the
     /// whole list, matching the daemon handler's best-effort behavior.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_session_summaries(
         &self,
         project_id: Option<&str>,
@@ -1867,6 +2015,10 @@ impl Db {
     /// project.
     // Retained for the not-yet-wired `cockpit -c` continue flow.
     #[allow(dead_code)]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn most_recent_open_session_for(&self, project_id: &str) -> Result<Option<SessionRow>> {
         self.read_blocking(|conn| {
             let result = conn.query_row(
@@ -2136,6 +2288,10 @@ mod tests {
         .unwrap();
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn fork_tool_call_ids(db: &Db, session_id: Uuid) -> Vec<String> {
         db.read_blocking(|conn| {
             let mut stmt = conn
@@ -2155,6 +2311,10 @@ mod tests {
         db.get_session(session_id).unwrap().is_some()
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn fork_rows_for_parent(db: &Db, parent_session_id: Uuid) -> Vec<Uuid> {
         db.read_blocking(|conn| {
             let mut stmt = conn
@@ -2173,6 +2333,10 @@ mod tests {
         .unwrap()
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn install_trigger(db: &Db, sql: &str) {
         let db = db.clone();
         let sql = sql.to_owned();
@@ -2195,6 +2359,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn latest_session_for_root_orders_by_last_message() {
         let db = Db::open_in_memory().unwrap();
         let first = db.create_session("p", "/proj", "Build").unwrap();
@@ -2298,6 +2466,10 @@ mod tests {
 
     /// Push a session's `last_active_at` into the past so recency ordering is
     /// deterministic without sleeping across a whole-second timestamp boundary.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn backdate_session(db: &Db, session_id: Uuid, seconds: i64) {
         db.write_blocking(move |conn| {
             conn.execute(
@@ -2408,6 +2580,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn ensure_short_id_retries_backfill_collision() {
         let db = Db::open_in_memory().unwrap();
         set_test_short_ids(&["aaaaaa"]);
@@ -3034,6 +3210,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn list_session_summaries_conn_matches_db_wrapper() {
         let db = Db::open_in_memory().unwrap();
         let root = db.create_session("pid", "/proj", "builder").unwrap();
@@ -3194,6 +3374,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn ensure_short_id_backfills_null() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").unwrap();
@@ -3352,6 +3536,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn btw_schema_enforces_one_live_fork() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").unwrap();
@@ -3383,6 +3571,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn btw_create_is_atomic_and_unique() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").unwrap();
@@ -3454,6 +3646,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn sweep_ephemeral_sessions_warns_on_delete_failure_and_continues() {
         let db = Db::open_in_memory().unwrap();
         let root = db.create_session("p", "/x", "a").unwrap();

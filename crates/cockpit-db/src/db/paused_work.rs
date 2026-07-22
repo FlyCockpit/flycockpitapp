@@ -55,6 +55,10 @@ pub struct PausedWorkRow {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn upsert_paused_session_work(
         &self,
         session_id: Uuid,
@@ -107,6 +111,10 @@ impl Db {
         self.resolve_paused_session_work(session_id, PausedWorkStatus::Cancelled)
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn resolve_paused_session_work(
         &self,
         session_id: Uuid,
@@ -127,6 +135,10 @@ impl Db {
     }
 
     #[allow(dead_code)]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn paused_session_work(&self, session_id: Uuid) -> Result<Option<PausedWorkRow>> {
         self.read_blocking(|conn| Self::paused_session_work_conn(conn, session_id))
     }
@@ -148,6 +160,10 @@ impl Db {
         .context("reading paused session work")
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn paused_session_work_all(&self) -> Result<Vec<PausedWorkRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn

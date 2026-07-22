@@ -36,6 +36,10 @@ impl Db {
     /// session row doesn't exist or the baseline columns are NULL (no
     /// guidance file resolved at session start — feature inert for that
     /// session).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn guidance_baseline(&self, session_id: Uuid) -> Result<Option<GuidanceBaseline>> {
         self.read_blocking(|conn| {
             let row: Option<(Option<String>, Option<String>)> = conn
@@ -58,6 +62,10 @@ impl Db {
     /// hash together. Used both for the start-of-session snapshot and to
     /// advance the baseline after a change is injected. The two columns are
     /// always written as a unit so they never disagree.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_guidance_baseline(
         &self,
         session_id: Uuid,
@@ -83,6 +91,10 @@ impl Db {
     /// Content-addressed: a second insert of the same hash is a no-op
     /// (`INSERT OR IGNORE`), so repeated snapshots of unchanged content
     /// never churn the row.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn put_guidance_contents(&self, hash: &str, contents: &str) -> Result<()> {
         let now = Utc::now().timestamp();
         let hash = hash.to_owned();
@@ -99,6 +111,10 @@ impl Db {
     }
 
     /// Fetch the stored guidance body for a hash, or `None` if absent.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn guidance_contents(&self, hash: &str) -> Result<Option<String>> {
         self.read_blocking(|conn| {
             let contents: Option<String> = conn

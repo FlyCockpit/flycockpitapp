@@ -1212,6 +1212,10 @@ fn export_includes_permission_decision_event() {
 /// They are not event decisions, so the export includes an explicit
 /// snapshot under `approvals/grants.json`.
 #[test]
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+)]
 fn export_includes_persisted_approval_grants_snapshot() {
     let db = Db::open_in_memory().unwrap();
     let s = db.create_session("p", "/proj", "builder").unwrap();

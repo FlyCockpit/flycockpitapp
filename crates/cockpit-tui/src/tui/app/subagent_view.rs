@@ -92,6 +92,10 @@ impl App {
         true
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn backfill_subagent_history(&self, task_call_id: &str, label: &str) -> Vec<HistoryEntry> {
         let Some(session_id) = self.current_session_id() else {
             return Vec::new();

@@ -235,6 +235,10 @@ pub fn now_ms() -> i64 {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn store_compaction_payload(
         &self,
         handoff_id: Uuid,
@@ -279,6 +283,10 @@ impl Db {
             .context("decoding compaction payload")
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn compaction_payload(&self, session_id: Uuid, handoff_id: &str) -> Result<Option<String>> {
         self.read_blocking(|conn| Self::compaction_payload_conn(conn, session_id, handoff_id))
     }
@@ -293,6 +301,10 @@ impl Db {
     /// (implementation note). The
     /// dispatch `ts_ms` is preserved across the update via `COALESCE` so the
     /// recorded timestamp is when the request went out, not when it settled.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn insert_inference_request(
         &self,
         call_id: &str,
@@ -360,6 +372,10 @@ impl Db {
         )
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn insert_session_event_with_context(
         &self,
         session_id: Uuid,
@@ -400,6 +416,10 @@ impl Db {
 
     /// All events for one session, ordered by `seq` (oldest first). Used
     /// by the exporter to merge per-fork timelines.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_session_events(&self, session_id: Uuid) -> Result<Vec<SessionEventRow>> {
         self.read_blocking(|conn| Self::list_session_events_conn(conn, session_id))
     }
@@ -453,6 +473,10 @@ impl Db {
         Ok(events)
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_session_events_before(
         &self,
         session_id: Uuid,
@@ -507,6 +531,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn read_session_messages(
         &self,
         session_id: Uuid,
@@ -584,6 +612,10 @@ impl Db {
     /// pre-0009 call). The export writes the payload verbatim and surfaces the
     /// status on the emitted file so a hung/failed turn's record carries its
     /// non-`completed` status.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn get_inference_request(&self, call_id: &str) -> Result<Option<(Value, String)>> {
         self.read_blocking(|conn| {
             let result: rusqlite::Result<(String, String)> = conn.query_row(
@@ -781,6 +813,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn inference_request_dispatch_then_terminal_update_supersedes() {
         // The dispatch-time write (status `pending`) and the terminal update
         // (status `timed_out`) for one call_id collapse onto a single row,
@@ -1178,6 +1214,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn list_session_events_since_filters_strictly_after_seq() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").unwrap();

@@ -110,6 +110,10 @@ pub struct NeedsAttentionRow {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn raise_interrupt(
         &self,
         session_id: Uuid,
@@ -166,6 +170,10 @@ impl Db {
         )
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn raise_interrupt_questions_with_payload(
         &self,
         session_id: Uuid,
@@ -218,6 +226,10 @@ impl Db {
         Ok(interrupt_id)
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn resolve_interrupt(&self, interrupt_id: Uuid, response: &ResolveResponse) -> Result<()> {
         let now = Utc::now().timestamp();
         let response_json =
@@ -238,6 +250,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_open_interrupts(&self, session_id: Uuid) -> Result<Vec<NeedsAttentionRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -261,6 +277,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_reconcilable_interrupts(&self, session_id: Uuid) -> Result<Vec<NeedsAttentionRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -284,6 +304,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn get_interrupt(&self, interrupt_id: Uuid) -> Result<Option<NeedsAttentionRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -305,6 +329,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn park_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
         self.write_blocking(move |conn| {
             let affected = conn
@@ -319,6 +347,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn mark_interrupt_interrupted(&self, interrupt_id: Uuid) -> Result<bool> {
         self.write_blocking(move |conn| {
             let affected = conn
@@ -333,6 +365,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn acknowledge_interrupted_turns(&self, session_id: Uuid) -> Result<usize> {
         let now = Utc::now().timestamp();
         self.write_blocking(move |conn| {
@@ -348,6 +384,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn raise_interrupted_turn(
         &self,
         session_id: Uuid,
@@ -377,6 +417,10 @@ impl Db {
         Ok(interrupt_id)
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn begin_parked_interrupt_execution(
         &self,
         interrupt_id: Uuid,
@@ -397,6 +441,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn complete_executing_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
         let now = Utc::now().timestamp();
         self.write_blocking(move |conn| {

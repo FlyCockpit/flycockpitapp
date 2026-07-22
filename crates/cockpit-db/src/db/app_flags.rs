@@ -7,6 +7,10 @@ use rusqlite::{OptionalExtension, params};
 use crate::db::Db;
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn app_flag_seen(&self, key: &str) -> Result<bool> {
         let key = key.to_owned();
         self.read_blocking(move |conn| {
@@ -21,6 +25,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn mark_app_flag_seen(&self, key: &str) -> Result<bool> {
         let key = key.to_owned();
         self.write_blocking(move |conn| {

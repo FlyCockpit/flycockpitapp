@@ -80,6 +80,10 @@ const OPEN_STATUS_VALUES: [&str; 6] = [
 ];
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn create_session_goal(
         &self,
         session_id: Uuid,
@@ -141,6 +145,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn current_session_goal(
         &self,
         session_id: Uuid,
@@ -188,6 +196,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn update_session_goal(
         &self,
         session_id: Uuid,
@@ -265,6 +277,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn clear_session_goal(&self, session_id: Uuid) -> Result<bool> {
         self.write_blocking(move |conn| {
             let now = Utc::now().timestamp();
@@ -290,6 +306,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_session_goal_status(
         &self,
         session_id: Uuid,
@@ -310,6 +330,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn refresh_session_goal_usage(&self, session_id: Uuid) -> Result<()> {
         self.write_blocking(move |conn| {
             let open_statuses = open_status_placeholders(2);

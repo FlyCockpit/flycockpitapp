@@ -2063,6 +2063,10 @@ fn boot_housekeeping_succeeds_with_empty_task_delegation_tables() {
 }
 
 #[tokio::test]
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+)]
 async fn retention_tick_runs_one_pass_without_sleep() {
     let db = Db::open_in_memory().expect("in-memory db");
     let session = db.create_session("p", "/x", "Build").unwrap();

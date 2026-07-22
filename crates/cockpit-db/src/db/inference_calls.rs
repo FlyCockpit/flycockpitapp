@@ -37,6 +37,10 @@ pub struct InferenceCallRow {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn insert_inference_call(&self, row: &InferenceCallRow) -> Result<()> {
         let row = row.clone();
         self.write_blocking(move |conn| {
@@ -77,6 +81,10 @@ impl Db {
     /// `inference_calls` row (e.g. a pre-flag call, or a captured request
     /// without a usage row) is simply absent from the result → treated as
     /// non-utility.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn utility_call_ids(
         &self,
         call_ids: &[String],
@@ -111,6 +119,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn insert_round_trip() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").unwrap();

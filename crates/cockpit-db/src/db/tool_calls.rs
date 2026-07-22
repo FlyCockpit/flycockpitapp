@@ -171,6 +171,10 @@ pub struct ToolCallEvent {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn insert_tool_call(&self, ev: &ToolCallEvent) -> Result<()> {
         let language = ev.path.as_deref().and_then(language_for_path);
         let (recovery_kind, recovery_stage) = ev.recovery.db_fields();
@@ -268,6 +272,10 @@ impl Db {
     ///   `recovery_kind` are included too — useful for spotting
     ///   patterns the catalog is already catching.
     /// - `limit`: max rows returned.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_failed_tool_calls(&self, filter: FailedCallsFilter) -> Result<Vec<ToolCallEvent>> {
         self.read_blocking(|conn| {
             let mut where_sql = PredicateBuilder::new();
@@ -328,6 +336,10 @@ impl Db {
     /// sandbox refusals and confined non-zero exits are ordinary tool results,
     /// not hard failures, so this intentionally does not apply the failed-call
     /// filter.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn get_tool_call_by_call_id(
         &self,
         session_id: Uuid,
@@ -367,6 +379,10 @@ impl Db {
 
     /// All tool-call rows for one session, oldest-first. Used by
     /// `Attach` to rebuild the user transcript on the client.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_tool_calls_for_session(&self, session_id: Uuid) -> Result<Vec<ToolCallEvent>> {
         self.read_blocking(|conn| Self::list_tool_calls_for_session_conn(conn, session_id))
     }
@@ -924,6 +940,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn language_populated_from_extension() {
         let db = Db::open_in_memory().unwrap();
         let sid = fixture(&db);
@@ -977,6 +997,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn shape_fingerprint_persists_and_groups_by_model_and_fingerprint() {
         let db = Db::open_in_memory().unwrap();
         let sid = fixture(&db);

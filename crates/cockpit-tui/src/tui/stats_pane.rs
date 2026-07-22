@@ -367,6 +367,10 @@ impl Pane for StatsPane {
 /// Run the roll-up for the current toggles, mapping the toggle state to
 /// the part-1 [`StatsScope`] / [`StatsRange`]. Returns the error as a
 /// string so the pane can render it inline rather than panicking.
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; migrated later in db-async-ops-and-tui-render"
+)]
 fn run_rollup(
     db: Option<&Db>,
     project_id: &Option<String>,

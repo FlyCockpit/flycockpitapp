@@ -27,6 +27,10 @@ impl Db {
     /// to `session_id`. `transcript_json` is the JSON-serialized message
     /// history. Idempotent on the handle (upsert) so re-reporting under the
     /// same handle refreshes the stored transcript.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn save_subagent_handle(
         &self,
         handle: &str,
@@ -67,6 +71,10 @@ impl Db {
     /// the handle is unknown / evicted / belongs to a different session —
     /// the caller turns that into a clear "spawn a fresh subagent" error
     /// (never a silent cold start).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn load_subagent_handle(
         &self,
         handle: &str,

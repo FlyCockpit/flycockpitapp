@@ -14,6 +14,10 @@ fn touch(dir: &Path, name: &str) -> PathBuf {
     p
 }
 
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
+)]
 fn fail_lock_reads_inserts(db: &Db) {
     db.write_blocking(move |conn| {
         conn.execute_batch(
@@ -28,6 +32,10 @@ fn fail_lock_reads_inserts(db: &Db) {
     .unwrap();
 }
 
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
+)]
 fn fail_lock_reads_deletes(db: &Db) {
     db.write_blocking(move |conn| {
         conn.execute_batch(
@@ -42,6 +50,10 @@ fn fail_lock_reads_deletes(db: &Db) {
     .unwrap();
 }
 
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
+)]
 fn fail_lock_state_deletes(db: &Db) {
     db.write_blocking(move |conn| {
         conn.execute_batch(

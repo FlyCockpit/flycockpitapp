@@ -122,6 +122,10 @@ pub struct DelegationChildDetail {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn upsert_task_delegation_job(
         &self,
         session_id: Uuid,
@@ -196,6 +200,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn background_task_delegation_child(
         &self,
         task_call_id: &str,
@@ -236,6 +244,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn complete_task_delegation_child(
         &self,
         task_call_id: &str,
@@ -312,6 +324,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn undelivered_task_delegation_children(
         &self,
         task_call_id: &str,
@@ -335,6 +351,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn mark_task_delegation_child_delivered(
         &self,
         task_call_id: &str,
@@ -383,6 +403,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_task_delegation_children(
         &self,
         session_id: Uuid,
@@ -411,6 +435,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn cancel_task_delegation_child(&self, task_call_id: &str, label: &str) -> Result<bool> {
         let now = Utc::now().timestamp();
         let task_call_id = task_call_id.to_owned();
@@ -461,6 +489,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn mark_task_delegation_child_lost(&self, task_call_id: &str, label: &str) -> Result<bool> {
         let now = Utc::now().timestamp();
         let task_call_id = task_call_id.to_owned();
@@ -481,6 +513,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn reconcile_orphaned_task_delegations(&self) -> Result<usize> {
         let now = Utc::now().timestamp();
         self.write_blocking(move |conn| {
@@ -534,6 +570,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn enqueue_task_delegation_steer(
         &self,
         task_call_id: &str,
@@ -565,6 +605,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn drain_task_delegation_steers(
         &self,
         task_call_id: &str,
@@ -604,6 +648,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_task_delegation_steers(
         &self,
         session_id: Uuid,
@@ -990,6 +1038,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn mark_task_delegation_child_lost_preserves_completed_jobs() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/tmp/p", "Build").unwrap();
@@ -1079,6 +1131,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn complete_child_rolls_back_when_job_update_fails() {
         let db = Db::open_in_memory().unwrap();
         let session_id = seed_job(&db, "task-rollback", &["default"]);
@@ -1108,6 +1164,10 @@ mod tests {
         assert_eq!(job_status(&db, "task-rollback"), DelegationStatus::Running);
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn job_status(db: &Db, task_call_id: &str) -> DelegationStatus {
         db.read_blocking(|conn| {
             let status: String = conn.query_row(

@@ -25,6 +25,10 @@ pub const USAGE_WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
 
 impl Db {
     /// Record one accepted pick. `project_id` is `Some` only for `tag`.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn record_usage(
         &self,
         kind: &str,
@@ -49,6 +53,10 @@ impl Db {
     /// grouped by `key`. `project_filter` is applied only when `Some`
     /// (i.e. for `tag`); `model` / `slash` pass `None` for a global
     /// tally.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn usage_counts(
         &self,
         kind: &str,
@@ -93,6 +101,10 @@ impl Db {
 
     /// Delete rows older than `before` (unix seconds). Returns the number
     /// pruned. Called on daemon startup.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn prune_usage_events(&self, before: i64) -> Result<usize> {
         self.write_blocking(move |conn| {
             let n = conn

@@ -1129,6 +1129,10 @@ fn collect_approval_entries(db: &Db, bundle: &[SessionRow]) -> Result<Vec<(Strin
     )])
 }
 
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+)]
 fn session_approval_snapshot(db: &Db, bundle: &[SessionRow]) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     for session in bundle {

@@ -42,6 +42,10 @@ impl Db {
     /// Pin the message at `(session_id, seq)`. Idempotent: pinning an
     /// already-pinned message is a no-op (no error). Returns `true` when a
     /// new pin was created, `false` when it was already pinned.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn pin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         let pinned_ms = now_ms();
         self.write_blocking(move |conn| {
@@ -59,6 +63,10 @@ impl Db {
     /// Unpin the message at `(session_id, seq)`. Returns `true` when a pin
     /// was removed, `false` when there was none. The unpin path for both
     /// `d` (delete) and checking a checklist item in `/pins`.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn unpin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         self.write_blocking(move |conn| {
             let n = conn
@@ -72,6 +80,10 @@ impl Db {
     }
 
     /// Whether the message at `(session_id, seq)` is currently pinned.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn is_pinned(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         self.read_blocking(|conn| {
             let found: Option<i64> = conn
@@ -102,6 +114,10 @@ impl Db {
     /// Count of pinned messages for one session. `0` when none — the
     /// below-input indicator and the `/sessions` per-session chrome read
     /// this.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn count_pins(&self, session_id: Uuid) -> Result<i64> {
         self.read_blocking(|conn| {
             let n: i64 = conn
@@ -118,6 +134,10 @@ impl Db {
     /// The `seq`s pinned in one session, in pin order (oldest pin first).
     /// Bare seqs, no text — for callers that only need the set (e.g. the
     /// mouse control's pinned/unpinned decision per rendered message).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_pin_seqs(&self, session_id: Uuid) -> Result<Vec<i64>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -145,6 +165,10 @@ impl Db {
     /// A pin whose referenced event row is missing is skipped (the FK
     /// CASCADE makes this unreachable in practice, but the read stays
     /// defensive).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_pins_with_text(&self, session_id: Uuid) -> Result<Vec<PinnedMessage>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -333,6 +357,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn pin_cascades_when_session_deleted() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Auto").unwrap();

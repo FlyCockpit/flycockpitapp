@@ -288,6 +288,10 @@ pub fn rehydrate_session_with_policy(
 /// own recorded fields so the transcript shows it rather than silently
 /// dropping it.
 #[allow(dead_code)]
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+)]
 pub fn history_snapshot(
     db: &Db,
     session_id: Uuid,
@@ -4276,6 +4280,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn history_snapshot_conn_matches_db_wrapper_byte_for_byte() {
         let s = root_session();
         record_user(&s, "read the file");
@@ -4301,6 +4309,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn history_snapshot_since_replays_only_rows_after_cursor() {
         let s = root_session();
         record_user(&s, "already rendered");
@@ -4339,6 +4351,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn history_page_before_returns_newest_entries_oldest_first() {
         let s = root_session();
         record_user(&s, "one");
@@ -4361,6 +4377,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn history_page_before_walk_reconstructs_full_snapshot() {
         let s = root_session();
         record_user(&s, "one");
@@ -4395,6 +4415,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn history_page_before_reports_has_more_until_first_entry() {
         let s = root_session();
         record_user(&s, "one");
@@ -4426,6 +4450,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn history_page_before_empty_session_returns_empty_page() {
         let s = root_session();
 
@@ -4439,6 +4467,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn history_page_before_carries_compact_boundary_brief() {
         let s = root_session();
         let handoff_id = Uuid::new_v4();
@@ -4559,6 +4591,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn session_compacted_persists_handoff() {
         let s = root_session();
         let handoff = format!("## Decisions\n{}", "durable ".repeat(3_000));
@@ -4662,6 +4698,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn compaction_entries_survive_replay() {
         let s = root_session();
         let seq = s
@@ -4847,6 +4887,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn history_snapshot_active_subagent_includes_running_row_and_child_turns() {
         let s = root_session();
         record_user(&s, "build it");
@@ -4940,6 +4984,10 @@ mod subagent_observe_tests {
     use serde_json::json;
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn subagent_snapshot_isolates_interleaved_runs_with_same_agent() {
         let db = Db::open_in_memory().unwrap();
         let session = db
@@ -5020,6 +5068,10 @@ mod subagent_observe_tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn root_snapshot_hides_finished_child_rows() {
         let db = Db::open_in_memory().unwrap();
         let session = db

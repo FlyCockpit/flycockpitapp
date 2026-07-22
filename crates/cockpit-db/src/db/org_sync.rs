@@ -27,6 +27,10 @@ pub struct OrgSyncDisclosure {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn upsert_org_sync_policy(
         &self,
         server_url: &str,
@@ -66,6 +70,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn org_sync_state(&self, server_url: &str, org_id: &str) -> Result<Option<OrgSyncState>> {
         self.read_blocking(|conn| {
             conn.query_row(
@@ -81,6 +89,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn active_org_sync_state_for_server(
         &self,
         server_url: &str,
@@ -114,6 +126,10 @@ impl Db {
             }))
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_org_sync_states(&self) -> Result<Vec<OrgSyncState>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -135,6 +151,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn mark_org_sync_disabled(&self, server_url: &str) -> Result<()> {
         let updated_at_ms = now_ms();
         let server_url = server_url.to_owned();
@@ -150,6 +170,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn update_org_sync_cursor(
         &self,
         server_url: &str,
@@ -174,6 +198,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn update_org_sync_error(&self, server_url: &str, org_id: &str, error: &str) -> Result<()> {
         let now = now_ms();
         let server_url = server_url.to_owned();
@@ -192,6 +220,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_org_sync_events_after(
         &self,
         cursor_seq: i64,

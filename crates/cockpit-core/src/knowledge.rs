@@ -1604,6 +1604,10 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     fn main_db_has_no_vectors() {
         let tmp = TempDir::new().unwrap();
         let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();

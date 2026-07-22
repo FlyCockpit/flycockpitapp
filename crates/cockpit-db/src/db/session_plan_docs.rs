@@ -16,6 +16,10 @@ pub struct SessionPlanDoc {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn get_session_plan_doc(&self, session_id: Uuid) -> Result<Option<SessionPlanDoc>> {
         self.read_blocking(|conn| {
             conn.query_row(
@@ -45,6 +49,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn write_session_plan_doc(
         &self,
         session_id: Uuid,

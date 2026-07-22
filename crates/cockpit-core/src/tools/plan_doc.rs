@@ -452,6 +452,10 @@ mod tests {
             .unwrap()
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
+    )]
     fn other_sessions(db: &crate::db::Db, plan_session_id: Uuid) -> Vec<(Uuid, String, String)> {
         db.read_blocking(|conn| {
             let mut stmt = conn.prepare(
@@ -503,6 +507,10 @@ mod tests {
         &output[start..end]
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
+    )]
     fn rewrite_handoff_note_text(db: &crate::db::Db, plan_session_id: Uuid, arbitrary: &str) {
         let arbitrary = arbitrary.to_string();
         let event = db
@@ -741,6 +749,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
+    )]
     async fn start_build_creates_fresh_build_session_with_only_plan_message() {
         let tmp = TempDir::new().unwrap();
         let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());

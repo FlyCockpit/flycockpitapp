@@ -583,6 +583,10 @@ mod tests {
     use crate::engine::tool::Tool;
     use crate::tools::common::{LOCK_BOOKKEEPING_ADVISORY, test_ctx_with_db};
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
+    )]
     fn fail_lock_state_deletes(db: &Db) {
         db.write_blocking(move |conn| {
             conn.execute_batch(

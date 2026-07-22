@@ -71,6 +71,10 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn insert_task_delegation_payload(
         &self,
         payload: NewTaskDelegationPayload<'_>,
@@ -129,6 +133,10 @@ impl Db {
             .context("inserted task delegation payload missing")
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn task_delegation_payload(
         &self,
         task_call_id: &str,
@@ -149,6 +157,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn task_delegation_payload_by_hash(
         &self,
         session_id: Uuid,
@@ -195,6 +207,10 @@ impl Db {
         Ok(Some(LoadedTaskDelegationPayload { body }))
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn mark_task_delegation_payload_delivered(
         &self,
         task_call_id: &str,
@@ -215,6 +231,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn session_has_task_delegation_payloads(&self, session_id: Uuid) -> Result<bool> {
         self.read_blocking(|conn| {
             let exists: i64 = conn
@@ -230,6 +250,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_task_delegation_payloads(
         &self,
         session_id: Uuid,

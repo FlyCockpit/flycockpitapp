@@ -22,6 +22,10 @@ impl Db {
     /// Store or replace the one speculative compaction shadow for a
     /// non-ephemeral session. Returns `false` when the session row is absent or
     /// ephemeral; in both cases any stale shadow row is removed.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn upsert_compaction_shadow(&self, session_id: Uuid, payload_json: &str) -> Result<bool> {
         let payload_json = payload_json.to_string();
         self.write_blocking(move |conn| {
@@ -63,6 +67,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn compaction_shadow(&self, session_id: Uuid) -> Result<Option<CompactionShadowRow>> {
         self.read_blocking(move |conn| {
             conn.query_row(
@@ -77,6 +85,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn delete_compaction_shadow(&self, session_id: Uuid) -> Result<()> {
         self.write_blocking(move |conn| {
             conn.execute(
@@ -89,6 +101,10 @@ impl Db {
     }
 
     #[cfg(test)]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn count_compaction_shadows(&self) -> Result<usize> {
         self.read_blocking(|conn| {
             let count: i64 =

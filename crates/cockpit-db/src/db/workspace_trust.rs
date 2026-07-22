@@ -55,6 +55,10 @@ pub struct WorkspaceTrustDecision {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_workspace_trust(
         &self,
         root_path: &Path,
@@ -78,6 +82,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn workspace_trust_by_root(
         &self,
         root_path: &Path,

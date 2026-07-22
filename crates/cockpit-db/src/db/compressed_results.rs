@@ -76,6 +76,10 @@ impl Db {
     /// Atomically persist every recoverable original needed by one private
     /// prune transform. Compaction uses this only after its handoff plan fits,
     /// so an aborted compaction leaves neither partial rows nor false markers.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn insert_compressed_tool_results(
         &self,
         entries: Vec<CompressedToolResultEntry>,
@@ -127,6 +131,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn compressed_tool_result(
         &self,
         session_id: Uuid,
@@ -146,6 +154,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn session_has_compressed_tool_results(&self, session_id: Uuid) -> Result<bool> {
         self.read_blocking(|conn| {
             let exists: i64 = conn
@@ -161,6 +173,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_compressed_tool_results(
         &self,
         session_id: Uuid,

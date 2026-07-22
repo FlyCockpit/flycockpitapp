@@ -28,6 +28,10 @@ impl AssistantRow {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn upsert_assistant(
         &self,
         name: &str,
@@ -56,11 +60,19 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn get_assistant(&self, name: &str) -> Result<Option<AssistantRow>> {
         let name = name.to_string();
         self.read_blocking(move |conn| get_assistant_conn(conn, &name))
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_assistants(&self) -> Result<Vec<AssistantRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -77,6 +89,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn delete_assistant(&self, name: &str) -> Result<bool> {
         let name = name.to_string();
         self.write_blocking(move |conn| {
@@ -87,6 +103,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn update_assistant_config(&self, name: &str, config_json: &str) -> Result<()> {
         let name = name.to_string();
         let config_json = config_json.to_string();

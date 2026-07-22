@@ -122,6 +122,10 @@ pub struct TaskTodoOverview {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn create_task_todo(
         &self,
         session_id: Uuid,
@@ -170,6 +174,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_task_todos(&self, session_id: Uuid) -> Result<Vec<TaskTodo>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -188,6 +196,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn update_task_todo(
         &self,
         session_id: Uuid,
@@ -234,6 +246,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn append_task_todo_note(
         &self,
         session_id: Uuid,
@@ -273,6 +289,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn assign_task_todos(
         &self,
         session_id: Uuid,
@@ -324,6 +344,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn finish_task_assignment(
         &self,
         session_id: Uuid,
@@ -355,6 +379,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn task_todo_detail_by_id_or_name(
         &self,
         session_id: Uuid,

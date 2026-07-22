@@ -34,6 +34,10 @@ impl Db {
     /// Every note for `project_root`, ordered by sidebar `position` (stable
     /// authoring order, independent of name/timestamps). Empty when the
     /// project has no notes yet.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_project_notes(&self, project_root: &str) -> Result<Vec<ProjectNote>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -75,6 +79,10 @@ impl Db {
     /// A duplicate name is disambiguated by appending ` (2)`, ` (3)`, … so
     /// the create always succeeds with a unique, non-empty name. Returns the
     /// stored note (with its final, possibly-suffixed name).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn create_project_note(&self, project_root: &str, name: &str) -> Result<ProjectNote> {
         let base = name.trim();
         if base.is_empty() {
@@ -112,6 +120,10 @@ impl Db {
 
     /// Overwrite a note's markdown `content`. No-op (Ok) if the note id
     /// doesn't exist. Bumps `updated_at`.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_project_note_content(&self, id: Uuid, content: &str) -> Result<()> {
         let now = Utc::now().timestamp();
         let content = content.to_owned();
@@ -130,6 +142,10 @@ impl Db {
     /// is disambiguated by suffixing (skipping the note being renamed).
     /// Returns the final, possibly-suffixed name. Errors if the note id
     /// doesn't exist.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn rename_project_note(&self, id: Uuid, name: &str) -> Result<String> {
         let base = name.trim();
         if base.is_empty() {
@@ -159,6 +175,10 @@ impl Db {
     }
 
     /// Delete a note by id. No-op (Ok) if it doesn't exist.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn delete_project_note(&self, id: Uuid) -> Result<()> {
         self.write_blocking(move |conn| {
             conn.execute("DELETE FROM project_notes WHERE id = ?1", [id.to_string()])

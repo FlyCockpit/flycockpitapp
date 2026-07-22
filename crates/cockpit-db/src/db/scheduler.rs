@@ -47,20 +47,36 @@ pub struct ScheduledJobRunUpdate {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn insert_scheduled_job(&self, job: NewScheduledJobRow) -> Result<ScheduledJobRow> {
         self.write_blocking(move |conn| insert_scheduled_job_conn(conn, &job))
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_scheduled_jobs(&self, owner: Option<&str>) -> Result<Vec<ScheduledJobRow>> {
         let owner = owner.map(ToOwned::to_owned);
         self.read_blocking(move |conn| list_scheduled_jobs_conn(conn, owner.as_deref()))
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn get_scheduled_job(&self, id: &str) -> Result<Option<ScheduledJobRow>> {
         let id = id.to_string();
         self.read_blocking(move |conn| get_scheduled_job_conn(conn, &id))
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn delete_scheduled_job(&self, id: &str) -> Result<bool> {
         let id = id.to_string();
         self.write_blocking(move |conn| {
@@ -71,6 +87,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_scheduled_job_enabled(
         &self,
         id: &str,
@@ -96,6 +116,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn update_scheduled_job_after_run(
         &self,
         update: ScheduledJobRunUpdate,
@@ -129,6 +153,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn update_scheduled_job_manual_run_result(
         &self,
         id: &str,
@@ -150,6 +178,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn update_scheduled_job_next_run(
         &self,
         id: &str,

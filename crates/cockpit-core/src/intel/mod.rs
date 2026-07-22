@@ -548,6 +548,10 @@ impl Index {
     }
 
     /// All known files for `tree` within an optional path prefix, ordered by path.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     pub fn tree_rows_scoped(&self, scope: Option<&str>) -> Result<Vec<TreeRow>> {
         let root_key = self.root_key.clone();
         let scope = normalize_scope(scope);
@@ -556,6 +560,10 @@ impl Index {
     }
 
     /// All indexed files with metadata needed by `context_pack`, ordered by path.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     pub fn context_file_rows(&self) -> Result<Vec<FileMetaRow>> {
         let root_key = self.root_key.clone();
         self.db.read_blocking(|conn| {
@@ -584,6 +592,10 @@ impl Index {
     }
 
     /// Symbols + imports for one file, ordered by line (for `outline`).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     pub fn outline_rows(&self, rel: &str) -> Result<OutlineData> {
         let root_key = self.root_key.clone();
         let rel_owned = rel.to_string();
@@ -616,6 +628,10 @@ impl Index {
 
     /// Find symbols by name. `exact` toggles `=` vs prefix `LIKE`;
     /// optional `kind` filters by symbol kind.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     pub fn symbol_find(
         &self,
         name: &str,
@@ -650,6 +666,10 @@ impl Index {
 
     /// Identifier occurrences for `word`, grouped by file. `case_insensitive`
     /// matches with `COLLATE NOCASE`.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     pub fn word_hits(
         &self,
         token: &str,
@@ -683,6 +703,10 @@ impl Index {
     }
 
     /// All dependency edges for the project (`deps` / `circular`).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     pub fn dep_edges(&self) -> Result<Vec<DepEdge>> {
         let root_key = self.root_key.clone();
         self.db.read_blocking(|conn| {
@@ -707,6 +731,10 @@ impl Index {
     /// The materialized per-file centrality scores for this project
     /// (`callgraph::load_centrality`). An absent/empty table yields an
     /// empty map, which the ranking treats as no signal (unranked order).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     pub fn centrality_scores(&self) -> Result<HashMap<String, f64>> {
         let root_key = self.root_key.clone();
         self.db.write_blocking(move |conn| {
@@ -745,6 +773,10 @@ impl Index {
     /// Resolve `name` (+ optional `path`/`kind` disambiguators, matching
     /// `symbol_find`'s exact-match conventions) to the target symbol(s)
     /// for the `impact` tool, returning each as `(path, line, kind)`.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     pub fn impact_targets(
         &self,
         name: &str,
@@ -790,6 +822,10 @@ impl Index {
     /// definition) to `(target_path, target_line)`. Returns
     /// `(caller_file, caller_line, caller_symbol)`. Ambiguous/unresolved
     /// callsites and denylisted names are omitted (never guessed).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     pub fn impact_callers(
         &self,
         target_path: &str,
@@ -838,6 +874,10 @@ impl Index {
     /// resolved **high-precision** (exactly one definition) to its callee.
     /// Returns `(callee_name, def_file, def_line)`. Ambiguous/unresolved
     /// callees and denylisted names are omitted.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     pub fn impact_calls(&self, target_name: &str) -> Result<Vec<(String, String, i64)>> {
         let root_key = self.root_key.clone();
         let target_name = target_name.to_string();
@@ -1633,6 +1673,10 @@ mod tests {
         assert_eq!(parsed.lines, Some(3));
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     fn count_rows(db: &Db, table: &str, root_key: &str, path: &str) -> i64 {
         db.read_blocking(|conn| {
             let sql = format!("SELECT COUNT(*) FROM {table} WHERE root = ?1 AND path = ?2");
@@ -1641,6 +1685,10 @@ mod tests {
         .unwrap()
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     fn stored_index_logic_version(db: &Db, root_key: &str) -> i64 {
         db.read_blocking(|conn| {
             Ok(conn.query_row(
@@ -1652,11 +1700,19 @@ mod tests {
         .unwrap()
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     fn stored_content_generation(db: &Db, root_key: &str) -> Option<i64> {
         db.read_blocking(|conn| load_meta_generation(conn, root_key, INTEL_CONTENT_GENERATION_KEY))
             .unwrap()
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     fn stored_centrality_built_generation(db: &Db, root_key: &str) -> Option<i64> {
         db.read_blocking(|conn| {
             load_meta_generation(conn, root_key, CENTRALITY_BUILT_GENERATION_KEY)
@@ -1664,6 +1720,10 @@ mod tests {
         .unwrap()
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     fn indexed_language(db: &Db, root_key: &str, path: &str) -> String {
         db.read_blocking(|conn| {
             Ok(conn.query_row(

@@ -1739,6 +1739,10 @@ fn task_control_live_registry_entry_keeps_happy_path() {
 }
 
 #[test]
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; migrated later in db-async-delegation-and-scheduler"
+)]
 fn task_query_reports_db_and_none_sources() {
     let (mut driver, _tmp) = test_driver(8);
     seed_task_delegation(&driver, "task-db", "default");

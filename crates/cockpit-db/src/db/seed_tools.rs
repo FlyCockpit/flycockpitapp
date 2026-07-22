@@ -30,6 +30,10 @@ impl Db {
         self.set_seed_tools_inner(session_id, seeds, None)
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn set_seed_tools_inner(
         &self,
         session_id: Uuid,
@@ -70,6 +74,10 @@ impl Db {
         self.take_seed_tools_inner(session_id, false)
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn take_seed_tools_inner(
         &self,
         session_id: Uuid,
@@ -149,6 +157,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn stored_seed_tools(db: &Db, session_id: Uuid) -> Vec<SeedTool> {
         db.read_blocking(|conn| {
             let mut stmt = conn
@@ -242,6 +254,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn malformed_args_json_still_drains_as_null_compatibly() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").unwrap();

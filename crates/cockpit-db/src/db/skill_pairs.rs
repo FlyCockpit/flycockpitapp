@@ -19,6 +19,10 @@ pub struct SkillPairRow {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn save_skill_pair(
         &self,
         session_id: Uuid,
@@ -51,6 +55,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_skill_pairs(&self, session_id: Uuid) -> Result<Vec<SkillPairRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -78,6 +86,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn delete_skill_pairs<I, S>(&self, session_id: Uuid, call_ids: I) -> Result<usize>
     where
         I: IntoIterator<Item = S>,

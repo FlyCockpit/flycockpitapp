@@ -471,6 +471,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
     fn register_package_with_timestamp(
         db: &Db,
         identifier: &str,

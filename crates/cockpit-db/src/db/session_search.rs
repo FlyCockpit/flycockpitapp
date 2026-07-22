@@ -46,6 +46,10 @@ impl Db {
     /// it. Returns `Ok(())` when FTS5 is usable; an explanatory error
     /// otherwise. The feature must never silently degrade to LIKE
     /// (prompt decision), so callers surface this and stop.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn fts5_available(&self) -> Result<()> {
         self.write_blocking(move |conn| {
             conn.execute_batch(
@@ -75,6 +79,10 @@ impl Db {
     ///   * archived threads (`archived_at IS NOT NULL`) are always
     ///     excluded — search never surfaces a soft-deleted thread.
     ///   * `since` (epoch seconds) keeps only threads active at/after it.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn search_candidates(
         &self,
         query: &str,
@@ -92,6 +100,10 @@ impl Db {
     /// ordered by `seq` (oldest first). Powers `session_read`'s
     /// windowing — the tool slices this in Rust per the `read`-tool
     /// pagination conventions. Non-message events are skipped.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn thread_turns(&self, session_id: Uuid) -> Result<Vec<ThreadTurn>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -130,6 +142,10 @@ impl Db {
     /// `seq`s within a thread whose message text matches `query` (FTS5),
     /// oldest first. `session_read` centers its window on these. Empty
     /// when the thread has no textual match.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn thread_match_seqs(&self, session_id: Uuid, query: &str) -> Result<Vec<i64>> {
         self.read_blocking(|conn| {
             let Some(match_query) = literal_fts_match_query(query) else {
@@ -620,6 +636,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn session_fts_is_contentless_and_does_not_expose_body_text() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").unwrap();
@@ -674,6 +694,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn title_update_event_update_and_deletes_keep_fts_in_sync() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").unwrap();
@@ -751,6 +775,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn backfill_indexes_preexisting_rows() {
         // Simulate pre-migration data: insert events with the FTS triggers
         // dropped, then re-run the backfill statements and confirm the

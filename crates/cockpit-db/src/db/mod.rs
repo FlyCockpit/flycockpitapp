@@ -2,9 +2,22 @@
 //!
 //! File-backed databases use one dedicated writer thread plus a small
 //! read-only WAL connection pool. Async call sites use [`Db::read`] and
-//! [`Db::write`]; synchronous CLI/test paths use explicit blocking wrappers
-//! over the same pool/actor so file-backed access no longer serializes on a
-//! process-wide `Mutex<Connection>`.
+//! [`Db::write`]. The only non-deprecated synchronous escape hatch is
+//! [`Db::blocking_for_sync_cli`], which runs a read/write-capable closure on
+//! the writer connection and panics if called from any Tokio runtime; async
+//! code must use [`Db::read`], [`Db::write`], or [`Db::transaction`] instead.
+//!
+//! Async migration rules:
+//!
+//! - `Db::write(...).await` completing means the write is committed, so a
+//!   later awaited read observes it. A read racing an unawaited write may see
+//!   the prior committed snapshot.
+//! - Composing two async accessors is not atomic. Any multi-statement
+//!   invariant that must not interleave with another writer belongs in a
+//!   single [`Db::transaction`] closure.
+//! - Pool checkouts are never held across an `.await` on the writer: read
+//!   closures run wholly inside one blocking worker, and write/transaction
+//!   closures run wholly on the writer thread before the async caller resumes.
 //!
 //! Layout:
 //!
@@ -161,23 +174,6 @@ impl Writer {
             .send(WriteRequest { job, reply })
             .map_err(|_| anyhow::anyhow!("db writer is shut down"))?;
         Ok(rx)
-    }
-}
-
-fn run_blocking_sync<F, T>(f: F) -> T
-where
-    F: FnOnce() -> T,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle)
-            if matches!(
-                handle.runtime_flavor(),
-                tokio::runtime::RuntimeFlavor::MultiThread
-            ) =>
-        {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
     }
 }
 
@@ -356,15 +352,23 @@ impl Db {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("opening in-memory sqlite")?;
         apply_connection_pragmas(&conn, false).context("setting pragmas on in-memory db")?;
+        migrate(&conn)?;
+        validate_schema_version(&conn, None)?;
         let db = Self {
             memory: Some(Arc::new(Mutex::new(conn))),
             writer: None,
             read_pool: None,
             path: None,
         };
-        db.write_blocking(migrate)?;
-        db.read_blocking(|conn| validate_schema_version(conn, None))?;
         Ok(db)
+    }
+
+    /// In-memory database constructor for `#[tokio::test]` and other async
+    /// tests that need to exercise [`Self::read`] and [`Self::write`].
+    pub async fn open_in_memory_async() -> Result<Self> {
+        tokio::task::spawn_blocking(Self::open_in_memory)
+            .await
+            .context("in-memory db worker thread joined")?
     }
 
     /// File path the database is backed by, or `None` for in-memory.
@@ -384,6 +388,10 @@ impl Db {
     }
 
     /// Return the exact squashed-schema identity recorded in SQLite.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn schema_version(&self) -> Result<i64> {
         self.read_blocking(sqlite_schema_version)
     }
@@ -446,56 +454,147 @@ impl Db {
         }
     }
 
-    /// Explicit blocking read access for synchronous CLI/test paths.
-    /// Async code should prefer [`Self::read`].
+    /// Execute an atomic write transaction on the writer connection.
+    ///
+    /// Use this instead of composing multiple async accessors when the
+    /// statements form one invariant. The closure runs entirely on the writer
+    /// thread and cannot hold a read-pool checkout across an `.await`.
+    pub async fn transaction<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if let Some(writer) = &self.writer {
+            let rx = writer.submit(move |conn| run_transaction(conn, f))?;
+            let boxed = tokio::task::spawn_blocking(move || {
+                rx.recv()
+                    .map_err(|_| anyhow::anyhow!("db writer reply dropped"))?
+            })
+            .await
+            .context("db transaction reply worker joined")??;
+            boxed
+                .downcast::<T>()
+                .map(|value| *value)
+                .map_err(|_| anyhow::anyhow!("db writer returned unexpected result type"))
+        } else {
+            let inner = self
+                .memory
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("db has no in-memory connection"))?;
+            tokio::task::spawn_blocking(move || {
+                let guard = inner
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+                run_transaction(&guard, f)
+            })
+            .await
+            .context("db transaction worker thread joined")?
+        }
+    }
+
+    /// Guarded blocking access for synchronous CLI one-shots.
+    ///
+    /// This closure runs on the writer connection, so it may read and write.
+    /// It is the only non-deprecated blocking DB accessor; async code must use
+    /// [`Self::read`], [`Self::write`], or [`Self::transaction`].
+    pub fn blocking_for_sync_cli<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            panic!(
+                "Db::blocking_for_sync_cli called from async runtime; call Db::read/Db::write from async code instead"
+            );
+        }
+        self.write_blocking_unguarded(f)
+    }
+
+    /// Explicit blocking read access for legacy synchronous paths.
+    /// Async code should prefer [`Self::read`]. Removed by `db-blocking-api-removal`.
+    #[deprecated(
+        note = "temporary db-async-foundation bridge; migrate to Db::read/Db::write before db-blocking-api-removal"
+    )]
     pub fn read_blocking<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
         if let Some(pool) = self.read_pool.as_ref() {
-            return run_blocking_sync(|| pool.run(f));
+            return pool.run(f);
         }
         let inner = self
             .memory
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("db has no in-memory connection"))?;
-        run_blocking_sync(|| {
-            let guard = inner
-                .lock()
-                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
-            f(&guard)
-        })
+        let guard = inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+        f(&guard)
     }
 
-    /// Explicit blocking write access for synchronous CLI/test paths.
-    /// Async code should prefer [`Self::write`].
+    /// Explicit blocking write access for legacy synchronous paths.
+    /// Async code should prefer [`Self::write`]. Removed by `db-blocking-api-removal`.
+    #[deprecated(
+        note = "temporary db-async-foundation bridge; migrate to Db::read/Db::write before db-blocking-api-removal"
+    )]
     pub fn write_blocking<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.write_blocking_unguarded(f)
+    }
+
+    fn write_blocking_unguarded<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
         if let Some(writer) = &self.writer {
             let rx = writer.submit(f)?;
-            return run_blocking_sync(|| {
-                let boxed = rx
-                    .recv()
-                    .map_err(|_| anyhow::anyhow!("db writer reply dropped"))??;
-                boxed
-                    .downcast::<T>()
-                    .map(|value| *value)
-                    .map_err(|_| anyhow::anyhow!("db writer returned unexpected result type"))
-            });
+            let boxed = rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("db writer reply dropped"))??;
+            return boxed
+                .downcast::<T>()
+                .map(|value| *value)
+                .map_err(|_| anyhow::anyhow!("db writer returned unexpected result type"));
         }
         let inner = self
             .memory
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("db has no in-memory connection"))?;
-        run_blocking_sync(|| {
-            let guard = inner
-                .lock()
-                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
-            f(&guard)
-        })
+        let guard = inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+        f(&guard)
+    }
+}
+
+fn run_transaction<F, T>(conn: &Connection, f: F) -> Result<T>
+where
+    F: FnOnce(&Connection) -> Result<T>,
+{
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .context("beginning db transaction")?;
+    let result = catch_unwind(AssertUnwindSafe(|| f(conn)));
+    match result {
+        Ok(Ok(value)) => {
+            if let Err(error) = conn.execute_batch("COMMIT;") {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(error).context("committing db transaction")
+            } else {
+                Ok(value)
+            }
+        }
+        Ok(Err(error)) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(error)
+        }
+        Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(anyhow::anyhow!("db transaction job panicked"))
+        }
     }
 }
 
@@ -718,6 +817,10 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn migrate_idempotent() {
         let db = Db::open_in_memory().unwrap();
         // Second migrate call is a no-op.
@@ -735,6 +838,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn connection_pragmas_set_busy_timeout_to_five_seconds() {
         let db = Db::open_in_memory().unwrap();
         let timeout_ms: i64 = db
@@ -763,6 +870,119 @@ mod tests {
         let db_path = data_dir.join("cockpit.db");
         assert_eq!(mode(&data_dir), 0o700);
         assert_eq!(mode(&db_path), 0o600);
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "Db::blocking_for_sync_cli called from async runtime; call Db::read/Db::write from async code instead"
+    )]
+    async fn db_blocking_guard_panics_inside_current_thread_runtime() {
+        let db = Db::open_in_memory().unwrap();
+        let _: () = db.blocking_for_sync_cli(|_| Ok(())).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[should_panic(
+        expected = "Db::blocking_for_sync_cli called from async runtime; call Db::read/Db::write from async code instead"
+    )]
+    async fn db_blocking_guard_panics_inside_multi_thread_runtime() {
+        let db = Db::open_in_memory().unwrap();
+        let _: () = db.blocking_for_sync_cli(|_| Ok(())).unwrap();
+    }
+
+    #[test]
+    fn db_blocking_guard_succeeds_outside_any_runtime() {
+        let db = Db::open_in_memory().unwrap();
+        let value: i64 = db
+            .blocking_for_sync_cli(|conn| Ok(conn.query_row("SELECT 7", [], |row| row.get(0))?))
+            .unwrap();
+        assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn db_blocking_guard_panic_message_names_the_async_alternative() {
+        let db = Db::open_in_memory().unwrap();
+        let panic = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _: () = db.blocking_for_sync_cli(|_| Ok(())).unwrap();
+        }))
+        .expect_err("blocking guard must panic inside tokio runtime");
+        let message = if let Some(message) = panic.downcast_ref::<String>() {
+            message.as_str()
+        } else if let Some(message) = panic.downcast_ref::<&'static str>() {
+            message
+        } else {
+            panic!("unexpected panic payload type");
+        };
+        assert!(message.contains("Db::blocking_for_sync_cli"));
+        assert!(message.contains("Db::read"));
+        assert!(message.contains("Db::write"));
+    }
+
+    #[tokio::test]
+    async fn db_blocking_guard_async_api_works_from_tokio_test() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        db.write(|conn| {
+            conn.execute_batch("CREATE TABLE async_probe (value INTEGER NOT NULL);")?;
+            conn.execute("INSERT INTO async_probe (value) VALUES (11)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let value: i64 = db
+            .read(|conn| Ok(conn.query_row("SELECT value FROM async_probe", [], |row| row.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(value, 11);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn db_blocking_guard_transaction_helper_is_atomic() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("transaction.db")).unwrap();
+        db.write(|conn| {
+            conn.execute_batch("CREATE TABLE tx_probe (value INTEGER NOT NULL);")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let writer_db = db.clone();
+        let writer = tokio::spawn(async move {
+            writer_db
+                .transaction(move |conn| {
+                    conn.execute("INSERT INTO tx_probe (value) VALUES (1)", [])?;
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    conn.execute("INSERT INTO tx_probe (value) VALUES (2)", [])?;
+                    Ok(())
+                })
+                .await
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("transaction should reach the midpoint");
+        let during_transaction: i64 = db
+            .read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM tx_probe", [], |row| row.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(during_transaction, 0);
+
+        release_tx.send(()).unwrap();
+        writer.await.unwrap().unwrap();
+        let values = db
+            .read(|conn| {
+                let mut stmt = conn.prepare("SELECT value FROM tx_probe ORDER BY value")?;
+                Ok(stmt
+                    .query_map([], |row| row.get::<_, i64>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(values, vec![1, 2]);
     }
 
     #[cfg(unix)]
@@ -951,6 +1171,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn busy_timeout_waits_for_short_write_contention() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("busy.db");
@@ -1309,6 +1533,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn essential_tables_exist() {
         let db = Db::open_in_memory().unwrap();
         for table in [
@@ -1344,6 +1572,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn approval_grants_has_risk_tier_column() {
         let db = Db::open_in_memory().unwrap();
         let columns: Vec<(String, String)> = db
@@ -1369,6 +1601,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn approval_grants_allows_mcp_tool_kind_with_null_access() {
         let db = Db::open_in_memory().unwrap();
         let session_id = uuid::Uuid::new_v4().to_string();

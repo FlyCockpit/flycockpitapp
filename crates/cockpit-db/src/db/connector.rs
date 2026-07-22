@@ -36,6 +36,10 @@ pub struct ConnectorDisclosure {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_connector_enabled(
         &self,
         server_url: &str,
@@ -62,6 +66,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn connector_state(
         &self,
         server_url: &str,
@@ -98,6 +106,10 @@ impl Db {
             }))
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn update_connector_status(
         &self,
         server_url: &str,

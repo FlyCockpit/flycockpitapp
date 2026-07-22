@@ -62,6 +62,10 @@ pub struct RetentionOutcome {
 
 impl Db {
     /// Delete old payload rows for closed sessions, preserving session rows.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn prune_session_payloads(&self, payload_cutoff_secs: i64) -> Result<u64> {
         if payload_cutoff_secs <= 0 {
             return Ok(0);
@@ -70,6 +74,10 @@ impl Db {
     }
 
     /// Delete old closed, non-ephemeral root sessions whose subtrees are closed.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn expire_old_sessions(&self, session_cutoff_secs: i64) -> Result<u64> {
         if session_cutoff_secs <= 0 {
             return Ok(0);
@@ -97,6 +105,10 @@ impl Db {
     }
 
     /// Record a successful retention vacuum timestamp.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn record_vacuum(&self, now_secs: i64) -> Result<()> {
         self.write_blocking(move |conn| {
             conn.execute(
@@ -138,6 +150,10 @@ impl Db {
         Ok(outcome)
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn vacuum_retention_database(&self) -> Result<bool> {
         if self.path.is_none() {
             return Ok(false);
@@ -154,6 +170,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn last_vacuum_secs(&self) -> Result<Option<i64>> {
         self.read_blocking(|conn| {
             conn.query_row(
@@ -251,6 +271,10 @@ fn parse_uuid_sql(raw: String) -> rusqlite::Result<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn close_session(db: &Db, id: Uuid, ts: i64) {
         db.write_blocking(move |conn| {
             conn.execute(
@@ -262,6 +286,10 @@ mod tests {
         .unwrap();
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn insert_payload_rows(db: &Db, session_id: Uuid, call_id: &str, ts_secs: i64) {
         let call_id = call_id.to_owned();
         db.write_blocking(move |conn| {
@@ -299,6 +327,10 @@ mod tests {
         .unwrap();
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn payload_count(db: &Db, table: &str, session_id: Uuid) -> i64 {
         db.read_blocking(|conn| {
             conn.query_row(
@@ -334,6 +366,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn payload_prune_failure_rolls_back_prior_table_deletes() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").unwrap();
@@ -414,6 +450,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn session_age_out_skips_ephemeral() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").unwrap();
@@ -466,6 +506,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn vacuum_uses_dedicated_connection_without_shared_mutex() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = Db::open(&tmp.path().join("retention.db")).unwrap();

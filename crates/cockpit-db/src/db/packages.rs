@@ -120,6 +120,10 @@ pub struct NewPackage {
 
 impl Db {
     /// Look a package up by its canonical `identifier`.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn package_by_identifier(&self, identifier: &str) -> Result<Option<PackageRow>> {
         self.read_blocking(|conn| {
             conn.query_row(
@@ -134,6 +138,10 @@ impl Db {
 
     /// Look a Git package up by its `source_url` — the repo-dedupe key.
     /// Returns the first match (a monorepo cloned once is reused).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn package_by_source_url(&self, source_url: &str) -> Result<Option<PackageRow>> {
         self.read_blocking(|conn| {
             conn.query_row(
@@ -147,6 +155,10 @@ impl Db {
     }
 
     /// Every registered package, alphabetical by identifier.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_packages(&self) -> Result<Vec<PackageRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -167,6 +179,10 @@ impl Db {
     /// `identifier`. Idempotent on `identifier`; returns the resolved
     /// row. Concurrent callers adding the same identifier converge on
     /// one row (the UNIQUE constraint + upsert serialize them).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn upsert_package(&self, pkg: &NewPackage) -> Result<PackageRow> {
         let now = Utc::now().timestamp();
         let pkg = pkg.clone();
@@ -177,6 +193,10 @@ impl Db {
     /// Returns `(row, inserted)` — `inserted = false` means the existing
     /// row was kept untouched. This is the import primitive: it never
     /// overwrites a row cockpit already has.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn insert_package_if_absent(&self, pkg: &NewPackage) -> Result<(PackageRow, bool)> {
         let now = Utc::now().timestamp();
         let pkg = pkg.clone();

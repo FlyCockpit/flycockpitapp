@@ -792,6 +792,10 @@ impl GrantStore {
         }
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn session_loop_rule(&self, signature: &str) -> Option<LoopVerdict> {
         self.db
             .read_blocking(|conn| {
@@ -810,6 +814,10 @@ impl GrantStore {
             .and_then(|s| parse_verdict(&s))
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn session_record_loop_rule(&self, signature: &str, verdict: LoopVerdict) -> Result<()> {
         let session_id = self.session_id;
         let signature = signature.to_owned();
@@ -931,6 +939,10 @@ impl GrantStore {
 
     // ---- session scope (SQLite) ------------------------------------------
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn session_command_grant_tier(&self, key: &str) -> Option<RiskTier> {
         self.db
             .read_blocking(|conn| {
@@ -949,6 +961,10 @@ impl GrantStore {
             .and_then(|tier| RiskTier::from_policy_key(&tier))
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn session_has(&self, kind: GrantKind, key: &str, verdict: Verdict) -> bool {
         self.db
             .read_blocking(|conn| {
@@ -969,6 +985,10 @@ impl GrantStore {
             .unwrap_or(false)
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn session_path_entries(&self, verdict: Verdict) -> Vec<(String, SandboxPathAccess)> {
         self.db
             .read_blocking(|conn| {
@@ -1025,6 +1045,10 @@ impl GrantStore {
             .any(|(key, _)| matches(key))
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn session_insert(
         &self,
         kind: GrantKind,
@@ -1062,6 +1086,10 @@ impl GrantStore {
 
     /// Remove a session-scope grant of `verdict` polarity for an exact
     /// `(kind, key)`. Used to clear the opposite polarity before writing.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn session_remove(&self, kind: GrantKind, key: &str, verdict: Verdict) -> Result<()> {
         let session_id = self.session_id;
         let key = key.to_owned();
@@ -1905,6 +1933,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn path_grant_modes_round_trip_at_each_scope() {
         for scope in [Scope::Session, Scope::Project, Scope::Global] {
             let tmp = tempfile::tempdir().unwrap();
@@ -1954,6 +1986,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn mcp_tool_grant_round_trips_through_session_and_file_scopes() {
         for scope in [Scope::Session, Scope::Project, Scope::Global] {
             let tmp = tempfile::tempdir().unwrap();
@@ -2066,6 +2102,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn approval_timestamp_columns_are_integer() {
         let db = Db::open_in_memory().unwrap();
         db.read_blocking(|conn| {
@@ -2083,6 +2123,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn session_approval_records_epoch_integer_timestamp() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
@@ -2116,6 +2160,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn loop_rule_records_epoch_integer_timestamp() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
@@ -2378,6 +2426,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
+    )]
     fn tierless_command_allow_rows_are_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();

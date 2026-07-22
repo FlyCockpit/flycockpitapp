@@ -984,6 +984,10 @@ mod tests {
         .unwrap();
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn run(db: &Db, scope: StatsScope, range: StatsRange, prices: &PriceTable) -> StatsRollup {
         // now = 1_000_000 keeps the 7d window's lower bound well-defined.
         db.read_blocking(|conn| super::rollup(conn, &scope, range, prices, false, 1_000_000))
@@ -1681,6 +1685,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn by_role_breakdown() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1");
@@ -1734,6 +1742,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn by_role_same_agent_multiple_tool_rows_count_once() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1");

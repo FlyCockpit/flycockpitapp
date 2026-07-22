@@ -55,6 +55,10 @@ impl Db {
     /// Resolve the tokenizer for `(provider, model)`. Returns the stored
     /// `(strategy, scale)` even if expired; falls back to
     /// `(cl100k_base, 1.0)` when there's no row.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn resolve_tokenizer(&self, provider: &str, model: &str) -> (TokenizerStrategy, f64) {
         let row = match self.read_blocking(|conn| {
             conn.query_row(
@@ -86,6 +90,10 @@ impl Db {
     /// Whether a non-expired calibration row exists for `(provider,
     /// model)`. The calibration accumulator skips recomputing while one
     /// does.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn tokenizer_calibration_fresh(&self, provider: &str, model: &str, now: i64) -> bool {
         match self.read_blocking(|conn| {
             let count: i64 = conn.query_row(
@@ -111,6 +119,10 @@ impl Db {
 
     /// Insert or replace the calibration row for `(provider, model)`.
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn upsert_tokenizer_calibration(
         &self,
         provider: &str,

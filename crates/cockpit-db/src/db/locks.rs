@@ -26,6 +26,10 @@ pub struct LockStateRow {
 impl Db {
     /// Record a freshly-acquired lock. Idempotent — re-acquiring by the
     /// same `(path, agent_id)` updates `acquired_at`.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn lock_acquire(&self, path: &Path, agent_id: &str, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
         let p = path_string(path);
@@ -41,6 +45,10 @@ impl Db {
     /// implementation note). Scoped to the holding
     /// `(session_id, agent_id)` so a stale writer can't refresh a lock it no longer
     /// owns; a no-op row count is fine (the lock was released concurrently).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn lock_touch(
         &self,
         path: &Path,
@@ -64,6 +72,10 @@ impl Db {
     /// Release a lock held by `(session_id, agent_id)`. No-op if not held by
     /// that owner (the in-memory manager errs loudly; the mirror just keeps
     /// disk consistent).
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn lock_release(&self, path: &Path, agent_id: &str, session_id: Uuid) -> Result<()> {
         let p = path_string(path);
         let agent_id = agent_id.to_owned();
@@ -79,6 +91,10 @@ impl Db {
     }
 
     /// Record a successful read for the §3c pre-write guard.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn lock_note_read(&self, path: &Path, agent_id: &str, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
         let p = path_string(path);
@@ -96,6 +112,10 @@ impl Db {
     }
 
     /// Atomically record a held lock and the matching read guard entry.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn lock_acquire_with_read(
         &self,
         path: &Path,
@@ -126,6 +146,10 @@ impl Db {
     /// because deleting the stale `lock_state` row failed. This is narrower
     /// than normal acquire: callers must only use it for paths they have
     /// marked as forced-released in memory.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn lock_force_acquire_with_read(
         &self,
         path: &Path,
@@ -164,6 +188,10 @@ impl Db {
 
     /// Delete a read record that has been invalidated by lock expiry or
     /// failed drift/taken resume. No-op when the row is already gone.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn lock_delete_read(&self, path: &Path, agent_id: &str, session_id: Uuid) -> Result<()> {
         let p = path_string(path);
         let agent_id = agent_id.to_owned();
@@ -179,6 +207,10 @@ impl Db {
     }
 
     /// Atomically release locks and delete matching read guard entries.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn lock_release_and_delete_reads(&self, entries: &[(PathBuf, Uuid, String)]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -210,6 +242,10 @@ impl Db {
 
     /// Atomically transfer every lock/read row for one agent in a session to
     /// another agent. Read rows are merged into the target agent's read set.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn lock_transfer_agent(
         &self,
         session_id: Uuid,
@@ -252,6 +288,10 @@ impl Db {
     }
 
     /// Permanently remove every persisted lock/read row for an ended session.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn lock_cleanup_session(&self, session_id: Uuid) -> Result<()> {
         self.write_blocking(move |conn| {
             let tx = conn
@@ -274,6 +314,10 @@ impl Db {
 
     /// All currently-held locks. Loaded on daemon startup to rebuild
     /// the in-memory manager.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_held_locks(&self) -> Result<Vec<LockStateRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -308,6 +352,10 @@ impl Db {
     /// Every `(path, agent)` pair that has read in `session_id`. Retained for
     /// targeted queries and tests; startup loads all reads in one pass.
     #[allow(dead_code)]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_reads_for_session(&self, session_id: Uuid) -> Result<Vec<(String, String)>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -331,6 +379,10 @@ impl Db {
 
     /// Every persisted read record. Loaded on daemon startup independently of
     /// held locks so read-only pre-write guards survive restart too.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_lock_reads(&self) -> Result<Vec<(Uuid, String, String)>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -529,6 +581,10 @@ mod tests {
         assert_eq!(reads[0].0, "builder");
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn assert_transaction_closed(db: &Db) {
         db.write_blocking(move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE; COMMIT;")?;
@@ -538,6 +594,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn acquire_with_read_failure_rolls_back_lock_and_closes_transaction() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").unwrap();
@@ -569,6 +629,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     fn transfer_agent_failure_rolls_back_memory_mirror_rows() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").unwrap();

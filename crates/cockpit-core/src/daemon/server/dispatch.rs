@@ -2315,6 +2315,10 @@ pub(super) fn stats_range_from_proto(range: proto::StatsRange) -> crate::db::sta
     }
 }
 
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; migrated later in db-async-ops-and-tui-render"
+)]
 pub(super) async fn stats_rollup(
     ctx: &Arc<DaemonContext>,
     project_id: Option<String>,

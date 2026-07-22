@@ -120,6 +120,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
+    )]
     fn export_ambiguous_identifier_returns_typed_usage_error() {
         let db = Db::open_in_memory().unwrap();
         let a = db.create_session("p1", "/x", "builder").unwrap();

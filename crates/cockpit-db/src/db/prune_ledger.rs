@@ -35,6 +35,10 @@ impl Db {
     /// Persist (upsert) the prune ledger for `session_id`. Idempotent on
     /// the session id, so persisting again at the next inference boundary
     /// replaces the prior ledger with the current pruned state.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn save_prune_ledger(&self, session_id: Uuid, ledger: &PruneLedger) -> Result<()> {
         let ledger_json = serde_json::to_string(ledger).context("serializing prune ledger")?;
         let now = chrono::Utc::now().timestamp();
@@ -59,6 +63,10 @@ impl Db {
     /// Returns an `Err` only when a stored ledger fails to deserialize
     /// (corrupt row) so the caller can treat it as a missing ledger and
     /// fall back to the full unpruned form with a warning.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn load_prune_ledger(&self, session_id: Uuid) -> Result<Option<PruneLedger>> {
         self.write_blocking(move |conn| {
             let row: Option<String> = conn

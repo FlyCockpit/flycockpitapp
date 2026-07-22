@@ -16,6 +16,10 @@ pub struct RemoteAuditRow {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_session_shared_with_collaborators(
         &self,
         session_id: Uuid,
@@ -41,6 +45,10 @@ impl Db {
         self.insert_remote_audit_with_path(principal, request_kind, session_id, verdict, None)
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn insert_remote_audit_with_path(
         &self,
         principal: &str,
@@ -74,6 +82,10 @@ impl Db {
     }
 
     #[allow(dead_code)]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_remote_audit(&self) -> Result<Vec<RemoteAuditRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -115,6 +127,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_remote_audit_after(
         &self,
         cursor_audit_id: i64,
@@ -164,6 +180,10 @@ impl Db {
     }
 
     #[allow(dead_code)]
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn session_shared_with_collaborators(&self, session_id: Uuid) -> Result<Option<bool>> {
         self.read_blocking(|conn| {
             conn.query_row(

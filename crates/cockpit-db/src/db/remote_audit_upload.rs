@@ -17,6 +17,10 @@ pub struct RemoteAuditUploadState {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn upsert_remote_audit_upload_state(
         &self,
         server_url: &str,
@@ -39,6 +43,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn remote_audit_upload_state(
         &self,
         server_url: &str,
@@ -58,6 +66,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_remote_audit_upload_states(&self) -> Result<Vec<RemoteAuditUploadState>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -79,6 +91,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn update_remote_audit_upload_cursor(
         &self,
         server_url: &str,
@@ -105,6 +121,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn update_remote_audit_upload_error(
         &self,
         server_url: &str,

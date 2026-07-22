@@ -92,6 +92,10 @@ pub struct SkillCuratorSnapshotRow {
 }
 
 impl Db {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn ensure_skill_usage(&self, seed: SkillUsageSeed, now: i64) -> Result<SkillUsageRow> {
         let name = seed.name.clone();
         self.write_blocking(move |conn| {
@@ -121,6 +125,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn record_skill_use(
         &self,
         seed: SkillUsageSeed,
@@ -168,6 +176,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn record_skill_patch(&self, seed: SkillUsageSeed, now: i64) -> Result<SkillUsageRow> {
         let name = seed.name.clone();
         self.write_blocking(move |conn| {
@@ -200,11 +212,19 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn get_skill_usage(&self, name: &str) -> Result<Option<SkillUsageRow>> {
         let name = name.to_string();
         self.read_blocking(move |conn| skill_usage_by_name_conn(conn, &name))
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_skill_usage(&self) -> Result<Vec<SkillUsageRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -217,6 +237,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_skill_usage_pinned(&self, name: &str, pinned: bool, now: i64) -> Result<()> {
         let name = name.to_string();
         self.write_blocking(move |conn| {
@@ -229,6 +253,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn set_skill_usage_state(
         &self,
         name: &str,
@@ -250,6 +278,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn restore_skill_usage_rows(&self, rows: Vec<SkillUsageRow>) -> Result<()> {
         self.write_blocking(move |conn| {
             let mut stmt = conn.prepare(
@@ -300,6 +332,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn insert_skill_curator_snapshot(
         &self,
         id: &str,
@@ -321,6 +357,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn list_skill_curator_snapshots(&self) -> Result<Vec<SkillCuratorSnapshotRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
@@ -344,6 +384,10 @@ impl Db {
         })
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
     pub fn delete_skill_curator_snapshot_rows(&self, ids: Vec<String>) -> Result<()> {
         self.write_blocking(move |conn| {
             let tx = conn

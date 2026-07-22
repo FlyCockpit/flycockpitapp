@@ -1324,7 +1324,6 @@ pub fn render_pending_incremental(
         state.body_width = body_width;
     }
 
-    let new_commit = stable_pending_commit_byte(&msg.text);
     if new_commit > state.commit_byte {
         let committed = &msg.text[state.commit_byte..new_commit];
         if !committed.trim().is_empty() {
@@ -1359,16 +1358,16 @@ pub fn render_pending_incremental(
 }
 
 fn stable_pending_commit_byte(text: &str) -> usize {
-    if text.contains("]: ") || text.contains("]:") {
-        return 0;
-    }
-
     let mut in_fence: Option<char> = None;
     let mut line_start = 0usize;
     let mut boundaries = Vec::new();
+    let mut link_refs_seen = 0usize;
     for line in text.split_inclusive('\n') {
         let line_end = line_start + line.len();
         let trimmed = line.trim_end_matches('\n').trim();
+        if in_fence.is_none() && is_link_reference_definition_start(line) {
+            link_refs_seen += 1;
+        }
         if let Some(fence) = markdown_fence_marker(trimmed) {
             match in_fence {
                 Some(open) if open == fence => in_fence = None,
@@ -1377,16 +1376,18 @@ fn stable_pending_commit_byte(text: &str) -> usize {
             }
         }
         if in_fence.is_none() && trimmed.is_empty() {
-            boundaries.push(line_end);
+            boundaries.push((line_end, link_refs_seen));
         }
         line_start = line_end;
     }
 
-    if in_fence.is_some() {
-        return 0;
+    for (boundary, refs_at_boundary) in boundaries.into_iter().rev() {
+        if refs_at_boundary == link_refs_seen {
+            return boundary;
+        }
     }
 
-    boundaries.last().copied().unwrap_or(0)
+    0
 }
 
 fn markdown_fence_marker(trimmed_line: &str) -> Option<char> {
@@ -1404,6 +1405,41 @@ fn markdown_fence_marker(trimmed_line: &str) -> Option<char> {
         }
     }
     (count >= 3).then_some(first)
+}
+
+fn is_link_reference_definition_start(line: &str) -> bool {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let mut rest = line;
+    let leading_spaces = rest.bytes().take_while(|byte| *byte == b' ').count();
+    if leading_spaces > 3 {
+        return false;
+    }
+    rest = &rest[leading_spaces..];
+    let Some(label) = rest.strip_prefix('[') else {
+        return false;
+    };
+
+    let mut escaped = false;
+    let mut label_len = 0usize;
+    for (idx, ch) in label.char_indices() {
+        if escaped {
+            label_len += ch.len_utf8();
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => {
+                label_len += ch.len_utf8();
+                escaped = true;
+            }
+            '[' => return false,
+            ']' => {
+                return label_len > 0 && label[idx + ch.len_utf8()..].starts_with(':');
+            }
+            _ => label_len += ch.len_utf8(),
+        }
+    }
+    false
 }
 
 fn render_pending_markdown_lines(

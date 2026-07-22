@@ -23,6 +23,63 @@ fn rgb_downgrades_to_yellow_without_truecolor() {
     assert_eq!(downgrade_for_terminal(Color::Cyan, true), Color::Cyan);
 }
 
+#[test]
+fn commit_boundary_survives_open_fence() {
+    let prefix = "safe paragraph\n\n";
+    let text = format!("{prefix}```rust\nfn main() {{\n");
+
+    assert_eq!(stable_pending_commit_byte(&text), prefix.len());
+}
+
+#[test]
+fn commit_boundary_bails_on_line_initial_link_reference() {
+    let text = "safe paragraph\n\n[ref]: https://example.com\nuse [ref]\n";
+
+    assert_eq!(stable_pending_commit_byte(text), 0);
+
+    let mut msg = PendingMsg {
+        name: "Build".to_string(),
+        text: String::new(),
+        reasoning: String::new(),
+        timestamp: chrono::Local::now(),
+        started_at: std::time::Instant::now(),
+        text_started_at: Some(std::time::Instant::now()),
+        inside_think: false,
+        body_started: true,
+        tag_partial: String::new(),
+        seq: None,
+        strip_think: true,
+    };
+    let mut state = PendingRenderState::default();
+    for chunk in text.as_bytes().chunks(11) {
+        msg.text.push_str(std::str::from_utf8(chunk).unwrap());
+        let incremental = render_pending_incremental(&msg, 72, &mut state);
+        let full = render_pending(&msg, 72);
+        assert_eq!(incremental, full);
+    }
+}
+
+#[test]
+fn commit_boundary_ignores_inline_bracket_colon() {
+    let text = "safe paragraph\n\nmap[key]: value\n\n";
+
+    assert_eq!(stable_pending_commit_byte(text), text.len());
+}
+
+#[test]
+fn link_reference_definition_start_shape_is_position_aware() {
+    assert!(is_link_reference_definition_start(
+        "[ref]: https://example.com"
+    ));
+    assert!(is_link_reference_definition_start("   [ref]: target"));
+    assert!(is_link_reference_definition_start("[a\\]]: target"));
+    assert!(!is_link_reference_definition_start("    [ref]: code"));
+    assert!(!is_link_reference_definition_start("prefix [ref]: target"));
+    assert!(!is_link_reference_definition_start("[]: target"));
+    assert!(!is_link_reference_definition_start("[a[b]: target"));
+    assert!(!is_link_reference_definition_start("[ref] : target"));
+}
+
 /// `/export` serializes the live transcript as an ordered turns
 /// array; tool calls carry the user-facing input (`full_input`) +
 /// recovery `state`, never the wire form (GOALS §14).

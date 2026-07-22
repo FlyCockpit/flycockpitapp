@@ -5028,6 +5028,8 @@ mod render_history_spacing_tests {
             "> quoted\n> continued\n\nplain\n",
             "name | value\n--- | ---\na | b\n\nnext\n",
             "```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\nafter fence\n",
+            "intro\n\n```rust\nfn still_streaming() {\n    println!(\"open\");\n",
+            "before\n\nlet value = map[key]: value;\n\nafter\n",
             "Setext heading\n---\n\nbody\n",
             "inline math \\(a+b\\) and display:\n\n\\[x^2\\]\n\n",
         ];
@@ -5054,6 +5056,70 @@ mod render_history_spacing_tests {
                 assert_eq!(incremental, full, "case failed after {:?}", msg.text);
             }
         }
+    }
+
+    fn pending_incremental_parser_bytes_for_doc(doc: &str) -> usize {
+        let mut msg = PendingMsg {
+            name: "Build".to_string(),
+            text: String::new(),
+            reasoning: String::new(),
+            timestamp: chrono::Local::now(),
+            started_at: std::time::Instant::now(),
+            text_started_at: Some(std::time::Instant::now()),
+            inside_think: false,
+            body_started: true,
+            tag_partial: String::new(),
+            seq: None,
+            strip_think: true,
+        };
+        let mut state = PendingRenderState::default();
+        let mut incremental_bytes = 0usize;
+
+        for chunk in doc.as_bytes().chunks(53) {
+            msg.text.push_str(std::str::from_utf8(chunk).unwrap());
+
+            reset_markdown_counters();
+            let incremental = render_pending_incremental(&msg, 96, &mut state);
+            incremental_bytes += markdown_render_byte_count();
+
+            reset_markdown_counters();
+            let full = render_pending(&msg, 96);
+            assert_eq!(incremental, full);
+        }
+
+        incremental_bytes
+    }
+
+    #[test]
+    fn pending_incremental_bounds_parse_bytes_for_streamed_code_fence() {
+        let doc = format!(
+            "{}\n\n```rust\n{}",
+            (0..260)
+                .map(|idx| format!("prefix paragraph {idx}\n\n"))
+                .collect::<String>(),
+            (0..400).map(|idx| format!("x{idx};\n")).collect::<String>()
+        );
+        let incremental_bytes = pending_incremental_parser_bytes_for_doc(&doc);
+
+        assert!(
+            incremental_bytes < doc.len() * 8,
+            "incremental parser read {incremental_bytes} bytes for {} bytes of input",
+            doc.len()
+        );
+    }
+
+    #[test]
+    fn pending_incremental_bounds_parse_bytes_for_code_containing_bracket_colon() {
+        let doc = (0..400)
+            .map(|idx| format!("line {idx} uses map[key]: value {idx}\n\n"))
+            .collect::<String>();
+        let incremental_bytes = pending_incremental_parser_bytes_for_doc(&doc);
+
+        assert!(
+            incremental_bytes < doc.len() * 8,
+            "incremental parser read {incremental_bytes} bytes for {} bytes of input",
+            doc.len()
+        );
     }
 
     #[test]

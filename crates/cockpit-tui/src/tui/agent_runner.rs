@@ -25,6 +25,7 @@ use cockpit_core::daemon::proto::{self, ErrorCode, ErrorPayload, Request, Respon
 use cockpit_core::engine::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
+use cockpit_core::jitter::{JitterSource, SystemJitter};
 
 /// The three 30-day autocomplete count maps fetched at session start.
 /// `models` and `slash` are global; `tags` is scoped to this session's
@@ -292,19 +293,7 @@ struct IncomingEventContext<'a> {
     last_applied_seq: &'a Arc<Mutex<Option<i64>>>,
 }
 
-trait JitterSource {
-    fn next_millis(&mut self, inclusive_upper: u64) -> u64;
-}
-
-struct RandomJitter;
-
-impl JitterSource for RandomJitter {
-    fn next_millis(&mut self, inclusive_upper: u64) -> u64 {
-        rand::random_range(0..=inclusive_upper)
-    }
-}
-
-struct ReconnectBackoff<J = RandomJitter> {
+struct ReconnectBackoff<J = SystemJitter> {
     base: Duration,
     cap: Duration,
     current: Duration,
@@ -323,9 +312,9 @@ enum ReconnectAttachError {
     Terminal(String),
 }
 
-impl ReconnectBackoff<RandomJitter> {
+impl ReconnectBackoff<SystemJitter> {
     fn new() -> Self {
-        Self::with_jitter(RandomJitter)
+        Self::with_jitter(SystemJitter)
     }
 }
 
@@ -341,8 +330,7 @@ impl<J: JitterSource> ReconnectBackoff<J> {
     }
 
     fn next_delay(&mut self) -> Duration {
-        let max_millis = self.current.as_millis().min(u128::from(u64::MAX)) as u64;
-        let jitter = Duration::from_millis(self.jitter.next_millis(max_millis));
+        let jitter = self.jitter.duration_up_to(self.current);
         let delay = self.base.saturating_add(jitter).min(self.cap);
         self.current = self.current.saturating_mul(2).min(self.cap);
         delay
@@ -3006,22 +2994,29 @@ mod tests {
     }
 
     struct FixedJitter {
-        values: std::collections::VecDeque<u64>,
-        seen_upper_bounds: Vec<u64>,
+        values: Mutex<std::collections::VecDeque<u64>>,
+        seen_upper_bounds: Mutex<Vec<u64>>,
     }
 
     impl JitterSource for FixedJitter {
-        fn next_millis(&mut self, inclusive_upper: u64) -> u64 {
-            self.seen_upper_bounds.push(inclusive_upper);
-            self.values.pop_front().unwrap_or(inclusive_upper)
+        fn duration_up_to(&self, cap: Duration) -> Duration {
+            let inclusive_upper = cap.as_millis().min(u128::from(u64::MAX)) as u64;
+            self.seen_upper_bounds.lock().unwrap().push(inclusive_upper);
+            let millis = self
+                .values
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(inclusive_upper);
+            Duration::from_millis(millis)
         }
     }
 
     #[test]
     fn reconnect_backoff_uses_injected_jitter_rising_floor_and_cap() {
         let jitter = FixedJitter {
-            values: [0, 500, 1_500, 60_000].into(),
-            seen_upper_bounds: Vec::new(),
+            values: Mutex::new([0, 500, 1_500, 60_000].into()),
+            seen_upper_bounds: Mutex::new(Vec::new()),
         };
         let mut backoff = ReconnectBackoff::with_jitter(jitter);
 
@@ -3030,7 +3025,7 @@ mod tests {
         assert_eq!(backoff.next_delay(), Duration::from_millis(2_000));
         assert_eq!(backoff.next_delay(), Duration::from_secs(30));
         assert_eq!(
-            backoff.jitter.seen_upper_bounds,
+            *backoff.jitter.seen_upper_bounds.lock().unwrap(),
             vec![500, 1_000, 2_000, 4_000]
         );
     }

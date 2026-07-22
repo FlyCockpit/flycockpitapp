@@ -24,6 +24,7 @@ use crate::daemon::relay_envelope::{
 };
 use crate::daemon::server::DaemonContext;
 use crate::db::connector::ConnectorStatusUpdate;
+use crate::jitter::{JitterSource, SystemJitter};
 
 const CHANNEL_BUFFER: usize = 128;
 const OUTBOUND_BUFFER: usize = 256;
@@ -124,7 +125,7 @@ async fn run_enabled_connector(
     wake_rx: &mut watch::Receiver<u64>,
 ) -> Result<ConnectorRunOutcome> {
     let mut backoff = Backoff::default();
-    let mut jitter = SystemJitter;
+    let jitter = SystemJitter;
     let mut first_connect = true;
     loop {
         if ctx.shutdown_signal().is_draining() {
@@ -181,74 +182,73 @@ async fn run_enabled_connector(
                         last_error: Some(&message),
                     },
                 );
-                sleep_or_connector_wake(wake_rx, backoff.next(&mut jitter)).await;
+                sleep_or_connector_wake(wake_rx, backoff.next(&jitter)).await;
                 continue;
             }
         };
 
         let mut stale_cache_retry = false;
         let (choice, token) = loop {
-            let selected =
-                match select_relay(&client, &credential, first_connect, &mut jitter).await {
-                    Ok(Some(selected)) => selected,
-                    Ok(None) => {
-                        let message = "no relay candidates available";
-                        publish_status(
-                            &ctx,
-                            &credential,
-                            true,
-                            ConnectorStatusUpdate {
-                                status: "reconnecting",
-                                relay_url: state.relay_url.as_deref(),
-                                relay_id: state.relay_id.as_deref(),
-                                relay_region: state.relay_region.as_deref(),
-                                last_error: Some(message),
-                            },
+            let selected = match select_relay(&client, &credential, first_connect, &jitter).await {
+                Ok(Some(selected)) => selected,
+                Ok(None) => {
+                    let message = "no relay candidates available";
+                    publish_status(
+                        &ctx,
+                        &credential,
+                        true,
+                        ConnectorStatusUpdate {
+                            status: "reconnecting",
+                            relay_url: state.relay_url.as_deref(),
+                            relay_id: state.relay_id.as_deref(),
+                            relay_region: state.relay_region.as_deref(),
+                            last_error: Some(message),
+                        },
+                    );
+                    first_connect = false;
+                    sleep_or_connector_wake(wake_rx, backoff.next(&jitter)).await;
+                    continue;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    publish_status(
+                        &ctx,
+                        &credential,
+                        true,
+                        ConnectorStatusUpdate {
+                            status: "reconnecting",
+                            relay_url: state.relay_url.as_deref(),
+                            relay_id: state.relay_id.as_deref(),
+                            relay_region: state.relay_region.as_deref(),
+                            last_error: Some(&message),
+                        },
+                    );
+                    if is_terminal_auth_error(&message) {
+                        let _ = clear_credential();
+                        let _ = ctx.db.set_connector_enabled(
+                            &credential.server_url,
+                            &credential.instance_id,
+                            false,
                         );
-                        first_connect = false;
-                        sleep_or_connector_wake(wake_rx, backoff.next(&mut jitter)).await;
-                        continue;
-                    }
-                    Err(error) => {
-                        let message = error.to_string();
                         publish_status(
                             &ctx,
                             &credential,
-                            true,
+                            false,
                             ConnectorStatusUpdate {
-                                status: "reconnecting",
-                                relay_url: state.relay_url.as_deref(),
-                                relay_id: state.relay_id.as_deref(),
-                                relay_region: state.relay_region.as_deref(),
+                                status: "off",
+                                relay_url: None,
+                                relay_id: None,
+                                relay_region: None,
                                 last_error: Some(&message),
                             },
                         );
-                        if is_terminal_auth_error(&message) {
-                            let _ = clear_credential();
-                            let _ = ctx.db.set_connector_enabled(
-                                &credential.server_url,
-                                &credential.instance_id,
-                                false,
-                            );
-                            publish_status(
-                                &ctx,
-                                &credential,
-                                false,
-                                ConnectorStatusUpdate {
-                                    status: "off",
-                                    relay_url: None,
-                                    relay_id: None,
-                                    relay_region: None,
-                                    last_error: Some(&message),
-                                },
-                            );
-                            return Ok(ConnectorRunOutcome::Revoked);
-                        }
-                        first_connect = false;
-                        sleep_or_connector_wake(wake_rx, backoff.next(&mut jitter)).await;
-                        continue;
+                        return Ok(ConnectorRunOutcome::Revoked);
                     }
-                };
+                    first_connect = false;
+                    sleep_or_connector_wake(wake_rx, backoff.next(&jitter)).await;
+                    continue;
+                }
+            };
 
             match client
                 .mint_connector_token(&credential, &selected.choice.relay_id)
@@ -307,7 +307,7 @@ async fn run_enabled_connector(
                         return Ok(ConnectorRunOutcome::Revoked);
                     }
                     first_connect = false;
-                    sleep_or_connector_wake(wake_rx, backoff.next(&mut jitter)).await;
+                    sleep_or_connector_wake(wake_rx, backoff.next(&jitter)).await;
                     continue;
                 }
             }
@@ -414,7 +414,7 @@ async fn run_enabled_connector(
                 );
             }
         }
-        sleep_or_connector_wake(wake_rx, backoff.next(&mut jitter)).await;
+        sleep_or_connector_wake(wake_rx, backoff.next(&jitter)).await;
     }
 }
 
@@ -424,23 +424,11 @@ struct SelectedRelay {
     from_cache: bool,
 }
 
-trait JitterSource {
-    fn duration_below(&mut self, cap: Duration) -> Duration;
-}
-
-struct SystemJitter;
-
-impl JitterSource for SystemJitter {
-    fn duration_below(&mut self, cap: Duration) -> Duration {
-        random_duration_below(cap)
-    }
-}
-
 async fn select_relay(
     client: &FlycockpitClient,
     credential: &StoredFlycockpitCredential,
     first_connect: bool,
-    jitter: &mut impl JitterSource,
+    jitter: &dyn JitterSource,
 ) -> Result<Option<SelectedRelay>> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     if let Some(choice) = credential
@@ -461,7 +449,7 @@ async fn select_relay(
 async fn select_relay_from_candidates(
     candidates: Vec<RelayCandidate>,
     first_connect: bool,
-    jitter: &mut impl JitterSource,
+    jitter: &dyn JitterSource,
 ) -> Result<Option<SelectedRelay>> {
     select_relay_from_candidates_with_timeout(candidates, first_connect, jitter, PROBE_TIMEOUT)
         .await
@@ -470,7 +458,7 @@ async fn select_relay_from_candidates(
 async fn select_relay_from_candidates_with_timeout(
     candidates: Vec<RelayCandidate>,
     first_connect: bool,
-    jitter: &mut impl JitterSource,
+    jitter: &dyn JitterSource,
     probe_timeout: Duration,
 ) -> Result<Option<SelectedRelay>> {
     if candidates.is_empty() {
@@ -484,7 +472,7 @@ async fn select_relay_from_candidates_with_timeout(
     }
 
     if !first_connect {
-        tokio::time::sleep(jitter.duration_below(COLD_PROBE_JITTER_MAX)).await;
+        tokio::time::sleep(jitter.duration_up_to(COLD_PROBE_JITTER_MAX)).await;
     }
 
     let http = reqwest::Client::new();
@@ -586,14 +574,6 @@ fn healthz_url(ws_url: &str) -> Result<String> {
 
 fn is_not_found_error(message: &str) -> bool {
     message.contains("404") || message.to_ascii_lowercase().contains("not found")
-}
-
-fn random_duration_below(cap: Duration) -> Duration {
-    let max_millis = cap.as_millis().min(u128::from(u64::MAX)) as u64;
-    if max_millis == 0 {
-        return Duration::ZERO;
-    }
-    Duration::from_millis(rand::random_range(0..=max_millis))
 }
 
 async fn connect_relay_socket(
@@ -1012,12 +992,12 @@ impl Default for Backoff {
 }
 
 impl Backoff {
-    fn next(&mut self, jitter: &mut impl JitterSource) -> Duration {
+    fn next(&mut self, jitter: &dyn JitterSource) -> Duration {
         let shift = self.attempt.min(20);
         let multiplier = 1_u32.checked_shl(shift).unwrap_or(u32::MAX);
         let max = self.base.saturating_mul(multiplier).min(self.cap);
         self.attempt = self.attempt.saturating_add(1);
-        jitter.duration_below(max)
+        jitter.duration_up_to(max)
     }
 
     fn reset(&mut self) {
@@ -1029,7 +1009,7 @@ impl Backoff {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::auth::flycockpit::AccountInfo;
     use crate::daemon::proto::{ErrorCode, ErrorPayload, Request, Response};
@@ -1162,30 +1142,33 @@ mod tests {
     struct ZeroJitter;
 
     impl JitterSource for ZeroJitter {
-        fn duration_below(&mut self, _cap: Duration) -> Duration {
+        fn duration_up_to(&self, _cap: Duration) -> Duration {
             Duration::ZERO
         }
     }
 
     struct AlternatingJitter {
-        high: bool,
+        high: AtomicBool,
     }
 
     impl JitterSource for AlternatingJitter {
-        fn duration_below(&mut self, cap: Duration) -> Duration {
-            self.high = !self.high;
-            if self.high { cap } else { Duration::ZERO }
+        fn duration_up_to(&self, cap: Duration) -> Duration {
+            if !self.high.fetch_xor(true, Ordering::SeqCst) {
+                cap
+            } else {
+                Duration::ZERO
+            }
         }
     }
 
     struct RecordingJitter {
-        calls: usize,
+        calls: AtomicUsize,
         value: Duration,
     }
 
     impl JitterSource for RecordingJitter {
-        fn duration_below(&mut self, cap: Duration) -> Duration {
-            self.calls += 1;
+        fn duration_up_to(&self, cap: Duration) -> Duration {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             self.value.min(cap)
         }
     }
@@ -1419,10 +1402,12 @@ mod tests {
     #[test]
     fn backoff_uses_full_jitter_and_varies_attempts() {
         let mut backoff = Backoff::default();
-        let mut jitter = AlternatingJitter { high: false };
+        let jitter = AlternatingJitter {
+            high: AtomicBool::new(false),
+        };
         let mut seen = Vec::new();
         for _ in 0..100 {
-            seen.push(backoff.next(&mut jitter));
+            seen.push(backoff.next(&jitter));
         }
         assert!(seen.contains(&Duration::ZERO));
         assert!(
@@ -1444,19 +1429,19 @@ mod tests {
             chosen_at: chrono::Utc::now().timestamp_millis(),
         });
         let client = FlycockpitClient::new(&credential.server_url).unwrap();
-        let mut jitter = RecordingJitter {
-            calls: 0,
+        let jitter = RecordingJitter {
+            calls: AtomicUsize::new(0),
             value: Duration::from_millis(1),
         };
 
-        let selected = select_relay(&client, &credential, false, &mut jitter)
+        let selected = select_relay(&client, &credential, false, &jitter)
             .await
             .unwrap()
             .unwrap();
 
         assert!(selected.from_cache);
         assert_eq!(selected.choice.relay_id, "relay-cached");
-        assert_eq!(jitter.calls, 0);
+        assert_eq!(jitter.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1467,9 +1452,9 @@ mod tests {
             region: None,
             ws_url,
         };
-        let mut jitter = ZeroJitter;
+        let jitter = ZeroJitter;
 
-        let selected = select_relay_from_candidates(vec![candidate], true, &mut jitter)
+        let selected = select_relay_from_candidates(vec![candidate], true, &jitter)
             .await
             .unwrap()
             .unwrap();
@@ -1501,9 +1486,9 @@ mod tests {
                 ws_url: medium,
             },
         ];
-        let mut jitter = ZeroJitter;
+        let jitter = ZeroJitter;
 
-        let selected = select_relay_from_candidates(candidates, true, &mut jitter)
+        let selected = select_relay_from_candidates(candidates, true, &jitter)
             .await
             .unwrap()
             .unwrap();
@@ -1568,19 +1553,19 @@ mod tests {
                 },
             ]
         };
-        let mut jitter = RecordingJitter {
-            calls: 0,
+        let jitter = RecordingJitter {
+            calls: AtomicUsize::new(0),
             value: Duration::from_millis(1),
         };
-        let _ = select_relay_from_candidates(candidates(), true, &mut jitter)
+        let _ = select_relay_from_candidates(candidates(), true, &jitter)
             .await
             .unwrap();
-        assert_eq!(jitter.calls, 0);
+        assert_eq!(jitter.calls.load(Ordering::SeqCst), 0);
 
-        let _ = select_relay_from_candidates(candidates(), false, &mut jitter)
+        let _ = select_relay_from_candidates(candidates(), false, &jitter)
             .await
             .unwrap();
-        assert_eq!(jitter.calls, 1);
+        assert_eq!(jitter.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

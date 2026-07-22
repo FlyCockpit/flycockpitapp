@@ -21,6 +21,7 @@ use crate::daemon::registry::SessionRegistry;
 use crate::daemon::session_worker::{SessionWork, TurnOutcome};
 use crate::db::Db;
 use crate::db::scheduler::{NewScheduledJobRow, ScheduledJobRow, ScheduledJobRunUpdate};
+use crate::jitter::{JitterSource, SystemJitter};
 
 const MAX_FAILURES: u32 = 5;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -123,6 +124,7 @@ pub struct DaemonScheduler {
     db: Db,
     clock: Arc<dyn SchedulerClock>,
     executor: Arc<dyn JobExecutor>,
+    jitter: Arc<dyn JitterSource>,
     last_user_activity: Arc<RwLock<i64>>,
     timeline: Arc<RwLock<BinaryHeap<Reverse<i64>>>>,
     in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
@@ -202,11 +204,21 @@ impl DaemonSchedulerHandle {
 
 impl DaemonScheduler {
     pub fn new(db: Db, clock: Arc<dyn SchedulerClock>, executor: Arc<dyn JobExecutor>) -> Self {
+        Self::with_jitter(db, clock, executor, Arc::new(SystemJitter))
+    }
+
+    pub fn with_jitter(
+        db: Db,
+        clock: Arc<dyn SchedulerClock>,
+        executor: Arc<dyn JobExecutor>,
+        jitter: Arc<dyn JitterSource>,
+    ) -> Self {
         let now = clock.now();
         Self {
             db,
             clock,
             executor,
+            jitter,
             last_user_activity: Arc::new(RwLock::new(now)),
             timeline: Arc::new(RwLock::new(BinaryHeap::new())),
             in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -485,7 +497,7 @@ impl DaemonScheduler {
             )
         });
         let backoff_until = (!ok && !disabled)
-            .then(|| finished_at.saturating_add(backoff_seconds(failure_count, &job.id)));
+            .then(|| finished_at.saturating_add(backoff_seconds(failure_count, &*self.jitter)));
         let enabled = current.enabled && !disabled;
         let next_run_at = if !enabled {
             None
@@ -1045,11 +1057,14 @@ fn validate_cron_part(part: &str, min: u32, max: u32, name: &str) -> Result<()> 
     Ok(())
 }
 
-fn backoff_seconds(failure_count: u32, job_id: &str) -> i64 {
+fn backoff_seconds(failure_count: u32, jitter: &dyn JitterSource) -> i64 {
     let exp = failure_count.saturating_sub(1).min(6);
-    let base = 60_i64.saturating_mul(1_i64 << exp);
-    let jitter = (job_id.bytes().map(u64::from).sum::<u64>() % 30) as i64;
-    base.saturating_add(jitter).min(60 * 60)
+    let base = 60_i64.saturating_mul(1_i64 << exp).min(60 * 60);
+    let floor = base / 2;
+    let extra = jitter
+        .duration_up_to(Duration::from_secs(floor as u64))
+        .as_secs() as i64;
+    floor.saturating_add(extra).min(60 * 60)
 }
 
 fn row_to_summary(row: ScheduledJobRow) -> Result<ScheduledJobSummary> {
@@ -1099,7 +1114,8 @@ fn row_to_job(row: ScheduledJobRow) -> Result<ScheduledJob> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -1134,6 +1150,45 @@ mod tests {
     impl SchedulerClock for ManualClock {
         fn now(&self) -> i64 {
             *self.0.lock().unwrap()
+        }
+    }
+
+    struct ZeroJitter;
+
+    impl JitterSource for ZeroJitter {
+        fn duration_up_to(&self, _cap: Duration) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    struct MaxJitter;
+
+    impl JitterSource for MaxJitter {
+        fn duration_up_to(&self, cap: Duration) -> Duration {
+            cap
+        }
+    }
+
+    struct SequenceJitter {
+        values: Mutex<VecDeque<Duration>>,
+    }
+
+    impl SequenceJitter {
+        fn new(values: impl IntoIterator<Item = Duration>) -> Self {
+            Self {
+                values: Mutex::new(values.into_iter().collect()),
+            }
+        }
+    }
+
+    impl JitterSource for SequenceJitter {
+        fn duration_up_to(&self, cap: Duration) -> Duration {
+            self.values
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(cap)
+                .min(cap)
         }
     }
 
@@ -1277,6 +1332,64 @@ mod tests {
             clock,
             executor,
         )
+    }
+
+    #[test]
+    fn backoff_jitter_varies_across_retries_of_the_same_job() {
+        let jitter = SequenceJitter::new([
+            Duration::ZERO,
+            Duration::from_secs(5),
+            Duration::from_secs(25),
+        ]);
+
+        let components = (1..=3)
+            .map(|failure_count| {
+                let floor = 30_i64 * (1_i64 << (failure_count - 1));
+                backoff_seconds(failure_count, &jitter) - floor
+            })
+            .collect::<Vec<_>>();
+
+        assert!(components.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn backoff_jitter_scales_with_the_backoff_base() {
+        let jitter = MaxJitter;
+
+        let low_floor = 30;
+        let high_floor = 1_800;
+        let low_extra = backoff_seconds(1, &jitter) - low_floor;
+        let high_extra = backoff_seconds(7, &jitter) - high_floor;
+
+        assert!(high_extra > low_extra);
+        assert_eq!(low_extra, low_floor);
+        assert_eq!(high_extra, high_floor);
+    }
+
+    #[test]
+    fn zero_jitter_reproduces_exact_backoff_ladder() {
+        let jitter = ZeroJitter;
+        let delays = (1..=7)
+            .map(|failure_count| backoff_seconds(failure_count, &jitter))
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays, vec![30, 60, 120, 240, 480, 960, 1_800]);
+        assert_eq!(backoff_seconds(64, &jitter), 1_800);
+    }
+
+    #[test]
+    fn backoff_never_exceeds_one_hour() {
+        let min_jitter = ZeroJitter;
+        let max_jitter = MaxJitter;
+
+        for failure_count in 1..=64 {
+            for delay in [
+                backoff_seconds(failure_count, &min_jitter),
+                backoff_seconds(failure_count, &max_jitter),
+            ] {
+                assert!((30..=3_600).contains(&delay));
+            }
+        }
     }
 
     #[derive(Default)]

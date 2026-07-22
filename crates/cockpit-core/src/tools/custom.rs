@@ -240,6 +240,7 @@ impl Tool for CustomBashTool {
                         .as_deref(),
                     None,
                     missing_binary.as_deref(),
+                    None,
                     self.binary_requirements(),
                 ),
             );

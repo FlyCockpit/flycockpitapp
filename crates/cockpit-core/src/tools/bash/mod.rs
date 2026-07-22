@@ -532,10 +532,8 @@ async fn call_bash_inner(
         {
             return Ok(output);
         }
-        return Ok(ToolOutput::text(format!(
-                "Error: the shell sandbox cannot start here ({reason}); `bash` will fail for the rest of the session until the user types `/sandbox off` in the cockpit composer (a UI command, not a shell command) — ask them to do that; do not retry or run `/sandbox off` yourself."
-            ))
-            .with_sandbox(meta));
+        let message = sandbox_unavailable_refusal(reason, ctx, !options.escalated);
+        return Ok(ToolOutput::text(message).with_sandbox(meta));
     }
 
     let confine = matches!(gate, crate::tools::shell_sandbox::SandboxGate::Confine);
@@ -635,7 +633,7 @@ async fn call_bash_inner(
             .with_bash_meta(meta, &resource_meta));
         }
         RunOutcome::SpawnError(e) => {
-            let mut message = render_spawn_error(&prefixed, &cwd, &e);
+            let mut message = render_spawn_error(&prefixed, &cwd, &e, Some(confine));
             message.push_str(
                 &crate::tools::command_resource_profiles::resource_profile_context(
                     &command_resource_plan,
@@ -717,7 +715,7 @@ async fn call_bash_inner(
                     .with_bash_meta(meta, &resource_meta));
                 }
                 RunOutcome::SpawnError(e) => {
-                    let mut message = render_spawn_error(&prefixed, &cwd, &e);
+                    let mut message = render_spawn_error(&prefixed, &cwd, &e, Some(false));
                     message.push_str(
                         &crate::tools::command_resource_profiles::resource_profile_context(
                             &command_resource_plan,
@@ -793,6 +791,7 @@ async fn call_bash_inner(
         None
     };
     let native_write_hint = durable_shell_write_hint(command);
+    let escalation_note = sandbox_escalation_note(ctx, confine, !options.escalated, &final_outcome);
 
     // Model-facing body is unchanged — only `final_outcome` is rendered,
     // never the sandbox metadata (which rides out-of-band for the event).
@@ -806,6 +805,8 @@ async fn call_bash_inner(
             tip,
             native_write_hint,
             timeout_note,
+            escalation_note: escalation_note.as_deref(),
+            confined: Some(confine),
         },
     );
     // Structured exit code for the `tool_call` event (export-audit
@@ -1273,6 +1274,51 @@ fn confined_failure_escalation_offer(_outcome: &ShellOutcome) -> Option<(i32, St
     None
 }
 
+fn sandbox_escalation_note(
+    ctx: &ToolCtx,
+    confined: bool,
+    first_attempt: bool,
+    outcome: &ShellOutcome,
+) -> Option<String> {
+    if !confined
+        || !first_attempt
+        || outcome.success
+        || !ctx.session.sandbox_escalation_enabled()
+        || !crate::engine::tool::Capability::SandboxEscalate.enabled(ctx.llm_mode)
+    {
+        return None;
+    }
+    let call_id = ctx
+        .current_tool_call_id
+        .as_deref()
+        .map(|id| format!(" with call_id=\"{id}\""))
+        .unwrap_or_default();
+    Some(format!(
+        "note: this ran under the shell sandbox; if it failed because the sandbox blocked a path, call `escalate`{call_id} (add suggested_paths so future commands keep working inside the sandbox)."
+    ))
+}
+
+fn sandbox_unavailable_refusal(reason: &str, ctx: &ToolCtx, first_attempt: bool) -> String {
+    let prefix = format!(
+        "Error: the shell sandbox cannot start here ({reason}); `bash` will fail for the rest of the session until the user types `/sandbox off` in the cockpit composer (a UI command, not a shell command)"
+    );
+    if first_attempt
+        && ctx.session.sandbox_escalation_enabled()
+        && crate::engine::tool::Capability::SandboxEscalate.enabled(ctx.llm_mode)
+    {
+        let call_id = ctx
+            .current_tool_call_id
+            .as_deref()
+            .map(|id| format!(" with call_id=\"{id}\""))
+            .unwrap_or_default();
+        format!(
+            "{prefix} — ask them to do that for the durable fix; for this failed call, call `escalate`{call_id}, and if escalation is denied then ask the user to use `/sandbox off`. Do not run `/sandbox off` yourself."
+        )
+    } else {
+        format!("{prefix} — ask them to do that; do not retry or run `/sandbox off` yourself.")
+    }
+}
+
 async fn sandbox_availability_for_bash(
     cwd: &Path,
 ) -> crate::tools::shell_sandbox::SandboxAvailability {
@@ -1481,6 +1527,8 @@ struct BashOutputAnnotations<'a> {
     tip: Option<crate::tools::shell_compress::BashTip>,
     native_write_hint: Option<&'a str>,
     timeout_note: Option<&'a str>,
+    escalation_note: Option<&'a str>,
+    confined: Option<bool>,
 }
 
 fn render_output(
@@ -1520,6 +1568,7 @@ fn render_output(
             Some(&exit_status),
             None,
             missing_binary.as_deref(),
+            annotations.confined,
         ));
     }
     // Defensive-mode routing nudge: after the `exit:` line, outside the
@@ -1534,6 +1583,10 @@ fn render_output(
         body.push('\n');
     }
     if let Some(note) = annotations.timeout_note {
+        body.push_str(note);
+        body.push('\n');
+    }
+    if let Some(note) = annotations.escalation_note {
         body.push_str(note);
         body.push('\n');
     }
@@ -1563,7 +1616,12 @@ fn append_timeout_note(message: &mut String, timeout_note: Option<&str>) {
     }
 }
 
-fn render_spawn_error(command: &str, cwd: &Path, error: &std::io::Error) -> String {
+fn render_spawn_error(
+    command: &str,
+    cwd: &Path,
+    error: &std::io::Error,
+    confined: Option<bool>,
+) -> String {
     let missing = if error.kind() == std::io::ErrorKind::NotFound {
         Some("sh")
     } else {
@@ -1576,6 +1634,7 @@ fn render_spawn_error(command: &str, cwd: &Path, error: &std::io::Error) -> Stri
         None,
         Some(&error.to_string()),
         missing,
+        confined,
     ));
     out
 }
@@ -1896,6 +1955,7 @@ fn cockpit_command_environment_block(
     exit_status: Option<&str>,
     spawn_error: Option<&str>,
     missing_binary: Option<&str>,
+    confined: Option<bool>,
 ) -> String {
     cockpit_command_environment_block_with_requirements(
         command,
@@ -1903,6 +1963,7 @@ fn cockpit_command_environment_block(
         exit_status,
         spawn_error,
         missing_binary,
+        confined,
         BashTool::declared_binary_requirements(),
     )
 }
@@ -1913,6 +1974,7 @@ pub(crate) fn cockpit_command_environment_block_with_requirements(
     exit_status: Option<&str>,
     spawn_error: Option<&str>,
     missing_binary: Option<&str>,
+    confined: Option<bool>,
     declared_requirements: Vec<crate::capabilities::BinaryRequirement>,
 ) -> String {
     let mut out = String::new();
@@ -1921,6 +1983,9 @@ pub(crate) fn cockpit_command_environment_block_with_requirements(
     out.push_str(&format!("cwd: {}\n", cwd.display()));
     if let Some(status) = exit_status {
         out.push_str(&format!("exit_code: {status}\n"));
+    }
+    if let Some(confined) = confined {
+        out.push_str(&format!("confined: {confined}\n"));
     }
     if let Some(error) = spawn_error {
         out.push_str(&format!("spawn_error: {error}\n"));
@@ -2207,6 +2272,8 @@ fn render_bash_outcome(
         None
     };
     let native_write_hint = durable_shell_write_hint(command);
+    let escalation_note =
+        sandbox_escalation_note(ctx, meta.confined, !meta.escalated, &final_outcome);
     let body = render_output(
         &final_outcome,
         compress,
@@ -2217,6 +2284,8 @@ fn render_bash_outcome(
             tip,
             native_write_hint,
             timeout_note,
+            escalation_note: escalation_note.as_deref(),
+            confined: Some(meta.confined),
         },
     );
     let exit_field = if final_outcome.signaled {

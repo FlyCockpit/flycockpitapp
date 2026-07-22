@@ -679,7 +679,8 @@ pub struct ToolCtx {
     /// Current outer model tool-call id, when this context was built for a
     /// live model-issued tool dispatch. Host-side tools can use it to parent
     /// synthetic UI/telemetry events without exposing the id to tool schemas or
-    /// model-visible arguments.
+    /// model-visible arguments. `bash` may echo it in sandbox failure text so
+    /// the model can call `escalate` with the required id.
     pub current_tool_call_id: Option<String>,
     /// The active LLM-mode of the calling agent. Read by tools that vary
     /// *behavior* (not just description prose) on the defensive/normal axis —
@@ -1784,6 +1785,13 @@ mod llm_mode_tests {
     #[test]
     fn every_builtin_tool_has_a_defensive_description() {
         for tool in all_builtin_tools() {
+            if tool.name() == "escalate" {
+                // `escalate` is removed from Defensive toolboxes by
+                // Capability::SandboxEscalate, so a defensive variant is
+                // unrenderable by construction. Keep this a named exemption so
+                // other built-ins cannot silently lose Defensive coverage.
+                continue;
+            }
             let terse = tool.description().to_string();
             let defensive = tool.defensive_description().unwrap_or_else(|| {
                 panic!(

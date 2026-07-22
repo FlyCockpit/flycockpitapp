@@ -1327,6 +1327,26 @@ mod compressed_tool_result_tests {
             .expect("mode removal notice");
         assert!(removed_by_mode.contains("now unavailable"));
     }
+
+    #[test]
+    fn escalate_is_absent_from_a_defensive_toolbox() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        session.set_sandbox_escalation_enabled(true);
+        let tools = ToolBox::new()
+            .with(Arc::new(crate::tools::bash::BashTool::new()))
+            .with(Arc::new(crate::tools::escalate::EscalateTool));
+
+        assert!(
+            !toolbox_with_retrieval_if_needed(
+                tools,
+                &session,
+                crate::config::extended::LlmMode::Defensive
+            )
+            .names()
+            .contains(&"escalate")
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1896,6 +1896,283 @@ async fn sandbox_unavailable_is_not_turned_into_a_prompt() {
     );
 }
 
+fn sandbox_unavailable(reason: &str) -> crate::tools::shell_sandbox::SandboxAvailability {
+    crate::tools::shell_sandbox::SandboxAvailability::Unavailable {
+        reason: reason.to_string(),
+        fix_command: None,
+    }
+}
+
+fn assert_no_escalate_note(content: &str) {
+    assert_eq!(note_count(content, "this ran under the shell sandbox"), 0);
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn confined_failure_names_escalate_and_call_id_in_normal_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with_store(tmp.path());
+    ctx.current_tool_call_id = Some("call-normal".to_string());
+    ctx.session.set_sandbox_escalation_enabled(true);
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [(true, shell_out("", "blocked", 13))],
+    );
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf blocked" }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert_eq!(
+        note_count(&out.content, "this ran under the shell sandbox"),
+        1
+    );
+    assert!(out.content.contains("call `escalate`"));
+    assert!(out.content.contains("call_id=\"call-normal\""));
+    assert!(out.content.contains("suggested_paths"));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn confined_failure_omits_call_id_clause_when_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_escalation_enabled(true);
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [(true, shell_out("", "blocked", 13))],
+    );
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf blocked" }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert_eq!(
+        note_count(&out.content, "this ran under the shell sandbox"),
+        1
+    );
+    assert!(out.content.contains("call `escalate`"));
+    assert!(!out.content.contains("call_id="));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn confined_failure_names_escalate_in_frontier_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with_store(tmp.path());
+    ctx.llm_mode = crate::config::extended::LlmMode::Frontier;
+    ctx.current_tool_call_id = Some("call-frontier".to_string());
+    ctx.session.set_sandbox_escalation_enabled(true);
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [(true, shell_out("", "blocked", 13))],
+    );
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf blocked" }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert_eq!(
+        note_count(&out.content, "this ran under the shell sandbox"),
+        1
+    );
+    assert!(out.content.contains("call `escalate`"));
+    assert!(out.content.contains("call_id=\"call-frontier\""));
+}
+
+#[test]
+fn confined_failure_omits_escalate_note_in_defensive_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with_store(tmp.path());
+    ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
+    ctx.current_tool_call_id = Some("call-defensive".to_string());
+    ctx.session.set_sandbox_escalation_enabled(true);
+    let outcome = shell_out("", "blocked", 13);
+    let note = sandbox_escalation_note(&ctx, true, true, &outcome);
+    let body = render_output(
+        &outcome,
+        false,
+        "printf blocked",
+        tmp.path(),
+        BashOutputAnnotations {
+            escalation_note: note.as_deref(),
+            confined: Some(true),
+            ..BashOutputAnnotations::default()
+        },
+    );
+
+    assert_no_escalate_note(&body);
+    assert!(!body.contains("call `escalate`"));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn confined_failure_omits_escalate_note_when_escalation_disabled() {
+    for mode in [
+        crate::config::extended::LlmMode::Normal,
+        crate::config::extended::LlmMode::Frontier,
+        crate::config::extended::LlmMode::Defensive,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_with_store(tmp.path());
+        ctx.llm_mode = mode;
+        ctx.current_tool_call_id = Some("call-disabled".to_string());
+        ctx.session.set_sandbox_escalation_enabled(false);
+        let _guard = set_bash_test_overrides(
+            Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+            None,
+            [(true, shell_out("", "blocked", 13))],
+        );
+
+        let out = BashTool::new()
+            .call(serde_json::json!({ "command": "printf blocked" }), &ctx)
+            .await
+            .expect("bash call returns");
+
+        assert_no_escalate_note(&out.content);
+        assert!(!out.content.contains("call `escalate`"));
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn confined_failure_omits_escalate_note_on_an_already_escalated_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with_store(tmp.path());
+    ctx.current_tool_call_id = Some("call-escalated".to_string());
+    ctx.session.set_sandbox_escalation_enabled(true);
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [(true, shell_out("", "blocked", 13))],
+    );
+
+    let out =
+        rerun_escalated_bash_confined(serde_json::json!({ "command": "printf blocked" }), &ctx)
+            .await
+            .expect("bash call returns");
+
+    assert_no_escalate_note(&out.content);
+    assert!(!out.content.contains("call `escalate`"));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn confined_success_body_is_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with_store(tmp.path());
+    ctx.current_tool_call_id = Some("call-success".to_string());
+    ctx.session.set_sandbox_escalation_enabled(true);
+    let outcome = shell_out("ok", "", 0);
+    let expected = render_output(
+        &outcome,
+        false,
+        "printf ok",
+        tmp.path(),
+        BashOutputAnnotations::default(),
+    );
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [(true, outcome)],
+    );
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf ok" }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert_eq!(out.content, expected);
+}
+
+#[tokio::test]
+async fn unconfined_failure_omits_escalate_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf blocked");
+    ctx.current_tool_call_id = Some("call-unconfined".to_string());
+    ctx.session.set_sandbox_escalation_enabled(true);
+    let _guard = set_bash_test_overrides(None, None, [(false, shell_out("", "blocked", 13))]);
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf blocked" }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert_no_escalate_note(&out.content);
+    assert!(!out.content.contains("call `escalate`"));
+    assert!(out.content.contains("confined: false"));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn sandbox_unavailable_refusal_names_escalate_in_normal_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with_store(tmp.path());
+    ctx.current_tool_call_id = Some("call-unavailable".to_string());
+    ctx.session.set_sandbox_escalation_enabled(true);
+    let _guard = set_bash_test_overrides(Some(sandbox_unavailable("bwrap absent")), None, []);
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf hi" }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert!(out.content.contains("call `escalate`"));
+    assert!(out.content.contains("call_id=\"call-unavailable\""));
+    assert!(!out.content.contains("do not retry"));
+    assert!(out.content.contains("Do not run `/sandbox off` yourself."));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn sandbox_unavailable_refusal_names_escalate_in_frontier_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with_store(tmp.path());
+    ctx.llm_mode = crate::config::extended::LlmMode::Frontier;
+    ctx.current_tool_call_id = Some("call-unavailable-frontier".to_string());
+    ctx.session.set_sandbox_escalation_enabled(true);
+    let _guard = set_bash_test_overrides(Some(sandbox_unavailable("bwrap absent")), None, []);
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf hi" }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert!(out.content.contains("call `escalate`"));
+    assert!(
+        out.content
+            .contains("call_id=\"call-unavailable-frontier\"")
+    );
+    assert!(!out.content.contains("do not retry"));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn sandbox_unavailable_refusal_is_unchanged_in_defensive_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with_store(tmp.path());
+    ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
+    ctx.current_tool_call_id = Some("call-defensive-unavailable".to_string());
+    ctx.session.set_sandbox_escalation_enabled(false);
+    let _guard = set_bash_test_overrides(Some(sandbox_unavailable("bwrap absent")), None, []);
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf hi" }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert_eq!(
+        out.content,
+        "Error: the shell sandbox cannot start here (bwrap absent); `bash` will fail for the rest of the session until the user types `/sandbox off` in the cockpit composer (a UI command, not a shell command) — ask them to do that; do not retry or run `/sandbox off` yourself."
+    );
+}
+
 #[cfg(not(windows))]
 #[test]
 fn sandbox_meta_distinguishes_four_states() {
@@ -2457,6 +2734,7 @@ fn missing_binary_diagnostic_adds_remedy_for_declared_binary_only() {
         Some("127"),
         None,
         Some("jq"),
+        None,
         vec![crate::capabilities::BinaryRequirement::required(
             "jq",
             crate::capabilities::common_remedy("jq"),
@@ -2472,6 +2750,7 @@ fn missing_binary_diagnostic_adds_remedy_for_declared_binary_only() {
         Some("127"),
         None,
         Some("mystery"),
+        None,
         Vec::new(),
     );
     assert!(undeclared.contains("missing_binary: mystery"));
@@ -2506,12 +2785,13 @@ fn nonzero_command_diagnostic_includes_attempted_command_and_cwd() {
 #[test]
 fn spawn_error_diagnostic_includes_command_cwd_and_error() {
     let error = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
-    let body = render_spawn_error("cargo test", Path::new("/repo"), &error);
+    let body = render_spawn_error("cargo test", Path::new("/repo"), &error, Some(true));
     assert!(body.contains("Error: could not start cockpit shell"));
     assert!(body.contains("cockpit_command_environment:"));
     assert!(body.contains("attempted_command: cargo test"));
     assert!(body.contains("cwd: /repo"));
     assert!(body.contains("spawn_error: No such file or directory"));
+    assert!(body.contains("confined: true"));
     assert!(body.contains("missing_binary: sh"));
     assert!(body.contains("not found in cockpit's command environment"));
 }

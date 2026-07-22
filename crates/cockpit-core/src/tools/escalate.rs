@@ -51,10 +51,6 @@ impl Tool for EscalateTool {
         "Re-run a sandbox-failed bash call after approval; prefer suggested_paths so future commands keep working inside the sandbox, and escalate without paths only when a durable grant would not help."
     }
 
-    fn defensive_description(&self) -> Option<String> {
-        Some("Use only with the call_id of a prior failed bash call from this session that failed while sandboxed or because the sandbox could not start; optionally include suggested_paths so the user can grant path access and retry inside the sandbox.".to_string())
-    }
-
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -74,27 +70,6 @@ impl Tool for EscalateTool {
             },
             "required": ["call_id"]
         })
-    }
-
-    fn defensive_parameters(&self) -> Option<Value> {
-        Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "call_id": { "type": "string", "description": "The exact call_id of a previous bash tool call in this session that failed under shell confinement or returned the sandbox-unavailable refusal" },
-                "suggested_paths": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Optional file or directory paths the sandbox likely blocked; relative paths resolve against the failed call cwd",
-                    "maxItems": MAX_SUGGESTED_PATHS
-                },
-                "access": {
-                    "type": "string",
-                    "enum": ["read", "read-write"],
-                    "description": "Access needed for every suggested path; defaults to read-write"
-                }
-            },
-            "required": ["call_id"]
-        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -401,6 +376,12 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         })
+    }
+
+    #[test]
+    fn escalate_has_no_defensive_variants() {
+        assert!(EscalateTool.defensive_description().is_none());
+        assert!(EscalateTool.defensive_parameters().is_none());
     }
 
     #[tokio::test]

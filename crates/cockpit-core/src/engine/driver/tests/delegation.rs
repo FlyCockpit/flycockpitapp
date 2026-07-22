@@ -1,4 +1,274 @@
 use super::*;
+use std::ops::ControlFlow;
+
+fn task_tool_call_with_args(
+    call_id: &str,
+    function_call_id: &str,
+    args: serde_json::Value,
+) -> crate::engine::message::ToolCall {
+    crate::engine::message::ToolCall {
+        id: call_id.to_string(),
+        call_id: Some(function_call_id.to_string()),
+        function: rig::message::ToolFunction {
+            name: "task".into(),
+            arguments: args,
+        },
+        signature: None,
+        additional_params: None,
+    }
+}
+
+async fn dispatch_task_args(
+    driver: &Driver,
+    args: serde_json::Value,
+) -> crate::engine::agent::TurnOutcome {
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    let tc = task_tool_call_with_args("task-unknown-agent", "fn-task-unknown-agent", args);
+    match crate::engine::agent::phase_10_dispatch_one_call(
+        &driver.stack[0].agent,
+        &driver.session,
+        &driver.config,
+        &tx,
+        &tc,
+        "task",
+    )
+    .await
+    .unwrap()
+    {
+        ControlFlow::Break(outcome) => outcome,
+        ControlFlow::Continue(()) => panic!("task dispatch must be structural"),
+    }
+}
+
+fn outcome_tool_result_text(outcome: crate::engine::agent::TurnOutcome) -> String {
+    match outcome {
+        crate::engine::agent::TurnOutcome::ToolResult { body, .. } => body,
+        _ => panic!("expected tool-result refusal"),
+    }
+}
+
+#[tokio::test]
+async fn task_delegate_unknown_agent_refuses_with_reachable_list() {
+    let (driver, _tmp) = test_driver(8);
+
+    let body = outcome_tool_result_text(
+        dispatch_task_args(
+            &driver,
+            serde_json::json!({
+                "agent": "no-such-agent",
+                "prompt": "do it"
+            }),
+        )
+        .await,
+    );
+
+    assert!(
+        body.contains("Error: unknown agent `no-such-agent`"),
+        "{body}"
+    );
+    assert!(body.contains("Reachable agents from `Build`"), "{body}");
+    assert!(body.contains("builder"), "{body}");
+}
+
+#[tokio::test]
+async fn task_delegate_unknown_agent_writes_no_delegation_payload_row() {
+    let (driver, _tmp) = test_driver(8);
+
+    let _ = dispatch_task_args(
+        &driver,
+        serde_json::json!({
+            "agent": "no-such-agent",
+            "prompt": "do it"
+        }),
+    )
+    .await;
+
+    let children = driver
+        .session
+        .db
+        .list_task_delegation_children(driver.session.id)
+        .unwrap();
+    assert!(children.is_empty(), "{children:?}");
+}
+
+#[tokio::test]
+async fn task_batch_unknown_agent_refuses_naming_the_label() {
+    let (driver, _tmp) = test_driver(8);
+
+    let body = outcome_tool_result_text(
+        dispatch_task_args(
+            &driver,
+            serde_json::json!({
+                "intent": "batch",
+                "batch": [
+                    {
+                        "label": "bad-review",
+                        "agent": "no-such-agent",
+                        "prompt": "review it"
+                    }
+                ]
+            }),
+        )
+        .await,
+    );
+
+    assert!(body.contains("batch entry `bad-review`"), "{body}");
+    assert!(body.contains("unknown agent `no-such-agent`"), "{body}");
+    assert!(body.contains("builder"), "{body}");
+}
+
+#[tokio::test]
+async fn task_delegate_absent_agent_still_defaults_to_builder() {
+    let (driver, _tmp) = test_driver(8);
+
+    match dispatch_task_args(
+        &driver,
+        serde_json::json!({
+            "intent": "delegate",
+            "delegate": { "prompt": "do it" }
+        }),
+    )
+    .await
+    {
+        crate::engine::agent::TurnOutcome::SpawnSubagent { child_agent, .. } => {
+            assert_eq!(child_agent, "builder");
+        }
+        _ => panic!("absent agent should default to interactive builder delegation"),
+    }
+}
+
+#[tokio::test]
+async fn task_delegate_with_cwd_argument_defers_validation() {
+    let (driver, tmp) = test_driver(8);
+    let child_dir = tmp.path().join("child");
+    std::fs::create_dir_all(&child_dir).unwrap();
+
+    match dispatch_task_args(
+        &driver,
+        serde_json::json!({
+            "intent": "delegate",
+            "delegate": {
+                "agent": "only-under-child",
+                "prompt": "do it",
+                "cwd": "child",
+                "mode": "subagent"
+            }
+        }),
+    )
+    .await
+    {
+        crate::engine::agent::TurnOutcome::SpawnNoninteractive {
+            child_agent, cwd, ..
+        } => {
+            assert_eq!(child_agent, "only-under-child");
+            assert_eq!(cwd.as_deref(), Some("child"));
+        }
+        _ => panic!("cwd-scoped unknown agent should defer parse-time validation"),
+    }
+}
+
+#[tokio::test]
+async fn task_unknown_agent_records_tool_rejected_event() {
+    let (driver, _tmp) = test_driver(8);
+
+    let _ = dispatch_task_args(
+        &driver,
+        serde_json::json!({
+            "agent": "no-such-agent",
+            "prompt": "do it"
+        }),
+    )
+    .await;
+
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|event| event.kind == "tool_rejected")
+        .expect("tool_rejected event");
+    assert_eq!(event.data["tool"], "task");
+    assert_eq!(event.data["reason"], "task_unknown_agent");
+}
+
+#[test]
+fn grant_rejection_unknown_agent_lists_reachable_agents() {
+    let (driver, _tmp) = test_driver(8);
+
+    let message = grant_rejection(
+        &driver.cwd,
+        &driver.config,
+        "Build",
+        "no-such-agent",
+        &[],
+        &driver.session.db,
+    )
+    .unwrap();
+
+    assert!(
+        message.contains("Error: unknown agent `no-such-agent`"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Reachable agents from `Build`"),
+        "{message}"
+    );
+    assert!(message.contains("builder"), "{message}");
+}
+
+#[tokio::test]
+async fn resolved_cwd_unknown_agent_refuses_before_load() {
+    let (mut driver, tmp) = test_driver(8);
+    let child_dir = tmp.path().join("child");
+    std::fs::create_dir_all(&child_dir).unwrap();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    let task = SingleNoninteractiveTask {
+        child_agent: "only-under-child".to_string(),
+        brief: "look around".to_string(),
+        model: None,
+        remaining_depth: Some(0),
+        why: "test".to_string(),
+        resume_handle: None,
+        child_cwd: ChildCwd {
+            requested: Some("child".to_string()),
+            resolved: child_dir,
+        },
+        granted_tools: Vec::new(),
+        prefill_seeds: Vec::new(),
+        todo_ids: Vec::new(),
+        skill_seed: Vec::new(),
+        child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-resolved-cwd".to_string(),
+        task_function_call_id: Some("fn-task-resolved-cwd".to_string()),
+    };
+
+    let completion = driver
+        .execute_single_noninteractive_task(task, &tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(completion.failed);
+    assert!(
+        completion
+            .report
+            .contains("Error: unknown agent `only-under-child`"),
+        "{}",
+        completion.report
+    );
+    assert!(
+        !completion.report.contains("failed to load"),
+        "{}",
+        completion.report
+    );
+    assert!(
+        completion.report.contains("Reachable agents from `Build`"),
+        "{}",
+        completion.report
+    );
+}
 
 #[test]
 fn interactive_child_load_failure_returns_tool_error_without_pushing_child() {

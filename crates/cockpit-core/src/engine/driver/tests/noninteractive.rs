@@ -1290,7 +1290,7 @@ async fn docs_pipeline_emits_no_routing_amend() {
 }
 
 #[tokio::test]
-async fn spawn_load_failure_emits_no_amend_but_still_reports() {
+async fn unknown_agent_refusal_emits_no_spawn_or_amend_but_still_reports() {
     let (mut driver, _tmp) = test_driver(8);
     seed_task_delegation(&driver, "task-load-failure", "default");
     seed_task_payload(&driver, "task-load-failure", "default", "missing-agent");
@@ -1310,26 +1310,28 @@ async fn spawn_load_failure_emits_no_amend_but_still_reports() {
         .await
         .unwrap();
     assert!(completion.failed);
-    driver
-        .finalize_single_noninteractive_task(completion, &tx, true)
-        .await
-        .unwrap();
+    assert!(
+        completion.report.contains("unknown agent `missing-agent`"),
+        "{}",
+        completion.report
+    );
+    assert!(
+        !completion.report.contains("failed to load"),
+        "{}",
+        completion.report
+    );
 
     let events = drain_turn_events(&mut rx);
-    let spawn_idx = events
-        .iter()
-        .position(|event| matches!(event, TurnEvent::SubagentSpawned { task_call_id, .. } if task_call_id == "task-load-failure"))
-        .expect("spawn event");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::SubagentSpawned { task_call_id, .. } if task_call_id == "task-load-failure"))
+    );
     assert!(
         !events
             .iter()
             .any(|event| matches!(event, TurnEvent::SubagentRouting { task_call_id, .. } if task_call_id == "task-load-failure"))
     );
-    let report_idx = events
-        .iter()
-        .position(|event| matches!(event, TurnEvent::SubagentReport { task_call_id, .. } if task_call_id == "task-load-failure"))
-        .expect("report event");
-    assert!(spawn_idx < report_idx);
 }
 
 #[tokio::test]

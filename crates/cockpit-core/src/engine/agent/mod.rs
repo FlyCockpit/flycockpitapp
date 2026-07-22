@@ -48,6 +48,9 @@ mod text_recovery;
 pub(crate) mod tool_dispatch;
 mod turn_phases;
 
+#[cfg(test)]
+pub(crate) use turn_phases::phase_10_dispatch_one_call;
+
 pub use backup::{
     BackupFallbackDecision, BackupTurnMetadata, FailoverAttempt, MAX_FAILOVER_CANDIDATES,
     suggested_action_for_failure_class, turn_with_backup,

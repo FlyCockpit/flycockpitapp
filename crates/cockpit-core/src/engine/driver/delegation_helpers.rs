@@ -301,13 +301,25 @@ pub(super) fn extract_todo_delta(report: &str) -> Option<serde_json::Value> {
 /// other target the grant is checked against the **same** role invariants a
 /// user-authored `tools:` grant is ([`crate::agents::invariants::validate_grant`]),
 /// resolving the target's own name + mode so the single-writer / spawn-only /
-/// primary-only rules are evaluated for that agent. A resolution failure
-/// (unknown agent) is itself a clear error — the grant is never silently honored.
+/// primary-only rules are evaluated for that agent. A resolution failure is
+/// itself a clear error — the grant is never silently honored.
 pub(super) fn grant_rejection(
     cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    parent_agent: &str,
     child_agent: &str,
     grant: &[String],
+    assistant_db: &crate::db::Db,
 ) -> Option<String> {
+    if let Some(message) = crate::engine::builtin::unknown_agent_rejection(
+        cwd,
+        config,
+        parent_agent,
+        child_agent,
+        assistant_db,
+    ) {
+        return Some(format!("Error: {message}"));
+    }
     if grant.is_empty() {
         return None;
     }
@@ -317,11 +329,15 @@ pub(super) fn grant_rejection(
              internal flow and its tool surface is not extensible."
         ));
     }
-    let (target_name, target_mode) = match crate::agents::resolve(cwd, child_agent) {
+    let (target_name, target_mode) = match crate::agents::resolve_with_assistant_db(
+        cwd,
+        child_agent,
+        assistant_db,
+    ) {
         Ok(Some(def)) => (def.name, def.mode),
         Ok(None) => {
             return Some(format!(
-                "Error: cannot grant tools to unknown agent `{child_agent}`."
+                "Error: cannot grant tools to `{child_agent}` because the agent could not be resolved."
             ));
         }
         Err(e) => {

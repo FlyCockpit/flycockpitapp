@@ -42,6 +42,13 @@ pub(crate) fn phase_07_history_push() {}
 pub(crate) fn phase_08_text_embedded_tool_call_recovery() {}
 pub(crate) fn phase_09_terminal_text_emit() {}
 
+fn record_task_unknown_agent_rejection(session: &Arc<Session>, agent: &Agent, tc: &ToolCall) {
+    if let Err(e) = session.record_tool_rejected(&agent.name, &tc.id, "task", "task_unknown_agent")
+    {
+        tracing::warn!(error = %e, tool = "task", "record tool_rejected event failed");
+    }
+}
+
 pub(crate) async fn phase_10_dispatch_one_call(
     agent: &Agent,
     session: &Arc<Session>,
@@ -221,6 +228,28 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             format!("duplicate batch label `{label}`"),
                         ));
                     }
+                    let cwd = item
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    if cwd.is_none()
+                        && let Some(message) = crate::engine::builtin::unknown_agent_rejection(
+                            &session.project_root,
+                            config,
+                            &agent.name,
+                            child,
+                            &session.db,
+                        )
+                    {
+                        record_task_unknown_agent_rejection(session, agent, tc);
+                        return_structural!(task_refusal(
+                            &tc.id,
+                            tc.call_id.clone(),
+                            format!("batch entry `{label}`: {message}"),
+                        ));
+                    }
                     if !crate::engine::builtin::is_noninteractive(child) {
                         return_structural!(task_refusal(
                             &tc.id,
@@ -259,12 +288,6 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             ));
                         }
                     };
-                    let cwd = item
-                        .get("cwd")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string);
                     let output_dir = item
                         .get("output_dir")
                         .and_then(Value::as_str)
@@ -306,6 +329,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                 let child = args
                     .get("agent")
                     .and_then(Value::as_str)
+                    .map(str::trim)
                     .unwrap_or("builder")
                     .to_string();
                 // Re-queryable-subagent fields (GOALS §3c). Both are present in the
@@ -328,6 +352,18 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
+                if cwd.is_none()
+                    && let Some(message) = crate::engine::builtin::unknown_agent_rejection(
+                        &session.project_root,
+                        config,
+                        &agent.name,
+                        &child,
+                        &session.db,
+                    )
+                {
+                    record_task_unknown_agent_rejection(session, agent, tc);
+                    return_structural!(task_refusal(&tc.id, tc.call_id.clone(), message));
+                }
                 let mode = args.get("mode").and_then(Value::as_str);
                 let model = match crate::engine::model_roles::DelegationModelSelector::from_value(
                     args.get("model"),

@@ -1795,6 +1795,67 @@ fn reachable_subagents(
     out
 }
 
+pub(crate) fn reachable_subagent_names(
+    parent_agent: &str,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    cwd: &Path,
+    assistant_db: &crate::db::Db,
+) -> Vec<String> {
+    match crate::agents::resolve_with_assistant_db(cwd, parent_agent, assistant_db) {
+        Ok(Some(def)) => reachable_subagents(&def, config, cwd),
+        Ok(None) | Err(_) => Vec::new(),
+    }
+}
+
+pub(crate) fn unknown_agent_rejection(
+    cwd: &Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    parent_agent: &str,
+    child_agent: &str,
+    assistant_db: &crate::db::Db,
+) -> Option<String> {
+    unknown_agent_rejection_with_resolver(
+        cwd,
+        config,
+        parent_agent,
+        child_agent,
+        assistant_db,
+        |cwd, child_agent| crate::agents::resolve_with_assistant_db(cwd, child_agent, assistant_db),
+    )
+}
+
+fn unknown_agent_rejection_with_resolver(
+    cwd: &Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    parent_agent: &str,
+    child_agent: &str,
+    assistant_db: &crate::db::Db,
+    resolve: impl FnOnce(&Path, &str) -> Result<Option<crate::agents::AgentDef>>,
+) -> Option<String> {
+    if child_agent == "docs" {
+        return None;
+    }
+    if child_agent != parent_agent && !matches!(child_agent, "docs-resolver" | "docs-answerer") {
+        match resolve(cwd, child_agent) {
+            Ok(Some(_)) => return None,
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+    }
+
+    let reachable = reachable_subagent_names(parent_agent, config, cwd, assistant_db);
+    if reachable.is_empty() {
+        Some(format!(
+            "unknown agent `{child_agent}`, and no subagents are reachable from `{parent_agent}`. Re-issue `task` with a reachable agent name."
+        ))
+    } else {
+        Some(format!(
+            "unknown agent `{child_agent}`. Reachable agents from `{parent_agent}`: {}. Re-issue `task` with one of these names.",
+            reachable.join(", ")
+        ))
+    }
+}
+
 /// The bundled reachable subagent set for `Plan` plus any user-authored
 /// custom subagent (`mode` `subagent`/`all`).
 fn plan_subagents(cwd: &Path) -> Vec<String> {
@@ -2471,6 +2532,10 @@ mod tests {
         test_spawn_args_with_provider_can_delegate(cwd, None)
     }
 
+    fn test_assistant_db() -> crate::db::Db {
+        crate::db::Db::open_in_memory().unwrap()
+    }
+
     fn test_spawn_args_with_provider_can_delegate(
         cwd: &Path,
         can_delegate: Option<bool>,
@@ -3126,6 +3191,139 @@ mod tests {
                 assert!(names.contains(&"lsp"), "`{name}` missing `lsp`: {names:?}");
             }
         }
+    }
+
+    #[test]
+    fn unknown_agent_rejection_lists_bundled_reachable_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let db = test_assistant_db();
+
+        let message =
+            unknown_agent_rejection(tmp.path(), &args.config, "Build", "missing", &db).unwrap();
+
+        assert!(message.contains("unknown agent `missing`"), "{message}");
+        assert!(
+            message.contains("Reachable agents from `Build`"),
+            "{message}"
+        );
+        assert!(message.contains("builder"), "{message}");
+        assert!(message.contains("explore"), "{message}");
+        assert!(message.contains("docs"), "{message}");
+    }
+
+    #[test]
+    fn unknown_agent_rejection_includes_custom_subagents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_dir = tmp.path().join(".cockpit/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("my-reviewer.md"),
+            "---\ndescription: reviewer\nmode: subagent\n---\nbody\n",
+        )
+        .unwrap();
+        let args = test_spawn_args(tmp.path());
+        let db = test_assistant_db();
+
+        let message =
+            unknown_agent_rejection(tmp.path(), &args.config, "Build", "missing", &db).unwrap();
+
+        assert!(message.contains("my-reviewer"), "{message}");
+    }
+
+    #[test]
+    fn unknown_agent_rejection_is_none_for_valid_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_dir = tmp.path().join(".cockpit/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("custom-sub.md"),
+            "---\ndescription: custom\nmode: subagent\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agents_dir.join("custom-primary.md"),
+            "---\ndescription: custom\nmode: primary\n---\nbody\n",
+        )
+        .unwrap();
+        let assistant_home = tmp.path().join("assistant-home");
+        std::fs::create_dir_all(&assistant_home).unwrap();
+        std::fs::write(
+            assistant_home.join("assistant.md"),
+            "---\ndescription: assistant\nmode: primary\n---\nassistant body\n",
+        )
+        .unwrap();
+        let db = test_assistant_db();
+        db.upsert_assistant("helper-bot", assistant_home.to_str().unwrap(), "{}", "hash")
+            .unwrap();
+        let args = test_spawn_args(tmp.path());
+
+        for name in [
+            "builder",
+            "explore",
+            "docs",
+            "custom-sub",
+            "custom-primary",
+            "helper-bot",
+        ] {
+            assert!(
+                unknown_agent_rejection(tmp.path(), &args.config, "Build", name, &db).is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_agent_rejection_refuses_parent_agent_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let db = test_assistant_db();
+
+        let message =
+            unknown_agent_rejection(tmp.path(), &args.config, "Build", "Build", &db).unwrap();
+
+        assert!(message.contains("unknown agent `Build`"), "{message}");
+        assert!(
+            message.contains("Reachable agents from `Build`"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Reachable agents from `Build`: Build"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn unknown_agent_rejection_refuses_docs_pipeline_stages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let db = test_assistant_db();
+
+        for name in ["docs-resolver", "docs-answerer"] {
+            let message = unknown_agent_rejection(tmp.path(), &args.config, "Build", name, &db)
+                .expect("internal docs stages are not task targets");
+            assert!(message.contains(name), "{message}");
+            assert!(message.contains("builder"), "{message}");
+        }
+        assert!(unknown_agent_rejection(tmp.path(), &args.config, "Build", "docs", &db).is_none());
+    }
+
+    #[test]
+    fn unknown_agent_rejection_degrades_with_empty_reachable_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let db = test_assistant_db();
+
+        let message =
+            unknown_agent_rejection(tmp.path(), &args.config, "locked-parent", "missing", &db)
+                .unwrap();
+
+        assert!(message.contains("unknown agent `missing`"), "{message}");
+        assert!(
+            message.contains("no subagents are reachable from `locked-parent`"),
+            "{message}"
+        );
+        assert!(!message.contains("Reachable agents from"), "{message}");
     }
 
     #[test]

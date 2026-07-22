@@ -865,6 +865,22 @@ pub fn find_override(cwd: &Path, name: &str) -> Option<PathBuf> {
 /// (naming its `source`) rather than silently falling back to the
 /// embedded default — that would hide the user's mistake.
 pub fn resolve(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
+    resolve_inner(cwd, name, resolve_assistant_agent)
+}
+
+pub(crate) fn resolve_with_assistant_db(
+    cwd: &Path,
+    name: &str,
+    db: &crate::db::Db,
+) -> Result<Option<AgentDef>> {
+    resolve_inner(cwd, name, |name| resolve_assistant_agent_from_db(db, name))
+}
+
+fn resolve_inner(
+    cwd: &Path,
+    name: &str,
+    resolve_assistant: impl FnOnce(&str) -> Result<Option<AgentDef>>,
+) -> Result<Option<AgentDef>> {
     for dir in agent_search_dirs(cwd) {
         let candidate = agent_path_in(&dir, name);
         if candidate.is_dir() {
@@ -879,13 +895,17 @@ pub fn resolve(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
     if let Some(def) = embedded_default(name) {
         return Ok(Some(def));
     }
-    resolve_assistant_agent(name)
+    resolve_assistant(name)
 }
 
 fn resolve_assistant_agent(name: &str) -> Result<Option<AgentDef>> {
     let Ok(db) = crate::db::Db::open_default() else {
         return Ok(None);
     };
+    resolve_assistant_agent_from_db(&db, name)
+}
+
+fn resolve_assistant_agent_from_db(db: &crate::db::Db, name: &str) -> Result<Option<AgentDef>> {
     let Some(row) = db.get_assistant(name)? else {
         return Ok(None);
     };

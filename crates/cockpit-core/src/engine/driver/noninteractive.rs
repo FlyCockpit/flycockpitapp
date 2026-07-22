@@ -884,7 +884,15 @@ impl Driver {
             NoninteractiveDelegationSnapshot::empty(),
         );
 
-        if let Some(err) = grant_rejection(&child_cwd.resolved, &child_agent, &granted_tools) {
+        let parent_agent = self.stack.last().unwrap().agent.name.clone();
+        if let Some(err) = grant_rejection(
+            &child_cwd.resolved,
+            &self.config,
+            &parent_agent,
+            &child_agent,
+            &granted_tools,
+            &self.session.db,
+        ) {
             return Ok(SingleNoninteractiveCompletion {
                 child_agent,
                 task_call_id,
@@ -2550,7 +2558,7 @@ impl Driver {
                 .routing_metadata_json(None);
             let _ = tx
                 .send(TurnEvent::SubagentSpawned {
-                    parent,
+                    parent: parent.clone(),
                     child: entry.child_agent.clone(),
                     task_call_id: task_call_id.clone(),
                     label: entry.label.clone(),
@@ -2608,8 +2616,14 @@ impl Driver {
             runs.push(async move {
                 let mut snapshot = NoninteractiveDelegationSnapshot::empty();
                 let outcome =
-                    if let Some(err) =
-                        grant_rejection(&child_cwd.resolved, &entry.child_agent, &entry.granted_tools)
+                    if let Some(err) = grant_rejection(
+                        &child_cwd.resolved,
+                        &driver.config,
+                        &parent,
+                        &entry.child_agent,
+                        &entry.granted_tools,
+                        &driver.session.db,
+                    )
                     {
                         DelegationChildOutcome::failed(err)
                     } else if entry.child_agent == "docs" {

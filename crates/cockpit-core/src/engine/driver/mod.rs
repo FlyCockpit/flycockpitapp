@@ -5578,11 +5578,19 @@ impl Driver {
                                 continue;
                             }
                         };
+                    let parent_agent = self.stack.last().unwrap().agent.name.clone();
                     // Per-delegation tool grants (prompt `parent-granted-tools.md`):
                     // validate against the target's role invariants before the
                     // handoff. An invalid grant is rejected as this `task`
                     // call's result — the conversation stays with the parent.
-                    if let Some(err) = grant_rejection(&self.cwd, &child_agent, &granted_tools) {
+                    if let Some(err) = grant_rejection(
+                        &self.cwd,
+                        &self.config,
+                        &parent_agent,
+                        &child_agent,
+                        &granted_tools,
+                        &self.session.db,
+                    ) {
                         next_prompt = Message::tool_result_with_call_id(
                             task_call_id,
                             task_function_call_id,
@@ -5590,7 +5598,6 @@ impl Driver {
                         );
                         continue;
                     }
-                    let parent_agent = self.stack.last().unwrap().agent.name.clone();
                     let task_args_json = serde_json::to_string(&serde_json::json!({
                         "child_agent": &child_agent,
                         "model": model_selector_json(&model),
@@ -5837,6 +5844,22 @@ impl Driver {
                             continue;
                         }
                     };
+                    let parent_agent = self.stack.last().unwrap().agent.name.clone();
+                    if let Some(err) = grant_rejection(
+                        &child_cwd.resolved,
+                        &self.config,
+                        &parent_agent,
+                        &child_agent,
+                        &granted_tools,
+                        &self.session.db,
+                    ) {
+                        next_prompt = Message::tool_result_with_call_id(
+                            task_call_id,
+                            task_function_call_id,
+                            prepend_task_repair_notes(err, &repair_notes),
+                        );
+                        continue;
+                    }
                     next_prompt = self
                         .run_single_noninteractive_task_backgroundable(
                             SingleNoninteractiveTask {
@@ -5893,6 +5916,33 @@ impl Driver {
                         }
                     }
                     if let Some(err) = cwd_error {
+                        next_prompt = Message::tool_result_with_call_id(
+                            task_call_id,
+                            task_function_call_id,
+                            prepend_task_repair_notes(err, &repair_notes),
+                        );
+                        continue;
+                    }
+                    let parent_agent = self.stack.last().unwrap().agent.name.clone();
+                    let mut unknown_agent_error = None;
+                    for (entry, child_cwd) in entries.iter().zip(child_cwds.iter()) {
+                        if let Some(err) = grant_rejection(
+                            &child_cwd.resolved,
+                            &self.config,
+                            &parent_agent,
+                            &entry.child_agent,
+                            &entry.granted_tools,
+                            &self.session.db,
+                        ) {
+                            unknown_agent_error = Some(format!(
+                                "Error: batch entry `{}`: {}",
+                                entry.label,
+                                err.strip_prefix("Error: ").unwrap_or(&err)
+                            ));
+                            break;
+                        }
+                    }
+                    if let Some(err) = unknown_agent_error {
                         next_prompt = Message::tool_result_with_call_id(
                             task_call_id,
                             task_function_call_id,

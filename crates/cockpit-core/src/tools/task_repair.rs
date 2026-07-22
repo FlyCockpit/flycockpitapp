@@ -536,18 +536,6 @@ fn repair_batch_entries(entries: Vec<Value>, notes: &mut Vec<String>) -> Vec<Val
 
 fn validate_delegate(delegate: &Map<String, Value>, path: &str) -> Result<(), TaskArgsRepairError> {
     if delegate
-        .get("agent")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-    {
-        return Err(TaskArgsRepairError::Invalid(format!(
-            "`{path}.agent` is required for task delegate. {}",
-            canonical_example("delegate")
-        )));
-    }
-    if delegate
         .get("prompt")
         .and_then(Value::as_str)
         .map(str::trim)

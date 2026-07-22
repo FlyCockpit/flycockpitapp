@@ -16,7 +16,9 @@
 //!    consults part 1's path-grant store and, if not granted, raises
 //!    part 1's approval prompt **naming the exact path**. This is pure
 //!    path-checking — it works on every platform, Windows included —
-//!    and is independent of the zerobox shell sandbox.
+//!    and is independent of the zerobox shell sandbox. `/sandbox off`
+//!    disables shell confinement, not native path approval: an unconfined
+//!    native file operation outside the boundary still takes grant-or-ask.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -83,9 +85,11 @@ pub fn within_root(canonical_root: &Path, candidate: &Path) -> bool {
 /// non-`Once` grant, persists it. On deny it returns an invalid-input
 /// error the tool surfaces verbatim.
 ///
-/// Skips entirely when the session has sandboxing disabled (the
-/// `/sandbox off` / `--no-sandbox` path) — confinement is off, so every
-/// path is allowed. When no approver is wired (a degraded state such as
+/// This is not governed by `/sandbox off`: that switch controls the
+/// zerobox shell sandbox only. Native file access has no separate user
+/// control; an out-of-boundary native operation is unconfined and therefore
+/// takes grant-or-ask, with path grants avoiding repeated prompts at the
+/// chosen scope. When no approver is wired (a degraded state such as
 /// seed-tool re-execution before the approver exists), already-proven
 /// in-boundary paths continue to work, but unproven or out-of-boundary
 /// paths fail closed because there is no safe prompt path.
@@ -99,10 +103,6 @@ pub async fn check_native_access(
 ) -> Result<PathBuf> {
     let effective = match effective_native_path(path) {
         Ok(path) => path,
-        Err(err) if !ctx.session.sandbox_enabled() => {
-            tracing::debug!(path = %path.display(), reason = %err, "native path could not be canonicalized while sandboxing is disabled");
-            path.to_path_buf()
-        }
         Err(err) => {
             let Some(approver) = ctx.approver.as_ref() else {
                 return Err(invalid_input(format!(
@@ -124,7 +124,7 @@ pub async fn check_native_access(
         }
     };
 
-    if !ctx.session.sandbox_enabled() || within_boundary(ctx, &effective) {
+    if within_boundary(ctx, &effective) {
         return Ok(effective);
     }
 
@@ -470,6 +470,13 @@ mod tests {
     }
 
     fn spawn_cancel_next_path_prompt(ctx: &ToolCtx) -> tokio::task::JoinHandle<()> {
+        spawn_resolve_next_path_prompt(ctx, ResolveResponse::Cancel)
+    }
+
+    fn spawn_resolve_next_path_prompt(
+        ctx: &ToolCtx,
+        response: ResolveResponse,
+    ) -> tokio::task::JoinHandle<()> {
         let db = ctx.session.db.clone();
         let sid = ctx.session.id;
         let hub = ctx.interrupts.clone();
@@ -480,7 +487,7 @@ mod tests {
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(iid, ResolveResponse::Cancel));
+            assert!(hub.resolve(iid, response));
         })
     }
 
@@ -605,6 +612,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_access_symlink_escape_still_rejected_with_sandbox_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        let link = tmp.path().join("link.txt");
+        symlink_file(&secret, &link);
+        let ctx = sandboxed_ctx(tmp.path());
+        ctx.session.set_sandbox_enabled(false);
+
+        let resolver = spawn_cancel_next_path_prompt(&ctx);
+        let err = check_native_access(&ctx, &link, SandboxPathAccess::Read)
+            .await
+            .unwrap_err();
+        resolver.await.unwrap();
+        assert!(
+            err.to_string().contains("outside the session boundary"),
+            "sandbox-off symlink escape must remain approval-gated: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn native_symlink_parent_escape_prompts_for_create_path() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -656,18 +685,160 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_disabled_skips_check() {
+    async fn native_access_parent_traversal_still_rejected_with_sandbox_off() {
         let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut ctx = sandboxed_ctx(tmp.path());
+        ctx.session.set_sandbox_enabled(false);
+        ctx.approver = None;
+        let target = outside.path().join("missing/../secret.txt");
+
+        let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved parent traversal in"),
+            "unresolved parent traversal must remain rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn confine_hard_deny_path_still_never_prompts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let secret = tmp.path().join("outside.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        let link = root.join("escape");
+        symlink_file(&secret, &link);
+
+        let err = confine(&root, "escape").unwrap_err();
+        assert!(
+            err.to_string().contains("outside the package sandbox"),
+            "hard-deny confine path must refuse without an approval seam: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_access_prompts_outside_boundary_with_sandbox_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
         let ctx = sandboxed_ctx(tmp.path());
         ctx.session.set_sandbox_enabled(false);
-        // Sandbox off → every path allowed, even far outside, no prompt.
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "secret").unwrap();
+
+        let resolver = spawn_cancel_next_path_prompt(&ctx);
+        let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
+            .await
+            .unwrap_err();
+        resolver.await.unwrap();
+        assert!(
+            err.to_string()
+                .contains("outside the session boundary and access was denied"),
+            "sandbox-off outside path must be approval-gated: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_access_granted_path_is_silent_with_sandbox_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ctx = sandboxed_ctx(tmp.path());
+        ctx.session.set_sandbox_enabled(false);
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "notes").unwrap();
+        let store = GrantStore::new(
+            ctx.session.db.clone(),
+            ctx.session.id,
+            ctx.cwd.clone(),
+            ctx.config.clone(),
+        );
+        store
+            .record_path(
+                outside.path(),
+                crate::approval::store::Scope::Session,
+                SandboxPathAccess::Read,
+            )
+            .unwrap();
+
+        check_native_access(&ctx, &target, SandboxPathAccess::Read)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_access_unprovable_path_prompts_with_sandbox_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ctx = sandboxed_ctx(tmp.path());
+        ctx.session.set_sandbox_enabled(false);
+        let broken = outside.path().join("broken-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path().join("missing"), &broken).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(outside.path().join("missing"), &broken).unwrap();
+
+        let resolver = spawn_cancel_next_path_prompt(&ctx);
+        let err = check_native_access(&ctx, &broken, SandboxPathAccess::Read)
+            .await
+            .unwrap_err();
+        resolver.await.unwrap();
+        assert!(
+            err.to_string()
+                .contains("outside the session boundary and access was denied"),
+            "sandbox-off unprovable path must prompt instead of passing through raw: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_access_behavior_unchanged_with_sandbox_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ctx = sandboxed_ctx(tmp.path());
+        assert!(ctx.session.sandbox_enabled());
+
         check_native_access(
             &ctx,
-            std::path::Path::new("/etc/shadow"),
+            &tmp.path().join("inside.txt"),
             SandboxPathAccess::Read,
         )
         .await
         .unwrap();
+
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "secret").unwrap();
+        let resolver = spawn_cancel_next_path_prompt(&ctx);
+        let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
+            .await
+            .unwrap_err();
+        resolver.await.unwrap();
+        assert!(
+            err.to_string()
+                .contains("outside the session boundary and access was denied"),
+            "sandbox-on outside behavior should remain approval-gated: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_access_without_approver_denies_in_both_sandbox_states() {
+        for sandbox_enabled in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let mut ctx = sandboxed_ctx(tmp.path());
+            ctx.session.set_sandbox_enabled(sandbox_enabled);
+            ctx.approver = None;
+            let target = outside.path().join("x.txt");
+            std::fs::write(&target, "x").unwrap();
+
+            let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("cannot be approved"),
+                "missing approver must fail closed with sandbox_enabled={sandbox_enabled}: {err}"
+            );
+        }
     }
 
     #[tokio::test]

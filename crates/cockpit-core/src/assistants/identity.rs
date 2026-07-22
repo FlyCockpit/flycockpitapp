@@ -419,7 +419,7 @@ mod tests {
         let redact = Arc::new(
             crate::redact::RedactionTable::build(
                 &crate::config::extended::RedactConfig::default(),
-                project,
+                home,
             )
             .unwrap(),
         );
@@ -430,7 +430,9 @@ mod tests {
                 llm_mode: crate::config::extended::LlmMode::Normal,
                 locks,
                 session: Arc::new(session),
-                cwd: project.to_path_buf(),
+                // Keep identity tests focused on SOUL/USER policy. Native
+                // out-of-boundary approval is covered in tools::sandbox.
+                cwd: home.to_path_buf(),
                 redact,
                 interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
                 cancel: tokio_util::sync::CancellationToken::new(),
@@ -452,7 +454,7 @@ mod tests {
                 lsp: None,
                 resource_scheduler: None,
                 config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
-                    project,
+                    home,
                 ),
                 env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             },

@@ -46,9 +46,8 @@ impl Tool for OutlineTool {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_input("`path` is required"))?;
-        // Native-tool boundary check (sandboxing part 2): the regex
-        // fallback below reads the file off disk, so an out-of-cwd path
-        // must escalate first.
+        // Native-tool boundary check (sandboxing part 2): outline targets a
+        // single file, so one pre-read check gates the only filesystem read.
         crate::tools::sandbox::check_native_access(
             ctx,
             &crate::tools::common::resolve(path_arg, &ctx.cwd),

@@ -78,9 +78,10 @@ impl Tool for SearchTool {
             Some(p) => crate::tools::common::resolve(p, &ctx.cwd),
             None => root.clone(),
         };
-        // Native-tool boundary check (sandboxing part 2): a `path` filter
-        // pointing outside cwd + session tmp must escalate before the
-        // search reads any file contents there.
+        // Native-tool boundary check (sandboxing part 2): one pre-scan check
+        // gates the requested root/file before search reads any contents, so
+        // an out-of-boundary tree stops at the first denial instead of
+        // prompting per file.
         crate::tools::sandbox::check_native_access(
             ctx,
             &search_path,
@@ -298,6 +299,36 @@ fn format_search_records(outcome: &SearchOutcome) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn intel_search_stops_at_first_denied_path() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "needle").unwrap();
+        let ctx = crate::tools::common::test_ctx(project.path());
+
+        let err = SearchTool
+            .call(
+                serde_json::json!({
+                    "pattern": "needle",
+                    "path": outside.path().to_string_lossy(),
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("cannot be approved"),
+            "search must stop at the native-access denial before scanning: {err}"
+        );
+    }
 }
 
 // ---- shared FS helpers -----------------------------------------------------

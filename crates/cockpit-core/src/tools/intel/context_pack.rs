@@ -753,6 +753,8 @@ async fn in_process_text_hits(
     if max_hits == 0 {
         return Ok(Vec::new());
     }
+    // One pre-scan native-access check gates the project root before the
+    // context-pack search walks files; denial stops here, not per file.
     let search_root = crate::tools::sandbox::check_native_access(
         ctx,
         &ctx.session.project_root,

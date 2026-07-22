@@ -37,6 +37,8 @@ pub use boundary::{command_directory_escape, outside_session_boundary};
 use boundary::{dynamic_shell_path, outside_cwd_error};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const MIN_TIMEOUT_MS: u64 = 1_000;
+const MIN_QUEUE_TIMEOUT_MS: u64 = 1_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 pub(crate) const SHELL_WRITE_NATIVE_TOOL_HINT: &str = "Use `writeunlock` to create or rewrite files; shell redirection is for commands whose output you inspect, not files you intend to keep.";
 const UNCONFINED_COMMAND_DENIAL: &str =
@@ -68,7 +70,7 @@ impl Default for BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        let description = "Execute shell command; stdout/stderr/exit display is capped at 8 KB; declare resources for expensive builds/tests; redirect verbose logs to $TMPDIR (120s default timeout)"
+        let description = "Run one shell command. Fresh shell each call: cd/env do NOT persist; use cwd or &&. Prefer read/search/tree over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers, editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources for expensive builds/tests; log verbose output to $TMPDIR."
             .to_string();
 
         // The defensive, explicitly-steering form (`llm-modes-
@@ -84,7 +86,9 @@ impl BashTool {
              file's functions/types without reading it → `outline`. If you are about to pipe \
              `cat`, `rg`, `grep`, `ls`, or `find` through bash, stop and use the tool above \
              instead. Each call is its own shell: `cd`/env changes do NOT persist — chain with \
-             `&&` or set `cwd`. For expensive builds/tests, declare `resources` such as \
+             `&&` or set `cwd`. This is non-interactive: stdin is /dev/null, so pagers, \
+             editors, `-i`, `watch`, `tail -f`, and servers only burn the timeout. \
+             For expensive builds/tests, declare `resources` such as \
              {\"cpu\":1,\"memory\":1}; `queue_timeout_ms` limits scheduler wait only. \
              Display output caps at 8 KB (head+tail kept); redirect verbose \
              build/test logs to a file under the session temp dir (`$TMPDIR`/`$TMP`/`$TEMP`) \
@@ -158,8 +162,8 @@ impl Tool for BashTool {
             "properties": {
                 "command":    { "type": "string", "x-cockpit-aliases": ["cmd", "shell", "script", "commandLine"], "description": "Shell command" },
                 "cwd":        { "type": "string", "description": "Working directory; defaults to session cwd" },
-                "timeout_ms": { "type": "integer", "description": "Hard timeout in ms (max 600000)" },
-                "queue_timeout_ms": { "type": "integer", "description": "Optional timeout in ms while waiting for resource scheduler permits" },
+                "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Hard timeout in ms; defaults to 120000, min 1000, max 600000" },
+                "queue_timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_QUEUE_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Optional timeout in ms while waiting for resource scheduler permits" },
                 "resources": resources_schema("Optional resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1}")
             },
             "required": ["command"]
@@ -173,8 +177,8 @@ impl Tool for BashTool {
             "properties": {
                 "command":    { "type": "string", "x-cockpit-aliases": ["cmd", "shell", "script", "commandLine"], "description": "The shell command line to run. May be a pipeline; chain dependent steps with `&&` since each call is a fresh shell with no carried-over state" },
                 "cwd":        { "type": "string", "description": "Directory to run the command in; defaults to the session working directory. Use this instead of a leading `cd`, which does not persist to later calls" },
-                "timeout_ms": { "type": "integer", "description": "Hard wall-clock timeout in milliseconds after the command starts before it is killed; defaults to 120000, maximum 600000. Raise it for long builds/test runs" },
-                "queue_timeout_ms": { "type": "integer", "description": "Optional milliseconds to wait for declared resource permits before giving up; this is separate from process runtime timeout" },
+                "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Hard wall-clock timeout in milliseconds after the command starts before it is killed; defaults to 120000, minimum 1000, maximum 600000. Raise it for long builds/test runs" },
+                "queue_timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_QUEUE_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Optional milliseconds to wait for declared resource permits before giving up; this is separate from process runtime timeout" },
                 "resources": resources_schema("Declare resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1} for builds, tests, or other CPU/RAM-heavy work")
             },
             "required": ["command"]
@@ -221,6 +225,79 @@ struct BashRunOptions {
     force_unconfined: bool,
     escalated: bool,
     approval_scope_recorded: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BashTimeouts {
+    timeout_ms: u64,
+    queue_timeout_ms: Option<u64>,
+    notes: Vec<String>,
+}
+
+impl BashTimeouts {
+    fn note_text(&self) -> Option<String> {
+        if self.notes.is_empty() {
+            None
+        } else {
+            Some(self.notes.join("\n"))
+        }
+    }
+}
+
+fn normalize_bash_timeouts(args: &Value) -> BashTimeouts {
+    let mut notes = Vec::new();
+    let timeout_ms = match args.get("timeout_ms").and_then(Value::as_u64) {
+        None => DEFAULT_TIMEOUT_MS,
+        Some(0) => {
+            notes.push(format!(
+                "note: timeout_ms=0 is not a valid timeout; ran with the {DEFAULT_TIMEOUT_MS} ms default"
+            ));
+            DEFAULT_TIMEOUT_MS
+        }
+        Some(value) if value < MIN_TIMEOUT_MS => {
+            notes.push(format!(
+                "note: timeout_ms={value} was raised to the {MIN_TIMEOUT_MS} ms minimum"
+            ));
+            MIN_TIMEOUT_MS
+        }
+        Some(value) if value > MAX_TIMEOUT_MS => {
+            notes.push(format!(
+                "note: timeout_ms={value} was lowered to the {MAX_TIMEOUT_MS} ms maximum"
+            ));
+            MAX_TIMEOUT_MS
+        }
+        Some(value) => value,
+    };
+
+    let queue_timeout_ms = match args.get("queue_timeout_ms").and_then(Value::as_u64) {
+        None => None,
+        Some(0) => {
+            notes.push(
+                "note: queue_timeout_ms=0 is not a valid wait; ran with no scheduler wait limit"
+                    .to_string(),
+            );
+            None
+        }
+        Some(value) if value < MIN_QUEUE_TIMEOUT_MS => {
+            notes.push(format!(
+                "note: queue_timeout_ms={value} was raised to the {MIN_QUEUE_TIMEOUT_MS} ms minimum"
+            ));
+            Some(MIN_QUEUE_TIMEOUT_MS)
+        }
+        Some(value) if value > MAX_TIMEOUT_MS => {
+            notes.push(format!(
+                "note: queue_timeout_ms={value} was lowered to the {MAX_TIMEOUT_MS} ms maximum"
+            ));
+            Some(MAX_TIMEOUT_MS)
+        }
+        Some(value) => Some(value),
+    };
+
+    BashTimeouts {
+        timeout_ms,
+        queue_timeout_ms,
+        notes,
+    }
 }
 
 pub(crate) async fn rerun_escalated_bash(
@@ -275,12 +352,11 @@ async fn call_bash_inner(
         .and_then(Value::as_str)
         .map(|s| crate::tools::common::resolve(s, &ctx.cwd))
         .unwrap_or_else(|| ctx.cwd.clone());
-    let timeout_ms = args
-        .get("timeout_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_TIMEOUT_MS)
-        .min(MAX_TIMEOUT_MS);
-    let queue_timeout_ms = args.get("queue_timeout_ms").and_then(Value::as_u64);
+    let timeouts = normalize_bash_timeouts(&args);
+    let timeout_ms = timeouts.timeout_ms;
+    let queue_timeout_ms = timeouts.queue_timeout_ms;
+    let timeout_note = timeouts.note_text();
+    let timeout_note = timeout_note.as_deref();
     let declared_resources = parse_resource_requirements(args.get("resources"))?;
 
     if let Some(outside) =
@@ -395,6 +471,7 @@ async fn call_bash_inner(
             &command_resource_plan,
             &resource_plan,
             ctx,
+            timeout_note,
         )
         .await;
     }
@@ -518,7 +595,7 @@ async fn call_bash_inner(
     }
 
     let (resource_meta, _resource_lease) =
-        match acquire_resource_lease(ctx, &resource_plan, &meta).await {
+        match acquire_resource_lease(ctx, &resource_plan, &meta, timeout_note).await {
             Ok(acquired) => acquired,
             Err(output) => return Ok(output),
         };
@@ -546,11 +623,12 @@ async fn call_bash_inner(
             .with_bash_meta(meta, &resource_meta));
         }
         RunOutcome::TimedOut => {
-            return Ok(ToolOutput::truncated_text(format!(
-                "Error: timeout after {timeout_ms} ms{}",
+            return Ok(ToolOutput::truncated_text(timeout_error_message(
+                timeout_ms,
                 crate::tools::command_resource_profiles::resource_profile_context(
-                    &command_resource_plan
-                )
+                    &command_resource_plan,
+                ),
+                timeout_note,
             ))
             .with_bash_meta(meta, &resource_meta));
         }
@@ -627,11 +705,12 @@ async fn call_bash_inner(
                     .with_bash_meta(meta, &resource_meta));
                 }
                 RunOutcome::TimedOut => {
-                    return Ok(ToolOutput::truncated_text(format!(
-                        "Error: timeout after {timeout_ms} ms{}",
+                    return Ok(ToolOutput::truncated_text(timeout_error_message(
+                        timeout_ms,
                         crate::tools::command_resource_profiles::resource_profile_context(
-                            &command_resource_plan
-                        )
+                            &command_resource_plan,
+                        ),
+                        timeout_note,
                     ))
                     .with_bash_meta(meta, &resource_meta));
                 }
@@ -717,12 +796,15 @@ async fn call_bash_inner(
     // never the sandbox metadata (which rides out-of-band for the event).
     let body = render_output(
         &final_outcome,
-        windows_notice,
         compress,
         command,
         &cwd,
-        tip,
-        native_write_hint,
+        BashOutputAnnotations {
+            notice: windows_notice,
+            tip,
+            native_write_hint,
+            timeout_note,
+        },
     );
     // Structured exit code for the `tool_call` event (export-audit
     // fidelity): authoritative source, distinct from the `exit: N` text the
@@ -1390,14 +1472,20 @@ fn set_bash_test_overrides(
 /// search command it just ran (`defensive-tool-routing-behavioral-
 /// nudge.md`). `None` in normal mode, for a non-file/search command, or once
 /// the model has adopted the tool (self-suppression).
+#[derive(Clone, Copy, Default)]
+struct BashOutputAnnotations<'a> {
+    notice: Option<&'a str>,
+    tip: Option<crate::tools::shell_compress::BashTip>,
+    native_write_hint: Option<&'a str>,
+    timeout_note: Option<&'a str>,
+}
+
 fn render_output(
     o: &ShellOutcome,
-    notice: Option<&str>,
     compress: bool,
     command: &str,
     cwd: &Path,
-    tip: Option<crate::tools::shell_compress::BashTip>,
-    native_write_hint: Option<&str>,
+    annotations: BashOutputAnnotations<'_>,
 ) -> String {
     let stdout_raw = String::from_utf8_lossy(&o.stdout);
     let stderr_raw = String::from_utf8_lossy(&o.stderr);
@@ -1433,18 +1521,42 @@ fn render_output(
     }
     // Defensive-mode routing nudge: after the `exit:` line, outside the
     // compression filter, so it always survives and reads as metadata.
-    if let Some(tip) = tip {
+    if let Some(tip) = annotations.tip {
         body.push_str(tip.line());
         body.push('\n');
     }
-    if let Some(hint) = native_write_hint {
+    if let Some(hint) = annotations.native_write_hint {
         body.push_str("--- hint(shell_write_native_tool): ");
         body.push_str(hint);
         body.push('\n');
     }
-    match notice {
+    if let Some(note) = annotations.timeout_note {
+        body.push_str(note);
+        body.push('\n');
+    }
+    match annotations.notice {
         Some(n) => format!("{n}\n{body}"),
         None => body,
+    }
+}
+
+fn timeout_error_message(
+    timeout_ms: u64,
+    resource_context: String,
+    timeout_note: Option<&str>,
+) -> String {
+    let mut message = format!("Error: timeout after {timeout_ms} ms{resource_context}");
+    append_timeout_note(&mut message, timeout_note);
+    message
+}
+
+fn append_timeout_note(message: &mut String, timeout_note: Option<&str>) {
+    if let Some(note) = timeout_note {
+        if !message.ends_with('\n') {
+            message.push('\n');
+        }
+        message.push_str(note);
+        message.push('\n');
     }
 }
 
@@ -1589,6 +1701,7 @@ async fn acquire_resource_lease(
     ctx: &ToolCtx,
     plan: &ResourcePlan,
     sandbox: &crate::engine::tool::SandboxMeta,
+    timeout_note: Option<&str>,
 ) -> std::result::Result<(Option<ResourceMeta>, Option<ResourceLeaseGuard>), ToolOutput> {
     if !plan.enabled || plan.effective.is_empty() {
         return Ok((None, None));
@@ -1682,10 +1795,10 @@ async fn acquire_resource_lease(
                 meta.error = Some(format!(
                     "resource scheduler queue timeout after {timeout_ms} ms"
                 ));
-                return Err(ToolOutput::text(format!(
-                    "Error: resource scheduler queue timeout after {timeout_ms} ms"
-                ))
-                .with_bash_meta(sandbox.clone(), &Some(meta)));
+                let mut message =
+                    format!("Error: resource scheduler queue timeout after {timeout_ms} ms");
+                append_timeout_note(&mut message, timeout_note);
+                return Err(ToolOutput::text(message).with_bash_meta(sandbox.clone(), &Some(meta)));
             }
         }
     } else {
@@ -1924,6 +2037,7 @@ async fn run_container_bash(
     command_resource_plan: &crate::tools::command_resource_profiles::CommandResourcePlan,
     resource_plan: &ResourcePlan,
     ctx: &ToolCtx,
+    timeout_note: Option<&str>,
 ) -> Result<ToolOutput> {
     let mode = ctx.session.sandbox_mode();
     let mut meta = crate::engine::tool::SandboxMeta {
@@ -1936,7 +2050,7 @@ async fn run_container_bash(
         resource_profiles: command_resource_plan.metas.clone(),
     };
     let (resource_meta, _resource_lease) =
-        match acquire_resource_lease(ctx, resource_plan, &meta).await {
+        match acquire_resource_lease(ctx, resource_plan, &meta, timeout_note).await {
             Ok(acquired) => acquired,
             Err(output) => return Ok(output),
         };
@@ -1960,11 +2074,12 @@ async fn run_container_bash(
             .with_bash_meta(meta, &resource_meta));
         }
         RunOutcome::TimedOut => {
-            return Ok(ToolOutput::truncated_text(format!(
-                "Error: timeout after {timeout_ms} ms{}",
+            return Ok(ToolOutput::truncated_text(timeout_error_message(
+                timeout_ms,
                 crate::tools::command_resource_profiles::resource_profile_context(
-                    command_resource_plan
-                )
+                    command_resource_plan,
+                ),
+                timeout_note,
             ))
             .with_bash_meta(meta, &resource_meta));
         }
@@ -1992,10 +2107,10 @@ async fn run_container_bash(
         display_command,
         cwd,
         final_outcome,
-        None,
         ctx,
         meta,
         &resource_meta,
+        timeout_note,
     ))
 }
 
@@ -2076,10 +2191,10 @@ fn render_bash_outcome(
     command: &str,
     cwd: &std::path::Path,
     final_outcome: ShellOutcome,
-    windows_notice: Option<&'static str>,
     ctx: &ToolCtx,
     meta: crate::engine::tool::SandboxMeta,
     resource_meta: &Option<ResourceMeta>,
+    timeout_note: Option<&str>,
 ) -> ToolOutput {
     let compress = ctx.session.shell_compression_enabled();
     let tip = if matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive) {
@@ -2091,12 +2206,15 @@ fn render_bash_outcome(
     let native_write_hint = durable_shell_write_hint(command);
     let body = render_output(
         &final_outcome,
-        windows_notice,
         compress,
         command,
         cwd,
-        tip,
-        native_write_hint,
+        BashOutputAnnotations {
+            notice: None,
+            tip,
+            native_write_hint,
+            timeout_note,
+        },
     );
     let exit_field = if final_outcome.signaled {
         None
@@ -2397,6 +2515,9 @@ fn scrub_overrides(
 /// (sandboxing part 2).
 #[cfg(test)]
 mod sandbox_escalation_signal_tests;
+
+#[cfg(test)]
+mod schema_tests;
 
 /// Windows-only: the shell-sandbox notice fires at most once per process
 /// and only when the session wanted sandboxing on (sandboxing part 2).

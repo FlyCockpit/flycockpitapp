@@ -44,12 +44,10 @@ fn sandbox_failure_without_trusted_signal_keeps_actionable_result() {
     let outcome = failed(b"touch: cannot touch '/outside': Read-only file system\n");
     let body = render_output(
         &outcome,
-        None,
         false,
         "touch /outside",
         tmp.path(),
-        None,
-        None,
+        BashOutputAnnotations::default(),
     );
 
     assert!(confined_failure_escalation_offer(&outcome).is_none());

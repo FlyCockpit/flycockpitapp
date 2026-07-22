@@ -446,6 +446,14 @@ fn shell_out(stdout: &str, stderr: &str, exit: i32) -> ShellOutcome {
     }
 }
 
+fn note_count(content: &str, field: &str) -> usize {
+    let prefix = format!("note: {field}");
+    content
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+        .count()
+}
+
 fn grant_command(ctx: &ToolCtx, command: &str, scope: Scope) {
     let approver = ctx.approver.as_ref().unwrap();
     let classification = crate::approval::classify::classify(command);
@@ -708,12 +716,12 @@ async fn bash_cancel_while_queued_removes_scheduler_request() {
 async fn bash_runtime_timeout_starts_after_resource_acquire() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_scheduler(tmp.path(), scheduler(1, 1));
-    grant_command(&ctx, "sleep 1", Scope::Session);
+    grant_command(&ctx, "sleep 2", Scope::Session);
     let out = BashTool::new()
         .call(
             serde_json::json!({
-                "command": "sleep 1",
-                "timeout_ms": 1,
+                "command": "sleep 2",
+                "timeout_ms": 1000,
                 "queue_timeout_ms": 1000,
                 "resources": { "cpu": 1, "memory": 1 }
             }),
@@ -721,10 +729,132 @@ async fn bash_runtime_timeout_starts_after_resource_acquire() {
         )
         .await
         .unwrap();
-    assert!(out.content.contains("timeout after 1 ms"));
+    assert!(out.content.contains("timeout after 1000 ms"));
     let meta = out.resource.unwrap();
     assert!(meta.acquired);
     assert!(meta.wait_ms.is_some());
+}
+
+#[tokio::test]
+async fn bash_timeout_ms_zero_runs_with_default_and_reports_the_substitution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok");
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": "printf ok", "timeout_ms": 0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("ok"), "{}", out.content);
+    assert!(
+        !out.content.contains("timeout after 0 ms"),
+        "{}",
+        out.content
+    );
+    assert_eq!(note_count(&out.content, "timeout_ms"), 1, "{}", out.content);
+    assert!(out.content.contains("120000 ms default"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn bash_timeout_ms_below_floor_is_raised_and_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok");
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": "printf ok", "timeout_ms": 250 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("ok"), "{}", out.content);
+    assert_eq!(note_count(&out.content, "timeout_ms"), 1, "{}", out.content);
+    assert!(
+        out.content.contains("raised to the 1000 ms minimum"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn bash_timeout_ms_above_max_is_lowered_and_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok");
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": "printf ok", "timeout_ms": 900000 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("ok"), "{}", out.content);
+    assert_eq!(note_count(&out.content, "timeout_ms"), 1, "{}", out.content);
+    assert!(
+        out.content.contains("lowered to the 600000 ms maximum"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn bash_queue_timeout_ms_zero_is_ignored_and_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok");
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": "printf ok", "queue_timeout_ms": 0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("ok"), "{}", out.content);
+    assert!(
+        !out.content
+            .contains("resource scheduler queue timeout after 0 ms"),
+        "{}",
+        out.content
+    );
+    assert_eq!(
+        note_count(&out.content, "queue_timeout_ms"),
+        1,
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("no scheduler wait limit"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn bash_timeout_ms_valid_and_absent_emit_no_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok");
+    let tool = BashTool::new();
+
+    let absent = tool
+        .call(serde_json::json!({ "command": "printf ok" }), &ctx)
+        .await
+        .unwrap();
+    assert!(!absent.content.contains("note:"), "{}", absent.content);
+
+    let valid = tool
+        .call(
+            serde_json::json!({
+                "command": "printf ok",
+                "timeout_ms": 1000,
+                "queue_timeout_ms": 1000
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(!valid.content.contains("note:"), "{}", valid.content);
 }
 
 async fn resolve_next_interrupt(
@@ -2029,6 +2159,41 @@ async fn normal_cat_appends_no_tip() {
 }
 
 #[tokio::test]
+async fn normal_pipeline_with_cat_appends_no_tip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let command = "printf hi | cat";
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command);
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("bash call returns");
+    assert!(out.content.contains("hi"), "{}", out.content);
+    assert!(
+        !out.content.contains("tip:"),
+        "normal mode must append no tip for pipelines, got: {}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn defensive_pipeline_with_cat_appends_read_tip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let command = "printf hi | cat";
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command);
+    ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("bash call returns");
+    assert!(out.content.contains("hi"), "{}", out.content);
+    assert!(
+        out.content.contains("tip: use `read <file>`"),
+        "defensive pipeline must append the read tip, got: {}",
+        out.content
+    );
+}
+
+#[tokio::test]
 async fn durable_shell_write_appends_writeunlock_hint() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf hello > durable.txt");
@@ -2144,12 +2309,10 @@ fn missing_binary_diagnostic_names_cockpit_environment() {
     };
     let body = render_output(
         &outcome,
-        None,
         false,
         "npm run build",
         Path::new("/repo"),
-        None,
-        None,
+        BashOutputAnnotations::default(),
     );
     assert!(body.contains("stderr:\nsh: 1: npm: not found\n"));
     assert!(body.contains("exit: 127\n"));
@@ -2202,12 +2365,10 @@ fn nonzero_command_diagnostic_includes_attempted_command_and_cwd() {
     };
     let body = render_output(
         &outcome,
-        None,
         false,
         "cargo test",
         Path::new("/repo"),
-        None,
-        None,
+        BashOutputAnnotations::default(),
     );
     assert!(body.contains("exit: 2\n"));
     assert!(body.contains("cockpit_command_environment:"));

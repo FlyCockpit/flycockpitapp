@@ -2087,13 +2087,16 @@ mod llm_mode_tests {
     /// TERSE-MODE BUDGET GUARD: rendered in `Normal` and `Frontier`, every
     /// built-in tool's description stays terse (the token-economy budget the
     /// CI check enforces). Defensive growth is the intended tradeoff and is
-    /// exempt. One sentence ≈ under ~200 chars is the terse bar.
+    /// exempt. One sentence ≈ under ~200 chars is the terse bar; `bash` gets
+    /// a larger budget because it is high-frequency and must steer models
+    /// away from routing around the dedicated file/search tools.
     #[test]
     fn terse_mode_descriptions_stay_within_budget() {
         for tool in all_builtin_tools() {
             for mode in [LlmMode::Normal, LlmMode::Frontier] {
                 let def = definition_of(&*tool, mode, None);
                 let budget = match tool.name() {
+                    "bash" => 400,
                     "schedule" => 280,
                     "writeunlock" => 240,
                     _ => 200,

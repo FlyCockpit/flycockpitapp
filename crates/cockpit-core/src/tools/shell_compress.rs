@@ -448,20 +448,45 @@ pub fn tip_adopted_by(tool: &str) -> Option<BashTip> {
     }
 }
 
-/// Classify a `bash` command line for the defensive-mode routing nudge: resolve
-/// the first real program (skipping `VAR=val` prefixes, basename-normalized)
-/// and map a file/search command to the dedicated tool that replaces it.
-/// Classifies off the FIRST program only — a pipeline (`cat x | grep y`)
-/// resolves on its head (`cat` → [`BashTip::Read`]); good enough, no pipeline
-/// parsing. Returns `None` for any command with no dedicated-tool replacement.
+/// Classify a `bash` command line for the defensive-mode routing nudge. The
+/// parsed simple commands are checked left-to-right, so a later pipeline or
+/// connective segment can still steer to a dedicated tool. Empty/unparseable
+/// commands fall back to the older first-program heuristic.
 pub fn classify_tip(command: &str) -> Option<BashTip> {
+    let classification = crate::approval::classify::classify(command);
+    let simple_commands = classification.simple_commands();
+    if !simple_commands.is_empty() {
+        return simple_commands.iter().find_map(tip_for_simple_command);
+    }
+
     let prog = first_program(command)?;
-    Some(match prog.as_str() {
-        "cat" | "head" | "tail" | "less" | "more" => BashTip::Read,
-        "grep" | "rg" | "egrep" => BashTip::Search,
-        "find" | "ls" => BashTip::Tree,
-        _ => return None,
-    })
+    tip_for_program(&prog)
+}
+
+fn tip_for_simple_command(info: &crate::approval::classify::SimpleCommandInfo) -> Option<BashTip> {
+    tip_for_program(&info.normalized_program).or_else(|| tip_for_wrapper_target(info))
+}
+
+fn tip_for_wrapper_target(info: &crate::approval::classify::SimpleCommandInfo) -> Option<BashTip> {
+    if !info.wrapper {
+        return None;
+    }
+    info.args
+        .iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .filter(|arg| arg.split_once('=').is_none_or(|(name, _)| !is_envish(name)))
+        .find_map(|arg| tip_for_program(arg))
+}
+
+fn tip_for_program(program: &str) -> Option<BashTip> {
+    Some(
+        match program.rsplit(['/', '\\']).next().unwrap_or(program) {
+            "cat" | "head" | "tail" | "less" | "more" => BashTip::Read,
+            "grep" | "rg" | "egrep" => BashTip::Search,
+            "find" | "ls" => BashTip::Tree,
+            _ => return None,
+        },
+    )
 }
 
 /// Whether a token's pre-`=` part looks like a shell env-var name
@@ -1234,6 +1259,21 @@ LastError: boom";
     fn classify_tip_pipeline_classifies_on_head() {
         // A pipeline resolves on its first program only.
         assert_eq!(classify_tip("cat x | grep y"), Some(BashTip::Read));
+    }
+
+    #[test]
+    fn classify_tip_classifies_every_simple_command_in_the_pipeline() {
+        assert_eq!(classify_tip("git log | cat"), Some(BashTip::Read));
+        assert_eq!(
+            classify_tip("git status | rg modified"),
+            Some(BashTip::Search)
+        );
+    }
+
+    #[test]
+    fn classify_tip_classifies_across_connectives_and_wrappers() {
+        assert_eq!(classify_tip("cd x && find ."), Some(BashTip::Tree));
+        assert_eq!(classify_tip("sudo grep x f"), Some(BashTip::Search));
     }
 
     #[test]

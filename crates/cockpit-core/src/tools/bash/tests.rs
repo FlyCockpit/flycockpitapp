@@ -100,15 +100,14 @@ fn resources_schema_is_closed_and_matches_scheduler_permits() {
 #[tokio::test]
 async fn cancel_kills_process_group_promptly() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
-    let tool = BashTool::new();
-
     // A descendant subshell touches a heartbeat file every 100ms. If the
     // process group is killed, the heartbeat stops; if only the immediate
     // `sh -c` died, the descendant would keep updating it.
     let heartbeat = tmp.path().join("heartbeat");
     let hb = heartbeat.to_string_lossy().to_string();
     let command = format!("( while true; do touch '{hb}'; sleep 0.1; done ) & sleep 30",);
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command);
+    let tool = BashTool::new();
 
     let cancel = ctx.cancel.clone();
     // Fire the cancel shortly after the command starts.
@@ -236,10 +235,6 @@ async fn kill_child_sends_sigkill_after_grace_when_sigterm_ignored() {
 #[tokio::test]
 async fn compression_enabled_strips_noise_keeps_signal_and_exit() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
-    ctx.session
-        .set_shell_compression(crate::config::extended::ShellCompression::Enabled);
-    let tool = BashTool::new();
     // Emit cargo-shaped output then exit non-zero. The command line starts
     // with `cargo` so the per-command (rust) strategy is recognized.
     let script = "printf '%s\\n' \
@@ -248,11 +243,13 @@ async fn compression_enabled_strips_noise_keeps_signal_and_exit() {
             'warning: unused variable: x' \
             'error[E0382]: borrow of moved value' \
             '   Finished dev in 2.3s'; exit 2";
+    let command = format!("cargo build; {script}");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command);
+    ctx.session
+        .set_shell_compression(crate::config::extended::ShellCompression::Enabled);
+    let tool = BashTool::new();
     let out = tool
-        .call(
-            serde_json::json!({ "command": format!("cargo build; {script}") }),
-            &ctx,
-        )
+        .call(serde_json::json!({ "command": command }), &ctx)
         .await
         .expect("bash call returns");
     let compressed_output = out
@@ -285,21 +282,19 @@ async fn compression_enabled_strips_noise_keeps_signal_and_exit() {
 #[tokio::test]
 async fn compression_disabled_returns_verbatim() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
-    ctx.session
-        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
-    let tool = BashTool::new();
     let script = "printf '%s\\n' \
             '   Compiling foo v0.1.0' \
             '   Compiling bar v0.2.0' \
             'warning: unused variable: x' \
             'error[E0382]: borrow of moved value' \
             '   Finished dev in 2.3s'";
+    let command = format!("cargo build; {script}");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command);
+    ctx.session
+        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
+    let tool = BashTool::new();
     let out = tool
-        .call(
-            serde_json::json!({ "command": format!("cargo build; {script}") }),
-            &ctx,
-        )
+        .call(serde_json::json!({ "command": command }), &ctx)
         .await
         .expect("bash call returns");
     // Verbatim: even the progress noise is present unchanged.
@@ -317,7 +312,7 @@ async fn compression_toggle_changes_output() {
     let tmp = tempfile::tempdir().unwrap();
     let cmd = "cargo build; printf '   Compiling foo v0.1.0\\ndone\\n'";
 
-    let ctx_on = crate::tools::common::test_ctx(tmp.path());
+    let ctx_on = sandbox_off_ctx_with_grant(tmp.path(), cmd);
     ctx_on
         .session
         .set_shell_compression(crate::config::extended::ShellCompression::Enabled);
@@ -326,7 +321,7 @@ async fn compression_toggle_changes_output() {
         .await
         .unwrap();
 
-    let ctx_off = crate::tools::common::test_ctx(tmp.path());
+    let ctx_off = sandbox_off_ctx_with_grant(tmp.path(), cmd);
     ctx_off
         .session
         .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
@@ -354,7 +349,7 @@ async fn compression_toggle_changes_output() {
 #[tokio::test]
 async fn normal_command_completes() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf hello");
     let tool = BashTool::new();
     let out = tool
         .call(serde_json::json!({ "command": "printf hello" }), &ctx)
@@ -372,7 +367,7 @@ async fn normal_command_completes() {
 #[tokio::test]
 async fn nonzero_exit_sets_structured_exit_code() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "exit 3");
     let tool = BashTool::new();
     let out = tool
         .call(serde_json::json!({ "command": "exit 3" }), &ctx)
@@ -441,7 +436,6 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
     }
 }
 
-#[cfg(not(windows))]
 fn shell_out(stdout: &str, stderr: &str, exit: i32) -> ShellOutcome {
     ShellOutcome {
         stdout: stdout.as_bytes().to_vec(),
@@ -461,6 +455,13 @@ fn grant_command(ctx: &ToolCtx, command: &str, scope: Scope) {
             .record_command(info, info.risk.tier, scope)
             .unwrap();
     }
+}
+
+fn sandbox_off_ctx_with_grant(cwd: &std::path::Path, command: &str) -> ToolCtx {
+    let ctx = ctx_with_store(cwd);
+    ctx.session.set_sandbox_enabled(false);
+    grant_command(&ctx, command, Scope::Session);
+    ctx
 }
 
 fn scheduler(cpu: u32, memory: u32) -> Arc<crate::engine::resource_scheduler::ResourceScheduler> {
@@ -536,7 +537,8 @@ fn ctx_with_scheduler(
     cwd: &std::path::Path,
     scheduler: Arc<crate::engine::resource_scheduler::ResourceScheduler>,
 ) -> ToolCtx {
-    let mut ctx = crate::tools::common::test_ctx(cwd);
+    let mut ctx = ctx_with_store(cwd);
+    ctx.session.set_sandbox_enabled(false);
     ctx.resource_scheduler = Some(scheduler);
     ctx
 }
@@ -603,7 +605,7 @@ fn resource_policy_structured_fields_are_conjunctive() {
 #[tokio::test]
 async fn bash_without_effective_resources_bypasses_scheduler() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok");
     let out = BashTool::new()
         .call(serde_json::json!({ "command": "printf ok" }), &ctx)
         .await
@@ -616,6 +618,7 @@ async fn bash_without_effective_resources_bypasses_scheduler() {
 async fn bash_resource_over_capacity_returns_model_error() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_scheduler(tmp.path(), scheduler(1, 1));
+    grant_command(&ctx, "printf nope", Scope::Session);
     let out = BashTool::new()
         .call(
             serde_json::json!({
@@ -650,6 +653,7 @@ async fn bash_queue_timeout_cancels_wait_without_spawning() {
         .await
         .unwrap();
     let ctx = ctx_with_scheduler(tmp.path(), scheduler.clone());
+    grant_command(&ctx, "touch should-not-exist", Scope::Session);
     let out = BashTool::new()
         .call(
             serde_json::json!({
@@ -684,6 +688,7 @@ async fn bash_cancel_while_queued_removes_scheduler_request() {
         .await
         .unwrap();
     let ctx = ctx_with_scheduler(tmp.path(), scheduler.clone());
+    grant_command(&ctx, "printf nope", Scope::Session);
     ctx.cancel.cancel();
     let out = BashTool::new()
         .call(
@@ -703,6 +708,7 @@ async fn bash_cancel_while_queued_removes_scheduler_request() {
 async fn bash_runtime_timeout_starts_after_resource_acquire() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_scheduler(tmp.path(), scheduler(1, 1));
+    grant_command(&ctx, "sleep 1", Scope::Session);
     let out = BashTool::new()
         .call(
             serde_json::json!({
@@ -728,6 +734,25 @@ async fn resolve_next_interrupt(
     selected_id: &'static str,
     exclude: Option<uuid::Uuid>,
 ) -> uuid::Uuid {
+    resolve_next_interrupt_with_response(
+        db,
+        sid,
+        hub,
+        ResolveResponse::Single {
+            selected_id: selected_id.into(),
+        },
+        exclude,
+    )
+    .await
+}
+
+async fn resolve_next_interrupt_with_response(
+    db: crate::db::Db,
+    sid: uuid::Uuid,
+    hub: Arc<crate::engine::interrupt::InterruptHub>,
+    response: ResolveResponse,
+    exclude: Option<uuid::Uuid>,
+) -> uuid::Uuid {
     let iid = loop {
         let open = db.list_open_interrupts(sid).unwrap();
         if let Some(row) = open.iter().find(|row| Some(row.interrupt_id) != exclude) {
@@ -735,12 +760,7 @@ async fn resolve_next_interrupt(
         }
         tokio::task::yield_now().await;
     };
-    assert!(hub.resolve(
-        iid,
-        ResolveResponse::Single {
-            selected_id: selected_id.into(),
-        }
-    ));
+    assert!(hub.resolve(iid, response));
     iid
 }
 
@@ -771,15 +791,14 @@ async fn bash_child_receives_session_env_overlay() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     ctx.session.set_sandbox_enabled(false);
+    let command = "printf '%s' \"$COCKPIT_REFRESH_TEST_VALUE\"";
+    grant_command(&ctx, command, Scope::Session);
     ctx.env_overlay.write().unwrap().insert(
         "COCKPIT_REFRESH_TEST_VALUE".to_string(),
         "sk-session".to_string(),
     );
     let out = BashTool::new()
-        .call(
-            serde_json::json!({ "command": "printf '%s' \"$COCKPIT_REFRESH_TEST_VALUE\"" }),
-            &ctx,
-        )
+        .call(serde_json::json!({ "command": command }), &ctx)
         .await
         .expect("bash call returns");
     assert!(out.content.contains("sk-session"));
@@ -792,16 +811,13 @@ async fn bash_child_does_not_receive_aws_access_key_from_parent_env() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     ctx.session.set_sandbox_enabled(false);
+    let command = "printf '%s' \"${AWS_ACCESS_KEY_ID:-scrubbed}\"";
+    grant_command(&ctx, command, Scope::Session);
     env.set_var("AWS_ACCESS_KEY_ID", "AKIATESTSECRET");
     let out = BashTool::new()
-            .call(
-                serde_json::json!({
-                    "command": "if [ -z \"${AWS_ACCESS_KEY_ID+x}\" ]; then printf scrubbed; else printf '%s' \"$AWS_ACCESS_KEY_ID\"; fi"
-                }),
-                &ctx,
-            )
-            .await
-            .expect("bash call returns");
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("bash call returns");
     assert!(out.content.contains("scrubbed"), "{}", out.content);
     assert!(!out.content.contains("AKIATESTSECRET"), "{}", out.content);
 }
@@ -988,7 +1004,7 @@ fn shell_write_content_preview_keeps_printf_and_dynamic_fallback() {
 #[tokio::test]
 async fn default_cwd_runs_at_session_root() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "pwd");
     let out = BashTool::new()
         .call(serde_json::json!({ "command": "pwd" }), &ctx)
         .await
@@ -1001,7 +1017,7 @@ async fn default_cwd_runs_at_session_root() {
 async fn explicit_inside_cwd_runs() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join("src")).unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "pwd");
     let out = BashTool::new()
         .call(serde_json::json!({ "command": "pwd", "cwd": "src" }), &ctx)
         .await
@@ -1049,6 +1065,7 @@ async fn approved_outside_cwd_executes() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     ctx.session.set_sandbox_enabled(false);
+    grant_command(&ctx, "pwd", Scope::Session);
     let parent = tmp.path().parent().unwrap().to_path_buf();
     let approve = {
         let ctx = ctx.clone();
@@ -1067,7 +1084,7 @@ async fn approved_outside_cwd_executes() {
 async fn cd_inside_root_is_allowed() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join("subdir")).unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "cd subdir && pwd");
     let out = BashTool::new()
         .call(serde_json::json!({ "command": "cd subdir && pwd" }), &ctx)
         .await
@@ -1137,7 +1154,7 @@ async fn pushd_escape_triggers_approval_before_execution() {
 #[tokio::test]
 async fn dotdot_as_data_is_not_rejected() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf '%s\\n' '../data'");
     let out = BashTool::new()
         .call(
             serde_json::json!({ "command": "printf '%s\\n' '../data'" }),
@@ -1233,7 +1250,10 @@ async fn no_approver_never_preauthorizes_escalation() {
 #[tokio::test]
 async fn sandbox_meta_records_sandbox_off_state() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_enabled(false);
+    grant_command(&ctx, "printf hi", Scope::Session);
+    let _guard = set_bash_test_overrides(None, None, [(false, shell_out("hi", "", 0))]);
     let tool = BashTool::new();
     let out = tool
         .call(serde_json::json!({ "command": "printf hi" }), &ctx)
@@ -1243,11 +1263,182 @@ async fn sandbox_meta_records_sandbox_off_state() {
     assert!(!meta.enabled, "sandbox off → not enabled");
     assert!(!meta.confined);
     assert!(!meta.escalated);
-    assert!(!meta.escalation_preauthorized);
+    assert!(meta.escalation_preauthorized);
     assert!(meta.approval_scope_recorded.is_none());
     // Model-facing body unchanged: only the command output, no note.
     assert!(out.content.contains("hi"));
     assert!(!out.content.to_lowercase().contains("sandbox"));
+}
+
+#[tokio::test]
+async fn escalation_preauthorized_computed_without_sandbox() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_enabled(false);
+    grant_command(&ctx, "printf hi", Scope::Session);
+
+    assert_eq!(
+        command_escalation_preauthorized(&ctx, "printf hi").await,
+        Some(Scope::Session)
+    );
+}
+
+#[tokio::test]
+async fn sandbox_off_ungranted_command_prompts_and_deny_blocks_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_enabled(false);
+    let marker = tmp.path().join("marker");
+    let db = ctx.session.db.clone();
+    let sid = ctx.session.id;
+    let hub = ctx.interrupts.clone();
+    let resolver = tokio::spawn(async move {
+        resolve_next_interrupt_with_response(db, sid, hub, ResolveResponse::Cancel, None).await
+    });
+
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": format!("touch '{}'", marker.display()) }),
+            &ctx,
+        )
+        .await
+        .expect("bash call returns");
+    resolver.await.unwrap();
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(!meta.enabled);
+    assert!(!meta.confined);
+    assert!(!meta.escalation_preauthorized);
+    assert!(out.content.contains("approval was denied"));
+    assert!(!marker.exists(), "denied unconfined command must not run");
+}
+
+#[tokio::test]
+async fn sandbox_off_granted_command_runs_without_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_enabled(false);
+    grant_command(&ctx, "printf hi", Scope::Session);
+    let _guard = set_bash_test_overrides(None, None, [(false, shell_out("hi", "", 0))]);
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf hi" }), &ctx)
+        .await
+        .expect("bash call returns");
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(!meta.enabled);
+    assert!(!meta.confined);
+    assert!(meta.escalation_preauthorized);
+    assert!(meta.approval_scope_recorded.is_none());
+    assert!(out.content.contains("hi"));
+    assert!(
+        ctx.session
+            .db
+            .list_open_interrupts(ctx.session.id)
+            .unwrap()
+            .is_empty(),
+        "granted sandbox-off command must not prompt"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_off_without_approver_denies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = crate::tools::common::test_ctx(tmp.path());
+    let marker = tmp.path().join("marker");
+
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": format!("touch '{}'", marker.display()) }),
+            &ctx,
+        )
+        .await
+        .expect("bash call returns");
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(!meta.enabled);
+    assert!(!meta.confined);
+    assert!(out.content.contains("approval was denied"));
+    assert!(!marker.exists(), "missing approver must fail closed");
+}
+
+#[tokio::test]
+async fn sandbox_off_noninteractive_denial_blocks_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_enabled(false);
+    let marker = tmp.path().join("marker");
+    let db = ctx.session.db.clone();
+    let sid = ctx.session.id;
+    let hub = ctx.interrupts.clone();
+    let resolver = tokio::spawn(async move {
+        resolve_next_interrupt_with_response(
+            db,
+            sid,
+            hub,
+            ResolveResponse::Freetext {
+                text: crate::approval::NONINTERACTIVE_RUN_DENIAL.into(),
+            },
+            None,
+        )
+        .await
+    });
+
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": format!("touch '{}'", marker.display()) }),
+            &ctx,
+        )
+        .await
+        .expect("bash call returns");
+    resolver.await.unwrap();
+    assert_eq!(out.content, crate::approval::NONINTERACTIVE_RUN_DENIAL);
+    assert!(!marker.exists(), "noninteractive denial must not run");
+}
+
+#[tokio::test]
+async fn sandbox_off_wrapper_always_prompts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_enabled(false);
+    let db = ctx.session.db.clone();
+    let sid = ctx.session.id;
+    let hub = ctx.interrupts.clone();
+    let resolver =
+        tokio::spawn(
+            async move { resolve_next_interrupt(db, sid, hub, ID_APPROVE_ONCE, None).await },
+        );
+    let _guard = set_bash_test_overrides(None, None, [(false, shell_out("hi", "", 0))]);
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "sh -c 'printf hi'" }), &ctx)
+        .await
+        .expect("bash call returns");
+    resolver.await.unwrap();
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(!meta.enabled);
+    assert!(!meta.confined);
+    assert!(!meta.escalation_preauthorized);
+    assert!(meta.approval_scope_recorded.is_none());
+}
+
+#[tokio::test]
+async fn force_unconfined_rerun_does_not_reprompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with_store(tmp.path());
+    ctx.approver = None;
+    let _guard = set_bash_test_overrides(None, None, [(false, shell_out("hi", "", 0))]);
+
+    let out = rerun_escalated_bash(
+        serde_json::json!({ "command": "printf hi" }),
+        &ctx,
+        Some("once".to_string()),
+    )
+    .await
+    .expect("bash call returns");
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(!meta.confined);
+    assert!(meta.escalated);
+    assert_eq!(meta.approval_scope_recorded.as_deref(), Some("once"));
+    assert!(out.content.contains("hi"));
 }
 
 /// A stored grant never changes the initial gate: with the sandbox available,
@@ -1415,10 +1606,9 @@ async fn wrapper_is_never_preauthorized_for_escalation() {
 
 #[cfg(not(windows))]
 #[tokio::test]
-async fn sandbox_unavailable_still_refuses_with_actionable_error() {
+async fn sandbox_unavailable_is_not_turned_into_a_prompt() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
-    grant_command(&ctx, "printf hi", Scope::Session);
     let _guard = set_bash_test_overrides(
         Some(
             crate::tools::shell_sandbox::SandboxAvailability::Unavailable {
@@ -1440,7 +1630,7 @@ async fn sandbox_unavailable_still_refuses_with_actionable_error() {
     assert!(meta.enabled);
     assert!(!meta.confined);
     assert!(!meta.escalated);
-    assert!(meta.escalation_preauthorized);
+    assert!(!meta.escalation_preauthorized);
     assert_eq!(meta.unavailable_reason.as_deref(), Some("bwrap absent"));
     assert!(
         ctx.session
@@ -1454,8 +1644,35 @@ async fn sandbox_unavailable_still_refuses_with_actionable_error() {
 
 #[cfg(not(windows))]
 #[test]
-fn sandbox_meta_distinguishes_escalation_states() {
-    let preauthorized = crate::engine::tool::SandboxMeta {
+fn sandbox_meta_distinguishes_four_states() {
+    let sandbox_off_granted = crate::engine::tool::SandboxMeta {
+        enabled: false,
+        confined: false,
+        escalated: false,
+        escalation_preauthorized: true,
+        approval_scope_recorded: None,
+        unavailable_reason: None,
+        resource_profiles: Vec::new(),
+    };
+    let sandbox_off_approved = crate::engine::tool::SandboxMeta {
+        enabled: false,
+        confined: false,
+        escalated: false,
+        escalation_preauthorized: false,
+        approval_scope_recorded: Some("once".to_string()),
+        unavailable_reason: None,
+        resource_profiles: Vec::new(),
+    };
+    let confined_success = crate::engine::tool::SandboxMeta {
+        enabled: true,
+        confined: true,
+        escalated: false,
+        escalation_preauthorized: false,
+        approval_scope_recorded: None,
+        unavailable_reason: None,
+        resource_profiles: Vec::new(),
+    };
+    let confined_escalated = crate::engine::tool::SandboxMeta {
         enabled: true,
         confined: true,
         escalated: true,
@@ -1464,36 +1681,21 @@ fn sandbox_meta_distinguishes_escalation_states() {
         unavailable_reason: None,
         resource_profiles: Vec::new(),
     };
-    let prompted = crate::engine::tool::SandboxMeta {
-        escalation_preauthorized: false,
-        approval_scope_recorded: Some("once".to_string()),
-        ..preauthorized.clone()
-    };
-    let confined_success = crate::engine::tool::SandboxMeta {
-        escalated: false,
-        escalation_preauthorized: false,
-        approval_scope_recorded: None,
-        ..preauthorized.clone()
-    };
-    let unavailable_refuse = crate::engine::tool::SandboxMeta {
-        confined: false,
-        escalated: false,
-        approval_scope_recorded: None,
-        unavailable_reason: Some("bwrap absent".to_string()),
-        ..preauthorized.clone()
-    };
 
-    let preauthorized_value = serde_json::to_value(&preauthorized).unwrap();
-    assert!(
-        preauthorized_value
-            .get("escalation_preauthorized")
-            .is_some()
-    );
-    for other in [prompted, confined_success, unavailable_refuse] {
-        assert_ne!(serde_json::to_value(other).unwrap(), preauthorized_value);
+    let values = [
+        serde_json::to_value(&sandbox_off_granted).unwrap(),
+        serde_json::to_value(&sandbox_off_approved).unwrap(),
+        serde_json::to_value(&confined_success).unwrap(),
+        serde_json::to_value(&confined_escalated).unwrap(),
+    ];
+    for (idx, left) in values.iter().enumerate() {
+        assert!(left.get("escalation_preauthorized").is_some());
+        for right in values.iter().skip(idx + 1) {
+            assert_ne!(left, right);
+        }
     }
 
-    let out = ToolOutput::text("model body").with_sandbox(preauthorized);
+    let out = ToolOutput::text("model body").with_sandbox(confined_escalated);
     assert_eq!(out.content, "model body");
     assert!(!out.content.contains("escalation_preauthorized"));
 }
@@ -1785,7 +1987,7 @@ async fn escalate_deny_keeps_confined_failure_and_records_no_scope() {
 #[tokio::test]
 async fn defensive_cat_appends_read_tip() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = crate::tools::common::test_ctx(tmp.path());
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), "cat foo.txt");
     ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
     let tool = BashTool::new();
     let out = tool
@@ -1808,7 +2010,7 @@ async fn defensive_cat_appends_read_tip() {
 #[tokio::test]
 async fn normal_cat_appends_no_tip() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "cat foo.txt");
     // test_ctx defaults to Normal.
     assert!(matches!(
         ctx.llm_mode,
@@ -1829,8 +2031,7 @@ async fn normal_cat_appends_no_tip() {
 #[tokio::test]
 async fn durable_shell_write_appends_writeunlock_hint() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
-    ctx.session.set_sandbox_enabled(false);
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf hello > durable.txt");
     let out = BashTool::new()
         .call(
             serde_json::json!({ "command": "printf hello > durable.txt" }),
@@ -1851,7 +2052,7 @@ async fn durable_shell_write_appends_writeunlock_hint() {
 #[tokio::test]
 async fn defensive_cat_tip_suppressed_after_read() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = crate::tools::common::test_ctx(tmp.path());
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), "cat foo.txt");
     ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
     // The model already adopted `read` this session (recorded at the
     // dispatch site on a successful read call).

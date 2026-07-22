@@ -39,6 +39,8 @@ use boundary::{dynamic_shell_path, outside_cwd_error};
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 pub(crate) const SHELL_WRITE_NATIVE_TOOL_HINT: &str = "Use `writeunlock` to create or rewrite files; shell redirection is for commands whose output you inspect, not files you intend to keep.";
+const UNCONFINED_COMMAND_DENIAL: &str =
+    "Error: `bash` was not run: unconfined command approval was denied.";
 
 /// One-shot guard so the Windows "shell sandboxing unavailable" notice
 /// prints at most once per process (≈ per session — the daemon runs one
@@ -339,11 +341,7 @@ async fn call_bash_inner(
     // `Some` on Windows; elsewhere it stays `None`.
     let windows_notice: Option<&'static str> = windows_shell_notice(ctx);
 
-    let escalation_preauthorized_scope = if sandbox_on {
-        command_escalation_preauthorized(ctx, command).await
-    } else {
-        None
-    };
+    let escalation_preauthorized_scope = command_escalation_preauthorized(ctx, command).await;
     let escalation_preauthorized = escalation_preauthorized_scope.is_some();
 
     let is_container_run = !options.force_unconfined && ctx.session.sandbox_mode().is_container();
@@ -466,9 +464,9 @@ async fn call_bash_inner(
     // Part B: the sandbox-state sub-object for the tool_call event. We
     // accumulate the four-state record as the run proceeds and attach it
     // to whichever `ToolOutput` we return (every path), so an export is
-    // diagnosable across sandbox-off / confined-success /
-    // confined-fail→escalate-after-prompt /
-    // confined-fail→escalate-preauthorized. It is NEVER added to the
+    // diagnosable across sandbox-off-granted / sandbox-off-approved /
+    // confined-success / confined-fail→escalate (prompted or preauthorized).
+    // It is NEVER added to the
     // model-facing body (token economy §10).
     let mut meta = crate::engine::tool::SandboxMeta {
         enabled: sandbox_enabled,
@@ -481,6 +479,30 @@ async fn call_bash_inner(
         unavailable_reason: None,
         resource_profiles: command_resource_plan.metas.clone(),
     };
+
+    if !confine && !options.escalated && escalation_preauthorized_scope.is_none() {
+        let Some(approver) = ctx.approver.as_ref() else {
+            // Unconfined means grant-or-ask. With no approver wired there is
+            // nobody to ask, so fail closed rather than silently spawning.
+            return Ok(ToolOutput::text(UNCONFINED_COMMAND_DENIAL).with_sandbox(meta));
+        };
+        // This is the same coarse command-key approval path used elsewhere:
+        // users can remember `cargo build`/`gh pr` at a scope instead of
+        // approving every unconfined invocation while the sandbox is off.
+        match approver.approve_command(command).await? {
+            crate::approval::Decision::Allow { scope } => {
+                meta.approval_scope_recorded = Some(scope.as_str().to_string());
+            }
+            crate::approval::Decision::NoninteractiveDeny => {
+                return Ok(
+                    ToolOutput::text(crate::approval::NONINTERACTIVE_RUN_DENIAL).with_sandbox(meta)
+                );
+            }
+            crate::approval::Decision::Deny => {
+                return Ok(ToolOutput::text(UNCONFINED_COMMAND_DENIAL).with_sandbox(meta));
+            }
+        }
+    }
 
     if confine && !command_resource_plan.invalid_roots.is_empty() {
         let issues = command_resource_plan

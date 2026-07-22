@@ -990,25 +990,25 @@ pub fn security_descriptor_for_config(
             },
             StepDescriptor {
                 id: "approval",
-                prompt: "How should gated commands and network calls be approved?",
-                help: "Manual asks every time. Auto uses the utility-model safety gate for safe calls and asks on unsafe or unavailable. Yolo runs gated calls unprompted. Remembered command/path grants can be once, session, project, or global; project/global grants are machine-local.",
+                prompt: "How should commands that leave the sandbox be approved?",
+                help: "Manual asks you before a command leaves the sandbox. Auto lets the utility model approve when possible and asks when unsafe or unavailable. Yolo runs unprompted. Remembered command/path grants can be once, session, project, or global; project/global grants are machine-local.",
                 help_hook: None,
                 kind: StepKind::Select {
                     options: vec![
                         SelectOption {
                             id: current.default_approval_mode.as_str().into(),
                             label: "Keep current approval mode".into(),
-                            description: "Recommended default is manual. You approve every gated command, web fetch, and MCP call.".into(),
+                            description: "Recommended default is manual. You approve anything that needs to leave the sandbox.".into(),
                         },
                         SelectOption {
                             id: "auto".into(),
                             label: "auto".into(),
-                            description: "Use the utility-model safety gate for safe calls; ask when unsafe or unavailable.".into(),
+                            description: "Let the utility model approve sandbox escapes when possible; ask when unsafe or unavailable.".into(),
                         },
                         SelectOption {
                             id: "yolo".into(),
                             label: "yolo".into(),
-                            description: "Runs gated commands and network calls unprompted.".into(),
+                            description: "Run commands without approval prompts.".into(),
                         },
                     ],
                 },

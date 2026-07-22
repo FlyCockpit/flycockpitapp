@@ -156,11 +156,13 @@ fn injection_result_action_label(a: InjectionResultAction) -> &'static str {
 
 fn approval_mode_label(m: ApprovalMode) -> &'static str {
     match m {
-        ApprovalMode::Manual => "manual (default — approve every command and network call)",
-        ApprovalMode::Auto => {
-            "auto (safety-gated — utility model vets each call; needs a utility model)"
+        ApprovalMode::Manual => {
+            "manual (default — sandboxed by default; you approve anything that needs to leave the sandbox)"
         }
-        ApprovalMode::Yolo => "yolo (run every command and network call unprompted)",
+        ApprovalMode::Auto => {
+            "auto (sandboxed by default; utility model can approve anything that needs to leave the sandbox)"
+        }
+        ApprovalMode::Yolo => "yolo (run without approval prompts)",
     }
 }
 
@@ -750,11 +752,11 @@ impl SettingId {
                  `frontier` at discovery)."
             }
             SettingId::ApprovalMode => {
-                "When a command, web fetch, or MCP call needs approval before it \
-                 runs. `manual` (default) asks you every time — you are the gate; \
-                 `auto` routes each call past the utility-model safety gate (safe \
-                 runs, unsafe asks) and needs a utility model; `yolo` runs \
-                 everything unprompted. Distinct from the `auto` *agent*."
+                "When a command needs approval to leave the sandbox. `manual` \
+                 (default) asks you — you are the gate; `auto` lets the \
+                 utility-model safety gate approve when possible and asks when \
+                 unsafe or unavailable; `yolo` runs without approval prompts. \
+                 Distinct from the `auto` *agent*."
             }
             SettingId::SandboxEscalationEnabled => {
                 "Allow the agent to offer an explicit unsandboxed retry after a \
@@ -3328,6 +3330,23 @@ mod descriptor_tests {
     use super::*;
 
     #[test]
+    fn approval_mode_copy_describes_sandbox_as_the_gate() {
+        let manual = approval_mode_label(ApprovalMode::Manual);
+        let auto = approval_mode_label(ApprovalMode::Auto);
+        let yolo = approval_mode_label(ApprovalMode::Yolo);
+
+        assert_eq!(
+            manual,
+            "manual (default — sandboxed by default; you approve anything that needs to leave the sandbox)"
+        );
+        assert!(auto.contains("sandboxed by default"));
+        assert!(auto.contains("utility model"));
+        let joined = [manual, auto, yolo].join("\n");
+        assert!(!joined.contains("approve every command"));
+        assert!(!joined.contains("gated commands"));
+    }
+
+    #[test]
     fn every_setting_id_has_descriptor() {
         for id in ALL_SETTING_IDS {
             let descriptor = id.descriptor();
@@ -3343,7 +3362,7 @@ mod descriptor_tests {
     fn approval_mode_help_is_preserved() {
         assert_eq!(
             SettingId::ApprovalMode.descriptor().help,
-            "When a command, web fetch, or MCP call needs approval before it runs. `manual` (default) asks you every time — you are the gate; `auto` routes each call past the utility-model safety gate (safe runs, unsafe asks) and needs a utility model; `yolo` runs everything unprompted. Distinct from the `auto` *agent*."
+            "When a command needs approval to leave the sandbox. `manual` (default) asks you — you are the gate; `auto` lets the utility-model safety gate approve when possible and asks when unsafe or unavailable; `yolo` runs without approval prompts. Distinct from the `auto` *agent*."
         );
     }
 }

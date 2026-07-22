@@ -79,9 +79,12 @@ pub(super) async fn safety_gate_decision_with_configs(
         return GateOutcome::Run { recheck: false };
     }
     match ctx.session.approval_mode() {
-        // `manual`: the gate is not invoked (the user is the gate elsewhere).
-        // `yolo`: everything runs, gate bypassed. Either way, run ungated.
-        ApprovalMode::Manual | ApprovalMode::Yolo => return GateOutcome::Run { recheck: false },
+        // `manual`: the utility-model gate is not invoked because the human
+        // is the gate. Bash asks in its grant-or-ask paths when a command
+        // would run unconfined; `escalate` prompts through its Manual route.
+        ApprovalMode::Manual => return GateOutcome::Run { recheck: false },
+        // `yolo`: everything runs unprompted and unverified.
+        ApprovalMode::Yolo => return GateOutcome::Run { recheck: false },
         ApprovalMode::Auto => {}
     }
 
@@ -362,10 +365,13 @@ mod safety_gate_tests {
     }
 
     #[tokio::test]
-    async fn manual_mode_runs_without_gating() {
-        // `manual`: the per-call utility gate is not this mode's engine — the
+    async fn manual_mode_skips_utility_gate_but_bash_still_asks() {
+        // `manual`: the per-call utility gate is not this mode's engine. The
         // gate decision is `Run` immediately, with no model call and no
-        // result re-check requested.
+        // result re-check requested. This is not unconditional command
+        // approval: unconfined `bash` runs still ask in
+        // `sandbox_off_ungranted_command_prompts_and_deny_blocks_run`, and
+        // the `escalate` tool prompts through its Manual route.
         let tmp = tempfile::tempdir().unwrap();
         let ctx = gate_ctx(tmp.path(), ApprovalMode::Manual, true);
         let (tx, _rx) = mpsc::channel(8);

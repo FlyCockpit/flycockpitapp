@@ -723,9 +723,9 @@ fn mode_description(mode: LlmMode) -> &'static str {
 
 fn approval_description(mode: ApprovalMode) -> &'static str {
     match mode {
-        ApprovalMode::Manual => "ask before gated commands and network calls",
-        ApprovalMode::Auto => "safety gate can auto-allow safe calls",
-        ApprovalMode::Yolo => "runs gated commands and network calls unprompted",
+        ApprovalMode::Manual => "you approve anything that leaves the sandbox",
+        ApprovalMode::Auto => "utility model can approve anything that leaves the sandbox",
+        ApprovalMode::Yolo => "runs without approval prompts",
     }
 }
 
@@ -769,6 +769,20 @@ mod tests {
             trust: ModelTrust::Trusted,
             mode: LlmMode::Normal,
         }
+    }
+
+    #[test]
+    fn approval_mode_copy_describes_sandbox_as_the_gate() {
+        let manual = approval_description(ApprovalMode::Manual);
+        let auto = approval_description(ApprovalMode::Auto);
+        let yolo = approval_description(ApprovalMode::Yolo);
+
+        assert_eq!(manual, "you approve anything that leaves the sandbox");
+        assert!(auto.contains("utility model"));
+        assert!(auto.contains("leaves the sandbox"));
+        let joined = [manual, auto, yolo].join("\n");
+        assert!(!joined.contains("approve every command"));
+        assert!(!joined.contains("gated commands"));
     }
 
     #[test]

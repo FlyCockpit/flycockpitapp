@@ -448,8 +448,8 @@ pub struct RepeatGuard {
 /// `bash`-only sandbox-state record for the `tool_call` event (Part B,
 /// data/export — never model-facing). Captures which of the four sandbox
 /// states a `bash` call took so an exported `events.json` is diagnosable:
-/// sandbox-off, sandbox-unavailable-refuse, confined-success, and
-/// confined-fail-to-escalate.
+/// sandbox-off-granted, sandbox-off-approved, confined-success, and
+/// confined-fail-to-escalate (prompted or preauthorized).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxMeta {
     /// Sandboxing was on for this session + platform supports it.

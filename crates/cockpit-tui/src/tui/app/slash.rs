@@ -1063,7 +1063,7 @@ fn run_curator(app: &mut App, args: &str) -> bool {
 }
 
 fn run_skills(app: &mut App, _: &str) -> bool {
-    app.overlay = Overlay::Skills(crate::tui::skills_pane::SkillsPane::open(&app.launch.cwd));
+    app.open_skills_pane();
     false
 }
 

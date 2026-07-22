@@ -34,6 +34,7 @@ mod render;
 mod resume;
 mod session_services;
 mod side_conversation;
+mod skills_pane_actions;
 mod slash;
 mod startup_layout;
 mod subagent_view;
@@ -1556,6 +1557,7 @@ pub struct App {
     /// drain instead of freezing the event loop.
     pub(super) async_actions: AsyncActionRunner,
     pub(super) completed_async_actions: Vec<AsyncActionResult>,
+    pub(super) skills_pane_generation: u64,
     startup_background: StartupBackground,
     /// Last-rendered chat area `Rect`. Used to translate absolute
     /// terminal mouse coordinates into chat-relative coordinates so
@@ -2731,6 +2733,7 @@ impl App {
             display_attach_backoff: DisplayAttachBackoff::default(),
             async_actions: AsyncActionRunner::default(),
             completed_async_actions: Vec::new(),
+            skills_pane_generation: 0,
             startup_background: StartupBackground {
                 daemon_socket: daemon_state.socket,
                 db: startup_db,
@@ -3308,6 +3311,8 @@ mod sandbox_notice_tests;
 mod session_schedule_tests;
 #[cfg(test)]
 mod skill_auto_injected_tests;
+#[cfg(test)]
+mod skills_pane_attached_tests;
 #[cfg(test)]
 mod slash_rank_tests;
 #[cfg(test)]

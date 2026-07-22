@@ -77,6 +77,7 @@ pub enum AsyncActionPayload {
         connector: Option<cockpit_db::connector::ConnectorDisclosure>,
     },
     ProviderUsage(Vec<cockpit_core::providers::usage::ProviderUsageSnapshot>),
+    Skills(crate::tui::skills_pane::SkillsPaneFetchResult),
     PasteTokenCount {
         block_id: u64,
         tokens: usize,

@@ -5,11 +5,10 @@
 //! pane is purely informational: there's no selecting, invoking, or
 //! editing — Esc (or `q`) dismisses it.
 //!
-//! The list comes from the daemon's `ListSkills` RPC (the same discovery
-//! the `skill` tool and auto-select path use), not from re-running
-//! discovery in the TUI. Mirrors [`crate::tui::stats_pane`]'s shape
-//! (`open` / `handle_key` / `render`); `App` opens it over the chat body
-//! and routes input/render the same way.
+//! The list comes from the attached session's `ListSkills` RPC when an
+//! agent runner is present, with local discovery as the detached fallback.
+//! Mirrors [`crate::tui::stats_pane`]'s shape (`handle_key` / `render`);
+//! `App` opens it over the chat body and routes input/render the same way.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -18,15 +17,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::tui::agent_runner;
 use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-use cockpit_core::daemon::proto::{Request, Response, SkillSummary};
+use cockpit_config::extended::SkillsConfig;
+use cockpit_core::daemon::proto::SkillSummary;
 
 pub struct SkillsPane {
-    /// Discovered skills, or an error string if the fetch failed. Loaded
-    /// once at open — the set is static for the life of the overlay.
-    skills: Result<Vec<SkillSummary>, String>,
+    generation: u64,
+    state: SkillsPaneState,
     /// Vertical scroll offset (in rendered body rows).
     scroll: usize,
     /// Rendered body height at the last draw — drives scroll clamping.
@@ -35,19 +33,69 @@ pub struct SkillsPane {
     last_content_rows: usize,
 }
 
+#[derive(Debug, Clone)]
+enum SkillsPaneState {
+    Loading,
+    Ready {
+        skills: Vec<SkillSummary>,
+        source: SkillsPaneSource,
+    },
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillsPaneSource {
+    Session,
+    Local,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillsPaneFetchResult {
+    pub generation: u64,
+    pub source: SkillsPaneSource,
+    pub skills: Result<Vec<SkillSummary>, String>,
+}
+
 impl SkillsPane {
-    /// Open the pane for `cwd`, fetching the skill list via the
-    /// `ListSkills` RPC. A daemon/RPC failure is non-fatal — the pane
-    /// renders the error inline rather than refusing to open, so
-    /// `/skills` always shows something.
-    pub fn open(cwd: &std::path::Path) -> Self {
-        let skills = fetch_skills(cwd);
+    pub fn loading(generation: u64) -> Self {
+        Self::new(generation, SkillsPaneState::Loading)
+    }
+
+    pub fn ready(
+        generation: u64,
+        source: SkillsPaneSource,
+        skills: Result<Vec<SkillSummary>, String>,
+    ) -> Self {
+        let state = match skills {
+            Ok(skills) => SkillsPaneState::Ready { skills, source },
+            Err(error) => SkillsPaneState::Error(error),
+        };
+        Self::new(generation, state)
+    }
+
+    fn new(generation: u64, state: SkillsPaneState) -> Self {
         Self {
-            skills,
+            generation,
+            state,
             scroll: 0,
             last_body_height: 0,
             last_content_rows: 0,
         }
+    }
+
+    pub fn apply_fetch_result(&mut self, result: SkillsPaneFetchResult) -> bool {
+        if result.generation != self.generation {
+            return false;
+        }
+        self.state = match result.skills {
+            Ok(skills) => SkillsPaneState::Ready {
+                skills,
+                source: result.source,
+            },
+            Err(error) => SkillsPaneState::Error(error),
+        };
+        self.scroll = 0;
+        true
     }
 
     /// Handle a key. Returns `true` when the pane should close. The
@@ -127,22 +175,39 @@ impl SkillsPane {
     /// reading `self`, so the empty-state / listing logic is unit-testable
     /// without an `App`/terminal.
     fn body_lines(&self) -> Vec<Line<'static>> {
-        match &self.skills {
-            Err(e) => vec![Line::from(Span::styled(
+        match &self.state {
+            SkillsPaneState::Loading => vec![Line::from(Span::styled(
+                "Loading skills...".to_string(),
+                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            ))],
+            SkillsPaneState::Error(e) => vec![Line::from(Span::styled(
                 format!("skills unavailable: {e}"),
                 Style::default().fg(Color::Red),
             ))],
-            Ok(skills) if skills.is_empty() => vec![Line::from(Span::styled(
-                "No skills found in the configured scan directories.".to_string(),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-            ))],
-            Ok(skills) => skill_lines(skills),
+            SkillsPaneState::Ready { skills, source } => ready_lines(skills, *source),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn body_text_for_test(&self) -> String {
+        self.body_lines()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generation_for_test(&self) -> u64 {
+        self.generation
     }
 }
 
-/// Fetch the skill list from the daemon for `cwd`. Returns the error as a
-/// string so the pane can render it inline rather than panicking.
 impl Pane for SkillsPane {
     type Outcome = bool;
 
@@ -155,14 +220,44 @@ impl Pane for SkillsPane {
     }
 }
 
-fn fetch_skills(cwd: &std::path::Path) -> Result<Vec<SkillSummary>, String> {
-    let req = Request::ListSkills {
-        project_root: cwd.to_string_lossy().into_owned(),
-    };
-    match agent_runner::daemon_request_blocking(req)? {
-        Response::Skills { skills } => Ok(skills),
-        other => Err(format!("unexpected daemon response: {other:?}")),
+pub(crate) fn local_skill_summaries(
+    cwd: &std::path::Path,
+    skills_config: &SkillsConfig,
+    agent_name: &str,
+) -> Result<Vec<SkillSummary>, String> {
+    cockpit_core::skills::discover_for_agent(cwd, skills_config, agent_name)
+        .map(|skills| {
+            skills
+                .into_iter()
+                .map(|s| SkillSummary {
+                    name: s.frontmatter.name,
+                    description: s.frontmatter.description,
+                    source: s.source.display().to_string(),
+                    user_invocable: s.frontmatter.user_invocable,
+                })
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn ready_lines(skills: &[SkillSummary], source: SkillsPaneSource) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if source == SkillsPaneSource::Local {
+        lines.push(Line::from(Span::styled(
+            "local view - session-specific activation unavailable".to_string(),
+            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+        )));
+        lines.push(Line::default());
     }
+    if skills.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No skills found in the configured scan directories.".to_string(),
+            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+        )));
+    } else {
+        lines.extend(skill_lines(skills));
+    }
+    lines
 }
 
 /// Render the non-empty skill list: a name + source header line per skill
@@ -208,12 +303,7 @@ mod tests {
     }
 
     fn pane_with(skills: Result<Vec<SkillSummary>, String>) -> SkillsPane {
-        SkillsPane {
-            skills,
-            scroll: 0,
-            last_body_height: 100,
-            last_content_rows: 0,
-        }
+        SkillsPane::ready(1, SkillsPaneSource::Session, skills)
     }
 
     fn summary(name: &str, desc: &str, source: &str) -> SkillSummary {
@@ -225,26 +315,13 @@ mod tests {
         }
     }
 
-    fn render_text(pane: &SkillsPane) -> String {
-        pane.body_lines()
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     #[test]
     fn lists_name_description_and_source() {
         let pane = pane_with(Ok(vec![
             summary("greet", "say hi", "/home/u/.agents/skills/greet/SKILL.md"),
             summary("build", "compile it", "/proj/.agents/skills/build/SKILL.md"),
         ]));
-        let text = render_text(&pane);
+        let text = pane.body_text_for_test();
         assert!(text.contains("greet"));
         assert!(text.contains("say hi"));
         assert!(text.contains("/home/u/.agents/skills/greet/SKILL.md"));
@@ -256,14 +333,14 @@ mod tests {
     #[test]
     fn empty_shows_empty_state_not_blank() {
         let pane = pane_with(Ok(Vec::new()));
-        let text = render_text(&pane);
+        let text = pane.body_text_for_test();
         assert_eq!(text, "No skills found in the configured scan directories.");
     }
 
     #[test]
     fn fetch_error_renders_inline() {
         let pane = pane_with(Err("daemon not running".to_string()));
-        let text = render_text(&pane);
+        let text = pane.body_text_for_test();
         assert!(text.contains("skills unavailable"));
         assert!(text.contains("daemon not running"));
     }
@@ -298,5 +375,38 @@ mod tests {
         assert_eq!(pane.scroll, 0, "g jumps to top");
         pane.handle_key(press(KeyCode::Char('G')));
         assert_eq!(pane.scroll, 6, "G jumps to bottom");
+    }
+
+    #[test]
+    fn local_source_renders_detached_subtitle() {
+        let pane = SkillsPane::ready(
+            1,
+            SkillsPaneSource::Local,
+            Ok(vec![summary("a", "d", "/s")]),
+        );
+
+        let text = pane.body_text_for_test();
+
+        assert!(text.contains("local view - session-specific activation unavailable"));
+        assert!(text.contains("a"));
+    }
+
+    #[test]
+    fn skills_pane_stale_result_dropped() {
+        let mut pane = SkillsPane::ready(
+            2,
+            SkillsPaneSource::Local,
+            Ok(vec![summary("new", "d", "/s")]),
+        );
+
+        let applied = pane.apply_fetch_result(SkillsPaneFetchResult {
+            generation: 1,
+            source: SkillsPaneSource::Session,
+            skills: Ok(vec![summary("stale", "d", "/s")]),
+        });
+
+        assert!(!applied);
+        assert!(pane.body_text_for_test().contains("new"));
+        assert!(!pane.body_text_for_test().contains("stale"));
     }
 }

@@ -77,12 +77,12 @@ pub struct AgentDef {
     /// for **this** agent without touching its ID or schema, so the same tool
     /// can encode different per-agent intent (e.g. `Build` "delegate-eager" vs
     /// a "do-it-yourself" primary). Keyed by tool name; the value carries the
-    /// per-`llm_mode` text (a bare string applies to all modes). Applied at
+    /// per-`llm_mode` text. Applied at
     /// [`crate::engine::builtin`] construction time onto the toolbox via
     /// [`crate::engine::tool::ToolBox::with_override`] — fixed at session
     /// start, so the tools array stays byte-stable (cache-safe). Empty / absent
     /// means every tool keeps its base description (byte-identical to today).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tool_descriptions")]
     pub tool_descriptions: BTreeMap<String, ToolDescriptionSpec>,
     /// Whether this agent's untrusted tool/subagent results are scanned by the
     /// prompt-injection guard before entering parent history. `None` means use
@@ -213,31 +213,34 @@ fn tool_family(name: &str) -> &'static str {
 
 /// A markdown agent's per-agent description override for one tool (prompt
 /// `per-agent-tool-definitions.md`). Authored in `tool_descriptions:`
-/// frontmatter in either of two forms:
+/// frontmatter as a per-mode object:
 ///
 /// ```yaml
 /// tool_descriptions:
-///   # bare string → applies to all llm_modes
-///   read: "Skim before delegating — you don't write."
-///   # per-mode object → distinct normal/frontier/defensive text (each optional)
 ///   task:
 ///     normal: "Delegate substantive work here."
 ///     frontier: "Delegate only clearly separable work."
 ///     defensive: "Hand each well-scoped piece to a subagent …"
 /// ```
 ///
+/// Tool authors write **two** tiers: [`crate::engine::tool::Tool::description`]
+/// (normal, also used for frontier) and
+/// [`crate::engine::tool::Tool::defensive_description`]. Agent authors may
+/// override **any of the three modes** independently. `frontier` is the only
+/// place frontier-specific tool text can exist anywhere in the system — the
+/// trait-level `frontier_description` slot was deliberately removed. An
+/// omitted mode always falls back to the tool's own text for that mode; there
+/// is no way to set one mode's text and have it leak into another.
+///
 /// Only the *description text* is selected; the tool's ID and SCHEMA are
 /// never affected (schema variation would change validation/repair behavior).
 ///
-/// Deserialization is hand-written (a [`serde::de::Visitor`]) rather than
-/// `#[serde(untagged)]`: serde_yaml 0.9's untagged path mishandles a
-/// newtype-string-vs-struct mix, silently producing an empty map. The visitor
-/// accepts a scalar string ([`Self::Both`]) or a `{normal, defensive}` map
-/// ([`Self::PerMode`]) directly, so it works under both YAML and JSON.
+/// Deserialization stays hand-written (a [`serde::de::Visitor`]) so scalar
+/// strings can fail with an explicit breaking-change diagnostic while
+/// `{normal, frontier, defensive}` maps continue to work under both YAML and
+/// JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolDescriptionSpec {
-    /// One string used for every mode.
-    Both(String),
     /// Distinct per-mode text; either field may be omitted to fall back to the
     /// tool's own base description for that mode.
     PerMode {
@@ -251,7 +254,6 @@ impl Serialize for ToolDescriptionSpec {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         match self {
-            ToolDescriptionSpec::Both(text) => ser.serialize_str(text),
             ToolDescriptionSpec::PerMode {
                 normal,
                 frontier,
@@ -282,19 +284,23 @@ impl<'de> Deserialize<'de> for ToolDescriptionSpec {
         impl<'de> serde::de::Visitor<'de> for SpecVisitor {
             type Value = ToolDescriptionSpec;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a description string or a `{normal, frontier, defensive}` map")
+                f.write_str("a `{normal, frontier, defensive}` map")
             }
             fn visit_str<E: serde::de::Error>(
                 self,
-                v: &str,
+                _v: &str,
             ) -> std::result::Result<Self::Value, E> {
-                Ok(ToolDescriptionSpec::Both(v.to_string()))
+                Err(E::custom(
+                    "expected a {normal, frontier, defensive} map; a bare string is no longer accepted (set the modes you want to override)",
+                ))
             }
             fn visit_string<E: serde::de::Error>(
                 self,
-                v: String,
+                _v: String,
             ) -> std::result::Result<Self::Value, E> {
-                Ok(ToolDescriptionSpec::Both(v))
+                Err(E::custom(
+                    "expected a {normal, frontier, defensive} map; a bare string is no longer accepted (set the modes you want to override)",
+                ))
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
@@ -328,15 +334,10 @@ impl<'de> Deserialize<'de> for ToolDescriptionSpec {
 
 impl ToolDescriptionSpec {
     /// Project to the engine-level [`crate::engine::tool::ToolDescOverride`].
-    /// A bare string fans out to every mode; the per-mode form maps straight
-    /// across.
+    /// Each per-mode field maps straight across; omitted modes remain `None`
+    /// so the tool's own description for that mode is preserved.
     pub fn to_override(&self) -> crate::engine::tool::ToolDescOverride {
         match self {
-            ToolDescriptionSpec::Both(text) => crate::engine::tool::ToolDescOverride {
-                normal: Some(text.clone()),
-                frontier: Some(text.clone()),
-                defensive: Some(text.clone()),
-            },
             ToolDescriptionSpec::PerMode {
                 normal,
                 frontier,
@@ -348,6 +349,39 @@ impl ToolDescriptionSpec {
             },
         }
     }
+}
+
+fn deserialize_tool_descriptions<'de, D>(
+    de: D,
+) -> std::result::Result<BTreeMap<String, ToolDescriptionSpec>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ToolDescriptionsVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ToolDescriptionsVisitor {
+        type Value = BTreeMap<String, ToolDescriptionSpec>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of tool names to `{normal, frontier, defensive}` maps")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some(tool) = map.next_key::<String>()? {
+                let spec = map.next_value::<ToolDescriptionSpec>().map_err(|err| {
+                    serde::de::Error::custom(format!("tool_descriptions.{tool}: {err}"))
+                })?;
+                out.insert(tool, spec);
+            }
+            Ok(out)
+        }
+    }
+
+    de.deserialize_map(ToolDescriptionsVisitor)
 }
 
 /// Reachability of an agent in the delegation tree. **Not** the
@@ -568,7 +602,7 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         tools: Option<Vec<String>>,
         #[serde(rename = "toolTiers", default)]
         tool_tiers: BTreeMap<String, ToolTier>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_tool_descriptions")]
         tool_descriptions: BTreeMap<String, ToolDescriptionSpec>,
         #[serde(rename = "scanToolResults", default)]
         scan_tool_results: Option<bool>,

@@ -4794,7 +4794,11 @@ mod tests {
         let mut tool_descriptions = std::collections::BTreeMap::new();
         tool_descriptions.insert(
             "read".to_string(),
-            ToolDescriptionSpec::Both("builder: read the file you will edit yourself".to_string()),
+            ToolDescriptionSpec::PerMode {
+                normal: Some("builder: read the file you will edit yourself".to_string()),
+                frontier: None,
+                defensive: None,
+            },
         );
         let def = AgentDef {
             name: "builder".to_string(),

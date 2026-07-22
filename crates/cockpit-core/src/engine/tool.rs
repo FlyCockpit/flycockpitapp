@@ -2169,6 +2169,54 @@ mod llm_mode_tests {
         );
     }
 
+    #[test]
+    fn override_cannot_silently_clobber_defensive_description() {
+        struct FakeTool;
+
+        #[async_trait]
+        impl Tool for FakeTool {
+            fn name(&self) -> &str {
+                "fake"
+            }
+
+            fn description(&self) -> &str {
+                "fake terse"
+            }
+
+            fn defensive_description(&self) -> Option<String> {
+                Some("fake defensive".to_string())
+            }
+
+            fn parameters(&self) -> Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+
+            async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+                Ok(ToolOutput::text(""))
+            }
+        }
+
+        let tool = FakeTool;
+        let ov = ToolDescOverride {
+            normal: Some("normal override only".to_string()),
+            frontier: None,
+            defensive: None,
+        };
+
+        assert_eq!(
+            definition_of(&tool, LlmMode::Normal, Some(&ov)).description,
+            "normal override only"
+        );
+        assert_eq!(
+            definition_of(&tool, LlmMode::Frontier, Some(&ov)).description,
+            tool.description()
+        );
+        assert_eq!(
+            definition_of(&tool, LlmMode::Defensive, Some(&ov)).description,
+            tool.defensive_description().unwrap()
+        );
+    }
+
     /// SAME ID + SAME SCHEMA, DIFFERENT DESCRIPTION: two toolboxes holding the
     /// same tool but different per-agent overrides advertise the same tool ID
     /// and identical parameters, with different description text encoding

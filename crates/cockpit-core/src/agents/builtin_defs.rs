@@ -584,17 +584,25 @@ fn docs_answerer_def() -> AgentDef {
     );
     def.tool_descriptions.insert(
         "grep".to_string(),
-        ToolDescriptionSpec::Both(
-            "Search file contents in this dependency package for a regex; with no shell here, use it to locate code before reading matches."
-                .to_string(),
-        ),
+        ToolDescriptionSpec::PerMode {
+            normal: Some(
+                "Search file contents in this dependency package for a regex; with no shell here, use it to locate code before reading matches."
+                    .to_string(),
+            ),
+            frontier: None,
+            defensive: None,
+        },
     );
     def.tool_descriptions.insert(
         "glob".to_string(),
-        ToolDescriptionSpec::Both(
-            "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them."
-                .to_string(),
-        ),
+        ToolDescriptionSpec::PerMode {
+            normal: Some(
+                "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them."
+                    .to_string(),
+            ),
+            frontier: None,
+            defensive: None,
+        },
     );
     def
 }

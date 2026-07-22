@@ -1253,7 +1253,7 @@ mod tests {
         let path = agents_dir.join("mine.md");
         fs::write(
             &path,
-            "---\ndescription: mine\ntools: [read, search, mcp]\ntoolTiers:\n  search: discoverable\ntool_descriptions:\n  search: custom search\n---\nbody\n",
+            "---\ndescription: mine\ntools: [read, search, mcp]\ntoolTiers:\n  search: discoverable\ntool_descriptions:\n  search:\n    normal: custom search\n---\nbody\n",
         )
         .unwrap();
         let mut d = agents_dialog(&tmp);

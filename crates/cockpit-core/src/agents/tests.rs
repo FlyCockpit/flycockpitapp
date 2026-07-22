@@ -896,7 +896,7 @@ fn next_primary_in_cycle_off_cycle_starts_at_front() {
 // ── Per-agent tool-description overrides ────────────────────────────────────
 
 #[test]
-fn parse_agent_reads_tool_descriptions_bare_and_per_mode() {
+fn parse_agent_reads_tool_descriptions_per_mode() {
     // Raw string so the YAML indentation is preserved literally (a `\`
     // line-continuation would eat the leading spaces and flatten the map).
     let text = r#"---
@@ -904,7 +904,8 @@ description: A custom builder.
 mode: primary
 tools: [read, task]
 tool_descriptions:
-  read: "Read the file you will edit yourself."
+  read:
+    normal: "Read the file you will edit yourself."
   task:
     normal: "Delegate substantive work here."
     frontier: "Delegate only when the work is separable."
@@ -914,20 +915,13 @@ tool_descriptions:
 Body.
 "#;
     let def = parse_agent(text, "builder", "x.md".into()).unwrap();
-    // Bare string fans out to every mode.
     let read = def.tool_descriptions.get("read").unwrap().to_override();
     assert_eq!(
         read.normal.as_deref(),
         Some("Read the file you will edit yourself.")
     );
-    assert_eq!(
-        read.defensive.as_deref(),
-        Some("Read the file you will edit yourself.")
-    );
-    assert_eq!(
-        read.frontier.as_deref(),
-        Some("Read the file you will edit yourself.")
-    );
+    assert_eq!(read.defensive.as_deref(), None);
+    assert_eq!(read.frontier.as_deref(), None);
     // Per-mode object maps straight across.
     let task = def.tool_descriptions.get("task").unwrap().to_override();
     assert_eq!(
@@ -945,13 +939,83 @@ Body.
 }
 
 #[test]
+fn bare_string_tool_description_is_rejected() {
+    let text = r#"---
+description: A custom builder.
+mode: primary
+tools: [grep]
+tool_descriptions:
+  grep: "Search differently."
+---
+
+Body.
+"#;
+    let err = parse_agent(text, "builder", "x.md".into()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("tool_descriptions.grep"), "{msg}");
+    assert!(
+        msg.contains("expected a {normal, frontier, defensive} map"),
+        "{msg}"
+    );
+    assert!(msg.contains("bare string is no longer accepted"), "{msg}");
+}
+
+#[test]
+fn partial_per_mode_tool_description_leaves_other_modes_unset() {
+    let text = r#"---
+description: A custom builder.
+mode: primary
+tools: [grep]
+tool_descriptions:
+  grep:
+    defensive: "Search with explicit defensive guidance."
+---
+
+Body.
+"#;
+    let def = parse_agent(text, "builder", "x.md".into()).unwrap();
+    let grep = def.tool_descriptions.get("grep").unwrap().to_override();
+    assert_eq!(grep.normal.as_deref(), None);
+    assert_eq!(grep.frontier.as_deref(), None);
+    assert_eq!(
+        grep.defensive.as_deref(),
+        Some("Search with explicit defensive guidance.")
+    );
+}
+
+#[test]
+fn unknown_tool_description_mode_key_is_rejected() {
+    let text = r#"---
+description: A custom builder.
+mode: primary
+tools: [grep]
+tool_descriptions:
+  grep:
+    verbose: "Search differently."
+---
+
+Body.
+"#;
+    let err = parse_agent(text, "builder", "x.md".into()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(
+            "unknown tool-description key `verbose` (expected `normal`, `frontier`, or `defensive`)"
+        ),
+        "{msg}"
+    );
+}
+
+#[test]
 fn tool_descriptions_round_trip_through_markdown() {
     let text = r#"---
 description: A custom builder.
 mode: subagent
 tools: [read]
 tool_descriptions:
-  read: "do-it-yourself wording"
+  read:
+    normal: "do-it-yourself wording"
+    defensive: "defensive do-it-yourself wording"
 ---
 
 Body.
@@ -962,6 +1026,17 @@ Body.
     let md = def.to_markdown().unwrap();
     let reparsed = parse_agent(&md, "builder", "x.md".into()).unwrap();
     assert_eq!(def.tool_descriptions, reparsed.tool_descriptions);
+    let read = reparsed
+        .tool_descriptions
+        .get("read")
+        .unwrap()
+        .to_override();
+    assert_eq!(read.normal.as_deref(), Some("do-it-yourself wording"));
+    assert_eq!(read.frontier.as_deref(), None);
+    assert_eq!(
+        read.defensive.as_deref(),
+        Some("defensive do-it-yourself wording")
+    );
 }
 
 #[test]
@@ -973,7 +1048,8 @@ description: d
 mode: subagent
 tools: [read]
 tool_descriptions:
-  bash: "nope, not granted"
+  bash:
+    normal: "nope, not granted"
 ---
 Body.
 "#;
@@ -991,7 +1067,8 @@ description: d
 mode: subagent
 tools: [read]
 tool_descriptions:
-  not_a_tool: "x"
+  not_a_tool:
+    normal: "x"
 ---
 Body.
 "#;
@@ -999,4 +1076,44 @@ Body.
     let err = validate_invariants(&def).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("unknown tool"), "{msg}");
+}
+
+#[test]
+fn docs_answerer_keeps_grep_and_glob_defensive_descriptions() {
+    use crate::config::extended::LlmMode;
+    use crate::engine::tool::{Tool, definition_of};
+    use crate::tools::{glob::GlobTool, grep::GrepTool};
+
+    let def = super::builtin_defs::embedded_internal_default("docs-answerer").unwrap();
+
+    let grep_override = def.tool_descriptions.get("grep").unwrap().to_override();
+    let grep = GrepTool;
+    let grep_docs_text = "Search file contents in this dependency package for a regex; with no shell here, use it to locate code before reading matches.";
+    assert_eq!(
+        definition_of(&grep, LlmMode::Normal, Some(&grep_override)).description,
+        grep_docs_text
+    );
+    assert_eq!(
+        definition_of(&grep, LlmMode::Frontier, Some(&grep_override)).description,
+        grep.description()
+    );
+    assert_eq!(
+        definition_of(&grep, LlmMode::Defensive, Some(&grep_override)).description,
+        grep.defensive_description().unwrap()
+    );
+
+    let glob_override = def.tool_descriptions.get("glob").unwrap().to_override();
+    let glob = GlobTool;
+    assert_eq!(
+        definition_of(&glob, LlmMode::Normal, Some(&glob_override)).description,
+        "List files in this dependency package matching a glob; with no shell here, use it to discover entry points before reading them."
+    );
+    assert_eq!(
+        definition_of(&glob, LlmMode::Frontier, Some(&glob_override)).description,
+        glob.description()
+    );
+    assert_eq!(
+        definition_of(&glob, LlmMode::Defensive, Some(&glob_override)).description,
+        glob.defensive_description().unwrap()
+    );
 }

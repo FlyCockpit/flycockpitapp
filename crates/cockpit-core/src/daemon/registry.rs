@@ -98,6 +98,15 @@ struct WorkerEntry {
 struct WorkerJoin {
     generation: WorkerGeneration,
     join: JoinHandle<()>,
+    _config_watcher: Option<ConfigWatcherJoin>,
+}
+
+struct ConfigWatcherJoin(JoinHandle<()>);
+
+impl Drop for ConfigWatcherJoin {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 struct StartSlot {
@@ -747,7 +756,7 @@ impl SessionRegistry {
             model,
             model_override,
             thinking_params,
-            project_root,
+            project_root.clone(),
             client_no_sandbox,
             extended_cfg,
             self.inner.lsp.clone(),
@@ -773,8 +782,20 @@ impl SessionRegistry {
                     handle: handle.clone(),
                 },
             );
-        crate::sync::lock_or_recover(&self.inner.worker_joins)
-            .insert(session_id, WorkerJoin { generation, join });
+        let config_watcher = crate::daemon::config_watch::spawn_config_watcher(
+            project_root,
+            self.inner.db.clone(),
+            self.inner.config_source.clone(),
+            handle.clone(),
+        );
+        crate::sync::lock_or_recover(&self.inner.worker_joins).insert(
+            session_id,
+            WorkerJoin {
+                generation,
+                join,
+                _config_watcher: config_watcher.map(ConfigWatcherJoin),
+            },
+        );
 
         Ok(handle)
     }
@@ -1086,7 +1107,14 @@ impl SessionRegistry {
                     .get(&session_id)
                     .is_some_and(|entry| entry.generation == generation)
                 {
-                    joins.insert(session_id, WorkerJoin { generation, join });
+                    joins.insert(
+                        session_id,
+                        WorkerJoin {
+                            generation,
+                            join,
+                            _config_watcher: None,
+                        },
+                    );
                 }
                 bail!(
                     "session {session_id} did not stop within {}ms; refusing destructive session mutation",
@@ -1134,8 +1162,14 @@ impl SessionRegistry {
             let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
             next_generation(&mut workers)
         };
-        crate::sync::lock_or_recover(&self.inner.worker_joins)
-            .insert(id, WorkerJoin { generation, join });
+        crate::sync::lock_or_recover(&self.inner.worker_joins).insert(
+            id,
+            WorkerJoin {
+                generation,
+                join,
+                _config_watcher: None,
+            },
+        );
     }
 
     #[cfg(test)]
@@ -1151,8 +1185,14 @@ impl SessionRegistry {
             workers.live.insert(id, WorkerEntry { generation, handle });
             generation
         };
-        crate::sync::lock_or_recover(&self.inner.worker_joins)
-            .insert(id, WorkerJoin { generation, join });
+        crate::sync::lock_or_recover(&self.inner.worker_joins).insert(
+            id,
+            WorkerJoin {
+                generation,
+                join,
+                _config_watcher: None,
+            },
+        );
         generation
     }
 
@@ -1181,8 +1221,14 @@ impl SessionRegistry {
         let join = tokio::spawn(async move {
             cleanup_worker_on_exit(weak, id, generation);
         });
-        crate::sync::lock_or_recover(&self.inner.worker_joins)
-            .insert(id, WorkerJoin { generation, join });
+        crate::sync::lock_or_recover(&self.inner.worker_joins).insert(
+            id,
+            WorkerJoin {
+                generation,
+                join,
+                _config_watcher: None,
+            },
+        );
     }
 }
 
@@ -1196,20 +1242,20 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn test_registry() -> SessionRegistry {
+        test_registry_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            ProvidersConfig::default(),
+            ExtendedConfig::default(),
+        ))
+    }
+
+    fn test_registry_with_config_source(
+        config_source: crate::daemon::config_source::ConfigSource,
+    ) -> SessionRegistry {
         // The DB + lock manager aren't touched by `drain_all`; point them at
         // a throwaway in-memory DB so construction never hits user state.
         let db = Db::open_in_memory().expect("in-memory db");
         let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
-        SessionRegistry::new(
-            db,
-            locks,
-            ShutdownSignal::new(),
-            None,
-            crate::daemon::config_source::ConfigSource::fixed(
-                ProvidersConfig::default(),
-                ExtendedConfig::default(),
-            ),
-        )
+        SessionRegistry::new(db, locks, ShutdownSignal::new(), None, config_source)
     }
 
     fn test_session(reg: &SessionRegistry) -> Arc<Session> {
@@ -1346,6 +1392,77 @@ mod tests {
         assert!(!reg.any_agent_running());
         assert_eq!(reg.live_status(id), None);
         assert!(matches!(reg.claim_attach(id), AttachClaim::Start(_)));
+    }
+
+    #[tokio::test]
+    async fn config_watcher_setup_failure_does_not_fail_session_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing-layer");
+        let source = crate::daemon::config_source::ConfigSource::new(
+            |_cwd| Ok((providers_for_btw_model_tests(), ExtendedConfig::default())),
+            |_cwd, _provider_id| None,
+            move |_cwd| {
+                crate::daemon::config_source::ConfigWatchPaths::new(
+                    vec![missing.join("config.json")],
+                    vec![missing.join("providers")],
+                )
+            },
+        );
+        let reg = test_registry_with_config_source(source);
+        reg.inner
+            .db
+            .set_workspace_trust(
+                tmp.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .unwrap();
+
+        let handle = reg
+            .attach(
+                None,
+                Some(tmp.path().to_path_buf()),
+                false,
+                None,
+                EnvSnapshot::new(
+                    crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                    Default::default(),
+                ),
+            )
+            .await
+            .expect("missing watch paths must not fail session start");
+
+        assert!(reg.lookup(handle.session_id).is_some());
+        reg.forget(handle.session_id);
+    }
+
+    #[tokio::test]
+    async fn config_watcher_task_is_aborted_on_session_forget() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let id = session.id;
+        let handle = test_handle(&reg, session);
+        let generation = reg.insert_test_worker_without_join(handle);
+        let config_watcher = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = config_watcher.abort_handle();
+        let join = tokio::spawn(async {});
+        crate::sync::lock_or_recover(&reg.inner.worker_joins).insert(
+            id,
+            WorkerJoin {
+                generation,
+                join,
+                _config_watcher: Some(ConfigWatcherJoin(config_watcher)),
+            },
+        );
+
+        reg.forget(id);
+
+        for _ in 0..100 {
+            if abort_handle.is_finished() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("forget should abort config watcher task");
     }
 
     #[test]

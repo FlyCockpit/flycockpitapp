@@ -1564,7 +1564,7 @@ fn engine_reads_config_through_session_handle() {
             .model
     );
     // A re-resolution bumps the generation the live handle observes.
-    let generation = replace_config_snapshot(
+    let result = replace_config_snapshot(
         &shared,
         SessionConfigSnapshot::new(
             0,
@@ -1572,7 +1572,8 @@ fn engine_reads_config_through_session_handle() {
             crate::config::extended::ExtendedConfig::default(),
         ),
     );
-    assert_eq!(generation, 1);
+    assert!(result.changed);
+    assert_eq!(result.generation, 1);
     assert_eq!(handle.generation(), 1);
 }
 
@@ -1745,9 +1746,19 @@ fn provider_view_requires_no_client_side_secret_resolution() {
 }
 
 #[test]
-fn config_snapshot_generation_increments_on_reresolve() {
+fn replace_config_snapshot_unchanged_values_do_not_bump_generation() {
     let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
-    let generation = replace_config_snapshot(
+    let replacement = snapshot.read().unwrap().clone();
+    let result = replace_config_snapshot(&snapshot, replacement);
+    assert!(!result.changed);
+    assert_eq!(result.generation, 0);
+    assert_eq!(snapshot.read().unwrap().generation, 0);
+}
+
+#[test]
+fn replace_config_snapshot_changed_values_bump_generation() {
+    let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
+    let result = replace_config_snapshot(
         &snapshot,
         SessionConfigSnapshot::new(
             0,
@@ -1755,7 +1766,8 @@ fn config_snapshot_generation_increments_on_reresolve() {
             crate::config::extended::ExtendedConfig::default(),
         ),
     );
-    assert_eq!(generation, 1);
+    assert!(result.changed);
+    assert_eq!(result.generation, 1);
 }
 
 #[test]
@@ -1867,6 +1879,22 @@ fn worker_broadcast_delivers_config_snapshot_to_subscriber() {
         proto::Event::ConfigSnapshot { snapshot }
             if snapshot.session_id == handle.session_id && snapshot.generation == 1
     ));
+}
+
+#[test]
+fn replace_config_snapshot_no_change_emits_no_config_snapshot_event() {
+    let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(16);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+    let session_id = Uuid::new_v4();
+    let replacement = snapshot.read().unwrap().clone();
+
+    let result = replace_config_snapshot(&snapshot, replacement);
+    let generation =
+        send_config_snapshot_event_if_changed(&event_tx, &redaction, &snapshot, session_id, result);
+
+    assert_eq!(generation, 0);
+    assert!(event_rx.try_recv().is_err());
 }
 
 #[test]
@@ -2014,24 +2042,33 @@ fn session_scoped_code_has_no_direct_config_reads() {
 
 #[test]
 fn config_reresolve_rereads_trust_policy() {
-    let dispatch = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/server/dispatch.rs"),
-    )
-    .unwrap();
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dispatch =
+        std::fs::read_to_string(manifest_dir.join("src/daemon/server/dispatch.rs")).unwrap();
     let refresh = dispatch
         .split("Request::RefreshConfig =>")
         .nth(1)
         .and_then(|tail| tail.split("Request::RecordUsage").next())
         .expect("RefreshConfig dispatch arm");
-    let trust_pos = refresh
+    assert!(
+        refresh.contains("refresh_session_config"),
+        "dispatch refresh arm should call the shared config refresh helper"
+    );
+
+    let shared = std::fs::read_to_string(manifest_dir.join("src/daemon/config_refresh.rs"))
+        .expect("shared config refresh helper");
+    let trust_pos = shared
         .find("resolve_workspace_trust_policy_from_db")
         .expect("refresh re-reads trust policy");
-    let load_pos = refresh
+    let load_pos = shared
         .find("load_with_trust")
         .expect("refresh loads through ConfigSource with trust");
+    let replace_pos = shared
+        .find("ReplaceConfigSnapshot")
+        .expect("refresh sends replacement through session worker");
     assert!(
-        trust_pos < load_pos,
-        "trust must be re-read before config load"
+        trust_pos < load_pos && load_pos < replace_pos,
+        "trust must be re-read before config load and worker replacement"
     );
 }
 

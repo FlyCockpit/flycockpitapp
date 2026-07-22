@@ -6444,6 +6444,7 @@ async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
             }
         },
         |_cwd, _provider_id| None,
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
     );
     let ctx = test_ctx_with_config_source(source);
     ctx.db
@@ -8624,6 +8625,7 @@ async fn list_models_respects_workspace_trust() {
             Ok((cfg, crate::config::extended::ExtendedConfig::default()))
         },
         |_cwd, _provider_id| None,
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
     );
     let ctx = test_ctx_with_config_source(source);
     let tmp = tempfile::tempdir().unwrap();

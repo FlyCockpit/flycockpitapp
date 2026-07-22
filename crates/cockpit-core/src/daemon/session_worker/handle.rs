@@ -332,17 +332,71 @@ pub(super) fn redacted_provider_view(
     crate::secret_ref::redact_provider_view(providers)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReplaceConfigSnapshotResult {
+    pub(super) generation: u64,
+    pub(super) changed: bool,
+}
+
 pub(super) fn replace_config_snapshot(
     config_snapshot: &Arc<RwLock<SessionConfigSnapshot>>,
     replacement: SessionConfigSnapshot,
-) -> u64 {
+) -> ReplaceConfigSnapshotResult {
     let mut snapshot = config_snapshot
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if config_snapshots_equal(&snapshot, &replacement) {
+        return ReplaceConfigSnapshotResult {
+            generation: snapshot.generation,
+            changed: false,
+        };
+    }
     snapshot.generation = snapshot.generation.saturating_add(1);
     snapshot.providers = replacement.providers;
     snapshot.extended = replacement.extended;
-    snapshot.generation
+    ReplaceConfigSnapshotResult {
+        generation: snapshot.generation,
+        changed: true,
+    }
+}
+
+pub(super) fn send_config_snapshot_event_if_changed(
+    event_tx: &EventSender,
+    redaction: &SharedRedactionTable,
+    config_snapshot: &Arc<RwLock<SessionConfigSnapshot>>,
+    session_id: Uuid,
+    result: ReplaceConfigSnapshotResult,
+) -> u64 {
+    if result.changed {
+        send_current_event(
+            event_tx,
+            redaction,
+            proto::Event::ConfigSnapshot {
+                snapshot: Box::new(
+                    config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .to_proto(session_id),
+                ),
+            },
+        );
+    }
+    result.generation
+}
+
+fn config_snapshots_equal(
+    current: &SessionConfigSnapshot,
+    replacement: &SessionConfigSnapshot,
+) -> bool {
+    serialize_equal(&current.providers, &replacement.providers)
+        && serialize_equal(&current.extended, &replacement.extended)
+}
+
+fn serialize_equal<T: serde::Serialize>(left: &T, right: &T) -> bool {
+    match (serde_json::to_value(left), serde_json::to_value(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 pub(super) fn sandbox_unavailable_notice_from_availability(

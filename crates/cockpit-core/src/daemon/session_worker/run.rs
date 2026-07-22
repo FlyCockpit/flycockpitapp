@@ -1352,18 +1352,13 @@ pub(super) async fn run_worker(
                     snapshot,
                     respond_to,
                 } => {
-                    let generation = replace_config_snapshot(&config_snapshot, *snapshot);
-                    send_current_event(
+                    let result = replace_config_snapshot(&config_snapshot, *snapshot);
+                    let generation = send_config_snapshot_event_if_changed(
                         &event_tx,
                         &redaction,
-                        proto::Event::ConfigSnapshot {
-                            snapshot: Box::new(
-                                config_snapshot
-                                    .read()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .to_proto(session_id),
-                            ),
-                        },
+                        &config_snapshot,
+                        session_id,
+                        result,
                     );
                     let _ = respond_to.send(generation);
                 }

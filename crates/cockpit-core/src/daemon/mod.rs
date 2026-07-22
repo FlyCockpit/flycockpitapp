@@ -24,7 +24,9 @@
 
 pub mod caffeinate;
 pub mod client;
+pub(crate) mod config_refresh;
 pub mod config_source;
+pub(crate) mod config_watch;
 pub mod connector;
 pub mod ephemeral_guard;
 pub mod fs_api;

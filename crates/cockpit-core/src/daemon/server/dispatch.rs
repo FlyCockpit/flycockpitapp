@@ -978,34 +978,14 @@ pub(super) async fn handle_request(
 
         Request::RefreshConfig => {
             let att = require_attached(state)?;
-            let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(
+            let _generation = crate::daemon::config_refresh::refresh_session_config(
                 &ctx.db,
-                &att.handle.project_root,
+                ctx.config_source(),
+                &att.handle,
+                None,
             )
+            .await
             .map_err(internal)?;
-            let (providers, extended) = match ctx
-                .config_source()
-                .load_with_trust(&att.handle.project_root, &trust_policy)
-            {
-                Ok(configs) => configs,
-                Err(error) => {
-                    att.handle.broadcast_notice(format!(
-                        "Config refresh failed; keeping the last good snapshot: {error:#}"
-                    ));
-                    return Ok(Response::Ack);
-                }
-            };
-            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
-            att.handle
-                .send_work(SessionWork::ReplaceConfigSnapshot {
-                    snapshot: Box::new(crate::daemon::session_worker::SessionConfigSnapshot::new(
-                        0, providers, extended,
-                    )),
-                    respond_to,
-                })
-                .await
-                .map_err(internal)?;
-            let _generation = response_rx.await.map_err(internal)?;
             Ok(Response::Ack)
         }
 

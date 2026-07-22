@@ -2764,8 +2764,15 @@ fn read_only_error(message: impl Into<String>) -> ErrorPayload {
     }
 }
 
-include!("authz.rs");
-include!("attachments.rs");
-include!("dispatch.rs");
-include!("sessions.rs");
-include!("tests.rs");
+mod attachments;
+mod authz;
+mod dispatch;
+mod sessions;
+#[cfg(test)]
+mod tests;
+
+use self::dispatch::handle_request;
+
+pub use attachments::validate_png_attachment_blocking;
+pub use dispatch::request_shutdown;
+pub(crate) use dispatch::spawn_lock_sweeper;

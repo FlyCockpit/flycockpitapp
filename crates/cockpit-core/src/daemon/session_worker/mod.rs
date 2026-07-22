@@ -419,8 +419,20 @@ impl LiveForegroundState {
     }
 }
 
-include!("handle.rs");
-include!("run.rs");
-include!("lifecycle.rs");
-include!("helpers.rs");
-include!("tests.rs");
+mod handle;
+mod helpers;
+mod lifecycle;
+mod run;
+#[cfg(test)]
+mod tests;
+
+use self::helpers::queue_target_to_proto;
+
+pub use handle::{
+    InteractiveClientGuard, SessionConfigHandle, SessionConfigSnapshot, SessionWork,
+    SessionWorkerHandle, spawn,
+};
+pub use helpers::DAEMON_NO_SANDBOX_ENV;
+#[allow(unused_imports)]
+pub(crate) use helpers::{resolve_root_agent, resolve_root_agent_conn};
+pub(crate) use lifecycle::initial_active_agent;

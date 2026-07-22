@@ -1,13 +1,18 @@
-const INTERRUPT_REDACTION_FAILED: &str = "[redaction failed]";
+use super::handle::*;
+use super::helpers::*;
+use super::lifecycle::*;
+use super::*;
 
-struct ParkedReplayCompletion {
+pub(super) const INTERRUPT_REDACTION_FAILED: &str = "[redaction failed]";
+
+pub(super) struct ParkedReplayCompletion {
     interrupt_id: uuid::Uuid,
     decision: Option<proto::InterruptDecision>,
     was_active: bool,
     result: std::result::Result<(), String>,
 }
 
-fn redaction_failed_interrupt_decision_payload(
+pub(super) fn redaction_failed_interrupt_decision_payload(
     interrupt_id: uuid::Uuid,
     decision: &crate::daemon::proto::InterruptDecision,
 ) -> serde_json::Value {
@@ -31,7 +36,7 @@ fn redaction_failed_interrupt_decision_payload(
     })
 }
 
-fn record_interrupt_decision_event(
+pub(super) fn record_interrupt_decision_event(
     session: &Session,
     redaction: &SharedRedactionTable,
     interrupt_id: uuid::Uuid,
@@ -64,7 +69,7 @@ fn record_interrupt_decision_event(
         .ok()
 }
 
-fn finish_parked_replay_completion(
+pub(super) fn finish_parked_replay_completion(
     session: &Session,
     event_tx: &EventSender,
     redaction: &SharedRedactionTable,
@@ -127,7 +132,7 @@ fn finish_parked_replay_completion(
     }
 }
 
-fn validate_parked_interrupt_payload(
+pub(super) fn validate_parked_interrupt_payload(
     row: &crate::db::needs_attention::NeedsAttentionRow,
 ) -> std::result::Result<(), &'static str> {
     let Some(payload) = row.parked.as_ref() else {
@@ -148,43 +153,8 @@ fn validate_parked_interrupt_payload(
     Ok(())
 }
 
-#[cfg(test)]
-mod interrupt_redaction_tests {
-    use super::*;
-
-    #[test]
-    fn redaction_failure_payload_preserves_shape_without_raw_interrupt_text() {
-        let interrupt_id = uuid::Uuid::new_v4();
-        let decision = crate::daemon::proto::InterruptDecision {
-            permission: true,
-            cancelled: false,
-            lines: vec![crate::daemon::proto::InterruptDecisionLine {
-                prompt: "Run `cat /tmp/secret`?".to_string(),
-                answer: "Allow once".to_string(),
-            }],
-        };
-
-        let payload = redaction_failed_interrupt_decision_payload(interrupt_id, &decision);
-        let serialized = payload.to_string();
-
-        assert_eq!(payload["interrupt_id"], interrupt_id.to_string());
-        assert_eq!(payload["decision"]["permission"], true);
-        assert_eq!(payload["decision"]["cancelled"], false);
-        assert_eq!(
-            payload["decision"]["lines"][0]["prompt"],
-            INTERRUPT_REDACTION_FAILED
-        );
-        assert_eq!(
-            payload["decision"]["lines"][0]["answer"],
-            INTERRUPT_REDACTION_FAILED
-        );
-        assert!(!serialized.contains("/tmp/secret"));
-        assert!(!serialized.contains("Allow once"));
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-async fn run_worker(
+pub(super) async fn run_worker(
     session: Arc<Session>,
     locks: Arc<LockManager>,
     redact: Arc<RedactionTable>,
@@ -225,7 +195,8 @@ async fn run_worker(
     // `/model` change, which restarts the worker on the new active model). A
     // live `/llm-mode` toggle still overrides this for the running session via
     // `DriverControl::SetLlmMode`.
-    let llm_mode = resolve_effective_llm_mode(&session, &start_config.providers, extended_cfg.llm_mode);
+    let llm_mode =
+        resolve_effective_llm_mode(&session, &start_config.providers, extended_cfg.llm_mode);
     // Root primary: the session's stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap or whichever primary `Auto` handed off
     // to, `plan.md §4.6.d`), falling back to the configured default
@@ -391,9 +362,7 @@ async fn run_worker(
                 }
                 proto::Event::AgentIdle { .. } => {
                     live_for_forward.processing.store(false, Ordering::Relaxed);
-                    live_for_forward
-                        .tool_running
-                        .store(0, Ordering::Relaxed);
+                    live_for_forward.tool_running.store(0, Ordering::Relaxed);
                     // Last-detach-while-idle edge, idle side
                     // (implementation note): the turn just finished, so if no
                     // interactive client is attached, release this session's locks now.
@@ -885,62 +854,32 @@ async fn run_worker(
                 );
             }
             WorkerInput::Work(work) => match work {
-            SessionWork::UserMessage {
-                submission,
-                respond_to,
-            } => {
-                if let Some(state) = repair_required
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-                {
-                    let ids = if state.failing_tool_call_ids.is_empty() {
-                        "unknown tool id".to_string()
-                    } else {
-                        state.failing_tool_call_ids.join(", ")
-                    };
-                    send_current_session_event(
-                        &session,
-                        &event_tx,
-                        &redaction,
-                        proto::Event::Notice {
-                            session_id,
-                            text: format!(
-                                "Read-only resume: refusing to send model context until Responses repair is resolved ({}: {}). Use the resume repair dialog, fork, or export a debug bundle.",
-                                state.failure_kind, ids
-                            ),
-                        },
-                        NoticeSource::DaemonDirect,
-                    );
-                    let _ = respond_to.send((
-                        proto::QueueItem {
-                            id: Uuid::nil(),
-                            status: proto::QueueItemStatus::Folding,
-                            text: String::new(),
-                            display_text: None,
-                            target: proto::QueueTarget::default(),
-                        },
-                        Vec::new(),
-                    ));
-                    continue;
-                }
-                // Lazy persistence (session-id-display-and-lazy-persist): the
-                // first user message is what commits the `sessions` row.
-                // Flush it *before* `touch()` and before the driver runs, so
-                // the row exists ahead of any dependent write (tool_calls,
-                // inference_calls, locks). A persist failure aborts the
-                // message rather than letting dependents reference a missing
-                // row.
-                match session.persist_if_needed() {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let error = format!("{e:#}");
-                        tracing::error!(error = %error, session_id = %session_id,
-                            "persisting session on first message failed; dropping message");
-                        send_current_event(
+                SessionWork::UserMessage {
+                    submission,
+                    respond_to,
+                } => {
+                    if let Some(state) = repair_required
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                    {
+                        let ids = if state.failing_tool_call_ids.is_empty() {
+                            "unknown tool id".to_string()
+                        } else {
+                            state.failing_tool_call_ids.join(", ")
+                        };
+                        send_current_session_event(
+                            &session,
                             &event_tx,
                             &redaction,
-                            proto::Event::SessionPersistFailed { session_id, error },
+                            proto::Event::Notice {
+                                session_id,
+                                text: format!(
+                                    "Read-only resume: refusing to send model context until Responses repair is resolved ({}: {}). Use the resume repair dialog, fork, or export a debug bundle.",
+                                    state.failure_kind, ids
+                                ),
+                            },
+                            NoticeSource::DaemonDirect,
                         );
                         let _ = respond_to.send((
                             proto::QueueItem {
@@ -954,721 +893,261 @@ async fn run_worker(
                         ));
                         continue;
                     }
-                }
-                if let Err(e) = session.touch() {
-                    tracing::warn!(error = %e, "session touch failed");
-                }
-                let session_env = env_overlay
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                let base_redact = {
-                    let snapshot = config_snapshot
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    snapshot.extended.redact.clone()
-                };
-                if !refresh_redaction_for_turn(
-                    &session,
-                    session_id,
-                    &project_root,
-                    base_redact,
-                    &redaction_overrides,
-                    &mut unsupported_redaction_notified,
-                    &redaction,
-                    &event_tx,
-                    &driver_control_tx,
-                    &session_env,
-                )
-                .await
-                {
-                    emit_session_driver_failed_once(
-                        &event_tx,
-                        &redaction,
-                        session_id,
-                        &mut driver_failed,
-                        "driver control channel closed".to_string(),
-                    );
-                    let _ = respond_to.send((
-                        proto::QueueItem {
-                            id: Uuid::nil(),
-                            status: proto::QueueItemStatus::Folding,
-                            text: String::new(),
-                            display_text: None,
-                            target: proto::QueueTarget::default(),
-                        },
-                        Vec::new(),
-                    ));
-                    break WorkerStop::DriverFailed;
-                }
-                let max_rounds = {
-                    let snapshot = config_snapshot
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    max_primary_rounds_for(&snapshot.extended)
-                };
-                if !send_driver_control_or_fail(
-                    &driver_control_tx,
-                    crate::engine::driver::DriverControl::SetMaxPrimaryRounds { max_rounds },
-                    &event_tx,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                )
-                .await
-                {
-                    let _ = respond_to.send((
-                        proto::QueueItem {
-                            id: Uuid::nil(),
-                            status: proto::QueueItemStatus::Folding,
-                            text: String::new(),
-                            display_text: None,
-                            target: proto::QueueTarget::default(),
-                        },
-                        Vec::new(),
-                    ));
-                    break WorkerStop::DriverFailed;
-                }
-                let target = foreground_input_target
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                let (id, snapshot) = driver_input_queue.push(*submission, target).await;
-                let queue: Vec<proto::QueueItem> =
-                    snapshot.into_iter().map(queue_item_to_proto).collect();
-                let item =
-                    queue
-                        .iter()
-                        .find(|item| item.id == id)
-                        .cloned()
-                        .unwrap_or(proto::QueueItem {
-                            id,
-                            status: proto::QueueItemStatus::Folding,
-                            text: String::new(),
-                            display_text: None,
-                            target: proto::QueueTarget::default(),
-                        });
-                let _ = respond_to.send((item, queue));
-            }
-            SessionWork::SteerDelegation {
-                task_call_id,
-                label,
-                message,
-                origin_principal,
-                respond_to,
-            } => {
-                let result = steer_delegation_side_channel(
-                    &session,
-                    &redact,
-                    task_call_id,
-                    label,
-                    message,
-                    origin_principal,
-                );
-                let _ = respond_to.send(result);
-            }
-            SessionWork::RemoveQueuedUserMessage {
-                queue_item_id,
-                respond_to,
-            } => {
-                let (result, snapshot) = driver_input_queue.remove(queue_item_id).await;
-                let reason = remove_reason_to_proto(result);
-                let _ = respond_to.send(proto::RemoveQueuedUserMessageResult {
-                    applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
-                    reason,
-                    removed_item: None,
-                    queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
-                });
-            }
-            SessionWork::RemoveNewestQueuedUserMessage {
-                target_id,
-                respond_to,
-            } => {
-                let target_id = target_id.unwrap_or_else(|| {
-                    foreground_input_target
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .id
-                        .clone()
-                });
-                let (result, removed_item, snapshot) =
-                    driver_input_queue.remove_newest_for(&target_id).await;
-                let reason = remove_reason_to_proto(result);
-                let _ = respond_to.send(proto::RemoveQueuedUserMessageResult {
-                    applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
-                    reason,
-                    removed_item: removed_item.map(queue_item_to_proto),
-                    queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
-                });
-            }
-            SessionWork::RemoveEditableQueuedUserMessages {
-                target_id,
-                respond_to,
-            } => {
-                let target_id = target_id.unwrap_or_else(|| {
-                    foreground_input_target
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .id
-                        .clone()
-                });
-                let (result, removed_items, snapshot) =
-                    driver_input_queue.remove_editable_for(&target_id).await;
-                let reason = remove_reason_to_proto(result);
-                let _ = respond_to.send(proto::RemoveQueuedUserMessagesResult {
-                    applied: !removed_items.is_empty(),
-                    reason,
-                    removed_items: removed_items.into_iter().map(queue_item_to_proto).collect(),
-                    queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
-                });
-            }
-            SessionWork::RepublishQueue => {
-                driver_input_queue.republish().await;
-            }
-            SessionWork::Cancel => {
-                // User ctrl+c (`CancelTurn`). Fire the in-flight run's
-                // cancellation token: the driver's `turn` aborts the
-                // streaming inference (returning an `InferenceCancelled`
-                // sentinel that unwinds the run cleanly), and any running
-                // `bash` subprocess is killed via its process group. Safe
-                // and idempotent at idle / mid-cancel — `CancelHandle::cancel`
-                // is a no-op when no run is in flight. The driver then emits
-                // `AgentIdle`, clearing the TUI's busy state.
-                tracing::info!(session_id = %session_id, "cancel requested");
-                cancel_handle.cancel();
-            }
-            SessionWork::ResolveInterrupt {
-                interrupt_id,
-                response,
-            } => {
-                let row = session.db.get_interrupt(interrupt_id).ok().flatten();
-                let was_active = session
-                    .db
-                    .list_open_interrupts(session_id)
-                    .ok()
-                    .and_then(|open| open.first().map(|row| row.interrupt_id))
-                    == Some(interrupt_id);
-                let decision = row.as_ref().map(|row| {
-                    crate::db::needs_attention::summarize_interrupt_decision(row, &response)
-                });
-                if let Some(row) = row.as_ref()
-                    && row.state == crate::db::needs_attention::InterruptState::Parked
-                {
-                    let claimed = match session
-                        .db
-                        .begin_parked_interrupt_execution(interrupt_id, &response)
-                    {
-                        Ok(claimed) => claimed,
-                        Err(error) => {
-                            tracing::warn!(%error, %interrupt_id, "claiming parked interrupt failed");
-                            false
-                        }
-                    };
-                    if !claimed {
-                        interrupts.emit_queue_state();
-                        continue;
-                    }
-                    // Process-boundary lifecycle tests kill the daemon while
-                    // a parked replay is durably `executing`. The hook is
-                    // debug-build + env-gated, so release production binaries
-                    // cannot enter this pause.
-                    if cfg!(debug_assertions)
-                        && std::env::var_os("COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING")
-                            .is_some()
-                    {
-                        loop {
-                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    // Lazy persistence (session-id-display-and-lazy-persist): the
+                    // first user message is what commits the `sessions` row.
+                    // Flush it *before* `touch()` and before the driver runs, so
+                    // the row exists ahead of any dependent write (tool_calls,
+                    // inference_calls, locks). A persist failure aborts the
+                    // message rather than letting dependents reference a missing
+                    // row.
+                    match session.persist_if_needed() {
+                        Ok(_) => {}
+                        Err(e) => {
+                            let error = format!("{e:#}");
+                            tracing::error!(error = %error, session_id = %session_id,
+                            "persisting session on first message failed; dropping message");
+                            send_current_event(
+                                &event_tx,
+                                &redaction,
+                                proto::Event::SessionPersistFailed { session_id, error },
+                            );
+                            let _ = respond_to.send((
+                                proto::QueueItem {
+                                    id: Uuid::nil(),
+                                    status: proto::QueueItemStatus::Folding,
+                                    text: String::new(),
+                                    display_text: None,
+                                    target: proto::QueueTarget::default(),
+                                },
+                                Vec::new(),
+                            ));
+                            continue;
                         }
                     }
-                    let Some(payload) = row.parked.clone() else {
-                        let _ = session.db.mark_interrupt_interrupted(interrupt_id);
-                        send_current_session_event(
-                            &session,
-                            &event_tx,
-                            &redaction,
-                            proto::Event::Notice {
-                                session_id,
-                                text: format!(
-                                    "Interrupted parked request {interrupt_id}: missing replay payload."
-                                ),
-                            },
-                            NoticeSource::DaemonDirect,
-                        );
-                        interrupts.emit_queue_state();
-                        continue;
-                    };
-                    let driver_control_tx = driver_control_tx.clone();
-                    let replay_completion_tx = replay_completion_tx.clone();
-                    let replay_response = response.clone();
-                    tokio::spawn(async move {
-                        let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
-                        let result = if driver_control_tx
-                            .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
-                                interrupt_id,
-                                payload,
-                                response: replay_response,
-                                respond_to,
-                            })
-                            .await
-                            .is_ok()
-                        {
-                            replay_result_rx.await.unwrap_or_else(|error| {
-                                Err(format!("driver replay response dropped: {error}"))
-                            })
-                        } else {
-                            Err("driver is not available for parked interrupt replay".to_string())
-                        };
-                        let _ = replay_completion_tx
-                            .send(ParkedReplayCompletion {
-                                interrupt_id,
-                                decision,
-                                was_active,
-                                result,
-                            })
-                            .await;
-                    });
-                    continue;
-                }
-                if let Err(e) = session.db.resolve_interrupt(interrupt_id, &response) {
-                    tracing::warn!(error = %e, %interrupt_id, "resolve_interrupt failed");
-                    interrupts.emit_queue_state();
-                    continue;
-                }
-                let seq = decision.as_ref().and_then(|decision| {
-                    record_interrupt_decision_event(&session, &redaction, interrupt_id, decision)
-                });
-                send_current_event(
-                    &event_tx,
-                    &redaction,
-                    proto::Event::InterruptResolved {
-                        session_id,
-                        interrupt_id,
-                        decision,
-                        seq,
-                    },
-                );
-                // Engine-side wakeup (GOALS §3b): hand the resolution to
-                // whatever tool call is blocked on this interrupt id (the
-                // `question` tool). `false` just means nobody was blocked
-                // locally — e.g. a `schedule` needs-attention nudge — and the
-                // DB row update above is the only effect.
-                interrupts.resolve(interrupt_id, response);
-                if was_active {
-                    interrupts.emit_active_from_db();
-                } else {
-                    interrupts.emit_queue_state();
-                }
-            }
-            SessionWork::RepairResume { respond_to } => {
-                let Some(state) = repair_required
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-                else {
-                    let _ = respond_to.send(Err(
-                        "no Responses resume repair is pending for this session".to_string(),
-                    ));
-                    continue;
-                };
-                let (driver_respond_to, driver_response_rx) = oneshot::channel();
-                if driver_control_tx
-                    .send(crate::engine::driver::DriverControl::RepairResume {
-                        root_agent: root_agent_name.clone(),
-                        respond_to: driver_respond_to,
-                    })
-                    .await
-                    .is_err()
-                {
-                    let message = "driver control channel closed".to_string();
-                    emit_session_driver_failed_once(
-                        &event_tx,
-                        &redaction,
-                        session_id,
-                        &mut driver_failed,
-                        message.clone(),
-                    );
-                    let _ = respond_to.send(Err(message));
-                    break WorkerStop::DriverFailed;
-                }
-                match driver_response_rx.await {
-                    Ok(Ok(heal_count)) => {
-                        {
-                            let mut slot = repair_required
-                                .write()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            *slot = None;
-                        }
-                        let text = format!(
-                            "Responses resume repair approved: synthetic resume heal applied to {heal_count} tool call(s)."
-                        );
-                        if let Err(error) = session.record_event(
-                            crate::db::session_log::SessionEventKind::UserNote,
-                            Some(&root_agent_name),
-                            None,
-                            &serde_json::json!({
-                                "text": text,
-                                "resume_repair": {
-                                    "approved": true,
-                                    "failure_kind": state.failure_kind,
-                                    "failing_tool_call_ids": state.failing_tool_call_ids,
-                                    "provider": state.provider,
-                                    "model": state.model,
-                                    "wire_api": state.wire_api,
-                                    "synthetic_heal_count": heal_count,
-                                    "detail": state.detail,
-                                }
-                            }),
-                        ) {
-                            tracing::warn!(%error, %session_id, "record resume repair provenance failed");
-                        }
-                        send_current_session_event(
-                            &session,
-                            &event_tx,
-                            &redaction,
-                            proto::Event::Notice { session_id, text },
-                            NoticeSource::DaemonDirect,
-                        );
-                        let _ = respond_to.send(Ok(()));
-                    }
-                    Ok(Err(message)) => {
-                        let _ = respond_to
-                            .send(Err(format!("explicit Responses repair failed: {message}")));
-                    }
-                    Err(error) => {
-                        let _ = respond_to
-                            .send(Err(format!("explicit Responses repair failed: {error}")));
-                    }
-                }
-            }
-            SessionWork::SetActiveModel {
-                provider,
-                model,
-                trigger,
-                reasoning_effort,
-                thinking_mode,
-            } => {
-                // Mid-session model switch (implementation note):
-                // route the new `(provider, model)` to the running driver. The
-                // driver owns the whole daemon-side transaction: build first,
-                // then session/config persistence, then the root-primary swap
-                // and authoritative active-model state event. Legitimate
-                // config/session drift (for example an on-disk edit while the
-                // session is live) is reported back to every attached client
-                // instead of being silently reconciled here.
-                if !send_driver_control_or_fail(
-                    &driver_control_tx,
-                    crate::engine::driver::DriverControl::SetActiveModel {
-                        provider,
-                        model,
-                        trigger,
-                        reasoning_effort,
-                        thinking_mode,
-                    },
-                    &event_tx,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                )
-                .await
-                {
-                    break WorkerStop::DriverFailed;
-                }
-            }
-            SessionWork::ReplaceConfigSnapshot {
-                snapshot,
-                respond_to,
-            } => {
-                let generation = replace_config_snapshot(&config_snapshot, *snapshot);
-                send_current_event(
-                    &event_tx,
-                    &redaction,
-                    proto::Event::ConfigSnapshot {
-                        snapshot: Box::new(
-                            config_snapshot
-                                .read()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .to_proto(session_id),
-                        ),
-                    },
-                );
-                let _ = respond_to.send(generation);
-            }
-            SessionWork::SetAgent { name } => {
-                // Persist the active-agent choice so a resume restarts on it,
-                // then swap the live primary in place at the idle boundary
-                // (`/plan` → `Plan`, `/build` → `Build`, `plan.md §4.6.d`).
-                if let Err(e) = session.set_active_agent(&name) {
-                    tracing::warn!(error = %e, "set_active_agent failed");
-                }
-                if !send_driver_control_or_fail(
-                    &driver_control_tx,
-                    crate::engine::driver::DriverControl::SwapPrimary { name },
-                    &event_tx,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                )
-                .await
-                {
-                    break WorkerStop::DriverFailed;
-                }
-            }
-            SessionWork::SetLlmMode { mode } => {
-                // Resolve toggle against the current config value (the
-                // single source of truth shared with `/settings` + the
-                // config file), persist the resolved value so a resume keeps
-                // it, then route the explicit mode to the driver to rebuild
-                // the root agent in place.
-                let current = config_snapshot
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .extended
-                    .llm_mode;
-                let resolved = mode.unwrap_or_else(|| current.cycled());
-                if let Err(e) = persist_llm_mode(&project_root, resolved) {
-                    tracing::warn!(error = %e, "persisting llm_mode failed");
-                }
-                if !send_driver_control_or_fail(
-                    &driver_control_tx,
-                    crate::engine::driver::DriverControl::SetLlmMode {
-                        mode: Some(resolved),
-                    },
-                    &event_tx,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                )
-                .await
-                {
-                    break WorkerStop::DriverFailed;
-                }
-            }
-            SessionWork::SetSessionLlmMode { mode } => {
-                if !send_driver_control_or_fail(
-                    &driver_control_tx,
-                    crate::engine::driver::DriverControl::SetLlmMode { mode: Some(mode) },
-                    &event_tx,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                )
-                .await
-                {
-                    break WorkerStop::DriverFailed;
-                }
-            }
-            SessionWork::SetDelegationRecursion {
-                enabled,
-                default_depth,
-            } => {
-                if !send_driver_control_or_fail(
-                    &driver_control_tx,
-                    crate::engine::driver::DriverControl::SetDelegationRecursion {
-                        enabled,
-                        default_depth,
-                    },
-                    &event_tx,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                )
-                .await
-                {
-                    break WorkerStop::DriverFailed;
-                }
-            }
-            SessionWork::SetRedaction {
-                scan_environment,
-                scan_dotenv,
-                scan_ssh_keys,
-            } => {
-                // `/toggle-redaction`: mutate the session's in-memory
-                // effective `RedactConfig`, rebuild the newly discoverable
-                // redaction table, then union it into the session's
-                // accumulated egress table. Session-only — never persisted.
-                // Turning a source off stops future discovery; it never
-                // removes values already known in this session.
-                //
-                // Prompt-cache note (`prompt-caching-strategy.md`): changing
-                // what's redacted can change the scrubbed bytes of the cached
-                // prefix, so the *next* outbound request after a toggle is a
-                // one-time cache re-warm. This is accepted — the toggle is a
-                // deliberate, rare user action; `scrub()` output is otherwise
-                // deterministic/byte-stable turn-to-turn (see
-                // `redact::tests::scrub_is_deterministic_within_a_session`),
-                // so it never silently varies the prefix between turns.
-                let mut effective_redact = config_snapshot
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .extended
-                    .redact
-                    .clone();
-                redaction_overrides.apply_to(&mut effective_redact);
-                if let Some(v) = scan_environment {
-                    redaction_overrides.scan_environment = Some(v);
-                    effective_redact.scan_environment = v;
-                }
-                if let Some(v) = scan_dotenv {
-                    redaction_overrides.scan_dotenv = Some(v);
-                    effective_redact.scan_dotenv = v;
-                }
-                if let Some(v) = scan_ssh_keys {
-                    redaction_overrides.scan_ssh_keys = Some(v);
-                    effective_redact.scan_ssh_keys = v;
-                }
-                let session_env = env_overlay
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                match crate::redact::RedactionTable::build_with_env_and_store(
-                    &effective_redact,
-                    &project_root,
-                    &session_env,
-                ) {
-                    Ok(new_table) => {
-                        let table = match current_redaction(&redaction).union(&new_table) {
-                            Ok(table) => Arc::new(table),
-                            Err(error) => {
-                                tracing::warn!(error = %error, "unioning redaction table failed");
-                                Arc::new(new_table)
-                            }
-                        };
-                        set_current_redaction(&redaction, table.clone());
-                        if let Err(error) = session.persist_redaction_table(&table) {
-                            tracing::warn!(error = %error, %session_id, "persisting redaction table failed");
-                        }
-                        for path in table.unsupported_files() {
-                            if unsupported_redaction_notified.insert(path.clone()) {
-                                send_current_session_event(
-                                    &session,
-                                    &event_tx,
-                                    &redaction,
-                                    proto::Event::Notice {
-                                        session_id,
-                                        text: format!(
-                                            "`{}` is an unsupported format; redaction for this file will not work",
-                                            path.display()
-                                        ),
-                                    },
-                                    NoticeSource::DaemonDirect,
-                                );
-                            }
-                        }
-                        if !send_driver_control_or_fail(
-                            &driver_control_tx,
-                            crate::engine::driver::DriverControl::SetRedaction {
-                                table,
-                                scan_environment,
-                                scan_dotenv,
-                                scan_ssh_keys,
-                            },
-                            &event_tx,
-                            &redaction,
-                            session_id,
-                            &mut driver_failed,
-                        )
-                        .await
-                        {
-                            break WorkerStop::DriverFailed;
-                        }
-                        send_current_event(
-                            &event_tx,
-                            &redaction,
-                            proto::Event::RedactionState {
-                                session_id,
-                                scan_environment: effective_redact.scan_environment,
-                                scan_dotenv: effective_redact.scan_dotenv,
-                                scan_ssh_keys: effective_redact.scan_ssh_keys,
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "rebuilding redaction table failed");
-                    }
-                }
-            }
-            SessionWork::SetPreflight { enabled } => {
-                // `/preflight`: route the override to the driver, which holds
-                // it (precedence over config), resolves the toggle against its
-                // authoritative current value, and broadcasts the resulting
-                // state via `TurnEvent::PreflightState`. Session-only — never
-                // persisted (mirrors `/toggle-redaction`).
-                if !send_driver_control_or_fail(
-                    &driver_control_tx,
-                    crate::engine::driver::DriverControl::SetPreflight { enabled },
-                    &event_tx,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                )
-                .await
-                {
-                    break WorkerStop::DriverFailed;
-                }
-            }
-            SessionWork::SetTrustedOnly { enabled } => {
-                let target = enabled.unwrap_or_else(|| session.toggle_trusted_only());
-                if enabled.is_some() {
-                    session.set_trusted_only(target);
-                }
-                send_current_event(
-                    &event_tx,
-                    &redaction,
-                    proto::Event::TrustedOnlyState {
-                        session_id,
-                        enabled: target,
-                    },
-                );
-            }
-            SessionWork::SetTandemModels { models } => {
-                // `/model-comparison`: build a completion model for each
-                // selected `(provider, model)` from the already-configured
-                // providers, route them to the driver's in-memory tandem set,
-                // and broadcast the resulting state (+ a one-line token-burn
-                // warning when non-empty). Empty disables the feature.
-                // Session-only — never persisted (mirrors `/toggle-redaction`).
-                let providers_cfg = config_snapshot
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .providers
-                    .clone();
-                // Reuse the session redaction table the registry already
-                // built successfully. Tandem models must never install an
-                // empty fail-open table after a redaction rebuild error.
-                let tandem_redact = redact.clone();
-                let active = (session.active_provider(), session.active_model());
-                let mut targets: Vec<crate::engine::schedule::TandemTarget> = Vec::new();
-                for (provider, model_id) in &models {
-                    // Defensive: never shadow the active model itself (the
-                    // client already excludes it; no self-shadowing).
-                    if active.0.as_deref() == Some(provider.as_str())
-                        && active.1.as_deref() == Some(model_id.as_str())
-                    {
-                        continue;
+                    if let Err(e) = session.touch() {
+                        tracing::warn!(error = %e, "session touch failed");
                     }
                     let session_env = env_overlay
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    match crate::engine::model::Model::for_provider_with_env_trusted_only(
-                        &providers_cfg,
-                        provider,
-                        model_id,
-                        tandem_redact.clone(),
-                        session.trusted_only_flag(),
-                        |name| session_env.get(name).cloned(),
-                    ) {
-                        Ok(m) => {
-                            let m = m.with_shutdown_gate(shutdown_gate.clone());
-                            targets.push(crate::engine::schedule::TandemTarget {
-                                provider: provider.clone(),
-                                model: model_id.clone(),
-                                handle: Arc::new(m),
-                            });
+                    let base_redact = {
+                        let snapshot = config_snapshot
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        snapshot.extended.redact.clone()
+                    };
+                    if !refresh_redaction_for_turn(
+                        &session,
+                        session_id,
+                        &project_root,
+                        base_redact,
+                        &redaction_overrides,
+                        &mut unsupported_redaction_notified,
+                        &redaction,
+                        &event_tx,
+                        &driver_control_tx,
+                        &session_env,
+                    )
+                    .await
+                    {
+                        emit_session_driver_failed_once(
+                            &event_tx,
+                            &redaction,
+                            session_id,
+                            &mut driver_failed,
+                            "driver control channel closed".to_string(),
+                        );
+                        let _ = respond_to.send((
+                            proto::QueueItem {
+                                id: Uuid::nil(),
+                                status: proto::QueueItemStatus::Folding,
+                                text: String::new(),
+                                display_text: None,
+                                target: proto::QueueTarget::default(),
+                            },
+                            Vec::new(),
+                        ));
+                        break WorkerStop::DriverFailed;
+                    }
+                    let max_rounds = {
+                        let snapshot = config_snapshot
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        max_primary_rounds_for(&snapshot.extended)
+                    };
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::SetMaxPrimaryRounds { max_rounds },
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        let _ = respond_to.send((
+                            proto::QueueItem {
+                                id: Uuid::nil(),
+                                status: proto::QueueItemStatus::Folding,
+                                text: String::new(),
+                                display_text: None,
+                                target: proto::QueueTarget::default(),
+                            },
+                            Vec::new(),
+                        ));
+                        break WorkerStop::DriverFailed;
+                    }
+                    let target = foreground_input_target
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    let (id, snapshot) = driver_input_queue.push(*submission, target).await;
+                    let queue: Vec<proto::QueueItem> =
+                        snapshot.into_iter().map(queue_item_to_proto).collect();
+                    let item = queue.iter().find(|item| item.id == id).cloned().unwrap_or(
+                        proto::QueueItem {
+                            id,
+                            status: proto::QueueItemStatus::Folding,
+                            text: String::new(),
+                            display_text: None,
+                            target: proto::QueueTarget::default(),
+                        },
+                    );
+                    let _ = respond_to.send((item, queue));
+                }
+                SessionWork::SteerDelegation {
+                    task_call_id,
+                    label,
+                    message,
+                    origin_principal,
+                    respond_to,
+                } => {
+                    let result = steer_delegation_side_channel(
+                        &session,
+                        &redact,
+                        task_call_id,
+                        label,
+                        message,
+                        origin_principal,
+                    );
+                    let _ = respond_to.send(result);
+                }
+                SessionWork::RemoveQueuedUserMessage {
+                    queue_item_id,
+                    respond_to,
+                } => {
+                    let (result, snapshot) = driver_input_queue.remove(queue_item_id).await;
+                    let reason = remove_reason_to_proto(result);
+                    let _ = respond_to.send(proto::RemoveQueuedUserMessageResult {
+                        applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
+                        reason,
+                        removed_item: None,
+                        queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                    });
+                }
+                SessionWork::RemoveNewestQueuedUserMessage {
+                    target_id,
+                    respond_to,
+                } => {
+                    let target_id = target_id.unwrap_or_else(|| {
+                        foreground_input_target
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .id
+                            .clone()
+                    });
+                    let (result, removed_item, snapshot) =
+                        driver_input_queue.remove_newest_for(&target_id).await;
+                    let reason = remove_reason_to_proto(result);
+                    let _ = respond_to.send(proto::RemoveQueuedUserMessageResult {
+                        applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
+                        reason,
+                        removed_item: removed_item.map(queue_item_to_proto),
+                        queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                    });
+                }
+                SessionWork::RemoveEditableQueuedUserMessages {
+                    target_id,
+                    respond_to,
+                } => {
+                    let target_id = target_id.unwrap_or_else(|| {
+                        foreground_input_target
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .id
+                            .clone()
+                    });
+                    let (result, removed_items, snapshot) =
+                        driver_input_queue.remove_editable_for(&target_id).await;
+                    let reason = remove_reason_to_proto(result);
+                    let _ = respond_to.send(proto::RemoveQueuedUserMessagesResult {
+                        applied: !removed_items.is_empty(),
+                        reason,
+                        removed_items: removed_items.into_iter().map(queue_item_to_proto).collect(),
+                        queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
+                    });
+                }
+                SessionWork::RepublishQueue => {
+                    driver_input_queue.republish().await;
+                }
+                SessionWork::Cancel => {
+                    // User ctrl+c (`CancelTurn`). Fire the in-flight run's
+                    // cancellation token: the driver's `turn` aborts the
+                    // streaming inference (returning an `InferenceCancelled`
+                    // sentinel that unwinds the run cleanly), and any running
+                    // `bash` subprocess is killed via its process group. Safe
+                    // and idempotent at idle / mid-cancel — `CancelHandle::cancel`
+                    // is a no-op when no run is in flight. The driver then emits
+                    // `AgentIdle`, clearing the TUI's busy state.
+                    tracing::info!(session_id = %session_id, "cancel requested");
+                    cancel_handle.cancel();
+                }
+                SessionWork::ResolveInterrupt {
+                    interrupt_id,
+                    response,
+                } => {
+                    let row = session.db.get_interrupt(interrupt_id).ok().flatten();
+                    let was_active = session
+                        .db
+                        .list_open_interrupts(session_id)
+                        .ok()
+                        .and_then(|open| open.first().map(|row| row.interrupt_id))
+                        == Some(interrupt_id);
+                    let decision = row.as_ref().map(|row| {
+                        crate::db::needs_attention::summarize_interrupt_decision(row, &response)
+                    });
+                    if let Some(row) = row.as_ref()
+                        && row.state == crate::db::needs_attention::InterruptState::Parked
+                    {
+                        let claimed = match session
+                            .db
+                            .begin_parked_interrupt_execution(interrupt_id, &response)
+                        {
+                            Ok(claimed) => claimed,
+                            Err(error) => {
+                                tracing::warn!(%error, %interrupt_id, "claiming parked interrupt failed");
+                                false
+                            }
+                        };
+                        if !claimed {
+                            interrupts.emit_queue_state();
+                            continue;
                         }
-                        Err(e) => {
-                            // A misconfigured tandem provider/model is skipped
-                            // with a notice rather than failing the toggle.
+                        // Process-boundary lifecycle tests kill the daemon while
+                        // a parked replay is durably `executing`. The hook is
+                        // debug-build + env-gated, so release production binaries
+                        // cannot enter this pause.
+                        if cfg!(debug_assertions)
+                            && std::env::var_os("COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING")
+                                .is_some()
+                        {
+                            loop {
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            }
+                        }
+                        let Some(payload) = row.parked.clone() else {
+                            let _ = session.db.mark_interrupt_interrupted(interrupt_id);
                             send_current_session_event(
                                 &session,
                                 &event_tx,
@@ -1676,109 +1155,604 @@ async fn run_worker(
                                 proto::Event::Notice {
                                     session_id,
                                     text: format!(
-                                        "model-comparison: skipping `{provider}/{model_id}` — {e:#}"
+                                        "Interrupted parked request {interrupt_id}: missing replay payload."
                                     ),
                                 },
                                 NoticeSource::DaemonDirect,
                             );
+                            interrupts.emit_queue_state();
+                            continue;
+                        };
+                        let driver_control_tx = driver_control_tx.clone();
+                        let replay_completion_tx = replay_completion_tx.clone();
+                        let replay_response = response.clone();
+                        tokio::spawn(async move {
+                            let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
+                            let result = if driver_control_tx
+                                .send(
+                                    crate::engine::driver::DriverControl::ReplayParkedInterrupt {
+                                        interrupt_id,
+                                        payload,
+                                        response: replay_response,
+                                        respond_to,
+                                    },
+                                )
+                                .await
+                                .is_ok()
+                            {
+                                replay_result_rx.await.unwrap_or_else(|error| {
+                                    Err(format!("driver replay response dropped: {error}"))
+                                })
+                            } else {
+                                Err("driver is not available for parked interrupt replay"
+                                    .to_string())
+                            };
+                            let _ = replay_completion_tx
+                                .send(ParkedReplayCompletion {
+                                    interrupt_id,
+                                    decision,
+                                    was_active,
+                                    result,
+                                })
+                                .await;
+                        });
+                        continue;
+                    }
+                    if let Err(e) = session.db.resolve_interrupt(interrupt_id, &response) {
+                        tracing::warn!(error = %e, %interrupt_id, "resolve_interrupt failed");
+                        interrupts.emit_queue_state();
+                        continue;
+                    }
+                    let seq = decision.as_ref().and_then(|decision| {
+                        record_interrupt_decision_event(
+                            &session,
+                            &redaction,
+                            interrupt_id,
+                            decision,
+                        )
+                    });
+                    send_current_event(
+                        &event_tx,
+                        &redaction,
+                        proto::Event::InterruptResolved {
+                            session_id,
+                            interrupt_id,
+                            decision,
+                            seq,
+                        },
+                    );
+                    // Engine-side wakeup (GOALS §3b): hand the resolution to
+                    // whatever tool call is blocked on this interrupt id (the
+                    // `question` tool). `false` just means nobody was blocked
+                    // locally — e.g. a `schedule` needs-attention nudge — and the
+                    // DB row update above is the only effect.
+                    interrupts.resolve(interrupt_id, response);
+                    if was_active {
+                        interrupts.emit_active_from_db();
+                    } else {
+                        interrupts.emit_queue_state();
+                    }
+                }
+                SessionWork::RepairResume { respond_to } => {
+                    let Some(state) = repair_required
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                    else {
+                        let _ = respond_to.send(Err(
+                            "no Responses resume repair is pending for this session".to_string(),
+                        ));
+                        continue;
+                    };
+                    let (driver_respond_to, driver_response_rx) = oneshot::channel();
+                    if driver_control_tx
+                        .send(crate::engine::driver::DriverControl::RepairResume {
+                            root_agent: root_agent_name.clone(),
+                            respond_to: driver_respond_to,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        let message = "driver control channel closed".to_string();
+                        emit_session_driver_failed_once(
+                            &event_tx,
+                            &redaction,
+                            session_id,
+                            &mut driver_failed,
+                            message.clone(),
+                        );
+                        let _ = respond_to.send(Err(message));
+                        break WorkerStop::DriverFailed;
+                    }
+                    match driver_response_rx.await {
+                        Ok(Ok(heal_count)) => {
+                            {
+                                let mut slot = repair_required
+                                    .write()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                *slot = None;
+                            }
+                            let text = format!(
+                                "Responses resume repair approved: synthetic resume heal applied to {heal_count} tool call(s)."
+                            );
+                            if let Err(error) = session.record_event(
+                                crate::db::session_log::SessionEventKind::UserNote,
+                                Some(&root_agent_name),
+                                None,
+                                &serde_json::json!({
+                                    "text": text,
+                                    "resume_repair": {
+                                        "approved": true,
+                                        "failure_kind": state.failure_kind,
+                                        "failing_tool_call_ids": state.failing_tool_call_ids,
+                                        "provider": state.provider,
+                                        "model": state.model,
+                                        "wire_api": state.wire_api,
+                                        "synthetic_heal_count": heal_count,
+                                        "detail": state.detail,
+                                    }
+                                }),
+                            ) {
+                                tracing::warn!(%error, %session_id, "record resume repair provenance failed");
+                            }
+                            send_current_session_event(
+                                &session,
+                                &event_tx,
+                                &redaction,
+                                proto::Event::Notice { session_id, text },
+                                NoticeSource::DaemonDirect,
+                            );
+                            let _ = respond_to.send(Ok(()));
+                        }
+                        Ok(Err(message)) => {
+                            let _ = respond_to
+                                .send(Err(format!("explicit Responses repair failed: {message}")));
+                        }
+                        Err(error) => {
+                            let _ = respond_to
+                                .send(Err(format!("explicit Responses repair failed: {error}")));
                         }
                     }
                 }
-                let labels: Vec<String> = targets
-                    .iter()
-                    .map(crate::engine::schedule::TandemTarget::label)
-                    .collect();
-                // Token-burn warning on a non-empty set (warning only — no cap,
-                // no meter), in the spirit of the `/swarm` entry warning.
-                let warning = (!labels.is_empty()).then(|| {
+                SessionWork::SetActiveModel {
+                    provider,
+                    model,
+                    trigger,
+                    reasoning_effort,
+                    thinking_mode,
+                } => {
+                    // Mid-session model switch (implementation note):
+                    // route the new `(provider, model)` to the running driver. The
+                    // driver owns the whole daemon-side transaction: build first,
+                    // then session/config persistence, then the root-primary swap
+                    // and authoritative active-model state event. Legitimate
+                    // config/session drift (for example an on-disk edit while the
+                    // session is live) is reported back to every attached client
+                    // instead of being silently reconciled here.
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::SetActiveModel {
+                            provider,
+                            model,
+                            trigger,
+                            reasoning_effort,
+                            thinking_mode,
+                        },
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
+                SessionWork::ReplaceConfigSnapshot {
+                    snapshot,
+                    respond_to,
+                } => {
+                    let generation = replace_config_snapshot(&config_snapshot, *snapshot);
+                    send_current_event(
+                        &event_tx,
+                        &redaction,
+                        proto::Event::ConfigSnapshot {
+                            snapshot: Box::new(
+                                config_snapshot
+                                    .read()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .to_proto(session_id),
+                            ),
+                        },
+                    );
+                    let _ = respond_to.send(generation);
+                }
+                SessionWork::SetAgent { name } => {
+                    // Persist the active-agent choice so a resume restarts on it,
+                    // then swap the live primary in place at the idle boundary
+                    // (`/plan` → `Plan`, `/build` → `Build`, `plan.md §4.6.d`).
+                    if let Err(e) = session.set_active_agent(&name) {
+                        tracing::warn!(error = %e, "set_active_agent failed");
+                    }
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::SwapPrimary { name },
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
+                SessionWork::SetLlmMode { mode } => {
+                    // Resolve toggle against the current config value (the
+                    // single source of truth shared with `/settings` + the
+                    // config file), persist the resolved value so a resume keeps
+                    // it, then route the explicit mode to the driver to rebuild
+                    // the root agent in place.
+                    let current = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extended
+                        .llm_mode;
+                    let resolved = mode.unwrap_or_else(|| current.cycled());
+                    if let Err(e) = persist_llm_mode(&project_root, resolved) {
+                        tracing::warn!(error = %e, "persisting llm_mode failed");
+                    }
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::SetLlmMode {
+                            mode: Some(resolved),
+                        },
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
+                SessionWork::SetSessionLlmMode { mode } => {
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::SetLlmMode { mode: Some(mode) },
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
+                SessionWork::SetDelegationRecursion {
+                    enabled,
+                    default_depth,
+                } => {
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::SetDelegationRecursion {
+                            enabled,
+                            default_depth,
+                        },
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
+                SessionWork::SetRedaction {
+                    scan_environment,
+                    scan_dotenv,
+                    scan_ssh_keys,
+                } => {
+                    // `/toggle-redaction`: mutate the session's in-memory
+                    // effective `RedactConfig`, rebuild the newly discoverable
+                    // redaction table, then union it into the session's
+                    // accumulated egress table. Session-only — never persisted.
+                    // Turning a source off stops future discovery; it never
+                    // removes values already known in this session.
+                    //
+                    // Prompt-cache note (`prompt-caching-strategy.md`): changing
+                    // what's redacted can change the scrubbed bytes of the cached
+                    // prefix, so the *next* outbound request after a toggle is a
+                    // one-time cache re-warm. This is accepted — the toggle is a
+                    // deliberate, rare user action; `scrub()` output is otherwise
+                    // deterministic/byte-stable turn-to-turn (see
+                    // `redact::tests::scrub_is_deterministic_within_a_session`),
+                    // so it never silently varies the prefix between turns.
+                    let mut effective_redact = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extended
+                        .redact
+                        .clone();
+                    redaction_overrides.apply_to(&mut effective_redact);
+                    if let Some(v) = scan_environment {
+                        redaction_overrides.scan_environment = Some(v);
+                        effective_redact.scan_environment = v;
+                    }
+                    if let Some(v) = scan_dotenv {
+                        redaction_overrides.scan_dotenv = Some(v);
+                        effective_redact.scan_dotenv = v;
+                    }
+                    if let Some(v) = scan_ssh_keys {
+                        redaction_overrides.scan_ssh_keys = Some(v);
+                        effective_redact.scan_ssh_keys = v;
+                    }
+                    let session_env = env_overlay
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    match crate::redact::RedactionTable::build_with_env_and_store(
+                        &effective_redact,
+                        &project_root,
+                        &session_env,
+                    ) {
+                        Ok(new_table) => {
+                            let table = match current_redaction(&redaction).union(&new_table) {
+                                Ok(table) => Arc::new(table),
+                                Err(error) => {
+                                    tracing::warn!(error = %error, "unioning redaction table failed");
+                                    Arc::new(new_table)
+                                }
+                            };
+                            set_current_redaction(&redaction, table.clone());
+                            if let Err(error) = session.persist_redaction_table(&table) {
+                                tracing::warn!(error = %error, %session_id, "persisting redaction table failed");
+                            }
+                            for path in table.unsupported_files() {
+                                if unsupported_redaction_notified.insert(path.clone()) {
+                                    send_current_session_event(
+                                        &session,
+                                        &event_tx,
+                                        &redaction,
+                                        proto::Event::Notice {
+                                            session_id,
+                                            text: format!(
+                                                "`{}` is an unsupported format; redaction for this file will not work",
+                                                path.display()
+                                            ),
+                                        },
+                                        NoticeSource::DaemonDirect,
+                                    );
+                                }
+                            }
+                            if !send_driver_control_or_fail(
+                                &driver_control_tx,
+                                crate::engine::driver::DriverControl::SetRedaction {
+                                    table,
+                                    scan_environment,
+                                    scan_dotenv,
+                                    scan_ssh_keys,
+                                },
+                                &event_tx,
+                                &redaction,
+                                session_id,
+                                &mut driver_failed,
+                            )
+                            .await
+                            {
+                                break WorkerStop::DriverFailed;
+                            }
+                            send_current_event(
+                                &event_tx,
+                                &redaction,
+                                proto::Event::RedactionState {
+                                    session_id,
+                                    scan_environment: effective_redact.scan_environment,
+                                    scan_dotenv: effective_redact.scan_dotenv,
+                                    scan_ssh_keys: effective_redact.scan_ssh_keys,
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "rebuilding redaction table failed");
+                        }
+                    }
+                }
+                SessionWork::SetPreflight { enabled } => {
+                    // `/preflight`: route the override to the driver, which holds
+                    // it (precedence over config), resolves the toggle against its
+                    // authoritative current value, and broadcasts the resulting
+                    // state via `TurnEvent::PreflightState`. Session-only — never
+                    // persisted (mirrors `/toggle-redaction`).
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::SetPreflight { enabled },
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
+                SessionWork::SetTrustedOnly { enabled } => {
+                    let target = enabled.unwrap_or_else(|| session.toggle_trusted_only());
+                    if enabled.is_some() {
+                        session.set_trusted_only(target);
+                    }
+                    send_current_event(
+                        &event_tx,
+                        &redaction,
+                        proto::Event::TrustedOnlyState {
+                            session_id,
+                            enabled: target,
+                        },
+                    );
+                }
+                SessionWork::SetTandemModels { models } => {
+                    // `/model-comparison`: build a completion model for each
+                    // selected `(provider, model)` from the already-configured
+                    // providers, route them to the driver's in-memory tandem set,
+                    // and broadcast the resulting state (+ a one-line token-burn
+                    // warning when non-empty). Empty disables the feature.
+                    // Session-only — never persisted (mirrors `/toggle-redaction`).
+                    let providers_cfg = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .providers
+                        .clone();
+                    // Reuse the session redaction table the registry already
+                    // built successfully. Tandem models must never install an
+                    // empty fail-open table after a redaction rebuild error.
+                    let tandem_redact = redact.clone();
+                    let active = (session.active_provider(), session.active_model());
+                    let mut targets: Vec<crate::engine::schedule::TandemTarget> = Vec::new();
+                    for (provider, model_id) in &models {
+                        // Defensive: never shadow the active model itself (the
+                        // client already excludes it; no self-shadowing).
+                        if active.0.as_deref() == Some(provider.as_str())
+                            && active.1.as_deref() == Some(model_id.as_str())
+                        {
+                            continue;
+                        }
+                        let session_env = env_overlay
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        match crate::engine::model::Model::for_provider_with_env_trusted_only(
+                            &providers_cfg,
+                            provider,
+                            model_id,
+                            tandem_redact.clone(),
+                            session.trusted_only_flag(),
+                            |name| session_env.get(name).cloned(),
+                        ) {
+                            Ok(m) => {
+                                let m = m.with_shutdown_gate(shutdown_gate.clone());
+                                targets.push(crate::engine::schedule::TandemTarget {
+                                    provider: provider.clone(),
+                                    model: model_id.clone(),
+                                    handle: Arc::new(m),
+                                });
+                            }
+                            Err(e) => {
+                                // A misconfigured tandem provider/model is skipped
+                                // with a notice rather than failing the toggle.
+                                send_current_session_event(
+                                    &session,
+                                    &event_tx,
+                                    &redaction,
+                                    proto::Event::Notice {
+                                        session_id,
+                                        text: format!(
+                                            "model-comparison: skipping `{provider}/{model_id}` — {e:#}"
+                                        ),
+                                    },
+                                    NoticeSource::DaemonDirect,
+                                );
+                            }
+                        }
+                    }
+                    let labels: Vec<String> = targets
+                        .iter()
+                        .map(crate::engine::schedule::TandemTarget::label)
+                        .collect();
+                    // Token-burn warning on a non-empty set (warning only — no cap,
+                    // no meter), in the spirit of the `/swarm` entry warning.
+                    let warning = (!labels.is_empty()).then(|| {
                     format!(
                         "model-comparison ON: every substantive request is ALSO sent to {} tandem model(s) ({}). This multiplies token spend — it is off by default and reverts on restart.",
                         labels.len(),
                         labels.join(", ")
                     )
                 });
-                if !send_driver_control_or_fail(
-                    &driver_control_tx,
-                    crate::engine::driver::DriverControl::SetTandemModels { targets },
-                    &event_tx,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                )
-                .await
-                {
-                    break WorkerStop::DriverFailed;
-                }
-                send_current_event(
-                    &event_tx,
-                    &redaction,
-                    proto::Event::TandemState {
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::SetTandemModels { targets },
+                        &event_tx,
+                        &redaction,
                         session_id,
-                        models: labels,
-                        warning,
-                    },
-                );
-            }
-            SessionWork::CancelSchedule { job_id } => {
-                if job_cmd_tx
-                    .send(crate::engine::schedule::ScheduleCommand::Cancel { job_id })
+                        &mut driver_failed,
+                    )
                     .await
-                    .is_err()
-                {
-                    tracing::warn!(session_id = %session_id, "job command channel closed");
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                    send_current_event(
+                        &event_tx,
+                        &redaction,
+                        proto::Event::TandemState {
+                            session_id,
+                            models: labels,
+                            warning,
+                        },
+                    );
                 }
-            }
-            SessionWork::Prune => {
-                if !send_driver_control_or_fail(
-                    &driver_control_tx,
-                    crate::engine::driver::DriverControl::Prune,
-                    &event_tx,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                )
-                .await
-                {
-                    break WorkerStop::DriverFailed;
+                SessionWork::CancelSchedule { job_id } => {
+                    if job_cmd_tx
+                        .send(crate::engine::schedule::ScheduleCommand::Cancel { job_id })
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(session_id = %session_id, "job command channel closed");
+                    }
                 }
-            }
-            SessionWork::Compact => {
-                if !send_driver_control_or_fail(
-                    &driver_control_tx,
-                    crate::engine::driver::DriverControl::Compact,
-                    &event_tx,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                )
-                .await
-                {
-                    break WorkerStop::DriverFailed;
+                SessionWork::Prune => {
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::Prune,
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
                 }
-            }
-            SessionWork::Pin { text } => {
-                if !send_driver_control_or_fail(
-                    &driver_control_tx,
-                    crate::engine::driver::DriverControl::Pin { text },
-                    &event_tx,
-                    &redaction,
-                    session_id,
-                    &mut driver_failed,
-                )
-                .await
-                {
-                    break WorkerStop::DriverFailed;
+                SessionWork::Compact => {
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::Compact,
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
                 }
-            }
-            SessionWork::Shutdown { pause_for_resume } => {
-                let (active, pending_tool_count) =
-                    shutdown_activity_snapshot(&session, session_id, &interrupts, &live);
-                break WorkerStop::Shutdown {
-                    pause_for_resume,
-                    active,
-                    pending_tool_count,
-                };
-            }
+                SessionWork::Pin { text } => {
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::Pin { text },
+                        &event_tx,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
+                SessionWork::Shutdown { pause_for_resume } => {
+                    let (active, pending_tool_count) =
+                        shutdown_activity_snapshot(&session, session_id, &interrupts, &live);
+                    break WorkerStop::Shutdown {
+                        pause_for_resume,
+                        active,
+                        pending_tool_count,
+                    };
+                }
             },
         }
     };
@@ -1836,7 +1810,7 @@ async fn run_worker(
     tracing::info!(session_id = %session_id, "session worker exited");
 }
 
-fn shutdown_activity_snapshot(
+pub(super) fn shutdown_activity_snapshot(
     session: &Session,
     session_id: Uuid,
     interrupts: &crate::engine::interrupt::InterruptHub,
@@ -1855,9 +1829,37 @@ fn shutdown_activity_snapshot(
     (active, pending_tool_count)
 }
 
-// Decide whether a just-landed user write/edit in this session earns the
-// one-time concurrent-write-during-plan warning, and word it mode-aware
-// (`plan-concurrent-build-and-merge.md`). Returns `Some(text)` to fire the
-// toast (and stamps `warned_plan` so the same plan episode warns only once),
-// or `None` when there's no active plan or this plan episode was already
-// warned. A *different* active plan re-arms the warning (the stamp differs).
+#[cfg(test)]
+mod interrupt_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn redaction_failure_payload_preserves_shape_without_raw_interrupt_text() {
+        let interrupt_id = uuid::Uuid::new_v4();
+        let decision = crate::daemon::proto::InterruptDecision {
+            permission: true,
+            cancelled: false,
+            lines: vec![crate::daemon::proto::InterruptDecisionLine {
+                prompt: "Run `cat /tmp/secret`?".to_string(),
+                answer: "Allow once".to_string(),
+            }],
+        };
+
+        let payload = redaction_failed_interrupt_decision_payload(interrupt_id, &decision);
+        let serialized = payload.to_string();
+
+        assert_eq!(payload["interrupt_id"], interrupt_id.to_string());
+        assert_eq!(payload["decision"]["permission"], true);
+        assert_eq!(payload["decision"]["cancelled"], false);
+        assert_eq!(
+            payload["decision"]["lines"][0]["prompt"],
+            INTERRUPT_REDACTION_FAILED
+        );
+        assert_eq!(
+            payload["decision"]["lines"][0]["answer"],
+            INTERRUPT_REDACTION_FAILED
+        );
+        assert!(!serialized.contains("/tmp/secret"));
+        assert!(!serialized.contains("Allow once"));
+    }
+}

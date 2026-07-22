@@ -1,4 +1,9 @@
-async fn handle_request(
+use super::attachments::*;
+use super::authz::*;
+use super::sessions::*;
+use super::*;
+
+pub(super) async fn handle_request(
     request: Request,
     state: &mut ClientState,
     ctx: &Arc<DaemonContext>,
@@ -373,17 +378,20 @@ async fn handle_request(
             no_sandbox,
             env_snapshot,
         } => {
-            let env_snapshot = env_snapshot
-                .map(EnvSnapshot::from_wire)
-                .unwrap_or_else(|| {
-                    ctx.env_baseline
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone()
-                });
+            let env_snapshot = env_snapshot.map(EnvSnapshot::from_wire).unwrap_or_else(|| {
+                ctx.env_baseline
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            });
             let handle = ctx
                 .registry
-                .create_assistant_session(&name, PathBuf::from(project_root), no_sandbox, env_snapshot)
+                .create_assistant_session(
+                    &name,
+                    PathBuf::from(project_root),
+                    no_sandbox,
+                    env_snapshot,
+                )
                 .await
                 .map_err(|e| ErrorPayload {
                     code: ErrorCode::BadRequest,
@@ -408,14 +416,16 @@ async fn handle_request(
             kind,
             include_generated_artifacts,
             include_sensitive,
-        } => export_session_data(
-            ctx,
-            session_id,
-            kind,
-            include_generated_artifacts,
-            include_sensitive,
-        )
-        .await,
+        } => {
+            export_session_data(
+                ctx,
+                session_id,
+                kind,
+                include_generated_artifacts,
+                include_sensitive,
+            )
+            .await
+        }
 
         Request::Curator {
             project_root,
@@ -435,13 +445,9 @@ async fn handle_request(
             project_root,
             path,
             show_hidden,
-        } => crate::daemon::fs_api::fs_list(
-            ctx,
-            &state.principal,
-            &project_root,
-            &path,
-            show_hidden,
-        ),
+        } => {
+            crate::daemon::fs_api::fs_list(ctx, &state.principal, &project_root, &path, show_hidden)
+        }
 
         Request::FsStat { project_root, path } => {
             crate::daemon::fs_api::fs_stat(ctx, &state.principal, &project_root, &path)
@@ -568,9 +574,7 @@ async fn handle_request(
             let db = ctx.db.clone();
             let (messages, has_more) = db
                 .read(move |conn| {
-                    crate::db::Db::read_session_messages_conn(
-                        conn, session_id, before_seq, limit,
-                    )
+                    crate::db::Db::read_session_messages_conn(conn, session_id, before_seq, limit)
                 })
                 .await
                 .map_err(internal)?;
@@ -602,13 +606,13 @@ async fn handle_request(
             let statuses = visible_ids
                 .into_iter()
                 .filter_map(|id| {
-                    ctx.registry
-                        .live_status(id)
-                        .map(|(has_active_schedules, processing, _tool_running)| proto::LiveStatus {
+                    ctx.registry.live_status(id).map(
+                        |(has_active_schedules, processing, _tool_running)| proto::LiveStatus {
                             session_id: id,
                             has_active_schedules,
                             processing,
-                        })
+                        },
+                    )
                 })
                 .collect();
             Ok(Response::SessionLiveStatus { statuses })
@@ -675,12 +679,8 @@ async fn handle_request(
             let activation = crate::skills::ActivationContext::from_tool_names(
                 active_tools.iter().map(String::as_str),
             );
-            let skills = crate::skills::discover_for_session(
-                cwd,
-                &extended.skills,
-                &activation,
-            )
-            .map_err(internal)?;
+            let skills = crate::skills::discover_for_session(cwd, &extended.skills, &activation)
+                .map_err(internal)?;
             let skills = skills
                 .into_iter()
                 .map(|s| proto::SkillSummary {
@@ -707,9 +707,7 @@ async fn handle_request(
         }
         Request::ListScheduledJobs { owner } => {
             let scheduler = require_scheduler(ctx)?;
-            let jobs = scheduler
-                .list_jobs(owner.as_deref())
-                .map_err(internal)?;
+            let jobs = scheduler.list_jobs(owner.as_deref()).map_err(internal)?;
             Ok(Response::ScheduledJobs { jobs })
         }
         Request::DeleteScheduledJob { id } => {
@@ -939,7 +937,8 @@ async fn handle_request(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
             }
-            ctx.store_flycockpit_credential(&credential).map_err(internal)?;
+            ctx.store_flycockpit_credential(&credential)
+                .map_err(internal)?;
             ctx.wake_connector();
             Ok(Response::Ack)
         }
@@ -979,12 +978,11 @@ async fn handle_request(
 
         Request::RefreshConfig => {
             let att = require_attached(state)?;
-            let trust_policy =
-                crate::config::trust::resolve_workspace_trust_policy_from_db(
-                    &ctx.db,
-                    &att.handle.project_root,
-                )
-                .map_err(internal)?;
+            let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(
+                &ctx.db,
+                &att.handle.project_root,
+            )
+            .map_err(internal)?;
             let (providers, extended) = match ctx
                 .config_source()
                 .load_with_trust(&att.handle.project_root, &trust_policy)
@@ -1088,9 +1086,8 @@ async fn handle_request(
                 .zip(model.as_deref())
                 .and_then(|(provider, model)| {
                     let (cfg, _) = ctx.config_source().load(cwd).ok()?;
-                    cfg.resolve_model_system_prompt(provider, model).map(|prompt| {
-                        crate::tokens::scaled_estimate(prompt, strategy, scale)
-                    })
+                    cfg.resolve_model_system_prompt(provider, model)
+                        .map(|prompt| crate::tokens::scaled_estimate(prompt, strategy, scale))
                 })
                 .unwrap_or(0);
             match crate::engine::builtin::load_agent_guidance(cwd) {
@@ -1130,18 +1127,15 @@ async fn handle_request(
     }
 }
 
-fn attached_trust_policy(
+pub(super) fn attached_trust_policy(
     ctx: &DaemonContext,
     att: &AttachedSession,
 ) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
-    crate::config::trust::resolve_workspace_trust_policy_from_db(
-        &ctx.db,
-        &att.handle.project_root,
-    )
-    .map_err(internal)
+    crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &att.handle.project_root)
+        .map_err(internal)
 }
 
-fn list_agents(
+pub(super) fn list_agents(
     ctx: &DaemonContext,
     state: &ClientState,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -1160,11 +1154,11 @@ fn list_agents(
         let def = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             crate::agents::resolve(&att.handle.project_root, name)
         })
-            .map_err(internal)?
-            .ok_or_else(|| ErrorPayload {
-                code: ErrorCode::Internal,
-                message: format!("chat-ownable agent `{name}` did not resolve"),
-            })?;
+        .map_err(internal)?
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::Internal,
+            message: format!("chat-ownable agent `{name}` did not resolve"),
+        })?;
         agents.push(proto::AgentSummary {
             builtin: crate::agents::is_builtin_agent(name),
             name: name.clone(),
@@ -1176,7 +1170,7 @@ fn list_agents(
     Ok(Response::Agents { agents })
 }
 
-fn list_models(
+pub(super) fn list_models(
     ctx: &DaemonContext,
     state: &ClientState,
     requested_provider: Option<&str>,
@@ -1215,7 +1209,7 @@ fn list_models(
     Ok(Response::Models { models })
 }
 
-fn agent_mode_summary(mode: crate::agents::AgentMode) -> &'static str {
+pub(super) fn agent_mode_summary(mode: crate::agents::AgentMode) -> &'static str {
     match mode {
         crate::agents::AgentMode::All => "all",
         crate::agents::AgentMode::Primary => "primary",
@@ -1256,7 +1250,7 @@ pub fn request_shutdown(ctx: &Arc<DaemonContext>) {
 /// resulting state to **all** clients, and (for `until-idle`) arm the
 /// daemon's auto-off watcher. The OS assertion lives in this process so it
 /// survives the requesting client's exit.
-fn set_caffeinate(
+pub(super) fn set_caffeinate(
     state: &ClientState,
     ctx: &Arc<DaemonContext>,
     mode: crate::daemon::caffeinate::CaffeinateMode,
@@ -1320,7 +1314,7 @@ fn set_caffeinate(
 /// Poll interval for the until-idle auto-off watcher. Short enough that
 /// the machine doesn't stay awake long after the last agent finishes,
 /// long enough to be negligible overhead.
-const UNTIL_IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+pub(super) const UNTIL_IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Spawn the daemon's `until-idle` auto-off watcher. The daemon owns the
 /// session workers / `ScheduleAuthority`, so it is the authority for "is an
@@ -1329,7 +1323,7 @@ const UNTIL_IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 /// clients. It exits if the mode is no longer until-idle (a later
 /// `on`/`off`/`toggle` superseded it) so a fresh `until-idle` can re-arm
 /// without stacking watchers racing each other.
-fn spawn_until_idle_watcher(ctx: Arc<DaemonContext>) {
+pub(super) fn spawn_until_idle_watcher(ctx: Arc<DaemonContext>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(UNTIL_IDLE_POLL).await;
@@ -1354,7 +1348,7 @@ fn spawn_until_idle_watcher(ctx: Arc<DaemonContext>) {
 /// [`crate::locks::LOCK_IDLE_TIMEOUT`] (5 min) so a reclaimable lock is
 /// freed within a few seconds of crossing the threshold, but coarse enough
 /// to be negligible overhead.
-const LOCK_SWEEP_POLL: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const LOCK_SWEEP_POLL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Spawn the daemon's idle-lock sweeper
 /// (implementation note). On each tick it asks the
@@ -1384,7 +1378,7 @@ pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn attach(
+pub(super) async fn attach(
     state: &mut ClientState,
     ctx: &DaemonContext,
     session_id: Option<Uuid>,
@@ -1676,7 +1670,7 @@ async fn attach(
     })
 }
 
-fn select_session_env(
+pub(super) fn select_session_env(
     ctx: &DaemonContext,
     client_snapshot: Option<EnvSnapshot>,
     policy: EnvDriftPolicy,
@@ -1746,7 +1740,7 @@ fn select_session_env(
     Ok((chosen, baseline_meta, session_meta, drift, policy))
 }
 
-fn active_model_trigger_from_proto(
+pub(super) fn active_model_trigger_from_proto(
     trigger: proto::ActiveModelSwitchTrigger,
 ) -> crate::session::ModelSwitchTrigger {
     match trigger {
@@ -1757,7 +1751,7 @@ fn active_model_trigger_from_proto(
     }
 }
 
-fn goal_to_proto(goal: crate::db::session_goals::SessionGoal) -> proto::GoalSummary {
+pub(super) fn goal_to_proto(goal: crate::db::session_goals::SessionGoal) -> proto::GoalSummary {
     proto::GoalSummary {
         id: goal.id,
         session_id: goal.session_id,
@@ -1774,7 +1768,9 @@ fn goal_to_proto(goal: crate::db::session_goals::SessionGoal) -> proto::GoalSumm
     }
 }
 
-fn assistant_to_proto(row: crate::db::assistants::AssistantRow) -> proto::AssistantSummary {
+pub(super) fn assistant_to_proto(
+    row: crate::db::assistants::AssistantRow,
+) -> proto::AssistantSummary {
     proto::AssistantSummary {
         name: row.name,
         created_at: row.created_at,
@@ -1784,14 +1780,14 @@ fn assistant_to_proto(row: crate::db::assistants::AssistantRow) -> proto::Assist
     }
 }
 
-fn stats_range_from_proto(range: proto::StatsRange) -> crate::db::stats::StatsRange {
+pub(super) fn stats_range_from_proto(range: proto::StatsRange) -> crate::db::stats::StatsRange {
     match range {
         proto::StatsRange::Last7Days => crate::db::stats::StatsRange::Last7Days,
         proto::StatsRange::AllTime => crate::db::stats::StatsRange::AllTime,
     }
 }
 
-async fn stats_rollup(
+pub(super) async fn stats_rollup(
     ctx: &Arc<DaemonContext>,
     project_id: Option<String>,
     range: proto::StatsRange,
@@ -1815,7 +1811,7 @@ async fn stats_rollup(
     Ok(Response::StatsRollup { rollup })
 }
 
-async fn export_session_data(
+pub(super) async fn export_session_data(
     ctx: &Arc<DaemonContext>,
     session_id: Uuid,
     kind: proto::ExportSessionKind,
@@ -1892,7 +1888,7 @@ async fn export_session_data(
     Ok(Response::ExportSessionData { data })
 }
 
-async fn auto_title_request(
+pub(super) async fn auto_title_request(
     ctx: &Arc<DaemonContext>,
     session_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -1917,9 +1913,11 @@ async fn auto_title_request(
         });
     }
 
-    let trust_policy =
-        crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &session.project_root)
-            .map_err(workspace_trust_error)?;
+    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(
+        &ctx.db,
+        &session.project_root,
+    )
+    .map_err(workspace_trust_error)?;
     let (providers, extended) = ctx
         .config_source()
         .load_with_trust(&session.project_root, &trust_policy)
@@ -1966,7 +1964,7 @@ async fn auto_title_request(
     Ok(Response::AutoTitle { session_id, title })
 }
 
-async fn curator_request(
+pub(super) async fn curator_request(
     ctx: &Arc<DaemonContext>,
     project_root: PathBuf,
     action: proto::CuratorAction,
@@ -1981,11 +1979,8 @@ async fn curator_request(
     let db = ctx.db.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<proto::CuratorResult> {
         crate::config::trust::with_workspace_trust_policy(trust_policy, || {
-            let curator = crate::skills::curator::SkillCurator::new(
-                db,
-                project_root,
-                extended.skills,
-            );
+            let curator =
+                crate::skills::curator::SkillCurator::new(db, project_root, extended.skills);
             match action {
                 proto::CuratorAction::Status => Ok(proto::CuratorResult::Status {
                     status: curator_status_to_proto(curator.status()?),
@@ -2043,7 +2038,9 @@ async fn curator_request(
     Ok(Response::Curator { result })
 }
 
-fn curator_status_to_proto(status: crate::skills::curator::CuratorStatus) -> proto::CuratorStatus {
+pub(super) fn curator_status_to_proto(
+    status: crate::skills::curator::CuratorStatus,
+) -> proto::CuratorStatus {
     proto::CuratorStatus {
         skills: status
             .skills
@@ -2058,7 +2055,7 @@ fn curator_status_to_proto(status: crate::skills::curator::CuratorStatus) -> pro
     }
 }
 
-fn curator_skill_to_proto(
+pub(super) fn curator_skill_to_proto(
     skill: crate::skills::curator::CuratorSkillStatus,
 ) -> proto::CuratorSkillStatus {
     proto::CuratorSkillStatus {
@@ -2073,7 +2070,7 @@ fn curator_skill_to_proto(
     }
 }
 
-fn curator_snapshot_to_proto(
+pub(super) fn curator_snapshot_to_proto(
     snapshot: crate::skills::curator::CuratorSnapshotStatus,
 ) -> proto::CuratorSnapshotStatus {
     proto::CuratorSnapshotStatus {
@@ -2084,7 +2081,7 @@ fn curator_snapshot_to_proto(
     }
 }
 
-fn curator_run_report_to_proto(
+pub(super) fn curator_run_report_to_proto(
     report: crate::skills::curator::CuratorRunReport,
 ) -> proto::CuratorRunReport {
     proto::CuratorRunReport {
@@ -2099,7 +2096,9 @@ fn curator_run_report_to_proto(
     }
 }
 
-fn paused_work_to_proto(row: crate::db::paused_work::PausedWorkRow) -> proto::PausedWorkSummary {
+pub(super) fn paused_work_to_proto(
+    row: crate::db::paused_work::PausedWorkRow,
+) -> proto::PausedWorkSummary {
     proto::PausedWorkSummary {
         session_id: row.session_id,
         active_agent: row.active_agent,

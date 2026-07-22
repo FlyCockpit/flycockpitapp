@@ -1,4 +1,7 @@
-fn prune_expired_attachments(state: &mut ClientState) {
+use super::sessions::*;
+use super::*;
+
+pub(super) fn prune_expired_attachments(state: &mut ClientState) {
     let ttl = Duration::from_secs(proto::PENDING_ATTACHMENT_TTL_SECS);
     let now = Instant::now();
     let expired: Vec<_> = state
@@ -17,19 +20,21 @@ fn prune_expired_attachments(state: &mut ClientState) {
         .retain(|_, attachment| now.duration_since(attachment.created_at) <= ttl);
 }
 
-fn validate_sha256_hex(sha256: &str) -> bool {
+pub(super) fn validate_sha256_hex(sha256: &str) -> bool {
     sha256.len() == 64
         && sha256
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     crate::intel::hex_lower(&digest)
 }
 
-async fn validate_png_attachment(bytes: Vec<u8>) -> std::result::Result<Vec<u8>, ErrorPayload> {
+pub(super) async fn validate_png_attachment(
+    bytes: Vec<u8>,
+) -> std::result::Result<Vec<u8>, ErrorPayload> {
     tokio::task::spawn_blocking(move || validate_png_attachment_blocking(bytes))
         .await
         .map_err(internal)?
@@ -58,7 +63,7 @@ pub fn validate_png_attachment_blocking(
     Ok(bytes)
 }
 
-fn begin_attachment_upload(
+pub(super) fn begin_attachment_upload(
     state: &mut ClientState,
     mime: String,
     byte_len: usize,
@@ -68,7 +73,7 @@ fn begin_attachment_upload(
     begin_attachment_upload_with_limits(state, mime, byte_len, sha256, purpose, state.upload_limits)
 }
 
-fn begin_attachment_upload_with_limits(
+pub(super) fn begin_attachment_upload_with_limits(
     state: &mut ClientState,
     mime: String,
     byte_len: usize,
@@ -141,7 +146,7 @@ fn begin_attachment_upload_with_limits(
     })
 }
 
-fn upload_attachment_chunk(
+pub(super) fn upload_attachment_chunk(
     state: &mut ClientState,
     upload_id: Uuid,
     offset: usize,
@@ -176,7 +181,7 @@ fn upload_attachment_chunk(
     })
 }
 
-async fn finish_attachment_upload(
+pub(super) async fn finish_attachment_upload(
     state: &mut ClientState,
     upload_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -222,7 +227,7 @@ async fn finish_attachment_upload(
     }
 }
 
-fn consume_image_refs(
+pub(super) fn consume_image_refs(
     state: &mut ClientState,
     session_id: Uuid,
     refs: &[proto::ImageAttachmentRef],

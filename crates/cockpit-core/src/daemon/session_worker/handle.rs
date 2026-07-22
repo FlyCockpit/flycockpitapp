@@ -1,3 +1,8 @@
+use super::helpers::*;
+use super::lifecycle::*;
+use super::run::run_worker;
+use super::*;
+
 /// Handle one or more client tasks hold to drive a session. Cheap to
 /// clone — both channels inside are reference-counted.
 #[derive(Clone)]
@@ -29,7 +34,7 @@ pub struct SessionWorkerHandle {
     /// condition and the TUI notice), so a renewed unavailable condition can
     /// surface again. Shared with the worker's event-forward task.
     sandbox_notice_armed: Arc<AtomicBool>,
-    sandbox_unavailable_notice: Arc<RwLock<Option<SandboxUnavailableNotice>>>,
+    pub(super) sandbox_unavailable_notice: Arc<RwLock<Option<SandboxUnavailableNotice>>>,
     /// The daemon-wide lock authority, so the last-detach-while-idle edge can
     /// release this session's locks (implementation note).
     /// The `InteractiveClientGuard`'s `Drop` consults it; the `AgentIdle` edge
@@ -38,16 +43,16 @@ pub struct SessionWorkerHandle {
     env_overlay: Arc<RwLock<HashMap<String, String>>>,
     repair_required: Arc<RwLock<Option<proto::ResumeRepairState>>>,
     foreground: Arc<Mutex<LiveForegroundState>>,
-    config_snapshot: Arc<RwLock<SessionConfigSnapshot>>,
+    pub(super) config_snapshot: Arc<RwLock<SessionConfigSnapshot>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SandboxUnavailableNotice {
-    remedy: String,
-    fix_command: Option<String>,
+pub(super) struct SandboxUnavailableNotice {
+    pub(super) remedy: String,
+    pub(super) fix_command: Option<String>,
 }
 
-struct WorkerCleanupGuard(Option<Box<dyn FnOnce() + Send + 'static>>);
+pub(super) struct WorkerCleanupGuard(Option<Box<dyn FnOnce() + Send + 'static>>);
 
 impl Drop for WorkerCleanupGuard {
     fn drop(&mut self) {
@@ -58,14 +63,14 @@ impl Drop for WorkerCleanupGuard {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DriverOutcome {
+pub(super) enum DriverOutcome {
     Ok,
     Err(String),
     Panicked(String),
 }
 
 impl DriverOutcome {
-    fn failure_error(&self) -> Option<&str> {
+    pub(super) fn failure_error(&self) -> Option<&str> {
         match self {
             DriverOutcome::Ok => None,
             DriverOutcome::Err(error) | DriverOutcome::Panicked(error) => Some(error),
@@ -74,7 +79,7 @@ impl DriverOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum WorkerStop {
+pub(super) enum WorkerStop {
     Shutdown {
         pause_for_resume: bool,
         active: bool,
@@ -86,7 +91,7 @@ enum WorkerStop {
 }
 
 impl WorkerStop {
-    fn session_ended_reason(&self) -> &'static str {
+    pub(super) fn session_ended_reason(&self) -> &'static str {
         match self {
             WorkerStop::DriverFailed => "driver failed",
             WorkerStop::DriverExited => "driver exited",
@@ -95,7 +100,7 @@ impl WorkerStop {
     }
 }
 
-fn driver_join_outcome(
+pub(super) fn driver_join_outcome(
     result: std::result::Result<DriverOutcome, tokio::task::JoinError>,
 ) -> DriverOutcome {
     match result {
@@ -119,7 +124,7 @@ fn driver_join_outcome(
     }
 }
 
-fn send_sandbox_unavailable_notice(
+pub(super) fn send_sandbox_unavailable_notice(
     event_tx: &EventSender,
     redaction: &SharedRedactionTable,
     session_id: Uuid,
@@ -244,12 +249,13 @@ impl SessionConfigHandle {
             }),
             mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         };
-        let (providers, extended) = crate::config::trust::with_workspace_trust_policy(policy, || {
-            (
-                crate::config::providers::ConfigDoc::load_effective(cwd),
-                crate::config::extended::load_for_cwd(cwd),
-            )
-        });
+        let (providers, extended) =
+            crate::config::trust::with_workspace_trust_policy(policy, || {
+                (
+                    crate::config::providers::ConfigDoc::load_effective(cwd),
+                    crate::config::extended::load_for_cwd(cwd),
+                )
+            });
         Self::detached(SessionConfigSnapshot::new(0, providers, extended))
     }
 
@@ -307,7 +313,7 @@ impl SessionConfigHandle {
     }
 }
 
-fn redacted_extended_config(
+pub(super) fn redacted_extended_config(
     extended: &crate::config::extended::ExtendedConfig,
 ) -> crate::config::extended::ExtendedConfig {
     let mut extended = extended.clone();
@@ -320,13 +326,13 @@ fn redacted_extended_config(
     extended
 }
 
-fn redacted_provider_view(
+pub(super) fn redacted_provider_view(
     providers: &crate::config::providers::ProvidersConfig,
 ) -> proto::ProviderConfigView {
     crate::secret_ref::redact_provider_view(providers)
 }
 
-fn replace_config_snapshot(
+pub(super) fn replace_config_snapshot(
     config_snapshot: &Arc<RwLock<SessionConfigSnapshot>>,
     replacement: SessionConfigSnapshot,
 ) -> u64 {
@@ -339,7 +345,7 @@ fn replace_config_snapshot(
     snapshot.generation
 }
 
-fn sandbox_unavailable_notice_from_availability(
+pub(super) fn sandbox_unavailable_notice_from_availability(
     availability: &crate::tools::shell_sandbox::SandboxAvailability,
 ) -> Option<SandboxUnavailableNotice> {
     match availability {
@@ -356,7 +362,7 @@ fn sandbox_unavailable_notice_from_availability(
     }
 }
 
-fn emit_session_driver_failed_once(
+pub(super) fn emit_session_driver_failed_once(
     event_tx: &EventSender,
     redaction: &SharedRedactionTable,
     session_id: Uuid,
@@ -378,7 +384,7 @@ fn emit_session_driver_failed_once(
     );
 }
 
-async fn send_driver_control_or_fail(
+pub(super) async fn send_driver_control_or_fail(
     driver_control_tx: &mpsc::Sender<crate::engine::driver::DriverControl>,
     control: crate::engine::driver::DriverControl,
     event_tx: &EventSender,
@@ -400,7 +406,7 @@ async fn send_driver_control_or_fail(
     false
 }
 
-fn active_wire_api_for_session(
+pub(super) fn active_wire_api_for_session(
     session: &Session,
     providers: &crate::config::providers::ProvidersConfig,
 ) -> (String, String, crate::config::providers::WireApi) {
@@ -415,7 +421,7 @@ fn active_wire_api_for_session(
     (provider, model, resolved)
 }
 
-fn wire_api_label(wire_api: crate::config::providers::WireApi) -> &'static str {
+pub(super) fn wire_api_label(wire_api: crate::config::providers::WireApi) -> &'static str {
     match wire_api {
         crate::config::providers::WireApi::Responses => "responses",
         crate::config::providers::WireApi::Completions => "completions",
@@ -423,7 +429,7 @@ fn wire_api_label(wire_api: crate::config::providers::WireApi) -> &'static str {
     }
 }
 
-fn build_resume_repair_state(
+pub(super) fn build_resume_repair_state(
     session: &Session,
     providers: &crate::config::providers::ProvidersConfig,
     repair: &crate::engine::rehydrate::RehydrateRepairRequired,
@@ -655,16 +661,16 @@ impl SessionWorkerHandle {
 /// interactive-client count on drop, so a disconnect (even an abrupt one)
 /// correctly returns the session to headless behavior.
 pub struct InteractiveClientGuard {
-    counter: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) counter: Arc<std::sync::atomic::AtomicUsize>,
     /// Session this guard belongs to — used by the last-detach-while-idle
     /// release edge (implementation note).
-    session_id: Uuid,
+    pub(super) session_id: Uuid,
     /// The daemon-wide lock authority, consulted on the last detach.
-    locks: Arc<LockManager>,
+    pub(super) locks: Arc<LockManager>,
     /// Live turn-state, so the detach edge releases only when idle (not
     /// mid-turn): a mid-turn detach keeps the worker (GOALS §8b) and its
     /// locks alive; the next `AgentIdle` with zero clients is the backstop.
-    live: Arc<LiveState>,
+    pub(super) live: Arc<LiveState>,
 }
 
 impl Drop for InteractiveClientGuard {
@@ -842,9 +848,12 @@ impl SessionWorkerHandle {
             return;
         };
         let questions = active.questions.clone().or_else(|| {
-            active.question.clone().map(|question| proto::InterruptQuestionSet {
-                questions: vec![question],
-            })
+            active
+                .question
+                .clone()
+                .map(|question| proto::InterruptQuestionSet {
+                    questions: vec![question],
+                })
         });
         let Some(questions) = questions else {
             return;
@@ -1211,10 +1220,7 @@ pub fn spawn(
             scheduler,
             global_bus,
         ));
-        crate::config::trust::scope_workspace_trust_policy(
-            trust_policy, worker,
-        )
-        .await;
+        crate::config::trust::scope_workspace_trust_policy(trust_policy, worker).await;
     });
 
     (handle, join)

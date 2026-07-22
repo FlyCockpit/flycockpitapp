@@ -1,4 +1,6 @@
-fn steer_delegation_side_channel(
+use super::*;
+
+pub(super) fn steer_delegation_side_channel(
     session: &Session,
     _redact: &RedactionTable,
     task_call_id: String,
@@ -71,7 +73,9 @@ fn steer_delegation_side_channel(
     }
 }
 
-fn queue_item_to_proto(item: crate::engine::message::QueuedUserMessage) -> proto::QueueItem {
+pub(super) fn queue_item_to_proto(
+    item: crate::engine::message::QueuedUserMessage,
+) -> proto::QueueItem {
     proto::QueueItem {
         id: item.id,
         status: match item.status {
@@ -84,7 +88,7 @@ fn queue_item_to_proto(item: crate::engine::message::QueuedUserMessage) -> proto
     }
 }
 
-fn remove_reason_to_proto(
+pub(super) fn remove_reason_to_proto(
     result: crate::engine::message::RemoveQueuedMessageResult,
 ) -> proto::RemoveQueuedUserMessageReason {
     match result {
@@ -100,7 +104,9 @@ fn remove_reason_to_proto(
     }
 }
 
-fn queue_target_to_proto(target: crate::engine::message::QueueTarget) -> proto::QueueTarget {
+pub(super) fn queue_target_to_proto(
+    target: crate::engine::message::QueueTarget,
+) -> proto::QueueTarget {
     proto::QueueTarget {
         id: target.id,
         agent: target.agent,
@@ -109,7 +115,7 @@ fn queue_target_to_proto(target: crate::engine::message::QueueTarget) -> proto::
     }
 }
 
-fn log_seed_tool_drain_failed(session_id: Uuid, error: &anyhow::Error) {
+pub(super) fn log_seed_tool_drain_failed(session_id: Uuid, error: &anyhow::Error) {
     tracing::warn!(
         session_id = %session_id,
         error = %error,
@@ -180,7 +186,7 @@ pub(crate) fn resolve_root_agent_conn(
 /// no model is active or the providers config can't be loaded, the global
 /// value passes through unchanged. Same first-hit config-layer rule as the
 /// rest of the worker.
-fn resolve_effective_llm_mode(
+pub(super) fn resolve_effective_llm_mode(
     session: &Session,
     providers: &crate::config::providers::ProvidersConfig,
     global: crate::config::extended::LlmMode,
@@ -199,7 +205,7 @@ fn resolve_effective_llm_mode(
 /// file + `/llm-mode` all resolve to the same value. Round-trips through
 /// [`ExtendedConfigDoc`] so unknown keys (including sibling layer/provider
 /// metadata) survive.
-fn persist_llm_mode(
+pub(super) fn persist_llm_mode(
     project_root: &std::path::Path,
     mode: crate::config::extended::LlmMode,
 ) -> anyhow::Result<()> {
@@ -224,12 +230,12 @@ fn persist_llm_mode(
 pub const DAEMON_NO_SANDBOX_ENV: &str = "COCKPIT_DAEMON_NO_SANDBOX";
 
 /// Whether the running daemon was launched with `--no-sandbox`.
-fn daemon_no_sandbox() -> bool {
+pub(super) fn daemon_no_sandbox() -> bool {
     std::env::var_os(DAEMON_NO_SANDBOX_ENV).is_some()
 }
 
 /// Resolve the new-session sandbox default from the live daemon flag.
-fn resolve_sandbox_default(
+pub(super) fn resolve_sandbox_default(
     client_no_sandbox: bool,
     configured_default: crate::tools::sandbox_mode::SandboxMode,
 ) -> crate::tools::sandbox_mode::SandboxMode {
@@ -240,7 +246,7 @@ fn resolve_sandbox_default(
 /// client `--no-sandbox` -> sandbox mode. Factored out from
 /// [`resolve_sandbox_default`] so the precedence can be unit-tested without
 /// touching process env.
-fn resolve_sandbox_default_with(
+pub(super) fn resolve_sandbox_default_with(
     daemon_no_sandbox: bool,
     client_no_sandbox: bool,
     configured_default: crate::tools::sandbox_mode::SandboxMode,
@@ -258,17 +264,19 @@ fn resolve_sandbox_default_with(
 /// Resolve the per-session async-jobs concurrency cap (GOALS §22) from the
 /// layered `config.json` rooted at `project_root`, falling back
 /// to the default when none is configured.
-fn max_concurrent_schedules_for(config: &crate::config::extended::ExtendedConfig) -> usize {
+pub(super) fn max_concurrent_schedules_for(
+    config: &crate::config::extended::ExtendedConfig,
+) -> usize {
     config.schedule.max_concurrent
 }
 
 /// Resolve the loop-guard threshold (GOALS §1/§12) from the layered
 /// `config.json` rooted at `project_root`, falling back to the
 /// default (2 = fire on the first exact repeat) when none is configured.
-fn loop_guard_threshold_for(config: &crate::config::extended::ExtendedConfig) -> u32 {
+pub(super) fn loop_guard_threshold_for(config: &crate::config::extended::ExtendedConfig) -> u32 {
     config.loop_guard.effective_threshold()
 }
 
-fn max_primary_rounds_for(config: &crate::config::extended::ExtendedConfig) -> u32 {
+pub(super) fn max_primary_rounds_for(config: &crate::config::extended::ExtendedConfig) -> u32 {
     config.max_primary_rounds
 }

@@ -1,4 +1,7 @@
-async fn list_sessions(
+use super::authz::*;
+use super::*;
+
+pub(super) async fn list_sessions(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
     project_id: Option<String>,
@@ -37,7 +40,7 @@ async fn list_sessions(
     Ok(Response::Sessions { sessions })
 }
 
-fn apply_live_activity_state(
+pub(super) fn apply_live_activity_state(
     summary: &mut proto::SessionSummary,
     processing: bool,
     tool_running: bool,
@@ -52,7 +55,7 @@ fn apply_live_activity_state(
     }
 }
 
-fn resource_scheduler_snapshot(
+pub(super) fn resource_scheduler_snapshot(
     ctx: &DaemonContext,
 ) -> crate::engine::resource_scheduler::ResourceSchedulerSnapshot {
     ctx.registry
@@ -63,7 +66,7 @@ fn resource_scheduler_snapshot(
         })
 }
 
-fn promote_resource_request(
+pub(super) fn promote_resource_request(
     ctx: &DaemonContext,
     request_id: &str,
     fallback_session_id: Option<Uuid>,
@@ -157,7 +160,7 @@ fn promote_resource_request(
     })
 }
 
-fn record_resource_promotion(
+pub(super) fn record_resource_promotion(
     ctx: &DaemonContext,
     session_id: Option<Uuid>,
     request_id: &str,
@@ -182,7 +185,7 @@ fn record_resource_promotion(
     );
 }
 
-fn fork_session(
+pub(super) fn fork_session(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
     parent_session_id: Uuid,
@@ -225,7 +228,7 @@ fn fork_session(
     })
 }
 
-fn btw_info_to_proto(info: crate::db::sessions::BtwForkInfo) -> proto::BtwForkInfo {
+pub(super) fn btw_info_to_proto(info: crate::db::sessions::BtwForkInfo) -> proto::BtwForkInfo {
     proto::BtwForkInfo {
         session_id: info.session_id,
         parent_session_id: info.parent_session_id,
@@ -236,7 +239,7 @@ fn btw_info_to_proto(info: crate::db::sessions::BtwForkInfo) -> proto::BtwForkIn
     }
 }
 
-fn create_btw_fork(
+pub(super) fn create_btw_fork(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
     parent_session_id: Uuid,
@@ -269,7 +272,7 @@ fn create_btw_fork(
     })
 }
 
-async fn end_btw_fork(
+pub(super) async fn end_btw_fork(
     ctx: &DaemonContext,
     parent_session_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -292,7 +295,7 @@ async fn end_btw_fork(
 /// descendant forks. Guarded — a non-ephemeral session is left untouched,
 /// so a stray discard can never drop a persisted session. Idempotent: an
 /// already-gone session acks without error.
-async fn discard_session(
+pub(super) async fn discard_session(
     state: &mut ClientState,
     ctx: &DaemonContext,
     session_id: Uuid,
@@ -316,7 +319,7 @@ async fn discard_session(
     Ok(Response::Ack)
 }
 
-fn rename_session(
+pub(super) fn rename_session(
     ctx: &DaemonContext,
     session_id: Uuid,
     title: &str,
@@ -340,7 +343,7 @@ fn rename_session(
 /// the target session and returns its assigned `seq`. The note never enters
 /// model-bound history (rehydration skips `user_note`) and triggers no
 /// inference — it is purely a durable, exportable transcript annotation.
-fn record_session_note(
+pub(super) fn record_session_note(
     ctx: &DaemonContext,
     session_id: Uuid,
     text: &str,
@@ -368,7 +371,7 @@ fn record_session_note(
     Ok(Response::NoteRecorded { seq })
 }
 
-async fn delete_session(
+pub(super) async fn delete_session(
     ctx: &DaemonContext,
     session_id: Uuid,
     cascade: bool,
@@ -393,7 +396,7 @@ async fn delete_session(
     Ok(Response::Ack)
 }
 
-async fn archive_session(
+pub(super) async fn archive_session(
     ctx: &DaemonContext,
     session_id: Uuid,
     cascade: bool,
@@ -422,7 +425,7 @@ async fn archive_session(
 /// the daemon currently has active workers for — there is no DB walk
 /// here because only sessions with a live worker need interrupting, and
 /// the registry already knows those.
-async fn stop_subtree(
+pub(super) async fn stop_subtree(
     ctx: &DaemonContext,
     root: Uuid,
     cascade: bool,
@@ -449,7 +452,7 @@ async fn stop_subtree(
     Ok(())
 }
 
-fn unarchive_session(
+pub(super) fn unarchive_session(
     ctx: &DaemonContext,
     session_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -467,14 +470,16 @@ fn unarchive_session(
     Ok(Response::Ack)
 }
 
-fn require_attached(state: &ClientState) -> std::result::Result<&AttachedSession, ErrorPayload> {
+pub(super) fn require_attached(
+    state: &ClientState,
+) -> std::result::Result<&AttachedSession, ErrorPayload> {
     state.attached.as_ref().ok_or_else(|| ErrorPayload {
         code: ErrorCode::NotAttached,
         message: "client has not attached to a session".into(),
     })
 }
 
-fn validate_set_agent(
+pub(super) fn validate_set_agent(
     ctx: &DaemonContext,
     att: &AttachedSession,
     name: &str,
@@ -490,7 +495,7 @@ fn validate_set_agent(
     validate_set_agent_name(name, cfg.experimental_mode, &ownable)
 }
 
-fn validate_set_agent_name(
+pub(super) fn validate_set_agent_name(
     name: &str,
     experimental_mode: bool,
     ownable: &[String],
@@ -515,7 +520,7 @@ fn validate_set_agent_name(
     Ok(())
 }
 
-fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
+pub(super) fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::Internal,
         // `{:#}` walks the full anyhow context chain (e.g. `resolving
@@ -526,14 +531,16 @@ fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
     }
 }
 
-fn require_scheduler(ctx: &DaemonContext) -> std::result::Result<&DaemonSchedulerHandle, ErrorPayload> {
+pub(super) fn require_scheduler(
+    ctx: &DaemonContext,
+) -> std::result::Result<&DaemonSchedulerHandle, ErrorPayload> {
     ctx.scheduler.as_ref().ok_or_else(|| ErrorPayload {
         code: ErrorCode::BadRequest,
         message: "scheduler is only available in the shared daemon".to_string(),
     })
 }
 
-fn workspace_trust_error(err: anyhow::Error) -> ErrorPayload {
+pub(super) fn workspace_trust_error(err: anyhow::Error) -> ErrorPayload {
     if err
         .downcast_ref::<crate::config::trust::WorkspaceTrustError>()
         .is_some()

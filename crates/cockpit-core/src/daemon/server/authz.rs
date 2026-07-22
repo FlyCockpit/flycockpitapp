@@ -1,4 +1,7 @@
-fn session_access_for_row(
+use super::sessions::*;
+use super::*;
+
+pub(super) fn session_access_for_row(
     principal: &ClientPrincipal,
     row: &crate::db::sessions::SessionRow,
 ) -> SessionAccess {
@@ -23,7 +26,7 @@ fn session_access_for_row(
     }
 }
 
-fn session_access_for_summary(
+pub(super) fn session_access_for_summary(
     principal: &ClientPrincipal,
     summary: &proto::SessionSummary,
 ) -> SessionAccess {
@@ -47,7 +50,7 @@ fn session_access_for_summary(
     }
 }
 
-fn attached_session_access(
+pub(super) fn attached_session_access(
     principal: &ClientPrincipal,
     state: &ClientState,
     ctx: &DaemonContext,
@@ -72,7 +75,7 @@ fn attached_session_access(
     }
 }
 
-fn require_remote_session_writer(
+pub(super) fn require_remote_session_writer(
     principal: &ClientPrincipal,
     state: &ClientState,
     ctx: &DaemonContext,
@@ -88,7 +91,7 @@ fn require_remote_session_writer(
     }
 }
 
-fn require_remote_target_session_writer(
+pub(super) fn require_remote_target_session_writer(
     principal: &ClientPrincipal,
     ctx: &DaemonContext,
     session_id: Uuid,
@@ -135,7 +138,7 @@ macro_rules! command_request_session_id_match {
 }
 
 #[allow(unused_variables)]
-fn request_session_id(request: &Request, state: &ClientState) -> Option<Uuid> {
+pub(super) fn request_session_id(request: &Request, state: &ClientState) -> Option<Uuid> {
     proto::command!(command_request_session_id_match, request, state)
 }
 
@@ -160,7 +163,7 @@ macro_rules! command_request_audit_path_match {
 }
 
 #[allow(unused_variables)]
-fn request_audit_path(request: &Request) -> Option<String> {
+pub(super) fn request_audit_path(request: &Request) -> Option<String> {
     proto::command!(command_request_audit_path_match, request)
 }
 
@@ -173,11 +176,11 @@ macro_rules! command_is_remote_mutating_match {
 }
 
 #[allow(unused_variables)]
-fn is_remote_mutating_request(request: &Request) -> bool {
+pub(super) fn is_remote_mutating_request(request: &Request) -> bool {
     proto::command!(command_is_remote_mutating_match, request)
 }
 
-fn audit_remote_request(
+pub(super) fn audit_remote_request(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
     kind: &str,
@@ -200,7 +203,7 @@ fn audit_remote_request(
     }
 }
 
-fn authorize_attach(
+pub(super) fn authorize_attach(
     request: &Request,
     state: &ClientState,
     ctx: &DaemonContext,
@@ -243,7 +246,7 @@ fn authorize_attach(
     }
 }
 
-fn authorize_subagent_transcript(
+pub(super) fn authorize_subagent_transcript(
     request: &Request,
     state: &ClientState,
     ctx: &DaemonContext,
@@ -268,7 +271,7 @@ fn authorize_subagent_transcript(
     }
 }
 
-fn authorize_read_session_messages(
+pub(super) fn authorize_read_session_messages(
     request: &Request,
     state: &ClientState,
     ctx: &DaemonContext,
@@ -293,7 +296,7 @@ fn authorize_read_session_messages(
     }
 }
 
-fn authorize_begin_attachment_upload(
+pub(super) fn authorize_begin_attachment_upload(
     request: &Request,
     state: &ClientState,
     ctx: &DaemonContext,
@@ -318,7 +321,7 @@ fn authorize_begin_attachment_upload(
     }
 }
 
-fn authorize_attachment_upload_step(
+pub(super) fn authorize_attachment_upload_step(
     request: &Request,
     state: &ClientState,
     ctx: &DaemonContext,
@@ -349,7 +352,7 @@ fn authorize_attachment_upload_step(
     }
 }
 
-fn authorize_steer_delegation(
+pub(super) fn authorize_steer_delegation(
     request: &Request,
     state: &ClientState,
     ctx: &DaemonContext,
@@ -360,7 +363,7 @@ fn authorize_steer_delegation(
     require_remote_target_session_writer(&state.principal, ctx, *session_id)
 }
 
-fn authorize_lsp_control(
+pub(super) fn authorize_lsp_control(
     request: &Request,
     state: &ClientState,
     _ctx: &DaemonContext,
@@ -378,7 +381,7 @@ fn authorize_lsp_control(
     }
 }
 
-fn authorize_session_row_writer(
+pub(super) fn authorize_session_row_writer(
     principal: &ClientPrincipal,
     ctx: &DaemonContext,
     session_id: Uuid,
@@ -401,7 +404,7 @@ fn authorize_session_row_writer(
     }
 }
 
-fn authorize_session_row_reader(
+pub(super) fn authorize_session_row_reader(
     principal: &ClientPrincipal,
     ctx: &DaemonContext,
     session_id: Uuid,
@@ -480,7 +483,7 @@ macro_rules! command_authorize_request_match {
 }
 
 #[allow(unused_variables)]
-fn authorize_request(
+pub(super) fn authorize_request(
     request: &Request,
     state: &ClientState,
     ctx: &DaemonContext,

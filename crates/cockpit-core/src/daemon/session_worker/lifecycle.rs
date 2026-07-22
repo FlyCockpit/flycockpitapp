@@ -1,4 +1,6 @@
-fn forward_sandbox_unavailable(armed: &AtomicBool) -> bool {
+use super::*;
+
+pub(super) fn forward_sandbox_unavailable(armed: &AtomicBool) -> bool {
     !armed.swap(true, Ordering::SeqCst)
 }
 
@@ -8,7 +10,7 @@ fn forward_sandbox_unavailable(armed: &AtomicBool) -> bool {
 /// here so the snapshot/wake/persist behavior lives in exactly one place.
 /// Errors are logged, never propagated: a failed release must not crash a
 /// detach or a turn boundary (the idle-expiry sweep is the backstop).
-fn schedule_session_locks_unattended(
+pub(super) fn schedule_session_locks_unattended(
     locks: Arc<LockManager>,
     counter: Arc<AtomicUsize>,
     live: Arc<LiveState>,
@@ -36,7 +38,7 @@ fn schedule_session_locks_unattended(
     }
 }
 
-fn schedule_session_container_release(
+pub(super) fn schedule_session_container_release(
     counter: Arc<AtomicUsize>,
     live: Arc<LiveState>,
     session_id: Uuid,
@@ -49,7 +51,7 @@ fn schedule_session_container_release(
     }
 }
 
-async fn release_session_container_unattended(
+pub(super) async fn release_session_container_unattended(
     counter: Arc<AtomicUsize>,
     live: Arc<LiveState>,
     session_id: Uuid,
@@ -69,7 +71,7 @@ async fn release_session_container_unattended(
     }
 }
 
-async fn release_session_locks_unattended(
+pub(super) async fn release_session_locks_unattended(
     locks: Arc<LockManager>,
     counter: Arc<AtomicUsize>,
     live: Arc<LiveState>,
@@ -114,11 +116,11 @@ async fn release_session_locks_unattended(
 /// count to zero (it was `1` before) **and** the session is idle (not
 /// mid-turn). A mid-turn detach is left alone — the worker keeps running and the
 /// next `AgentIdle` with zero clients is the release backstop.
-fn detach_should_release(prev_count: usize, processing: bool) -> bool {
+pub(super) fn detach_should_release(prev_count: usize, processing: bool) -> bool {
     prev_count == 1 && !processing
 }
 
-fn update_live_foreground(
+pub(super) fn update_live_foreground(
     foreground: &Arc<Mutex<LiveForegroundState>>,
     foreground_input_target: &Arc<Mutex<crate::engine::message::QueueTarget>>,
     event: &TurnEvent,

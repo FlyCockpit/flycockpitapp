@@ -60,8 +60,12 @@ impl Approver {
             &offered,
             None,
         );
-        let response = self.raise_and_wait(&description, question).await?;
-        let choice = response_to_approval_choice(&response, false);
+        let set = approval_option_set("path_approval", false, &offered, None);
+        let choice = self
+            .raise_and_decode(&description, question, |response| {
+                response_to_approval_choice(response, &set)
+            })
+            .await?;
         let decision = match choice {
             ApprovalChoice::Deny => Decision::Deny,
             ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
@@ -184,12 +188,12 @@ impl Approver {
         let question = InterruptQuestion::Single {
             prompt,
             options: vec![
-                opt(ID_GITIGNORE_FILE, "Approve file"),
+                opt(ApprovalOptionId::GitignoreFile, "Approve file"),
                 opt(
-                    ID_GITIGNORE_PARENT,
+                    ApprovalOptionId::GitignoreParent,
                     &format!("Approve parent directory ({parent_label})"),
                 ),
-                opt(ID_GITIGNORE_REJECT, "Reject"),
+                opt(ApprovalOptionId::GitignoreReject, "Reject"),
             ],
             allow_freetext: false,
             command_detail: None,
@@ -198,19 +202,32 @@ impl Approver {
             sandbox_escalation: None,
         };
         let description = format!("`{display_path}` is gitignored — allow read?");
-        let response = self.raise_and_wait(&description, question).await?;
-        if matches!(
-            &response,
-            ResolveResponse::Freetext { text } if text == NONINTERACTIVE_RUN_DENIAL
-        ) {
-            return Ok(GitignoreShape::NoninteractiveReject);
-        }
-        Ok(match response_single_id(&response) {
-            Some(id) if id == ID_GITIGNORE_FILE => GitignoreShape::File,
-            Some(id) if id == ID_GITIGNORE_PARENT => GitignoreShape::Parent,
-            // Reject / dismissal / unknown → reject (safe default).
-            _ => GitignoreShape::Reject,
+        let set = ApprovalOptionSet::new(
+            "gitignore_shape",
+            [
+                ApprovalOptionId::GitignoreFile,
+                ApprovalOptionId::GitignoreParent,
+                ApprovalOptionId::GitignoreReject,
+            ],
+        );
+        self.raise_and_decode(&description, question, |response| {
+            if matches!(
+                response,
+                ResolveResponse::Freetext { text } if text == NONINTERACTIVE_RUN_DENIAL
+            ) {
+                return Ok(GitignoreShape::NoninteractiveReject);
+            }
+            let Some(id) = decode_option_response(response, &set)? else {
+                return Ok(GitignoreShape::Reject);
+            };
+            Ok(match id {
+                ApprovalOptionId::GitignoreFile => GitignoreShape::File,
+                ApprovalOptionId::GitignoreParent => GitignoreShape::Parent,
+                ApprovalOptionId::GitignoreReject => GitignoreShape::Reject,
+                _ => return Err(ForeignOptionId::new(&set, id.as_str())),
+            })
         })
+        .await
     }
 
     /// Raise the stage-2 (persistence) gitignore prompt and block for the
@@ -220,9 +237,9 @@ impl Approver {
         let question = InterruptQuestion::Single {
             prompt,
             options: vec![
-                opt(ID_ONCE, "Approve once"),
-                opt(ID_SESSION, "Approve for this session"),
-                opt(ID_PROJECT, "Approve for this project"),
+                opt(ApprovalOptionId::ApproveOnce, "Approve once"),
+                opt(ApprovalOptionId::ApproveSession, "Approve for this session"),
+                opt(ApprovalOptionId::ApproveProject, "Approve for this project"),
             ],
             allow_freetext: false,
             command_detail: None,
@@ -231,19 +248,31 @@ impl Approver {
             sandbox_escalation: None,
         };
         let description = format!("Allow reading `{display_path}` — persistence?");
-        let response = self.raise_and_wait(&description, question).await?;
-        if matches!(
-            &response,
-            ResolveResponse::Freetext { text } if text == NONINTERACTIVE_RUN_DENIAL
-        ) {
-            return Ok(GitignorePersistence::NoninteractiveReject);
-        }
-        Ok(match response_single_id(&response) {
-            Some(id) if id == ID_ONCE => GitignorePersistence::Once,
-            Some(id) if id == ID_SESSION => GitignorePersistence::Session,
-            Some(id) if id == ID_PROJECT => GitignorePersistence::Project,
-            // Dismissal / unknown → reject (safe default).
-            _ => GitignorePersistence::Reject,
+        let set = ApprovalOptionSet::new(
+            "gitignore_persistence",
+            [
+                ApprovalOptionId::ApproveOnce,
+                ApprovalOptionId::ApproveSession,
+                ApprovalOptionId::ApproveProject,
+            ],
+        );
+        self.raise_and_decode(&description, question, |response| {
+            if matches!(
+                response,
+                ResolveResponse::Freetext { text } if text == NONINTERACTIVE_RUN_DENIAL
+            ) {
+                return Ok(GitignorePersistence::NoninteractiveReject);
+            }
+            let Some(id) = decode_option_response(response, &set)? else {
+                return Ok(GitignorePersistence::Reject);
+            };
+            Ok(match id {
+                ApprovalOptionId::ApproveOnce => GitignorePersistence::Once,
+                ApprovalOptionId::ApproveSession => GitignorePersistence::Session,
+                ApprovalOptionId::ApproveProject => GitignorePersistence::Project,
+                _ => return Err(ForeignOptionId::new(&set, id.as_str())),
+            })
         })
+        .await
     }
 }

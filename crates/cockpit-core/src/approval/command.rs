@@ -94,29 +94,46 @@ impl Approver {
             suggested_access,
         };
 
-        let options = if grant_offer.is_some() && !offered_scopes.is_empty() {
-            let mut options = Vec::new();
+        let accepted = if grant_offer.is_some() && !offered_scopes.is_empty() {
+            let mut accepted = Vec::new();
             for scope in &offered_scopes {
                 let id = match scope {
-                    Scope::Session => ID_ESCALATE_GRANT_SESSION,
-                    Scope::Project => ID_ESCALATE_GRANT_PROJECT,
-                    Scope::Global => ID_ESCALATE_GRANT_GLOBAL,
+                    Scope::Session => ApprovalOptionId::EscalateGrantSession,
+                    Scope::Project => ApprovalOptionId::EscalateGrantProject,
+                    Scope::Global => ApprovalOptionId::EscalateGrantGlobal,
                     Scope::Once => continue,
                 };
-                options.push(opt(id, &format!("Grant paths for {}", scope_label(*scope))));
+                accepted.push(id);
             }
-            options.push(opt(
-                ID_ESCALATE_RUN_UNCONFINED_ONCE,
-                "Run once without sandbox",
-            ));
-            options.push(opt(ID_REJECT, "Deny"));
-            options
+            accepted.push(ApprovalOptionId::EscalateRunUnconfinedOnce);
+            accepted.push(ApprovalOptionId::Reject);
+            accepted
         } else {
             vec![
-                opt(ID_ESCALATE_RUN_UNCONFINED_ONCE, "Run once without sandbox"),
-                opt(ID_REJECT, "Deny"),
+                ApprovalOptionId::EscalateRunUnconfinedOnce,
+                ApprovalOptionId::Reject,
             ]
         };
+        let options = accepted
+            .iter()
+            .map(|id| match id {
+                ApprovalOptionId::EscalateGrantSession => opt(
+                    *id,
+                    &format!("Grant paths for {}", scope_label(Scope::Session)),
+                ),
+                ApprovalOptionId::EscalateGrantProject => opt(
+                    *id,
+                    &format!("Grant paths for {}", scope_label(Scope::Project)),
+                ),
+                ApprovalOptionId::EscalateGrantGlobal => opt(
+                    *id,
+                    &format!("Grant paths for {}", scope_label(Scope::Global)),
+                ),
+                ApprovalOptionId::EscalateRunUnconfinedOnce => opt(*id, "Run once without sandbox"),
+                ApprovalOptionId::Reject => opt(*id, "Deny"),
+                _ => unreachable!("sandbox escalation accepted set is fixed"),
+            })
+            .collect();
 
         let prompt = if grant_offer.is_some() {
             format!(
@@ -134,10 +151,15 @@ impl Approver {
             approval_class: Some(GrantKind::Command),
             sandbox_escalation: Some(escalation),
         };
-        let response = self
-            .raise_and_wait("Sandboxed command failed — choose a remedy", question)
+        let set = ApprovalOptionSet::new("sandbox_escalation", accepted);
+        let choice = self
+            .raise_and_decode(
+                "Sandboxed command failed — choose a remedy",
+                question,
+                |response| response_to_approval_choice(response, &set),
+            )
             .await?;
-        match response_to_approval_choice(&response, false) {
+        match choice {
             ApprovalChoice::NoninteractiveDeny => Ok(SandboxEscalationApproval::NoninteractiveDeny),
             ApprovalChoice::GrantPaths(scope) => {
                 let Some(offer) = grant_offer else {

@@ -1063,7 +1063,7 @@ mod tests {
     /// session allowlist, so a second read is silent.
     #[tokio::test]
     async fn gitignore_gate_two_stage_session_approval() {
-        use crate::approval::{ID_GITIGNORE_FILE, ID_SESSION};
+        use crate::approval::{ID_APPROVE_SESSION, ID_GITIGNORE_FILE};
         use crate::daemon::proto::ResolveResponse;
         let tmp = tempfile::tempdir().unwrap();
         let ctx = gitignore_ctx(tmp.path());
@@ -1100,7 +1100,7 @@ mod tests {
             assert!(hub.resolve(
                 iid2,
                 ResolveResponse::Single {
-                    selected_id: ID_SESSION.into(),
+                    selected_id: ID_APPROVE_SESSION.into(),
                 }
             ));
         });

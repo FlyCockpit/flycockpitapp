@@ -5,14 +5,9 @@ use async_trait::async_trait;
 use serde_json::Map;
 use serde_json::Value;
 
-use crate::daemon::proto::{
-    InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
-};
+use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 use crate::skills::manage::{SkillManageAction, SkillManageArgs, SkillMutationService};
-
-const APPROVE: &str = "approve";
-const REJECT: &str = "reject";
 
 pub struct SkillManageTool;
 
@@ -90,6 +85,12 @@ fn requires_prior_view(action: SkillManageAction) -> bool {
 }
 
 async fn approve_write(args: &SkillManageArgs, ctx: &ToolCtx) -> Result<bool> {
+    use crate::approval::{ApprovalOptionId, ApprovalOptionSet};
+
+    let set = ApprovalOptionSet::new(
+        "skill_write_approval",
+        [ApprovalOptionId::Approve, ApprovalOptionId::Reject],
+    );
     let question = InterruptQuestion::Single {
         prompt: format!(
             "Allow skill {:?} for `{}`? The exact tool call will be replayed only if approved.",
@@ -97,13 +98,13 @@ async fn approve_write(args: &SkillManageArgs, ctx: &ToolCtx) -> Result<bool> {
         ),
         options: vec![
             InterruptOption {
-                id: APPROVE.to_string(),
+                id: ApprovalOptionId::Approve.as_str().to_string(),
                 label: "Allow once".to_string(),
                 description: Some("Apply this exact skill mutation".to_string()),
                 secondary: false,
             },
             InterruptOption {
-                id: REJECT.to_string(),
+                id: ApprovalOptionId::Reject.as_str().to_string(),
                 label: "Deny".to_string(),
                 description: Some("Leave the skill library unchanged".to_string()),
                 secondary: false,
@@ -115,27 +116,36 @@ async fn approve_write(args: &SkillManageArgs, ctx: &ToolCtx) -> Result<bool> {
         approval_class: None,
         sandbox_escalation: None,
     };
-    let response = crate::engine::interrupt::raise_and_wait(
-        &ctx.session.db,
-        &ctx.interrupts,
-        ctx.session.id,
-        &ctx.agent_id,
-        &format!("Skill write: {:?} `{}`", args.action, args.name),
-        InterruptQuestionSet {
-            questions: vec![question],
-        },
-        "skill write approval",
-    )
-    .await
-    .into_response()?;
-    Ok(matches!(
-        response,
-        ResolveResponse::Single { ref selected_id } if selected_id == APPROVE
-    ) || matches!(
-        response,
-        ResolveResponse::Batch { ref responses }
-            if matches!(responses.first(), Some(ResolveResponse::Single { selected_id }) if selected_id == APPROVE)
-    ))
+    let description = format!("Skill write: {:?} `{}`", args.action, args.name);
+    loop {
+        let response = crate::engine::interrupt::raise_and_wait(
+            &ctx.session.db,
+            &ctx.interrupts,
+            ctx.session.id,
+            &ctx.agent_id,
+            &description,
+            InterruptQuestionSet {
+                questions: vec![question.clone()],
+            },
+            "skill write approval",
+        )
+        .await
+        .into_response()?;
+        let Some(id) = (match crate::approval::decode_option_response(&response, &set) {
+            Ok(id) => id,
+            Err(foreign) => {
+                crate::approval::warn_foreign_option_id(&foreign);
+                continue;
+            }
+        }) else {
+            return Ok(false);
+        };
+        return match id {
+            ApprovalOptionId::Approve => Ok(true),
+            ApprovalOptionId::Reject => Ok(false),
+            _ => unreachable!("skill write accepted set is fixed"),
+        };
+    }
 }
 
 fn skill_manage_schema(defensive: bool) -> Value {
@@ -296,6 +306,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    use crate::daemon::proto::ResolveResponse;
     use crate::db::needs_attention::{InterruptParkPayload, InterruptResumeAnchor};
 
     fn write_config(cwd: &std::path::Path, root: &std::path::Path, approval: bool) {
@@ -709,7 +721,7 @@ mod tests {
         let output = crate::engine::interrupt::with_pre_resolved_interrupt(
             interrupt_id,
             ResolveResponse::Single {
-                selected_id: APPROVE.to_string(),
+                selected_id: crate::approval::ID_APPROVE.to_string(),
             },
             SkillManageTool.call(args, &ctx),
         )
@@ -1006,7 +1018,7 @@ mod tests {
         let output = crate::engine::interrupt::with_pre_resolved_interrupt(
             interrupt_id,
             ResolveResponse::Single {
-                selected_id: APPROVE.to_string(),
+                selected_id: crate::approval::ID_APPROVE.to_string(),
             },
             SkillManageTool.call(args, &ctx),
         )
@@ -1027,7 +1039,7 @@ mod tests {
         let denied = crate::engine::interrupt::with_pre_resolved_interrupt(
             uuid::Uuid::new_v4(),
             ResolveResponse::Single {
-                selected_id: REJECT.to_string(),
+                selected_id: crate::approval::ID_REJECT.to_string(),
             },
             SkillManageTool.call(denied_args, &ctx),
         )

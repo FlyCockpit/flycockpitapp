@@ -4625,12 +4625,17 @@ impl Driver {
             );
         }
 
+        use crate::approval::{ApprovalOptionId, ApprovalOptionSet};
         use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+        let options = ApprovalOptionSet::new(
+            "schedule_unbounded_loop_approval",
+            [ApprovalOptionId::Approve, ApprovalOptionId::Reject],
+        );
         let question = InterruptQuestion::Single {
             prompt: "Allow unbounded schedule loops for this session?".to_string(),
             options: vec![
                 InterruptOption {
-                    id: "approve".into(),
+                    id: ApprovalOptionId::Approve.as_str().into(),
                     label: "Allow".into(),
                     description: Some(
                         "Permit schedule limit=0 loops until this session ends".into(),
@@ -4638,7 +4643,7 @@ impl Driver {
                     secondary: false,
                 },
                 InterruptOption {
-                    id: "deny".into(),
+                    id: ApprovalOptionId::Reject.as_str().into(),
                     label: "Deny".into(),
                     description: Some("Reject this unbounded loop request".into()),
                     secondary: false,
@@ -4650,25 +4655,39 @@ impl Driver {
             approval_class: None,
             sandbox_escalation: None,
         };
-        let set = InterruptQuestionSet {
-            questions: vec![question],
-        };
-        let resp = crate::engine::interrupt::raise_and_wait(
-            &self.session.db,
-            &self.interrupts,
-            self.session.id,
-            self.active_agent(),
-            "Unbounded schedule loop approval",
-            set,
-            "schedule unbounded loop approval",
-        )
-        .await
-        .into_response()?;
-        if crate::engine::interrupt::selected_id_of(&resp).as_deref() == Some("approve") {
-            self.unbounded_schedule_loops_approved = true;
-            Ok(())
-        } else {
-            anyhow::bail!("unbounded schedule loop rejected")
+        loop {
+            let resp = crate::engine::interrupt::raise_and_wait(
+                &self.session.db,
+                &self.interrupts,
+                self.session.id,
+                self.active_agent(),
+                "Unbounded schedule loop approval",
+                InterruptQuestionSet {
+                    questions: vec![question.clone()],
+                },
+                "schedule unbounded loop approval",
+            )
+            .await
+            .into_response()?;
+            let Some(id) = (match crate::approval::decode_option_response(&resp, &options) {
+                Ok(id) => id,
+                Err(foreign) => {
+                    crate::approval::warn_foreign_option_id(&foreign);
+                    continue;
+                }
+            }) else {
+                anyhow::bail!("unbounded schedule loop rejected");
+            };
+            match id {
+                ApprovalOptionId::Approve => {
+                    self.unbounded_schedule_loops_approved = true;
+                    return Ok(());
+                }
+                ApprovalOptionId::Reject => {
+                    anyhow::bail!("unbounded schedule loop rejected");
+                }
+                _ => unreachable!("schedule unbounded loop accepted set is fixed"),
+            }
         }
     }
 

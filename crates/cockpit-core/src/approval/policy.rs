@@ -186,8 +186,13 @@ impl Approver {
             &offered,
             None,
         );
-        let response = self.raise_and_wait(&prompt, question).await?;
-        let decision = match response_to_approval_choice(&response, false) {
+        let set = approval_option_set("mcp_tool_approval", false, &offered, None);
+        let choice = self
+            .raise_and_decode(&prompt, question, |response| {
+                response_to_approval_choice(response, &set)
+            })
+            .await?;
+        let decision = match choice {
             ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
             ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
             ApprovalChoice::Approve(scope) => {
@@ -244,7 +249,7 @@ impl Approver {
             prompt,
             // Once-only: each new package is its own decision, never
             // remembered (mirrors the wrapper/`approve_tool_call` shape).
-            options: vec![opt(ID_ONCE, "Yes, clone it")],
+            options: vec![opt(ApprovalOptionId::ApproveOnce, "Yes, clone it")],
             allow_freetext: false,
             command_detail: None,
             permission: true,
@@ -252,13 +257,18 @@ impl Approver {
             sandbox_escalation: None,
         };
         let description = format!("Clone `{identifier}` from {clone_url} for docs? ({rationale})");
-        let response = self.raise_and_wait(&description, question).await?;
-        // Any selection of the lone "clone it" option approves; a dismissal
-        // (Cancel / unknown) reads as deny — the safe default.
-        let decision = match response_single_id(&response) {
-            Some(id) if id == ID_ONCE => Decision::Allow { scope: Scope::Once },
-            _ => Decision::Deny,
-        };
+        let set = ApprovalOptionSet::new("package_add_approval", [ApprovalOptionId::ApproveOnce]);
+        let decision = self
+            .raise_and_decode(&description, question, |response| {
+                let Some(id) = decode_option_response(response, &set)? else {
+                    return Ok(Decision::Deny);
+                };
+                match id {
+                    ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
+                    _ => Err(ForeignOptionId::new(&set, id.as_str())),
+                }
+            })
+            .await?;
         self.record_permission_decision(
             "add-package",
             clone_url,

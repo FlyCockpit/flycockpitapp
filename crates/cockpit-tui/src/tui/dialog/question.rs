@@ -2550,6 +2550,7 @@ mod tests {
 
     // ---- bash command-detail block --------------------------------------
 
+    use cockpit_core::approval::{ID_APPROVE_ONCE, ID_APPROVE_SESSION};
     use cockpit_core::daemon::proto::{CharSpan, CommandDetail};
 
     fn ctrl(code: KeyCode) -> KeyEvent {
@@ -2568,8 +2569,8 @@ mod tests {
             questions: vec![InterruptQuestion::Single {
                 prompt: "Run `cd`?".into(),
                 options: vec![
-                    opt("once", "Yes, once"),
-                    opt("session", "Yes, for this session"),
+                    opt(ID_APPROVE_ONCE, "Yes, once"),
+                    opt(ID_APPROVE_SESSION, "Yes, for this session"),
                 ],
                 allow_freetext: false,
                 command_detail: Some(Box::new(detail)),
@@ -2669,7 +2670,7 @@ mod tests {
         let path_set = InterruptQuestionSet {
             questions: vec![InterruptQuestion::Single {
                 prompt: "Allow read access to /tmp/x?".into(),
-                options: vec![opt("once", "Approve once")],
+                options: vec![opt(ID_APPROVE_ONCE, "Approve once")],
                 allow_freetext: false,
                 command_detail: None,
                 permission: true,
@@ -3254,7 +3255,7 @@ mod tests {
         match d.take_result() {
             Some(QuestionResult::Submit { responses, .. }) => assert!(matches!(
                 responses.as_slice(),
-                [ResolveResponse::Single { selected_id }] if selected_id == "session"
+                [ResolveResponse::Single { selected_id }] if selected_id == ID_APPROVE_SESSION
             )),
             other => panic!("expected Submit, got {other:?}"),
         }
@@ -3317,11 +3318,11 @@ mod tests {
     fn escalation_dialog(esc: SandboxEscalation, rememberable: bool) -> QuestionDialog {
         let options = if rememberable {
             vec![
-                opt("once", "Yes, once"),
-                opt("session", "Yes, for this session"),
+                opt(ID_APPROVE_ONCE, "Yes, once"),
+                opt(ID_APPROVE_SESSION, "Yes, for this session"),
             ]
         } else {
-            vec![opt("once", "Yes, once")]
+            vec![opt(ID_APPROVE_ONCE, "Yes, once")]
         };
         let set = InterruptQuestionSet {
             questions: vec![InterruptQuestion::Single {

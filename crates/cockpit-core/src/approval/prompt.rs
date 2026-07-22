@@ -26,6 +26,23 @@ impl Approver {
         .into_response()?)
     }
 
+    pub(super) async fn raise_and_decode<T>(
+        &self,
+        description: &str,
+        question: InterruptQuestion,
+        mut decode: impl FnMut(&ResolveResponse) -> std::result::Result<T, ForeignOptionId>,
+    ) -> Result<T> {
+        loop {
+            let response = self.raise_and_wait(description, question.clone()).await?;
+            match decode(&response) {
+                Ok(choice) => return Ok(choice),
+                Err(foreign) => {
+                    warn_foreign_option_id(&foreign);
+                }
+            }
+        }
+    }
+
     /// Decide a back-to-back identical tool call (the loop guard, GOALS
     /// §1/§12). The dispatcher calls this only once the same `(tool,
     /// wire_input)` signature has repeated to the configured threshold.
@@ -127,18 +144,12 @@ impl Approver {
         };
         let description = format!("Repeated `{tool}` call — likely a loop. Allow it?");
 
-        let response = crate::engine::interrupt::raise_and_wait(
-            &self.db,
-            &self.interrupts,
-            self.session_id,
-            &self.agent_id,
+        self.raise_and_decode(
             &description,
-            set,
-            "loop-guard prompt",
+            set.questions[0].clone(),
+            response_to_repeat_choice,
         )
         .await
-        .into_response()?;
-        Ok(response_to_repeat_choice(&response))
     }
 
     /// Raise an approval interrupt and block until the user answers,
@@ -176,7 +187,19 @@ impl Approver {
             };
             *prompt = format!("{notice}\n{prompt}");
         }
-        let response = self.raise_and_wait(&description, question).await?;
-        Ok(response_to_approval_choice(&response, wrapper))
+        let set = approval_option_set(
+            if wrapper {
+                "wrapper_approval"
+            } else {
+                "command_approval"
+            },
+            wrapper,
+            offered_scopes,
+            extras.batch_count,
+        );
+        self.raise_and_decode(&description, question, |response| {
+            response_to_approval_choice(response, &set)
+        })
+        .await
     }
 }

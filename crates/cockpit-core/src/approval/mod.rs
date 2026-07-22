@@ -40,6 +40,7 @@ pub mod classify;
 pub mod store;
 
 mod command;
+mod options;
 mod paths;
 mod policy;
 mod prompt;
@@ -49,6 +50,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::approval::classify::{Classification, RiskTier, SimpleCommandInfo};
+pub(crate) use crate::approval::options::{ApprovalOptionId, ApprovalOptionSet, ForeignOptionId};
 use crate::approval::store::{GrantKind, GrantStore, LoopVerdict, Scope};
 use crate::daemon::proto::{
     CharSpan, CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet,
@@ -58,33 +60,31 @@ use crate::engine::interrupt::InterruptHub;
 
 /// Stable option ids for approval prompts. These are approval-domain ids that
 /// ride through generic interrupt answers; the TUI renders them generically.
-pub const ID_APPROVE: &str = "approve";
-pub const ID_REJECT: &str = "reject";
-pub const ID_APPROVE_ONCE: &str = "approve_once";
-pub const ID_APPROVE_SESSION: &str = "approve_session";
-pub const ID_APPROVE_PROJECT: &str = "approve_project";
-pub const ID_APPROVE_GLOBAL: &str = "approve_global";
-pub const ID_REJECT_SESSION: &str = "reject_session";
-pub const ID_REJECT_PROJECT: &str = "reject_project";
-pub const ID_REJECT_GLOBAL: &str = "reject_global";
-pub const ID_MORE_OPTIONS: &str = "more_options";
-pub const ID_APPROVE_ALL_ONCE: &str = "approve_all_once";
-pub const ID_ESCALATE_GRANT_SESSION: &str = "escalate_grant_session";
-pub const ID_ESCALATE_GRANT_PROJECT: &str = "escalate_grant_project";
-pub const ID_ESCALATE_GRANT_GLOBAL: &str = "escalate_grant_global";
-pub const ID_ESCALATE_RUN_UNCONFINED_ONCE: &str = "escalate_run_unconfined_once";
-pub const ID_ONCE: &str = "once";
-pub const ID_SESSION: &str = "session";
-pub const ID_PROJECT: &str = "project";
-pub const ID_LOOP_ACCEPT_ONCE: &str = "loop_accept_once";
-pub const ID_LOOP_REJECT_ONCE: &str = "loop_reject_once";
-pub const ID_LOOP_ACCEPT_SESSION: &str = "loop_accept_session";
-pub const ID_LOOP_REJECT_SESSION: &str = "loop_reject_session";
-pub const ID_LOOP_ACCEPT_PROJECT: &str = "loop_accept_project";
-pub const ID_LOOP_REJECT_PROJECT: &str = "loop_reject_project";
-pub const ID_GITIGNORE_FILE: &str = "gitignore_file";
-pub const ID_GITIGNORE_PARENT: &str = "gitignore_parent";
-pub const ID_GITIGNORE_REJECT: &str = "gitignore_reject";
+pub const ID_APPROVE: &str = ApprovalOptionId::Approve.as_str();
+pub const ID_REJECT: &str = ApprovalOptionId::Reject.as_str();
+pub const ID_APPROVE_ONCE: &str = ApprovalOptionId::ApproveOnce.as_str();
+pub const ID_APPROVE_SESSION: &str = ApprovalOptionId::ApproveSession.as_str();
+pub const ID_APPROVE_PROJECT: &str = ApprovalOptionId::ApproveProject.as_str();
+pub const ID_APPROVE_GLOBAL: &str = ApprovalOptionId::ApproveGlobal.as_str();
+pub const ID_REJECT_SESSION: &str = ApprovalOptionId::RejectSession.as_str();
+pub const ID_REJECT_PROJECT: &str = ApprovalOptionId::RejectProject.as_str();
+pub const ID_REJECT_GLOBAL: &str = ApprovalOptionId::RejectGlobal.as_str();
+pub const ID_MORE_OPTIONS: &str = ApprovalOptionId::MoreOptions.as_str();
+pub const ID_APPROVE_ALL_ONCE: &str = ApprovalOptionId::ApproveAllOnce.as_str();
+pub const ID_ESCALATE_GRANT_SESSION: &str = ApprovalOptionId::EscalateGrantSession.as_str();
+pub const ID_ESCALATE_GRANT_PROJECT: &str = ApprovalOptionId::EscalateGrantProject.as_str();
+pub const ID_ESCALATE_GRANT_GLOBAL: &str = ApprovalOptionId::EscalateGrantGlobal.as_str();
+pub const ID_ESCALATE_RUN_UNCONFINED_ONCE: &str =
+    ApprovalOptionId::EscalateRunUnconfinedOnce.as_str();
+pub const ID_LOOP_ACCEPT_ONCE: &str = ApprovalOptionId::RepeatAcceptOnce.as_str();
+pub const ID_LOOP_REJECT_ONCE: &str = ApprovalOptionId::RepeatRejectOnce.as_str();
+pub const ID_LOOP_ACCEPT_SESSION: &str = ApprovalOptionId::RepeatAcceptSession.as_str();
+pub const ID_LOOP_REJECT_SESSION: &str = ApprovalOptionId::RepeatRejectSession.as_str();
+pub const ID_LOOP_ACCEPT_PROJECT: &str = ApprovalOptionId::RepeatAcceptProject.as_str();
+pub const ID_LOOP_REJECT_PROJECT: &str = ApprovalOptionId::RepeatRejectProject.as_str();
+pub const ID_GITIGNORE_FILE: &str = ApprovalOptionId::GitignoreFile.as_str();
+pub const ID_GITIGNORE_PARENT: &str = ApprovalOptionId::GitignoreParent.as_str();
+pub const ID_GITIGNORE_REJECT: &str = ApprovalOptionId::GitignoreReject.as_str();
 
 /// The decision a prompt (or an already-granted query) produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +265,74 @@ fn response_single_id(response: &ResolveResponse) -> Option<&str> {
     }
 }
 
+pub(crate) fn decode_option_response(
+    response: &ResolveResponse,
+    set: &ApprovalOptionSet,
+) -> Result<Option<ApprovalOptionId>, ForeignOptionId> {
+    let Some(id) = response_single_id(response) else {
+        return Ok(None);
+    };
+    let Some(option) = ApprovalOptionId::from_str(id) else {
+        return Err(ForeignOptionId::new(set, id));
+    };
+    if !set.contains(option) {
+        return Err(ForeignOptionId::new(set, id));
+    }
+    Ok(Some(option))
+}
+
+fn approval_option_set(
+    kind: &'static str,
+    wrapper: bool,
+    offered_scopes: &[Scope],
+    batch_count: Option<u32>,
+) -> ApprovalOptionSet {
+    if wrapper {
+        return ApprovalOptionSet::new(kind, [ApprovalOptionId::Approve, ApprovalOptionId::Reject]);
+    }
+
+    let mut accepted = vec![ApprovalOptionId::ApproveOnce, ApprovalOptionId::Reject];
+    if batch_count.is_some_and(|count| count > 1) {
+        accepted.push(ApprovalOptionId::ApproveAllOnce);
+    }
+    for scope in offered_scopes.iter().copied() {
+        match scope {
+            Scope::Once => {}
+            Scope::Session => {
+                accepted.push(ApprovalOptionId::ApproveSession);
+                accepted.push(ApprovalOptionId::RejectSession);
+            }
+            Scope::Project => {
+                accepted.push(ApprovalOptionId::ApproveProject);
+                accepted.push(ApprovalOptionId::RejectProject);
+            }
+            Scope::Global => {
+                accepted.push(ApprovalOptionId::ApproveGlobal);
+                accepted.push(ApprovalOptionId::RejectGlobal);
+            }
+        }
+    }
+    if offered_scopes.iter().any(|scope| *scope != Scope::Once) {
+        accepted.push(ApprovalOptionId::MoreOptions);
+    }
+    ApprovalOptionSet::new(kind, accepted)
+}
+
+fn repeat_option_set() -> ApprovalOptionSet {
+    ApprovalOptionSet::new(
+        "loop_guard",
+        [
+            ApprovalOptionId::RepeatAcceptOnce,
+            ApprovalOptionId::RepeatRejectOnce,
+            ApprovalOptionId::MoreOptions,
+            ApprovalOptionId::RepeatAcceptSession,
+            ApprovalOptionId::RepeatRejectSession,
+            ApprovalOptionId::RepeatAcceptProject,
+            ApprovalOptionId::RepeatRejectProject,
+        ],
+    )
+}
+
 /// Build the six-option loop-guard question. The options ride through the
 /// generic interrupt; the answering dialog renders them with no
 /// special-casing, exactly like a `question`-tool prompt.
@@ -272,13 +340,25 @@ fn repeat_question(tool: &str) -> InterruptQuestion {
     InterruptQuestion::Single {
         prompt: format!("`{tool}` repeated the previous call exactly — likely a loop. Run it?"),
         options: vec![
-            opt(ID_LOOP_ACCEPT_ONCE, "Accept (once)"),
-            opt(ID_LOOP_ACCEPT_PROJECT, "Always accept for this project"),
-            opt(ID_REJECT, "Deny"),
-            opt(ID_MORE_OPTIONS, "More options…"),
-            secondary_opt(ID_LOOP_ACCEPT_SESSION, "Always accept for this session"),
-            secondary_opt(ID_LOOP_REJECT_SESSION, "Always reject for this session"),
-            secondary_opt(ID_LOOP_REJECT_PROJECT, "Always reject for this project"),
+            opt(ApprovalOptionId::RepeatAcceptOnce, "Accept (once)"),
+            opt(
+                ApprovalOptionId::RepeatAcceptProject,
+                "Always accept for this project",
+            ),
+            opt(ApprovalOptionId::RepeatRejectOnce, "Deny"),
+            opt(ApprovalOptionId::MoreOptions, "More options…"),
+            secondary_opt(
+                ApprovalOptionId::RepeatAcceptSession,
+                "Always accept for this session",
+            ),
+            secondary_opt(
+                ApprovalOptionId::RepeatRejectSession,
+                "Always reject for this session",
+            ),
+            secondary_opt(
+                ApprovalOptionId::RepeatRejectProject,
+                "Always reject for this project",
+            ),
         ],
         // Fixed choices; no free-text.
         allow_freetext: false,
@@ -293,39 +373,35 @@ fn repeat_question(tool: &str) -> InterruptQuestion {
     }
 }
 
-/// Map a resolved interrupt response back to a loop-guard choice. An
-/// unknown id, a non-`Single` response, or a `Cancel` reads as
-/// reject-once — the safe default for a likely loop.
-fn response_to_repeat_choice(response: &ResolveResponse) -> RepeatChoice {
-    let id = match response {
-        ResolveResponse::Single { selected_id } => selected_id.as_str(),
-        ResolveResponse::Batch { responses } => match responses.first() {
-            Some(ResolveResponse::Single { selected_id }) => selected_id.as_str(),
-            _ => return RepeatChoice::RejectOnce,
-        },
-        _ => return RepeatChoice::RejectOnce,
+/// Map a resolved interrupt response back to a loop-guard choice. A
+/// cancellation reads as reject-once; an unexpected selected id is a
+/// routing error for the caller to re-raise.
+fn response_to_repeat_choice(response: &ResolveResponse) -> Result<RepeatChoice, ForeignOptionId> {
+    let set = repeat_option_set();
+    let Some(id) = decode_option_response(response, &set)? else {
+        return Ok(RepeatChoice::RejectOnce);
     };
-    match id {
-        ID_LOOP_ACCEPT_ONCE => RepeatChoice::AcceptOnce,
-        ID_REJECT | ID_LOOP_REJECT_ONCE => RepeatChoice::RejectOnce,
-        ID_LOOP_ACCEPT_SESSION => RepeatChoice::Always {
+    Ok(match id {
+        ApprovalOptionId::RepeatAcceptOnce => RepeatChoice::AcceptOnce,
+        ApprovalOptionId::RepeatRejectOnce => RepeatChoice::RejectOnce,
+        ApprovalOptionId::RepeatAcceptSession => RepeatChoice::Always {
             verdict: LoopVerdict::Accept,
             scope: Scope::Session,
         },
-        ID_LOOP_REJECT_SESSION => RepeatChoice::Always {
+        ApprovalOptionId::RepeatRejectSession => RepeatChoice::Always {
             verdict: LoopVerdict::Reject,
             scope: Scope::Session,
         },
-        ID_LOOP_ACCEPT_PROJECT => RepeatChoice::Always {
+        ApprovalOptionId::RepeatAcceptProject => RepeatChoice::Always {
             verdict: LoopVerdict::Accept,
             scope: Scope::Project,
         },
-        ID_LOOP_REJECT_PROJECT => RepeatChoice::Always {
+        ApprovalOptionId::RepeatRejectProject => RepeatChoice::Always {
             verdict: LoopVerdict::Reject,
             scope: Scope::Project,
         },
-        _ => RepeatChoice::RejectOnce,
-    }
+        _ => return Err(ForeignOptionId::new(&set, id.as_str())),
+    })
 }
 
 /// Build the approval question. Normal approvals expose each scoped approve
@@ -362,8 +438,8 @@ fn approval_question(
     let options = if wrapper {
         // Both transient: a wrapper can only ever be approved/rejected once.
         vec![
-            opt(ID_APPROVE, "Approve once"),
-            opt(ID_REJECT, "Reject once"),
+            opt(ApprovalOptionId::Approve, "Approve once"),
+            opt(ApprovalOptionId::Reject, "Reject once"),
         ]
     } else {
         let mut options = scoped_approval_options(label, offered_scopes);
@@ -371,7 +447,7 @@ fn approval_question(
             options.insert(
                 1,
                 opt(
-                    ID_APPROVE_ALL_ONCE,
+                    ApprovalOptionId::ApproveAllOnce,
                     &format!("Approve all {count} steps once"),
                 ),
             );
@@ -556,16 +632,16 @@ fn prompt_description(
     }
 }
 
-fn opt(id: &str, label: &str) -> InterruptOption {
+fn opt(id: ApprovalOptionId, label: &str) -> InterruptOption {
     InterruptOption {
-        id: id.to_string(),
+        id: id.as_str().to_string(),
         label: label.to_string(),
         description: None,
         secondary: false,
     }
 }
 
-fn secondary_opt(id: &str, label: &str) -> InterruptOption {
+fn secondary_opt(id: ApprovalOptionId, label: &str) -> InterruptOption {
     let mut option = opt(id, label);
     option.secondary = true;
     option
@@ -579,27 +655,27 @@ fn scoped_approval_options(label: &str, scopes: &[Scope]) -> Vec<InterruptOption
     } else {
         None
     };
-    let mut options = vec![opt(ID_APPROVE_ONCE, "Approve once")];
+    let mut options = vec![opt(ApprovalOptionId::ApproveOnce, "Approve once")];
     if let Some(scope) = remember {
         options.push(opt(
             match scope {
-                Scope::Session => ID_APPROVE_SESSION,
-                Scope::Project => ID_APPROVE_PROJECT,
+                Scope::Session => ApprovalOptionId::ApproveSession,
+                Scope::Project => ApprovalOptionId::ApproveProject,
                 _ => unreachable!(),
             },
             &format!("Approve `{label}` for {}", scope_label(scope)),
         ));
     }
-    options.push(opt(ID_REJECT, "Deny"));
+    options.push(opt(ApprovalOptionId::Reject, "Deny"));
 
     let mut secondary = Vec::new();
     for scope in scopes.iter().copied().filter(|scope| *scope != Scope::Once) {
         if Some(scope) != remember {
             secondary.push(secondary_opt(
                 match scope {
-                    Scope::Session => ID_APPROVE_SESSION,
-                    Scope::Project => ID_APPROVE_PROJECT,
-                    Scope::Global => ID_APPROVE_GLOBAL,
+                    Scope::Session => ApprovalOptionId::ApproveSession,
+                    Scope::Project => ApprovalOptionId::ApproveProject,
+                    Scope::Global => ApprovalOptionId::ApproveGlobal,
                     Scope::Once => unreachable!(),
                 },
                 &format!("Approve `{label}` for {}", scope_label(scope)),
@@ -607,16 +683,16 @@ fn scoped_approval_options(label: &str, scopes: &[Scope]) -> Vec<InterruptOption
         }
         secondary.push(secondary_opt(
             match scope {
-                Scope::Session => ID_REJECT_SESSION,
-                Scope::Project => ID_REJECT_PROJECT,
-                Scope::Global => ID_REJECT_GLOBAL,
+                Scope::Session => ApprovalOptionId::RejectSession,
+                Scope::Project => ApprovalOptionId::RejectProject,
+                Scope::Global => ApprovalOptionId::RejectGlobal,
                 Scope::Once => unreachable!(),
             },
             &format!("Reject `{label}` for {}", scope_label(scope)),
         ));
     }
     if !secondary.is_empty() {
-        options.push(opt(ID_MORE_OPTIONS, "More options…"));
+        options.push(opt(ApprovalOptionId::MoreOptions, "More options…"));
         options.extend(secondary);
     }
     options
@@ -631,41 +707,40 @@ fn scope_label(scope: Scope) -> &'static str {
     }
 }
 
-/// Map the single approval response back to the final choice. A cancel,
-/// unknown id, or non-`Single` shape reads as deny-once.
-fn response_to_approval_choice(response: &ResolveResponse, wrapper: bool) -> ApprovalChoice {
+/// Map the single approval response back to the final choice. A cancel or
+/// non-`Single` shape reads as deny-once; an unexpected selected id is a
+/// routing error for the caller to re-raise.
+fn response_to_approval_choice(
+    response: &ResolveResponse,
+    set: &ApprovalOptionSet,
+) -> Result<ApprovalChoice, ForeignOptionId> {
     if matches!(
         response,
         ResolveResponse::Freetext { text } if text == NONINTERACTIVE_RUN_DENIAL
     ) {
-        return ApprovalChoice::NoninteractiveDeny;
+        return Ok(ApprovalChoice::NoninteractiveDeny);
     }
-    let Some(id) = response_single_id(response) else {
-        return ApprovalChoice::Deny;
+    let Some(id) = decode_option_response(response, set)? else {
+        return Ok(ApprovalChoice::Deny);
     };
-    if wrapper {
-        return match id {
-            ID_APPROVE => ApprovalChoice::Approve(Scope::Once),
-            ID_REJECT => ApprovalChoice::Deny,
-            _ => ApprovalChoice::Deny,
-        };
-    }
-    match id {
-        ID_APPROVE_ONCE => ApprovalChoice::Approve(Scope::Once),
-        ID_APPROVE_SESSION => ApprovalChoice::Approve(Scope::Session),
-        ID_APPROVE_PROJECT => ApprovalChoice::Approve(Scope::Project),
-        ID_APPROVE_GLOBAL => ApprovalChoice::Approve(Scope::Global),
-        ID_APPROVE_ALL_ONCE => ApprovalChoice::ApproveAllOnce,
-        ID_ESCALATE_GRANT_SESSION => ApprovalChoice::GrantPaths(Scope::Session),
-        ID_ESCALATE_GRANT_PROJECT => ApprovalChoice::GrantPaths(Scope::Project),
-        ID_ESCALATE_GRANT_GLOBAL => ApprovalChoice::GrantPaths(Scope::Global),
-        ID_ESCALATE_RUN_UNCONFINED_ONCE => ApprovalChoice::Approve(Scope::Once),
-        ID_REJECT => ApprovalChoice::Deny,
-        ID_REJECT_SESSION => ApprovalChoice::Reject(Scope::Session),
-        ID_REJECT_PROJECT => ApprovalChoice::Reject(Scope::Project),
-        ID_REJECT_GLOBAL => ApprovalChoice::Reject(Scope::Global),
-        _ => ApprovalChoice::Deny,
-    }
+    Ok(match id {
+        ApprovalOptionId::Approve | ApprovalOptionId::ApproveOnce => {
+            ApprovalChoice::Approve(Scope::Once)
+        }
+        ApprovalOptionId::ApproveSession => ApprovalChoice::Approve(Scope::Session),
+        ApprovalOptionId::ApproveProject => ApprovalChoice::Approve(Scope::Project),
+        ApprovalOptionId::ApproveGlobal => ApprovalChoice::Approve(Scope::Global),
+        ApprovalOptionId::ApproveAllOnce => ApprovalChoice::ApproveAllOnce,
+        ApprovalOptionId::EscalateGrantSession => ApprovalChoice::GrantPaths(Scope::Session),
+        ApprovalOptionId::EscalateGrantProject => ApprovalChoice::GrantPaths(Scope::Project),
+        ApprovalOptionId::EscalateGrantGlobal => ApprovalChoice::GrantPaths(Scope::Global),
+        ApprovalOptionId::EscalateRunUnconfinedOnce => ApprovalChoice::Approve(Scope::Once),
+        ApprovalOptionId::Reject => ApprovalChoice::Deny,
+        ApprovalOptionId::RejectSession => ApprovalChoice::Reject(Scope::Session),
+        ApprovalOptionId::RejectProject => ApprovalChoice::Reject(Scope::Project),
+        ApprovalOptionId::RejectGlobal => ApprovalChoice::Reject(Scope::Global),
+        _ => return Err(ForeignOptionId::new(set, id.as_str())),
+    })
 }
 
 /// Map a loop-guard repeat verdict onto the allow/deny shape the
@@ -677,6 +752,15 @@ fn repeat_to_decision(repeat: RepeatDecision) -> Decision {
         RepeatDecision::Accept => Decision::Allow { scope: Scope::Once },
         RepeatDecision::Reject => Decision::Deny,
     }
+}
+
+pub(crate) fn warn_foreign_option_id(foreign: &ForeignOptionId) {
+    tracing::warn!(
+        prompt_kind = foreign.kind,
+        offered = ?foreign.offered,
+        received = %foreign.received,
+        "foreign approval option id; discarding answer and re-raising prompt"
+    );
 }
 
 /// The scope set a command prompt offers, for the `permission_decision`
@@ -901,7 +985,35 @@ mod tests {
     use crate::approval::classify::ApprovalKey;
     use crate::config::extended::{ApprovalPolicyScope, DangerousFlagRule};
     use crate::daemon::session_worker::SessionConfigSnapshot;
+    use std::io;
+    use std::sync::Mutex as StdMutex;
     use std::sync::RwLock;
+    use tracing::Level;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<StdMutex<Vec<u8>>>);
+
+    struct CaptureGuard(Arc<StdMutex<Vec<u8>>>);
+
+    impl io::Write for CaptureGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureGuard(self.0.clone())
+        }
+    }
 
     fn approver(cwd: &std::path::Path) -> (Approver, uuid::Uuid) {
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -965,6 +1077,233 @@ mod tests {
             .filter(|e| e.kind == "permission_decision")
             .map(|e| e.data)
             .collect()
+    }
+
+    fn test_command_option_set() -> ApprovalOptionSet {
+        approval_option_set(
+            "test_command",
+            false,
+            &[Scope::Once, Scope::Session, Scope::Project, Scope::Global],
+            None,
+        )
+    }
+
+    fn test_wrapper_option_set() -> ApprovalOptionSet {
+        approval_option_set("test_wrapper", true, &[Scope::Once], None)
+    }
+
+    fn single_response(id: &str) -> ResolveResponse {
+        ResolveResponse::Single {
+            selected_id: id.to_string(),
+        }
+    }
+
+    fn question_option_ids(question: InterruptQuestion) -> Vec<String> {
+        let InterruptQuestion::Single { options, .. } = question else {
+            panic!("expected single question");
+        };
+        options.into_iter().map(|option| option.id).collect()
+    }
+
+    fn capture_warn_log(f: impl FnOnce()) -> String {
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::WARN)
+            .with_ansi(false)
+            .with_writer(CaptureWriter(bytes.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn approval_vocab_all_prompts_use_enum_ids() {
+        let prompt_ids = [
+            question_option_ids(approval_question(
+                "gh pr create",
+                false,
+                GrantKind::Command,
+                None,
+                None,
+                None,
+                &[Scope::Once, Scope::Session, Scope::Project, Scope::Global],
+                Some(3),
+            )),
+            question_option_ids(approval_question(
+                "bash -c",
+                true,
+                GrantKind::Command,
+                None,
+                None,
+                None,
+                &[Scope::Once],
+                None,
+            )),
+            question_option_ids(repeat_question("read")),
+            vec![
+                ID_ESCALATE_GRANT_SESSION.to_string(),
+                ID_ESCALATE_GRANT_PROJECT.to_string(),
+                ID_ESCALATE_GRANT_GLOBAL.to_string(),
+                ID_ESCALATE_RUN_UNCONFINED_ONCE.to_string(),
+            ],
+            vec![
+                ID_GITIGNORE_FILE.to_string(),
+                ID_GITIGNORE_PARENT.to_string(),
+                ID_GITIGNORE_REJECT.to_string(),
+                ID_APPROVE_ONCE.to_string(),
+                ID_APPROVE_SESSION.to_string(),
+                ID_APPROVE_PROJECT.to_string(),
+            ],
+        ];
+
+        for id in prompt_ids.into_iter().flatten() {
+            assert!(
+                ApprovalOptionId::from_str(&id).is_some(),
+                "{id} must be in the approval option vocabulary"
+            );
+        }
+
+        for retired in [
+            "once",
+            "session",
+            "project",
+            "loop_accept_once",
+            "loop_reject_once",
+            "loop_accept_session",
+            "loop_reject_session",
+            "loop_accept_project",
+            "loop_reject_project",
+        ] {
+            assert!(
+                ApprovalOptionId::from_str(retired).is_none(),
+                "{retired} must not decode as an approval option id"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_vocab_decoder_rejects_foreign_ids() {
+        let command_set = test_command_option_set();
+        let wrapper_set = test_wrapper_option_set();
+        let gitignore_shape_set = ApprovalOptionSet::new(
+            "gitignore_shape",
+            [
+                ApprovalOptionId::GitignoreFile,
+                ApprovalOptionId::GitignoreParent,
+                ApprovalOptionId::GitignoreReject,
+            ],
+        );
+        let skill_write_set = ApprovalOptionSet::new(
+            "skill_write_approval",
+            [ApprovalOptionId::Approve, ApprovalOptionId::Reject],
+        );
+        let schedule_loop_set = ApprovalOptionSet::new(
+            "schedule_unbounded_loop_approval",
+            [ApprovalOptionId::Approve, ApprovalOptionId::Reject],
+        );
+
+        assert!(decode_option_response(&single_response("unknown"), &command_set).is_err());
+        assert!(
+            decode_option_response(&single_response(ID_APPROVE_SESSION), &wrapper_set).is_err()
+        );
+        assert!(response_to_repeat_choice(&single_response(ID_APPROVE_ONCE)).is_err());
+        assert!(
+            decode_option_response(&single_response(ID_APPROVE_ONCE), &gitignore_shape_set)
+                .is_err()
+        );
+        assert!(
+            decode_option_response(&single_response(ID_APPROVE_ONCE), &skill_write_set).is_err()
+        );
+        assert!(
+            decode_option_response(&single_response(ID_APPROVE_ONCE), &schedule_loop_set).is_err()
+        );
+    }
+
+    #[test]
+    fn approval_vocab_foreign_id_never_denies() {
+        let command_set = test_command_option_set();
+        let command_result = response_to_approval_choice(&single_response("unknown"), &command_set);
+        assert!(command_result.is_err());
+
+        let wrapper_set = test_wrapper_option_set();
+        let wrapper_result =
+            response_to_approval_choice(&single_response(ID_APPROVE_PROJECT), &wrapper_set);
+        assert!(wrapper_result.is_err());
+
+        let repeat_result = response_to_repeat_choice(&single_response(ID_APPROVE_ONCE));
+        assert!(repeat_result.is_err());
+
+        let more_options_result =
+            response_to_approval_choice(&single_response(ID_MORE_OPTIONS), &command_set);
+        let more_options_error = more_options_result.unwrap_err();
+        assert_eq!(more_options_error.received, ID_MORE_OPTIONS);
+        assert!(more_options_error.offered.contains(&ID_MORE_OPTIONS));
+
+        let repeat_more_options_result =
+            response_to_repeat_choice(&single_response(ID_MORE_OPTIONS));
+        let repeat_more_options_error = repeat_more_options_result.unwrap_err();
+        assert_eq!(repeat_more_options_error.received, ID_MORE_OPTIONS);
+        assert!(repeat_more_options_error.offered.contains(&ID_MORE_OPTIONS));
+    }
+
+    #[test]
+    fn approval_vocab_genuine_answers_unchanged() {
+        let command_set = test_command_option_set();
+        assert_eq!(
+            response_to_approval_choice(&single_response(ID_APPROVE_ONCE), &command_set).unwrap(),
+            ApprovalChoice::Approve(Scope::Once)
+        );
+        assert_eq!(
+            response_to_approval_choice(&single_response(ID_APPROVE_PROJECT), &command_set)
+                .unwrap(),
+            ApprovalChoice::Approve(Scope::Project)
+        );
+        assert_eq!(
+            response_to_approval_choice(&single_response(ID_REJECT), &command_set).unwrap(),
+            ApprovalChoice::Deny
+        );
+        assert_eq!(
+            response_to_repeat_choice(&single_response(ID_LOOP_ACCEPT_ONCE)).unwrap(),
+            RepeatChoice::AcceptOnce
+        );
+        assert_eq!(
+            response_to_repeat_choice(&single_response(ID_LOOP_REJECT_PROJECT)).unwrap(),
+            RepeatChoice::Always {
+                verdict: LoopVerdict::Reject,
+                scope: Scope::Project,
+            }
+        );
+    }
+
+    #[test]
+    fn approval_vocab_foreign_id_warns_with_kind_offered_received() {
+        let set = ApprovalOptionSet::new(
+            "command_approval",
+            [ApprovalOptionId::ApproveOnce, ApprovalOptionId::Reject],
+        );
+        let foreign = ForeignOptionId::new(&set, "bogus");
+        let log = capture_warn_log(|| warn_foreign_option_id(&foreign));
+
+        assert!(log.contains("foreign approval option id"));
+        assert!(log.contains("command_approval"));
+        assert!(log.contains("approve_once"));
+        assert!(log.contains("reject"));
+        assert!(log.contains("bogus"));
+    }
+
+    #[tokio::test]
+    async fn approval_vocab_foreign_id_reraises_once_per_fresh_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let resolver =
+            resolve_sequence_collecting_prompts(&approver, &[ID_LOOP_ACCEPT_ONCE, ID_APPROVE_ONCE]);
+
+        let decision = approver.approve_command("rm file").await.unwrap();
+        let prompts = resolver.await.unwrap();
+
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0], prompts[1]);
     }
 
     #[test]
@@ -1123,13 +1462,16 @@ mod tests {
 
     #[test]
     fn approval_response_mapping_is_fail_closed_and_scope_exact() {
+        let command_set = test_command_option_set();
+        let wrapper_set = test_wrapper_option_set();
         assert_eq!(
             response_to_approval_choice(
                 &ResolveResponse::Single {
                     selected_id: ID_APPROVE_PROJECT.to_string(),
                 },
-                false,
-            ),
+                &command_set,
+            )
+            .unwrap(),
             ApprovalChoice::Approve(Scope::Project)
         );
         assert_eq!(
@@ -1139,32 +1481,33 @@ mod tests {
                         selected_id: ID_REJECT_SESSION.to_string(),
                     }],
                 },
-                false,
-            ),
+                &command_set,
+            )
+            .unwrap(),
             ApprovalChoice::Reject(Scope::Session)
         );
-        assert_eq!(
+        assert!(
             response_to_approval_choice(
                 &ResolveResponse::Single {
                     selected_id: ID_APPROVE_GLOBAL.to_string(),
                 },
-                true,
-            ),
-            ApprovalChoice::Deny,
-            "wrapper prompts cannot persist broader approval ids"
+                &wrapper_set,
+            )
+            .is_err(),
+            "wrapper prompts reject broader approval ids as foreign"
         );
         assert_eq!(
-            response_to_approval_choice(&ResolveResponse::Cancel, false),
+            response_to_approval_choice(&ResolveResponse::Cancel, &command_set).unwrap(),
             ApprovalChoice::Deny
         );
-        assert_eq!(
+        assert!(
             response_to_approval_choice(
                 &ResolveResponse::Single {
                     selected_id: "unknown".to_string(),
                 },
-                false,
-            ),
-            ApprovalChoice::Deny
+                &command_set,
+            )
+            .is_err()
         );
     }
 
@@ -1173,13 +1516,15 @@ mod tests {
         assert_eq!(
             response_to_repeat_choice(&ResolveResponse::Single {
                 selected_id: ID_LOOP_ACCEPT_ONCE.to_string(),
-            }),
+            })
+            .unwrap(),
             RepeatChoice::AcceptOnce
         );
         assert_eq!(
             response_to_repeat_choice(&ResolveResponse::Single {
                 selected_id: ID_LOOP_REJECT_PROJECT.to_string(),
-            }),
+            })
+            .unwrap(),
             RepeatChoice::Always {
                 verdict: LoopVerdict::Reject,
                 scope: Scope::Project,
@@ -1190,21 +1535,22 @@ mod tests {
                 responses: vec![ResolveResponse::Single {
                     selected_id: ID_LOOP_ACCEPT_SESSION.to_string(),
                 }],
-            }),
+            })
+            .unwrap(),
             RepeatChoice::Always {
                 verdict: LoopVerdict::Accept,
                 scope: Scope::Session,
             }
         );
         assert_eq!(
-            response_to_repeat_choice(&ResolveResponse::Cancel),
+            response_to_repeat_choice(&ResolveResponse::Cancel).unwrap(),
             RepeatChoice::RejectOnce
         );
-        assert_eq!(
+        assert!(
             response_to_repeat_choice(&ResolveResponse::Single {
                 selected_id: "unknown".to_string(),
-            }),
-            RepeatChoice::RejectOnce
+            })
+            .is_err()
         );
     }
 
@@ -1919,7 +2265,7 @@ mod tests {
             assert!(hub.resolve(
                 iid,
                 ResolveResponse::Single {
-                    selected_id: ID_ONCE.to_string()
+                    selected_id: ID_APPROVE_ONCE.to_string()
                 }
             ));
         });
@@ -2453,6 +2799,7 @@ mod tests {
 
     #[test]
     fn approval_response_mapping_round_trips_scoped_actions() {
+        let set = test_command_option_set();
         for (id, choice) in [
             (ID_APPROVE_ONCE, ApprovalChoice::Approve(Scope::Once)),
             (ID_APPROVE_SESSION, ApprovalChoice::Approve(Scope::Session)),
@@ -2466,23 +2813,25 @@ mod tests {
             let resp = ResolveResponse::Single {
                 selected_id: id.into(),
             };
-            assert_eq!(response_to_approval_choice(&resp, false), choice);
+            assert_eq!(response_to_approval_choice(&resp, &set).unwrap(), choice);
         }
         assert_eq!(
-            response_to_approval_choice(&ResolveResponse::Cancel, false),
+            response_to_approval_choice(&ResolveResponse::Cancel, &set).unwrap(),
             ApprovalChoice::Deny
         );
     }
 
     #[test]
     fn wrapper_response_mapping_remains_once_only() {
+        let set = test_wrapper_option_set();
         assert_eq!(
             response_to_approval_choice(
                 &ResolveResponse::Single {
                     selected_id: ID_APPROVE.into(),
                 },
-                true
-            ),
+                &set,
+            )
+            .unwrap(),
             ApprovalChoice::Approve(Scope::Once)
         );
         assert_eq!(
@@ -2490,12 +2839,13 @@ mod tests {
                 &ResolveResponse::Single {
                     selected_id: ID_REJECT.into(),
                 },
-                true
-            ),
+                &set,
+            )
+            .unwrap(),
             ApprovalChoice::Deny
         );
         assert_eq!(
-            response_to_approval_choice(&ResolveResponse::Cancel, true),
+            response_to_approval_choice(&ResolveResponse::Cancel, &set).unwrap(),
             ApprovalChoice::Deny
         );
     }
@@ -2512,36 +2862,36 @@ mod tests {
             selected_id: id.into(),
         };
         assert_eq!(
-            response_to_repeat_choice(&single(ID_LOOP_ACCEPT_ONCE)),
+            response_to_repeat_choice(&single(ID_LOOP_ACCEPT_ONCE)).unwrap(),
             RepeatChoice::AcceptOnce
         );
         assert_eq!(
-            response_to_repeat_choice(&single(ID_LOOP_REJECT_ONCE)),
+            response_to_repeat_choice(&single(ID_LOOP_REJECT_ONCE)).unwrap(),
             RepeatChoice::RejectOnce
         );
         assert_eq!(
-            response_to_repeat_choice(&single(ID_LOOP_ACCEPT_SESSION)),
+            response_to_repeat_choice(&single(ID_LOOP_ACCEPT_SESSION)).unwrap(),
             RepeatChoice::Always {
                 verdict: LoopVerdict::Accept,
                 scope: Scope::Session
             }
         );
         assert_eq!(
-            response_to_repeat_choice(&single(ID_LOOP_REJECT_SESSION)),
+            response_to_repeat_choice(&single(ID_LOOP_REJECT_SESSION)).unwrap(),
             RepeatChoice::Always {
                 verdict: LoopVerdict::Reject,
                 scope: Scope::Session
             }
         );
         assert_eq!(
-            response_to_repeat_choice(&single(ID_LOOP_ACCEPT_PROJECT)),
+            response_to_repeat_choice(&single(ID_LOOP_ACCEPT_PROJECT)).unwrap(),
             RepeatChoice::Always {
                 verdict: LoopVerdict::Accept,
                 scope: Scope::Project
             }
         );
         assert_eq!(
-            response_to_repeat_choice(&single(ID_LOOP_REJECT_PROJECT)),
+            response_to_repeat_choice(&single(ID_LOOP_REJECT_PROJECT)).unwrap(),
             RepeatChoice::Always {
                 verdict: LoopVerdict::Reject,
                 scope: Scope::Project
@@ -2549,7 +2899,7 @@ mod tests {
         );
         // A dismissal reads as reject-once (safe default for a loop).
         assert_eq!(
-            response_to_repeat_choice(&ResolveResponse::Cancel),
+            response_to_repeat_choice(&ResolveResponse::Cancel).unwrap(),
             RepeatChoice::RejectOnce
         );
     }

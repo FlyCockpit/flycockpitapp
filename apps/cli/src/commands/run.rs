@@ -924,7 +924,6 @@ fn safe_once_option(question: &proto::InterruptQuestion) -> Option<String> {
         crate::approval::ID_APPROVE,
         crate::approval::ID_ESCALATE_RUN_UNCONFINED_ONCE,
         crate::approval::ID_GITIGNORE_FILE,
-        crate::approval::ID_ONCE,
     ]
     .into_iter()
     .find(|id| options.iter().any(|option| option.id == *id))

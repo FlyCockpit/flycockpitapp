@@ -507,7 +507,7 @@ use std::sync::Arc;
 
 use crate::approval::Approver;
 use crate::approval::store::{GrantStore, Scope};
-use crate::approval::{ID_APPROVE_ONCE, ID_APPROVE_SESSION};
+use crate::approval::{ID_APPROVE_ONCE, ID_APPROVE_SESSION, ID_REJECT};
 use crate::daemon::proto::ResolveResponse;
 
 /// Build a sandbox-enabled ctx with an approver + grant store.
@@ -1657,9 +1657,7 @@ async fn sandbox_off_wrapper_always_prompts() {
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
     let resolver =
-        tokio::spawn(
-            async move { resolve_next_interrupt(db, sid, hub, ID_APPROVE_ONCE, None).await },
-        );
+        tokio::spawn(async move { resolve_next_interrupt(db, sid, hub, ID_REJECT, None).await });
     let _guard = set_bash_test_overrides(None, None, [(false, shell_out("hi", "", 0))]);
 
     let out = BashTool::new()
@@ -1834,9 +1832,7 @@ async fn wrapper_is_never_preauthorized_for_escalation() {
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
     let resolver =
-        tokio::spawn(
-            async move { resolve_next_interrupt(db, sid, hub, ID_APPROVE_ONCE, None).await },
-        );
+        tokio::spawn(async move { resolve_next_interrupt(db, sid, hub, ID_REJECT, None).await });
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
         Some((13, "sandbox denied".to_string())),

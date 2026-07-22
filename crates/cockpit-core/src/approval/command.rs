@@ -58,6 +58,7 @@ impl Approver {
             confined_stderr,
             suggested_paths: Vec::new(),
             suggested_access: None,
+            denial: None,
         };
         self.approve_command_inner(command, Some(escalation)).await
     }
@@ -92,6 +93,7 @@ impl Approver {
             confined_stderr,
             suggested_paths,
             suggested_access,
+            denial: None,
         };
 
         let accepted = if grant_offer.is_some() && !offered_scopes.is_empty() {

@@ -2668,6 +2668,7 @@ mod tests {
             confined_stderr: "cat: /etc/secret: Permission denied".into(),
             suggested_paths: Vec::new(),
             suggested_access: None,
+            denial: None,
         };
         let desc = prompt_description("cat", false, None, Some(&esc));
         assert!(

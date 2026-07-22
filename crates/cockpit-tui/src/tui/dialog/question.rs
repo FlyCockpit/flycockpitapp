@@ -3360,6 +3360,7 @@ mod tests {
                 confined_stderr: "cat: /etc/secret: Permission denied".into(),
                 suggested_paths: Vec::new(),
                 suggested_access: None,
+                denial: None,
             },
             true,
         );
@@ -3394,6 +3395,7 @@ mod tests {
                 confined_stderr: String::new(),
                 suggested_paths: Vec::new(),
                 suggested_access: None,
+                denial: None,
             },
             false,
         );
@@ -3414,6 +3416,7 @@ mod tests {
                 confined_stderr: "cat: Permission denied".into(),
                 suggested_paths: vec!["/var/cache/tool".into()],
                 suggested_access: Some("read".into()),
+                denial: None,
             },
             true,
         );

@@ -1011,8 +1011,9 @@ pub use cockpit_config::{
 #[allow(unused_imports)]
 pub use cockpit_db::wire::{
     CharSpan, CommandDetail, GrantKind, InterruptDecision, InterruptDecisionLine, InterruptOption,
-    InterruptQuestion, InterruptQuestionSet, MessageRole, ResolveResponse, SandboxEscalation,
-    SessionActivityState, SessionMessage, SessionSummary, WriteContentPreview,
+    InterruptQuestion, InterruptQuestionSet, MessageRole, ResolveResponse, SandboxDenialConfidence,
+    SandboxDenialEvidence, SandboxDenialReport, SandboxEscalation, SessionActivityState,
+    SessionMessage, SessionSummary, WriteContentPreview,
 };
 
 pub use cockpit_db::db::session_goals::GoalStatus;
@@ -2116,6 +2117,7 @@ mod tests {
                 confined_stderr: "permission denied".into(),
                 suggested_paths: vec!["/var/cache/tool".into()],
                 suggested_access: Some("read-write".into()),
+                denial: None,
             }),
         };
         let s = serde_json::to_string(&q).unwrap();

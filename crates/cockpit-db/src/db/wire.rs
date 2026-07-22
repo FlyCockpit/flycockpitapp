@@ -1,6 +1,7 @@
 //! Persisted session and interrupt wire shapes used by DB rows.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -193,6 +194,112 @@ pub struct SandboxEscalation {
     pub suggested_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggested_access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial: Option<SandboxDenialReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxDenialReport {
+    pub confidence: SandboxDenialConfidence,
+    pub evidence: Vec<SandboxDenialEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxDenialConfidence {
+    High,
+    Possible,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxDenialEvidence {
+    WriteOutsideAllowlist {
+        path: String,
+    },
+    ReadOutsideAllowlist {
+        path: String,
+    },
+    StderrPermissionMarker,
+    Unknown {
+        kind: String,
+        data: Option<Value>,
+        raw: Option<Value>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", content = "data")]
+enum KnownSandboxDenialEvidence {
+    WriteOutsideAllowlist { path: String },
+    ReadOutsideAllowlist { path: String },
+    StderrPermissionMarker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawSandboxDenialEvidence {
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
+}
+
+impl Serialize for SandboxDenialEvidence {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::WriteOutsideAllowlist { path } => {
+                KnownSandboxDenialEvidence::WriteOutsideAllowlist { path: path.clone() }
+                    .serialize(serializer)
+            }
+            Self::ReadOutsideAllowlist { path } => {
+                KnownSandboxDenialEvidence::ReadOutsideAllowlist { path: path.clone() }
+                    .serialize(serializer)
+            }
+            Self::StderrPermissionMarker => {
+                KnownSandboxDenialEvidence::StderrPermissionMarker.serialize(serializer)
+            }
+            Self::Unknown { kind, data, raw } => {
+                if let Some(raw) = raw {
+                    raw.serialize(serializer)
+                } else {
+                    RawSandboxDenialEvidence {
+                        kind: kind.clone(),
+                        data: data.clone(),
+                    }
+                    .serialize(serializer)
+                }
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SandboxDenialEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        if let Ok(known) = serde_json::from_value::<KnownSandboxDenialEvidence>(value.clone()) {
+            return Ok(match known {
+                KnownSandboxDenialEvidence::WriteOutsideAllowlist { path } => {
+                    Self::WriteOutsideAllowlist { path }
+                }
+                KnownSandboxDenialEvidence::ReadOutsideAllowlist { path } => {
+                    Self::ReadOutsideAllowlist { path }
+                }
+                KnownSandboxDenialEvidence::StderrPermissionMarker => Self::StderrPermissionMarker,
+            });
+        }
+
+        let raw = serde_json::from_value::<RawSandboxDenialEvidence>(value.clone())
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self::Unknown {
+            kind: raw.kind,
+            data: raw.data,
+            raw: Some(value),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,5 +337,102 @@ impl ResolveResponse {
             ResolveResponse::Cancel => std::iter::repeat_n(ResolveResponse::Cancel, n).collect(),
             other => vec![other],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SandboxDenialConfidence, SandboxDenialEvidence, SandboxDenialReport, SandboxEscalation,
+    };
+    use serde_json::{Value, json};
+
+    #[test]
+    fn sandbox_denial_wire_report_round_trips() {
+        let report = SandboxDenialReport {
+            confidence: SandboxDenialConfidence::High,
+            evidence: vec![
+                SandboxDenialEvidence::WriteOutsideAllowlist {
+                    path: "/var/cache/tool".into(),
+                },
+                SandboxDenialEvidence::StderrPermissionMarker,
+            ],
+        };
+
+        let value = serde_json::to_value(&report).expect("serialize report");
+        assert_eq!(
+            value,
+            json!({
+                "confidence": "high",
+                "evidence": [
+                    {
+                        "kind": "write_outside_allowlist",
+                        "data": { "path": "/var/cache/tool" }
+                    },
+                    { "kind": "stderr_permission_marker" }
+                ]
+            })
+        );
+
+        let back: SandboxDenialReport = serde_json::from_value(value).expect("deserialize report");
+        assert_eq!(back, report);
+    }
+
+    #[test]
+    fn sandbox_denial_wire_absent_key_round_trips() {
+        let escalation = SandboxEscalation {
+            confined_exit: 101,
+            confined_stderr: "permission denied".into(),
+            suggested_paths: Vec::new(),
+            suggested_access: None,
+            denial: None,
+        };
+
+        let value = serde_json::to_value(&escalation).expect("serialize escalation");
+        assert!(
+            value.get("denial").is_none(),
+            "None denial should omit the key: {value}"
+        );
+
+        let legacy = json!({
+            "confined_exit": 101,
+            "confined_stderr": "permission denied"
+        });
+        let back: SandboxEscalation =
+            serde_json::from_value(legacy).expect("deserialize legacy escalation");
+        assert!(back.denial.is_none());
+    }
+
+    #[test]
+    fn sandbox_denial_wire_unknown_evidence_forward_open() {
+        let value = json!({
+            "kind": "network_denied",
+            "data": { "host": "x" }
+        });
+
+        let evidence: SandboxDenialEvidence =
+            serde_json::from_value(value.clone()).expect("deserialize unknown evidence");
+        assert_eq!(
+            evidence,
+            SandboxDenialEvidence::Unknown {
+                kind: "network_denied".into(),
+                data: Some(json!({ "host": "x" })),
+                raw: Some(value.clone()),
+            }
+        );
+
+        let back: Value = serde_json::to_value(&evidence).expect("serialize unknown evidence");
+        assert_eq!(back, value);
+
+        let future_value = json!({
+            "kind": "network_denied",
+            "data": null,
+            "source": "future_sandbox"
+        });
+        let future_evidence: SandboxDenialEvidence =
+            serde_json::from_value(future_value.clone()).expect("deserialize future evidence");
+        let future_back: Value =
+            serde_json::to_value(&future_evidence).expect("serialize future evidence");
+        assert_eq!(future_back, future_value);
     }
 }

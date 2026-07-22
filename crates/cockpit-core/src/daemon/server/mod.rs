@@ -1517,10 +1517,27 @@ fn scrub_sandbox_escalation(escalation: &mut proto::SandboxEscalation, redact: &
         confined_stderr,
         suggested_paths,
         suggested_access,
+        denial,
     } = escalation;
     scrub_string(confined_stderr, redact);
     scrub_strings(suggested_paths, redact);
     scrub_option_string(suggested_access, redact);
+    if let Some(denial) = denial {
+        scrub_sandbox_denial_report(denial, redact);
+    }
+}
+
+fn scrub_sandbox_denial_report(report: &mut proto::SandboxDenialReport, redact: &RedactionTable) {
+    for evidence in &mut report.evidence {
+        match evidence {
+            proto::SandboxDenialEvidence::WriteOutsideAllowlist { path }
+            | proto::SandboxDenialEvidence::ReadOutsideAllowlist { path } => {
+                scrub_string(path, redact);
+            }
+            proto::SandboxDenialEvidence::StderrPermissionMarker
+            | proto::SandboxDenialEvidence::Unknown { .. } => {}
+        }
+    }
 }
 
 fn scrub_interrupt_decision(decision: &mut proto::InterruptDecision, redact: &RedactionTable) {

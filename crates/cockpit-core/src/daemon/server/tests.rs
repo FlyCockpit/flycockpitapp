@@ -9391,6 +9391,62 @@ async fn concurrent_request_panic_yields_internal_error_and_keeps_connection() {
 }
 
 #[tokio::test]
+async fn blocking_fs_handler_panic_keeps_client_connection() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("panic.txt"), "panic").unwrap();
+    crate::daemon::fs_api::set_fs_read_panic_for_test(
+        tmp.path().join("panic.txt").canonicalize().unwrap(),
+    );
+    let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let executor = tokio::spawn(run_client_executor(
+        ctx,
+        ClientPrincipal::owner(),
+        executor_rx,
+        event_cmd_tx,
+        writer_tx,
+    ));
+
+    let panic_id = Uuid::new_v4();
+    let status_id = Uuid::new_v4();
+    executor_tx
+        .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
+            Envelope::request(panic_id, fs_read_request(tmp.path(), "panic.txt")),
+        ))))
+        .await
+        .unwrap();
+    executor_tx
+        .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
+            Envelope::request(status_id, Request::DaemonStatus),
+        ))))
+        .await
+        .unwrap();
+
+    let mut saw_fs_error = false;
+    let mut saw_status = false;
+    for _ in 0..2 {
+        match recv_writer_body(&mut writer_rx, "fs panic/status response").await {
+            Body::Error { id, error } if id == Some(panic_id) => {
+                assert_eq!(error.code, ErrorCode::Internal);
+                assert_eq!(error.message, "filesystem handler panicked");
+                saw_fs_error = true;
+            }
+            Body::Response { id, response } if id == status_id => {
+                assert!(matches!(*response, Response::DaemonStatus { .. }));
+                saw_status = true;
+            }
+            other => panic!("unexpected response after fs handler panic: {other:?}"),
+        }
+    }
+    assert!(saw_fs_error);
+    assert!(saw_status);
+    drop(executor_tx);
+    executor.await.unwrap();
+}
+
+#[tokio::test]
 async fn concurrent_request_semaphore_applies_backpressure_not_drops() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();

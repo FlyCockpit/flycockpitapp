@@ -465,7 +465,7 @@ pub(super) async fn handle_serialized_request(
             path,
             show_hidden,
         } => {
-            crate::daemon::fs_api::fs_list_blocking(
+            crate::daemon::fs_api::fs_list(
                 ctx.clone(),
                 state.principal.clone(),
                 project_root,
@@ -476,13 +476,8 @@ pub(super) async fn handle_serialized_request(
         }
 
         Request::FsStat { project_root, path } => {
-            crate::daemon::fs_api::fs_stat_blocking(
-                ctx.clone(),
-                state.principal.clone(),
-                project_root,
-                path,
-            )
-            .await
+            crate::daemon::fs_api::fs_stat(ctx.clone(), state.principal.clone(), project_root, path)
+                .await
         }
 
         Request::FsRead {
@@ -490,7 +485,7 @@ pub(super) async fn handle_serialized_request(
             path,
             base64,
         } => {
-            crate::daemon::fs_api::fs_read_blocking(
+            crate::daemon::fs_api::fs_read(
                 ctx.clone(),
                 state.principal.clone(),
                 project_root,
@@ -506,39 +501,30 @@ pub(super) async fn handle_serialized_request(
             content,
             base_hash,
         } => {
-            crate::daemon::fs_api::fs_write_blocking(
-                ctx.clone(),
-                project_root,
-                path,
-                content,
-                base_hash,
-            )
-            .await
+            crate::daemon::fs_api::fs_write(ctx.clone(), project_root, path, content, base_hash)
+                .await
         }
 
         Request::FsCreateDir { project_root, path } => {
-            crate::daemon::fs_api::fs_create_dir_blocking(project_root, path).await
+            crate::daemon::fs_api::fs_create_dir(project_root, path).await
         }
 
         Request::FsRename {
             project_root,
             from_path,
             to_path,
-        } => {
-            crate::daemon::fs_api::fs_rename_blocking(ctx.clone(), project_root, from_path, to_path)
-                .await
-        }
+        } => crate::daemon::fs_api::fs_rename(ctx.clone(), project_root, from_path, to_path).await,
 
         Request::FsDelete { project_root, path } => {
-            crate::daemon::fs_api::fs_delete_blocking(ctx.clone(), project_root, path).await
+            crate::daemon::fs_api::fs_delete(ctx.clone(), project_root, path).await
         }
 
         Request::GitStatus { project_root } => {
-            crate::daemon::fs_api::git_status_blocking(project_root).await
+            crate::daemon::fs_api::git_status(project_root).await
         }
 
         Request::GitDiffFile { project_root, path } => {
-            crate::daemon::fs_api::git_diff_file_blocking(project_root, path).await
+            crate::daemon::fs_api::git_diff_file(project_root, path).await
         }
 
         Request::OpenTerminal { cwd, cols, rows } => {
@@ -1269,7 +1255,7 @@ pub(super) async fn handle_concurrent_request(
             path,
             show_hidden,
         } => {
-            crate::daemon::fs_api::fs_list_blocking(
+            crate::daemon::fs_api::fs_list(
                 ctx.clone(),
                 shared.principal.clone(),
                 project_root,
@@ -1279,7 +1265,7 @@ pub(super) async fn handle_concurrent_request(
             .await
         }
         Request::FsStat { project_root, path } => {
-            crate::daemon::fs_api::fs_stat_blocking(
+            crate::daemon::fs_api::fs_stat(
                 ctx.clone(),
                 shared.principal.clone(),
                 project_root,
@@ -1292,7 +1278,7 @@ pub(super) async fn handle_concurrent_request(
             path,
             base64,
         } => {
-            crate::daemon::fs_api::fs_read_blocking(
+            crate::daemon::fs_api::fs_read(
                 ctx.clone(),
                 shared.principal.clone(),
                 project_root,
@@ -1302,10 +1288,10 @@ pub(super) async fn handle_concurrent_request(
             .await
         }
         Request::GitStatus { project_root } => {
-            crate::daemon::fs_api::git_status_blocking(project_root).await
+            crate::daemon::fs_api::git_status(project_root).await
         }
         Request::GitDiffFile { project_root, path } => {
-            crate::daemon::fs_api::git_diff_file_blocking(project_root, path).await
+            crate::daemon::fs_api::git_diff_file(project_root, path).await
         }
         Request::ListSessions {
             project_id,

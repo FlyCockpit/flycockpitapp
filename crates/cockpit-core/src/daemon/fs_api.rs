@@ -20,7 +20,23 @@ const FS_TEXT_READ_BYTE_CAP: usize = crate::tools::common::OUTPUT_BYTE_CAP;
 const FS_BINARY_READ_BYTE_CAP: usize = 256 * 1024;
 const REMOTE_FILE_AGENT: &str = "remote-project-files";
 
-pub fn fs_list(
+pub async fn fs_list(
+    ctx: Arc<DaemonContext>,
+    principal: ClientPrincipal,
+    project_root: String,
+    path: String,
+    show_hidden: bool,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "fs_list",
+        tokio::task::spawn_blocking(move || {
+            fs_list_blocking(&ctx, &principal, &project_root, &path, show_hidden)
+        }),
+    )
+    .await
+}
+
+pub(crate) fn fs_list_blocking(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
     project_root: &str,
@@ -51,21 +67,22 @@ pub fn fs_list(
     Ok(Response::FsList { entries, truncated })
 }
 
-pub async fn fs_list_blocking(
+pub async fn fs_stat(
     ctx: Arc<DaemonContext>,
     principal: ClientPrincipal,
     project_root: String,
     path: String,
-    show_hidden: bool,
 ) -> Result<Response, ErrorPayload> {
-    tokio::task::spawn_blocking(move || {
-        fs_list(&ctx, &principal, &project_root, &path, show_hidden)
-    })
+    join_fs_handler(
+        "fs_stat",
+        tokio::task::spawn_blocking(move || {
+            fs_stat_blocking(&ctx, &principal, &project_root, &path)
+        }),
+    )
     .await
-    .map_err(internal)?
 }
 
-pub fn fs_stat(
+pub(crate) fn fs_stat_blocking(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
     project_root: &str,
@@ -81,18 +98,23 @@ pub fn fs_stat(
     Ok(Response::FsStat { entry })
 }
 
-pub async fn fs_stat_blocking(
+pub async fn fs_read(
     ctx: Arc<DaemonContext>,
     principal: ClientPrincipal,
     project_root: String,
     path: String,
+    wants_base64: bool,
 ) -> Result<Response, ErrorPayload> {
-    tokio::task::spawn_blocking(move || fs_stat(&ctx, &principal, &project_root, &path))
-        .await
-        .map_err(internal)?
+    join_fs_handler(
+        "fs_read",
+        tokio::task::spawn_blocking(move || {
+            fs_read_blocking(&ctx, &principal, &project_root, &path, wants_base64)
+        }),
+    )
+    .await
 }
 
-pub fn fs_read(
+pub(crate) fn fs_read_blocking(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
     project_root: &str,
@@ -105,6 +127,8 @@ pub fn fs_read(
         return Err(bad_request(format!("`{path}` is a directory")));
     }
     ensure_read_allowed(ctx, principal, &root, &resolved)?;
+    #[cfg(test)]
+    apply_fs_read_panic_for_test(&resolved);
     #[cfg(test)]
     apply_fs_read_block_for_test(&resolved);
 
@@ -143,20 +167,6 @@ pub fn fs_read(
     })
 }
 
-pub async fn fs_read_blocking(
-    ctx: Arc<DaemonContext>,
-    principal: ClientPrincipal,
-    project_root: String,
-    path: String,
-    wants_base64: bool,
-) -> Result<Response, ErrorPayload> {
-    tokio::task::spawn_blocking(move || {
-        fs_read(&ctx, &principal, &project_root, &path, wants_base64)
-    })
-    .await
-    .map_err(internal)?
-}
-
 #[cfg(test)]
 struct FsReadBlockHook {
     entered: tokio::sync::oneshot::Sender<()>,
@@ -171,6 +181,12 @@ fn fs_read_block_hooks() -> &'static StdMutex<std::collections::HashMap<PathBuf,
 }
 
 #[cfg(test)]
+fn fs_read_panic_hooks() -> &'static StdMutex<std::collections::HashSet<PathBuf>> {
+    static HOOKS: OnceLock<StdMutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    HOOKS.get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+}
+
+#[cfg(test)]
 pub(crate) fn set_fs_read_block_for_test(
     path: PathBuf,
     entered: tokio::sync::oneshot::Sender<()>,
@@ -180,6 +196,18 @@ pub(crate) fn set_fs_read_block_for_test(
         .lock()
         .unwrap()
         .insert(path, FsReadBlockHook { entered, release });
+}
+
+#[cfg(test)]
+pub(crate) fn set_fs_read_panic_for_test(path: PathBuf) {
+    fs_read_panic_hooks().lock().unwrap().insert(path);
+}
+
+#[cfg(test)]
+fn apply_fs_read_panic_for_test(path: &Path) {
+    if fs_read_panic_hooks().lock().unwrap().remove(path) {
+        panic!("fs_read blocking body panic");
+    }
 }
 
 #[cfg(test)]
@@ -196,7 +224,23 @@ fn apply_fs_read_block_for_test(path: &Path) {
     }
 }
 
-pub fn fs_write(
+pub async fn fs_write(
+    ctx: Arc<DaemonContext>,
+    project_root: String,
+    path: String,
+    content: String,
+    base_hash: Option<String>,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "fs_write",
+        tokio::task::spawn_blocking(move || {
+            fs_write_blocking(&ctx, &project_root, &path, &content, base_hash)
+        }),
+    )
+    .await
+}
+
+pub(crate) fn fs_write_blocking(
     ctx: &DaemonContext,
     project_root: &str,
     path: &str,
@@ -233,35 +277,40 @@ pub fn fs_write(
     Ok(Response::FsWrite { hash })
 }
 
-pub async fn fs_write_blocking(
-    ctx: Arc<DaemonContext>,
-    project_root: String,
-    path: String,
-    content: String,
-    base_hash: Option<String>,
-) -> Result<Response, ErrorPayload> {
-    tokio::task::spawn_blocking(move || fs_write(&ctx, &project_root, &path, &content, base_hash))
-        .await
-        .map_err(internal)?
+pub async fn fs_create_dir(project_root: String, path: String) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "fs_create_dir",
+        tokio::task::spawn_blocking(move || fs_create_dir_blocking(&project_root, &path)),
+    )
+    .await
 }
 
-pub fn fs_create_dir(project_root: &str, path: &str) -> Result<Response, ErrorPayload> {
+pub(crate) fn fs_create_dir_blocking(
+    project_root: &str,
+    path: &str,
+) -> Result<Response, ErrorPayload> {
     let root = canonical_project_root(project_root)?;
     let target = resolve_for_write(&root, path)?;
     std::fs::create_dir_all(&target).map_err(internal)?;
     Ok(Response::Ack)
 }
 
-pub async fn fs_create_dir_blocking(
+pub async fn fs_rename(
+    ctx: Arc<DaemonContext>,
     project_root: String,
-    path: String,
+    from_path: String,
+    to_path: String,
 ) -> Result<Response, ErrorPayload> {
-    tokio::task::spawn_blocking(move || fs_create_dir(&project_root, &path))
-        .await
-        .map_err(internal)?
+    join_fs_handler(
+        "fs_rename",
+        tokio::task::spawn_blocking(move || {
+            fs_rename_blocking(&ctx, &project_root, &from_path, &to_path)
+        }),
+    )
+    .await
 }
 
-pub fn fs_rename(
+pub(crate) fn fs_rename_blocking(
     ctx: &DaemonContext,
     project_root: &str,
     from_path: &str,
@@ -284,18 +333,19 @@ pub fn fs_rename(
     Ok(Response::Ack)
 }
 
-pub async fn fs_rename_blocking(
+pub async fn fs_delete(
     ctx: Arc<DaemonContext>,
     project_root: String,
-    from_path: String,
-    to_path: String,
+    path: String,
 ) -> Result<Response, ErrorPayload> {
-    tokio::task::spawn_blocking(move || fs_rename(&ctx, &project_root, &from_path, &to_path))
-        .await
-        .map_err(internal)?
+    join_fs_handler(
+        "fs_delete",
+        tokio::task::spawn_blocking(move || fs_delete_blocking(&ctx, &project_root, &path)),
+    )
+    .await
 }
 
-pub fn fs_delete(
+pub(crate) fn fs_delete_blocking(
     ctx: &DaemonContext,
     project_root: &str,
     path: &str,
@@ -315,17 +365,15 @@ pub fn fs_delete(
     Ok(Response::Ack)
 }
 
-pub async fn fs_delete_blocking(
-    ctx: Arc<DaemonContext>,
-    project_root: String,
-    path: String,
-) -> Result<Response, ErrorPayload> {
-    tokio::task::spawn_blocking(move || fs_delete(&ctx, &project_root, &path))
-        .await
-        .map_err(internal)?
+pub async fn git_status(project_root: String) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "git_status",
+        tokio::task::spawn_blocking(move || git_status_blocking(&project_root)),
+    )
+    .await
 }
 
-pub fn git_status(project_root: &str) -> Result<Response, ErrorPayload> {
+pub(crate) fn git_status_blocking(project_root: &str) -> Result<Response, ErrorPayload> {
     let root = canonical_project_root(project_root)?;
     let outcome = crate::git::run_git(&root, &["status", "--porcelain=v2"]).map_err(internal)?;
     if !outcome.success {
@@ -341,13 +389,18 @@ pub fn git_status(project_root: &str) -> Result<Response, ErrorPayload> {
     Ok(Response::GitStatus { entries })
 }
 
-pub async fn git_status_blocking(project_root: String) -> Result<Response, ErrorPayload> {
-    tokio::task::spawn_blocking(move || git_status(&project_root))
-        .await
-        .map_err(internal)?
+pub async fn git_diff_file(project_root: String, path: String) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "git_diff_file",
+        tokio::task::spawn_blocking(move || git_diff_file_blocking(&project_root, &path)),
+    )
+    .await
 }
 
-pub fn git_diff_file(project_root: &str, path: &str) -> Result<Response, ErrorPayload> {
+pub(crate) fn git_diff_file_blocking(
+    project_root: &str,
+    path: &str,
+) -> Result<Response, ErrorPayload> {
     let root = canonical_project_root(project_root)?;
     let resolved = resolve_existing_or_parent_path(&root, path)?;
     let rel = resolved
@@ -369,13 +422,20 @@ pub fn git_diff_file(project_root: &str, path: &str) -> Result<Response, ErrorPa
     })
 }
 
-pub async fn git_diff_file_blocking(
-    project_root: String,
-    path: String,
+async fn join_fs_handler(
+    request_kind: &'static str,
+    handle: tokio::task::JoinHandle<Result<Response, ErrorPayload>>,
 ) -> Result<Response, ErrorPayload> {
-    tokio::task::spawn_blocking(move || git_diff_file(&project_root, &path))
-        .await
-        .map_err(internal)?
+    match handle.await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(request_kind, %error, "filesystem handler panicked");
+            Err(ErrorPayload {
+                code: ErrorCode::Internal,
+                message: "filesystem handler panicked".to_string(),
+            })
+        }
+    }
 }
 
 fn entry_to_wire(
@@ -737,7 +797,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
         std::fs::write(root.join("ignored.txt"), "secret").unwrap();
-        let Response::FsList { entries, .. } = fs_list(
+        let Response::FsList { entries, .. } = fs_list_blocking(
             &ctx,
             &remote_project_files(root),
             root.to_str().unwrap(),
@@ -766,7 +826,7 @@ mod tests {
         let release = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
         set_fs_read_block_for_test(file.canonicalize().unwrap(), entered_tx, release.clone());
 
-        let read_task = tokio::spawn(fs_read_blocking(
+        let read_task = tokio::spawn(fs_read(
             ctx,
             ClientPrincipal::owner(),
             root.to_string_lossy().into_owned(),
@@ -782,5 +842,48 @@ mod tests {
         cvar.notify_all();
         let response = read_task.await.unwrap().unwrap();
         assert!(matches!(response, Response::FsRead { .. }));
+    }
+
+    #[tokio::test]
+    async fn blocking_fs_handler_panic_maps_to_internal_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let file = root.join("panic.txt");
+        std::fs::write(&file, "panic").unwrap();
+        set_fs_read_panic_for_test(file.canonicalize().unwrap());
+
+        let err = fs_read(
+            Arc::new(test_ctx(root)),
+            ClientPrincipal::owner(),
+            root.to_string_lossy().into_owned(),
+            "panic.txt".to_string(),
+            false,
+        )
+        .await
+        .expect_err("panic maps to internal error");
+
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(err.message, "filesystem handler panicked");
+    }
+
+    #[tokio::test]
+    async fn blocking_fs_read_matches_sync_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("read.txt"), "read").unwrap();
+        let ctx = Arc::new(test_ctx(root));
+        let principal = ClientPrincipal::owner();
+        let project_root = root.to_string_lossy().into_owned();
+
+        let sync = fs_read_blocking(&ctx, &principal, &project_root, "read.txt", false)
+            .expect("sync read succeeds");
+        let async_result = fs_read(ctx, principal, project_root, "read.txt".to_string(), false)
+            .await
+            .expect("async read succeeds");
+
+        assert_eq!(
+            serde_json::to_value(sync).unwrap(),
+            serde_json::to_value(async_result).unwrap()
+        );
     }
 }

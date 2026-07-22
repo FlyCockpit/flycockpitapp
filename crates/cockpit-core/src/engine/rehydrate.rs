@@ -88,6 +88,18 @@ pub struct Rehydrated {
     pub heals: Vec<Recovery>,
 }
 
+/// A backward-paged slice of rendered transcript history.
+#[derive(Debug)]
+pub struct HistoryPage {
+    /// Oldest-first, like every other history snapshot.
+    pub entries: Vec<proto::HistoryEntry>,
+    /// True when older events exist before this page.
+    pub has_more: bool,
+    /// Cursor for the next older page: the oldest underlying event seq in
+    /// this page. `None` when the page is empty.
+    pub oldest_seq: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RehydratePolicy {
     repair_mode: RepairMode,
@@ -313,6 +325,27 @@ pub fn history_snapshot_since_with_active_subagent_conn(
     let events = Db::list_session_events_since_conn(conn, session_id, since_seq)
         .map_err(|e| anyhow!("loading session events for history replay: {e}"))?;
     history_snapshot_from_events_conn(conn, session_id, root_agent, active_subagent, events)
+}
+
+/// Render a backward page of transcript history. Pages walk strictly
+/// backwards from `before_seq`, so mid-turn appends after one page is fetched
+/// cannot shift, duplicate, or skip older rows in the next page.
+pub fn history_page_before_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    root_agent: &str,
+    before_seq: Option<i64>,
+    limit: u32,
+) -> Result<HistoryPage> {
+    let page = Db::list_session_events_before_conn(conn, session_id, before_seq, limit)
+        .map_err(|e| anyhow!("loading session events for history page: {e}"))?;
+    let entries =
+        history_snapshot_from_events_conn(conn, session_id, root_agent, None, page.events)?;
+    Ok(HistoryPage {
+        entries,
+        has_more: page.has_more,
+        oldest_seq: page.oldest_seq,
+    })
 }
 
 fn history_snapshot_from_events_conn(
@@ -4203,6 +4236,149 @@ mod tests {
             }
             other => panic!("expected replayed assistant entry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn history_page_before_returns_newest_entries_oldest_first() {
+        let s = root_session();
+        record_user(&s, "one");
+        record_user(&s, "two");
+        record_user(&s, "three");
+
+        let page =
+            s.db.read_blocking(|conn| history_page_before_conn(conn, s.id, "Build", None, 2))
+                .unwrap();
+
+        assert!(page.has_more);
+        assert!(page.oldest_seq.is_some());
+        assert_eq!(page.entries.len(), 2);
+        assert!(
+            matches!(&page.entries[0], proto::HistoryEntry::User { text, .. } if text == "two")
+        );
+        assert!(
+            matches!(&page.entries[1], proto::HistoryEntry::User { text, .. } if text == "three")
+        );
+    }
+
+    #[test]
+    fn history_page_before_walk_reconstructs_full_snapshot() {
+        let s = root_session();
+        record_user(&s, "one");
+        record_assistant(&s, "infer-1", "two");
+        record_user(&s, "three");
+        record_assistant(&s, "infer-2", "four");
+        record_user(&s, "five");
+
+        let full = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let mut cursor = None;
+        let mut pages = Vec::new();
+        loop {
+            let page =
+                s.db.read_blocking(|conn| history_page_before_conn(conn, s.id, "Build", cursor, 2))
+                    .unwrap();
+            let has_more = page.has_more;
+            cursor = page.oldest_seq;
+            pages.push(page.entries);
+            if !has_more {
+                break;
+            }
+        }
+
+        let mut walked = Vec::new();
+        for page in pages.into_iter().rev() {
+            walked.extend(page);
+        }
+        assert_eq!(
+            serde_json::to_value(&walked).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
+    }
+
+    #[test]
+    fn history_page_before_reports_has_more_until_first_entry() {
+        let s = root_session();
+        record_user(&s, "one");
+        record_user(&s, "two");
+        record_user(&s, "three");
+        record_user(&s, "four");
+        record_user(&s, "five");
+
+        let first =
+            s.db.read_blocking(|conn| history_page_before_conn(conn, s.id, "Build", None, 2))
+                .unwrap();
+        assert!(first.has_more);
+        let second =
+            s.db.read_blocking(|conn| {
+                history_page_before_conn(conn, s.id, "Build", first.oldest_seq, 2)
+            })
+            .unwrap();
+        assert!(second.has_more);
+        let third =
+            s.db.read_blocking(|conn| {
+                history_page_before_conn(conn, s.id, "Build", second.oldest_seq, 2)
+            })
+            .unwrap();
+        assert!(!third.has_more);
+        assert_eq!(third.entries.len(), 1);
+        assert!(
+            matches!(&third.entries[0], proto::HistoryEntry::User { text, .. } if text == "one")
+        );
+    }
+
+    #[test]
+    fn history_page_before_empty_session_returns_empty_page() {
+        let s = root_session();
+
+        let page =
+            s.db.read_blocking(|conn| history_page_before_conn(conn, s.id, "Build", None, 20))
+                .unwrap();
+
+        assert!(page.entries.is_empty());
+        assert!(!page.has_more);
+        assert_eq!(page.oldest_seq, None);
+    }
+
+    #[test]
+    fn history_page_before_carries_compact_boundary_brief() {
+        let s = root_session();
+        let handoff_id = Uuid::new_v4();
+        s.db.store_compaction_payload(
+            handoff_id,
+            s.id,
+            &json!({
+                "predecessor_short_id": "abc123",
+                "seed_tool_count": 2,
+                "brief_text": "handoff summary",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        s.record_event(
+            crate::db::session_log::SessionEventKind::SessionCompacted,
+            Some("Build"),
+            None,
+            &json!({
+                "handoff_ref": handoff_id.to_string(),
+            }),
+        )
+        .unwrap();
+
+        let full = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let page =
+            s.db.read_blocking(|conn| history_page_before_conn(conn, s.id, "Build", None, 1))
+                .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&page.entries).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
+        assert!(matches!(
+            &page.entries[..],
+            [proto::HistoryEntry::CompactBoundary {
+                brief: Some(brief),
+                ..
+            }] if brief == "handoff summary"
+        ));
     }
 
     #[tokio::test]

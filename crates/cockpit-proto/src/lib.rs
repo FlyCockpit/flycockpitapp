@@ -1614,6 +1614,41 @@ mod tests {
     }
 
     #[test]
+    fn read_history_page_request_round_trips_without_before_seq() {
+        let session_id = Uuid::new_v4();
+        let value = serde_json::to_value(Request::ReadHistoryPage {
+            session_id,
+            before_seq: None,
+            limit: 25,
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "request": "read_history_page",
+                "params": {
+                    "session_id": session_id,
+                    "limit": 25,
+                }
+            })
+        );
+
+        let back: Request = serde_json::from_value(value).unwrap();
+        match back {
+            Request::ReadHistoryPage {
+                session_id: got,
+                before_seq,
+                limit,
+            } => {
+                assert_eq!(got, session_id);
+                assert_eq!(before_seq, None);
+                assert_eq!(limit, 25);
+            }
+            other => panic!("expected ReadHistoryPage, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn send_user_message_serializes_image_refs_not_raw_byte_arrays() {
         let image_ref = ImageAttachmentRef { id: Uuid::new_v4() };
         let env = Envelope::request(

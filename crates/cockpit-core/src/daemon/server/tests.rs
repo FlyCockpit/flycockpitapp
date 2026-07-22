@@ -143,6 +143,90 @@ async fn read_session_messages_requires_read_access_returns_page_and_does_not_sp
 }
 
 #[tokio::test]
+async fn read_history_page_requires_read_access_returns_page_and_does_not_spawn_worker() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+    let seq = ctx
+        .db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "hello"}),
+        )
+        .unwrap();
+    let request = Request::ReadHistoryPage {
+        session_id: session.session_id,
+        before_seq: None,
+        limit: 20,
+    };
+    let grant = crate::daemon::principal::PrincipalGrant {
+        scope: crate::daemon::principal::PrincipalScope::AgentReadonly,
+        project_root: Some("/repo".to_string()),
+    };
+    let mut denied = remote_state_with_grants(vec![grant.clone()]);
+    let error = handle_request(request.clone(), &mut denied, &ctx)
+        .await
+        .expect_err("unshared session is not readable to a remote principal");
+    assert_eq!(error.code, ErrorCode::Authorization);
+
+    ctx.db
+        .set_session_shared_with_collaborators(session.session_id, true)
+        .unwrap();
+    let mut allowed = remote_state_with_grants(vec![grant]);
+    let response = handle_request(request, &mut allowed, &ctx)
+        .await
+        .expect("readonly collaborator can read shared history pages");
+    let Response::HistoryPage {
+        session_id,
+        entries,
+        has_more,
+        oldest_seq,
+    } = response
+    else {
+        panic!("expected HistoryPage response");
+    };
+    assert_eq!(session_id, session.session_id);
+    assert!(!has_more);
+    assert_eq!(oldest_seq, Some(seq));
+    assert_eq!(entries.len(), 1);
+    assert!(matches!(
+        &entries[0],
+        proto::HistoryEntry::User { text, seq: got, .. } if text == "hello" && *got == seq
+    ));
+    assert!(
+        !ctx.registry
+            .active_session_ids()
+            .contains(&session.session_id),
+        "read-history-page is a DB/RPC read and must not create a session worker"
+    );
+}
+
+#[tokio::test]
+async fn read_history_page_denied_without_session_read_access() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+    let request = Request::ReadHistoryPage {
+        session_id: session.session_id,
+        before_seq: None,
+        limit: 20,
+    };
+    let grant = crate::daemon::principal::PrincipalGrant {
+        scope: crate::daemon::principal::PrincipalScope::AgentReadonly,
+        project_root: Some("/repo".to_string()),
+    };
+    let mut state = remote_state_with_grants(vec![grant]);
+
+    let error = handle_request(request, &mut state, &ctx)
+        .await
+        .expect_err("unshared session is denied to remote readonly principal");
+
+    assert_eq!(error.code, ErrorCode::Authorization);
+    assert_eq!(error.message, "remote principal cannot access this session");
+}
+
+#[tokio::test]
 async fn goal_rpc_reads_sets_and_clears() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
@@ -2192,6 +2276,7 @@ fn dispatch_matrix_class_for_command(
         | ("git_diff_file", "project_files", false)
         | ("list_sessions", "public_read", false)
         | ("read_session_messages", "custom", false)
+        | ("read_history_page", "custom", false)
         | ("session_live_status", "public_read", false)
         | ("goal_status", "session_row_reader", false)
         | ("list_skills", "project_read", false)
@@ -2229,6 +2314,7 @@ enum ReadonlyDispatchCaseKind {
     GitDiffFile,
     ListSessions,
     ReadSessionMessages,
+    ReadHistoryPage,
     SessionLiveStatus,
     GoalStatus,
     ListSkills,
@@ -2273,6 +2359,10 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
         ReadonlyDispatchCase {
             kind: "read_session_messages",
             case: ReadonlyDispatchCaseKind::ReadSessionMessages,
+        },
+        ReadonlyDispatchCase {
+            kind: "read_history_page",
+            case: ReadonlyDispatchCaseKind::ReadHistoryPage,
         },
         ReadonlyDispatchCase {
             kind: "session_live_status",
@@ -2806,6 +2896,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "fs_create_dir"
         | "lsp_control"
         | "read_session_messages"
+        | "read_history_page"
         | "unarchive_session"
         | "fork_session"
         | "btw_create"
@@ -2922,6 +3013,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_terminal("lsp_control"),
         authz_session_writer("resolve_interrupt"),
         authz_session_reader("read_session_messages"),
+        authz_session_reader("read_history_page"),
         authz_session_writer("archive_session"),
         authz_session_writer("unarchive_session"),
         authz_session_writer("fork_session"),
@@ -3809,6 +3901,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             before_seq: None,
             limit: 20,
         },
+        "read_history_page" => Request::ReadHistoryPage {
+            session_id,
+            before_seq: None,
+            limit: 20,
+        },
         "archive_session" => Request::ArchiveSession {
             session_id,
             cascade: false,
@@ -4098,6 +4195,37 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(messages.len(), 1);
                 assert_eq!(messages[0].seq, seq);
             }
+            Self::ReadHistoryPage => {
+                let ctx = test_ctx();
+                let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                let seq = ctx
+                    .db
+                    .insert_session_event(
+                        session.session_id,
+                        crate::db::session_log::SessionEventKind::UserMessage,
+                        Some("Build"),
+                        None,
+                        &serde_json::json!({"text": "hello"}),
+                    )
+                    .unwrap();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::ReadHistoryPage {
+                        session_id: session.session_id,
+                        before_seq: None,
+                        limit: 20,
+                    },
+                )
+                .await
+                .expect("read_history_page happy");
+                let Response::HistoryPage { entries, .. } = response else {
+                    panic!("expected HistoryPage");
+                };
+                assert_eq!(entries.len(), 1);
+                assert!(
+                    matches!(&entries[0], proto::HistoryEntry::User { seq: got, .. } if *got == seq)
+                );
+            }
             Self::SessionLiveStatus => {
                 let ctx = test_ctx();
                 let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
@@ -4326,6 +4454,33 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(session_id, unknown_session_id);
                 assert!(messages.is_empty());
                 assert!(!has_more);
+            }
+            Self::ReadHistoryPage => {
+                let ctx = test_ctx();
+                let unknown_session_id = Uuid::new_v4();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::ReadHistoryPage {
+                        session_id: unknown_session_id,
+                        before_seq: None,
+                        limit: 20,
+                    },
+                )
+                .await
+                .expect("unknown history page returns an empty typed page");
+                let Response::HistoryPage {
+                    session_id,
+                    entries,
+                    has_more,
+                    oldest_seq,
+                } = response
+                else {
+                    panic!("expected HistoryPage");
+                };
+                assert_eq!(session_id, unknown_session_id);
+                assert!(entries.is_empty());
+                assert!(!has_more);
+                assert_eq!(oldest_seq, None);
             }
             Self::SessionLiveStatus => {
                 let ctx = test_ctx();
@@ -6651,7 +6806,7 @@ macro_rules! request_ordering_rows_from_command_table {
 }
 
 #[test]
-fn request_ordering_concurrent_set_is_exactly_the_twenty_enumerated_reads() {
+fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_reads() {
     let rows = proto::command!(request_ordering_rows_from_command_table);
     assert!(
         rows.len() > 80,
@@ -6679,6 +6834,7 @@ fn request_ordering_concurrent_set_is_exactly_the_twenty_enumerated_reads() {
         "list_scheduled_jobs",
         "list_sessions",
         "list_skills",
+        "read_history_page",
         "read_session_messages",
         "resource_snapshot",
         "session_live_status",
@@ -6791,6 +6947,17 @@ fn command_table_metadata_is_exhaustive_and_stable() {
                 limit: 20,
             },
             kind: "read_session_messages",
+            session_id: Some(transcript_session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::ReadHistoryPage {
+                session_id: transcript_session_id,
+                before_seq: None,
+                limit: 20,
+            },
+            kind: "read_history_page",
             session_id: Some(transcript_session_id),
             audit_path: None,
             mutating: false,
@@ -7664,6 +7831,7 @@ fn command_table_metadata_is_exhaustive_and_stable() {
         ResolveInterrupt,
         ListSessions,
         ReadSessionMessages,
+        ReadHistoryPage,
         SessionLiveStatus,
         ArchiveSession,
         UnarchiveSession,

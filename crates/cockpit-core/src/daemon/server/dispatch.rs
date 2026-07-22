@@ -626,6 +626,27 @@ pub(super) async fn handle_serialized_request(
             })
         }
 
+        Request::ReadHistoryPage {
+            session_id,
+            before_seq,
+            limit,
+        } => {
+            let db = ctx.db.clone();
+            let config_source = ctx.config_source.clone();
+            let page = db
+                .read(move |conn| {
+                    read_history_page_conn(conn, session_id, before_seq, limit, &config_source)
+                })
+                .await
+                .map_err(internal)?;
+            Ok(Response::HistoryPage {
+                session_id,
+                entries: page.entries,
+                has_more: page.has_more,
+                oldest_seq: page.oldest_seq,
+            })
+        }
+
         Request::SessionLiveStatus { session_ids } => {
             let mut visible_ids = Vec::new();
             for id in session_ids {
@@ -1315,6 +1336,26 @@ pub(super) async fn handle_concurrent_request(
                 has_more,
             })
         }
+        Request::ReadHistoryPage {
+            session_id,
+            before_seq,
+            limit,
+        } => {
+            let db = ctx.db.clone();
+            let config_source = ctx.config_source.clone();
+            let page = db
+                .read(move |conn| {
+                    read_history_page_conn(conn, session_id, before_seq, limit, &config_source)
+                })
+                .await
+                .map_err(internal)?;
+            Ok(Response::HistoryPage {
+                session_id,
+                entries: page.entries,
+                has_more: page.has_more,
+                oldest_seq: page.oldest_seq,
+            })
+        }
         Request::SessionLiveStatus { session_ids } => {
             let mut visible_ids = Vec::new();
             for id in session_ids {
@@ -1757,6 +1798,32 @@ pub(super) fn set_caffeinate(
             message,
         }),
     }
+}
+
+fn read_history_page_conn(
+    conn: &rusqlite::Connection,
+    session_id: Uuid,
+    before_seq: Option<i64>,
+    limit: u32,
+    config_source: &crate::daemon::config_source::ConfigSource,
+) -> anyhow::Result<crate::engine::rehydrate::HistoryPage> {
+    let extended_cfg = crate::db::Db::get_session_conn(conn, session_id)?
+        .and_then(|row| {
+            config_source
+                .load(std::path::Path::new(&row.project_root))
+                .ok()
+                .map(|(_, extended)| extended)
+        })
+        .unwrap_or_default();
+    let root_agent =
+        crate::daemon::session_worker::resolve_root_agent_conn(conn, session_id, &extended_cfg);
+    crate::engine::rehydrate::history_page_before_conn(
+        conn,
+        session_id,
+        &root_agent,
+        before_seq,
+        limit,
+    )
 }
 
 /// Poll interval for the until-idle auto-off watcher. Short enough that

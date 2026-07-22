@@ -117,6 +117,14 @@ pub enum Response {
         has_more: bool,
     },
 
+    HistoryPage {
+        session_id: Uuid,
+        entries: Vec<HistoryEntry>,
+        has_more: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oldest_seq: Option<i64>,
+    },
+
     /// A `/note` session-history note was recorded ([`Request::RecordSessionNote`]).
     /// `seq` is the assigned monotonic `session_events` sequence so the client
     /// can place the note row in the correct chronological position.

@@ -871,6 +871,22 @@
     },
     "response": "session_messages"
   },
+  "history_page": {
+    "data": {
+      "entries": [
+        {
+          "role": "user",
+          "seq": 5,
+          "text": "message",
+          "ts_ms": 1700000000000
+        }
+      ],
+      "has_more": true,
+      "oldest_seq": 5,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "response": "history_page"
+  },
   "sessions": {
     "data": {
       "sessions": [

@@ -353,6 +353,16 @@ pub enum Request {
         limit: u32,
     },
 
+    /// Read a paginated page of full transcript history for a session.
+    /// `before_seq = None` reads the newest page; `Some(seq)` reads older
+    /// events with `seq < before_seq`. The daemon clamps `limit`.
+    ReadHistoryPage {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_seq: Option<i64>,
+        limit: u32,
+    },
+
     /// Per-session live status for the `/sessions` browser's top two
     /// tiers (GOALS §17f): which of `session_ids` currently have active
     /// async jobs (loop/timer/background) and which are mid-turn
@@ -787,6 +797,7 @@ macro_rules! command {
             (Request::ResolveInterrupt { .. }, "resolve_interrupt", session_writer, attached, true, serialized, none);
             (Request::ListSessions { .. }, "list_sessions", public_read, none, false, concurrent, none);
             (Request::ReadSessionMessages { session_id, .. }, "read_session_messages", custom(authorize_read_session_messages), field(session_id), false, concurrent, none);
+            (Request::ReadHistoryPage { session_id, .. }, "read_history_page", custom(authorize_read_history_page), field(session_id), false, concurrent, none);
             (Request::SessionLiveStatus { .. }, "session_live_status", public_read, none, false, concurrent, none);
             (Request::ArchiveSession { session_id, .. }, "archive_session", session_row_writer(session_id), field(session_id), true, serialized, none);
             (Request::UnarchiveSession { session_id }, "unarchive_session", session_row_writer(session_id), field(session_id), true, serialized, none);

@@ -1432,6 +1432,31 @@ pub fn read_session_messages_blocking(
     }
 }
 
+#[allow(dead_code)] // Consumed by tui-scrollback-page-in; remove there.
+pub fn read_history_page_blocking(
+    socket: &Path,
+    session_id: uuid::Uuid,
+    before_seq: Option<i64>,
+    limit: u32,
+) -> Result<(Vec<proto::HistoryEntry>, bool, Option<i64>), String> {
+    match daemon_request_at_blocking(
+        socket,
+        Request::ReadHistoryPage {
+            session_id,
+            before_seq,
+            limit,
+        },
+    )? {
+        Response::HistoryPage {
+            session_id: got,
+            entries,
+            has_more,
+            oldest_seq,
+        } if got == session_id => Ok((entries, has_more, oldest_seq)),
+        other => Err(format!("unexpected read_history_page response: {other:?}")),
+    }
+}
+
 pub fn resource_snapshot_blocking() -> Result<proto::Response, String> {
     match daemon_request_blocking(Request::ResourceSnapshot)? {
         response @ Response::ResourceSnapshot { .. } => Ok(response),
@@ -2406,6 +2431,62 @@ mod tests {
         );
         assert_eq!(est.guidance_tokens, 0);
         assert!(est.system_tokens > 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_history_page_blocking_rejects_unexpected_response() {
+        use cockpit_core::daemon::proto::{
+            Body, Envelope, ProtoStream, RecvFrame, Request, Response,
+        };
+        use tokio::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let session_id = uuid::Uuid::new_v4();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut proto = ProtoStream::new(stream);
+            let env = match proto.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(env) => env,
+                RecvFrame::VersionMismatch { .. } => panic!("unexpected version mismatch"),
+            };
+            let Body::Request { id, request } = env.body else {
+                panic!("expected request envelope");
+            };
+            match request {
+                Request::ReadHistoryPage {
+                    session_id: got,
+                    before_seq,
+                    limit,
+                } => {
+                    assert_eq!(got, session_id);
+                    assert_eq!(before_seq, None);
+                    assert_eq!(limit, 20);
+                }
+                other => panic!("expected read_history_page request, got {other:?}"),
+            }
+            proto
+                .send(&Envelope::response(
+                    id,
+                    Response::SessionMessages {
+                        session_id,
+                        messages: Vec::new(),
+                        has_more: false,
+                    },
+                ))
+                .await
+                .unwrap();
+        });
+
+        let err = read_history_page_blocking(&socket, session_id, None, 20)
+            .expect_err("mismatched response variant is rejected");
+
+        assert!(err.contains("unexpected read_history_page response"));
+        assert!(err.contains("SessionMessages"));
+        server.await.unwrap();
     }
 
     fn runner_with_client_task(handle: JoinHandle<()>) -> AgentRunner {

@@ -318,12 +318,31 @@ pub(super) fn authorize_read_session_messages(
     state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
-    let principal = &state.principal;
     let Request::ReadSessionMessages { session_id, .. } = request else {
         unreachable!("authorize_read_session_messages called for non-ReadSessionMessages request");
     };
 
-    match ctx.db.get_session(*session_id) {
+    authorize_session_reader_by_id(&state.principal, ctx, *session_id)
+}
+
+pub(super) fn authorize_read_history_page(
+    request: &Request,
+    state: &MutableClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let Request::ReadHistoryPage { session_id, .. } = request else {
+        unreachable!("authorize_read_history_page called for non-ReadHistoryPage request");
+    };
+
+    authorize_session_reader_by_id(&state.principal, ctx, *session_id)
+}
+
+fn authorize_session_reader_by_id(
+    principal: &ClientPrincipal,
+    ctx: &DaemonContext,
+    session_id: Uuid,
+) -> std::result::Result<(), ErrorPayload> {
+    match ctx.db.get_session(session_id) {
         Ok(Some(row)) => match session_access_for_row(principal, &row) {
             SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => Ok(()),
             SessionAccess::None => Err(authorization_error(
@@ -464,23 +483,20 @@ pub(super) fn authorize_shared_custom(
             }
         }
         Request::SubagentTranscript { session_id, .. }
-        | Request::ReadSessionMessages { session_id, .. } => {
-            match ctx.db.get_session(*session_id) {
-                Ok(Some(row)) => match session_access_for_row(principal, &row) {
-                    SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => {
-                        Ok(())
-                    }
-                    SessionAccess::None => Err(authorization_error(
-                        "remote principal cannot access this session",
-                    )),
-                },
-                Ok(None) => Err(ErrorPayload {
-                    code: ErrorCode::UnknownSession,
-                    message: format!("unknown session {session_id}"),
-                }),
-                Err(e) => Err(internal(e)),
-            }
-        }
+        | Request::ReadSessionMessages { session_id, .. }
+        | Request::ReadHistoryPage { session_id, .. } => match ctx.db.get_session(*session_id) {
+            Ok(Some(row)) => match session_access_for_row(principal, &row) {
+                SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => Ok(()),
+                SessionAccess::None => Err(authorization_error(
+                    "remote principal cannot access this session",
+                )),
+            },
+            Ok(None) => Err(ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown session {session_id}"),
+            }),
+            Err(e) => Err(internal(e)),
+        },
         Request::BeginAttachmentUpload { purpose, .. } => {
             if matches!(purpose, proto::AttachmentPurpose::TerminalPasteImage { .. }) {
                 if principal.has_terminal() {

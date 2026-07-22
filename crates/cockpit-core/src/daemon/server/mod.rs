@@ -286,6 +286,12 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 scrub_session_message(message, redact);
             }
         }
+        proto::Response::HistoryPage {
+            session_id: _,
+            entries,
+            has_more: _,
+            oldest_seq: _,
+        } => scrub_history_entries(entries, redact),
         proto::Response::GoalStatus { goal } => {
             if let Some(goal) = goal {
                 scrub_goal_summary(goal, redact);

@@ -19,7 +19,8 @@ use crate::auth::flycockpit::{
 use crate::daemon::principal::ClientPrincipal;
 use crate::daemon::proto::{self, Body, Envelope, Event, InterruptQuestion};
 use crate::daemon::relay_envelope::{
-    IncomingRelayFrame, RelayPrincipal, daemon_client_frame, daemon_control_frame, parse_incoming,
+    AttentionEventType, AttentionNotificationPayload, IncomingRelayFrame, RelayPrincipal,
+    daemon_client_frame, daemon_control_frame, parse_incoming,
 };
 use crate::daemon::server::DaemonContext;
 use crate::db::connector::ConnectorStatusUpdate;
@@ -27,7 +28,6 @@ use crate::db::connector::ConnectorStatusUpdate;
 const CHANNEL_BUFFER: usize = 128;
 const OUTBOUND_BUFFER: usize = 256;
 const CHANNEL_DUPLEX_BYTES: usize = proto::MAX_FRAME_BYTES;
-const ATTENTION_EVENT: &str = "attention";
 const PRESENCE_EVENT: &str = "presence";
 const HEARTBEAT_SECS: u64 = 30;
 const TOKEN_REFRESH_SKEW_SECS: u64 = 60;
@@ -714,7 +714,6 @@ async fn run_socket(
                                 frame.channel_id.clone(),
                                 principal,
                                 ctx.clone(),
-                                credential.instance_id.clone(),
                                 relay_url.clone(),
                                 out_tx.clone(),
                             )
@@ -742,22 +741,13 @@ fn spawn_channel(
     channel_id: String,
     principal: RelayPrincipal,
     ctx: Arc<DaemonContext>,
-    instance_id: String,
     relay_url: String,
     outbound: mpsc::Sender<OutboundFrame>,
 ) -> ChannelHandle {
     let (input_tx, input_rx) = mpsc::channel(CHANNEL_BUFFER);
     let task = tokio::spawn(async move {
-        if let Err(error) = channel_task(
-            channel_id,
-            principal,
-            ctx,
-            instance_id,
-            relay_url,
-            input_rx,
-            outbound,
-        )
-        .await
+        if let Err(error) =
+            channel_task(channel_id, principal, ctx, relay_url, input_rx, outbound).await
         {
             tracing::debug!(error = %error, "relay channel closed");
         }
@@ -769,7 +759,6 @@ async fn channel_task(
     channel_id: String,
     principal: RelayPrincipal,
     ctx: Arc<DaemonContext>,
-    instance_id: String,
     relay_url: String,
     mut input_rx: mpsc::Receiver<Value>,
     outbound: mpsc::Sender<OutboundFrame>,
@@ -793,13 +782,8 @@ async fn channel_task(
 
     let mut lines = BufReader::new(read_half).lines();
     while let Some(line) = lines.next_line().await? {
-        if let Some(payload) = attention_payload_from_line(&line, &ctx, &instance_id) {
-            let _ = outbound
-                .send(OutboundFrame::Control {
-                    event: ATTENTION_EVENT.to_string(),
-                    payload,
-                })
-                .await;
+        if let Some(frame) = attention_frame_from_line(&line, &ctx) {
+            let _ = outbound.send(frame).await;
         }
         let payload: Value = serde_json::from_str(&line).context("parsing daemon envelope")?;
         outbound
@@ -839,24 +823,51 @@ fn publish_status(
     });
 }
 
-pub(crate) fn attention_payload_from_line(
-    line: &str,
-    ctx: &DaemonContext,
-    instance_id: &str,
-) -> Option<Value> {
+pub(crate) fn attention_payload_from_line(line: &str, ctx: &DaemonContext) -> Option<Value> {
     let envelope: Envelope = serde_json::from_str(line).ok()?;
     let Body::Event { event } = envelope.body else {
         return None;
     };
-    attention_payload_for_event(&event, ctx, instance_id)
+    attention_payload_for_event(&event, ctx)
 }
 
-pub(crate) fn attention_payload_for_event(
+fn attention_frame_from_line(line: &str, ctx: &DaemonContext) -> Option<OutboundFrame> {
+    let payload = attention_payload_from_line(line, ctx)?;
+    Some(OutboundFrame::Control {
+        event: attention_payload_event_name(&payload)?,
+        payload,
+    })
+}
+
+#[cfg(test)]
+fn attention_frame_for_event_with_meta(
     event: &Event,
     ctx: &DaemonContext,
-    instance_id: &str,
-) -> Option<Value> {
-    let (session_id, kind, description) = match event {
+    event_id: String,
+    ts: String,
+) -> Option<OutboundFrame> {
+    let payload = attention_payload_for_event_with_meta(event, ctx, event_id, ts)?;
+    let frame_event = attention_event_type_wire_string(&payload.event_type)?;
+    Some(OutboundFrame::Control {
+        event: frame_event,
+        payload: serde_json::to_value(payload).ok()?,
+    })
+}
+
+pub(crate) fn attention_payload_for_event(event: &Event, ctx: &DaemonContext) -> Option<Value> {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let payload = attention_payload_for_event_with_meta(event, ctx, event_id, ts)?;
+    serde_json::to_value(payload).ok()
+}
+
+fn attention_payload_for_event_with_meta(
+    event: &Event,
+    ctx: &DaemonContext,
+    event_id: String,
+    ts: String,
+) -> Option<AttentionNotificationPayload> {
+    let (session_id, event_type, fixed_string_title, fixed_string_body) = match event {
         Event::InterruptRaised {
             session_id,
             question,
@@ -869,23 +880,43 @@ pub(crate) fn attention_payload_for_event(
                     .is_some_and(|set| set.questions.iter().any(question_is_approval));
             (
                 *session_id,
-                if approval { "approval" } else { "question" },
+                if approval {
+                    AttentionEventType::ApprovalNeeded
+                } else {
+                    AttentionEventType::QuestionRaised
+                },
                 if approval {
                     "Approval needed"
                 } else {
                     "Question waiting"
                 },
+                if approval {
+                    "Open the session to review the request."
+                } else {
+                    "Open the session to respond."
+                },
             )
         }
-        Event::AgentIdle { session_id, .. } => (*session_id, "turn_done", "Agent finished"),
+        Event::AgentIdle { session_id, .. } => (
+            *session_id,
+            AttentionEventType::TurnDone,
+            "Agent finished",
+            "Open the session to see the result.",
+        ),
         Event::SessionPersistFailed { session_id, .. }
         | Event::SessionDriverFailed { session_id, .. }
-        | Event::InferenceFailed { session_id, .. } => {
-            (*session_id, "turn_error", "Agent turn failed")
-        }
-        Event::ScheduleCompleted { session_id, .. } => {
-            (*session_id, "schedule_done", "Background job finished")
-        }
+        | Event::InferenceFailed { session_id, .. } => (
+            *session_id,
+            AttentionEventType::TurnError,
+            "Agent turn failed",
+            "Open the session to inspect it.",
+        ),
+        Event::ScheduleCompleted { session_id, .. } => (
+            *session_id,
+            AttentionEventType::ScheduleDone,
+            "Background job finished",
+            "Open the session to review it.",
+        ),
         _ => return None,
     };
     let project_root = ctx
@@ -894,13 +925,31 @@ pub(crate) fn attention_payload_for_event(
         .ok()
         .flatten()
         .map(|row| row.project_root);
-    Some(json!({
-        "kind": kind,
-        "description": description,
-        "sessionId": session_id,
-        "projectRoot": project_root,
-        "instanceId": instance_id,
-    }))
+    Some(AttentionNotificationPayload {
+        event_id,
+        session_id: session_id.to_string(),
+        project_root,
+        event_type,
+        fixed_string_title: fixed_string_title.to_string(),
+        fixed_string_body: Some(fixed_string_body.to_string()),
+        ts,
+        target_principal: None,
+    })
+}
+
+#[cfg(test)]
+fn attention_event_type_wire_string(event_type: &AttentionEventType) -> Option<String> {
+    serde_json::to_value(event_type)
+        .ok()?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn attention_payload_event_name(payload: &Value) -> Option<String> {
+    payload
+        .get("eventType")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn question_is_approval(question: &InterruptQuestion) -> bool {
@@ -1025,6 +1074,45 @@ mod tests {
                 ),
             )),
         )
+    }
+
+    fn test_session_id(ctx: &DaemonContext) -> Uuid {
+        ctx.db
+            .create_session("project", "/repo", "Build")
+            .unwrap()
+            .session_id
+    }
+
+    fn interrupt_event(session_id: Uuid, permission: bool) -> Event {
+        Event::InterruptRaised {
+            session_id,
+            interrupt_id: Uuid::new_v4(),
+            agent: "Build".to_string(),
+            description: "please approve DO_NOT_FORWARD_USER_TEXT".to_string(),
+            question: Some(InterruptQuestion::Single {
+                prompt: "run secret command?".to_string(),
+                options: vec![],
+                allow_freetext: false,
+                command_detail: None,
+                permission,
+                approval_class: None,
+                sandbox_escalation: None,
+            }),
+            questions: None,
+            pending_count: 0,
+            reason: crate::daemon::proto::InterruptRaiseReason::Initial,
+        }
+    }
+
+    fn attention_payload_for_test(event: &Event, ctx: &DaemonContext) -> Value {
+        let payload = attention_payload_for_event_with_meta(
+            event,
+            ctx,
+            "evt-test".to_string(),
+            "2026-07-10T00:00:00.000Z".to_string(),
+        )
+        .unwrap();
+        serde_json::to_value(payload).unwrap()
     }
 
     async fn relay_pair() -> (
@@ -1525,32 +1613,169 @@ mod tests {
     }
 
     #[test]
+    fn attention_payload_conforms_to_envelope() {
+        let (_tmp, ctx) = test_context();
+        let session_id = test_session_id(&ctx);
+        let cases = vec![
+            (
+                interrupt_event(session_id, true),
+                AttentionEventType::ApprovalNeeded,
+                "Approval needed",
+                "Open the session to review the request.",
+            ),
+            (
+                interrupt_event(session_id, false),
+                AttentionEventType::QuestionRaised,
+                "Question waiting",
+                "Open the session to respond.",
+            ),
+            (
+                Event::AgentIdle {
+                    session_id,
+                    turn_id: Some("turn-1".to_string()),
+                    reason: crate::daemon::proto::IdleReason::Completed,
+                },
+                AttentionEventType::TurnDone,
+                "Agent finished",
+                "Open the session to see the result.",
+            ),
+            (
+                Event::SessionPersistFailed {
+                    session_id,
+                    error: "persist failed".to_string(),
+                },
+                AttentionEventType::TurnError,
+                "Agent turn failed",
+                "Open the session to inspect it.",
+            ),
+            (
+                Event::ScheduleCompleted {
+                    session_id,
+                    job_id: "job-1".to_string(),
+                    label: "Nightly".to_string(),
+                    kind: "background".to_string(),
+                    failed: false,
+                },
+                AttentionEventType::ScheduleDone,
+                "Background job finished",
+                "Open the session to review it.",
+            ),
+        ];
+
+        for (event, event_type, title, body) in cases {
+            let payload = attention_payload_for_test(&event, &ctx);
+            assert!(
+                payload.get("instanceId").is_none(),
+                "canonical payload omits instanceId"
+            );
+            let parsed: AttentionNotificationPayload =
+                serde_json::from_value(payload).expect("payload conforms");
+            assert_eq!(parsed.event_type, event_type);
+            assert_eq!(parsed.session_id, session_id.to_string());
+            assert_eq!(parsed.project_root.as_deref(), Some("/repo"));
+            assert_eq!(parsed.fixed_string_title, title);
+            assert_eq!(parsed.fixed_string_body.as_deref(), Some(body));
+            assert!(parsed.target_principal.is_none());
+        }
+    }
+
+    #[test]
+    fn attention_frame_event_is_event_type() {
+        let (_tmp, ctx) = test_context();
+        let event = interrupt_event(test_session_id(&ctx), true);
+        let line = serde_json::to_string(&Envelope::event(event)).unwrap();
+
+        let frame = attention_frame_from_line(&line, &ctx).unwrap();
+
+        match frame {
+            OutboundFrame::Control { event, payload } => {
+                assert_eq!(event, "APPROVAL_NEEDED");
+                assert_eq!(payload["eventType"], "APPROVAL_NEEDED");
+            }
+            OutboundFrame::Client { .. } => panic!("attention emits a control frame"),
+        }
+    }
+
+    #[test]
+    fn attention_payload_has_event_id_and_ts() {
+        let (_tmp, ctx) = test_context();
+        let event = interrupt_event(test_session_id(&ctx), true);
+
+        let first = attention_payload_for_event_with_meta(
+            &event,
+            &ctx,
+            "evt-1".to_string(),
+            "2026-07-10T00:00:00.000Z".to_string(),
+        )
+        .unwrap();
+        let second = attention_payload_for_event_with_meta(
+            &event,
+            &ctx,
+            "evt-2".to_string(),
+            "2026-07-10T00:00:01.000Z".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(first.event_id, "evt-1");
+        assert_eq!(first.ts, "2026-07-10T00:00:00.000Z");
+        assert!(first.ts.ends_with('Z'));
+        chrono::DateTime::parse_from_rfc3339(&first.ts).expect("ts is RFC3339");
+        assert!(!first.event_id.is_empty());
+        assert_ne!(first.event_id, second.event_id);
+    }
+
+    #[test]
     fn attention_payload_is_fixed_string_and_omits_user_text() {
         let (_tmp, ctx) = test_context();
-        let event = Event::InterruptRaised {
-            session_id: Uuid::new_v4(),
-            interrupt_id: Uuid::new_v4(),
-            agent: "Build".to_string(),
-            description: "please approve DO_NOT_FORWARD_USER_TEXT".to_string(),
-            question: Some(InterruptQuestion::Single {
-                prompt: "run secret command?".to_string(),
-                options: vec![],
-                allow_freetext: false,
-                command_detail: None,
-                permission: true,
-                approval_class: None,
-                sandbox_escalation: None,
-            }),
-            questions: None,
-            pending_count: 0,
-            reason: crate::daemon::proto::InterruptRaiseReason::Initial,
-        };
-        let payload = attention_payload_for_event(&event, &ctx, "instance-1").unwrap();
-        assert_eq!(payload["kind"], "approval");
-        assert_eq!(payload["description"], "Approval needed");
+        let event = interrupt_event(test_session_id(&ctx), true);
+        let payload = attention_payload_for_test(&event, &ctx);
+        assert_eq!(payload["eventType"], "APPROVAL_NEEDED");
+        assert_eq!(payload["fixedStringTitle"], "Approval needed");
+        assert_eq!(
+            payload["fixedStringBody"],
+            "Open the session to review the request."
+        );
         let serialized = payload.to_string();
         assert!(!serialized.contains("DO_NOT_FORWARD_USER_TEXT"));
         assert!(!serialized.contains("run secret command"));
+    }
+
+    #[test]
+    fn attention_payload_matches_control_fixture() {
+        let (_tmp, ctx) = test_context();
+        let event = interrupt_event(test_session_id(&ctx), true);
+        let frame = attention_frame_for_event_with_meta(
+            &event,
+            &ctx,
+            "evt-1".to_string(),
+            "2026-07-10T00:00:00.000Z".to_string(),
+        )
+        .unwrap();
+        let OutboundFrame::Control { event, payload } = frame else {
+            panic!("attention emits a control frame");
+        };
+        let actual = serde_json::to_value(daemon_control_frame(event, payload)).unwrap();
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/relay-protocol/fixtures/daemon-control-relay-frame.json");
+        let fixture: Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture_path).unwrap()).unwrap();
+        let actual_payload = actual["payload"].as_object().unwrap();
+        let fixture_payload = fixture["payload"].as_object().unwrap();
+
+        assert_eq!(actual["v"], fixture["v"]);
+        assert_eq!(actual["to"], fixture["to"]);
+        assert_eq!(actual["event"], fixture["event"]);
+        assert_eq!(
+            actual_payload
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            fixture_payload
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        for key in ["eventType", "fixedStringTitle", "fixedStringBody"] {
+            assert_eq!(actual["payload"][key], fixture["payload"][key]);
+        }
     }
 
     #[test]

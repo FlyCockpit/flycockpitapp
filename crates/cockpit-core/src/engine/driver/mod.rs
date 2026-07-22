@@ -562,6 +562,10 @@ pub struct Driver {
     /// every turn start, so identical config errors warn every time but produce
     /// only one transcript notice until a success clears the dedupe key.
     active_model_refresh_failure_notice: Option<String>,
+    /// Last active tool-surface refresh failure surfaced to the user. Kept
+    /// separate from model refresh so one recurring failure cannot suppress
+    /// the other's first transcript notice.
+    active_tool_surface_refresh_failure_notice: Option<String>,
     active_model_state_generation: u64,
     current_lifecycle_turn_id: Option<String>,
     /// Cancellation handle for the in-flight user-message run (ctrl+c →
@@ -1165,6 +1169,9 @@ impl Driver {
             delegation_recursion_override: self.delegation_recursion_override,
             preflight_guard_logged: self.preflight_guard_logged,
             active_model_refresh_failure_notice: self.active_model_refresh_failure_notice.clone(),
+            active_tool_surface_refresh_failure_notice: self
+                .active_tool_surface_refresh_failure_notice
+                .clone(),
             active_model_state_generation: self.active_model_state_generation,
             current_lifecycle_turn_id: self.current_lifecycle_turn_id.clone(),
             cancel_current: self.cancel_current.clone(),
@@ -1466,6 +1473,7 @@ impl Driver {
             delegation_recursion_override: None,
             preflight_guard_logged: false,
             active_model_refresh_failure_notice: None,
+            active_tool_surface_refresh_failure_notice: None,
             active_model_state_generation: 0,
             current_lifecycle_turn_id: None,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
@@ -1563,26 +1571,45 @@ impl Driver {
         }
     }
 
-    /// Refresh the root primary model from layered config at the start of each
-    /// turn. Only the root frame is rebuilt: deeper interactive frames, tandem
-    /// models, and `model_override` intentionally keep their build-time model
-    /// identity for their lifetime so running work does not change capability
-    /// or cost underneath it. The live safety subset for those pinned models
-    /// remains refreshed elsewhere (`trusted_only`, redaction, and wire API).
-    async fn refresh_active_model_for_turn(&mut self, tx: &mpsc::Sender<TurnEvent>) {
-        let Some(root_frame) = self.stack.first() else {
+    fn active_frame_index(&self) -> Option<usize> {
+        self.stack.len().checked_sub(1)
+    }
+
+    /// Refresh the frame that is actually running at the start of each turn.
+    ///
+    /// The model binding and the tool surface are refreshed as separate steps.
+    /// The model step re-resolves the active frame's current provider/model
+    /// pair from layered config without changing the frame's pinned identity.
+    /// The tool-surface step then reloads the same active agent name so live
+    /// config and custom subagent files update the `task` schema every turn.
+    /// Parked parent frames, tandem models, and `model_override` remain pinned.
+    async fn refresh_active_frame_for_turn(&mut self, tx: &mpsc::Sender<TurnEvent>) {
+        let Some(active_idx) = self.active_frame_index() else {
             return;
         };
-        let running = root_frame.agent.model.clone();
+        self.schedule
+            .set_agent(self.stack[active_idx].agent.clone());
+        self.refresh_active_model_for_turn(active_idx, tx).await;
+        self.refresh_active_tool_surface_for_turn(active_idx, tx)
+            .await;
+    }
+
+    async fn refresh_active_model_for_turn(
+        &mut self,
+        active_idx: usize,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        let running = self.stack[active_idx].agent.model.clone();
         let provider = running.provider_id().to_string();
         let model = running.model_id_ref().to_string();
-        let old_llm_mode = root_frame.agent.llm_mode;
+        let old_llm_mode = self.stack[active_idx].agent.llm_mode;
         match self.build_live_model_for_running(&running, &provider, &model) {
             Ok(new_model) => {
                 let llm_mode = self.effective_llm_mode_for(&provider, &model);
-                let rebuilt = self.rebuild_frame_with_model(0, Arc::new(new_model), llm_mode);
-                self.stack[0].agent = Arc::new(rebuilt);
-                self.schedule.set_agent(self.stack[0].agent.clone());
+                let refreshed = self.replace_frame_model(active_idx, Arc::new(new_model), llm_mode);
+                self.stack[active_idx].agent = Arc::new(refreshed);
+                self.schedule
+                    .set_agent(self.stack[active_idx].agent.clone());
                 if old_llm_mode != llm_mode {
                     let _ = tx.send(TurnEvent::LlmModeChanged { mode: llm_mode }).await;
                 }
@@ -1606,6 +1633,52 @@ impl Driver {
                         })
                         .await;
                     self.active_model_refresh_failure_notice = Some(notice);
+                }
+            }
+        }
+    }
+
+    async fn refresh_active_tool_surface_for_turn(
+        &mut self,
+        active_idx: usize,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        let model = self.stack[active_idx].agent.model.clone();
+        let llm_mode = self.stack[active_idx].agent.llm_mode;
+        match self.try_rebuild_frame_with_model(active_idx, model.clone(), llm_mode) {
+            Ok(rebuilt) => {
+                self.stack[active_idx].agent = Arc::new(rebuilt);
+                self.schedule
+                    .set_agent(self.stack[active_idx].agent.clone());
+                self.active_tool_surface_refresh_failure_notice = None;
+            }
+            Err(e) if active_idx == 0 => {
+                tracing::warn!(error = %e, "refreshing root tool surface from config fell back to default Build");
+                let rebuilt = self.rebuild_frame_with_model(active_idx, model, llm_mode);
+                self.stack[active_idx].agent = Arc::new(rebuilt);
+                self.schedule
+                    .set_agent(self.stack[active_idx].agent.clone());
+                self.active_tool_surface_refresh_failure_notice = None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %self.stack[active_idx].agent.name,
+                    error = %e,
+                    "refreshing active tool surface from config failed"
+                );
+                let notice = format!(
+                    "Refreshing this agent's tool surface from config failed — {e:#}. \
+                     Keeping the previous tool surface."
+                );
+                if self.active_tool_surface_refresh_failure_notice.as_deref()
+                    != Some(notice.as_str())
+                {
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: notice.clone(),
+                        })
+                        .await;
+                    self.active_tool_surface_refresh_failure_notice = Some(notice);
                 }
             }
         }
@@ -2424,7 +2497,7 @@ impl Driver {
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
         self.reset_delegation_retry_budget();
         self.refresh_redaction_table_for_turn(tx).await;
-        self.refresh_active_model_for_turn(tx).await;
+        self.refresh_active_frame_for_turn(tx).await;
         self.refresh_wire_api_for_turn();
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel_guard = {
@@ -3954,16 +4027,35 @@ impl Driver {
     /// model with different reasoning controls sends the right vendor params (and
     /// drops a prior model's params that the new one would reject — priority #1),
     /// while the session-scoped `prompt_cache_key` is carried across unchanged.
-    fn rebuild_frame_with_model(
+    fn replace_frame_model(
         &self,
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
         llm_mode: crate::config::extended::LlmMode,
     ) -> Agent {
-        let name = self.stack[frame_idx].agent.name.clone();
+        let mut refreshed = (*self.stack[frame_idx].agent).clone();
         // Re-resolve the new model's reasoning params from the (freshly-written)
         // config's active-model thinking mode; fall back to none when the config
         // can't be read or no mode is selected.
+        let additional_params = self.resolve_thinking_params_for(&new_model);
+        refreshed.model = new_model;
+        refreshed.llm_mode = llm_mode;
+        refreshed.params = crate::engine::model::ModelParams {
+            additional_params,
+            // The cache key is the session id — model-agnostic, carried across.
+            prompt_cache_key: self.stack[frame_idx].agent.params.prompt_cache_key.clone(),
+            ..crate::engine::model::ModelParams::default()
+        };
+        refreshed
+    }
+
+    fn rebuild_frame_args(
+        &self,
+        frame_idx: usize,
+        new_model: Arc<crate::engine::model::Model>,
+        llm_mode: crate::config::extended::LlmMode,
+    ) -> (String, crate::engine::builtin::SpawnArgs) {
+        let name = self.stack[frame_idx].agent.name.clone();
         let additional_params = self.resolve_thinking_params_for(&new_model);
         // Every frame on `self.stack` is foreground/user-facing: index 0 is the
         // root primary, and deeper frames are interactive subagents. One-shot
@@ -3980,6 +4072,26 @@ impl Driver {
             prompt_cache_key: self.stack[frame_idx].agent.params.prompt_cache_key.clone(),
             ..crate::engine::model::ModelParams::default()
         };
+        (name, args)
+    }
+
+    fn try_rebuild_frame_with_model(
+        &self,
+        frame_idx: usize,
+        new_model: Arc<crate::engine::model::Model>,
+        llm_mode: crate::config::extended::LlmMode,
+    ) -> Result<Agent> {
+        let (name, args) = self.rebuild_frame_args(frame_idx, new_model, llm_mode);
+        crate::engine::builtin::load(&name, &args)
+    }
+
+    fn rebuild_frame_with_model(
+        &self,
+        frame_idx: usize,
+        new_model: Arc<crate::engine::model::Model>,
+        llm_mode: crate::config::extended::LlmMode,
+    ) -> Agent {
+        let (name, args) = self.rebuild_frame_args(frame_idx, new_model, llm_mode);
         // `builtin::load` honors a user override of a bundled primary; fall back
         // to the same agent name's default build on a load failure so the swap
         // never strands the session without a primary.
@@ -5021,7 +5133,7 @@ impl Driver {
         self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
         self.reset_delegation_retry_budget();
         self.refresh_redaction_table_for_turn(tx).await;
-        self.refresh_active_model_for_turn(tx).await;
+        self.refresh_active_frame_for_turn(tx).await;
         self.refresh_wire_api_for_turn();
         // Pasted image parts (vision models only) ride alongside the text
         // through every text-only step below (titling, skills, seed,

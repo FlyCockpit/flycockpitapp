@@ -331,6 +331,13 @@ fn learn_driver(
         .unwrap(),
     )
     .unwrap();
+    let agents_dir = config_dir.join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    std::fs::write(
+        agents_dir.join("Build.md"),
+        "---\ndescription: Learn test primary\nmode: primary\ntools: [skill_manage, mcp]\ntoolTiers:\n  skill_manage: builtin\n---\n\nAuthor reusable skills from verified evidence.\n",
+    )
+    .unwrap();
 
     let (provider_url, requests) =
         scripted_learn_provider(learn_tool_args(skill_name), request_count);

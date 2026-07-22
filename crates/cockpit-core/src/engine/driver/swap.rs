@@ -37,7 +37,9 @@ impl Driver {
         };
         let old_session_provider = self.session.active_provider();
         let old_session_model = self.session.active_model();
-        let active_idx = 0;
+        let Some(active_idx) = self.active_frame_index() else {
+            return;
+        };
         let current = &self.stack[active_idx].agent.model;
         let old_llm_mode = self.stack[active_idx].agent.llm_mode;
         if current.provider_id() == provider && current.model_id_ref() == model {
@@ -82,7 +84,35 @@ impl Driver {
             }
         };
         let llm_mode = self.effective_llm_mode_for(provider, model);
-        let rebuilt = Arc::new(self.rebuild_frame_with_model(active_idx, new_model, llm_mode));
+        let rebuilt =
+            match self.try_rebuild_frame_with_model(active_idx, new_model.clone(), llm_mode) {
+                Ok(agent) => Arc::new(agent),
+                Err(_) if active_idx == 0 => {
+                    Arc::new(self.rebuild_frame_with_model(active_idx, new_model, llm_mode))
+                }
+                Err(e) => {
+                    let error = format!("{e:#}");
+                    self.record_model_switch_audit(crate::session::ModelSwitchAudit {
+                        from_provider: old_session_provider.as_deref(),
+                        from_model: old_session_model.as_deref(),
+                        to_provider: provider,
+                        to_model: model,
+                        trigger,
+                        outcome: crate::session::ModelSwitchOutcome::BuildFailed,
+                        error: Some(&error),
+                    });
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: format!(
+                                "Model switch to `{provider}/{model}` failed — {error}. \
+                             Keeping the current model active."
+                            ),
+                        })
+                        .await;
+                    self.emit_active_model_state(tx).await;
+                    return;
+                }
+            };
         if let Err(e) = self.persist_active_model_session(provider, model) {
             let error = format!("{e:#}");
             self.session
@@ -180,9 +210,8 @@ impl Driver {
             error: None,
         });
         self.stack[active_idx].agent = rebuilt;
-        // The job authority's fork context is rooted on the root agent;
-        // rebind it when the root model changes.
-        self.schedule.set_agent(self.stack[0].agent.clone());
+        self.schedule
+            .set_agent(self.stack[active_idx].agent.clone());
         if old_llm_mode != llm_mode {
             let _ = tx.send(TurnEvent::LlmModeChanged { mode: llm_mode }).await;
         }
@@ -206,10 +235,7 @@ impl Driver {
         &self,
         active: &crate::config::providers::ActiveModelRef,
     ) -> Result<crate::engine::model::Model> {
-        let running = self
-            .stack
-            .first()
-            .expect("stack never empty")
+        let running = self.stack[self.active_frame_index().expect("stack never empty")]
             .agent
             .model
             .clone();

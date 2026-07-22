@@ -742,6 +742,11 @@ impl ScheduleAuthority {
     pub fn set_agent(&mut self, agent: Arc<Agent>) {
         self.ctx.agent = agent;
     }
+
+    #[cfg(test)]
+    pub(crate) fn agent_name_for_tests(&self) -> &str {
+        &self.ctx.agent.name
+    }
 }
 
 /// Short random scheduled-task id (`sched-xxxxxxxx`). Human-typable in

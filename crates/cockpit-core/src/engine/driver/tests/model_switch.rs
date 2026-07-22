@@ -228,10 +228,10 @@ async fn live_model_switch_commits_config_and_session_together() {
     drain_until_active_model_state(&mut rx);
 }
 
-/// A switch requested while a child frame is foregrounded is applied to the
-/// root primary and never to the transient child frame.
+/// A switch requested while a child frame is foregrounded is applied to that
+/// active frame and never to the parked root frame.
 #[tokio::test]
-async fn live_model_switch_from_subagent_frame_applies_to_root() {
+async fn live_model_switch_from_subagent_frame_applies_to_active_child() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     push_test_child(&mut driver, Vec::new());
@@ -249,10 +249,10 @@ async fn live_model_switch_from_subagent_frame_applies_to_root() {
         )
         .await;
 
-    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
-    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
-    assert_eq!(driver.stack[1].agent.model.provider_id(), "provider-a");
-    assert_eq!(driver.stack[1].agent.model.model_id_ref(), "model-a");
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+    assert_eq!(driver.stack[1].agent.model.provider_id(), "provider-b");
+    assert_eq!(driver.stack[1].agent.model.model_id_ref(), "model-b");
     assert_eq!(
         driver.session.active_provider().as_deref(),
         Some("provider-b")
@@ -707,6 +707,406 @@ fn assert_disk_config_active_model(root: &std::path::Path, provider: &str, model
     assert_eq!(active.model, model);
 }
 
+fn write_custom_agent(root: &std::path::Path, name: &str) {
+    let agents = root.join(".cockpit/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join(format!("{name}.md")),
+        format!(
+            "---\ndescription: test agent\nmode: subagent\ntools: [read]\n---\n\n{name} body\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn write_malformed_agent_override(root: &std::path::Path, name: &str) {
+    let agents = root.join(".cockpit/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join(format!("{name}.md")),
+        "---\nmode: subagent\n---\nmissing description\n",
+    )
+    .unwrap();
+}
+
+fn remove_agent_override(root: &std::path::Path, name: &str) {
+    let path = root.join(".cockpit/agents").join(format!("{name}.md"));
+    if path.exists() {
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+fn tool_definitions_value(agent: &crate::engine::agent::Agent) -> serde_json::Value {
+    serde_json::to_value(agent.tools.definitions(agent.llm_mode)).unwrap()
+}
+
+fn task_definition_mentions_agent(agent: &crate::engine::agent::Agent, name: &str) -> bool {
+    agent
+        .tools
+        .definitions(agent.llm_mode)
+        .into_iter()
+        .find(|definition| definition.name == "task")
+        .map(|definition| serde_json::to_string(&definition).unwrap().contains(name))
+        .unwrap_or(false)
+}
+
+fn push_named_test_child(driver: &mut Driver, name: &str) {
+    let mut args = driver.spawn_args(true);
+    args.model = driver.stack[0].agent.model.clone();
+    let agent = Arc::new(crate::engine::builtin::load(name, &args).unwrap());
+    push_test_child(driver, Vec::new());
+    let depth = driver.stack.len() - 1;
+    let child = driver.stack.last_mut().unwrap();
+    child.queue_target =
+        crate::engine::message::QueueTarget::child(name.to_string(), depth, "test", "default");
+    child.agent = agent;
+}
+
+fn drain_notices(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<String> {
+    let mut notices = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let TurnEvent::Notice { text } = event {
+            notices.push(text);
+        }
+    }
+    notices
+}
+
+#[tokio::test]
+async fn active_frame_refresh_rebuilds_top_frame_not_root() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    push_test_child(&mut driver, Vec::new());
+    let root_before = Arc::as_ptr(&driver.stack[0].agent);
+    let child_before = Arc::as_ptr(&driver.stack.last().unwrap().agent);
+
+    driver.refresh_active_frame_for_turn(&tx).await;
+
+    assert_eq!(
+        Arc::as_ptr(&driver.stack[0].agent),
+        root_before,
+        "root frame must not be rebuilt while a child frame is active"
+    );
+    assert_ne!(
+        Arc::as_ptr(&driver.stack.last().unwrap().agent),
+        child_before,
+        "active child frame must be rebuilt"
+    );
+}
+
+#[tokio::test]
+async fn active_frame_refresh_root_only_stack_is_unchanged_behavior() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let before = driver.stack[0].agent.clone();
+
+    driver.refresh_active_frame_for_turn(&tx).await;
+
+    let after = &driver.stack[0].agent;
+    assert_eq!(after.name, before.name);
+    assert_eq!(after.model.provider_id(), before.model.provider_id());
+    assert_eq!(after.model.model_id_ref(), before.model.model_id_ref());
+    assert_eq!(
+        after.params.prompt_cache_key,
+        before.params.prompt_cache_key
+    );
+}
+
+#[tokio::test]
+async fn active_frame_refresh_picks_up_new_custom_agent_in_subagent_frame() {
+    let (mut driver, tmp) = model_switch_driver_with_disk_config();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    push_test_child(&mut driver, Vec::new());
+    let custom = "active-frame-helper";
+    assert!(
+        !task_definition_mentions_agent(driver.stack.last().unwrap().agent.as_ref(), custom),
+        "custom agent should not be present before its file exists"
+    );
+
+    write_custom_agent(tmp.path(), custom);
+    driver.refresh_active_frame_for_turn(&tx).await;
+
+    assert!(
+        task_definition_mentions_agent(driver.stack.last().unwrap().agent.as_ref(), custom),
+        "active child task schema should include the new custom agent after refresh"
+    );
+    assert!(
+        !task_definition_mentions_agent(driver.stack[0].agent.as_ref(), custom),
+        "parked root task schema should not be rebuilt while the child is active"
+    );
+}
+
+#[tokio::test]
+async fn active_frame_refresh_is_byte_identical_when_config_unchanged() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    push_test_child(&mut driver, Vec::new());
+    let before = tool_definitions_value(driver.stack.last().unwrap().agent.as_ref());
+
+    driver.refresh_active_frame_for_turn(&tx).await;
+    let after = tool_definitions_value(driver.stack.last().unwrap().agent.as_ref());
+
+    assert_eq!(
+        after, before,
+        "deterministic active-frame refresh must leave the serialized tool surface unchanged"
+    );
+}
+
+#[tokio::test]
+async fn active_frame_tool_surface_refresh_survives_model_build_failure() {
+    let (mut driver, tmp) = model_switch_driver_with_disk_config();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    push_test_child(&mut driver, Vec::new());
+    let custom = "model-failure-helper";
+    write_custom_agent(tmp.path(), custom);
+    driver.test_providers_override = Some((
+        crate::config::providers::ProvidersConfig::default(),
+        "provider-a".into(),
+        "model-a".into(),
+    ));
+
+    driver.refresh_active_frame_for_turn(&tx).await;
+
+    let notices = drain_notices(&mut rx);
+    assert!(
+        notices
+            .iter()
+            .any(|text| text.contains("Refreshing the active model from config failed")),
+        "model refresh failure must emit its existing notice: {notices:?}"
+    );
+    assert!(
+        task_definition_mentions_agent(driver.stack.last().unwrap().agent.as_ref(), custom),
+        "tool surface should still pick up the custom agent when model rebuild fails"
+    );
+}
+
+#[tokio::test]
+async fn active_frame_tool_surface_refresh_failure_emits_its_own_notice() {
+    let (mut driver, tmp) = model_switch_driver_with_disk_config();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    push_named_test_child(&mut driver, "builder");
+    let active_idx = driver.stack.len() - 1;
+    let before = Arc::as_ptr(&driver.stack[active_idx].agent);
+    write_malformed_agent_override(tmp.path(), "builder");
+
+    driver
+        .refresh_active_tool_surface_for_turn(active_idx, &tx)
+        .await;
+
+    assert_eq!(
+        Arc::as_ptr(&driver.stack[active_idx].agent),
+        before,
+        "non-root tool-surface failure must retain the previous agent"
+    );
+    let notices = drain_notices(&mut rx);
+    assert_eq!(notices.len(), 1, "expected one tool-surface notice");
+    assert!(
+        notices[0].contains("tool surface")
+            && notices[0].contains("Keeping the previous tool surface"),
+        "unexpected notice: {}",
+        notices[0]
+    );
+    assert_eq!(
+        driver.stack[active_idx].agent.name, "builder",
+        "non-root failure must not fall back to the default Build primary"
+    );
+}
+
+#[tokio::test]
+async fn active_frame_refresh_notices_dedupe_independently() {
+    let (mut driver, tmp) = model_switch_driver_with_disk_config();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    push_named_test_child(&mut driver, "builder");
+    write_malformed_agent_override(tmp.path(), "builder");
+    driver.test_providers_override = Some((
+        crate::config::providers::ProvidersConfig::default(),
+        "provider-a".into(),
+        "model-a".into(),
+    ));
+
+    driver.refresh_active_frame_for_turn(&tx).await;
+    let notices = drain_notices(&mut rx);
+    assert_eq!(
+        notices.len(),
+        2,
+        "both independent failures should report once"
+    );
+    assert!(notices.iter().any(|text| text.contains("active model")));
+    assert!(notices.iter().any(|text| text.contains("tool surface")));
+
+    driver.refresh_active_frame_for_turn(&tx).await;
+    assert!(
+        drain_notices(&mut rx).is_empty(),
+        "identical recurring failures should dedupe independently"
+    );
+
+    remove_agent_override(tmp.path(), "builder");
+    driver.test_providers_override = Some((
+        two_model_providers_config(),
+        "provider-a".into(),
+        "model-a".into(),
+    ));
+    driver.refresh_active_frame_for_turn(&tx).await;
+    assert!(
+        drain_notices(&mut rx).is_empty(),
+        "successful refresh clears both dedupe slots without a notice"
+    );
+
+    write_malformed_agent_override(tmp.path(), "builder");
+    driver.refresh_active_frame_for_turn(&tx).await;
+    let notices = drain_notices(&mut rx);
+    assert_eq!(
+        notices.len(),
+        1,
+        "only the reintroduced failure should notify"
+    );
+    assert!(
+        notices[0].contains("tool surface"),
+        "unexpected notice: {}",
+        notices[0]
+    );
+}
+
+#[tokio::test]
+async fn active_frame_refresh_updates_schedule_agent() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    push_named_test_child(&mut driver, "builder");
+
+    driver.refresh_active_frame_for_turn(&tx).await;
+
+    assert_eq!(driver.schedule.agent_name_for_tests(), "builder");
+}
+
+#[tokio::test]
+async fn active_frame_refresh_updates_schedule_when_tool_surface_fails() {
+    let (mut driver, tmp) = model_switch_driver_with_disk_config();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    push_named_test_child(&mut driver, "builder");
+    write_malformed_agent_override(tmp.path(), "builder");
+
+    driver.refresh_active_frame_for_turn(&tx).await;
+
+    assert_eq!(driver.schedule.agent_name_for_tests(), "builder");
+    assert!(
+        drain_notices(&mut rx)
+            .iter()
+            .any(|notice| notice.contains("tool surface")),
+        "tool-surface failure should still be surfaced"
+    );
+}
+
+#[tokio::test]
+async fn active_frame_refresh_updates_schedule_when_both_refreshes_fail() {
+    let (mut driver, tmp) = model_switch_driver_with_disk_config();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    push_named_test_child(&mut driver, "builder");
+    write_malformed_agent_override(tmp.path(), "builder");
+    driver.test_providers_override = Some((
+        crate::config::providers::ProvidersConfig::default(),
+        "provider-a".into(),
+        "model-a".into(),
+    ));
+
+    driver.refresh_active_frame_for_turn(&tx).await;
+
+    assert_eq!(driver.schedule.agent_name_for_tests(), "builder");
+    let notices = drain_notices(&mut rx);
+    assert!(
+        notices.iter().any(|notice| notice.contains("active model")),
+        "model refresh failure should be surfaced: {notices:?}"
+    );
+    assert!(
+        notices.iter().any(|notice| notice.contains("tool surface")),
+        "tool-surface failure should be surfaced: {notices:?}"
+    );
+}
+
+#[tokio::test]
+async fn model_switch_inside_subagent_frame_rebuilds_that_frame() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    push_named_test_child(&mut driver, "builder");
+    let root_before = Arc::as_ptr(&driver.stack[0].agent);
+    let child_before = Arc::as_ptr(&driver.stack.last().unwrap().agent);
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(
+        Arc::as_ptr(&driver.stack[0].agent),
+        root_before,
+        "explicit switch inside a subagent must leave the root frame untouched"
+    );
+    assert_ne!(
+        Arc::as_ptr(&driver.stack.last().unwrap().agent),
+        child_before,
+        "explicit switch inside a subagent must rebuild the child frame"
+    );
+    let child = driver.stack.last().unwrap();
+    assert_eq!(child.agent.name, "builder");
+    assert_eq!(child.agent.model.provider_id(), "provider-b");
+    assert_eq!(child.agent.model.model_id_ref(), "model-b");
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+}
+
+#[tokio::test]
+async fn model_switch_inside_subagent_frame_rebuild_failure_keeps_child() {
+    let (mut driver, tmp) = model_switch_driver_with_disk_config();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    push_named_test_child(&mut driver, "builder");
+    let root_before = Arc::as_ptr(&driver.stack[0].agent);
+    let child_before = Arc::as_ptr(&driver.stack.last().unwrap().agent);
+    write_malformed_agent_override(tmp.path(), "builder");
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(Arc::as_ptr(&driver.stack[0].agent), root_before);
+    assert_eq!(
+        Arc::as_ptr(&driver.stack.last().unwrap().agent),
+        child_before
+    );
+    assert_eq!(driver.stack.last().unwrap().agent.name, "builder");
+    assert_eq!(
+        driver.stack.last().unwrap().agent.model.provider_id(),
+        "provider-a"
+    );
+    assert_eq!(
+        driver.stack.last().unwrap().agent.model.model_id_ref(),
+        "model-a"
+    );
+    let notices = drain_notices(&mut rx);
+    assert!(
+        notices.iter().any(|notice| {
+            notice.contains("Model switch to `provider-b/model-b` failed")
+                && notice.contains("Keeping the current model active")
+        }),
+        "model switch rebuild failure should be surfaced: {notices:?}"
+    );
+}
+
 #[test]
 fn refresh_rebuild_inherits_wire_state_only_for_same_identity() {
     use crate::config::providers::WireApi;
@@ -745,7 +1145,7 @@ async fn refresh_preserves_confirmed_endpoint_without_probe_cache() {
         .model
         .confirm_wire_api_for_base_url("http://localhost:1/v1", WireApi::Responses);
 
-    driver.refresh_active_model_for_turn(&tx).await;
+    driver.refresh_active_frame_for_turn(&tx).await;
 
     let refreshed = &driver.stack[0].agent.model;
     assert_eq!(
@@ -782,7 +1182,7 @@ async fn explicit_config_endpoint_beats_stale_confirmation_after_refresh() {
         .expect("provider-a exists")
         .wire_api = WireApi::Completions;
 
-    driver.refresh_active_model_for_turn(&tx).await;
+    driver.refresh_active_frame_for_turn(&tx).await;
 
     let refreshed = &driver.stack[0].agent.model;
     assert_eq!(
@@ -814,7 +1214,7 @@ async fn refresh_failure_is_loud_and_deduped() {
         "model-a".into(),
     ));
 
-    driver.refresh_active_model_for_turn(&tx).await;
+    driver.refresh_active_frame_for_turn(&tx).await;
     assert_eq!(
         Arc::as_ptr(&driver.stack[0].agent.model),
         before,
@@ -837,7 +1237,7 @@ async fn refresh_failure_is_loud_and_deduped() {
         other => panic!("expected a Notice, got {other:?}"),
     }
 
-    driver.refresh_active_model_for_turn(&tx).await;
+    driver.refresh_active_frame_for_turn(&tx).await;
     assert!(
         rx.try_recv().is_err(),
         "identical consecutive refresh failures should dedupe notices"
@@ -848,7 +1248,7 @@ async fn refresh_failure_is_loud_and_deduped() {
         "provider-a".into(),
         "model-a".into(),
     ));
-    driver.refresh_active_model_for_turn(&tx).await;
+    driver.refresh_active_frame_for_turn(&tx).await;
     assert!(
         rx.try_recv().is_err(),
         "successful refresh should not emit a notice"
@@ -859,7 +1259,7 @@ async fn refresh_failure_is_loud_and_deduped() {
         "provider-a".into(),
         "model-a".into(),
     ));
-    driver.refresh_active_model_for_turn(&tx).await;
+    driver.refresh_active_frame_for_turn(&tx).await;
     rx.try_recv()
         .expect("success clears the dedupe key so the next failure re-notifies");
 }

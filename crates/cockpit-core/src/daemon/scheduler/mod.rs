@@ -506,7 +506,7 @@ impl DaemonScheduler {
                 &current.schedule,
                 finished_at,
                 Some(finished_at),
-                finished_at,
+                current.created_at,
                 self.last_user_activity(),
                 current.missed_run_policy,
                 None,
@@ -1261,6 +1261,22 @@ mod tests {
         }
     }
 
+    struct AdvancingFailingExecutor {
+        runs: AtomicUsize,
+        clock: Arc<ManualClock>,
+        advance_seconds: i64,
+    }
+
+    #[async_trait]
+    impl JobExecutor for AdvancingFailingExecutor {
+        async fn execute(&self, _job: ScheduledJob) -> Result<String> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let now = self.clock.now();
+            self.clock.set(now.saturating_add(self.advance_seconds));
+            bail!("advanced failure");
+        }
+    }
+
     struct GatedExecutor {
         started: std::sync::Mutex<Vec<String>>,
         active: AtomicUsize,
@@ -2009,6 +2025,41 @@ mod tests {
         assert_eq!(result.finished_at, 1_150);
         assert_eq!(job.last_run_at, Some(1_150));
         assert_eq!(job.next_run_at, Some(1_210));
+    }
+
+    #[tokio::test]
+    async fn next_run_and_backoff_both_anchored_at_completion_on_failed_long_run() {
+        let db = Db::open_in_memory().unwrap();
+        let clock = ManualClock::new(1_000);
+        let executor = Arc::new(AdvancingFailingExecutor {
+            runs: AtomicUsize::new(0),
+            clock: clock.clone(),
+            advance_seconds: 90,
+        });
+        let scheduler =
+            DaemonScheduler::with_jitter(db, clock.clone(), executor.clone(), Arc::new(ZeroJitter));
+        scheduler
+            .create_job(callback_job(
+                "job-slow-fail",
+                ScheduledJobSchedule::Every { seconds: 60 },
+            ))
+            .unwrap();
+
+        clock.set(1_060);
+        scheduler.run_due_once().await.unwrap();
+        let job = wait_for_job_result(&scheduler, "job-slow-fail").await;
+        let result = job.last_result.expect("slow failure result");
+        let expected_backoff = 1_150 + backoff_seconds(1, &ZeroJitter);
+
+        assert_eq!(executor.runs.load(Ordering::SeqCst), 1);
+        assert_eq!(job.failure_count, 1);
+        assert!(job.enabled);
+        assert!(!result.ok);
+        assert_eq!(result.finished_at, 1_150);
+        assert_eq!(job.last_run_at, Some(1_150));
+        assert_eq!(job.next_run_at, Some(1_210));
+        assert_eq!(job.backoff_until, Some(expected_backoff));
+        assert!(expected_backoff > 1_150);
     }
 
     #[tokio::test]

@@ -318,9 +318,17 @@ fn toolbox_with_retrieval_if_needed(
 }
 
 fn truncated_tool_result_is_retrievable(tool: &str) -> bool {
+    // Retrieve tools page stored results; storing their own truncated pages
+    // would mint a fresh hash for each continuation.
     !matches!(
         tool,
-        "read" | "readlock" | "writeunlock" | "editunlock" | "unlock"
+        "read"
+            | "readlock"
+            | "writeunlock"
+            | "editunlock"
+            | "unlock"
+            | "tool_result_retrieve"
+            | "delegation_payload_retrieve"
     )
 }
 
@@ -403,8 +411,9 @@ pub(crate) fn maybe_store_retrievable_truncated_tool_result(
 
     let hash = store_truncated_tool_result(session, agent_id, tool, call_id, retained)?;
     let partial = if retained.partial { " partial" } else { "" };
+    let lines = retained.content.lines().count();
     delivered_body.push_str(&format!(
-        "\n[truncated{partial} tool result: tool={tool} delivered_bytes={} stored_bytes={} original_bytes={} hash={hash} retrieve with tool_result_retrieve]\n",
+        "\n[truncated{partial} tool result: tool={tool} delivered_bytes={} stored_bytes={} original_bytes={} lines={lines} hash={hash} retrieve with tool_result_retrieve]\n",
         delivered_body.len(),
         retained.content.len(),
         retained.original_byte_len,
@@ -1207,6 +1216,53 @@ mod compressed_tool_result_tests {
             .names()
             .contains(&"tool_result_retrieve")
         );
+    }
+
+    #[test]
+    fn truncated_marker_reports_line_count() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        let mut delivered = "visible line\n[truncated]\n".to_string();
+        let retained = crate::engine::tool::RetainedTruncatedOutput {
+            content: "visible line\nhidden line\nlast line\n".to_string(),
+            original_byte_len: "visible line\nhidden line\nlast line\n".len(),
+            partial: false,
+        };
+
+        let stored = maybe_store_retrievable_truncated_tool_result(
+            &session,
+            "Build",
+            "bash",
+            "call-1",
+            &mut delivered,
+            Some(&retained),
+            false,
+        )
+        .unwrap();
+
+        assert!(stored.is_some());
+        assert!(delivered.contains("[truncated tool result: tool=bash"));
+        assert!(delivered.contains("lines=3"));
+        assert!(delivered.contains("retrieve with tool_result_retrieve"));
+    }
+
+    #[test]
+    fn retrieve_tools_are_not_retrievable() {
+        for tool in [
+            "read",
+            "readlock",
+            "writeunlock",
+            "editunlock",
+            "unlock",
+            "tool_result_retrieve",
+            "delegation_payload_retrieve",
+        ] {
+            assert!(
+                !truncated_tool_result_is_retrievable(tool),
+                "{tool} must not store retrievable truncated output"
+            );
+        }
+        assert!(truncated_tool_result_is_retrievable("bash"));
     }
 
     #[test]

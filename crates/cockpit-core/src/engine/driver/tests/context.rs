@@ -1296,7 +1296,7 @@ async fn compact_end_to_end_unchanged() {
     assert_eq!(
         snapshot,
         serde_json::json!({
-            "history_hash": "fee7e7228af0fe49c45870e176573494eb0ef492fe1c5bba120d5f53dc8f9392",
+            "history_hash": "65d18b105ca8eaeeff47dd54350fd23e9ccc86159cb7008f36256ccc091f4cc5",
             "compact_ready": {
                 "brief": "test compact brief",
                 "handoff": "test compact brief\n\n---\n## State appendix (deterministic — runtime ledger)\n\n\n**Files read:**\n- `seed.txt`\n",
@@ -1305,12 +1305,12 @@ async fn compact_end_to_end_unchanged() {
                 "source": "manual",
                 "tail_kept": 2,
                 "tail_trimmed": 0,
-                "tokens_after": 2265,
+                "tokens_after": 2268,
                 "tokens_before": 3642,
                 "trigger_ctx_pct": null,
                 "turns_summarized": 0,
             },
-            "session_compacted_hash": "5f2084ca68843b30028c5c425693e386d2855d53a7acfae5e892fa2473c04dcb",
+            "session_compacted_hash": "cdf178122d0b96c3193a3925fa068715fd16ea65f249e1aa1218ead546a7b7c3",
             "seed_tools": [
                 {
                     "args": {

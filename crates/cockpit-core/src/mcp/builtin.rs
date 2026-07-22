@@ -1473,7 +1473,26 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(retrieved.content, full);
+        assert!(retrieved.truncated);
+        assert!(retrieved.content.len() <= crate::tools::common::OUTPUT_BYTE_CAP);
+        assert!(retrieved.content.starts_with("retained-output\n"));
+        assert!(retrieved.content.contains("ask tool_result_retrieve"));
+        let next = retrieved
+            .content
+            .split("start_line=")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .and_then(|line| line.parse::<usize>().ok())
+            .expect("retrieval continuation line");
+        let continued = crate::tools::tool_result_retrieve::ToolResultRetrieveTool
+            .call(
+                serde_json::json!({ "hash": hash, "start_line": next }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(continued.content.starts_with("retained-output\n"));
+        assert!(continued.content.len() < full.len());
     }
 
     #[tokio::test]

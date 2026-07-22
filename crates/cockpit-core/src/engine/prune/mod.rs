@@ -85,10 +85,11 @@ pub fn compressed_tool_result_marker(
     tool: &str,
     original_bytes: usize,
     condensed_bytes: usize,
+    lines: usize,
     hash: &str,
 ) -> String {
     format!(
-        "{COMPRESSED_RESULT_MARKER_PREFIX} tool={tool} original_bytes={original_bytes} condensed_bytes={condensed_bytes} hash={hash} retrieve with tool_result_retrieve]"
+        "{COMPRESSED_RESULT_MARKER_PREFIX} tool={tool} original_bytes={original_bytes} condensed_bytes={condensed_bytes} lines={lines} hash={hash} retrieve with tool_result_retrieve]"
     )
 }
 
@@ -549,6 +550,7 @@ fn apply_condensed_tool_result_direct(
             &candidate.tool,
             candidate.original_body.len(),
             candidate.condensed_body.len(),
+            candidate.original_body.lines().count(),
             hash,
         ),
         candidate.condensed_body
@@ -1099,6 +1101,7 @@ mod tests {
                 "bash",
                 original.len(),
                 expected_condensed.len(),
+                original.lines().count(),
                 "0123456789abcdefabcdef12",
             ),
             expected_condensed
@@ -1513,8 +1516,27 @@ mod tests {
         assert!(body.contains("tool=bash"));
         assert!(body.contains("original_bytes="));
         assert!(body.contains("condensed_bytes="));
+        assert!(body.contains("lines=700"));
         assert!(body.contains("hash=0123456789abcdefabcdef12"));
         assert!(body.contains("[deterministic shell condensation]"));
+    }
+
+    #[test]
+    fn compressed_marker_reports_line_count() {
+        let marker =
+            compressed_tool_result_marker("bash", 1000, 100, 42, "0123456789abcdefabcdef12");
+
+        assert!(marker.contains("lines=42"));
+        assert!(marker.contains("retrieve with tool_result_retrieve"));
+    }
+
+    #[test]
+    fn compressed_marker_with_line_count_is_still_detected() {
+        let marker =
+            compressed_tool_result_marker("bash", 1000, 100, 42, "0123456789abcdefabcdef12");
+
+        assert!(is_compressed_tool_result_marker(&marker));
+        assert!(is_compressed_tool_result_marker_line(&marker));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use super::*;
 /// both messages carry `call_id` and are removed together so history stays
 /// well-formed.
 pub(in crate::engine::driver) struct SkillPair {
-    /// The synthesized `skill` call's id (the `skillslash-…` value shared by
+    /// The synthesized `skill` call's id (the `fc-skillslash-…` value shared by
     /// the assistant ToolCall and its tool_result).
     pub(in crate::engine::driver) call_id: String,
     /// The primary that was active when the skill was invoked. Its swap-out
@@ -330,7 +330,7 @@ impl Driver {
             if !budget.write(&body) {
                 break;
             }
-            let call_id = format!("seed-{}", uuid::Uuid::new_v4());
+            let call_id = seed_tool_call_id();
             let provider_identity =
                 crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
                     &call_id,
@@ -813,7 +813,7 @@ impl Driver {
         }
         let duration_ms = started.elapsed().as_millis() as u64;
 
-        let call_id = format!("skillslash-{}", uuid::Uuid::new_v4());
+        let call_id = skill_slash_call_id();
         let provider_identity = crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
             &call_id,
             Some(agent.model.current_wire_api()),
@@ -947,9 +947,24 @@ impl Driver {
     }
 }
 
+fn seed_tool_call_id() -> String {
+    format!("fc-seed-{}", uuid::Uuid::new_v4())
+}
+
+fn skill_slash_call_id() -> String {
+    format!("fc-skillslash-{}", uuid::Uuid::new_v4())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{seed_tool_call_id, skill_slash_call_id};
     use serde_json::json;
+
+    #[test]
+    fn responses_fc_prefix_mints_are_wire_legal() {
+        assert!(seed_tool_call_id().starts_with("fc-seed-"));
+        assert!(skill_slash_call_id().starts_with("fc-skillslash-"));
+    }
 
     #[test]
     fn seed_label_output_unchanged_except_escaping() {

@@ -730,7 +730,7 @@ async fn abandoned_skill_pair_is_stripped_on_handoff_swap() {
             matches!(m,
             Message::User { content }
                 if content.iter().any(|c| matches!(c,
-                    UserContent::ToolResult(tr) if tr.id.starts_with("skillslash-"))))
+                    UserContent::ToolResult(tr) if tr.id.starts_with("fc-skillslash-"))))
         })
     };
     assert!(

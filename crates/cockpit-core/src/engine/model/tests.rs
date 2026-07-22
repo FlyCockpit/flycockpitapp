@@ -643,10 +643,10 @@ fn redaction_preserves_assistant_tool_call_identity_fields() {
 #[test]
 fn responses_normalization_leaves_complete_pair_unchanged() {
     let mut history = vec![assistant(vec![responses_tool_call(
-        "provider-item",
+        "fc_provider-item",
         Some("provider-call"),
     )])];
-    let mut prompt = tool_result_message("provider-item", Some("provider-call"));
+    let mut prompt = tool_result_message("fc_provider-item", Some("provider-call"));
 
     let records = normalize_responses_tool_call_identity(&mut history, &mut prompt).unwrap();
 
@@ -658,14 +658,14 @@ fn responses_normalization_leaves_complete_pair_unchanged() {
         records,
         vec![
             ResponsesToolIdentityRecord {
-                cockpit_call_id: "provider-item".into(),
-                provider_item_id: "provider-item".into(),
+                cockpit_call_id: "fc_provider-item".into(),
+                provider_item_id: "fc_provider-item".into(),
                 provider_call_id: "provider-call".into(),
                 provider_call_id_source: "provider",
             },
             ResponsesToolIdentityRecord {
-                cockpit_call_id: "provider-item".into(),
-                provider_item_id: "provider-item".into(),
+                cockpit_call_id: "fc_provider-item".into(),
+                provider_item_id: "fc_provider-item".into(),
                 provider_call_id: "provider-call".into(),
                 provider_call_id_source: "provider",
             },
@@ -682,12 +682,128 @@ fn responses_normalization_fills_missing_call_ids_with_provenance() {
 
     let tc = first_assistant_tool_call(&history[0]);
     let tr = first_tool_result(&prompt);
+    assert_eq!(tc.id, "fc-provider-item");
     assert_eq!(tc.call_id.as_deref(), Some("provider-item"));
+    assert_eq!(tr.id, "provider-item");
     assert_eq!(tr.call_id.as_deref(), Some("provider-item"));
     assert!(records.iter().all(|record| {
         record.provider_call_id == "provider-item"
             && record.provider_call_id_source == "normalized_from_assistant_id"
     }));
+}
+
+#[test]
+fn responses_fc_prefix_rewrites_synthetic_item_id() {
+    let mut history = vec![assistant(vec![responses_tool_call(
+        "skillslash-123",
+        Some("provider-call"),
+    )])];
+    let mut prompt = tool_result_message("skillslash-123", Some("provider-call"));
+
+    let records = normalize_responses_tool_call_identity(&mut history, &mut prompt).unwrap();
+
+    let tc = first_assistant_tool_call(&history[0]);
+    let tr = first_tool_result(&prompt);
+    assert_eq!(tc.id, "fc-skillslash-123");
+    assert_eq!(tc.call_id.as_deref(), Some("provider-call"));
+    assert_eq!(tr.id, "skillslash-123");
+    assert_eq!(tr.call_id.as_deref(), Some("provider-call"));
+    assert_eq!(records[0].cockpit_call_id, "skillslash-123");
+    assert_eq!(records[0].provider_item_id, "fc-skillslash-123");
+    assert_eq!(records[0].provider_call_id, "provider-call");
+}
+
+#[test]
+fn responses_fc_prefix_preserves_provider_ids_and_is_idempotent() {
+    let mut history = vec![assistant(vec![responses_tool_call("fc_1", Some("call_1"))])];
+    let mut prompt = tool_result_message("fc_1", Some("call_1"));
+
+    normalize_responses_tool_call_identity(&mut history, &mut prompt).unwrap();
+    let once_tc = first_assistant_tool_call(&history[0]);
+    let once_tr = first_tool_result(&prompt);
+    assert_eq!(once_tc.id, "fc_1");
+    assert_eq!(once_tc.call_id.as_deref(), Some("call_1"));
+    assert_eq!(once_tr.id, "fc_1");
+    assert_eq!(once_tr.call_id.as_deref(), Some("call_1"));
+
+    normalize_responses_tool_call_identity(&mut history, &mut prompt).unwrap();
+    let twice_tc = first_assistant_tool_call(&history[0]);
+    let twice_tr = first_tool_result(&prompt);
+    assert_eq!(twice_tc.id, "fc_1");
+    assert_eq!(twice_tc.call_id.as_deref(), Some("call_1"));
+    assert_eq!(twice_tr.id, "fc_1");
+    assert_eq!(twice_tr.call_id.as_deref(), Some("call_1"));
+
+    let mut rewritten_history = vec![assistant(vec![responses_tool_call("skillslash-old", None)])];
+    let mut rewritten_prompt = tool_result_message("skillslash-old", None);
+    normalize_responses_tool_call_identity(&mut rewritten_history, &mut rewritten_prompt).unwrap();
+    normalize_responses_tool_call_identity(&mut rewritten_history, &mut rewritten_prompt).unwrap();
+    let rewritten_tc = first_assistant_tool_call(&rewritten_history[0]);
+    let rewritten_tr = first_tool_result(&rewritten_prompt);
+    assert_eq!(rewritten_tc.id, "fc-skillslash-old");
+    assert_eq!(rewritten_tc.call_id.as_deref(), Some("skillslash-old"));
+    assert_eq!(rewritten_tr.id, "skillslash-old");
+    assert_eq!(rewritten_tr.call_id.as_deref(), Some("skillslash-old"));
+}
+
+#[test]
+fn responses_fc_prefix_rewrites_any_non_fc_id() {
+    let mut history = vec![assistant(vec![responses_tool_call(
+        "arbitrary-prefix-1",
+        Some("call-1"),
+    )])];
+    let mut prompt = tool_result_message("arbitrary-prefix-1", Some("call-1"));
+
+    normalize_responses_tool_call_identity(&mut history, &mut prompt).unwrap();
+
+    let tc = first_assistant_tool_call(&history[0]);
+    let tr = first_tool_result(&prompt);
+    assert_eq!(tc.id, "fc-arbitrary-prefix-1");
+    assert_eq!(tc.call_id.as_deref(), Some("call-1"));
+    assert_eq!(tr.id, "arbitrary-prefix-1");
+    assert_eq!(tr.call_id.as_deref(), Some("call-1"));
+}
+
+#[test]
+fn responses_fc_prefix_fills_call_id_before_rewrite() {
+    let mut history = vec![assistant(vec![responses_tool_call(
+        "delegation-payload-plan-abcdef123456",
+        None,
+    )])];
+    let mut prompt = tool_result_message("delegation-payload-plan-abcdef123456", None);
+
+    normalize_responses_tool_call_identity(&mut history, &mut prompt).unwrap();
+
+    let tc = first_assistant_tool_call(&history[0]);
+    let tr = first_tool_result(&prompt);
+    assert_eq!(tc.id, "fc-delegation-payload-plan-abcdef123456");
+    assert_eq!(
+        tc.call_id.as_deref(),
+        Some("delegation-payload-plan-abcdef123456")
+    );
+    assert_eq!(tr.id, "delegation-payload-plan-abcdef123456");
+    assert_eq!(
+        tr.call_id.as_deref(),
+        Some("delegation-payload-plan-abcdef123456")
+    );
+}
+
+#[test]
+fn responses_fc_prefix_still_rejects_result_call_id_mismatch() {
+    let mut history = vec![assistant(vec![responses_tool_call(
+        "fc-skillslash-old",
+        Some("skillslash-old"),
+    )])];
+    let mut prompt = tool_result_message("skillslash-old", Some("wrong-call"));
+
+    let err = normalize_responses_tool_call_identity(&mut history, &mut prompt)
+        .expect_err("explicit result call_id mismatch rejected");
+
+    let structured = err
+        .downcast_ref::<ResponsesToolIdentityError>()
+        .expect("structured identity error");
+    assert_eq!(structured.kind, "mismatched_pair");
+    assert_eq!(structured.call_id, "skillslash-old");
 }
 
 #[test]

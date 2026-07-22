@@ -78,7 +78,7 @@ pub(super) fn skill_pair_call_ids_in_history(
             Message::Assistant { content, .. } => {
                 for part in content.iter() {
                     if let AssistantContent::ToolCall(tc) = part
-                        && tc.id.starts_with("skillslash-")
+                        && is_skill_slash_call_id(&tc.id)
                         && tc.function.name == "skill"
                     {
                         skill_calls.insert(tc.id.clone());
@@ -88,7 +88,7 @@ pub(super) fn skill_pair_call_ids_in_history(
             Message::User { content } => {
                 for part in content.iter() {
                     if let UserContent::ToolResult(tr) = part
-                        && tr.id.starts_with("skillslash-")
+                        && is_skill_slash_call_id(&tr.id)
                     {
                         skill_results.insert(tr.id.clone());
                     }
@@ -98,6 +98,10 @@ pub(super) fn skill_pair_call_ids_in_history(
         }
     }
     skill_calls.intersection(&skill_results).cloned().collect()
+}
+
+fn is_skill_slash_call_id(id: &str) -> bool {
+    id.starts_with("skillslash-") || id.starts_with("fc-skillslash-")
 }
 
 pub(super) fn ensure_or_restore_parked_tool_call(
@@ -251,11 +255,7 @@ pub(super) fn delegation_payload_retrieval_history(
     use crate::engine::message::{AssistantContent, OneOrMany, ToolCall};
     use rig::message::{ToolFunction, ToolResult, ToolResultContent, UserContent};
 
-    let call_id = format!(
-        "delegation-payload-{}-{}",
-        row.label,
-        &row.payload_hash[..12]
-    );
+    let call_id = delegation_payload_call_id(&row.label, &row.payload_hash);
     vec![
         Message::Assistant {
             id: None,
@@ -278,6 +278,10 @@ pub(super) fn delegation_payload_retrieval_history(
             })),
         },
     ]
+}
+
+fn delegation_payload_call_id(label: &str, payload_hash: &str) -> String {
+    format!("fc-delegation-payload-{}-{}", label, &payload_hash[..12])
 }
 
 pub(super) fn extract_todo_delta(report: &str) -> Option<serde_json::Value> {
@@ -377,5 +381,18 @@ pub(super) async fn run_shrink(
             };
             deleg_shrink::compact_shrink(parent_full, &drafter).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delegation_payload_call_id;
+
+    #[test]
+    fn responses_fc_prefix_mints_are_wire_legal() {
+        assert_eq!(
+            delegation_payload_call_id("Build", "abcdef1234567890"),
+            "fc-delegation-payload-Build-abcdef123456"
+        );
     }
 }

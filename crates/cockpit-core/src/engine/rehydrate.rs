@@ -2746,6 +2746,106 @@ mod tests {
         assert_eq!(results[0].call_id.as_deref(), Some(call_id));
     }
 
+    #[test]
+    fn responses_fc_prefix_rehydrate_accepts_old_and_new_prefixes() {
+        for call_id in [
+            "skillslash-persisted",
+            "fc-skillslash-fresh",
+            "seed-persisted",
+            "fc-seed-fresh",
+        ] {
+            let s = root_session();
+            record_user(&s, "synthetic tool context");
+            let is_skill = call_id.contains("skillslash");
+            if !is_skill {
+                record_assistant(&s, "infer-1", "reading seed");
+            }
+            let tool = if is_skill { "skill" } else { "read" };
+            let identity = crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
+                call_id,
+                Some(crate::config::providers::WireApi::Responses),
+            );
+            s.record_tool_call(ToolCallRow {
+                event_id: Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                agent: "Build".into(),
+                call_id: call_id.into(),
+                parent_call_id: None,
+                parent_child_index: None,
+                identity: identity.clone(),
+                tool: tool.into(),
+                path: (!is_skill).then(|| "seed.txt".into()),
+                mcp_server: None,
+                original_input_json: if is_skill {
+                    json!({ "name": "test-skill" })
+                } else {
+                    json!({ "path": "seed.txt" })
+                },
+                wire_input_json: if is_skill {
+                    json!({ "name": "test-skill" })
+                } else {
+                    json!({ "path": "seed.txt" })
+                },
+                recovery: Recovery::Clean,
+                hard_fail: false,
+                exit_code: None,
+                sandbox_enabled: false,
+                sandboxed: false,
+                sandbox_unavailable_reason: None,
+                output: if is_skill {
+                    "Skill body".into()
+                } else {
+                    "seed body".into()
+                },
+                truncated: false,
+                duration_ms: 1,
+                llm_mode: crate::config::extended::LlmMode::default(),
+                shape_fingerprint: None,
+                hint: None,
+            })
+            .unwrap();
+            s.record_event(
+                crate::db::session_log::SessionEventKind::ToolCall,
+                Some("Build"),
+                Some(call_id),
+                &json!({
+                    "tool": tool,
+                    "original_input": if is_skill {
+                        json!({ "name": "test-skill" })
+                    } else {
+                        json!({ "path": "seed.txt" })
+                    },
+                    "wire_input": if is_skill {
+                        json!({ "name": "test-skill" })
+                    } else {
+                        json!({ "path": "seed.txt" })
+                    },
+                    "output": if is_skill { "Skill body" } else { "seed body" },
+                    "skill_slash": is_skill,
+                    "seed": !is_skill,
+                    "provider_identity": {
+                        "provider_item_id": identity.provider_item_id,
+                        "provider_call_id": identity.provider_call_id,
+                        "provider_call_id_source": identity.provider_call_id_source,
+                        "wire_api": identity.wire_api,
+                        "provider_family": identity.provider_family,
+                    },
+                }),
+            )
+            .unwrap();
+
+            let r = rehydrate_session_with_policy(&s.db, s.id, "Build", RehydratePolicy::strict())
+                .unwrap()
+                .unwrap();
+            let calls = assistant_calls(&r.history[1]);
+            assert_eq!(calls[0].id, call_id);
+            assert_eq!(calls[0].call_id.as_deref(), Some(call_id));
+            let results = tool_results(&r.history[2]);
+            assert_eq!(results[0].id, call_id);
+            assert_eq!(results[0].call_id.as_deref(), Some(call_id));
+        }
+    }
+
     /// A `task` delegation rebuilds as a `task` tool_use paired with the
     /// subagent report as its result.
     #[test]

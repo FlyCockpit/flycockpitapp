@@ -86,7 +86,7 @@ async fn inject_seeds_caps_under_budget_and_injects_pairs() {
         })
         .collect();
     for (id, call_id) in &seed_call_ids {
-        assert!(id.starts_with("seed-"), "seed call id is tagged");
+        assert!(id.starts_with("fc-seed-"), "seed call id is tagged");
         assert_eq!(
             call_id.as_deref(),
             Some(id.as_str()),
@@ -104,7 +104,7 @@ async fn inject_seeds_caps_under_budget_and_injects_pairs() {
         })
         .flat_map(|content| content.iter())
         .filter_map(|c| match c {
-            UserContent::ToolResult(result) if result.id.starts_with("seed-") => {
+            UserContent::ToolResult(result) if result.id.starts_with("fc-seed-") => {
                 Some((result.id.clone(), result.call_id.clone()))
             }
             _ => None,
@@ -138,7 +138,10 @@ async fn inject_seeds_caps_under_budget_and_injects_pairs() {
         "each folded seed has a persisted tool-call row"
     );
     for r in seed_rows {
-        assert!(r.call_id.starts_with("seed-"), "seed row tagged as a seed");
+        assert!(
+            r.call_id.starts_with("fc-seed-"),
+            "seed row tagged as a seed"
+        );
         assert_eq!(r.provider_item_id.as_deref(), Some(r.call_id.as_str()));
         assert_eq!(r.provider_call_id.as_deref(), Some(r.call_id.as_str()));
         assert_eq!(
@@ -484,7 +487,7 @@ async fn seed_forced_skill_records_and_folds_a_real_skill_call() {
     assert_eq!(skill_rows.len(), 1, "one persisted skill tool-call row");
     let row = skill_rows[0];
     assert!(
-        row.call_id.starts_with("skillslash-"),
+        row.call_id.starts_with("fc-skillslash-"),
         "row tagged as a skill-slash invocation"
     );
     assert_eq!(row.provider_item_id.as_deref(), Some(row.call_id.as_str()));

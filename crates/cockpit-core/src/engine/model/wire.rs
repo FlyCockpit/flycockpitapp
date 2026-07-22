@@ -377,6 +377,7 @@ fn normalize_responses_message(
             open.clear();
             for part in content.iter_mut() {
                 if let AssistantContent::ToolCall(tc) = part {
+                    let cockpit_call_id = tc.id.clone();
                     let (call_id, source) = match tc.call_id.clone() {
                         Some(call_id) => (call_id, "provider"),
                         None => {
@@ -385,14 +386,15 @@ fn normalize_responses_message(
                             (call_id, "normalized_from_assistant_id")
                         }
                     };
+                    tc.id = responses_fc_prefixed_item_id(&tc.id);
                     records.push(ResponsesToolIdentityRecord {
-                        cockpit_call_id: tc.id.clone(),
+                        cockpit_call_id: cockpit_call_id.clone(),
                         provider_item_id: tc.id.clone(),
                         provider_call_id: call_id.clone(),
                         provider_call_id_source: source,
                     });
                     open.push(OpenResponsesCall {
-                        id: tc.id.clone(),
+                        id: cockpit_call_id,
                         call_id,
                         source,
                         covered: false,
@@ -405,7 +407,10 @@ fn normalize_responses_message(
             for part in content.iter_mut() {
                 if let UserContent::ToolResult(tr) = part {
                     saw_result = true;
-                    let Some(open_call) = open.iter_mut().find(|call| call.id == tr.id) else {
+                    let Some(open_call) = open
+                        .iter_mut()
+                        .find(|call| call.id == tr.id || call.call_id == tr.id)
+                    else {
                         return Err(responses_identity_error(
                             ResponsesToolIdentityFailureKind::OrphanToolResult,
                             tr.id.clone(),
@@ -446,6 +451,14 @@ fn normalize_responses_message(
         }
     }
     Ok(())
+}
+
+fn responses_fc_prefixed_item_id(id: &str) -> String {
+    if id.starts_with("fc") {
+        id.to_string()
+    } else {
+        format!("fc-{id}")
+    }
 }
 
 fn ensure_responses_open_calls_covered(open: &[OpenResponsesCall]) -> Result<()> {

@@ -2,6 +2,21 @@ use super::*;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+#[test]
+fn skills_write_approval_defaults_on() {
+    assert!(SkillsConfig::default().write_approval);
+    assert!(
+        serde_json::from_str::<SkillsConfig>("{}")
+            .unwrap()
+            .write_approval
+    );
+    assert!(
+        !serde_json::from_str::<SkillsConfig>(r#"{"write_approval": false}"#)
+            .unwrap()
+            .write_approval
+    );
+}
+
 /// Consolidation (GOALS §2a): a single `config.json` holding BOTH
 /// layer-wide provider metadata AND the former-`ExtendedConfig` keys must
 /// deserialize cleanly through each loader — neither rejects the

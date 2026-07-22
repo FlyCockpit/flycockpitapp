@@ -55,8 +55,10 @@ impl Tool for SkillManageTool {
             )));
         }
         let extended = ctx.config.extended();
-        let approval_required = extended.skills.write_approval
-            || crate::engine::interrupt::pre_resolved_interrupt_pending();
+        let config_requires_approval = extended.skills.write_approval
+            && ctx.skill_write_origin != crate::skills::manage::SkillWriteOrigin::BackgroundReview;
+        let approval_required =
+            config_requires_approval || crate::engine::interrupt::pre_resolved_interrupt_pending();
         if approval_required
             && ctx
                 .review_cage
@@ -188,12 +190,134 @@ mod tests {
         .unwrap();
     }
 
+    fn extended_with_skills_root(
+        root: &std::path::Path,
+        write_approval: Option<bool>,
+    ) -> crate::config::extended::ExtendedConfig {
+        let mut skills = crate::config::extended::SkillsConfig {
+            scan_dirs: vec![root.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        if let Some(write_approval) = write_approval {
+            skills.write_approval = write_approval;
+        }
+        crate::config::extended::ExtendedConfig {
+            skills,
+            ..Default::default()
+        }
+    }
+
+    fn apply_test_config(ctx: &mut ToolCtx, root: &std::path::Path, write_approval: Option<bool>) {
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended_with_skills_root(root, write_approval),
+            ),
+        );
+    }
+
+    fn ctx_with_interrupt_hub(
+        cwd: &std::path::Path,
+        root: &std::path::Path,
+        write_approval: Option<bool>,
+    ) -> (Arc<ToolCtx>, crate::db::Db) {
+        let (mut ctx, db) = crate::tools::common::test_ctx_with_db(cwd);
+        apply_test_config(&mut ctx, root, write_approval);
+        let (events, _receiver) = tokio::sync::broadcast::channel(8);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::redact::RedactionTable::empty(),
+        )));
+        ctx.interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            redaction,
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            db.clone(),
+            ctx.session.id,
+        ));
+        (Arc::new(ctx), db)
+    }
+
+    async fn assert_parks_without_writing(
+        ctx: Arc<ToolCtx>,
+        db: &crate::db::Db,
+        args: Value,
+        call_id: &str,
+    ) -> uuid::Uuid {
+        let payload = InterruptParkPayload {
+            tool: "skill_manage".to_string(),
+            args: args.clone(),
+            call_id: call_id.to_string(),
+            resume: InterruptResumeAnchor {
+                agent_id: ctx.agent_id.clone(),
+                call_id: call_id.to_string(),
+                provider_call_id: None,
+                assistant_seq: None,
+                call_origin: ctx.skill_write_origin,
+            },
+        };
+        let task_ctx = ctx.clone();
+        let task = tokio::spawn(async move {
+            crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+                SkillManageTool.call(args, &task_ctx).await
+            })
+            .await
+        });
+
+        let mut interrupt_id = None;
+        for _ in 0..1000 {
+            if let Some(row) = db.list_open_interrupts(ctx.session.id).unwrap().first() {
+                interrupt_id = Some(row.interrupt_id);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let interrupt_id = interrupt_id.expect("skill_manage call did not raise an interrupt");
+        assert_eq!(ctx.interrupts.park_all_registered(), 1);
+        let error = task.await.unwrap().unwrap_err();
+        assert!(crate::engine::interrupt::is_parked(&error));
+        interrupt_id
+    }
+
     fn create_value(name: &str) -> Value {
         serde_json::json!({
             "action": "create",
             "name": name,
             "description": "Approval replay skill",
             "content": "Apply the guarded workflow."
+        })
+    }
+
+    fn edit_value(name: &str, body: &str) -> Value {
+        serde_json::json!({
+            "action": "edit",
+            "name": name,
+            "content": body
+        })
+    }
+
+    fn delete_value(name: &str) -> Value {
+        serde_json::json!({
+            "action": "delete",
+            "name": name,
+            "absorbed_into": "umbrella-skill"
+        })
+    }
+
+    fn write_file_value(name: &str, path: &str, content: &str) -> Value {
+        serde_json::json!({
+            "action": "write_file",
+            "name": name,
+            "path": path,
+            "content": content
+        })
+    }
+
+    fn remove_file_value(name: &str, path: &str) -> Value {
+        serde_json::json!({
+            "action": "remove_file",
+            "name": name,
+            "path": path
         })
     }
 
@@ -206,6 +330,12 @@ mod tests {
         })
     }
 
+    async fn create_seed_skill(cwd: &std::path::Path, root: &std::path::Path, name: &str) {
+        create_foreground_skill(cwd, root, name).await;
+        std::fs::create_dir_all(root.join(name).join("references")).unwrap();
+        std::fs::write(root.join(name).join("references/old.md"), "old support").unwrap();
+    }
+
     async fn create_foreground_skill(cwd: &std::path::Path, root: &std::path::Path, name: &str) {
         write_config(cwd, root, false);
         let (ctx, _db) = crate::tools::common::test_ctx_with_db(cwd);
@@ -213,6 +343,144 @@ mod tests {
             .call(create_value(name), &ctx)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreground_write_requires_approval_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None);
+        assert!(ctx.config.extended().skills.write_approval);
+        let args = create_value("default-gated");
+
+        let interrupt_id =
+            assert_parks_without_writing(ctx.clone(), &db, args.clone(), "default-gated-call")
+                .await;
+
+        assert!(!root.join("default-gated/SKILL.md").exists());
+        let output = crate::engine::interrupt::with_pre_resolved_interrupt(
+            interrupt_id,
+            ResolveResponse::Single {
+                selected_id: APPROVE.to_string(),
+            },
+            SkillManageTool.call(args, &ctx),
+        )
+        .await
+        .unwrap();
+        assert!(output.content.contains("Created skill"));
+        assert!(root.join("default-gated/SKILL.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn background_review_bypasses_default_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        apply_test_config(&mut ctx, &root, None);
+        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+        ctx.skill_write_origin = crate::skills::manage::SkillWriteOrigin::BackgroundReview;
+
+        let output = SkillManageTool
+            .call(create_value("background-default"), &ctx)
+            .await
+            .unwrap();
+
+        assert!(output.content.contains("Created skill"));
+        assert!(root.join("background-default/SKILL.md").is_file());
+        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_write_approval_false_still_bypasses_foreground() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        let mut ctx = ctx;
+        apply_test_config(&mut ctx, &root, Some(false));
+
+        let output = SkillManageTool
+            .call(create_value("explicit-direct"), &ctx)
+            .await
+            .unwrap();
+
+        assert!(output.content.contains("Created skill"));
+        assert!(root.join("explicit-direct/SKILL.md").is_file());
+        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gate_covers_every_action() {
+        let cases = vec![
+            (
+                "create",
+                create_value("gated-create"),
+                "gated-create".to_string(),
+                false,
+            ),
+            (
+                "patch",
+                patch_value(
+                    "existing-workflow",
+                    "Apply the guarded workflow.",
+                    "mutated by patch",
+                ),
+                "existing-workflow".to_string(),
+                true,
+            ),
+            (
+                "edit",
+                edit_value("existing-workflow", "mutated by edit"),
+                "existing-workflow".to_string(),
+                true,
+            ),
+            (
+                "delete",
+                delete_value("existing-workflow"),
+                "existing-workflow".to_string(),
+                true,
+            ),
+            (
+                "write_file",
+                write_file_value("existing-workflow", "references/new.md", "mutated support"),
+                "existing-workflow".to_string(),
+                true,
+            ),
+            (
+                "remove_file",
+                remove_file_value("existing-workflow", "references/old.md"),
+                "existing-workflow".to_string(),
+                true,
+            ),
+        ];
+
+        for (action, args, skill_name, seed_existing) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("skills");
+            if seed_existing {
+                create_seed_skill(tmp.path(), &root, &skill_name).await;
+            }
+            let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None);
+
+            assert_parks_without_writing(ctx.clone(), &db, args, &format!("gate-{action}-call"))
+                .await;
+
+            if seed_existing {
+                assert!(root.join(&skill_name).join("SKILL.md").is_file());
+                assert!(
+                    !std::fs::read_to_string(root.join(&skill_name).join("SKILL.md"))
+                        .unwrap()
+                        .contains("mutated")
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join(&skill_name).join("references/old.md"))
+                        .unwrap(),
+                    "old support"
+                );
+                assert!(!root.join(&skill_name).join("references/new.md").exists());
+            } else {
+                assert!(!root.join(&skill_name).join("SKILL.md").exists());
+            }
+        }
     }
 
     #[tokio::test]

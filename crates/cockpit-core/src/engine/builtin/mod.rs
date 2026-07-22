@@ -2625,6 +2625,28 @@ mod tests {
         names
     }
 
+    #[test]
+    fn build_skill_manage_tool_set_is_mode_invariant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        let mut expected = None;
+
+        for mode in [
+            crate::config::extended::LlmMode::Normal,
+            crate::config::extended::LlmMode::Frontier,
+            crate::config::extended::LlmMode::Defensive,
+        ] {
+            args.llm_mode = mode;
+            let names = sorted_tool_names(&build(&args));
+            assert!(names.iter().any(|name| name == "skill_manage"));
+            if let Some(expected) = &expected {
+                assert_eq!(&names, expected, "Build tool set changed in {mode:?}");
+            } else {
+                expected = Some(names);
+            }
+        }
+    }
+
     fn host_for_agent(agent: &Agent, cwd: &Path) -> crate::mcp::builtin::HostContext {
         let mut ctx = crate::tools::common::test_ctx(cwd);
         ctx.mcp_builtin_registry = agent.tools.mcp_builtin_registry();

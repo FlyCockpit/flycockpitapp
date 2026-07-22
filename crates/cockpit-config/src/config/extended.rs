@@ -972,7 +972,7 @@ where
 pub const SEEDED_SCAN_DIRS: [&str; 2] = ["~/.agents/skills", "./.agents/skills"];
 
 /// Skills subsystem config (GOALS §5).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillsConfig {
     /// Directories scanned for `<name>/SKILL.md`. Each entry supports `~`
     /// home expansion, `$VAR` references, and relative paths resolved
@@ -1009,11 +1009,14 @@ pub struct SkillsConfig {
     #[serde(default)]
     pub ancestor_walk: bool,
 
-    /// Require a persisted user decision before any `skill_manage` mutation.
-    /// Disabled by default so explicitly granted skill writers apply changes
-    /// directly; when enabled the ordinary parked-interrupt replay path holds
-    /// the exact tool arguments until approval.
-    #[serde(default)]
+    /// Require a persisted user decision before foreground `skill_manage`
+    /// mutations. Enabled by default: granting the tool is not consent for
+    /// every durable skill-library write. Background-review writes are
+    /// exempt from this config-driven gate because the review cage already
+    /// enforces read-before-write and auto-denies any interrupt it raises.
+    /// The ordinary parked-interrupt replay path holds the exact tool
+    /// arguments until approval.
+    #[serde(default = "default_true")]
     pub write_approval: bool,
 
     /// Allow the skill curator to lifecycle bundled or hub-installed skills.
@@ -1027,6 +1030,20 @@ pub struct SkillsConfig {
     /// only opts into the guarded LLM review phase.
     #[serde(default)]
     pub consolidate: bool,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            scan_dirs: Vec::new(),
+            external_dirs: Vec::new(),
+            auto_bang_commands: false,
+            ancestor_walk: false,
+            write_approval: default_true(),
+            prune_builtins: false,
+            consolidate: false,
+        }
+    }
 }
 
 impl SkillsConfig {

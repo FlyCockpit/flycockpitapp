@@ -86,6 +86,29 @@ async fn bash_truncated_output_carries_retention() {
 }
 
 #[tokio::test]
+async fn bash_large_output_is_bounded_at_pipe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let command = "yes 0123456789 | head -c 1000000";
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command);
+    ctx.session
+        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
+
+    let output = BashTool::new()
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert!(output.truncated);
+    let sidecar = output.output_sidecar.expect("large output gets sidecar");
+    let stdout = sidecar.payload["stdout"]
+        .as_str()
+        .expect("sidecar stdout is a string");
+    assert!(stdout.len() <= crate::process::CHILD_PIPE_CAPTURE_BYTES);
+    assert!(stdout.starts_with("0123456789"));
+    assert!(!stdout.is_empty());
+}
+
+#[tokio::test]
 async fn bash_untruncated_output_carries_no_retention() {
     let tmp = tempfile::tempdir().unwrap();
     let command = "printf ok";

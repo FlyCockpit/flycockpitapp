@@ -14,6 +14,7 @@
 //! backend-neutral even when their runtime command is Firecrawl/TinyFish/etc.
 
 use std::collections::BTreeSet;
+use std::process::Stdio;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -21,6 +22,7 @@ use serde_json::Value;
 
 use crate::config::extended::ToolCommandTemplate;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolOutputSidecar};
+use crate::process::{CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES};
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 const SHELL_TIMEOUT_SECS: u64 = 30;
@@ -166,37 +168,72 @@ impl Tool for CustomBashTool {
             cmd = cmd.replace(&format!("{{{p}}}"), &quoted);
         }
 
-        let output = tokio::time::timeout(
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn()?;
+        let child_pid = child.id();
+        let stdout_task = crate::process::spawn_bounded_pipe_drain(
+            child.stdout.take(),
+            CHILD_PIPE_CAPTURE_HEAD_BYTES,
+            CHILD_PIPE_CAPTURE_TAIL_BYTES,
+        );
+        let stderr_task = crate::process::spawn_bounded_pipe_drain(
+            child.stderr.take(),
+            CHILD_PIPE_CAPTURE_HEAD_BYTES,
+            CHILD_PIPE_CAPTURE_TAIL_BYTES,
+        );
+        let status = match tokio::time::timeout(
             std::time::Duration::from_secs(SHELL_TIMEOUT_SECS),
-            tokio::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(&cmd)
-                .output(),
+            child.wait(),
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("tool `{}` timed out after {SHELL_TIMEOUT_SECS}s", self.name)
-        })??;
+        {
+            Ok(status) => status?,
+            Err(_) => {
+                crate::process::terminate_group_async(
+                    &mut child,
+                    child_pid,
+                    std::time::Duration::from_millis(200),
+                )
+                .await;
+                stdout_task.abort();
+                stderr_task.abort();
+                let _ = stdout_task.join().await;
+                let _ = stderr_task.join().await;
+                return Err(anyhow::anyhow!(
+                    "tool `{}` timed out after {SHELL_TIMEOUT_SECS}s",
+                    self.name
+                ));
+            }
+        };
+        let stdout = stdout_task.join_lossy().await;
+        let stderr = stderr_task.join_lossy().await;
 
         let mut combined = String::new();
-        combined.push_str(&String::from_utf8_lossy(&output.stdout));
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let missing_binary = output.status.code().and_then(|code| {
+        combined.push_str(&stdout);
+        if !status.success() {
+            let missing_binary = status.code().and_then(|code| {
                 crate::tools::bash::missing_binary_from_shell_failure(code, &stderr)
             });
             combined.push_str(&render_failure_diagnostic(
                 &self.name,
                 &selected,
-                output.status.code(),
+                status.code(),
                 ctx,
             ));
             combined.push_str(
                 &crate::tools::bash::cockpit_command_environment_block_with_requirements(
                     &cmd,
                     &ctx.cwd,
-                    output
-                        .status
+                    status
                         .code()
                         .as_ref()
                         .map(|code| code.to_string())
@@ -218,7 +255,7 @@ impl Tool for CustomBashTool {
                 ToolOutput::truncated_text(truncate_head_tail(&combined, OUTPUT_BYTE_CAP))
                     .with_output_sidecar(self.provenance_sidecar(
                         &selected,
-                        output.status.code(),
+                        status.code(),
                         changed_after_build,
                     )),
             );
@@ -226,7 +263,7 @@ impl Tool for CustomBashTool {
         Ok(
             ToolOutput::text(combined).with_output_sidecar(self.provenance_sidecar(
                 &selected,
-                output.status.code(),
+                status.code(),
                 changed_after_build,
             )),
         )
@@ -595,5 +632,30 @@ mod tests {
         ));
         assert!(out.content.contains("[stderr]"));
         assert!(out.content.contains("cockpit-definitely-missing-websearch"));
+    }
+
+    #[tokio::test]
+    async fn custom_tool_output_is_byte_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let ctx = crate::tools::common::test_ctx(cwd);
+        let tpl = ToolCommandTemplate {
+            enabled: true,
+            command: "yes 0123456789 | head -c 1000000".into(),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            "large",
+            &tpl,
+            ToolTemplateProvenance::Configured {
+                source: "test".to_string(),
+            },
+        );
+
+        let out = tool.call(serde_json::json!({}), &ctx).await.unwrap();
+
+        assert!(out.truncated);
+        assert!(out.content.len() <= OUTPUT_BYTE_CAP);
+        assert_eq!(out.output_sidecar.unwrap().payload["exit_code"], 0);
     }
 }

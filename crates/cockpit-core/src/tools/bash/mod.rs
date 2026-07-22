@@ -31,6 +31,7 @@ use crate::engine::tool::{
     ToolPresentation, single_line_preview, string_field,
 };
 use crate::intel::budget::retained_truncated_body;
+use crate::process::{CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES};
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 mod boundary;
@@ -2364,23 +2365,16 @@ async fn run_prepared_command(
     };
     let child_pid = child.id();
 
-    use tokio::io::AsyncReadExt;
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(pipe) = stdout_pipe.as_mut() {
-            let _ = pipe.read_to_end(&mut buf).await;
-        }
-        buf
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(pipe) = stderr_pipe.as_mut() {
-            let _ = pipe.read_to_end(&mut buf).await;
-        }
-        buf
-    });
+    let stdout_task = crate::process::spawn_bounded_pipe_drain(
+        child.stdout.take(),
+        CHILD_PIPE_CAPTURE_HEAD_BYTES,
+        CHILD_PIPE_CAPTURE_TAIL_BYTES,
+    );
+    let stderr_task = crate::process::spawn_bounded_pipe_drain(
+        child.stderr.take(),
+        CHILD_PIPE_CAPTURE_HEAD_BYTES,
+        CHILD_PIPE_CAPTURE_TAIL_BYTES,
+    );
 
     let timeout = std::time::Duration::from_millis(timeout_ms);
     let status = tokio::select! {
@@ -2389,6 +2383,8 @@ async fn run_prepared_command(
             kill_child(&mut child, child_pid).await;
             stdout_task.abort();
             stderr_task.abort();
+            let _ = stdout_task.join().await;
+            let _ = stderr_task.join().await;
             return RunOutcome::Cancelled;
         }
         res = tokio::time::timeout(timeout, child.wait()) => match res {
@@ -2398,13 +2394,15 @@ async fn run_prepared_command(
                 kill_child(&mut child, child_pid).await;
                 stdout_task.abort();
                 stderr_task.abort();
+                let _ = stdout_task.join().await;
+                let _ = stderr_task.join().await;
                 return RunOutcome::TimedOut;
             }
         },
     };
 
-    let stdout = stdout_task.await.unwrap_or_default();
-    let stderr = stderr_task.await.unwrap_or_default();
+    let stdout = stdout_task.join().await.bytes;
+    let stderr = stderr_task.join().await.bytes;
     let exit = status.code().unwrap_or(-1);
     let signaled = !status.success() && status.code().is_none();
 

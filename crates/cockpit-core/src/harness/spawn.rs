@@ -12,7 +12,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use tempfile::NamedTempFile;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use super::prepare::PromptDelivery;
@@ -20,7 +20,7 @@ use super::prepare::PromptDelivery;
 /// Bounded byte tail kept per stream. 256 KiB is generous for diagnostics
 /// while bounding a runaway harness's output; the structured-result path
 /// further caps what reaches the model.
-pub const HARNESS_OUTPUT_TAIL_BYTES: usize = 256 * 1024;
+pub const HARNESS_OUTPUT_TAIL_BYTES: usize = crate::process::CHILD_PIPE_CAPTURE_BYTES;
 
 /// Captured output of one harness invocation.
 #[derive(Debug, Clone)]
@@ -120,14 +120,16 @@ pub async fn run_to_completion(
     };
 
     // Spawn the concurrent drainers immediately.
-    let stdout_task = drain_bounded(child.stdout.take(), HARNESS_OUTPUT_TAIL_BYTES);
-    let stderr_task = drain_bounded(child.stderr.take(), HARNESS_OUTPUT_TAIL_BYTES);
+    let stdout_task =
+        crate::process::spawn_bounded_pipe_drain(child.stdout.take(), 0, HARNESS_OUTPUT_TAIL_BYTES);
+    let stderr_task =
+        crate::process::spawn_bounded_pipe_drain(child.stderr.take(), 0, HARNESS_OUTPUT_TAIL_BYTES);
 
     tokio::select! {
         status = child.wait() => {
             let status = status.context("waiting for harness child")?;
-            let stdout = join_string(stdout_task).await;
-            let stderr = join_string(stderr_task).await;
+            let stdout = stdout_task.join_lossy().await;
+            let stderr = stderr_task.join_lossy().await;
             let success = status.success();
             Ok(RunOutcome::Completed {
                 output: HarnessOutput { stdout, stderr, exit_code: status.code() },
@@ -142,69 +144,12 @@ pub async fn run_to_completion(
                 std::time::Duration::from_millis(200),
             )
             .await;
-            let stdout = join_string(stdout_task).await;
-            let stderr = join_string(stderr_task).await;
+            let stdout = stdout_task.join_lossy().await;
+            let stderr = stderr_task.join_lossy().await;
             Ok(RunOutcome::TimedOut {
                 output: HarnessOutput { stdout, stderr, exit_code: None },
             })
         }
-    }
-}
-
-/// Spawn a task that reads `reader` to EOF, keeping only the last
-/// `tail_bytes`. Returns its join handle. `None` reader → an empty result.
-fn drain_bounded<R>(reader: Option<R>, tail_bytes: usize) -> tokio::task::JoinHandle<Vec<u8>>
-where
-    R: AsyncReadExt + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let Some(mut reader) = reader else {
-            return Vec::new();
-        };
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            match reader.read(&mut chunk).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    buf.extend_from_slice(&chunk[..n]);
-                    // Trim from the front once we exceed the tail budget,
-                    // on a UTF-8 char boundary near the cut.
-                    if buf.len() > tail_bytes {
-                        let cut = buf.len() - tail_bytes;
-                        let cut = floor_char_boundary(&buf, cut);
-                        buf.drain(..cut);
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        buf
-    })
-}
-
-/// Largest index `<= idx` that begins a UTF-8 sequence in `buf` (so the
-/// front-trim never splits a multi-byte char). Falls back to `idx` when
-/// no boundary is found within a short window.
-fn floor_char_boundary(buf: &[u8], idx: usize) -> usize {
-    let mut i = idx.min(buf.len());
-    let lower = i.saturating_sub(4);
-    while i > lower {
-        if (buf[i] & 0b1100_0000) != 0b1000_0000 {
-            return i;
-        }
-        i -= 1;
-    }
-    idx.min(buf.len())
-}
-
-/// Await a drain task and decode its tail (UTF-8 lossy). A join failure
-/// (task panic / abort) yields an empty string — diagnostics, not control
-/// flow.
-async fn join_string(task: tokio::task::JoinHandle<Vec<u8>>) -> String {
-    match task.await {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(_) => String::new(),
     }
 }
 

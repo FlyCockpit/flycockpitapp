@@ -1445,6 +1445,7 @@ pub struct App {
     /// `App::new` time; the renderer derives the dot count from the
     /// elapsed time so the animation advances each tick.
     pub(super) started_at: Instant,
+    startup_first_paint_timing: StartupFirstPaintTiming,
     /// True while the agent is actively working on the user's turn —
     /// from a fresh submit (rising edge) until the daemon's `AgentIdle`
     /// (falling edge). Unlike `pending.is_some()` this stays set across
@@ -2537,6 +2538,41 @@ fn take_redraw_request(needs_redraw: &mut bool) -> bool {
     true
 }
 
+#[derive(Debug, Clone)]
+struct StartupFirstPaintTiming {
+    launch_start: Option<Instant>,
+    logged: bool,
+}
+
+impl StartupFirstPaintTiming {
+    fn new(launch_start: Option<Instant>) -> Self {
+        Self {
+            launch_start,
+            logged: false,
+        }
+    }
+
+    fn log_after_draw(&mut self) {
+        if self.logged {
+            return;
+        }
+
+        let Some(launch_start) = self.launch_start else {
+            return;
+        };
+
+        self.logged = true;
+        let launch_to_first_paint_ms = launch_start.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(
+            target: cockpit_core::startup::TARGET,
+            launch_to_first_paint_ms = format_args!("{launch_to_first_paint_ms:.1}"),
+            "startup first paint"
+        );
+        #[cfg(test)]
+        STARTUP_FIRST_PAINT_LOG_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 static EVENT_LOOP_DRAW_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -2550,10 +2586,29 @@ pub(crate) fn event_loop_draw_call_count() -> usize {
     EVENT_LOOP_DRAW_CALL_COUNT.load(Ordering::SeqCst)
 }
 
+#[cfg(test)]
+static STARTUP_FIRST_PAINT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_startup_first_paint_log_count() {
+    STARTUP_FIRST_PAINT_LOG_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn startup_first_paint_log_count() -> usize {
+    STARTUP_FIRST_PAINT_LOG_COUNT.load(Ordering::SeqCst)
+}
+
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
-        Self::new_inner(project, no_sandbox, None, StartupWorkspaceTrust::Decided)
+        Self::new_inner(
+            project,
+            no_sandbox,
+            None,
+            StartupWorkspaceTrust::Decided,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -2563,6 +2618,7 @@ impl App {
             no_sandbox,
             Some(db),
             StartupWorkspaceTrust::Decided,
+            None,
         )
     }
 
@@ -2572,7 +2628,17 @@ impl App {
         db: cockpit_db::Db,
         trust: StartupWorkspaceTrust,
     ) -> Self {
-        Self::new_inner(project, no_sandbox, Some(db), trust)
+        Self::new_with_db_and_workspace_trust_and_launch_start(project, no_sandbox, db, trust, None)
+    }
+
+    pub fn new_with_db_and_workspace_trust_and_launch_start(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        db: cockpit_db::Db,
+        trust: StartupWorkspaceTrust,
+        launch_start: Option<Instant>,
+    ) -> Self {
+        Self::new_inner(project, no_sandbox, Some(db), trust, launch_start)
     }
 
     pub fn new_with_db_and_session(
@@ -2581,11 +2647,22 @@ impl App {
         db: cockpit_db::Db,
         session_id: uuid::Uuid,
     ) -> Self {
+        Self::new_with_db_and_session_and_launch_start(project, no_sandbox, db, session_id, None)
+    }
+
+    pub fn new_with_db_and_session_and_launch_start(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        db: cockpit_db::Db,
+        session_id: uuid::Uuid,
+        launch_start: Option<Instant>,
+    ) -> Self {
         let mut app = Self::new_inner(
             project,
             no_sandbox,
             Some(db),
             StartupWorkspaceTrust::Decided,
+            launch_start,
         );
         app.launch.session_id = Some(session_id);
         app
@@ -2602,6 +2679,7 @@ impl App {
         no_sandbox: bool,
         startup_db: Option<cockpit_db::Db>,
         startup_trust: StartupWorkspaceTrust,
+        launch_start: Option<Instant>,
     ) -> Self {
         let mut timer = cockpit_core::startup::PhaseTimer::start("App::new");
         // Skip the synchronous `git status` here — it can take seconds in a
@@ -2709,6 +2787,7 @@ impl App {
             transcript_view: TranscriptViewMeta::Main,
             transcript_view_stack: Vec::new(),
             started_at: Instant::now(),
+            startup_first_paint_timing: StartupFirstPaintTiming::new(launch_start),
             busy: false,
             working_span_state: WorkingSpanState::Idle,
             span_started_at: None,
@@ -3055,6 +3134,7 @@ impl App {
                 EVENT_LOOP_DRAW_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
                 self.link_registry.begin_frame();
                 terminal.draw(|frame| self.render(frame))?;
+                self.startup_first_paint_timing.log_after_draw();
                 crate::tui::links::emit_osc8(&self.link_registry, self.hyperlinks)?;
                 // The composer is the user's active input surface this frame iff
                 // no question dialog is displacing it
@@ -3317,6 +3397,8 @@ mod skills_pane_attached_tests;
 mod slash_rank_tests;
 #[cfg(test)]
 mod startup_first_paint_tests;
+#[cfg(test)]
+mod startup_timing_tests;
 #[cfg(test)]
 mod subagent_settle_tests;
 #[cfg(test)]

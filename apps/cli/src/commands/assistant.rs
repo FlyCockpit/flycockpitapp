@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Write};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 
@@ -9,13 +10,17 @@ use crate::db::Db;
 use crate::session::project_id_for;
 use crate::wizard::WizardRun;
 
-pub async fn run(cmd: AssistantCommand, no_sandbox: bool) -> Result<()> {
+pub async fn run(
+    cmd: AssistantCommand,
+    no_sandbox: bool,
+    launch_start: Option<Instant>,
+) -> Result<()> {
     match cmd {
         AssistantCommand::New(args) => new(args).await,
         AssistantCommand::List => list(),
         AssistantCommand::Show { name } => show(&name),
         AssistantCommand::Delete(args) => delete(args),
-        AssistantCommand::Chat { name } => chat(&name, no_sandbox).await,
+        AssistantCommand::Chat { name } => chat(&name, no_sandbox, launch_start).await,
         AssistantCommand::Learn(args) => crate::commands::learn::run(args, no_sandbox).await,
     }
 }
@@ -109,7 +114,7 @@ fn delete(args: AssistantDeleteArgs) -> Result<()> {
     Ok(())
 }
 
-async fn chat(name: &str, no_sandbox: bool) -> Result<()> {
+async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Result<()> {
     crate::assistants::validate_assistant_name(name)?;
     let project_root = std::env::current_dir().context("resolving cwd")?;
     let db = Db::open_default().context("opening cockpit DB")?;
@@ -128,8 +133,13 @@ async fn chat(name: &str, no_sandbox: bool) -> Result<()> {
                 .context("creating assistant session")?
         }
     };
-    crate::commands::tui::run_with_session(Some(&project_root), no_sandbox, session.session_id)
-        .await
+    crate::commands::tui::run_with_session(
+        Some(&project_root),
+        no_sandbox,
+        session.session_id,
+        launch_start,
+    )
+    .await
 }
 
 struct StdTerminalIo;

@@ -14,7 +14,8 @@
 //!
 //! Daemon child phases land in the daemon's log file (it's spawned with
 //! stdio nulled); inherit the env var into it to capture them. The TUI's
-//! own phases print to its interactive log file unless `--print-logs`.
+//! own phases, including launch-to-first-paint, print to its interactive
+//! log file unless `--print-logs`.
 
 use std::time::Instant;
 

@@ -32,6 +32,7 @@ mod terminal_host;
 use clap::Parser;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use crate::cli::{Cli, Command};
 
@@ -563,6 +564,8 @@ pub fn main_entry() -> ExitCode {
         return commands::jq::run_from_argv0();
     }
 
+    let launch_start = Instant::now();
+
     // Sandboxing part 2: dispatch the zerobox Linux sandbox helper and
     // install the PATH-prepend alias BEFORE the tokio runtime starts.
     tools::shell_sandbox::init();
@@ -573,7 +576,7 @@ pub fn main_entry() -> ExitCode {
         .thread_stack_size(TOKIO_WORKER_STACK_SIZE)
         .build();
     let result = match runtime {
-        Ok(runtime) => runtime.block_on(async_main()),
+        Ok(runtime) => runtime.block_on(async_main(launch_start)),
         Err(err) => Err(anyhow::Error::new(err)),
     };
     match result {
@@ -617,7 +620,7 @@ fn error_stderr_line(err: &anyhow::Error) -> String {
     }
 }
 
-async fn async_main() -> anyhow::Result<()> {
+async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     init_tracing(cli.log_level.as_deref(), cli.print_logs);
@@ -630,14 +633,18 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     match cli.command {
-        None => commands::tui::run(cli.project.as_deref(), cli.no_sandbox).await,
+        None => {
+            commands::tui::run(cli.project.as_deref(), cli.no_sandbox, Some(launch_start)).await
+        }
 
         Some(Command::Ask(args)) => commands::ask::run(args).await,
         Some(Command::Run(args)) => {
             commands::run::run(args, cli.no_sandbox, cli.project.as_deref()).await
         }
         Some(Command::Agent(sub)) => commands::agent::run(sub).await,
-        Some(Command::Assistant(sub)) => commands::assistant::run(sub, cli.no_sandbox).await,
+        Some(Command::Assistant(sub)) => {
+            commands::assistant::run(sub, cli.no_sandbox, Some(launch_start)).await
+        }
         Some(Command::Account(sub)) => match sub {
             crate::cli::AccountCommand::Login(args) => commands::flycockpit::login(args).await,
             crate::cli::AccountCommand::Logout => commands::flycockpit::logout().await,

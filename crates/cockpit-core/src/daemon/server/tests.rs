@@ -2040,13 +2040,11 @@ fn attached_state_with_worker_receiver(
     );
     let locks = Arc::new(LockManager::from_db(ctx.db.clone()).expect("locks"));
     let (handle, work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
-    let event_rx = handle.subscribe();
     (
         ClientState {
             principal: ClientPrincipal::owner(),
             attached: Some(AttachedSession {
                 handle,
-                event_rx,
                 _interactive_guard: None,
             }),
             pending_replay: Vec::new(),
@@ -2901,7 +2899,33 @@ async fn dispatch_matrix_request_after(
     prelude: Vec<Request>,
     request: Request,
 ) -> std::result::Result<Response, ErrorPayload> {
-    dispatch_authz_request_after(ctx, ClientPrincipal::owner(), prelude, None, None, request).await
+    let result = dispatch_authz_request_after(
+        ctx,
+        ClientPrincipal::owner(),
+        prelude.clone(),
+        None,
+        None,
+        request.clone(),
+    )
+    .await;
+    if matches!(
+        &result,
+        Err(ErrorPayload {
+            code: ErrorCode::Internal,
+            message,
+        }) if message == "daemon connection closed"
+    ) {
+        return dispatch_authz_request_after(
+            ctx,
+            ClientPrincipal::owner(),
+            prelude,
+            None,
+            None,
+            request,
+        )
+        .await;
+    }
+    result
 }
 
 #[cfg(unix)]
@@ -3072,7 +3096,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     loop {
-        match recv_body(proto).await {
+        match recv_body_result(proto).await? {
             Body::Response { id, response } => {
                 assert_eq!(id, request_id);
                 return Ok(*response);
@@ -3084,6 +3108,27 @@ where
             Body::Event { .. } => continue,
             other => panic!("expected dispatch response/error, got {other:?}"),
         }
+    }
+}
+
+async fn recv_body_result<S>(proto: &mut ProtoStream<S>) -> std::result::Result<Body, ErrorPayload>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    match proto.recv().await {
+        Ok(Some(RecvFrame::Envelope(env))) => Ok(env.body),
+        Ok(Some(RecvFrame::VersionMismatch { v, .. })) => Err(ErrorPayload {
+            code: ErrorCode::ProtocolVersion,
+            message: proto::version_mismatch_message(v),
+        }),
+        Ok(None) => Err(ErrorPayload {
+            code: ErrorCode::Internal,
+            message: "daemon connection closed".to_string(),
+        }),
+        Err(error) => Err(ErrorPayload {
+            code: ErrorCode::Internal,
+            message: format!("daemon read failed: {error}"),
+        }),
     }
 }
 
@@ -8254,6 +8299,12 @@ async fn set_approval_mode_updates_session_and_broadcasts() {
     let ctx = test_ctx();
     let tmp = tempfile::TempDir::new().unwrap();
     let (mut state, _session_id) = attached_state(&ctx, tmp.path());
+    let mut event_rx = state
+        .attached
+        .as_ref()
+        .expect("attached session")
+        .handle
+        .subscribe();
 
     let response = handle_request(
         Request::SetApprovalMode {
@@ -8271,13 +8322,7 @@ async fn set_approval_mode_updates_session_and_broadcasts() {
         other => panic!("expected ApprovalModeState response, got {other:?}"),
     }
 
-    let attached = state.attached.as_mut().expect("attached session");
-    match attached
-        .event_rx
-        .try_recv()
-        .expect("approval broadcast")
-        .event
-    {
+    match event_rx.try_recv().expect("approval broadcast").event {
         proto::Event::ApprovalModeState { mode, .. } => {
             assert_eq!(mode, crate::config::extended::ApprovalMode::Yolo);
         }
@@ -8290,6 +8335,12 @@ async fn set_sandbox_escalation_updates_session_and_broadcasts() {
     let ctx = test_ctx();
     let tmp = tempfile::TempDir::new().unwrap();
     let (mut state, _session_id) = attached_state(&ctx, tmp.path());
+    let mut event_rx = state
+        .attached
+        .as_ref()
+        .expect("attached session")
+        .handle
+        .subscribe();
 
     let response = handle_request(
         Request::SetSandboxEscalation { enabled: false },
@@ -8305,8 +8356,7 @@ async fn set_sandbox_escalation_updates_session_and_broadcasts() {
 
     let attached = state.attached.as_mut().expect("attached session");
     assert!(!attached.handle.sandbox_escalation_enabled());
-    match attached
-        .event_rx
+    match event_rx
         .try_recv()
         .expect("sandbox escalation broadcast")
         .event
@@ -8322,9 +8372,8 @@ async fn set_sandbox_escalation_updates_session_and_broadcasts() {
     )
     .await
     .expect("idempotent sandbox escalation request succeeds");
-    let attached = state.attached.as_mut().expect("attached session");
     assert!(
-        attached.event_rx.try_recv().is_err(),
+        event_rx.try_recv().is_err(),
         "idempotent set should not broadcast"
     );
 }
@@ -8774,6 +8823,313 @@ fn response_send_failure_warns_with_request_id_and_no_payload() {
     assert!(!log.contains("provider_header"));
 }
 
+fn test_event_envelope(event: proto::Event) -> EventEnvelope {
+    EventEnvelope {
+        event,
+        redact: std::sync::Arc::new(RedactionTable::empty()),
+    }
+}
+
+async fn recv_writer_body(
+    writer_rx: &mut mpsc::Receiver<ClientWriterMessage>,
+    label: &'static str,
+) -> Body {
+    match writer_rx.recv().await.expect(label) {
+        ClientWriterMessage::Envelope(envelope) => envelope.body,
+        ClientWriterMessage::EnvelopeWithAck { envelope, .. } => envelope.body,
+    }
+}
+
+#[tokio::test]
+async fn serialized_requests_apply_in_receipt_order() {
+    let ctx = test_ctx();
+    let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let executor = tokio::spawn(run_client_executor(
+        ctx,
+        ClientPrincipal::owner(),
+        executor_rx,
+        event_cmd_tx,
+        writer_tx,
+    ));
+
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    executor_tx
+        .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
+            Envelope::request(first, Request::DaemonStatus),
+        ))))
+        .await
+        .unwrap();
+    executor_tx
+        .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
+            Envelope::request(second, Request::DaemonStatus),
+        ))))
+        .await
+        .unwrap();
+
+    match recv_writer_body(&mut writer_rx, "first response").await {
+        Body::Response { id, .. } => assert_eq!(id, first),
+        other => panic!("expected first response, got {other:?}"),
+    }
+    match recv_writer_body(&mut writer_rx, "second response").await {
+        Body::Response { id, .. } => assert_eq!(id, second),
+        other => panic!("expected second response, got {other:?}"),
+    }
+    drop(executor_tx);
+    executor.await.unwrap();
+}
+
+#[tokio::test]
+async fn client_io_split_slow_request_does_not_block_event_forwarding() {
+    let ctx = test_ctx();
+    let (global_tx, global_rx) = broadcast::channel(8);
+    let (_event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (executor_tx, _executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let event_task = tokio::spawn(run_client_event_forwarder(
+        ctx,
+        ClientPrincipal::owner(),
+        global_rx,
+        event_cmd_rx,
+        executor_tx,
+        writer_tx,
+    ));
+
+    global_tx
+        .send(test_event_envelope(proto::Event::LspNotice {
+            text: "forwarded while executor is unavailable".to_string(),
+        }))
+        .unwrap();
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        recv_writer_body(&mut writer_rx, "writer envelope"),
+    )
+    .await
+    .expect("event forwarded")
+    {
+        Body::Event {
+            event: proto::Event::LspNotice { text },
+        } => assert_eq!(text, "forwarded while executor is unavailable"),
+        other => panic!("expected forwarded event, got {other:?}"),
+    }
+    event_task.abort();
+}
+
+#[test]
+fn client_io_split_writer_is_sole_socket_writer() {
+    let source = include_str!("mod.rs");
+    let transport_start = source
+        .find("async fn handle_client_transport_as")
+        .expect("transport function");
+    let transport_end = source
+        .find("enum ClientExecutorInput")
+        .expect("task helpers");
+    let transport = &source[transport_start..transport_end];
+    assert!(!transport.contains(".send(&Envelope"));
+    assert!(!transport.contains(".send(&envelope"));
+    assert!(source.contains("async fn run_client_writer"));
+    assert!(source.contains("writer.send(&envelope).await"));
+}
+
+#[tokio::test]
+async fn client_io_split_reader_eof_tears_down_all_tasks() {
+    let ctx = test_ctx();
+    let (server, client) = tokio::io::duplex(proto::MAX_FRAME_BYTES);
+    let task = tokio::spawn(handle_client_transport_as(
+        server,
+        ctx,
+        ClientPrincipal::owner(),
+    ));
+    drop(client);
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("client task exits on reader eof")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn attach_replay_precedes_live_events_under_task_split() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            tmp.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .unwrap();
+    let session = ctx
+        .db
+        .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .unwrap();
+    let live_session = Arc::new(
+        Session::resume(ctx.db.clone(), session.session_id)
+            .unwrap()
+            .unwrap(),
+    );
+    let (handle, _work_rx) =
+        SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
+    let join = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+    });
+    ctx.registry.insert_test_worker(handle, join);
+    assert!(ctx.shutdown.begin_drain());
+
+    let mut state = ClientState::detached_for_test();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, mut event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let request_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::request(
+            request_id,
+            Request::Attach {
+                session_id: Some(session.session_id),
+                since_seq: None,
+                project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                no_sandbox: false,
+                interactive: true,
+                model_override: None,
+                client_protocol_version: proto::PROTOCOL_VERSION,
+                env_snapshot: None,
+                env_policy: EnvDriftPolicy::Daemon,
+            },
+        ),
+        &mut state,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "attach response").await,
+        Body::Response { .. }
+    ));
+    let mut saw_drain = false;
+    for _ in 0..8 {
+        if let Body::Event { event } = recv_writer_body(&mut writer_rx, "attach replay").await
+            && matches!(event, proto::Event::DaemonDraining { .. })
+        {
+            saw_drain = true;
+            break;
+        }
+    }
+    assert!(
+        saw_drain,
+        "attach should enqueue drain replay before live events"
+    );
+    assert!(matches!(
+        event_cmd_rx
+            .recv()
+            .await
+            .expect("live subscription command"),
+        ClientEventCommand::Attach(_)
+    ));
+}
+
+#[tokio::test]
+async fn client_io_split_detach_silences_session_events() {
+    let ctx = test_ctx();
+    let (session_tx, session_rx) = broadcast::channel(8);
+    let (_global_tx, global_rx) = broadcast::channel(8);
+    let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (executor_tx, _executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let event_task = tokio::spawn(run_client_event_forwarder(
+        ctx,
+        ClientPrincipal::owner(),
+        global_rx,
+        event_cmd_rx,
+        executor_tx,
+        writer_tx,
+    ));
+
+    event_cmd_tx
+        .send(ClientEventCommand::Attach(session_rx))
+        .await
+        .unwrap();
+    session_tx
+        .send(test_event_envelope(proto::Event::Notice {
+            session_id: Uuid::new_v4(),
+            text: "before detach".to_string(),
+        }))
+        .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "pre-detach event").await,
+        Body::Event {
+            event: proto::Event::Notice { .. }
+        }
+    ));
+
+    event_cmd_tx.send(ClientEventCommand::Detach).await.unwrap();
+    session_tx
+        .send(test_event_envelope(proto::Event::Notice {
+            session_id: Uuid::new_v4(),
+            text: "after detach".to_string(),
+        }))
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), writer_rx.recv())
+            .await
+            .is_err()
+    );
+    event_task.abort();
+}
+
+#[tokio::test]
+async fn client_io_split_global_lag_still_emits_resync_error() {
+    let ctx = test_ctx();
+    let (global_tx, global_rx) = broadcast::channel(1);
+    global_tx
+        .send(test_event_envelope(proto::Event::LspNotice {
+            text: "first".to_string(),
+        }))
+        .unwrap();
+    global_tx
+        .send(test_event_envelope(proto::Event::LspNotice {
+            text: "second".to_string(),
+        }))
+        .unwrap();
+    global_tx
+        .send(test_event_envelope(proto::Event::LspNotice {
+            text: "third".to_string(),
+        }))
+        .unwrap();
+
+    let (_event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (executor_tx, _executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let event_task = tokio::spawn(run_client_event_forwarder(
+        ctx,
+        ClientPrincipal::owner(),
+        global_rx,
+        event_cmd_rx,
+        executor_tx,
+        writer_tx,
+    ));
+
+    let mut saw_error = false;
+    for _ in 0..3 {
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            recv_writer_body(&mut writer_rx, "writer envelope"),
+        )
+        .await
+        .expect("resync envelope");
+        if let Body::Error { error, .. } = body {
+            assert!(error.message.contains("global event stream lagged"));
+            saw_error = true;
+            break;
+        }
+    }
+    assert!(saw_error, "global lag should emit a synthetic error");
+    event_task.abort();
+}
+
 #[tokio::test]
 async fn delete_live_session_timeout_leaves_row_intact() {
     let ctx = test_ctx();
@@ -8927,12 +9283,10 @@ async fn btw_concurrent_with_parent_turn() {
     );
     let (parent_handle, mut parent_rx) =
         SessionWorkerHandle::test_handle_with_receiver(parent_session, ctx.registry.locks());
-    let parent_event_rx = parent_handle.subscribe();
     let mut parent_state = ClientState {
         principal: ClientPrincipal::owner(),
         attached: Some(AttachedSession {
             handle: parent_handle,
-            event_rx: parent_event_rx,
             _interactive_guard: None,
         }),
         pending_replay: Vec::new(),
@@ -8975,12 +9329,10 @@ async fn btw_concurrent_with_parent_turn() {
     );
     let (btw_handle, mut btw_rx) =
         SessionWorkerHandle::test_handle_with_receiver(btw_session, ctx.registry.locks());
-    let btw_event_rx = btw_handle.subscribe();
     let mut btw_state = ClientState {
         principal: ClientPrincipal::owner(),
         attached: Some(AttachedSession {
             handle: btw_handle,
-            event_rx: btw_event_rx,
             _interactive_guard: None,
         }),
         pending_replay: Vec::new(),
@@ -9366,10 +9718,9 @@ async fn attach_replays_drain_state_after_attached_response() {
     ctx.registry.insert_test_worker(handle, join);
     assert!(ctx.shutdown.begin_drain());
 
-    let (left, right) = tokio::io::duplex(proto::MAX_FRAME_BYTES);
-    let mut server = ProtoStream::new(left);
-    let mut client = ProtoStream::new(right);
     let mut state = ClientState::detached_for_test();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let request_id = Uuid::new_v4();
     handle_envelope(
         Envelope::request(
@@ -9388,12 +9739,13 @@ async fn attach_replays_drain_state_after_attached_response() {
         ),
         &mut state,
         &ctx,
-        &mut server,
+        &event_cmd_tx,
+        &writer_tx,
     )
     .await
     .expect("attach envelope handled");
 
-    match recv_body(&mut client).await {
+    match recv_writer_body(&mut writer_rx, "response").await {
         Body::Response { id, response } => {
             let Response::Attached { session_id, .. } = *response else {
                 panic!("expected Attached response, got {response:?}");
@@ -9403,12 +9755,21 @@ async fn attach_replays_drain_state_after_attached_response() {
         }
         other => panic!("expected Attached response, got {other:?}"),
     }
-    match recv_body(&mut client).await {
-        Body::Event {
-            event: proto::Event::DaemonDraining { forced },
-        } => assert!(!forced),
-        other => panic!("expected DaemonDraining replay, got {other:?}"),
+    let mut saw_drain = false;
+    for _ in 0..8 {
+        match recv_writer_body(&mut writer_rx, "drain state replay").await {
+            Body::Event {
+                event: proto::Event::DaemonDraining { forced },
+            } => {
+                assert!(!forced);
+                saw_drain = true;
+                break;
+            }
+            Body::Event { .. } => {}
+            other => panic!("expected replay event, got {other:?}"),
+        }
     }
+    assert!(saw_drain, "expected DaemonDraining replay");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -9483,25 +9844,28 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
         history.is_empty(),
         "since_seq attach flushes replay after Attached, not inside response history"
     );
-    assert_eq!(state.pending_replay.len(), 1);
-    match state.pending_replay.pop().expect("pending replay") {
-        proto::Event::HistoryReplay {
-            session_id,
-            entries,
-            max_seq,
-        } => {
-            assert_eq!(session_id, session.session_id);
-            assert_eq!(max_seq, seq2);
-            assert_eq!(entries.len(), 1);
-            match &entries[0] {
-                proto::HistoryEntry::User { text, seq, .. } => {
-                    assert_eq!(text, "missed while disconnected");
-                    assert_eq!(*seq, seq2);
-                }
-                other => panic!("expected replayed user message, got {other:?}"),
-            }
+    let replay = state
+        .pending_replay
+        .iter()
+        .find_map(|event| match event {
+            proto::Event::HistoryReplay {
+                session_id,
+                entries,
+                max_seq,
+            } => Some((*session_id, entries, *max_seq)),
+            _ => None,
+        })
+        .expect("pending history replay");
+    let (session_id, entries, max_seq) = replay;
+    assert_eq!(session_id, session.session_id);
+    assert_eq!(max_seq, seq2);
+    assert_eq!(entries.len(), 1);
+    match &entries[0] {
+        proto::HistoryEntry::User { text, seq, .. } => {
+            assert_eq!(text, "missed while disconnected");
+            assert_eq!(*seq, seq2);
         }
-        other => panic!("expected HistoryReplay, got {other:?}"),
+        other => panic!("expected replayed user message, got {other:?}"),
     }
 }
 

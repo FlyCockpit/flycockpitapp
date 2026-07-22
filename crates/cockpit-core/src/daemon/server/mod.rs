@@ -26,7 +26,8 @@ use crate::daemon::DaemonPaths;
 use crate::daemon::config_source::ConfigSource;
 use crate::daemon::principal::{self, ClientPrincipal, SessionAccess};
 use crate::daemon::proto::{
-    self, Body, Envelope, ErrorCode, ErrorPayload, ProtoStream, RecvFrame, Request, Response,
+    self, Body, Envelope, ErrorCode, ErrorPayload, ProtoReadHalf, ProtoStream, ProtoWriteHalf,
+    RecvFrame, Request, Response,
 };
 use crate::daemon::registry::SessionRegistry;
 use crate::daemon::scheduler::DaemonSchedulerHandle;
@@ -49,6 +50,10 @@ use crate::redact::RedactionTable;
 const GLOBAL_EVENT_CAPACITY: usize = 64;
 const IN_PROCESS_REQUEST_QUEUE: usize = 64;
 const IN_PROCESS_EVENT_QUEUE: usize = 1024;
+// Per-client task handoff channels are bounded so a stalled socket writer or
+// request executor backpressures its producer instead of retaining unbounded
+// daemon-global or session events.
+const CLIENT_IO_CHANNEL_CAPACITY: usize = 64;
 
 static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, Weak<DaemonContext>>>> =
     OnceLock::new();
@@ -1742,15 +1747,7 @@ impl DaemonContext {
         send_event(&self.global_events, &table, event);
     }
 
-    async fn resync_caffeinate_state<S>(&self, proto: &mut ProtoStream<S>) -> Result<()>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send,
-    {
-        proto
-            .send(&Envelope::event(self.caffeinate_state_event()))
-            .await
-    }
-
+    #[cfg(test)]
     async fn resync_drain_state<S>(&self, proto: &mut ProtoStream<S>) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -1760,20 +1757,6 @@ impl DaemonContext {
         } else {
             Ok(())
         }
-    }
-
-    async fn resync_after_global_lag<S>(
-        &self,
-        proto: &mut ProtoStream<S>,
-        attached: Option<&AttachedSession>,
-    ) -> Result<()>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send,
-    {
-        self.resync_caffeinate_state(proto).await?;
-        self.resync_drain_state(proto).await?;
-        let _ = attached;
-        Ok(())
     }
 
     /// Subscribe to connector wakeups. Credential store/clear requests use
@@ -2320,13 +2303,18 @@ struct ReadyAttachment {
 
 struct AttachedSession {
     handle: SessionWorkerHandle,
-    event_rx: EventReceiver,
     /// Held for the lifetime of the attachment when this client is
     /// interactive (can answer interrupts). Dropping it on detach /
     /// re-attach / disconnect decrements the worker's interactive-client
     /// count so the loop guard reverts to headless behavior. `None` for a
     /// non-interactive attach (e.g. `cockpit run`'s event pump).
     _interactive_guard: Option<crate::daemon::session_worker::InteractiveClientGuard>,
+}
+
+#[derive(Default)]
+pub(super) struct ClientRequestEffects {
+    session_event_rx: Option<EventReceiver>,
+    shutdown_after_response: bool,
 }
 
 pub(crate) struct InProcessRequest {
@@ -2355,6 +2343,7 @@ async fn run_in_process_client(
         ctx.terminal_host.clone(),
     );
     let mut global_rx = ctx.subscribe_global();
+    let mut session_event_rx: Option<EventReceiver> = None;
 
     if event_tx.send(ctx.caffeinate_state_event()).await.is_err() {
         return;
@@ -2362,8 +2351,8 @@ async fn run_in_process_client(
 
     loop {
         let event_branch = async {
-            match state.attached.as_mut() {
-                Some(att) => Some(att.event_rx.recv().await),
+            match session_event_rx.as_mut() {
+                Some(rx) => Some(rx.recv().await),
                 None => std::future::pending().await,
             }
         };
@@ -2403,6 +2392,7 @@ async fn run_in_process_client(
                     }
                     Some(Err(broadcast::error::RecvError::Closed)) => {
                         state.attached = None;
+                        session_event_rx = None;
                     }
                     None => unreachable!("event_branch is pending when not attached"),
                 }
@@ -2412,7 +2402,8 @@ async fn run_in_process_client(
                     return;
                 };
                 let is_attach = matches!(&request, Request::Attach { .. });
-                let result = handle_request(request, &mut state, &ctx).await;
+                let mut effects = ClientRequestEffects::default();
+                let result = handle_request_with_effects(request, &mut state, &ctx, &mut effects).await;
                 let attached = matches!(&result, Ok(Response::Attached { .. }));
                 let _ = reply.send(result);
                 if is_attach && attached {
@@ -2427,6 +2418,11 @@ async fn run_in_process_client(
                         return;
                     }
                 }
+                if let Some(rx) = effects.session_event_rx.take() {
+                    session_event_rx = Some(rx);
+                } else if state.attached.is_none() {
+                    session_event_rx = None;
+                }
             }
         }
     }
@@ -2440,7 +2436,7 @@ async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()
 #[allow(dead_code)]
 pub(crate) async fn handle_relay_channel<S>(stream: S, ctx: Arc<DaemonContext>) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     handle_relay_channel_as(stream, ctx, ClientPrincipal::owner()).await
 }
@@ -2451,14 +2447,14 @@ pub(crate) async fn handle_relay_channel_as<S>(
     principal: ClientPrincipal,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     handle_client_transport_as(stream, ctx, principal).await
 }
 
 async fn handle_client_transport<S>(stream: S, ctx: Arc<DaemonContext>) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     handle_client_transport_as(stream, ctx, ClientPrincipal::owner()).await
 }
@@ -2469,12 +2465,16 @@ async fn handle_client_transport_as<S>(
     principal: ClientPrincipal,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // Count this client for the lifetime of the task. The guard
     // decrements on every return below (Layer C presence tracking).
     let _client_guard = ctx.track_client();
-    let mut proto = ProtoStream::new(stream);
+    let proto = ProtoStream::new(stream);
+    let (reader, writer) = proto.into_split();
+    let (writer_tx, writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
 
     // Emit a "hello" envelope immediately so cheap probes
     // (`probe_blocking`, third-party reachability checks) can confirm
@@ -2504,83 +2504,225 @@ where
             schema_version: ctx.db.schema_version().unwrap_or(0),
         },
     );
-    if proto.send(&hello).await.is_err() {
+    if !send_writer_envelope(&writer_tx, hello).await {
         return Ok(());
     }
+    let _ = writer_tx
+        .send(ClientWriterMessage::Envelope(Envelope::event(
+            ctx.caffeinate_state_event(),
+        )))
+        .await;
 
-    let mut state = ClientState::detached_with_principal(
-        ctx.upload_accounting.clone(),
+    let reader_task = tokio::spawn(run_client_reader(reader, executor_tx.clone()));
+    let writer_task = tokio::spawn(run_client_writer(writer, writer_rx));
+    let event_task = tokio::spawn(run_client_event_forwarder(
+        ctx.clone(),
+        principal.clone(),
+        ctx.subscribe_global(),
+        event_cmd_rx,
+        executor_tx.clone(),
+        writer_tx.clone(),
+    ));
+    let executor_task = tokio::spawn(run_client_executor(
+        ctx,
         principal,
-        ctx.terminal_host.clone(),
-    );
+        executor_rx,
+        event_cmd_tx,
+        writer_tx,
+    ));
 
-    // Daemon-global events (caffeinate, …) reach every client regardless
-    // of attachment, so this receiver lives for the whole client task.
-    let mut global_rx = ctx.subscribe_global();
+    tokio::pin!(reader_task);
+    tokio::pin!(writer_task);
+    tokio::pin!(event_task);
+    tokio::pin!(executor_task);
 
-    // On connect, sync the client's caffeinate glyph to the daemon's
-    // current state (a TUI that attaches while caffeination is already on
-    // must show ☕ immediately). Fire-and-forget; a send failure just
-    // means the client went away.
-    let _ = ctx.resync_caffeinate_state(&mut proto).await;
+    tokio::select! {
+        _ = &mut reader_task => {}
+        _ = &mut writer_task => {}
+        _ = &mut event_task => {}
+        _ = &mut executor_task => {}
+    }
 
+    reader_task.abort();
+    writer_task.abort();
+    event_task.abort();
+    executor_task.abort();
+    Ok(())
+}
+
+enum ClientExecutorInput {
+    Frame(RecvFrame),
+    SessionEventsClosed,
+}
+
+enum ClientWriterMessage {
+    Envelope(Envelope),
+    EnvelopeWithAck {
+        envelope: Envelope,
+        ack: oneshot::Sender<std::result::Result<(), String>>,
+    },
+}
+
+enum ClientEventCommand {
+    Attach(EventReceiver),
+    Detach,
+}
+
+async fn send_writer_envelope(
+    writer_tx: &mpsc::Sender<ClientWriterMessage>,
+    envelope: Envelope,
+) -> bool {
+    writer_tx
+        .send(ClientWriterMessage::Envelope(envelope))
+        .await
+        .is_ok()
+}
+
+async fn send_writer_envelope_with_ack(
+    writer_tx: &mpsc::Sender<ClientWriterMessage>,
+    envelope: Envelope,
+) -> bool {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if writer_tx
+        .send(ClientWriterMessage::EnvelopeWithAck {
+            envelope,
+            ack: ack_tx,
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    matches!(ack_rx.await, Ok(Ok(())))
+}
+
+async fn run_client_reader<R>(
+    mut reader: ProtoReadHalf<R>,
+    executor_tx: mpsc::Sender<ClientExecutorInput>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     loop {
-        // The select! pulls from whichever side of the socket has work.
-        // We have to expand `recv_event` inline because Future<Output=
-        // …> from `broadcast::Receiver::recv` borrows the receiver.
-        let inbound = async {
-            match proto.recv().await {
-                Ok(Some(env)) => Some(Ok(env)),
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
+        match reader.recv().await {
+            Ok(Some(frame)) => {
+                if executor_tx
+                    .send(ClientExecutorInput::Frame(frame))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
             }
-        };
+            Ok(None) => return,
+            Err(e) => {
+                tracing::debug!(error = ?e, "envelope decode failed; closing client");
+                return;
+            }
+        }
+    }
+}
 
-        // If there's an attached session, listen for its events too.
-        // When there isn't, the `event_branch` future is `pending`.
-        let event_branch = async {
-            match state.attached.as_mut() {
-                Some(att) => Some(att.event_rx.recv().await),
+async fn run_client_writer<W>(
+    mut writer: ProtoWriteHalf<W>,
+    mut writer_rx: mpsc::Receiver<ClientWriterMessage>,
+) where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    while let Some(message) = writer_rx.recv().await {
+        let (envelope, ack) = match message {
+            ClientWriterMessage::Envelope(envelope) => (envelope, None),
+            ClientWriterMessage::EnvelopeWithAck { envelope, ack } => (envelope, Some(ack)),
+        };
+        let result = writer.send(&envelope).await;
+        if let Some(ack) = ack {
+            let _ = ack.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+        }
+        if let Err(e) = result {
+            tracing::debug!(error = ?e, "client disconnected during envelope send");
+            return;
+        }
+    }
+}
+
+async fn run_client_event_forwarder(
+    ctx: Arc<DaemonContext>,
+    principal: ClientPrincipal,
+    mut global_rx: EventReceiver,
+    mut event_cmd_rx: mpsc::Receiver<ClientEventCommand>,
+    executor_tx: mpsc::Sender<ClientExecutorInput>,
+    writer_tx: mpsc::Sender<ClientWriterMessage>,
+) {
+    let mut session_event_rx: Option<EventReceiver> = None;
+    loop {
+        let session_branch = async {
+            match session_event_rx.as_mut() {
+                Some(rx) => Some(rx.recv().await),
                 None => std::future::pending().await,
             }
         };
 
         tokio::select! {
             biased;
+            cmd = event_cmd_rx.recv() => {
+                match cmd {
+                    Some(ClientEventCommand::Attach(rx)) => {
+                        session_event_rx = Some(rx);
+                    }
+                    Some(ClientEventCommand::Detach) => {
+                        session_event_rx = None;
+                    }
+                    None => return,
+                }
+            }
             global = global_rx.recv() => {
                 match global {
                     Ok(envelope) => {
-                        let Some(ev) = scrub_event_for_principal(&state.principal, envelope) else {
+                        let Some(event) = scrub_event_for_principal(&principal, envelope) else {
                             continue;
                         };
-                        if let Err(e) = proto.send(&Envelope::event(ev)).await {
-                            tracing::debug!(error = ?e, "client disconnected during global event send");
-                            return Ok(());
+                        if !send_writer_envelope(&writer_tx, Envelope::event(event)).await {
+                            return;
                         }
                     }
-                    // A lagging global bus is non-fatal: caffeinate state
-                    // and other daemon-global level state are re-synced
-                    // immediately so dropped edge events do not leave stale
-                    // chrome behind.
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(missed = n, "client global event stream lagged");
-                        if ctx
-                            .resync_after_global_lag(&mut proto, state.attached.as_ref())
-                            .await
-                            .is_err()
+                        if !send_writer_envelope(
+                            &writer_tx,
+                            Envelope::event(ctx.caffeinate_state_event()),
+                        )
+                        .await
                         {
-                            return Ok(());
+                            return;
+                        }
+                        if let Some(event) = ctx.drain_state_event()
+                            && !send_writer_envelope(&writer_tx, Envelope::event(event)).await
+                        {
+                            return;
+                        }
+                        if !send_writer_envelope(
+                            &writer_tx,
+                            Envelope::error(
+                                None,
+                                ErrorPayload {
+                                    code: ErrorCode::Internal,
+                                    message: format!(
+                                        "global event stream lagged by {n}; resyncing"
+                                    ),
+                                },
+                            ),
+                        )
+                        .await
+                        {
+                            return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        // The daemon is tearing down; let the socket close.
-                    }
+                    Err(broadcast::error::RecvError::Closed) => {}
                 }
             }
-            event = event_branch => {
+            event = session_branch => {
                 match event {
                     Some(Ok(envelope)) => {
-                        let Some(ev) = scrub_event_for_principal(&state.principal, envelope) else {
+                        let Some(event) = scrub_event_for_principal(&principal, envelope) else {
                             continue;
                         };
                         // A raised/resolved interrupt moves the project's
@@ -2588,89 +2730,109 @@ where
                         // recomputes and broadcasts the global plan-status
                         // state once per interrupt event; this per-client fan-
                         // out path only forwards the interrupt itself.
-                        if let Err(e) = proto.send(&Envelope::event(ev)).await {
-                            tracing::debug!(error = ?e, "client disconnected during event send");
-                            return Ok(());
+                        if !send_writer_envelope(&writer_tx, Envelope::event(event)).await {
+                            return;
                         }
                     }
                     Some(Err(broadcast::error::RecvError::Lagged(n))) => {
                         tracing::warn!(missed = n, "client event stream lagged; reattach to resync");
-                        // Per design, lagging clients re-attach. We
-                        // emit a synthetic error so the TUI surfaces it.
-                        let _ = proto
-                            .send(&Envelope::error(
+                        let _ = send_writer_envelope(
+                            &writer_tx,
+                            Envelope::error(
                                 None,
                                 ErrorPayload {
                                     code: ErrorCode::Internal,
                                     message: format!("event stream lagged by {n}; re-attach"),
                                 },
-                            ))
-                            .await;
+                            ),
+                        )
+                        .await;
                     }
                     Some(Err(broadcast::error::RecvError::Closed)) => {
-                        // The session worker exited. Detach so the
-                        // client can attach to a different session
-                        // without churning.
-                        state.attached = None;
+                        session_event_rx = None;
+                        let _ = executor_tx.send(ClientExecutorInput::SessionEventsClosed).await;
                     }
-                    None => unreachable!("event_branch is pending when not attached"),
-                }
-            }
-            recv = inbound => {
-                match recv {
-                    None => return Ok(()), // clean EOF
-                    Some(Err(e)) => {
-                        tracing::debug!(error = ?e, "envelope decode failed; closing client");
-                        return Ok(());
-                    }
-                    Some(Ok(frame)) => {
-                        match frame {
-                            RecvFrame::Envelope(env) => {
-                                handle_envelope(*env, &mut state, &ctx, &mut proto).await?;
-                            }
-                            RecvFrame::VersionMismatch { v, kind, id } => {
-                                if kind == "req"
-                                    && let Some(id) = id
-                                {
-                                    let envelope = Envelope::error(
-                                        Some(id),
-                                        ErrorPayload {
-                                            code: ErrorCode::ProtocolVersion,
-                                            message: proto::version_mismatch_message(v),
-                                        },
-                                    );
-                                    let _ = proto.send(&envelope).await;
-                                } else {
-                                    tracing::debug!(
-                                        version = v,
-                                        kind,
-                                        ?id,
-                                        "closing client after protocol version mismatch"
-                                    );
-                                }
-                                return Ok(());
-                            }
-                        }
-                    }
+                    None => unreachable!("session_branch is pending when not attached"),
                 }
             }
         }
     }
 }
 
-async fn handle_envelope<S>(
+async fn run_client_executor(
+    ctx: Arc<DaemonContext>,
+    principal: ClientPrincipal,
+    mut executor_rx: mpsc::Receiver<ClientExecutorInput>,
+    event_cmd_tx: mpsc::Sender<ClientEventCommand>,
+    writer_tx: mpsc::Sender<ClientWriterMessage>,
+) {
+    let mut state = ClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        principal,
+        ctx.terminal_host.clone(),
+    );
+    while let Some(input) = executor_rx.recv().await {
+        match input {
+            ClientExecutorInput::Frame(frame) => {
+                if !handle_client_frame(frame, &mut state, &ctx, &event_cmd_tx, &writer_tx).await {
+                    return;
+                }
+            }
+            ClientExecutorInput::SessionEventsClosed => {
+                state.attached = None;
+            }
+        }
+    }
+}
+
+async fn handle_client_frame(
+    frame: RecvFrame,
+    state: &mut ClientState,
+    ctx: &Arc<DaemonContext>,
+    event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
+    writer_tx: &mpsc::Sender<ClientWriterMessage>,
+) -> bool {
+    match frame {
+        RecvFrame::Envelope(env) => handle_envelope(*env, state, ctx, event_cmd_tx, writer_tx)
+            .await
+            .is_ok(),
+        RecvFrame::VersionMismatch { v, kind, id } => {
+            if kind == "req"
+                && let Some(id) = id
+            {
+                let envelope = Envelope::error(
+                    Some(id),
+                    ErrorPayload {
+                        code: ErrorCode::ProtocolVersion,
+                        message: proto::version_mismatch_message(v),
+                    },
+                );
+                let _ = send_writer_envelope_with_ack(writer_tx, envelope).await;
+            } else {
+                tracing::debug!(
+                    version = v,
+                    kind,
+                    ?id,
+                    "closing client after protocol version mismatch"
+                );
+            }
+            false
+        }
+    }
+}
+
+async fn handle_envelope(
     env: Envelope,
     state: &mut ClientState,
     ctx: &Arc<DaemonContext>,
-    proto: &mut ProtoStream<S>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
+    event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
+    writer_tx: &mpsc::Sender<ClientWriterMessage>,
+) -> Result<()> {
     match env.body {
         Body::Request { id, request } => {
             let is_attach = matches!(&request, Request::Attach { .. });
-            let result = handle_request(request, state, ctx).await;
+            let mut effects = ClientRequestEffects::default();
+            let result = handle_request_with_effects(request, state, ctx, &mut effects).await;
             let attached = matches!(&result, Ok(Response::Attached { .. }));
             let envelope = match result {
                 Ok(response) => {
@@ -2699,17 +2861,46 @@ where
                 }
                 Err(err) => Envelope::error(Some(id), err),
             };
-            if let Err(error) = proto.send(&envelope).await {
-                log_response_send_failed(id, envelope_kind(&envelope), &error);
+            let envelope_kind = envelope_kind(&envelope);
+            let sent = if effects.shutdown_after_response {
+                send_writer_envelope_with_ack(writer_tx, envelope).await
+            } else {
+                send_writer_envelope(writer_tx, envelope).await
+            };
+            if !sent {
+                log_response_send_failed(
+                    id,
+                    envelope_kind,
+                    &anyhow::anyhow!("client writer task ended"),
+                );
+                if effects.shutdown_after_response {
+                    request_shutdown(ctx);
+                }
+                return Ok(());
+            }
+            if effects.shutdown_after_response {
+                request_shutdown(ctx);
             }
             if is_attach && attached {
                 for event in std::mem::take(&mut state.pending_replay) {
-                    if let Err(error) = proto.send(&Envelope::event(event)).await {
-                        tracing::debug!(error = ?error, "client disconnected during attach replay");
+                    let Some(event) =
+                        scrub_replay_event_for_principal(&state.principal, state, event)
+                    else {
+                        continue;
+                    };
+                    if !send_writer_envelope(writer_tx, Envelope::event(event)).await {
+                        tracing::debug!("client disconnected during attach replay");
                         return Ok(());
                     }
                 }
-                let _ = ctx.resync_drain_state(proto).await;
+                if let Some(event) = ctx.drain_state_event() {
+                    let _ = send_writer_envelope(writer_tx, Envelope::event(event)).await;
+                }
+                if let Some(rx) = effects.session_event_rx.take() {
+                    let _ = event_cmd_tx.send(ClientEventCommand::Attach(rx)).await;
+                }
+            } else if state.attached.is_none() {
+                let _ = event_cmd_tx.send(ClientEventCommand::Detach).await;
             }
         }
         Body::Response { id, .. } => {
@@ -2723,6 +2914,20 @@ where
         }
     }
     Ok(())
+}
+
+fn scrub_replay_event_for_principal(
+    principal: &ClientPrincipal,
+    state: &ClientState,
+    event: proto::Event,
+) -> Option<proto::Event> {
+    if principal.is_owner() {
+        return Some(event);
+    }
+    let Some(attached) = state.attached.as_ref() else {
+        return Some(event);
+    };
+    scrub_proto_event(event, &attached.handle.redaction_table())
 }
 
 fn envelope_kind(envelope: &Envelope) -> &'static str {
@@ -2771,7 +2976,7 @@ mod sessions;
 #[cfg(test)]
 mod tests;
 
-use self::dispatch::handle_request;
+use self::dispatch::handle_request_with_effects;
 
 pub use attachments::validate_png_attachment_blocking;
 pub use dispatch::request_shutdown;

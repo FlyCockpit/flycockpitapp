@@ -33,8 +33,8 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
+use tokio_util::codec::{Framed, FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1311,6 +1311,18 @@ where
         }
     }
 
+    pub fn into_split(self) -> (ProtoReadHalf<ReadHalf<S>>, ProtoWriteHalf<WriteHalf<S>>) {
+        let (read, write) = tokio::io::split(self.framed.into_inner());
+        (
+            ProtoReadHalf {
+                framed: FramedRead::new(read, LinesCodec::new_with_max_length(MAX_FRAME_BYTES)),
+            },
+            ProtoWriteHalf {
+                framed: FramedWrite::new(write, LinesCodec::new_with_max_length(MAX_FRAME_BYTES)),
+            },
+        )
+    }
+
     /// Send one envelope. Serializes to a compact single-line JSON
     /// string and writes a trailing newline (`LinesCodec` adds the
     /// newline).
@@ -1333,37 +1345,87 @@ where
         Ok(())
     }
 
+    pub async fn recv(&mut self) -> Result<Option<RecvFrame>> {
+        recv_frame(&mut self.framed).await
+    }
+}
+
+pub struct ProtoReadHalf<R> {
+    framed: FramedRead<R, LinesCodec>,
+}
+
+impl<R> ProtoReadHalf<R>
+where
+    R: AsyncRead + Unpin,
+{
     /// Receive the next frame. Returns `Ok(None)` on clean EOF;
     /// returns `Err` on framing failure (frame too large, invalid UTF-8)
     /// or JSON/header deserialization failure.
     pub async fn recv(&mut self) -> Result<Option<RecvFrame>> {
-        match self.framed.next().await {
-            None => Ok(None),
-            Some(Err(e)) => Err(codec_error(e)).context("reading envelope"),
-            Some(Ok(line)) => {
-                let value: serde_json::Value =
-                    serde_json::from_str(&line).context("deserializing envelope")?;
-                let v = value
-                    .get("v")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|n| u32::try_from(n).ok())
-                    .context("deserializing envelope: missing or invalid v")?;
-                if !is_protocol_compatible(v) {
-                    let kind = value
-                        .get("kind")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let id = value
-                        .get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|raw| Uuid::parse_str(raw).ok());
-                    return Ok(Some(RecvFrame::VersionMismatch { v, kind, id }));
-                }
-                let env: Envelope =
-                    serde_json::from_value(value).context("deserializing envelope")?;
-                Ok(Some(RecvFrame::Envelope(Box::new(env))))
+        recv_frame(&mut self.framed).await
+    }
+}
+
+pub struct ProtoWriteHalf<W> {
+    framed: FramedWrite<W, LinesCodec>,
+}
+
+impl<W> ProtoWriteHalf<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    /// Send one envelope. Serializes to a compact single-line JSON
+    /// string and writes a trailing newline (`LinesCodec` adds the
+    /// newline).
+    pub async fn send(&mut self, env: &Envelope) -> Result<()> {
+        let line = serde_json::to_string(env).context("serializing envelope")?;
+        self.framed
+            .send(line)
+            .await
+            .map_err(codec_error)
+            .context("writing envelope")?;
+        Ok(())
+    }
+
+    pub async fn send_raw_line(&mut self, line: String) -> Result<()> {
+        self.framed
+            .send(line)
+            .await
+            .map_err(codec_error)
+            .context("writing raw envelope")?;
+        Ok(())
+    }
+}
+
+async fn recv_frame<T>(framed: &mut T) -> Result<Option<RecvFrame>>
+where
+    T: futures::Stream<Item = std::result::Result<String, LinesCodecError>> + Unpin,
+{
+    match framed.next().await {
+        None => Ok(None),
+        Some(Err(e)) => Err(codec_error(e)).context("reading envelope"),
+        Some(Ok(line)) => {
+            let value: serde_json::Value =
+                serde_json::from_str(&line).context("deserializing envelope")?;
+            let v = value
+                .get("v")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .context("deserializing envelope: missing or invalid v")?;
+            if !is_protocol_compatible(v) {
+                let kind = value
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let id = value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|raw| Uuid::parse_str(raw).ok());
+                return Ok(Some(RecvFrame::VersionMismatch { v, kind, id }));
             }
+            let env: Envelope = serde_json::from_value(value).context("deserializing envelope")?;
+            Ok(Some(RecvFrame::Envelope(Box::new(env))))
         }
     }
 }

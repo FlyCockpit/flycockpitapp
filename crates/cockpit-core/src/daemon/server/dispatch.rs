@@ -3,10 +3,25 @@ use super::authz::*;
 use super::sessions::*;
 use super::*;
 
+#[cfg(test)]
 pub(super) async fn handle_request(
     request: Request,
     state: &mut ClientState,
     ctx: &Arc<DaemonContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let mut effects = ClientRequestEffects::default();
+    let result = handle_request_with_effects(request, state, ctx, &mut effects).await;
+    if effects.shutdown_after_response {
+        request_shutdown(ctx);
+    }
+    result
+}
+
+pub(super) async fn handle_request_with_effects(
+    request: Request,
+    state: &mut ClientState,
+    ctx: &Arc<DaemonContext>,
+    effects: &mut ClientRequestEffects,
 ) -> std::result::Result<Response, ErrorPayload> {
     prune_expired_attachments(state);
     let request_kind = principal::request_kind(&request);
@@ -62,6 +77,7 @@ pub(super) async fn handle_request(
                 env_snapshot,
                 env_policy,
                 &principal,
+                effects,
             )
             .await
         }
@@ -1095,13 +1111,7 @@ pub(super) async fn handle_request(
             if let Some(secs) = grace_secs {
                 ctx.set_shutdown_grace_override(std::time::Duration::from_secs(secs));
             }
-            // Route through the single graceful-shutdown path
-            // (`daemon-graceful-drain-shutdown.md`): the same begin-drain /
-            // shorten-to-force transition SIGINT/SIGTERM and the ephemeral
-            // teardown use. A second `StopDaemon` while already draining
-            // shortens to an immediate force-exit instead of starting a
-            // second drain or resetting the deadline.
-            request_shutdown(ctx);
+            effects.shutdown_after_response = true;
             Ok(Response::Ack)
         }
     }
@@ -1371,6 +1381,7 @@ pub(super) async fn attach(
     env_snapshot: Option<EnvSnapshotWire>,
     env_policy: EnvDriftPolicy,
     principal: &ClientPrincipal,
+    effects: &mut ClientRequestEffects,
 ) -> std::result::Result<Response, ErrorPayload> {
     // The client's `--no-sandbox` only governs sessions it *creates*
     // (sandboxing part 2). On resume of an existing session id the session
@@ -1460,7 +1471,7 @@ pub(super) async fn attach(
     // before the old `state.attached` is replaced means a re-attach by the
     // same client transiently holds two guards, never zero — the count
     // can't briefly read headless mid-swap.
-    let event_rx = handle.subscribe();
+    let mut event_rx = handle.subscribe();
     let interactive_guard = if interactive {
         Some(handle.register_interactive_client())
     } else {
@@ -1513,7 +1524,6 @@ pub(super) async fn attach(
     state.upload_limits = extended_cfg.daemon.uploads.into();
     state.attached = Some(AttachedSession {
         handle,
-        event_rx,
         _interactive_guard: interactive_guard,
     });
 
@@ -1600,6 +1610,19 @@ pub(super) async fn attach(
             "paused work is waiting for resume or cancel after daemon restart".to_string(),
         );
     }
+
+    loop {
+        match event_rx.try_recv() {
+            Ok(envelope) => state.pending_replay.push(envelope.event),
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                tracing::warn!(missed = n, "attach hydration event replay lagged");
+                break;
+            }
+            Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    effects.session_event_rx = Some(event_rx);
 
     history = if let Some(att) = state.attached.as_ref() {
         let redact = att.handle.redaction_table();

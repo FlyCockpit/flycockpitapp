@@ -236,6 +236,9 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
         }
     }
 
+    let effective_tools = effective_grant_for_invariants(def);
+    validate_discoverable_tools_have_mcp(def, &effective_tools)?;
+
     let Some(tools) = &def.tools else {
         // No explicit tool grant — the agent inherits its role-default
         // surface from the factory; nothing further to validate here.
@@ -299,6 +302,43 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
     Ok(())
 }
 
+fn effective_grant_for_invariants(def: &AgentDef) -> Vec<String> {
+    if let Some(tools) = &def.tools {
+        return tools.clone();
+    }
+    crate::agents::embedded_default(&def.name)
+        .and_then(|embedded| embedded.tools)
+        .unwrap_or_default()
+}
+
+fn validate_discoverable_tools_have_mcp(def: &AgentDef, tools: &[String]) -> Result<()> {
+    if tools.iter().any(|tool| tool == "mcp") {
+        return Ok(());
+    }
+    for tool in tools {
+        let tier = def
+            .tool_tiers
+            .get(tool)
+            .copied()
+            .unwrap_or_else(|| discoverable_default_tier(&def.name, tool));
+        if tier == ToolTier::Discoverable {
+            bail!(
+                "agent `{}` tiers tool `{tool}` as `discoverable` but does not grant `mcp`, so the tool is unreachable — grant `mcp` or tier it `builtin`",
+                def.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn discoverable_default_tier(agent_name: &str, tool: &str) -> ToolTier {
+    if crate::engine::builtin::default_discoverable_tools_for(agent_name).contains(&tool) {
+        ToolTier::Discoverable
+    } else {
+        ToolTier::Builtin
+    }
+}
+
 #[cfg(test)]
 mod grant_tests {
     use super::*;
@@ -306,6 +346,31 @@ mod grant_tests {
 
     fn g(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn tiered_def(
+        name: &str,
+        tools: &[&str],
+        tool: &str,
+        tier: ToolTier,
+    ) -> crate::agents::AgentDef {
+        let mut tool_tiers = std::collections::BTreeMap::new();
+        tool_tiers.insert(tool.to_string(), tier);
+        crate::agents::AgentDef {
+            name: name.to_string(),
+            description: "custom".to_string(),
+            mode: AgentMode::Primary,
+            model: None,
+            temperature: None,
+            tools: Some(g(tools)),
+            tool_tiers,
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: None,
+            permission: None,
+            prompt: "body".to_string(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: std::path::PathBuf::new(),
+        }
     }
 
     /// Granting MCP to a read-only noninteractive child (`explore`) is the
@@ -377,5 +442,49 @@ mod grant_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn discoverable_without_mcp_grant_is_rejected() {
+        let def = tiered_def(
+            "custom-discoverable",
+            &["read", "word"],
+            "word",
+            ToolTier::Discoverable,
+        );
+
+        let err = validate_invariants(&def)
+            .expect_err("discoverable tool without mcp must be rejected")
+            .to_string();
+
+        assert!(err.contains("custom-discoverable"), "{err}");
+        assert!(err.contains("word"), "{err}");
+        assert!(err.contains("mcp"), "{err}");
+    }
+
+    #[test]
+    fn discoverable_with_mcp_grant_is_accepted() {
+        let with_mcp = tiered_def(
+            "custom-discoverable",
+            &["read", "word", "mcp"],
+            "word",
+            ToolTier::Discoverable,
+        );
+        let builtin = tiered_def(
+            "custom-builtin",
+            &["read", "word"],
+            "word",
+            ToolTier::Builtin,
+        );
+        let disabled = tiered_def(
+            "custom-disabled",
+            &["read", "word"],
+            "word",
+            ToolTier::Disabled,
+        );
+
+        validate_invariants(&with_mcp).expect("mcp makes discoverable tool reachable");
+        validate_invariants(&builtin).expect("builtin tier is directly reachable");
+        validate_invariants(&disabled).expect("disabled tier is not discoverable");
     }
 }

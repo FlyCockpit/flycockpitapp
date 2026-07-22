@@ -520,6 +520,8 @@ fn bee_def() -> AgentDef {
 }
 
 /// `Multireview` — hidden read-only primary reached only by `/multireview`.
+/// Grants `mcp` so its discoverable harness tools are reachable through the
+/// MCP harness advert named by the role prompt.
 fn multireview_def() -> AgentDef {
     def_with_normal(
         "Multireview",
@@ -545,6 +547,7 @@ fn multireview_def() -> AgentDef {
             "harness_invoke",
             "schedule",
             "question",
+            "mcp",
         ],
         crate::engine::builtin::MULTIREVIEW_PROMPT,
         Some(crate::engine::builtin::MULTIREVIEW_PROMPT_NORMAL),

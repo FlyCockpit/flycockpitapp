@@ -275,7 +275,7 @@ mod tests {
         tool_tiers.insert("search".to_string(), crate::agents::ToolTier::Discoverable);
         run.submit(WizardAnswer::ToolSurface(
             crate::agents::ToolSurfaceSelection {
-                tools: vec!["read".to_string(), "search".to_string()],
+                tools: vec!["read".to_string(), "search".to_string(), "mcp".to_string()],
                 tool_tiers: tool_tiers.clone(),
             },
         ))
@@ -285,7 +285,7 @@ mod tests {
         let spec =
             spec_from_wizard("helper-bot", std::path::PathBuf::from("/tmp/helper"), &run).unwrap();
         assert_eq!(spec.mode, AgentMode::All);
-        assert_eq!(spec.tools.unwrap(), vec!["read", "search"]);
+        assert_eq!(spec.tools.unwrap(), vec!["read", "search", "mcp"]);
         assert_eq!(spec.tool_tiers, tool_tiers);
     }
 }

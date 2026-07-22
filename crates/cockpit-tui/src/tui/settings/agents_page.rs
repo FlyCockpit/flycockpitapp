@@ -1126,7 +1126,7 @@ mod tests {
         fs::create_dir_all(&agents_dir).unwrap();
         fs::write(
             agents_dir.join("mine.md"),
-            "---\ndescription: mine\ntools: [read, search]\ntoolTiers:\n  search: discoverable\n---\nbody\n",
+            "---\ndescription: mine\ntools: [read, search, mcp]\ntoolTiers:\n  search: discoverable\n---\nbody\n",
         )
         .unwrap();
         let mut d = agents_dialog(&tmp);
@@ -1151,6 +1151,8 @@ mod tests {
         focus_tool(&mut d, "search");
         d.handle_key(press(KeyCode::Char(' ')));
         d.handle_key(press(KeyCode::Char('t')));
+        focus_tool(&mut d, "mcp");
+        d.handle_key(press(KeyCode::Char(' ')));
         d.handle_key(ctrl_s());
         let def = load_agent(&path, "mine");
         assert!(def.tools.unwrap().iter().any(|tool| tool == "search"));
@@ -1251,7 +1253,7 @@ mod tests {
         let path = agents_dir.join("mine.md");
         fs::write(
             &path,
-            "---\ndescription: mine\ntools: [read, search]\ntoolTiers:\n  search: discoverable\ntool_descriptions:\n  search: custom search\n---\nbody\n",
+            "---\ndescription: mine\ntools: [read, search, mcp]\ntoolTiers:\n  search: discoverable\ntool_descriptions:\n  search: custom search\n---\nbody\n",
         )
         .unwrap();
         let mut d = agents_dialog(&tmp);
@@ -1391,7 +1393,7 @@ mod tests {
         tiers.insert("search".to_string(), ToolTier::Discoverable);
         run.submit(cockpit_core::wizard::WizardAnswer::ToolSurface(
             cockpit_core::agents::ToolSurfaceSelection {
-                tools: vec!["read".to_string(), "search".to_string()],
+                tools: vec!["read".to_string(), "search".to_string(), "mcp".to_string()],
                 tool_tiers: tiers.clone(),
             },
         ))

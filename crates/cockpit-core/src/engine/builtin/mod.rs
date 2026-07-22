@@ -1289,9 +1289,9 @@ fn disabled_tier_names(def: &crate::agents::AgentDef) -> std::collections::BTree
         .collect()
 }
 
-fn default_discoverable_tools_for(name: &str) -> &'static [&'static str] {
+pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static str] {
     match name {
-        "Build" | "builder" | "Plan" | "Swarm" | "bee" | "scout" => &[
+        "Build" | "builder" | "Plan" | "Swarm" => &[
             "word",
             "hot",
             "circular",
@@ -1306,7 +1306,6 @@ fn default_discoverable_tools_for(name: &str) -> &'static [&'static str] {
             "update_goal",
             "lsp",
         ],
-        "explore" => &["word", "hot", "circular", "impact", "change_impact"],
         "Auto" | "Multireview" => &[
             "harness_list",
             "harness_invoke",
@@ -2317,7 +2316,8 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
             .with(Arc::new(crate::tools::harness::HarnessListTool))
             .with(Arc::new(crate::tools::harness::HarnessInvokeTool))
             .with(Arc::new(crate::tools::schedule::ScheduleTool))
-            .with(Arc::new(crate::tools::question::QuestionTool)),
+            .with(Arc::new(crate::tools::question::QuestionTool))
+            .with(Arc::new(crate::tools::mcp_tool::McpTool)),
             &args.config,
             &args.cwd,
             &std::collections::BTreeSet::new(),
@@ -2955,7 +2955,7 @@ mod tests {
 
         std::fs::write(
             agents_dir.join("discoverable-child.md"),
-            "---\ndescription: child\nmode: subagent\ntools: [read, search]\ntoolTiers:\n  search: discoverable\n---\nbody\n",
+            "---\ndescription: child\nmode: subagent\ntools: [read, search, mcp]\ntoolTiers:\n  search: discoverable\n---\nbody\n",
         )
         .unwrap();
         let promoted = load("discoverable-child", &args).unwrap();
@@ -3062,6 +3062,68 @@ mod tests {
                     advert_text.contains(&tool) || agent.role_prompt.contains(&tool),
                     "`{name}` discoverable tool `{tool}` is not named by an advert or role prompt"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn discoverable_tier_requires_mcp_on_every_builtin_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            let agent = load(name, &args).unwrap();
+            let discoverable = agent.tools.discoverable_mcp_tool_names();
+            if !discoverable.is_empty() {
+                assert!(
+                    agent.tools.names().contains(&"mcp"),
+                    "`{name}` has discoverable tools {discoverable:?} but no direct `mcp` tool"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multireview_reaches_harness_tools_through_mcp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let agent = load("Multireview", &args).unwrap();
+        let names = agent.tools.names();
+        let discoverable = agent.tools.discoverable_mcp_tool_names();
+
+        assert!(names.contains(&"mcp"), "{names:?}");
+        assert!(
+            discoverable.iter().any(|tool| tool == "harness_list"),
+            "{discoverable:?}"
+        );
+        assert!(
+            discoverable.iter().any(|tool| tool == "harness_invoke"),
+            "{discoverable:?}"
+        );
+
+        let direct = multireview(&args);
+        assert!(direct.tools.names().contains(&"mcp"));
+    }
+
+    #[test]
+    fn read_workers_get_intel_tail_as_direct_builtins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+
+        for name in ["explore", "scout", "bee"] {
+            let agent = load(name, &args).unwrap();
+            let names = agent.tools.names();
+            let discoverable = agent.tools.discoverable_mcp_tool_names();
+
+            assert!(discoverable.is_empty(), "`{name}`: {discoverable:?}");
+            for tool in ["word", "hot", "circular", "impact", "change_impact"] {
+                assert!(
+                    names.contains(&tool),
+                    "`{name}` missing `{tool}`: {names:?}"
+                );
+            }
+            if matches!(name, "scout" | "bee") {
+                assert!(names.contains(&"lsp"), "`{name}` missing `lsp`: {names:?}");
             }
         }
     }

@@ -1,8 +1,9 @@
 //! Approval-decision store (sandboxing part 1, §2).
 //!
-//! Records grants so a future access skips the prompt. Two grant kinds —
-//! command-key (the §1 `argv[0]`+subcommand key) and path (an absolute
-//! path or prefix, for part 2's native confinement) — across four
+//! Records grants so a future access skips the prompt. Grant kinds cover
+//! command-key (the §1 `argv[0]`+subcommand key), path (an absolute path or
+//! prefix, for part 2's native confinement), and external MCP tool keys
+//! (`server/tool`) across four
 //! scopes:
 //!
 //! - [`Once`](Scope::Once) — never stored.
@@ -195,6 +196,13 @@ struct ApprovalsFile {
     /// Path allow grants, as absolute path / prefix strings mapped to access mode.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     paths: BTreeMap<String, SandboxPathAccess>,
+    /// External MCP tool allow grants, keyed by escaped `server/tool`.
+    #[serde(
+        rename = "mcpTools",
+        default,
+        skip_serializing_if = "BTreeSet::is_empty"
+    )]
+    mcp_tools: BTreeSet<String>,
     /// Command-key **reject** grants — the allow set's mirror. A key here
     /// auto-denies a future attempt without re-prompting. Mutually exclusive
     /// with `commands` for the same key (the recorder clears the other
@@ -206,6 +214,13 @@ struct ApprovalsFile {
     /// is retained for the unified persisted shape; reject matching ignores it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     paths_reject: BTreeMap<String, SandboxPathAccess>,
+    /// External MCP tool **reject** grants — the allow set's mirror.
+    #[serde(
+        rename = "mcpToolsReject",
+        default,
+        skip_serializing_if = "BTreeSet::is_empty"
+    )]
+    mcp_tools_reject: BTreeSet<String>,
     /// Loop-guard always-accept rules, keyed by call signature (a hash of
     /// tool name + canonical `wire_input`; see [`GrantStore::loop_signature`]).
     /// A signature here auto-accepts a back-to-back repeat of that exact
@@ -433,6 +448,46 @@ impl GrantStore {
         None
     }
 
+    pub fn mcp_tool_grant_scope(&self, server: &str, tool: &str) -> Option<Scope> {
+        let key = mcp_tool_key(server, tool);
+        if self.session_has(GrantKind::McpTool, &key, Verdict::Allow) {
+            return Some(Scope::Session);
+        }
+        if self
+            .project_file()
+            .is_some_and(|f| f.mcp_tools.contains(&key))
+        {
+            return Some(Scope::Project);
+        }
+        if self
+            .global_file()
+            .is_some_and(|f| f.mcp_tools.contains(&key))
+        {
+            return Some(Scope::Global);
+        }
+        None
+    }
+
+    pub fn mcp_tool_reject_scope(&self, server: &str, tool: &str) -> Option<Scope> {
+        let key = mcp_tool_key(server, tool);
+        if self.session_has(GrantKind::McpTool, &key, Verdict::Reject) {
+            return Some(Scope::Session);
+        }
+        if self
+            .project_file()
+            .is_some_and(|f| f.mcp_tools_reject.contains(&key))
+        {
+            return Some(Scope::Project);
+        }
+        if self
+            .global_file()
+            .is_some_and(|f| f.mcp_tools_reject.contains(&key))
+        {
+            return Some(Scope::Global);
+        }
+        None
+    }
+
     #[cfg(test)]
     fn is_path_granted(&self, path: &Path) -> bool {
         self.is_path_granted_for(path, SandboxPathAccess::Read)
@@ -592,6 +647,51 @@ impl GrantStore {
             scope,
             Verdict::Reject,
             Some(SandboxPathAccess::ReadWrite),
+            None,
+        )
+    }
+
+    /// Record an external MCP tool **allow** grant at `scope`. The key is
+    /// exact `(server, tool)`: arguments are intentionally not part of the
+    /// grant, so repeated calls to the same external tool do not prompt per
+    /// argument set. `Once` is applied by the caller and never persisted.
+    pub fn record_mcp_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        scope: Scope,
+    ) -> Result<(), StoreError> {
+        if scope == Scope::Once {
+            return Err(StoreError::OnceNotPersistable);
+        }
+        self.record(
+            GrantKind::McpTool,
+            &mcp_tool_key(server, tool),
+            scope,
+            Verdict::Allow,
+            None,
+            None,
+        )
+    }
+
+    /// Record an external MCP tool **reject** grant at `scope` — the allow
+    /// recorder's mirror. Clears any standing allow for the same exact
+    /// `(server, tool)` before writing.
+    pub fn record_mcp_tool_reject(
+        &self,
+        server: &str,
+        tool: &str,
+        scope: Scope,
+    ) -> Result<(), StoreError> {
+        if scope == Scope::Once {
+            return Err(StoreError::OnceNotPersistable);
+        }
+        self.record(
+            GrantKind::McpTool,
+            &mcp_tool_key(server, tool),
+            scope,
+            Verdict::Reject,
+            None,
             None,
         )
     }
@@ -1052,6 +1152,12 @@ fn verdict_insert(
                 access.unwrap_or(SandboxPathAccess::ReadWrite),
             );
         }
+        (GrantKind::McpTool, Verdict::Allow) => {
+            file.mcp_tools.insert(key.to_string());
+        }
+        (GrantKind::McpTool, Verdict::Reject) => {
+            file.mcp_tools_reject.insert(key.to_string());
+        }
     }
 }
 
@@ -1061,6 +1167,8 @@ fn verdict_remove(file: &mut ApprovalsFile, kind: GrantKind, verdict: Verdict, k
         (GrantKind::Command, Verdict::Reject) => file.commands_reject.remove(key),
         (GrantKind::Path, Verdict::Allow) => file.paths.remove(key).is_some(),
         (GrantKind::Path, Verdict::Reject) => file.paths_reject.remove(key).is_some(),
+        (GrantKind::McpTool, Verdict::Allow) => file.mcp_tools.remove(key),
+        (GrantKind::McpTool, Verdict::Reject) => file.mcp_tools_reject.remove(key),
     }
 }
 
@@ -1070,6 +1178,21 @@ fn path_access_from_storage(value: Option<&str>) -> SandboxPathAccess {
         Some("read-write") => SandboxPathAccess::ReadWrite,
         _ => SandboxPathAccess::ReadWrite,
     }
+}
+
+pub fn mcp_tool_key(server: &str, tool: &str) -> String {
+    // MCP tool names may legally contain `/` after cockpit sanitization, so
+    // encode separators before storing the exact `(server, tool)` key. This
+    // keeps the human-readable `server/tool` shape without collisions.
+    format!(
+        "{}/{}",
+        escape_mcp_tool_key_part(server),
+        escape_mcp_tool_key_part(tool)
+    )
+}
+
+fn escape_mcp_tool_key_part(part: &str) -> String {
+    part.replace('%', "%25").replace('/', "%2F")
 }
 
 fn paths_overlap(a: &str, b: &str) -> bool {
@@ -1090,7 +1213,7 @@ pub fn project_approvals_dir(root: &Path) -> Option<PathBuf> {
     crate::config::dirs::local_config_dir_for(root).ok()
 }
 
-/// A management-UI grant kind: the four entry buckets a project/global
+/// A management-UI grant kind: the entry buckets a project/global
 /// `approvals.json` carries. Unlike [`GrantKind`] (which only spans the
 /// command/path grants the approval flow records), this also names the
 /// two loop-guard buckets so the `/permissions` UI can list and delete
@@ -1101,6 +1224,8 @@ pub enum ManagedGrantKind {
     Command,
     /// A path grant (`paths` set).
     Path,
+    /// An external MCP tool grant (`mcpTools` set).
+    McpTool,
     /// A loop-guard always-accept rule (`loop_accept` set).
     LoopAccept,
     /// A loop-guard always-reject rule (`loop_reject` set).
@@ -1114,6 +1239,7 @@ impl ManagedGrantKind {
         match self {
             ManagedGrantKind::Command => "Commands",
             ManagedGrantKind::Path => "Paths",
+            ManagedGrantKind::McpTool => "External MCP tools",
             ManagedGrantKind::LoopAccept => "Loop always-accept",
             ManagedGrantKind::LoopReject => "Loop always-reject",
         }
@@ -1147,14 +1273,15 @@ impl ManagedPathGrant {
     }
 }
 
-/// The four ordered grant buckets of one scope's `approvals.json`, each a
+/// The ordered grant buckets of one scope's `approvals.json`, each a
 /// sorted list of entries. Produced by [`list_managed_grants`] for the
-/// `/permissions` management UI; the order (commands, paths, accept,
+/// `/permissions` management UI; the order (commands, paths, MCP tools, accept,
 /// reject) is the order the UI renders sections in.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ManagedGrants {
     pub commands: Vec<ManagedCommandGrant>,
     pub paths: Vec<ManagedPathGrant>,
+    pub mcp_tools: Vec<String>,
     pub loop_accept: Vec<String>,
     pub loop_reject: Vec<String>,
 }
@@ -1165,6 +1292,7 @@ impl ManagedGrants {
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
             && self.paths.is_empty()
+            && self.mcp_tools.is_empty()
             && self.loop_accept.is_empty()
             && self.loop_reject.is_empty()
     }
@@ -1173,6 +1301,7 @@ impl ManagedGrants {
         match kind {
             ManagedGrantKind::Command => self.commands.len(),
             ManagedGrantKind::Path => self.paths.len(),
+            ManagedGrantKind::McpTool => self.mcp_tools.len(),
             ManagedGrantKind::LoopAccept => self.loop_accept.len(),
             ManagedGrantKind::LoopReject => self.loop_reject.len(),
         }
@@ -1201,6 +1330,7 @@ pub fn list_managed_grants(dir: &Path) -> ManagedGrants {
             .into_iter()
             .map(|(key, access)| ManagedPathGrant { key, access })
             .collect(),
+        mcp_tools: file.mcp_tools.into_iter().collect(),
         loop_accept: file.loop_accept.into_iter().collect(),
         loop_reject: file.loop_reject.into_iter().collect(),
     }
@@ -1219,6 +1349,7 @@ pub fn delete_managed_grant(dir: &Path, kind: ManagedGrantKind, key: &str) -> Re
     let removed = match kind {
         ManagedGrantKind::Command => file.commands.remove(key).is_some(),
         ManagedGrantKind::Path => file.paths.remove(key).is_some(),
+        ManagedGrantKind::McpTool => file.mcp_tools.remove(key),
         ManagedGrantKind::LoopAccept => file.loop_accept.remove(key),
         ManagedGrantKind::LoopReject => file.loop_reject.remove(key),
     };
@@ -1823,6 +1954,78 @@ mod tests {
     }
 
     #[test]
+    fn mcp_tool_grant_round_trips_through_session_and_file_scopes() {
+        for scope in [Scope::Session, Scope::Project, Scope::Global] {
+            let tmp = tempfile::tempdir().unwrap();
+            let global = tempfile::tempdir().unwrap();
+            let (store, sid) = test_store(tmp.path(), global.path().to_path_buf());
+
+            assert!(
+                store
+                    .mcp_tool_grant_scope("external", "search/query")
+                    .is_none()
+            );
+            store
+                .record_mcp_tool("external", "search/query", scope)
+                .unwrap();
+            assert_eq!(
+                store.mcp_tool_grant_scope("external", "search/query"),
+                Some(scope),
+                "scope {scope:?}"
+            );
+            assert!(
+                store
+                    .mcp_tool_grant_scope("external/search", "query")
+                    .is_none(),
+                "escaped key must not collide with a different server/tool split"
+            );
+
+            let key = mcp_tool_key("external", "search/query");
+            match scope {
+                Scope::Session => {
+                    let (access, risk_tier): (Option<String>, Option<String>) = store
+                        .db
+                        .read_blocking(|conn| {
+                            Ok(conn.query_row(
+                                "SELECT access, risk_tier FROM approval_grants \
+                                 WHERE session_id = ?1 AND grant_kind = 'mcp_tool' AND grant_key = ?2",
+                                rusqlite::params![sid.to_string(), key],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )?)
+                        })
+                        .unwrap();
+                    assert_eq!(access, None);
+                    assert_eq!(risk_tier, None);
+                }
+                Scope::Project => {
+                    assert_eq!(
+                        list_managed_grants(test_project_dir(&store)).mcp_tools,
+                        vec![key]
+                    );
+                }
+                Scope::Global => {
+                    assert_eq!(list_managed_grants(global.path()).mcp_tools, vec![key]);
+                }
+                Scope::Once => unreachable!(),
+            }
+
+            let mut reloaded = GrantStore::new(
+                store.db.clone(),
+                sid,
+                tmp.path().to_path_buf(),
+                SessionConfigHandle::from_disk_for_tests(tmp.path()),
+            );
+            point_project_scope(&mut reloaded, tmp.path(), global.path());
+            reloaded.global_dir = Some(global.path().to_path_buf());
+            assert_eq!(
+                reloaded.mcp_tool_grant_scope("external", "search/query"),
+                Some(scope),
+                "reload {scope:?}"
+            );
+        }
+    }
+
+    #[test]
     fn effective_path_grants_use_strongest_access_and_filter_rejects() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
@@ -2104,6 +2307,39 @@ mod tests {
             !store.is_path_rejected(&dir.join("x")),
             "allow cleared reject"
         );
+    }
+
+    #[test]
+    fn mcp_tool_reject_blocks_without_prompting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+
+        store
+            .record_mcp_tool("external", "search", Scope::Project)
+            .unwrap();
+        assert_eq!(
+            store.mcp_tool_grant_scope("external", "search"),
+            Some(Scope::Project)
+        );
+
+        store
+            .record_mcp_tool_reject("external", "search", Scope::Session)
+            .unwrap();
+        assert_eq!(
+            store.mcp_tool_reject_scope("external", "search"),
+            Some(Scope::Session)
+        );
+        assert!(store.mcp_tool_grant_scope("external", "search").is_none());
+
+        store
+            .record_mcp_tool("external", "search", Scope::Global)
+            .unwrap();
+        assert_eq!(
+            store.mcp_tool_grant_scope("external", "search"),
+            Some(Scope::Global)
+        );
+        assert!(store.mcp_tool_reject_scope("external", "search").is_none());
     }
 
     /// `Once` is never persisted in either polarity, and a wrapper command can
@@ -2483,6 +2719,26 @@ mod tests {
         assert!(delete_managed_grant(&project_dir, ManagedGrantKind::LoopAccept, &acc).unwrap());
         assert!(delete_managed_grant(&project_dir, ManagedGrantKind::LoopReject, &rej).unwrap());
         assert!(list_managed_grants(&project_dir).is_empty());
+    }
+
+    #[test]
+    fn managed_grants_list_and_revoke_mcp_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        store
+            .record_mcp_tool("external", "search", Scope::Project)
+            .unwrap();
+
+        let project_dir = test_project_dir(&store).to_path_buf();
+        let key = mcp_tool_key("external", "search");
+        let grants = list_managed_grants(&project_dir);
+        assert_eq!(grants.mcp_tools, vec![key.clone()]);
+        assert_eq!(grants.entry_count(ManagedGrantKind::McpTool), 1);
+
+        assert!(delete_managed_grant(&project_dir, ManagedGrantKind::McpTool, &key).unwrap());
+        assert!(list_managed_grants(&project_dir).is_empty());
+        assert!(store.mcp_tool_grant_scope("external", "search").is_none());
     }
 
     #[test]

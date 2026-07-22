@@ -141,6 +141,83 @@ impl Approver {
         Ok(decision)
     }
 
+    /// Gate an external MCP server tool invocation. This is distinct from
+    /// [`Self::approve_tool_call`]: the key is persistable as exact
+    /// `(server, tool)`, so the user can remember a server's tool at
+    /// session/project/global scope. Concurrent ungranted invocations may
+    /// each prompt before either records a grant; that matches command/path
+    /// behavior and avoids a per-key in-flight lock.
+    pub async fn approve_mcp_tool(&self, server: &str, tool: &str) -> Result<Decision> {
+        let target = crate::approval::store::mcp_tool_key(server, tool);
+        let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
+        if self.store.mcp_tool_reject_scope(server, tool).is_some() {
+            let decision = Decision::Deny;
+            self.record_permission_decision(
+                "mcp_tool",
+                &target,
+                &offered,
+                decision,
+                DecisionSource::StandingReject,
+            );
+            return Ok(decision);
+        }
+        if let Some(scope) = self.store.mcp_tool_grant_scope(server, tool) {
+            let decision = Decision::Allow { scope };
+            self.record_permission_decision(
+                "mcp_tool",
+                &target,
+                &offered,
+                decision,
+                DecisionSource::AlreadyGranted,
+            );
+            return Ok(decision);
+        }
+
+        let prompt = format!(
+            "`{tool}` on MCP server `{server}` wants to run. This server is external to cockpit."
+        );
+        let question = approval_question(
+            &target,
+            false,
+            GrantKind::McpTool,
+            Some(&prompt),
+            None,
+            None,
+            &offered,
+            None,
+        );
+        let response = self.raise_and_wait(&prompt, question).await?;
+        let decision = match response_to_approval_choice(&response, false) {
+            ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
+            ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
+            ApprovalChoice::Approve(scope) => {
+                if let Err(e) = self.store.record_mcp_tool(server, tool, scope) {
+                    tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool grant failed; applying once");
+                    Decision::Allow { scope: Scope::Once }
+                } else {
+                    Decision::Allow { scope }
+                }
+            }
+            ApprovalChoice::Reject(scope) => {
+                if let Err(e) = self.store.record_mcp_tool_reject(server, tool, scope) {
+                    tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool reject failed; denying once");
+                }
+                Decision::Deny
+            }
+            ApprovalChoice::Deny
+            | ApprovalChoice::ApproveAllOnce
+            | ApprovalChoice::GrantPaths(_) => Decision::Deny,
+        };
+        self.record_permission_decision(
+            "mcp_tool",
+            &target,
+            &offered,
+            decision,
+            DecisionSource::UserPrompt,
+        );
+        Ok(decision)
+    }
+
     /// Gate the `docs` pipeline's auto-clone of a NEW dependency package
     /// (implementation note). Docs.1 runs
     /// noninteractively, but adding/cloning a package into the registry is a

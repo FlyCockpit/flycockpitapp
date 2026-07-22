@@ -211,6 +211,15 @@ impl PermissionsPane {
                             });
                         }
                     }
+                    ManagedGrantKind::McpTool => {
+                        for key in &sv.grants.mcp_tools {
+                            rows.push(DeletableRow {
+                                dir: dir.clone(),
+                                kind,
+                                key: key.clone(),
+                            });
+                        }
+                    }
                     ManagedGrantKind::LoopAccept => {
                         for key in &sv.grants.loop_accept {
                             rows.push(DeletableRow {
@@ -348,6 +357,13 @@ impl PermissionsPane {
                             row_idx += 1;
                         }
                     }
+                    ManagedGrantKind::McpTool => {
+                        for key in &sv.grants.mcp_tools {
+                            let selected = row_idx == self.list.cursor();
+                            lines.push(grant_row(key, selected));
+                            row_idx += 1;
+                        }
+                    }
                     ManagedGrantKind::LoopAccept => {
                         for key in &sv.grants.loop_accept {
                             let selected = row_idx == self.list.cursor();
@@ -439,9 +455,10 @@ impl Pane for PermissionsPane {
 
 /// The kind sections, in the order the pane renders (and the order the
 /// flat row index walks) them.
-const KIND_ORDER: [ManagedGrantKind; 4] = [
+const KIND_ORDER: [ManagedGrantKind; 5] = [
     ManagedGrantKind::Command,
     ManagedGrantKind::Path,
+    ManagedGrantKind::McpTool,
     ManagedGrantKind::LoopAccept,
     ManagedGrantKind::LoopReject,
 ];
@@ -596,6 +613,7 @@ mod tests {
         let file = serde_json::json!({
             "commands": commands,
             "paths": paths,
+            "mcpTools": grants.mcp_tools,
             "loop_accept": grants.loop_accept,
             "loop_reject": grants.loop_reject,
         });
@@ -618,6 +636,7 @@ mod tests {
                     access: cockpit_core::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
                 })
                 .collect(),
+            mcp_tools: Vec::new(),
             loop_accept: Vec::new(),
             loop_reject: Vec::new(),
         }

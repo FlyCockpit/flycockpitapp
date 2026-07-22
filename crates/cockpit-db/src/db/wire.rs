@@ -73,6 +73,7 @@ pub enum SessionActivityState {
 pub enum GrantKind {
     Command,
     Path,
+    McpTool,
 }
 
 impl GrantKind {
@@ -80,6 +81,7 @@ impl GrantKind {
         match self {
             Self::Command => "command",
             Self::Path => "path",
+            Self::McpTool => "mcp_tool",
         }
     }
 }
@@ -91,8 +93,9 @@ impl std::str::FromStr for GrantKind {
         match value {
             "command" => Ok(Self::Command),
             "path" => Ok(Self::Path),
+            "mcp_tool" => Ok(Self::McpTool),
             other => Err(format!(
-                "unknown approval class `{other}`; expected command or path"
+                "unknown approval class `{other}`; expected command, path, or mcp_tool"
             )),
         }
     }

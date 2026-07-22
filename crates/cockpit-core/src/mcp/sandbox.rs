@@ -499,7 +499,7 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::mpsc;
 
     fn test_builtin_host(open: bool) -> (HostContext, Arc<AtomicBool>) {
@@ -528,6 +528,70 @@ mod tests {
         let session = ctx.session.clone();
         let host = HostContext::from_tool_ctx(&ctx).with_test_builtin_gate(gate.clone());
         (host, gate, session, rx)
+    }
+
+    fn approvable_ctx(
+        root: &std::path::Path,
+    ) -> (
+        crate::engine::tool::ToolCtx,
+        crate::db::Db,
+        Arc<crate::engine::interrupt::InterruptHub>,
+    ) {
+        let (mut ctx, db) = crate::tools::common::test_ctx_with_db(root);
+        let (events, _rx) = tokio::sync::broadcast::channel(16);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::redact::RedactionTable::empty(),
+        )));
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            redaction,
+            Arc::new(AtomicUsize::new(1)),
+            db.clone(),
+            ctx.session.id,
+        ));
+        let store = crate::approval::store::GrantStore::new(
+            db.clone(),
+            ctx.session.id,
+            root.to_path_buf(),
+            ctx.config.clone(),
+        );
+        let approver = Arc::new(crate::approval::Approver::new(
+            store,
+            db.clone(),
+            ctx.session.id,
+            ctx.agent_id.clone(),
+            hub.clone(),
+        ));
+        ctx.interrupts = hub.clone();
+        ctx.approver = Some(approver);
+        (ctx, db, hub)
+    }
+
+    async fn resolve_next_interrupt(
+        db: &crate::db::Db,
+        session_id: uuid::Uuid,
+        hub: &crate::engine::interrupt::InterruptHub,
+        response: crate::daemon::proto::ResolveResponse,
+    ) -> crate::db::needs_attention::NeedsAttentionRow {
+        let row = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(row) = db
+                    .list_open_interrupts(session_id)
+                    .unwrap()
+                    .first()
+                    .cloned()
+                {
+                    return row;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("approval prompt must be raised");
+
+        db.resolve_interrupt(row.interrupt_id, &response).unwrap();
+        assert!(hub.resolve(row.interrupt_id, response));
+        row
     }
 
     fn child_rows(
@@ -781,7 +845,20 @@ mod tests {
     async fn external_invoke_emits_child_event_marked_non_builtin() {
         let cfg = configured_external_stub_cfg();
         let tmp = tempfile::tempdir().unwrap();
-        let (host, _gate, session, mut rx) = child_event_host(tmp.path(), "outer-ext", true);
+        let (mut ctx, db, _hub) = approvable_ctx(tmp.path());
+        ctx.current_tool_call_id = Some("outer-ext".to_string());
+        let (tx, mut rx) = mpsc::channel(32);
+        ctx.events = Some(tx);
+        let session = ctx.session.clone();
+        crate::approval::store::GrantStore::new(
+            db,
+            session.id,
+            tmp.path().to_path_buf(),
+            ctx.config.clone(),
+        )
+        .record_mcp_tool("external", "echo", crate::approval::store::Scope::Session)
+        .unwrap();
+        let host = HostContext::from_tool_ctx(&ctx);
         let host = host.with_test_external_invoke(|server, tool, args| {
             Ok(serde_json::json!({
                 "server": server,
@@ -806,6 +883,328 @@ mod tests {
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0].1["mcp_builtin"], false);
         assert_eq!(starts[0].1["mcp_server"], "external");
+    }
+
+    #[tokio::test]
+    async fn external_mcp_invoke_prompts_when_ungranted() {
+        let cfg = configured_external_stub_cfg();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        let session_id = ctx.session.id;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let host = HostContext::from_tool_ctx(&ctx).with_test_external_invoke({
+            let calls = calls.clone();
+            move |server, tool, args| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({
+                    "server": server,
+                    "tool": tool,
+                    "args": args
+                }))
+            }
+        });
+
+        let script = tokio::spawn(async move {
+            run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await
+        });
+        let row = resolve_next_interrupt(
+            &db,
+            session_id,
+            &hub,
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            },
+        )
+        .await;
+        assert!(row.description.contains("external"), "{}", row.description);
+        assert!(row.description.contains("echo"), "{}", row.description);
+
+        let out = script.await.unwrap().unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["server"], "external");
+        assert_eq!(value["tool"], "echo");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn external_mcp_invoke_denied_returns_structured_refusal() {
+        let cfg = configured_external_stub_cfg();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        let session_id = ctx.session.id;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let host = HostContext::from_tool_ctx(&ctx).with_test_external_invoke({
+            let calls = calls.clone();
+            move |_server, _tool, _args| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({"unreachable": true}))
+            }
+        });
+
+        let script = tokio::spawn(async move {
+            run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await
+        });
+        resolve_next_interrupt(
+            &db,
+            session_id,
+            &hub,
+            crate::daemon::proto::ResolveResponse::Cancel,
+        )
+        .await;
+
+        let out = script.await.unwrap().unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["denied"], true);
+        assert_eq!(value["kind"], "approval_denied");
+        assert_eq!(value["server"], "external");
+        assert_eq!(value["tool"], "echo");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_mcp_invoke_noninteractive_denied_returns_structured_refusal() {
+        let cfg = configured_external_stub_cfg();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        let session_id = ctx.session.id;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let host = HostContext::from_tool_ctx(&ctx).with_test_external_invoke({
+            let calls = calls.clone();
+            move |_server, _tool, _args| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({"unreachable": true}))
+            }
+        });
+
+        let script = tokio::spawn(async move {
+            run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await
+        });
+        resolve_next_interrupt(
+            &db,
+            session_id,
+            &hub,
+            crate::daemon::proto::ResolveResponse::Freetext {
+                text: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+            },
+        )
+        .await;
+
+        let out = script.await.unwrap().unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["denied"], true);
+        assert_eq!(value["kind"], "approval_noninteractive_denied");
+        assert_eq!(value["message"], crate::approval::NONINTERACTIVE_RUN_DENIAL);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_mcp_invoke_session_grant_silences_same_tool_only() {
+        let cfg = configured_external_stub_cfg();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        let session_id = ctx.session.id;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let host = HostContext::from_tool_ctx(&ctx).with_test_external_invoke({
+            let calls = calls.clone();
+            move |server, tool, args| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({
+                    "server": server,
+                    "tool": tool,
+                    "args": args
+                }))
+            }
+        });
+
+        let script = tokio::spawn({
+            let cfg = cfg.clone();
+            let host = host.clone();
+            async move { run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await }
+        });
+        resolve_next_interrupt(
+            &db,
+            session_id,
+            &hub,
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_SESSION.to_string(),
+            },
+        )
+        .await;
+        let out = script.await.unwrap().unwrap();
+        assert!(out.contains("\"tool\":\"echo\""), "{out}");
+
+        let out = run_with_host("mcp.invoke('external', 'echo', {'x': 2})", &cfg, &host)
+            .await
+            .unwrap();
+        assert!(out.contains("\"x\":2"), "{out}");
+        assert!(db.list_open_interrupts(session_id).unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let script = tokio::spawn({
+            let cfg = cfg.clone();
+            let host = host.clone();
+            async move { run_with_host("mcp.invoke('external', 'other', {'x': 3})", &cfg, &host).await }
+        });
+        resolve_next_interrupt(
+            &db,
+            session_id,
+            &hub,
+            crate::daemon::proto::ResolveResponse::Cancel,
+        )
+        .await;
+        let out = script.await.unwrap().unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["kind"], "approval_denied");
+        assert_eq!(value["tool"], "other");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn external_mcp_invoke_once_scope_persists_nothing() {
+        let cfg = configured_external_stub_cfg();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        let session_id = ctx.session.id;
+        let host =
+            HostContext::from_tool_ctx(&ctx).with_test_external_invoke(|server, tool, args| {
+                Ok(serde_json::json!({
+                    "server": server,
+                    "tool": tool,
+                    "args": args
+                }))
+            });
+
+        let script = tokio::spawn({
+            let cfg = cfg.clone();
+            let host = host.clone();
+            async move { run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await }
+        });
+        resolve_next_interrupt(
+            &db,
+            session_id,
+            &hub,
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            },
+        )
+        .await;
+        script.await.unwrap().unwrap();
+
+        let store = crate::approval::store::GrantStore::new(
+            db.clone(),
+            session_id,
+            tmp.path().to_path_buf(),
+            ctx.config.clone(),
+        );
+        assert!(store.mcp_tool_grant_scope("external", "echo").is_none());
+
+        let script = tokio::spawn({
+            let cfg = cfg.clone();
+            let host = host.clone();
+            async move { run_with_host("mcp.invoke('external', 'echo', {'x': 2})", &cfg, &host).await }
+        });
+        resolve_next_interrupt(
+            &db,
+            session_id,
+            &hub,
+            crate::daemon::proto::ResolveResponse::Cancel,
+        )
+        .await;
+        let out = script.await.unwrap().unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["kind"], "approval_denied");
+    }
+
+    #[tokio::test]
+    async fn external_mcp_invoke_prompts_in_yolo_mode() {
+        let cfg = configured_external_stub_cfg();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
+        let session_id = ctx.session.id;
+        let host =
+            HostContext::from_tool_ctx(&ctx).with_test_external_invoke(|server, tool, args| {
+                Ok(serde_json::json!({
+                    "server": server,
+                    "tool": tool,
+                    "args": args
+                }))
+            });
+
+        let script = tokio::spawn(async move {
+            run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await
+        });
+        let row = resolve_next_interrupt(
+            &db,
+            session_id,
+            &hub,
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            },
+        )
+        .await;
+        assert!(row.description.contains("external"), "{}", row.description);
+        let out = script.await.unwrap().unwrap();
+        assert!(out.contains("\"tool\":\"echo\""), "{out}");
+    }
+
+    #[tokio::test]
+    async fn builtin_mcp_invoke_is_not_double_gated() {
+        let cfg = McpConfig::default();
+        let (host, _gate) = test_builtin_host(true);
+
+        let out = run_with_host(
+            "mcp.invoke('cockpit', 'test_count', {'count': 1})",
+            &cfg,
+            &host,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("\"count\":1"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn mcp_describe_is_not_gated() {
+        let cfg = configured_external_stub_cfg();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, db, _hub) = approvable_ctx(tmp.path());
+        let session_id = ctx.session.id;
+        let host = HostContext::from_tool_ctx(&ctx);
+
+        let err = run_with_host("mcp.describe('external', 'echo')", &cfg, &host)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("mcp.describe failed"), "{err}");
+        assert!(
+            db.list_open_interrupts(session_id).unwrap().is_empty(),
+            "describe must not ask for external MCP invoke approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_mcp_invoke_without_approver_is_denied() {
+        let cfg = configured_external_stub_cfg();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let host = HostContext::from_tool_ctx(&ctx).with_test_external_invoke({
+            let calls = calls.clone();
+            move |_server, _tool, _args| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({"unreachable": true}))
+            }
+        });
+
+        let out = run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["denied"], true);
+        assert_eq!(value["kind"], "approval_noninteractive_denied");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1063,13 +1462,13 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_host_function_surfaces_error_in_sandbox() {
-        // `mcp.invoke` on an unknown server reaches the host catalog, which
+        // `mcp.describe` on an unknown server reaches the host catalog, which
         // returns an error; the sandbox sees it as a Python exception that
         // the script can catch — proving the host-routing seam end to end.
         let cfg = McpConfig::default();
         let script = "\
 try:
-    mcp.invoke('nope', 'tool', {})
+    mcp.describe('nope', 'tool')
     r = 'no-error'
 except Exception as e:
     r = 'caught'
@@ -1084,14 +1483,19 @@ r";
     #[tokio::test]
     async fn mcp_host_result_returns_into_sandbox_for_processing() {
         // The result of a host call returns *into* the sandbox (not directly
-        // to model context): the script can branch on it. Here the host
-        // rejects the call, the script distills its own final value.
+        // to model context): the script can branch on it. Here external
+        // invoke approval is unavailable, so the structured denial returns
+        // as data and the script distills its own final value.
         let cfg = McpConfig::default();
+        let mut cfg = cfg;
+        cfg.servers.insert(
+            "nope".into(),
+            configured_external_stub_cfg().servers["external"].clone(),
+        );
         let script = "\
 ok = True
-try:
-    mcp.invoke('nope', 't', {'k': 1})
-except Exception:
+result = mcp.invoke('nope', 't', {'k': 1})
+if result.get('denied'):
     ok = False
 {'ran': True, 'ok': ok}";
         let out = run(script, &cfg).await.unwrap();
@@ -1242,7 +1646,18 @@ for line in sys.stdin:
         let tmp = fake_stdio_server();
         let script = tmp.path().join("fake-mcp.py");
         let cfg = monty_stdio_cfg(script.to_str().unwrap());
-        let out = run("mcp.invoke('fake', 'count', {'count': '3'})", &cfg)
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, db, _hub) = approvable_ctx(root.path());
+        crate::approval::store::GrantStore::new(
+            db,
+            ctx.session.id,
+            root.path().to_path_buf(),
+            ctx.config.clone(),
+        )
+        .record_mcp_tool("fake", "count", crate::approval::store::Scope::Session)
+        .unwrap();
+        let host = HostContext::from_tool_ctx(&ctx);
+        let out = run_with_host("mcp.invoke('fake', 'count', {'count': '3'})", &cfg, &host)
             .await
             .unwrap();
         assert!(out.contains("\"count\":3"), "{out}");

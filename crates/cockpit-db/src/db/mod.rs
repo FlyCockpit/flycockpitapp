@@ -1369,6 +1369,52 @@ mod tests {
     }
 
     #[test]
+    fn approval_grants_allows_mcp_tool_kind_with_null_access() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        db.write_blocking(move |conn| {
+            conn.execute(
+                "INSERT INTO sessions \
+                 (session_id, project_id, project_root, started_at, last_active_at) \
+                 VALUES (?1, 'project', '/tmp/project', 1, 1)",
+                [&session_id],
+            )?;
+
+            conn.execute(
+                "INSERT INTO approval_grants \
+                 (session_id, grant_kind, grant_key, granted_at, verdict, access, risk_tier) \
+                 VALUES (?1, 'mcp_tool', 'external/search', 2, 'allow', NULL, NULL)",
+                [&session_id],
+            )?;
+
+            let access_result = conn.execute(
+                "INSERT INTO approval_grants \
+                 (session_id, grant_kind, grant_key, granted_at, verdict, access, risk_tier) \
+                 VALUES (?1, 'mcp_tool', 'external/read', 2, 'allow', 'read', NULL)",
+                [&session_id],
+            );
+            assert!(
+                access_result.is_err(),
+                "mcp_tool grants must not carry access"
+            );
+
+            let tier_result = conn.execute(
+                "INSERT INTO approval_grants \
+                 (session_id, grant_kind, grant_key, granted_at, verdict, access, risk_tier) \
+                 VALUES (?1, 'mcp_tool', 'external/write', 2, 'allow', NULL, 'ordinary')",
+                [&session_id],
+            );
+            assert!(
+                tier_result.is_err(),
+                "mcp_tool grants must not carry risk_tier"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn no_second_migration_file_exists() {
         let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")

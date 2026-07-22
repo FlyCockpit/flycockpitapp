@@ -108,6 +108,17 @@ pub async fn invoke(
     if builtin::is_builtin_server(server) {
         return builtin::invoke(host, tool, args).await;
     }
+    // External MCP tools are third-party code and use their own exact
+    // `(server, tool)` grant-or-ask seam. This sits after the builtin early
+    // return so cockpit's own Monty tools are not double-gated, and before
+    // the test hook so stubbed external invocations validate the same path.
+    match approve_external_mcp_tool(host, server, tool).await? {
+        crate::approval::Decision::Allow { .. } => {}
+        crate::approval::Decision::Deny => return Ok(mcp_tool_denial(server, tool, false)),
+        crate::approval::Decision::NoninteractiveDeny => {
+            return Ok(mcp_tool_denial(server, tool, true));
+        }
+    }
     #[cfg(test)]
     if let Some(result) = host.test_external_invoke(server, tool, args.clone()) {
         return result;
@@ -120,6 +131,40 @@ pub async fn invoke(
     }
     let mut conn = client::connect(server, server_cfg).await?;
     conn.call_tool(tool, args).await
+}
+
+async fn approve_external_mcp_tool(
+    host: &HostContext,
+    server: &str,
+    tool: &str,
+) -> Result<crate::approval::Decision> {
+    let Some(tool_ctx) = host.native_tool_ctx.as_ref() else {
+        return Ok(crate::approval::Decision::NoninteractiveDeny);
+    };
+    let Some(approver) = tool_ctx.approver.as_ref() else {
+        return Ok(crate::approval::Decision::NoninteractiveDeny);
+    };
+    approver.approve_mcp_tool(server, tool).await
+}
+
+fn mcp_tool_denial(server: &str, tool: &str, noninteractive: bool) -> Value {
+    if noninteractive {
+        serde_json::json!({
+            "denied": true,
+            "kind": "approval_noninteractive_denied",
+            "server": server,
+            "tool": tool,
+            "message": crate::approval::NONINTERACTIVE_RUN_DENIAL
+        })
+    } else {
+        serde_json::json!({
+            "denied": true,
+            "kind": "approval_denied",
+            "server": server,
+            "tool": tool,
+            "message": "external MCP tool call denied"
+        })
+    }
 }
 
 fn sanitize_tool_descriptors(tools: Vec<ToolDescriptor>) -> Vec<ToolDescriptor> {
@@ -137,6 +182,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
 
     fn server(mode: DisclosureMode) -> ServerConfig {
         ServerConfig {
@@ -212,13 +258,32 @@ for line in sys.stdin:
     async fn invoke_rejects_unknown_and_disabled_servers() {
         let mut cfg = McpConfig::default();
         let host = HostContext::empty_for_tests();
-        let err = invoke(&cfg, &host, "nope", "t", Value::Null)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("unknown MCP server"));
+        let out = invoke(&cfg, &host, "nope", "t", Value::Null).await.unwrap();
+        assert_eq!(out["denied"], true);
+        assert_eq!(out["kind"], "approval_noninteractive_denied");
+
         let mut s = server(DisclosureMode::Monty);
         s.enabled = false;
         cfg.servers.insert("off".into(), s);
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        let store = crate::approval::store::GrantStore::new(
+            db.clone(),
+            ctx.session.id,
+            tmp.path().to_path_buf(),
+            ctx.config.clone(),
+        );
+        store
+            .record_mcp_tool("off", "t", crate::approval::store::Scope::Session)
+            .unwrap();
+        ctx.approver = Some(Arc::new(crate::approval::Approver::new(
+            store,
+            db,
+            ctx.session.id,
+            ctx.agent_id.clone(),
+            ctx.interrupts.clone(),
+        )));
+        let host = HostContext::from_tool_ctx(&ctx);
         let err = invoke(&cfg, &host, "off", "t", Value::Null)
             .await
             .unwrap_err();

@@ -621,24 +621,25 @@ CREATE TABLE compaction_shadows (
 );
 
 -- ---- approval_grants (sandboxing part 1, §2) -------------------------------------
--- Session-scope command/path approval grants; a present row skips the
+-- Session-scope command/path/MCP-tool approval grants; a present row skips the
 -- approval prompt. Project- and Global-scope grants persist outside the
 -- DB in the layered `.cockpit/` config dirs — only Session belongs in
 -- SQLite (dropped with the session via CASCADE).
 --
 -- `grant_kind` is 'command' (keyed by argv[0]+subcommand, e.g. `gh pr`)
--- or 'path'. Wrapper/eval commands are NEVER persisted here — the store
--- layer rejects them before insert. `risk_tier` records the command tier
+-- or 'path' or 'mcp_tool' (keyed by external MCP server/tool). Wrapper/eval
+-- commands are NEVER persisted here — the store layer rejects them before
+-- insert. `risk_tier` records the command tier
 -- displayed when an allow grant was issued, so future invocations of the
 -- same coarse command key only skip the prompt when their recomputed tier
--- is no higher. Path grants and command rejects carry no tier.
+-- is no higher. Path grants, MCP-tool grants, and rejects carry no tier.
 -- `verdict` carries the polarity; the (session_id, grant_kind, grant_key)
 -- PK means allow and reject for the same key can never coexist — the
 -- recorder flips the verdict in place via INSERT OR REPLACE.
 
 CREATE TABLE approval_grants (
     session_id  TEXT    NOT NULL,
-    grant_kind  TEXT    NOT NULL CHECK (grant_kind IN ('command', 'path')),
+    grant_kind  TEXT    NOT NULL CHECK (grant_kind IN ('command', 'path', 'mcp_tool')),
     grant_key   TEXT    NOT NULL,
     granted_at  INTEGER NOT NULL,
     verdict     TEXT    NOT NULL DEFAULT 'allow'

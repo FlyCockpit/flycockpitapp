@@ -48,11 +48,11 @@
 //!
 //! Centrality is a whole-graph property, so a single changed file shifts
 //! other files' scores. [`recompute_centrality`] rebuilds the
-//! `intel_centrality(root, path, score)` table **wholesale** via one SQL
-//! aggregate join, run once per `ensure_fresh` pass that wrote any chunk
-//! (cheap — no re-parse). The query hot path reads it via
-//! [`load_centrality`]; an absent/empty table degrades gracefully to
-//! unranked order (returns an empty map), never panics.
+//! `intel_centrality(root, path, score)` table **wholesale** when the
+//! stored centrality generation is stale relative to indexed content
+//! (cheap — no re-parse). The query hot path reads it via [`load_centrality`];
+//! an absent/empty table degrades gracefully to unranked order (returns an
+//! empty map), never panics.
 
 use std::collections::HashMap;
 
@@ -168,9 +168,42 @@ pub fn resolve_defs(
 /// Recompute `intel_centrality` for `root` wholesale. Deletes the old
 /// rows and re-derives every file's weighted in-degree via the 1/M split
 /// over `intel_callsites ⋈ intel_symbols`. Deterministic: pure SQL +
-/// arithmetic, no ordering-dependent accumulation. Called once per
-/// `ensure_fresh` pass that wrote any chunk.
+/// arithmetic, no ordering-dependent accumulation.
 pub fn recompute_centrality(conn: &Connection, root: &str) -> rusqlite::Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = recompute_centrality_in_transaction(conn, root, None);
+    match result {
+        Ok(()) => {
+            if let Err(err) = conn.execute_batch("COMMIT;") {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(err)
+            } else {
+                Ok(())
+            }
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(err)
+        }
+    }
+}
+
+/// Recompute `intel_centrality` and record the content generation it was
+/// built from in the caller's active transaction. The caller is responsible
+/// for checking staleness before invoking this.
+pub(crate) fn recompute_centrality_at_generation(
+    conn: &Connection,
+    root: &str,
+    built_generation: i64,
+) -> rusqlite::Result<()> {
+    recompute_centrality_in_transaction(conn, root, Some(built_generation))
+}
+
+fn recompute_centrality_in_transaction(
+    conn: &Connection,
+    root: &str,
+    built_generation: Option<i64>,
+) -> rusqlite::Result<()> {
     // Pull every callsite's (callee_name, callee_kind) and tally resolved
     // definitions in Rust so the kind→def-kind mapping and the denylist
     // live in exactly one place (this module), not duplicated in SQL.
@@ -204,16 +237,17 @@ pub fn recompute_centrality(conn: &Connection, root: &str) -> rusqlite::Result<(
         }
     }
 
-    let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM intel_centrality WHERE root = ?1", [root])?;
+    conn.execute("DELETE FROM intel_centrality WHERE root = ?1", [root])?;
     {
         let mut ins =
-            tx.prepare("INSERT INTO intel_centrality (root, path, score) VALUES (?1, ?2, ?3)")?;
+            conn.prepare("INSERT INTO intel_centrality (root, path, score) VALUES (?1, ?2, ?3)")?;
         for (path, score) in &scores {
             ins.execute(rusqlite::params![root, path, score])?;
         }
     }
-    tx.commit()?;
+    if let Some(built_generation) = built_generation {
+        super::store_centrality_built_generation(conn, root, built_generation)?;
+    }
     Ok(())
 }
 

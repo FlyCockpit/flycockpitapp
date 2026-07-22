@@ -110,6 +110,8 @@ static TEST_WALK_COUNT: OnceLock<TestCountCell> = OnceLock::new();
 #[cfg(test)]
 static TEST_RECOMPUTE_COUNT: OnceLock<TestCountCell> = OnceLock::new();
 #[cfg(test)]
+static TEST_RECOMPUTE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+#[cfg(test)]
 static TEST_NOW_SECS: OnceLock<Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicI64>>>> =
     OnceLock::new();
 
@@ -249,6 +251,14 @@ pub(crate) fn set_test_recompute_counter(
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap() = root_key.zip(counter);
+}
+
+#[cfg(test)]
+pub(crate) async fn test_recompute_counter_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_RECOMPUTE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
 #[cfg(test)]
@@ -700,9 +710,35 @@ impl Index {
     pub fn centrality_scores(&self) -> Result<HashMap<String, f64>> {
         let root_key = self.root_key.clone();
         self.db.write_blocking(move |conn| {
-            record_recompute_centrality(&root_key);
-            callgraph::recompute_centrality(conn, &root_key)?;
-            Ok(callgraph::load_centrality(conn, &root_key)?)
+            conn.execute_batch("BEGIN IMMEDIATE;")
+                .context("locking intel centrality generation")?;
+            let result = (|| {
+                let content_generation = load_or_initialize_content_generation(conn, &root_key)?;
+                let built_generation = load_centrality_built_generation(conn, &root_key)?;
+                if built_generation != Some(content_generation) {
+                    record_recompute_centrality(&root_key);
+                    callgraph::recompute_centrality_at_generation(
+                        conn,
+                        &root_key,
+                        content_generation,
+                    )?;
+                }
+                Ok(callgraph::load_centrality(conn, &root_key)?)
+            })();
+            match result {
+                Ok(scores) => {
+                    if let Err(err) = conn.execute_batch("COMMIT;") {
+                        let _ = conn.execute_batch("ROLLBACK;");
+                        Err(err).context("committing intel centrality transaction")
+                    } else {
+                        Ok(scores)
+                    }
+                }
+                Err(err) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(err)
+                }
+            }
         })
     }
 
@@ -1002,6 +1038,9 @@ fn apply_fresh_metadata(
         return Ok(());
     }
     let tx = conn.unchecked_transaction()?;
+    if !removed.is_empty() {
+        bump_content_generation(&tx, root_key)?;
+    }
     {
         let mut del = tx.prepare("DELETE FROM intel_files WHERE root = ?1 AND path = ?2")?;
         for path in removed {
@@ -1132,6 +1171,72 @@ fn disk_file_for(abs: &Path, root: &Path) -> Option<DiskFile> {
 
 type IndexedMap = HashMap<String, (i64, i64, String)>;
 
+const INTEL_CONTENT_GENERATION_KEY: &str = "intel_content_generation";
+const CENTRALITY_BUILT_GENERATION_KEY: &str = "centrality_built_generation";
+
+fn load_meta_generation(conn: &Connection, root_key: &str, key: &str) -> Result<Option<i64>> {
+    let generation = conn
+        .query_row(
+            "SELECT value FROM intel_meta WHERE root = ?1 AND key = ?2",
+            params![root_key, key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(generation)
+}
+
+fn store_meta_generation(
+    conn: &Connection,
+    root_key: &str,
+    key: &str,
+    generation: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO intel_meta (root, key, value) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(root, key) DO UPDATE SET value = excluded.value",
+        params![root_key, key, generation],
+    )?;
+    Ok(())
+}
+
+fn load_or_initialize_content_generation(conn: &Connection, root_key: &str) -> Result<i64> {
+    match load_meta_generation(conn, root_key, INTEL_CONTENT_GENERATION_KEY)? {
+        Some(generation) => Ok(generation),
+        None => {
+            store_meta_generation(conn, root_key, INTEL_CONTENT_GENERATION_KEY, 0)?;
+            Ok(0)
+        }
+    }
+}
+
+fn load_centrality_built_generation(conn: &Connection, root_key: &str) -> Result<Option<i64>> {
+    load_meta_generation(conn, root_key, CENTRALITY_BUILT_GENERATION_KEY)
+}
+
+pub(crate) fn store_centrality_built_generation(
+    conn: &Connection,
+    root_key: &str,
+    generation: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO intel_meta (root, key, value) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(root, key) DO UPDATE SET value = excluded.value",
+        params![root_key, CENTRALITY_BUILT_GENERATION_KEY, generation],
+    )?;
+    Ok(())
+}
+
+fn bump_content_generation(conn: &Connection, root_key: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO intel_meta (root, key, value) VALUES (?1, ?2, 1) \
+         ON CONFLICT(root, key) DO UPDATE SET value = value + 1",
+        params![root_key, INTEL_CONTENT_GENERATION_KEY],
+    )?;
+    let generation = load_meta_generation(conn, root_key, INTEL_CONTENT_GENERATION_KEY)?
+        .context("content generation missing after bump")?;
+    Ok(generation)
+}
+
 fn load_index_logic_version(conn: &Connection, root_key: &str) -> Result<Option<i64>> {
     let version = conn
         .query_row(
@@ -1246,7 +1351,11 @@ fn write_chunk(
     parsed: &[ParsedFile],
     now: i64,
 ) -> Result<()> {
+    if parsed.is_empty() {
+        return Ok(());
+    }
     let tx = conn.unchecked_transaction()?;
+    bump_content_generation(&tx, root_key)?;
     {
         let mut del = tx.prepare("DELETE FROM intel_files WHERE root = ?1 AND path = ?2")?;
         let mut ins_file = tx.prepare(
@@ -1539,6 +1648,18 @@ mod tests {
                 [root_key],
                 |r| r.get(0),
             )?)
+        })
+        .unwrap()
+    }
+
+    fn stored_content_generation(db: &Db, root_key: &str) -> Option<i64> {
+        db.read_blocking(|conn| load_meta_generation(conn, root_key, INTEL_CONTENT_GENERATION_KEY))
+            .unwrap()
+    }
+
+    fn stored_centrality_built_generation(db: &Db, root_key: &str) -> Option<i64> {
+        db.read_blocking(|conn| {
+            load_meta_generation(conn, root_key, CENTRALITY_BUILT_GENERATION_KEY)
         })
         .unwrap()
     }
@@ -2051,6 +2172,159 @@ mod tests {
             .copied()
             .unwrap_or(0.0);
         assert_eq!(after, 0.0, "removed caller's edge must not persist");
+    }
+
+    #[tokio::test]
+    async fn centrality_recomputes_after_index_content_changes() {
+        let _guard = test_recompute_counter_guard().await;
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let root_key = root.to_string_lossy().into_owned();
+        write_file(&root, "lib.rs", "pub fn target() {}\n");
+        let index = Index::new(db.clone(), root.clone());
+        index.ensure_fresh().await.unwrap();
+
+        let recomputes = Arc::new(AtomicUsize::new(0));
+        set_test_recompute_counter(Some(root_key.clone()), Some(recomputes.clone()));
+        let before = index.centrality_scores().unwrap();
+        assert_eq!(recomputes.load(Ordering::SeqCst), 1);
+
+        write_file(&root, "caller.rs", "pub fn caller() {\n    target();\n}\n");
+        clear_freshness_cache();
+        index.ensure_fresh().await.unwrap();
+
+        let after = index.centrality_scores().unwrap();
+        assert_eq!(recomputes.load(Ordering::SeqCst), 2);
+        assert_ne!(before, after);
+        assert!(
+            after.get("lib.rs").copied().unwrap_or(0.0) > 0.0,
+            "new caller should raise target file centrality: {after:?}"
+        );
+        set_test_recompute_counter(None, None);
+    }
+
+    #[tokio::test]
+    async fn stat_only_refresh_does_not_bump_centrality_generation() {
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let root_key = root.to_string_lossy().into_owned();
+        let body = "pub fn x() {}\n";
+        write_file(&root, "x.rs", body);
+        let index = Index::new(db.clone(), root.clone());
+        index.ensure_fresh().await.unwrap();
+        let before = stored_content_generation(&db, &root_key).expect("generation exists");
+
+        let write_root_key = root_key.clone();
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE intel_files SET mtime_ns = -1 WHERE root = ?1 AND path = 'x.rs'",
+                [&write_root_key],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        clear_freshness_cache();
+        index.ensure_fresh().await.unwrap();
+
+        assert_eq!(stored_content_generation(&db, &root_key), Some(before));
+    }
+
+    #[tokio::test]
+    async fn centrality_scores_memoized_across_index_handles() {
+        let _guard = test_recompute_counter_guard().await;
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let root_key = root.to_string_lossy().into_owned();
+        write_file(
+            &root,
+            "lib.rs",
+            "pub fn target() {}\npub fn caller() { target(); }\n",
+        );
+        let first = Index::new(db.clone(), root.clone());
+        first.ensure_fresh().await.unwrap();
+
+        let recomputes = Arc::new(AtomicUsize::new(0));
+        set_test_recompute_counter(Some(root_key.clone()), Some(recomputes.clone()));
+        let second = Index::new(db.clone(), root.clone());
+        let first_scores = first.centrality_scores().unwrap();
+        let second_scores = second.centrality_scores().unwrap();
+
+        assert_eq!(recomputes.load(Ordering::SeqCst), 1);
+        assert_eq!(first_scores, second_scores);
+        assert_eq!(
+            stored_centrality_built_generation(&db, &root_key),
+            stored_content_generation(&db, &root_key)
+        );
+        set_test_recompute_counter(None, None);
+    }
+
+    #[tokio::test]
+    async fn centrality_generation_is_partitioned_by_root() {
+        let db = Db::open_in_memory().unwrap();
+        let tmp_a = tempfile::tempdir().unwrap();
+        let tmp_b = tempfile::tempdir().unwrap();
+        let root_a = tmp_a.path().to_path_buf();
+        let root_b = tmp_b.path().to_path_buf();
+        let root_key_a = root_a.to_string_lossy().into_owned();
+        let root_key_b = root_b.to_string_lossy().into_owned();
+        write_file(&root_a, "a.rs", "pub fn a() {}\n");
+        write_file(&root_b, "b.rs", "pub fn b() {}\n");
+        let index_a = Index::new(db.clone(), root_a.clone());
+        let index_b = Index::new(db.clone(), root_b.clone());
+        index_a.ensure_fresh().await.unwrap();
+        index_b.ensure_fresh().await.unwrap();
+        index_a.centrality_scores().unwrap();
+        index_b.centrality_scores().unwrap();
+        assert_eq!(stored_content_generation(&db, &root_key_a), Some(1));
+        assert_eq!(stored_content_generation(&db, &root_key_b), Some(1));
+        assert_eq!(
+            stored_centrality_built_generation(&db, &root_key_a),
+            stored_content_generation(&db, &root_key_a)
+        );
+        assert_eq!(
+            stored_centrality_built_generation(&db, &root_key_b),
+            stored_content_generation(&db, &root_key_b)
+        );
+
+        write_file(&root_a, "a2.rs", "pub fn a2() { a(); }\n");
+        clear_freshness_cache();
+        index_a.ensure_fresh().await.unwrap();
+
+        assert_eq!(stored_content_generation(&db, &root_key_a), Some(2));
+        assert_eq!(stored_content_generation(&db, &root_key_b), Some(1));
+        assert_ne!(
+            stored_centrality_built_generation(&db, &root_key_a),
+            stored_content_generation(&db, &root_key_a),
+            "root A should be stale after its write"
+        );
+        assert_eq!(
+            stored_centrality_built_generation(&db, &root_key_b),
+            stored_content_generation(&db, &root_key_b),
+            "root A writes must not make root B stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_refresh_bumps_centrality_generation() {
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let root_key = root.to_string_lossy().into_owned();
+        write_file(&root, "src/a.rs", "pub fn a() {}\n");
+        write_file(&root, "other/b.rs", "pub fn b() {}\n");
+        let index = Index::new(db.clone(), root.clone());
+        index.ensure_fresh().await.unwrap();
+        let before = stored_content_generation(&db, &root_key).expect("generation exists");
+
+        write_file(&root, "src/c.rs", "pub fn c() { a(); }\n");
+        clear_freshness_cache();
+        index.ensure_fresh_scoped(Some("src")).await.unwrap();
+
+        assert_eq!(stored_content_generation(&db, &root_key), Some(before + 1));
     }
 
     #[tokio::test]

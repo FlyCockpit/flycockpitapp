@@ -1,6 +1,9 @@
 use super::*;
 use crate::engine::tool::Tool;
-use crate::intel::{clear_freshness_cache, set_test_recompute_counter, set_test_walk_counter};
+use crate::intel::{
+    clear_freshness_cache, set_test_recompute_counter, set_test_walk_counter,
+    test_recompute_counter_guard,
+};
 use crate::tools::common::test_ctx;
 use crate::tools::intel::common::set_test_index_allowlist;
 use std::collections::HashMap;
@@ -333,6 +336,7 @@ async fn unscoped_tree_call_walks_the_filesystem_once() {
 
 #[tokio::test]
 async fn tree_call_does_not_recompute_centrality_inline() {
+    let _guard = test_recompute_counter_guard().await;
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
     let ctx = test_ctx(tmp.path());
@@ -350,6 +354,84 @@ async fn tree_call_does_not_recompute_centrality_inline() {
         0,
         "tree should not recompute callgraph centrality on its read path"
     );
+    set_test_recompute_counter(None, None);
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn repeated_search_calls_recompute_centrality_once() {
+    let _guard = test_recompute_counter_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/lib.rs",
+        "pub fn target() {}\npub fn caller() {\n    target();\n}\n",
+    );
+    let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+    let index = crate::intel::Index::new(db, ctx.session.project_root.clone());
+    index.ensure_fresh().await.unwrap();
+    let root_key = ctx.session.project_root.to_string_lossy().into_owned();
+    let recomputes = Arc::new(AtomicUsize::new(0));
+    set_test_recompute_counter(Some(root_key), Some(recomputes.clone()));
+
+    for _ in 0..3 {
+        let out = SearchTool
+            .call(serde_json::json!({ "pattern": "target" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.content.contains("src/lib.rs"), "{}", out.content);
+    }
+
+    assert_eq!(recomputes.load(Ordering::SeqCst), 1);
+    set_test_recompute_counter(None, None);
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn intel_tools_in_one_turn_recompute_centrality_once() {
+    let _guard = test_recompute_counter_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/lib.rs",
+        "pub fn target() {}\npub fn caller() {\n    target();\n}\n",
+    );
+    let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+    let index = crate::intel::Index::new(db, ctx.session.project_root.clone());
+    index.ensure_fresh().await.unwrap();
+    let root_key = ctx.session.project_root.to_string_lossy().into_owned();
+    let recomputes = Arc::new(AtomicUsize::new(0));
+    set_test_recompute_counter(Some(root_key), Some(recomputes.clone()));
+
+    let search = SearchTool
+        .call(serde_json::json!({ "pattern": "target" }), &ctx)
+        .await
+        .unwrap();
+    assert!(search.content.contains("src/lib.rs"), "{}", search.content);
+    let symbols = SymbolFindTool
+        .call(serde_json::json!({ "name": "target", "exact": true }), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        symbols.content.contains("src/lib.rs"),
+        "{}",
+        symbols.content
+    );
+    let impact = ImpactTool
+        .call(serde_json::json!({ "name": "target" }), &ctx)
+        .await
+        .unwrap();
+    assert!(impact.content.contains("caller"), "{}", impact.content);
+    let context = ContextPackTool
+        .call(
+            serde_json::json!({ "target": "target", "kind": "symbol" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(context.content.contains("target"), "{}", context.content);
+
+    assert_eq!(recomputes.load(Ordering::SeqCst), 1);
     set_test_recompute_counter(None, None);
     clear_freshness_cache();
 }

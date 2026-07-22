@@ -17,9 +17,9 @@ fn batch_count_for_prompting(
 ) -> Option<u32> {
     let step_count = prompting.len() as u32;
     (step_count > 1
-        && prompting.iter().all(|(info, _)| {
-            !matches!(info.risk.tier, RiskTier::Destructive | RiskTier::Privileged)
-        }))
+        && prompting
+            .iter()
+            .all(|(info, _)| info.risk.tier < RiskTier::Destructive))
     .then_some(step_count)
 }
 
@@ -178,7 +178,7 @@ impl Approver {
         }
 
         let classification = classify::classify(command);
-        let simple_commands = match &classification {
+        let mut simple_commands = match &classification {
             Classification::Parsed {
                 simple_commands, ..
             } => simple_commands.clone(),
@@ -191,6 +191,7 @@ impl Approver {
         // this in-flight prompt under new rules (the next decision reads the
         // new policy).
         let policy_cfg = self.store.approval_policy();
+        super::apply_dangerous_flag_policy_to_all(&mut simple_commands, &policy_cfg);
         let policies: Vec<ApprovalPromptPolicy> = simple_commands
             .iter()
             .map(|info| approval_policy_for(info, &policy_cfg))
@@ -483,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_count_excludes_destructive_and_privileged_constituents() {
+    fn batch_count_excludes_destructive_privileged_and_dynamic_constituents() {
         let policies = [policy(), policy(), policy()];
 
         let ordinary = classify::classify("echo a && mkdir b && touch c");
@@ -499,6 +500,11 @@ mod tests {
         let privileged = classify::classify("echo a && sudo true && touch c");
         let privileged_commands = privileged.simple_commands();
         let prompting: Vec<_> = privileged_commands.iter().zip(policies.iter()).collect();
+        assert_eq!(batch_count_for_prompting(&prompting), None);
+
+        let dynamic = classify::classify("echo a && sh && touch c");
+        let dynamic_commands = dynamic.simple_commands();
+        let prompting: Vec<_> = dynamic_commands.iter().zip(policies.iter()).collect();
         assert_eq!(batch_count_for_prompting(&prompting), None);
     }
 }

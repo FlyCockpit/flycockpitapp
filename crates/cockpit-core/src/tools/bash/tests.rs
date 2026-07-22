@@ -1140,6 +1140,7 @@ async fn granted_broad_skips_the_box() {
         program: "cargo".into(),
         normalized_program: "cargo".into(),
         subcommand: Some("build".into()),
+        args: vec!["build".into()],
         key: crate::approval::classify::ApprovalKey {
             program: "cargo".into(),
             subcommand: Some("build".into()),

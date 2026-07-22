@@ -774,6 +774,55 @@ fn approval_policy_for(
     ApprovalPromptPolicy::new(max)
 }
 
+pub(super) fn apply_dangerous_flag_policy(
+    info: &mut SimpleCommandInfo,
+    cfg: &crate::config::extended::ApprovalPolicyConfig,
+) {
+    let exact_key = info.key.as_storage_str();
+    if let Some(rule) = cfg.dangerous_flags.get(&exact_key) {
+        apply_one_dangerous_flag_rule(info, rule);
+    }
+    if exact_key != info.normalized_program
+        && let Some(rule) = cfg.dangerous_flags.get(&info.normalized_program)
+    {
+        apply_one_dangerous_flag_rule(info, rule);
+    }
+    dedup_strings(&mut info.risk.reasons);
+}
+
+fn apply_one_dangerous_flag_rule(
+    info: &mut SimpleCommandInfo,
+    rule: &crate::config::extended::DangerousFlagRule,
+) {
+    let Some(tier) = RiskTier::from_policy_key(&rule.tier) else {
+        return;
+    };
+    let Some(flag) = rule.flags.iter().find(|flag| {
+        info.args
+            .iter()
+            .any(|arg| dangerous_policy_flag_matches(flag, arg))
+    }) else {
+        return;
+    };
+    info.risk.tier = max_risk_tier(info.risk.tier, tier);
+    info.risk
+        .reasons
+        .push(format!("approvalPolicy.dangerousFlags matched `{flag}`"));
+}
+
+pub(super) fn apply_dangerous_flag_policy_to_all(
+    infos: &mut [SimpleCommandInfo],
+    cfg: &crate::config::extended::ApprovalPolicyConfig,
+) {
+    for info in infos {
+        apply_dangerous_flag_policy(info, cfg);
+    }
+}
+
+fn dangerous_policy_flag_matches(configured: &str, arg: &str) -> bool {
+    arg == configured || (configured.ends_with('=') && arg.starts_with(configured))
+}
+
 pub(crate) fn command_grant_allowed_by_policy(
     store: &GrantStore,
     info: &SimpleCommandInfo,
@@ -781,7 +830,10 @@ pub(crate) fn command_grant_allowed_by_policy(
     if info.wrapper {
         return false;
     }
-    let policy = approval_policy_for(info, &store.approval_policy());
+    let policy_cfg = store.approval_policy();
+    let mut info = info.clone();
+    apply_dangerous_flag_policy(&mut info, &policy_cfg);
+    let policy = approval_policy_for(&info, &policy_cfg);
     store
         .command_grant_scope(&info.key)
         .is_some_and(|scope| scope.within(policy.max_scope))
@@ -820,17 +872,7 @@ fn narrowest(a: Scope, b: Scope) -> Scope {
 }
 
 fn max_risk_tier(a: RiskTier, b: RiskTier) -> RiskTier {
-    if risk_rank(a) >= risk_rank(b) { a } else { b }
-}
-
-fn risk_rank(tier: RiskTier) -> u8 {
-    match tier {
-        RiskTier::Ordinary => 0,
-        RiskTier::Mutating => 1,
-        RiskTier::Destructive => 2,
-        RiskTier::Privileged => 3,
-        RiskTier::Dynamic => 4,
-    }
+    a.max(b)
 }
 
 fn dedup_strings(values: &mut Vec<String>) {
@@ -842,6 +884,7 @@ fn dedup_strings(values: &mut Vec<String>) {
 mod tests {
     use super::*;
     use crate::approval::classify::ApprovalKey;
+    use crate::config::extended::DangerousFlagRule;
 
     fn approver(cwd: &std::path::Path) -> (Approver, uuid::Uuid) {
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -901,6 +944,41 @@ mod tests {
         );
         let widened = approval_policy_for(rm_info, &cfg);
         assert_eq!(widened.max_scope, Scope::Session);
+    }
+
+    #[test]
+    fn dangerous_flag_policy_composes_exact_key_then_bare_program() {
+        let mut info = classify::classify("deploy prod --profile=prod")
+            .simple_commands()
+            .first()
+            .cloned()
+            .expect("simple command");
+        assert_eq!(info.key.as_storage_str(), "deploy prod");
+        assert_eq!(info.risk.tier, RiskTier::Ordinary);
+
+        let mut cfg = crate::config::extended::ApprovalPolicyConfig::default();
+        cfg.dangerous_flags.insert(
+            "deploy".to_string(),
+            DangerousFlagRule {
+                flags: vec!["--profile=prod".to_string()],
+                tier: "mutating".to_string(),
+            },
+        );
+        cfg.dangerous_flags.insert(
+            "deploy prod".to_string(),
+            DangerousFlagRule {
+                flags: vec!["--profile=prod".to_string()],
+                tier: "destructive".to_string(),
+            },
+        );
+
+        apply_dangerous_flag_policy(&mut info, &cfg);
+        assert_eq!(info.risk.tier, RiskTier::Destructive);
+        assert!(
+            info.risk
+                .reasons
+                .contains(&"approvalPolicy.dangerousFlags matched `--profile=prod`".to_string())
+        );
     }
 
     #[test]
@@ -1423,6 +1501,7 @@ mod tests {
             program: "cargo".into(),
             normalized_program: "cargo".into(),
             subcommand: Some("build".into()),
+            args: vec!["build".into()],
             key: ApprovalKey {
                 program: "cargo".into(),
                 subcommand: Some("build".into()),
@@ -1458,6 +1537,7 @@ mod tests {
             program: "cargo".into(),
             normalized_program: "cargo".into(),
             subcommand: Some("build".into()),
+            args: vec!["build".into()],
             key: ApprovalKey {
                 program: "cargo".into(),
                 subcommand: Some("build".into()),
@@ -1502,6 +1582,7 @@ mod tests {
             program: "gh".into(),
             normalized_program: "gh".into(),
             subcommand: Some("pr".into()),
+            args: vec!["pr".into()],
             key: ApprovalKey {
                 program: "gh".into(),
                 subcommand: Some("pr".into()),
@@ -1542,6 +1623,7 @@ mod tests {
             program: "cat".into(),
             normalized_program: "cat".into(),
             subcommand: None,
+            args: Vec::new(),
             key: ApprovalKey {
                 program: "cat".into(),
                 subcommand: None,
@@ -1938,6 +2020,7 @@ mod tests {
             program: "git".into(),
             normalized_program: "git".into(),
             subcommand: Some("push".into()),
+            args: vec!["push".into()],
             key: ApprovalKey {
                 program: "git".into(),
                 subcommand: Some("push".into()),
@@ -2123,6 +2206,7 @@ mod tests {
             program: "x".into(),
             normalized_program: "x".into(),
             subcommand: None,
+            args: Vec::new(),
             key: ApprovalKey {
                 program: "x".into(),
                 subcommand: None,

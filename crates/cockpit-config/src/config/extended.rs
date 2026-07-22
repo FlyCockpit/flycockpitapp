@@ -526,6 +526,15 @@ pub struct ApprovalPolicyConfig {
     pub program_max_scope: HashMap<String, ApprovalPolicyScope>,
     #[serde(default, rename = "keyMaxScope")]
     pub key_max_scope: HashMap<String, ApprovalPolicyScope>,
+    #[serde(default, rename = "dangerousFlags")]
+    pub dangerous_flags: HashMap<String, DangerousFlagRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DangerousFlagRule {
+    #[serde(default)]
+    pub flags: Vec<String>,
+    pub tier: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

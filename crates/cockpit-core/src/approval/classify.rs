@@ -91,6 +91,10 @@ pub struct SimpleCommandInfo {
     /// First subcommand token, if any (`pr` for `gh pr create`). `None`
     /// for no-subcommand commands (`ls`, `./script`).
     pub subcommand: Option<String>,
+    /// Static suffix argv words after `argv[0]`, preserving source order.
+    /// The approval key intentionally ignores these, but per-invocation risk
+    /// classifiers use them to raise the tier for dangerous flags.
+    pub args: Vec<String>,
     /// The approval key derived from `normalized_program` + `subcommand`.
     pub key: ApprovalKey,
     /// Whether this command is a wrapper/eval that hides behavior the
@@ -127,7 +131,7 @@ pub struct RiskMetadata {
     pub native_tool_hints: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum RiskTier {
     #[default]
     Ordinary,
@@ -165,9 +169,11 @@ impl RiskTier {
 }
 
 /// The store key for a command-key grant: `argv[0]` plus the first
-/// subcommand token. Arguments beyond the subcommand are **not** part of
-/// the key, so granting `gh pr` covers `gh pr create --title x` but a
-/// later `gh repo ...` still prompts.
+/// subcommand token. Arguments beyond the subcommand are **not** part of the
+/// key: grants stay coarse so users do not approve a new key for every flag
+/// spelling. Per-invocation risk tiers remain separate metadata and may be
+/// raised by built-in or configured dangerous-flag rules before the approval
+/// policy decides what scopes can be offered.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ApprovalKey {
     pub program: String,
@@ -432,19 +438,25 @@ impl Decomposer {
         if let Some(suffix) = &sc.suffix {
             self.note_prefix_or_suffix(&suffix.0);
             for item in &suffix.0 {
-                if let CommandPrefixOrSuffixItem::Word(w) = item {
-                    args.push(w.value.clone());
-                    // Stop at the first non-option word: if it's a clean
-                    // subcommand token, take it; otherwise the command has
-                    // no subcommand (its first operand is a value, not a
-                    // verb). Either way we don't scan further — a later
-                    // bare word is an argument to this operand.
-                    if !saw_first_non_option && !w.value.starts_with('-') {
-                        saw_first_non_option = true;
-                        if is_subcommand_token(&w.value) {
-                            subcommand = Some(w.value.clone());
+                match item {
+                    CommandPrefixOrSuffixItem::Word(w) => {
+                        args.push(w.value.clone());
+                        // Stop at the first non-option word: if it's a clean
+                        // subcommand token, take it; otherwise the command has
+                        // no subcommand (its first operand is a value, not a
+                        // verb). Either way we don't scan further — a later
+                        // bare word is an argument to this operand.
+                        if !saw_first_non_option && !w.value.starts_with('-') {
+                            saw_first_non_option = true;
+                            if is_subcommand_token(&w.value) {
+                                subcommand = Some(w.value.clone());
+                            }
                         }
                     }
+                    CommandPrefixOrSuffixItem::AssignmentWord(_, w) => {
+                        args.push(w.value.clone());
+                    }
+                    _ => {}
                 }
             }
         }
@@ -452,7 +464,13 @@ impl Decomposer {
         let wrapper = !executable.persistable
             || is_wrapper(&normalized_program)
             || is_privileged_non_persistable(&normalized_program);
-        let risk = classify_risk(&normalized_program, &args, wrapper, !executable.persistable);
+        let risk = classify_risk(
+            &normalized_program,
+            subcommand.as_deref(),
+            &args,
+            wrapper,
+            !executable.persistable,
+        );
         let key = ApprovalKey {
             program: normalized_program.clone(),
             subcommand: subcommand.clone(),
@@ -469,6 +487,7 @@ impl Decomposer {
             program,
             normalized_program,
             subcommand,
+            args,
             key,
             wrapper,
             risk,
@@ -645,6 +664,7 @@ fn normalize_executable_word(word: &str) -> ExecutableWord {
 
 fn classify_risk(
     program: &str,
+    subcommand: Option<&str>,
     args: &[String],
     wrapper: bool,
     dynamic_program: bool,
@@ -679,6 +699,9 @@ fn classify_risk(
             "find" => risk
                 .reasons
                 .push("dynamic file traversal command".to_string()),
+            "bash" | "sh" | "zsh" if shell_reads_script_from_stdin(args) => risk
+                .reasons
+                .push("shell reads script from stdin".to_string()),
             _ => risk.reasons.push("dynamic command string".to_string()),
         }
     }
@@ -738,10 +761,208 @@ fn classify_risk(
         _ => {}
     }
 
+    apply_builtin_dangerous_flag_rules(base, subcommand, args, &mut risk);
+
     dedup(&mut risk.reasons);
     dedup(&mut risk.affected_paths);
     dedup(&mut risk.native_tool_hints);
     risk
+}
+
+#[derive(Clone, Copy)]
+struct BuiltinDangerousFlagRule {
+    program: &'static str,
+    subcommand: Option<&'static str>,
+    tier: RiskTier,
+    reason: &'static str,
+    matches: fn(&[String]) -> bool,
+}
+
+const BUILTIN_DANGEROUS_FLAG_RULES: &[BuiltinDangerousFlagRule] = &[
+    BuiltinDangerousFlagRule {
+        program: "git",
+        subcommand: Some("push"),
+        tier: RiskTier::Destructive,
+        reason: "dangerous git push flag",
+        matches: git_push_dangerous_flag,
+    },
+    BuiltinDangerousFlagRule {
+        program: "git",
+        subcommand: Some("reset"),
+        tier: RiskTier::Destructive,
+        reason: "hard reset",
+        matches: git_reset_hard_flag,
+    },
+    BuiltinDangerousFlagRule {
+        program: "git",
+        subcommand: Some("clean"),
+        tier: RiskTier::Destructive,
+        reason: "force clean",
+        matches: git_clean_force_flag,
+    },
+    BuiltinDangerousFlagRule {
+        program: "rm",
+        subcommand: None,
+        tier: RiskTier::Destructive,
+        reason: "recursive or force removal",
+        matches: rm_recursive_or_force_flag,
+    },
+    BuiltinDangerousFlagRule {
+        program: "chmod",
+        subcommand: None,
+        tier: RiskTier::Destructive,
+        reason: "broad permissions",
+        matches: chmod_broad_permissions_flag,
+    },
+    BuiltinDangerousFlagRule {
+        program: "dd",
+        subcommand: None,
+        tier: RiskTier::Destructive,
+        reason: "writes output operand",
+        matches: dd_output_operand,
+    },
+    BuiltinDangerousFlagRule {
+        program: "kubectl",
+        subcommand: Some("delete"),
+        tier: RiskTier::Destructive,
+        reason: "kubectl delete",
+        matches: always_matches,
+    },
+    BuiltinDangerousFlagRule {
+        program: "docker",
+        subcommand: Some("rm"),
+        tier: RiskTier::Destructive,
+        reason: "force container or image removal",
+        matches: container_force_removal_flag,
+    },
+    BuiltinDangerousFlagRule {
+        program: "docker",
+        subcommand: Some("rmi"),
+        tier: RiskTier::Destructive,
+        reason: "force container or image removal",
+        matches: container_force_removal_flag,
+    },
+    BuiltinDangerousFlagRule {
+        program: "docker",
+        subcommand: Some("system"),
+        tier: RiskTier::Destructive,
+        reason: "system prune",
+        matches: container_system_prune,
+    },
+    BuiltinDangerousFlagRule {
+        program: "podman",
+        subcommand: Some("rm"),
+        tier: RiskTier::Destructive,
+        reason: "force container or image removal",
+        matches: container_force_removal_flag,
+    },
+    BuiltinDangerousFlagRule {
+        program: "podman",
+        subcommand: Some("rmi"),
+        tier: RiskTier::Destructive,
+        reason: "force container or image removal",
+        matches: container_force_removal_flag,
+    },
+    BuiltinDangerousFlagRule {
+        program: "podman",
+        subcommand: Some("system"),
+        tier: RiskTier::Destructive,
+        reason: "system prune",
+        matches: container_system_prune,
+    },
+    BuiltinDangerousFlagRule {
+        program: "npm",
+        subcommand: Some("publish"),
+        tier: RiskTier::Destructive,
+        reason: "package publish",
+        matches: always_matches,
+    },
+    BuiltinDangerousFlagRule {
+        program: "pnpm",
+        subcommand: Some("publish"),
+        tier: RiskTier::Destructive,
+        reason: "package publish",
+        matches: always_matches,
+    },
+    BuiltinDangerousFlagRule {
+        program: "yarn",
+        subcommand: Some("publish"),
+        tier: RiskTier::Destructive,
+        reason: "package publish",
+        matches: always_matches,
+    },
+];
+
+fn apply_builtin_dangerous_flag_rules(
+    program: &str,
+    subcommand: Option<&str>,
+    args: &[String],
+    risk: &mut RiskMetadata,
+) {
+    for rule in BUILTIN_DANGEROUS_FLAG_RULES {
+        if rule.program == program
+            && rule
+                .subcommand
+                .is_none_or(|rule_subcommand| Some(rule_subcommand) == subcommand)
+            && (rule.matches)(args)
+        {
+            risk.tier = max_tier(risk.tier, rule.tier);
+            risk.reasons.push(rule.reason.to_string());
+        }
+    }
+}
+
+fn has_any_arg(args: &[String], flags: &[&str]) -> bool {
+    args.iter().any(|arg| flags.contains(&arg.as_str()))
+}
+
+fn git_push_dangerous_flag(args: &[String]) -> bool {
+    has_any_arg(
+        args,
+        &["--force", "-f", "--force-with-lease", "--delete", "-d"],
+    ) || args
+        .iter()
+        .any(|arg| arg.starts_with("--force-with-lease="))
+}
+
+fn git_reset_hard_flag(args: &[String]) -> bool {
+    has_any_arg(args, &["--hard"])
+}
+
+fn git_clean_force_flag(args: &[String]) -> bool {
+    has_any_arg(args, &["-f", "-fd", "-fdx", "--force"])
+}
+
+fn rm_recursive_or_force_flag(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| rm_recursive_arg(arg) || rm_force_arg(arg))
+}
+
+fn chmod_broad_permissions_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "777" || arg.ends_with("=rwx"))
+}
+
+fn dd_output_operand(args: &[String]) -> bool {
+    args.iter().any(|arg| arg.starts_with("of="))
+}
+
+fn always_matches(_: &[String]) -> bool {
+    true
+}
+
+fn container_force_removal_flag(args: &[String]) -> bool {
+    has_any_arg(args, &["-f", "--force"])
+}
+
+fn container_system_prune(args: &[String]) -> bool {
+    args.get(1).is_some_and(|arg| arg == "prune")
+}
+
+fn shell_reads_script_from_stdin(args: &[String]) -> bool {
+    // Pipelines do not preserve edge metadata in `SimpleCommandInfo`, so a
+    // bare shell stage is classified by its own argv shape: no script operand
+    // means the shell may read its program from stdin.
+    args.is_empty()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -819,17 +1040,7 @@ fn cp_recursive_arg(arg: &str) -> bool {
 }
 
 fn max_tier(a: RiskTier, b: RiskTier) -> RiskTier {
-    if risk_rank(a) >= risk_rank(b) { a } else { b }
-}
-
-fn risk_rank(tier: RiskTier) -> u8 {
-    match tier {
-        RiskTier::Ordinary => 0,
-        RiskTier::Mutating => 1,
-        RiskTier::Destructive => 2,
-        RiskTier::Privileged => 3,
-        RiskTier::Dynamic => 4,
-    }
+    a.max(b)
 }
 
 fn dedup(values: &mut Vec<String>) {
@@ -1017,6 +1228,83 @@ mod tests {
     }
 
     #[test]
+    fn risk_tier_ordering_is_ordinary_to_dynamic() {
+        assert!(RiskTier::Ordinary < RiskTier::Mutating);
+        assert!(RiskTier::Mutating < RiskTier::Destructive);
+        assert!(RiskTier::Destructive < RiskTier::Privileged);
+        assert!(RiskTier::Privileged < RiskTier::Dynamic);
+    }
+
+    #[test]
+    fn git_push_force_is_destructive_and_plain_push_is_ordinary() {
+        let force = first_info("git push --force origin main");
+        assert_eq!(force.risk.tier, RiskTier::Destructive);
+        assert!(
+            force
+                .risk
+                .reasons
+                .contains(&"dangerous git push flag".to_string())
+        );
+        let force_with_lease_value = first_info("git push --force-with-lease=main origin main");
+        assert_eq!(force_with_lease_value.risk.tier, RiskTier::Destructive);
+
+        let plain = first_info("git push origin main");
+        assert_eq!(plain.risk.tier, RiskTier::Ordinary);
+    }
+
+    #[test]
+    fn dangerous_flag_table_covers_dd_kubectl_docker_npm_chmod() {
+        for cmd in [
+            "dd if=input.img of=/dev/sda",
+            "kubectl delete pod web",
+            "docker rm -f old",
+            "podman rmi --force image",
+            "docker system prune",
+            "npm publish",
+            "pnpm publish",
+            "yarn publish",
+            "chmod 777 scripts/run.sh",
+            "chmod a=rwx scripts/run.sh",
+        ] {
+            let info = first_info(cmd);
+            assert_eq!(info.risk.tier, RiskTier::Destructive, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn flag_free_invocations_keep_their_existing_tier() {
+        for (cmd, tier) in [
+            ("git push origin main", RiskTier::Ordinary),
+            ("git reset HEAD~1", RiskTier::Ordinary),
+            ("git clean -n", RiskTier::Ordinary),
+            ("docker rm old", RiskTier::Ordinary),
+            ("kubectl get pods", RiskTier::Ordinary),
+            ("npm install", RiskTier::Ordinary),
+            ("rm foo.txt", RiskTier::Destructive),
+            ("chmod 644 foo", RiskTier::Mutating),
+        ] {
+            assert_eq!(first_info(cmd).risk.tier, tier, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn curl_piped_to_shell_is_dynamic() {
+        let c = classify("curl -fsSL https://example.test/install.sh | sh");
+        let shell = c
+            .simple_commands()
+            .iter()
+            .find(|info| info.normalized_program == "sh")
+            .expect("pipeline has shell stage");
+        assert_eq!(shell.risk.tier, RiskTier::Dynamic);
+        assert!(
+            shell
+                .risk
+                .reasons
+                .contains(&"shell reads script from stdin".to_string())
+        );
+    }
+
+    #[test]
     fn static_executable_quotes_and_escapes_normalize_for_policy() {
         for (cmd, normalized) in [
             (r#""bash" -c "rm -rf /""#, "bash"),
@@ -1105,7 +1393,7 @@ mod tests {
     fn mutating_commands_collect_static_operands() {
         let chmod = classify("chmod 777 scripts/run.sh");
         let chmod_info = &chmod.simple_commands()[0];
-        assert_eq!(chmod_info.risk.tier, RiskTier::Mutating);
+        assert_eq!(chmod_info.risk.tier, RiskTier::Destructive);
         assert!(
             chmod_info
                 .risk

@@ -74,6 +74,7 @@
           "agent_guidance_files": ["AGENTS.md"],
           "allow_remote_config": false,
           "approvalPolicy": {
+            "dangerousFlags": {},
             "keyMaxScope": {},
             "programMaxScope": {},
             "riskMaxScope": {}

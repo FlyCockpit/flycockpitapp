@@ -1275,6 +1275,42 @@ fn approval_policy_config_parses_risk_program_and_key_caps() {
 }
 
 #[test]
+fn approval_policy_parses_dangerous_flags() {
+    let cfg: ExtendedConfig = serde_json::from_str(
+        r#"{
+                "approvalPolicy": {
+                    "dangerousFlags": {
+                        "git push": {
+                            "flags": ["--force", "--force-with-lease"],
+                            "tier": "destructive"
+                        },
+                        "deploy": {
+                            "flags": ["--profile=prod"],
+                            "tier": "privileged"
+                        }
+                    }
+                }
+            }"#,
+    )
+    .unwrap();
+    let git_push = cfg
+        .approval_policy
+        .dangerous_flags
+        .get("git push")
+        .expect("git push rule parsed");
+    assert_eq!(git_push.flags, vec!["--force", "--force-with-lease"]);
+    assert_eq!(git_push.tier, "destructive");
+
+    let deploy = cfg
+        .approval_policy
+        .dangerous_flags
+        .get("deploy")
+        .expect("bare program rule parsed");
+    assert_eq!(deploy.flags, vec!["--profile=prod"]);
+    assert_eq!(deploy.tier, "privileged");
+}
+
+#[test]
 fn approval_mode_round_trips_through_extended_doc() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");

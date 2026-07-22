@@ -239,13 +239,19 @@ pub struct GrantStore {
 /// are the risk-tier caps (`riskMaxScope`). An unrecognized risk key silently
 /// drops the cap the user intended, which would *widen* the allowed scope — a
 /// fall-open. A policy carrying one is therefore treated as malformed so the
-/// last good policy is kept instead. Program/command keys are an open domain
-/// (any command name) and are not validated.
+/// last good policy is kept instead. Dangerous-flag rules are also fail-closed:
+/// their target tier must parse through the same closed tier parser and their
+/// flag list must be non-empty. Program/command keys are an open domain (any
+/// command name) and are not validated.
 fn approval_policy_is_valid(policy: &ApprovalPolicyConfig) -> bool {
     policy
         .risk_max_scope
         .keys()
         .all(|key| RiskTier::from_policy_key(key).is_some())
+        && policy
+            .dangerous_flags
+            .values()
+            .all(|rule| !rule.flags.is_empty() && RiskTier::from_policy_key(&rule.tier).is_some())
 }
 
 impl GrantStore {
@@ -1258,6 +1264,7 @@ fn canonical_json(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::approval::classify::SimpleCommandInfo;
+    use crate::config::extended::DangerousFlagRule;
 
     fn cmd_info(program: &str, sub: Option<&str>, wrapper: bool) -> SimpleCommandInfo {
         let key = ApprovalKey {
@@ -1268,6 +1275,7 @@ mod tests {
             program: program.to_string(),
             normalized_program: program.to_string(),
             subcommand: sub.map(str::to_string),
+            args: sub.into_iter().map(str::to_string).collect(),
             key,
             wrapper,
             risk: Default::default(),
@@ -2301,6 +2309,18 @@ mod tests {
         policy
     }
 
+    fn dangerous_flag_policy(tier: &str, flags: Vec<&str>) -> ApprovalPolicyConfig {
+        let mut policy = ApprovalPolicyConfig::default();
+        policy.dangerous_flags.insert(
+            "git push".to_string(),
+            DangerousFlagRule {
+                flags: flags.into_iter().map(str::to_string).collect(),
+                tier: tier.to_string(),
+            },
+        );
+        policy
+    }
+
     /// A1: a policy change during a live session is observed by the store
     /// without rebuilding it.
     #[test]
@@ -2439,6 +2459,54 @@ mod tests {
         assert!(
             !resolved.risk_max_scope.contains_key("not-a-tier"),
             "the malformed policy must not be adopted",
+        );
+    }
+
+    #[test]
+    fn dangerous_flags_rule_with_bad_tier_keeps_last_good_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, cell) = live_policy_store(
+            tmp.path(),
+            risk_policy("ordinary", ApprovalPolicyScope::Session),
+        );
+
+        set_cell_policy(
+            &cell,
+            2,
+            dangerous_flag_policy("not-a-tier", vec!["--force"]),
+        );
+
+        let resolved = store.approval_policy();
+        assert_eq!(
+            resolved.risk_max_scope.get("ordinary"),
+            Some(&ApprovalPolicyScope::Session),
+            "bad dangerousFlags tier must keep the last good policy",
+        );
+        assert!(
+            resolved.dangerous_flags.is_empty(),
+            "the malformed dangerousFlags policy must not be adopted",
+        );
+    }
+
+    #[test]
+    fn dangerous_flags_rule_with_empty_flag_list_keeps_last_good_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, cell) = live_policy_store(
+            tmp.path(),
+            risk_policy("ordinary", ApprovalPolicyScope::Session),
+        );
+
+        set_cell_policy(&cell, 2, dangerous_flag_policy("destructive", Vec::new()));
+
+        let resolved = store.approval_policy();
+        assert_eq!(
+            resolved.risk_max_scope.get("ordinary"),
+            Some(&ApprovalPolicyScope::Session),
+            "empty dangerousFlags flag list must keep the last good policy",
+        );
+        assert!(
+            resolved.dangerous_flags.is_empty(),
+            "the malformed dangerousFlags policy must not be adopted",
         );
     }
 

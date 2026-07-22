@@ -11,9 +11,8 @@
 //! canonical file, which older bodies' line sub-ranges are **fully covered**
 //! by a newer read of the same file, and rewrites the older body to elide
 //! exactly those lines while keeping its non-overlapping remainder. The
-//! elided sub-range is replaced by a one-line marker that points at the
-//! newer (retaining) body's `original_event_id`, mirroring the whole-body
-//! [`super::Elision`] marker convention.
+//! elided sub-range is replaced by a one-line marker that tells the model
+//! to use the newer retained read already present in the conversation.
 //!
 //! ## Reconstructable from the WIRE (correctness #1)
 //!
@@ -276,9 +275,8 @@ fn ranges_overlap(a: LineRange, b: LineRange) -> bool {
 /// structural lines (header / `Note:` prelude / truncation marker) are always
 /// kept. Returns `None` when no numbered line was covered (no elision to do).
 fn rewrite_eliding_covered(body: &str, covering: &[&ReadLoc]) -> Option<String> {
-    // The newest covering body's id is the pointer for every marker we write
-    // (the freshest retained copy of the lines).
-    let pointer = covering.last()?.call_id.as_str();
+    // At least one newer full body must retain the covered lines.
+    covering.last()?;
 
     let mut out = String::with_capacity(body.len());
     let mut in_elided_run = false;
@@ -293,7 +291,7 @@ fn rewrite_eliding_covered(body: &str, covering: &[&ReadLoc]) -> Option<String> 
         if covered {
             if !in_elided_run {
                 // Open a new elided run with a single marker line.
-                out.push_str(&overlap_marker_line(pointer));
+                out.push_str(&overlap_marker_line());
                 out.push('\n');
                 in_elided_run = true;
                 any_elided = true;
@@ -316,19 +314,49 @@ fn rewrite_eliding_covered(body: &str, covering: &[&ReadLoc]) -> Option<String> 
     Some(out)
 }
 
-/// The one-line marker that replaces an elided overlapping line run, pointing
-/// at the newer body that retains those lines. Terse (token economy §10) and
-/// prefixed `"[elided:"` so [`Elision::is_marker`] recognizes it (it never
-/// re-elides and the resume scan treats it as a pruned body).
-pub fn overlap_marker_line(pointer_event_id: &str) -> String {
+/// The one-line marker that replaces an elided overlapping line run. Terse
+/// (token economy §10) and prefixed `"[elided:"` so [`Elision::is_marker`]
+/// recognizes it (it never re-elides and the resume scan treats it as a
+/// pruned body).
+pub fn overlap_marker_line() -> String {
     format!(
-        "[elided: {OVERLAP_REASON} — these lines are in a later read; full body in transcript event {pointer_event_id}]"
+        "[elided: {OVERLAP_REASON} — these lines appear in a later read in this conversation; use that one. Not retrievable and not worth re-running.]"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::message::{Message, ToolCall};
+    use rig::OneOrMany;
+    use rig::message::{AssistantContent, ToolResult, ToolResultContent};
+    use serde_json::json;
+
+    fn assistant_call(call_id: &str, args: serde_json::Value) -> Message {
+        Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: call_id.to_string(),
+                call_id: None,
+                function: rig::message::ToolFunction {
+                    name: "read".to_string(),
+                    arguments: args,
+                },
+                signature: None,
+                additional_params: None,
+            })),
+        }
+    }
+
+    fn tool_result(call_id: &str, body: &str) -> Message {
+        Message::User {
+            content: OneOrMany::one(rig::message::UserContent::ToolResult(ToolResult {
+                id: call_id.to_string(),
+                call_id: None,
+                content: OneOrMany::one(ToolResultContent::text(body)),
+            })),
+        }
+    }
 
     #[test]
     fn parses_numbered_line_numbers() {
@@ -392,9 +420,44 @@ mod tests {
         assert!(!out.contains("3|c"));
         assert!(!out.contains("5|e"));
         assert!(out.contains("[elided:"));
-        assert!(out.contains("newer"));
+        assert!(!out.contains("newer"));
         // One marker line for the contiguous covered run.
         assert_eq!(out.matches("[elided:").count(), 1);
+    }
+
+    #[test]
+    fn overlap_marker_states_wire_recovery_and_omits_event_id() {
+        let marker = overlap_marker_line();
+
+        assert!(marker.starts_with("[elided: "));
+        assert!(marker.contains("overlapping read superseded — "));
+        assert!(marker.contains("later read in this conversation"));
+        assert!(marker.contains("use that one"));
+        assert!(marker.contains("Not retrievable"));
+        assert!(marker.contains("not worth re-running"));
+        assert!(!marker.contains("transcript event"));
+        assert!(!marker.contains("newer"));
+    }
+
+    #[test]
+    fn prune_is_idempotent_over_its_own_overlap_output() {
+        let mut history = vec![
+            assistant_call("old", json!({ "path": "/f", "offset": 1, "limit": 3 })),
+            tool_result("old", "1|a\n2|b\n3|c\n"),
+            assistant_call("new", json!({ "path": "/f", "offset": 2, "limit": 3 })),
+            tool_result("new", "2|b\n3|c\n4|d\n"),
+        ];
+
+        let first = crate::engine::prune::dedup_plan(&history);
+        assert_eq!(first.targets.len(), 1);
+        assert_eq!(crate::engine::prune::apply_plan(&mut history, &first), 1);
+        let after_first = history.clone();
+        let second = crate::engine::prune::dedup_plan(&history);
+        assert!(second.is_empty());
+        assert_eq!(second.tokens_saved(), 0);
+        assert_eq!(crate::engine::prune::apply_plan(&mut history, &second), 0);
+
+        assert_eq!(history, after_first);
     }
 
     #[test]

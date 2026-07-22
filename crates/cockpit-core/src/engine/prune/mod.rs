@@ -26,9 +26,9 @@
 //! Elision touches the **model-bound** `Vec<Message>` history only. The
 //! on-disk `tool_calls` rows and the TUI scrollback are driven by a
 //! separate event stream and keep full fidelity, so the original body
-//! is always recoverable (`cockpit session show`). The marker carries
-//! the originating `call_id` as `original_event_id` to point a reader
-//! at the full body.
+//! is always recoverable (`cockpit session show`). The marker tells the
+//! model to use the later full result that is still in the wire history;
+//! `original_event_id` remains in the prune ledger for audit readers.
 //!
 //! ## Snapshot-class tools
 //!
@@ -123,16 +123,13 @@ fn strip_truncated_tool_result_marker_lines(body: &str) -> String {
 }
 
 fn contains_overlap_marker(body: &str) -> bool {
-    let prefix = format!(
-        "[elided: {OVERLAP_REASON} — these lines are in a later read; full body in transcript event "
-    );
-    body.lines()
-        .any(|line| line.starts_with(&prefix) && line.ends_with(']'))
+    let marker = overlap::overlap_marker_line();
+    body.lines().any(|line| line == marker)
 }
 
-fn exact_snapshot_marker(body: &str, call_id: &str) -> bool {
+fn exact_snapshot_marker(body: &str, _call_id: &str) -> bool {
     body == (Elision {
-        original_event_id: call_id.to_string(),
+        original_event_id: String::new(),
         reason: REASON_SNAPSHOT_SUPERSEDED,
     })
     .marker_text()
@@ -152,9 +149,9 @@ pub struct CondenseCandidate {
 /// rewrites a tool-result body, never a call's shape.
 ///
 /// `original_event_id` is the originating tool call's `id` (the same
-/// value the `tool_calls` row keys on), so a reader can recover the
-/// full body from the on-disk transcript. `reason` is a terse,
-/// human-readable explanation rendered into the marker text.
+/// value the `tool_calls` row keys on), retained for the ledger/audit
+/// reader. `reason` is a terse, human-readable explanation rendered into
+/// the marker text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Elision {
     pub original_event_id: String,
@@ -167,8 +164,8 @@ impl Elision {
     /// full body is still in context, so the model can read it there.
     pub fn marker_text(&self) -> String {
         format!(
-            "[elided: {} — superseded by a later identical call; full body in transcript event {}]",
-            self.reason, self.original_event_id
+            "[elided: {} — a later identical call in this conversation still carries the full result; use that one. Not retrievable and not worth re-running.]",
+            self.reason
         )
     }
 
@@ -663,8 +660,8 @@ pub fn current_elided_ids(history: &[Message]) -> Vec<String> {
 ///
 /// Contents:
 /// - `elided`: every currently-elided body, each carrying the exact
-///   `original_event_id` + `reason` [`apply_plan`] wrote, so the marker
-///   text reproduces character-for-character on rebuild (the same
+///   `original_event_id` + `reason` [`apply_plan`] wrote, so the audit pointer
+///   and marker reason reproduce character-for-character on rebuild (the same
 ///   [`Elision`] type, never a forked marker format).
 /// - `watermark`: the foreground root history length at the last prune
 ///   (the driver's depth-1 `prune_watermark`), so auto-prune's
@@ -1090,12 +1087,12 @@ mod tests {
         assert_eq!(tool_result_id_at(&history, 7), "overlap-new");
         assert_eq!(
             body_at(&history, 1),
-            "[elided: snapshot superseded — superseded by a later identical call; full body in transcript event exact-old]"
+            "[elided: snapshot superseded — a later identical call in this conversation still carries the full result; use that one. Not retrievable and not worth re-running.]"
         );
         assert_eq!(body_at(&history, 3), "exact new body with enough padding");
         assert_eq!(
             body_at(&history, 5),
-            "1|line 1 content\n[elided: overlapping read superseded — these lines are in a later read; full body in transcript event overlap-new]\n"
+            format!("1|line 1 content\n{}\n", overlap::overlap_marker_line())
         );
         assert_eq!(
             body_at(&history, 7),
@@ -1561,6 +1558,101 @@ mod tests {
     }
 
     #[test]
+    fn elision_marker_states_wire_recovery_and_omits_event_id() {
+        let marker = Elision {
+            original_event_id: "call-hidden".to_string(),
+            reason: REASON_SNAPSHOT_SUPERSEDED,
+        }
+        .marker_text();
+
+        assert!(marker.starts_with("[elided: "));
+        assert!(marker.contains("snapshot superseded — "));
+        assert!(marker.contains("later identical call in this conversation"));
+        assert!(marker.contains("use that one"));
+        assert!(marker.contains("Not retrievable"));
+        assert!(marker.contains("not worth re-running"));
+        assert!(!marker.contains("transcript event"));
+        assert!(!marker.contains("call-hidden"));
+    }
+
+    #[test]
+    fn elision_marker_is_not_mistaken_for_a_compressed_marker() {
+        let snapshot = Elision {
+            original_event_id: "call-hidden".to_string(),
+            reason: REASON_SNAPSHOT_SUPERSEDED,
+        }
+        .marker_text();
+        let overlap = overlap::overlap_marker_line();
+
+        for marker in [snapshot, overlap] {
+            assert!(!marker.ends_with(" retrieve with tool_result_retrieve]"));
+            assert!(!is_compressed_tool_result_marker(&marker));
+            assert!(!is_compressed_tool_result_marker_line(&marker));
+        }
+    }
+
+    #[test]
+    fn elision_marker_predicates_match_both_new_markers() {
+        let snapshot = Elision {
+            original_event_id: "call-hidden".to_string(),
+            reason: REASON_SNAPSHOT_SUPERSEDED,
+        }
+        .marker_text();
+        let overlap = overlap::overlap_marker_line();
+
+        assert!(Elision::is_marker(&snapshot));
+        assert!(Elision::contains_marker(&snapshot));
+        assert!(Elision::is_marker(&overlap));
+        assert!(Elision::contains_marker(&overlap));
+    }
+
+    #[test]
+    fn contains_overlap_marker_distinguishes_the_two_families() {
+        let snapshot = Elision {
+            original_event_id: "call-hidden".to_string(),
+            reason: REASON_SNAPSHOT_SUPERSEDED,
+        }
+        .marker_text();
+        let overlap = overlap::overlap_marker_line();
+
+        assert!(contains_overlap_marker(&overlap));
+        assert!(!contains_overlap_marker(&snapshot));
+    }
+
+    #[test]
+    fn exact_snapshot_marker_matches_the_new_marker_text() {
+        let marker = Elision {
+            original_event_id: "call-hidden".to_string(),
+            reason: REASON_SNAPSHOT_SUPERSEDED,
+        }
+        .marker_text();
+
+        assert!(exact_snapshot_marker(&marker, "call-hidden"));
+    }
+
+    #[test]
+    fn prune_is_idempotent_over_its_own_snapshot_output() {
+        let args = json!({ "path": "/abs/idempotent.rs" });
+        let mut history = vec![
+            assistant_call("c1", "read", args.clone()),
+            tool_result("c1", "same body with enough padding"),
+            assistant_call("c2", "read", args),
+            tool_result("c2", "same body with enough padding"),
+        ];
+
+        let first = dedup_plan(&history);
+        assert_eq!(first.targets.len(), 1);
+        assert_eq!(apply_plan(&mut history, &first), 1);
+        let after_first = history.clone();
+        let second = dedup_plan(&history);
+        assert!(second.is_empty());
+        assert_eq!(second.tokens_saved(), 0);
+        assert_eq!(apply_plan(&mut history, &second), 0);
+
+        assert_eq!(history, after_first);
+    }
+
+    #[test]
     fn bash_truncated_body_still_condenses_to_one_compressed_marker() {
         let original = format!(
             "[truncated tool result: tool=bash delivered_bytes=8000 stored_bytes=12000 original_bytes=12000 lines=900 hash=aaaaaaaaaaaaaaaaaaaaaaaa retrieve with tool_result_retrieve]\n{}",
@@ -1948,8 +2040,9 @@ mod tests {
     }
 
     /// A newer read of the same file whose range OVERLAPS an older read: the
-    /// older body's overlapping lines are elided (partial body) and point at
-    /// the newer body; its non-overlapping remainder is kept verbatim.
+    /// older body's overlapping lines are elided (partial body) and tell the
+    /// model to use the newer body; its non-overlapping remainder is kept
+    /// verbatim.
     #[test]
     fn overlap_merge_elides_overlap_keeps_remainder() {
         let args1 = json!({ "path": "/f", "offset": 1, "limit": 20 });
@@ -1969,14 +2062,15 @@ mod tests {
 
         apply_plan(&mut history, &plan);
         let older = body_at(&history, 1);
-        // Lines 1..=9 (non-overlap) kept; 10..=20 (overlap) elided; one marker
-        // pointing at c2 (the newer retaining body).
+        // Lines 1..=9 (non-overlap) kept; 10..=20 (overlap) elided; one
+        // marker tells the model to use the newer retaining body.
         assert!(older.contains("1|line 1"));
         assert!(older.contains("9|line 9"));
         assert!(!older.contains("10|line 10"));
         assert!(!older.contains("20|line 20"));
         assert!(older.contains("[elided:"));
-        assert!(older.contains("c2"));
+        assert!(older.contains("later read in this conversation"));
+        assert!(!older.contains("c2"));
         // The newer body is untouched (the union of content survives in it).
         assert!(body_at(&history, 3).contains("29|line 29"));
     }

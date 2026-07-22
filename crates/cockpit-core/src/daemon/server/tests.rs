@@ -4794,7 +4794,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             .await
             .expect("second stop forces drain");
             assert!(matches!(response, Response::Ack));
-            assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Forced);
+            wait_for_shutdown_phase(&ctx, ShutdownPhase::Forced).await;
         }
         other => panic!("unhandled mutating malformed case {other}"),
     }
@@ -6438,7 +6438,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
             .await
             .expect("stop daemon");
             assert!(matches!(response, Response::Ack));
-            assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Draining);
+            wait_for_shutdown_phase(&ctx, ShutdownPhase::Draining).await;
         }
         "lsp_control" => {
             let ctx = test_ctx();
@@ -6633,6 +6633,100 @@ fn run_git(cwd: &Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+macro_rules! command_request_ordering_value {
+    (serialized) => {
+        principal::RequestOrdering::Serialized
+    };
+    (concurrent) => {
+        principal::RequestOrdering::Concurrent
+    };
+}
+
+macro_rules! request_ordering_rows_from_command_table {
+    (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        vec![$(($kind, command_request_ordering_value!($ordering))),+]
+    }};
+}
+
+#[test]
+fn request_ordering_concurrent_set_is_exactly_the_twenty_enumerated_reads() {
+    let rows = proto::command!(request_ordering_rows_from_command_table);
+    assert!(
+        rows.len() > 80,
+        "command table should enumerate Request rows"
+    );
+    let actual: BTreeSet<_> = rows
+        .iter()
+        .filter_map(|(kind, ordering)| {
+            (*ordering == principal::RequestOrdering::Concurrent).then_some(*kind)
+        })
+        .collect();
+    let expected = BTreeSet::from([
+        "daemon_status",
+        "export_session_data",
+        "fs_list",
+        "fs_read",
+        "fs_stat",
+        "get_usage_counts",
+        "git_diff_file",
+        "git_status",
+        "guidance_estimate",
+        "list_agents",
+        "list_assistants",
+        "list_models",
+        "list_scheduled_jobs",
+        "list_sessions",
+        "list_skills",
+        "read_session_messages",
+        "resource_snapshot",
+        "session_live_status",
+        "stats_rollup",
+        "subagent_transcript",
+    ]);
+    assert_eq!(actual, expected);
+    for serialized in [
+        "attach",
+        "begin_attachment_upload",
+        "upload_attachment_chunk",
+        "finish_attachment_upload",
+        "cancel_attachment_upload",
+        "open_terminal",
+        "attach_terminal",
+        "terminal_input",
+        "terminal_resize",
+        "close_terminal",
+        "send_user_message",
+        "remove_queued_user_message",
+        "remove_newest_queued_user_message",
+        "remove_editable_queued_user_messages",
+        "cancel_turn",
+        "steer_delegation",
+        "resolve_interrupt",
+        "set_active_model",
+        "set_agent",
+        "set_llm_mode",
+        "set_session_llm_mode",
+        "set_approval_mode",
+        "set_delegation_recursion",
+        "set_sandbox",
+        "set_sandbox_escalation",
+        "set_preflight",
+        "set_trusted_only",
+        "set_redaction",
+        "set_tandem_models",
+    ] {
+        let (_, ordering) = rows
+            .iter()
+            .find(|(kind, _)| *kind == serialized)
+            .unwrap_or_else(|| panic!("missing request kind {serialized}"));
+        assert_eq!(
+            *ordering,
+            principal::RequestOrdering::Serialized,
+            "{serialized} must stay serialized"
+        );
+    }
 }
 
 #[test]
@@ -8916,6 +9010,23 @@ fn test_event_envelope(event: proto::Event) -> EventEnvelope {
     }
 }
 
+async fn wait_for_shutdown_phase(ctx: &Arc<DaemonContext>, expected: ShutdownPhase) {
+    if ctx.shutdown.phase() == expected {
+        return;
+    }
+    let mut phase_rx = ctx.shutdown.subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            phase_rx.changed().await.expect("shutdown signal open");
+            if *phase_rx.borrow() == expected {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("shutdown phase did not reach {expected:?}"));
+}
+
 async fn recv_writer_body(
     writer_rx: &mut mpsc::Receiver<ClientWriterMessage>,
     label: &'static str,
@@ -8926,9 +9037,194 @@ async fn recv_writer_body(
     }
 }
 
+fn fs_read_request(project_root: &std::path::Path, path: &str) -> Request {
+    Request::FsRead {
+        project_root: project_root.to_string_lossy().into_owned(),
+        path: path.to_string(),
+        base64: false,
+    }
+}
+
+fn fs_read_hook_key(project_root: &std::path::Path, path: &str) -> String {
+    format!("fs_read:{}:{path}", project_root.to_string_lossy())
+}
+
 #[tokio::test]
 async fn serialized_requests_apply_in_receipt_order() {
     let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            tmp.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .unwrap();
+    let session = ctx
+        .db
+        .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .unwrap();
+    let live_session = Arc::new(
+        Session::resume(ctx.db.clone(), session.session_id)
+            .unwrap()
+            .unwrap(),
+    );
+    let (handle, mut work_rx) =
+        SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
+    let join = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+    });
+    ctx.registry.insert_test_worker(handle, join);
+
+    let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let executor = tokio::spawn(run_client_executor(
+        ctx.clone(),
+        ClientPrincipal::owner(),
+        executor_rx,
+        event_cmd_tx,
+        writer_tx,
+    ));
+
+    let attach_id = Uuid::new_v4();
+    executor_tx
+        .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
+            Envelope::request(
+                attach_id,
+                Request::Attach {
+                    session_id: Some(session.session_id),
+                    since_seq: None,
+                    project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                    no_sandbox: false,
+                    interactive: true,
+                    model_override: None,
+                    client_protocol_version: proto::PROTOCOL_VERSION,
+                    env_snapshot: None,
+                    env_policy: EnvDriftPolicy::Daemon,
+                },
+            ),
+        ))))
+        .await
+        .unwrap();
+    match recv_writer_body(&mut writer_rx, "attach response").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, attach_id);
+            assert!(matches!(*response, Response::Attached { .. }));
+        }
+        other => panic!("expected attach response, got {other:?}"),
+    }
+    assert!(matches!(
+        work_rx.recv().await.expect("attach queue hydration"),
+        SessionWork::RepublishQueue
+    ));
+
+    let set_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    executor_tx
+        .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
+            Envelope::request(
+                set_id,
+                Request::SetActiveModel {
+                    provider: "openai".to_string(),
+                    model: "gpt-5".to_string(),
+                    trigger: proto::ActiveModelSwitchTrigger::Daemon,
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                },
+            ),
+        ))))
+        .await
+        .unwrap();
+    executor_tx
+        .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
+            Envelope::request(
+                message_id,
+                Request::SendUserMessage {
+                    text: "after model switch".to_string(),
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    image_refs: Vec::new(),
+                    forced_skill: None,
+                },
+            ),
+        ))))
+        .await
+        .unwrap();
+
+    match work_rx.recv().await.expect("set-active-model work") {
+        SessionWork::SetActiveModel {
+            provider,
+            model,
+            trigger,
+            reasoning_effort,
+            thinking_mode,
+        } => {
+            assert_eq!(provider, "openai");
+            assert_eq!(model, "gpt-5");
+            assert!(matches!(
+                trigger,
+                crate::session::ModelSwitchTrigger::Daemon
+            ));
+            assert_eq!(reasoning_effort, None);
+            assert_eq!(thinking_mode, None);
+        }
+        other => panic!("expected SetActiveModel before message, got {other:?}"),
+    }
+    match work_rx.recv().await.expect("user-message work") {
+        SessionWork::UserMessage {
+            submission,
+            respond_to,
+        } => {
+            assert_eq!(submission.text, "after model switch");
+            let item = proto::QueueItem {
+                id: Uuid::new_v4(),
+                status: proto::QueueItemStatus::Queued,
+                text: submission.text.clone(),
+                display_text: None,
+                target: proto::QueueTarget::default(),
+            };
+            respond_to.send((item.clone(), vec![item])).unwrap();
+        }
+        other => panic!("expected UserMessage after model switch, got {other:?}"),
+    }
+    let mut saw_set_ack = false;
+    let mut saw_message = false;
+    for _ in 0..16 {
+        match recv_writer_body(&mut writer_rx, "serialized response").await {
+            Body::Response { id, response } if id == set_id => {
+                assert!(matches!(*response, Response::Ack));
+                saw_set_ack = true;
+            }
+            Body::Response { id, response } if id == message_id => {
+                assert!(matches!(*response, Response::UserMessageQueued { .. }));
+                saw_message = true;
+            }
+            Body::Event { .. } => {}
+            other => panic!("unexpected serialized response body: {other:?}"),
+        }
+        if saw_set_ack && saw_message {
+            break;
+        }
+    }
+    assert!(saw_set_ack);
+    assert!(saw_message);
+    drop(executor_tx);
+    executor.await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_requests_may_complete_out_of_order() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("slow.txt"), "slow").unwrap();
+    std::fs::write(tmp.path().join("fast.txt"), "fast").unwrap();
+    let slow_entered = Arc::new(tokio::sync::Notify::new());
+    let slow_release = Arc::new(tokio::sync::Notify::new());
+    set_concurrent_request_wait_for_test(
+        fs_read_hook_key(tmp.path(), "slow.txt"),
+        slow_entered.clone(),
+        slow_release.clone(),
+    );
     let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
@@ -8940,31 +9236,200 @@ async fn serialized_requests_apply_in_receipt_order() {
         writer_tx,
     ));
 
-    let first = Uuid::new_v4();
-    let second = Uuid::new_v4();
+    let slow_id = Uuid::new_v4();
+    let fast_id = Uuid::new_v4();
     executor_tx
         .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
-            Envelope::request(first, Request::DaemonStatus),
+            Envelope::request(slow_id, fs_read_request(tmp.path(), "slow.txt")),
         ))))
         .await
         .unwrap();
+    slow_entered.notified().await;
     executor_tx
         .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
-            Envelope::request(second, Request::DaemonStatus),
+            Envelope::request(fast_id, fs_read_request(tmp.path(), "fast.txt")),
         ))))
         .await
         .unwrap();
 
-    match recv_writer_body(&mut writer_rx, "first response").await {
-        Body::Response { id, .. } => assert_eq!(id, first),
-        other => panic!("expected first response, got {other:?}"),
+    match recv_writer_body(&mut writer_rx, "fast response").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, fast_id);
+            assert!(matches!(*response, Response::FsRead { .. }));
+        }
+        other => panic!("expected fast response, got {other:?}"),
     }
-    match recv_writer_body(&mut writer_rx, "second response").await {
-        Body::Response { id, .. } => assert_eq!(id, second),
-        other => panic!("expected second response, got {other:?}"),
+    slow_release.notify_waiters();
+    match recv_writer_body(&mut writer_rx, "slow response").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, slow_id);
+            assert!(matches!(*response, Response::FsRead { .. }));
+        }
+        other => panic!("expected slow response, got {other:?}"),
     }
     drop(executor_tx);
     executor.await.unwrap();
+}
+
+#[tokio::test]
+async fn slow_request_does_not_block_event_forwarding() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("slow.txt"), "slow").unwrap();
+    let slow_entered = Arc::new(tokio::sync::Notify::new());
+    let slow_release = Arc::new(tokio::sync::Notify::new());
+    set_concurrent_request_wait_for_test(
+        fs_read_hook_key(tmp.path(), "slow.txt"),
+        slow_entered.clone(),
+        slow_release.clone(),
+    );
+
+    let (global_tx, global_rx) = broadcast::channel(8);
+    let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let event_task = tokio::spawn(run_client_event_forwarder(
+        ctx.clone(),
+        ClientPrincipal::owner(),
+        global_rx,
+        event_cmd_rx,
+        executor_tx.clone(),
+        writer_tx.clone(),
+    ));
+    let executor = tokio::spawn(run_client_executor(
+        ctx,
+        ClientPrincipal::owner(),
+        executor_rx,
+        event_cmd_tx,
+        writer_tx,
+    ));
+
+    let slow_id = Uuid::new_v4();
+    executor_tx
+        .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
+            Envelope::request(slow_id, fs_read_request(tmp.path(), "slow.txt")),
+        ))))
+        .await
+        .unwrap();
+    slow_entered.notified().await;
+    global_tx
+        .send(test_event_envelope(proto::Event::LspNotice {
+            text: "forwarded before slow read response".to_string(),
+        }))
+        .unwrap();
+
+    match recv_writer_body(&mut writer_rx, "event before slow response").await {
+        Body::Event {
+            event: proto::Event::LspNotice { text },
+        } => assert_eq!(text, "forwarded before slow read response"),
+        other => panic!("expected forwarded event, got {other:?}"),
+    }
+    slow_release.notify_waiters();
+    match recv_writer_body(&mut writer_rx, "slow response").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, slow_id);
+            assert!(matches!(*response, Response::FsRead { .. }));
+        }
+        other => panic!("expected slow response, got {other:?}"),
+    }
+    event_task.abort();
+    drop(executor_tx);
+    executor.await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_request_panic_yields_internal_error_and_keeps_connection() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("panic.txt"), "panic").unwrap();
+    set_concurrent_request_panic_for_test(fs_read_hook_key(tmp.path(), "panic.txt"));
+    let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let executor = tokio::spawn(run_client_executor(
+        ctx,
+        ClientPrincipal::owner(),
+        executor_rx,
+        event_cmd_tx,
+        writer_tx,
+    ));
+
+    let panic_id = Uuid::new_v4();
+    let status_id = Uuid::new_v4();
+    executor_tx
+        .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
+            Envelope::request(panic_id, fs_read_request(tmp.path(), "panic.txt")),
+        ))))
+        .await
+        .unwrap();
+    executor_tx
+        .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
+            Envelope::request(status_id, Request::DaemonStatus),
+        ))))
+        .await
+        .unwrap();
+
+    let mut saw_panic_error = false;
+    let mut saw_status = false;
+    for _ in 0..2 {
+        match recv_writer_body(&mut writer_rx, "panic/status response").await {
+            Body::Error { id, error } if id == Some(panic_id) => {
+                assert_eq!(error.code, ErrorCode::Internal);
+                saw_panic_error = true;
+            }
+            Body::Response { id, response } if id == status_id => {
+                assert!(matches!(*response, Response::DaemonStatus { .. }));
+                saw_status = true;
+            }
+            other => panic!("unexpected response after concurrent panic: {other:?}"),
+        }
+    }
+    assert!(saw_panic_error);
+    assert!(saw_status);
+    drop(executor_tx);
+    executor.await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_request_semaphore_applies_backpressure_not_drops() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("read.txt"), "read").unwrap();
+    let mut state = MutableClientState::detached_for_test();
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::with_permits_for_test(0);
+    let permits = concurrent.permits.clone();
+    let request_id = Uuid::new_v4();
+    let mut blocked = Box::pin(handle_envelope(
+        Envelope::request(request_id, fs_read_request(tmp.path(), "read.txt")),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    ));
+
+    tokio::select! {
+        result = &mut blocked => panic!("saturated semaphore should block, got {result:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+    assert!(writer_rx.try_recv().is_err());
+    permits.add_permits(1);
+    blocked.await.unwrap();
+    match concurrent.join_next().await.expect("concurrent task joins") {
+        Ok(()) => {}
+        Err(error) => panic!("concurrent task failed: {error}"),
+    }
+    match recv_writer_body(&mut writer_rx, "response after permit").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, request_id);
+            assert!(matches!(*response, Response::FsRead { .. }));
+        }
+        other => panic!("expected response after permit, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -9068,6 +9533,7 @@ async fn attach_replay_precedes_live_events_under_task_split() {
     let mut shared = state.shared_snapshot();
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (event_cmd_tx, mut event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
     let request_id = Uuid::new_v4();
     handle_envelope(
         Envelope::request(
@@ -9089,6 +9555,7 @@ async fn attach_replay_precedes_live_events_under_task_split() {
         &ctx,
         &event_cmd_tx,
         &writer_tx,
+        &mut concurrent,
     )
     .await
     .unwrap();
@@ -9117,6 +9584,128 @@ async fn attach_replay_precedes_live_events_under_task_split() {
             .expect("live subscription command"),
         ClientEventCommand::Attach(_)
     ));
+}
+
+#[tokio::test]
+async fn attach_replay_precedes_live_events_under_concurrency() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("slow.txt"), "slow").unwrap();
+    ctx.db
+        .set_workspace_trust(
+            tmp.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .unwrap();
+    let session = ctx
+        .db
+        .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .unwrap();
+    let live_session = Arc::new(
+        Session::resume(ctx.db.clone(), session.session_id)
+            .unwrap()
+            .unwrap(),
+    );
+    let (handle, _work_rx) =
+        SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
+    let join = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+    });
+    ctx.registry.insert_test_worker(handle, join);
+    assert!(ctx.shutdown.begin_drain());
+
+    let slow_entered = Arc::new(tokio::sync::Notify::new());
+    let slow_release = Arc::new(tokio::sync::Notify::new());
+    set_concurrent_request_wait_for_test(
+        fs_read_hook_key(tmp.path(), "slow.txt"),
+        slow_entered.clone(),
+        slow_release.clone(),
+    );
+    let mut state = MutableClientState::detached_for_test();
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, mut event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+
+    let slow_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::request(slow_id, fs_read_request(tmp.path(), "slow.txt")),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    slow_entered.notified().await;
+
+    let attach_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::request(
+            attach_id,
+            Request::Attach {
+                session_id: Some(session.session_id),
+                since_seq: None,
+                project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                no_sandbox: false,
+                interactive: true,
+                model_override: None,
+                client_protocol_version: proto::PROTOCOL_VERSION,
+                env_snapshot: None,
+                env_policy: EnvDriftPolicy::Daemon,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+
+    match recv_writer_body(&mut writer_rx, "attach response").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, attach_id);
+            assert!(matches!(*response, Response::Attached { .. }));
+        }
+        other => panic!("expected attach response, got {other:?}"),
+    }
+    let mut saw_drain = false;
+    for _ in 0..8 {
+        if let Body::Event { event } = recv_writer_body(&mut writer_rx, "attach replay").await
+            && matches!(event, proto::Event::DaemonDraining { .. })
+        {
+            saw_drain = true;
+            break;
+        }
+    }
+    assert!(
+        saw_drain,
+        "attach should enqueue drain replay before slow read response"
+    );
+    assert!(matches!(
+        event_cmd_rx
+            .recv()
+            .await
+            .expect("live subscription command"),
+        ClientEventCommand::Attach(_)
+    ));
+    slow_release.notify_waiters();
+    match concurrent.join_next().await.expect("slow read joins") {
+        Ok(()) => {}
+        Err(error) => panic!("slow read task failed: {error}"),
+    }
+    match recv_writer_body(&mut writer_rx, "slow response").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, slow_id);
+            assert!(matches!(*response, Response::FsRead { .. }));
+        }
+        other => panic!("expected slow read response, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -9810,6 +10399,7 @@ async fn attach_replays_drain_state_after_attached_response() {
     let mut shared = state.shared_snapshot();
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
     let request_id = Uuid::new_v4();
     handle_envelope(
         Envelope::request(
@@ -9831,6 +10421,7 @@ async fn attach_replays_drain_state_after_attached_response() {
         &ctx,
         &event_cmd_tx,
         &writer_tx,
+        &mut concurrent,
     )
     .await
     .expect("attach envelope handled");

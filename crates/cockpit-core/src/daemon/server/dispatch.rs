@@ -465,44 +465,80 @@ pub(super) async fn handle_serialized_request(
             path,
             show_hidden,
         } => {
-            crate::daemon::fs_api::fs_list(ctx, &state.principal, &project_root, &path, show_hidden)
+            crate::daemon::fs_api::fs_list_blocking(
+                ctx.clone(),
+                state.principal.clone(),
+                project_root,
+                path,
+                show_hidden,
+            )
+            .await
         }
 
         Request::FsStat { project_root, path } => {
-            crate::daemon::fs_api::fs_stat(ctx, &state.principal, &project_root, &path)
+            crate::daemon::fs_api::fs_stat_blocking(
+                ctx.clone(),
+                state.principal.clone(),
+                project_root,
+                path,
+            )
+            .await
         }
 
         Request::FsRead {
             project_root,
             path,
             base64,
-        } => crate::daemon::fs_api::fs_read(ctx, &state.principal, &project_root, &path, base64),
+        } => {
+            crate::daemon::fs_api::fs_read_blocking(
+                ctx.clone(),
+                state.principal.clone(),
+                project_root,
+                path,
+                base64,
+            )
+            .await
+        }
 
         Request::FsWrite {
             project_root,
             path,
             content,
             base_hash,
-        } => crate::daemon::fs_api::fs_write(ctx, &project_root, &path, &content, base_hash),
+        } => {
+            crate::daemon::fs_api::fs_write_blocking(
+                ctx.clone(),
+                project_root,
+                path,
+                content,
+                base_hash,
+            )
+            .await
+        }
 
         Request::FsCreateDir { project_root, path } => {
-            crate::daemon::fs_api::fs_create_dir(&project_root, &path)
+            crate::daemon::fs_api::fs_create_dir_blocking(project_root, path).await
         }
 
         Request::FsRename {
             project_root,
             from_path,
             to_path,
-        } => crate::daemon::fs_api::fs_rename(ctx, &project_root, &from_path, &to_path),
-
-        Request::FsDelete { project_root, path } => {
-            crate::daemon::fs_api::fs_delete(ctx, &project_root, &path)
+        } => {
+            crate::daemon::fs_api::fs_rename_blocking(ctx.clone(), project_root, from_path, to_path)
+                .await
         }
 
-        Request::GitStatus { project_root } => crate::daemon::fs_api::git_status(&project_root),
+        Request::FsDelete { project_root, path } => {
+            crate::daemon::fs_api::fs_delete_blocking(ctx.clone(), project_root, path).await
+        }
+
+        Request::GitStatus { project_root } => {
+            crate::daemon::fs_api::git_status_blocking(project_root).await
+        }
 
         Request::GitDiffFile { project_root, path } => {
-            crate::daemon::fs_api::git_diff_file(&project_root, &path)
+            crate::daemon::fs_api::git_diff_file_blocking(project_root, path).await
         }
 
         Request::OpenTerminal { cwd, cols, rows } => {
@@ -1151,6 +1187,8 @@ pub(super) async fn handle_concurrent_request(
             "allowed",
         );
     }
+    #[cfg(test)]
+    apply_concurrent_request_test_hook(&request).await;
     match request {
         Request::SubagentTranscript {
             session_id,
@@ -1201,17 +1239,6 @@ pub(super) async fn handle_concurrent_request(
                 history,
             })
         }
-        Request::GoalStatus { session_id } => {
-            ctx.db
-                .refresh_session_goal_usage(session_id)
-                .map_err(internal)?;
-            let goal = ctx
-                .db
-                .current_session_goal(session_id, false)
-                .map_err(internal)?
-                .map(goal_to_proto);
-            Ok(Response::GoalStatus { goal })
-        }
         Request::ListAssistants => {
             let assistants = ctx
                 .db
@@ -1241,24 +1268,44 @@ pub(super) async fn handle_concurrent_request(
             project_root,
             path,
             show_hidden,
-        } => crate::daemon::fs_api::fs_list(
-            &ctx,
-            &shared.principal,
-            &project_root,
-            &path,
-            show_hidden,
-        ),
+        } => {
+            crate::daemon::fs_api::fs_list_blocking(
+                ctx.clone(),
+                shared.principal.clone(),
+                project_root,
+                path,
+                show_hidden,
+            )
+            .await
+        }
         Request::FsStat { project_root, path } => {
-            crate::daemon::fs_api::fs_stat(&ctx, &shared.principal, &project_root, &path)
+            crate::daemon::fs_api::fs_stat_blocking(
+                ctx.clone(),
+                shared.principal.clone(),
+                project_root,
+                path,
+            )
+            .await
         }
         Request::FsRead {
             project_root,
             path,
             base64,
-        } => crate::daemon::fs_api::fs_read(&ctx, &shared.principal, &project_root, &path, base64),
-        Request::GitStatus { project_root } => crate::daemon::fs_api::git_status(&project_root),
+        } => {
+            crate::daemon::fs_api::fs_read_blocking(
+                ctx.clone(),
+                shared.principal.clone(),
+                project_root,
+                path,
+                base64,
+            )
+            .await
+        }
+        Request::GitStatus { project_root } => {
+            crate::daemon::fs_api::git_status_blocking(project_root).await
+        }
         Request::GitDiffFile { project_root, path } => {
-            crate::daemon::fs_api::git_diff_file(&project_root, &path)
+            crate::daemon::fs_api::git_diff_file_blocking(project_root, path).await
         }
         Request::ListSessions {
             project_id,

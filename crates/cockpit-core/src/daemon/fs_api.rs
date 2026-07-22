@@ -1,5 +1,8 @@
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use base64::Engine as _;
@@ -48,6 +51,20 @@ pub fn fs_list(
     Ok(Response::FsList { entries, truncated })
 }
 
+pub async fn fs_list_blocking(
+    ctx: Arc<DaemonContext>,
+    principal: ClientPrincipal,
+    project_root: String,
+    path: String,
+    show_hidden: bool,
+) -> Result<Response, ErrorPayload> {
+    tokio::task::spawn_blocking(move || {
+        fs_list(&ctx, &principal, &project_root, &path, show_hidden)
+    })
+    .await
+    .map_err(internal)?
+}
+
 pub fn fs_stat(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
@@ -64,6 +81,17 @@ pub fn fs_stat(
     Ok(Response::FsStat { entry })
 }
 
+pub async fn fs_stat_blocking(
+    ctx: Arc<DaemonContext>,
+    principal: ClientPrincipal,
+    project_root: String,
+    path: String,
+) -> Result<Response, ErrorPayload> {
+    tokio::task::spawn_blocking(move || fs_stat(&ctx, &principal, &project_root, &path))
+        .await
+        .map_err(internal)?
+}
+
 pub fn fs_read(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
@@ -77,6 +105,8 @@ pub fn fs_read(
         return Err(bad_request(format!("`{path}` is a directory")));
     }
     ensure_read_allowed(ctx, principal, &root, &resolved)?;
+    #[cfg(test)]
+    apply_fs_read_block_for_test(&resolved);
 
     let bytes = std::fs::read(&resolved).map_err(internal)?;
     let hash = content_hash(&bytes);
@@ -111,6 +141,59 @@ pub fn fs_read(
         truncated,
         kind: FsReadKind::Text,
     })
+}
+
+pub async fn fs_read_blocking(
+    ctx: Arc<DaemonContext>,
+    principal: ClientPrincipal,
+    project_root: String,
+    path: String,
+    wants_base64: bool,
+) -> Result<Response, ErrorPayload> {
+    tokio::task::spawn_blocking(move || {
+        fs_read(&ctx, &principal, &project_root, &path, wants_base64)
+    })
+    .await
+    .map_err(internal)?
+}
+
+#[cfg(test)]
+struct FsReadBlockHook {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: Arc<(StdMutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+fn fs_read_block_hooks() -> &'static StdMutex<std::collections::HashMap<PathBuf, FsReadBlockHook>> {
+    static HOOKS: OnceLock<StdMutex<std::collections::HashMap<PathBuf, FsReadBlockHook>>> =
+        OnceLock::new();
+    HOOKS.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn set_fs_read_block_for_test(
+    path: PathBuf,
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: Arc<(StdMutex<bool>, std::sync::Condvar)>,
+) {
+    fs_read_block_hooks()
+        .lock()
+        .unwrap()
+        .insert(path, FsReadBlockHook { entered, release });
+}
+
+#[cfg(test)]
+fn apply_fs_read_block_for_test(path: &Path) {
+    let hook = fs_read_block_hooks().lock().unwrap().remove(path);
+    let Some(FsReadBlockHook { entered, release }) = hook else {
+        return;
+    };
+    let _ = entered.send(());
+    let (lock, cvar) = &*release;
+    let mut released = lock.lock().unwrap();
+    while !*released {
+        released = cvar.wait(released).unwrap();
+    }
 }
 
 pub fn fs_write(
@@ -150,11 +233,32 @@ pub fn fs_write(
     Ok(Response::FsWrite { hash })
 }
 
+pub async fn fs_write_blocking(
+    ctx: Arc<DaemonContext>,
+    project_root: String,
+    path: String,
+    content: String,
+    base_hash: Option<String>,
+) -> Result<Response, ErrorPayload> {
+    tokio::task::spawn_blocking(move || fs_write(&ctx, &project_root, &path, &content, base_hash))
+        .await
+        .map_err(internal)?
+}
+
 pub fn fs_create_dir(project_root: &str, path: &str) -> Result<Response, ErrorPayload> {
     let root = canonical_project_root(project_root)?;
     let target = resolve_for_write(&root, path)?;
     std::fs::create_dir_all(&target).map_err(internal)?;
     Ok(Response::Ack)
+}
+
+pub async fn fs_create_dir_blocking(
+    project_root: String,
+    path: String,
+) -> Result<Response, ErrorPayload> {
+    tokio::task::spawn_blocking(move || fs_create_dir(&project_root, &path))
+        .await
+        .map_err(internal)?
 }
 
 pub fn fs_rename(
@@ -180,6 +284,17 @@ pub fn fs_rename(
     Ok(Response::Ack)
 }
 
+pub async fn fs_rename_blocking(
+    ctx: Arc<DaemonContext>,
+    project_root: String,
+    from_path: String,
+    to_path: String,
+) -> Result<Response, ErrorPayload> {
+    tokio::task::spawn_blocking(move || fs_rename(&ctx, &project_root, &from_path, &to_path))
+        .await
+        .map_err(internal)?
+}
+
 pub fn fs_delete(
     ctx: &DaemonContext,
     project_root: &str,
@@ -200,6 +315,16 @@ pub fn fs_delete(
     Ok(Response::Ack)
 }
 
+pub async fn fs_delete_blocking(
+    ctx: Arc<DaemonContext>,
+    project_root: String,
+    path: String,
+) -> Result<Response, ErrorPayload> {
+    tokio::task::spawn_blocking(move || fs_delete(&ctx, &project_root, &path))
+        .await
+        .map_err(internal)?
+}
+
 pub fn git_status(project_root: &str) -> Result<Response, ErrorPayload> {
     let root = canonical_project_root(project_root)?;
     let outcome = crate::git::run_git(&root, &["status", "--porcelain=v2"]).map_err(internal)?;
@@ -214,6 +339,12 @@ pub fn git_status(project_root: &str) -> Result<Response, ErrorPayload> {
         })
         .collect();
     Ok(Response::GitStatus { entries })
+}
+
+pub async fn git_status_blocking(project_root: String) -> Result<Response, ErrorPayload> {
+    tokio::task::spawn_blocking(move || git_status(&project_root))
+        .await
+        .map_err(internal)?
 }
 
 pub fn git_diff_file(project_root: &str, path: &str) -> Result<Response, ErrorPayload> {
@@ -236,6 +367,15 @@ pub fn git_diff_file(project_root: &str, path: &str) -> Result<Response, ErrorPa
         diff: outcome.stdout[..cap].to_string(),
         truncated: outcome.stdout.len() > cap,
     })
+}
+
+pub async fn git_diff_file_blocking(
+    project_root: String,
+    path: String,
+) -> Result<Response, ErrorPayload> {
+    tokio::task::spawn_blocking(move || git_diff_file(&project_root, &path))
+        .await
+        .map_err(internal)?
 }
 
 fn entry_to_wire(
@@ -613,5 +753,34 @@ mod tests {
             .unwrap();
         assert!(ignored.gitignored);
         assert!(ignored.blocked);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_fs_read_does_not_occupy_a_runtime_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let file = root.join("read.txt");
+        std::fs::write(&file, "read").unwrap();
+        let ctx = Arc::new(test_ctx(root));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        set_fs_read_block_for_test(file.canonicalize().unwrap(), entered_tx, release.clone());
+
+        let read_task = tokio::spawn(fs_read_blocking(
+            ctx,
+            ClientPrincipal::owner(),
+            root.to_string_lossy().into_owned(),
+            "read.txt".to_string(),
+            false,
+        ));
+        entered_rx.await.expect("fs_read entered blocking body");
+        let progressed = tokio::spawn(async { 1usize });
+        assert_eq!(progressed.await.unwrap(), 1);
+
+        let (lock, cvar) = &*release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+        let response = read_task.await.unwrap().unwrap();
+        assert!(matches!(response, Response::FsRead { .. }));
     }
 }

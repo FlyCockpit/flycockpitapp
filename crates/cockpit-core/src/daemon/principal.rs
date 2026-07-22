@@ -282,17 +282,75 @@ mod tests {
     }
 
     #[test]
-    fn request_ordering_is_serialized_for_every_variant() {
+    fn request_ordering_concurrent_set_is_exact() {
         let rows = proto::command!(request_ordering_rows_from_command_table);
         assert!(
             rows.len() > 80,
             "command table should enumerate Request rows"
         );
-        for (kind, ordering) in rows {
+        let expected = std::collections::BTreeSet::from([
+            "daemon_status",
+            "export_session_data",
+            "fs_list",
+            "fs_read",
+            "fs_stat",
+            "get_usage_counts",
+            "git_diff_file",
+            "git_status",
+            "guidance_estimate",
+            "list_agents",
+            "list_assistants",
+            "list_models",
+            "list_scheduled_jobs",
+            "list_sessions",
+            "list_skills",
+            "read_session_messages",
+            "resource_snapshot",
+            "session_live_status",
+            "stats_rollup",
+            "subagent_transcript",
+        ]);
+        let actual: std::collections::BTreeSet<_> = rows
+            .iter()
+            .filter_map(|(kind, ordering)| {
+                (*ordering == RequestOrdering::Concurrent).then_some(*kind)
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        for serialized in [
+            "attach",
+            "begin_attachment_upload",
+            "upload_attachment_chunk",
+            "finish_attachment_upload",
+            "cancel_attachment_upload",
+            "send_user_message",
+            "remove_queued_user_message",
+            "remove_newest_queued_user_message",
+            "remove_editable_queued_user_messages",
+            "cancel_turn",
+            "steer_delegation",
+            "resolve_interrupt",
+            "set_active_model",
+            "set_agent",
+            "set_llm_mode",
+            "set_session_llm_mode",
+            "set_approval_mode",
+            "set_delegation_recursion",
+            "set_sandbox",
+            "set_sandbox_escalation",
+            "set_preflight",
+            "set_trusted_only",
+            "set_redaction",
+            "set_tandem_models",
+        ] {
+            let (_, ordering) = rows
+                .iter()
+                .find(|(kind, _)| *kind == serialized)
+                .unwrap_or_else(|| panic!("missing request kind {serialized}"));
             assert_eq!(
                 *ordering,
                 RequestOrdering::Serialized,
-                "{kind} should remain serialized in this no-op classifier"
+                "{serialized} must stay serialized"
             );
         }
     }

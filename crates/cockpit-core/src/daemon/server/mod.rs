@@ -8,17 +8,20 @@
 //! contract that lets this layer ship without bikeshedding transport.
 
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
+use futures::FutureExt;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::config::extended::{DaemonUploadLimitsConfig, ExtendedConfig, RetentionConfig};
@@ -54,6 +57,7 @@ const IN_PROCESS_EVENT_QUEUE: usize = 1024;
 // request executor backpressures its producer instead of retaining unbounded
 // daemon-global or session events.
 const CLIENT_IO_CHANNEL_CAPACITY: usize = 64;
+const MAX_CONCURRENT_CLIENT_REQUESTS: usize = 16;
 
 static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, Weak<DaemonContext>>>> =
     OnceLock::new();
@@ -2136,6 +2140,36 @@ impl SharedAttachedSession {
     }
 }
 
+struct ConcurrentRequestRuntime {
+    permits: Arc<Semaphore>,
+    tasks: JoinSet<()>,
+}
+
+impl ConcurrentRequestRuntime {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENT_REQUESTS)),
+            tasks: JoinSet::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_permits_for_test(permits: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(permits)),
+            tasks: JoinSet::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    async fn join_next(&mut self) -> Option<std::result::Result<(), tokio::task::JoinError>> {
+        self.tasks.join_next().await
+    }
+}
+
 impl MutableClientState {
     fn detached_with_principal(
         upload_accounting: Arc<StdMutex<UploadAccounting>>,
@@ -2393,6 +2427,8 @@ async fn run_in_process_client(
     let mut shared = state.shared_snapshot();
     let mut global_rx = ctx.subscribe_global();
     let mut session_event_rx: Option<EventReceiver> = None;
+    let concurrent_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENT_REQUESTS));
+    let mut concurrent_tasks = JoinSet::new();
 
     if event_tx.send(ctx.caffeinate_state_event()).await.is_err() {
         return;
@@ -2408,6 +2444,11 @@ async fn run_in_process_client(
 
         tokio::select! {
             biased;
+            Some(joined) = concurrent_tasks.join_next(), if !concurrent_tasks.is_empty() => {
+                if let Err(error) = joined {
+                    tracing::warn!(%error, "in-process concurrent request task failed");
+                }
+            }
             global = global_rx.recv() => {
                 match global {
                     Ok(envelope) => {
@@ -2451,12 +2492,25 @@ async fn run_in_process_client(
                 let Some(InProcessRequest { request, reply }) = cmd else {
                     return;
                 };
+                if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
+                    let Ok(permit) = concurrent_permits.clone().acquire_owned().await else {
+                        return;
+                    };
+                    let shared = shared.clone();
+                    let ctx = ctx.clone();
+                    concurrent_tasks.spawn(async move {
+                        let _permit = permit;
+                        let result = run_concurrent_request_catching_panic(request, shared, ctx).await;
+                        let _ = reply.send(result);
+                    });
+                    continue;
+                }
                 let is_attach = matches!(&request, Request::Attach { .. });
                 let mut effects = ClientRequestEffects::default();
-                let result = dispatch_request_inline(
+                let result = dispatch::handle_serialized_request(
                     request,
                     &mut state,
-                    &mut shared,
+                    &shared,
                     &ctx,
                     &mut effects,
                 )
@@ -2832,25 +2886,40 @@ async fn run_client_executor(
         ctx.terminal_host.clone(),
     );
     let mut shared = state.shared_snapshot();
-    while let Some(input) = executor_rx.recv().await {
-        match input {
-            ClientExecutorInput::Frame(frame) => {
-                if !handle_client_frame(
-                    frame,
-                    &mut state,
-                    &mut shared,
-                    &ctx,
-                    &event_cmd_tx,
-                    &writer_tx,
-                )
-                .await
-                {
-                    return;
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    loop {
+        tokio::select! {
+            biased;
+            Some(joined) = concurrent.join_next(), if !concurrent.is_empty() => {
+                if let Err(error) = joined {
+                    tracing::warn!(%error, "concurrent request task failed");
                 }
             }
-            ClientExecutorInput::SessionEventsClosed => {
-                state.attached = None;
-                shared = state.shared_snapshot();
+            input = executor_rx.recv() => {
+                let Some(input) = input else {
+                    return;
+                };
+                match input {
+                    ClientExecutorInput::Frame(frame) => {
+                        if !handle_client_frame(
+                            frame,
+                            &mut state,
+                            &mut shared,
+                            &ctx,
+                            &event_cmd_tx,
+                            &writer_tx,
+                            &mut concurrent,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                    ClientExecutorInput::SessionEventsClosed => {
+                        state.attached = None;
+                        shared = state.shared_snapshot();
+                    }
+                }
             }
         }
     }
@@ -2863,13 +2932,20 @@ async fn handle_client_frame(
     ctx: &Arc<DaemonContext>,
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
+    concurrent: &mut ConcurrentRequestRuntime,
 ) -> bool {
     match frame {
-        RecvFrame::Envelope(env) => {
-            handle_envelope(*env, state, shared, ctx, event_cmd_tx, writer_tx)
-                .await
-                .is_ok()
-        }
+        RecvFrame::Envelope(env) => handle_envelope(
+            *env,
+            state,
+            shared,
+            ctx,
+            event_cmd_tx,
+            writer_tx,
+            concurrent,
+        )
+        .await
+        .is_ok(),
         RecvFrame::VersionMismatch { v, kind, id } => {
             if kind == "req"
                 && let Some(id) = id
@@ -2895,23 +2971,6 @@ async fn handle_client_frame(
     }
 }
 
-async fn dispatch_request_inline(
-    request: Request,
-    state: &mut MutableClientState,
-    shared: &mut Arc<SharedClientState>,
-    ctx: &Arc<DaemonContext>,
-    effects: &mut ClientRequestEffects,
-) -> std::result::Result<Response, ErrorPayload> {
-    match principal::request_ordering(&request) {
-        principal::RequestOrdering::Serialized => {
-            self::dispatch::handle_serialized_request(request, state, shared, ctx, effects).await
-        }
-        principal::RequestOrdering::Concurrent => {
-            self::dispatch::handle_concurrent_request(request, shared.clone(), ctx.clone()).await
-        }
-    }
-}
-
 async fn handle_envelope(
     env: Envelope,
     state: &mut MutableClientState,
@@ -2919,43 +2978,37 @@ async fn handle_envelope(
     ctx: &Arc<DaemonContext>,
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
+    concurrent: &mut ConcurrentRequestRuntime,
 ) -> Result<()> {
     match env.body {
         Body::Request { id, request } => {
+            if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
+                let Ok(permit) = concurrent.permits.clone().acquire_owned().await else {
+                    return Ok(());
+                };
+                let request_shared = shared.clone();
+                let ctx = ctx.clone();
+                let writer_tx = writer_tx.clone();
+                concurrent.tasks.spawn(async move {
+                    let _permit = permit;
+                    let response_shared = request_shared.clone();
+                    let result =
+                        run_concurrent_request_catching_panic(request, request_shared, ctx).await;
+                    let envelope = response_envelope_for_shared(id, result, &response_shared);
+                    let _ = send_writer_envelope(&writer_tx, envelope).await;
+                });
+                return Ok(());
+            }
             let is_attach = matches!(&request, Request::Attach { .. });
             let mut effects = ClientRequestEffects::default();
-            let result = dispatch_request_inline(request, state, shared, ctx, &mut effects).await;
+            let result =
+                dispatch::handle_serialized_request(request, state, shared, ctx, &mut effects)
+                    .await;
             let attached = matches!(&result, Ok(Response::Attached { .. }));
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();
             }
-            let envelope = match result {
-                Ok(response) => {
-                    let response = if shared.principal.is_owner() {
-                        Some(response)
-                    } else if let Some(attached) = shared.attached.as_ref() {
-                        scrub_proto_response(response, &attached.redaction_table())
-                    } else {
-                        // Session-bearing responses without an attachment must
-                        // scrub inside their request arm using the target
-                        // session's persisted table (for example
-                        // `SubagentTranscript`). Other unattached responses do
-                        // not carry session user content.
-                        Some(response)
-                    };
-                    match response {
-                        Some(response) => Envelope::response(id, response),
-                        None => Envelope::error(
-                            Some(id),
-                            ErrorPayload {
-                                code: ErrorCode::Internal,
-                                message: "response redaction failed".to_string(),
-                            },
-                        ),
-                    }
-                }
-                Err(err) => Envelope::error(Some(id), err),
-            };
+            let envelope = response_envelope_for_shared(id, result, shared);
             let envelope_kind = envelope_kind(&envelope);
             let sent = if effects.shutdown_after_response {
                 send_writer_envelope_with_ack(writer_tx, envelope).await
@@ -3007,6 +3060,118 @@ async fn handle_envelope(
         }
     }
     Ok(())
+}
+
+async fn run_concurrent_request_catching_panic(
+    request: Request,
+    shared: Arc<SharedClientState>,
+    ctx: Arc<DaemonContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    match AssertUnwindSafe(dispatch::handle_concurrent_request(request, shared, ctx))
+        .catch_unwind()
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ErrorPayload {
+            code: ErrorCode::Internal,
+            message: "concurrent request handler panicked".to_string(),
+        }),
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ConcurrentRequestTestHooks {
+    waits: StdMutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    entered: StdMutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    panics: StdMutex<HashSet<String>>,
+}
+
+#[cfg(test)]
+fn concurrent_request_test_hooks() -> &'static ConcurrentRequestTestHooks {
+    static HOOKS: OnceLock<ConcurrentRequestTestHooks> = OnceLock::new();
+    HOOKS.get_or_init(ConcurrentRequestTestHooks::default)
+}
+
+#[cfg(test)]
+fn concurrent_request_test_key(request: &Request) -> Option<String> {
+    match request {
+        Request::FsRead {
+            project_root, path, ..
+        } => Some(format!("fs_read:{project_root}:{path}")),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn set_concurrent_request_wait_for_test(
+    key: String,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) {
+    let hooks = concurrent_request_test_hooks();
+    hooks.entered.lock().unwrap().insert(key.clone(), entered);
+    hooks.waits.lock().unwrap().insert(key, release);
+}
+
+#[cfg(test)]
+fn set_concurrent_request_panic_for_test(key: String) {
+    concurrent_request_test_hooks()
+        .panics
+        .lock()
+        .unwrap()
+        .insert(key);
+}
+
+#[cfg(test)]
+async fn apply_concurrent_request_test_hook(request: &Request) {
+    let Some(key) = concurrent_request_test_key(request) else {
+        return;
+    };
+    let hooks = concurrent_request_test_hooks();
+    if let Some(entered) = hooks.entered.lock().unwrap().remove(&key) {
+        entered.notify_waiters();
+    }
+    if hooks.panics.lock().unwrap().remove(&key) {
+        panic!("concurrent request test hook panic");
+    }
+    let wait = hooks.waits.lock().unwrap().remove(&key);
+    if let Some(wait) = wait {
+        wait.notified().await;
+    }
+}
+
+fn response_envelope_for_shared(
+    id: Uuid,
+    result: std::result::Result<Response, ErrorPayload>,
+    shared: &SharedClientState,
+) -> Envelope {
+    match result {
+        Ok(response) => {
+            let response = if shared.principal.is_owner() {
+                Some(response)
+            } else if let Some(attached) = shared.attached.as_ref() {
+                scrub_proto_response(response, &attached.redaction_table())
+            } else {
+                // Session-bearing responses without an attachment must scrub
+                // inside their request arm using the target session's
+                // persisted table (for example `SubagentTranscript`). Other
+                // unattached responses do not carry session user content.
+                Some(response)
+            };
+            match response {
+                Some(response) => Envelope::response(id, response),
+                None => Envelope::error(
+                    Some(id),
+                    ErrorPayload {
+                        code: ErrorCode::Internal,
+                        message: "response redaction failed".to_string(),
+                    },
+                ),
+            }
+        }
+        Err(err) => Envelope::error(Some(id), err),
+    }
 }
 
 fn scrub_replay_event_for_principal(

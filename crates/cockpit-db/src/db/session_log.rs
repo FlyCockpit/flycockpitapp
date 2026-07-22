@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::db::Db;
 
 const READ_SESSION_MESSAGES_MAX_LIMIT: u32 = 200;
+const LIST_SESSION_EVENTS_MAX_LIMIT: u32 = 500;
 
 /// Event-type discriminants for the session log. The string forms are
 /// the stable on-disk + `events.json` values; keep them aligned with the
@@ -216,6 +217,15 @@ pub struct SessionEventRow {
     pub label: Option<String>,
     pub origin_principal: Option<String>,
     pub data: Value,
+}
+
+/// Bounded page of session events strictly before a cursor, ordered by `seq`
+/// ascending like the full event readers.
+#[derive(Debug, Clone)]
+pub struct SessionEventPage {
+    pub events: Vec<SessionEventRow>,
+    pub has_more: bool,
+    pub oldest_seq: Option<i64>,
 }
 
 /// Current epoch milliseconds. One helper so every session-log timestamp
@@ -443,6 +453,60 @@ impl Db {
         Ok(events)
     }
 
+    pub fn list_session_events_before(
+        &self,
+        session_id: Uuid,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> Result<SessionEventPage> {
+        self.read_blocking(|conn| {
+            Self::list_session_events_before_conn(conn, session_id, before_seq, limit)
+        })
+    }
+
+    pub fn list_session_events_before_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> Result<SessionEventPage> {
+        let limit = limit.clamp(1, LIST_SESSION_EVENTS_MAX_LIMIT);
+        let fetch_limit = i64::from(limit) + 1;
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal, data_json
+                   FROM session_events
+                  WHERE session_id = ?1
+                    AND (?2 IS NULL OR seq < ?3)
+                  ORDER BY seq DESC
+                  LIMIT ?4",
+            )
+            .context("preparing list_session_events_before")?;
+        let rows = stmt
+            .query_map(
+                params![session_id.to_string(), before_seq, before_seq, fetch_limit],
+                raw_event_row,
+            )
+            .context("querying session_events before seq")?;
+        let mut raw = Vec::new();
+        for row in rows {
+            raw.push(row.context("reading session_event row")?);
+        }
+        let has_more = raw.len() > limit as usize;
+        if has_more {
+            raw.truncate(limit as usize);
+        }
+        raw.reverse();
+        let mut events = decode_event_rows(raw)?;
+        hydrate_compaction_payloads_conn(conn, session_id, &mut events)?;
+        let oldest_seq = events.first().map(|event| event.seq);
+        Ok(SessionEventPage {
+            events,
+            has_more,
+            oldest_seq,
+        })
+    }
+
     pub fn read_session_messages(
         &self,
         session_id: Uuid,
@@ -641,6 +705,54 @@ fn is_truncated_tail_error(err: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn insert_numbered_events(db: &Db, session_id: Uuid, count: usize) -> Vec<i64> {
+        (1..=count)
+            .map(|index| {
+                let kind = match index % 3 {
+                    0 => SessionEventKind::ToolCall,
+                    1 => SessionEventKind::UserMessage,
+                    _ => SessionEventKind::AssistantMessage,
+                };
+                db.insert_session_event(
+                    session_id,
+                    kind,
+                    Some("builder"),
+                    None,
+                    &json!({"text": format!("event-{index}")}),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn assert_session_event_rows_eq(left: &[SessionEventRow], right: &[SessionEventRow]) {
+        assert_eq!(left.len(), right.len(), "event row count mismatch");
+        for (index, (left, right)) in left.iter().zip(right).enumerate() {
+            assert_eq!(left.seq, right.seq, "seq mismatch at index {index}");
+            assert_eq!(
+                left.session_id, right.session_id,
+                "session_id mismatch at index {index}"
+            );
+            assert_eq!(left.ts_ms, right.ts_ms, "ts_ms mismatch at index {index}");
+            assert_eq!(left.kind, right.kind, "kind mismatch at index {index}");
+            assert_eq!(left.agent, right.agent, "agent mismatch at index {index}");
+            assert_eq!(
+                left.call_id, right.call_id,
+                "call_id mismatch at index {index}"
+            );
+            assert_eq!(
+                left.task_call_id, right.task_call_id,
+                "task_call_id mismatch at index {index}"
+            );
+            assert_eq!(left.label, right.label, "label mismatch at index {index}");
+            assert_eq!(
+                left.origin_principal, right.origin_principal,
+                "origin_principal mismatch at index {index}"
+            );
+            assert_eq!(left.data, right.data, "data mismatch at index {index}");
+        }
+    }
 
     #[test]
     fn inference_request_round_trip() {
@@ -1107,6 +1219,275 @@ mod tests {
             .read_blocking(|conn| Db::list_session_events_since_conn(conn, s.session_id, seq3))
             .unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn list_session_events_before_returns_newest_page_oldest_first() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        let seqs = insert_numbered_events(&db, s.session_id, 5);
+
+        let page = db
+            .list_session_events_before(s.session_id, None, 2)
+            .expect("newest page");
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![seqs[3], seqs[4]]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.oldest_seq, Some(seqs[3]));
+
+        let missing_cursor_page = db
+            .list_session_events_before(s.session_id, Some(seqs[4] + 100), 2)
+            .expect("page before missing cursor");
+        assert_eq!(
+            missing_cursor_page
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![seqs[3], seqs[4]]
+        );
+    }
+
+    #[test]
+    fn list_session_events_before_walk_reconstructs_full_event_list() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        insert_numbered_events(&db, s.session_id, 7);
+        let full = db.list_session_events(s.session_id).unwrap();
+
+        let mut pages = Vec::new();
+        let mut before_seq = None;
+        loop {
+            let page = db
+                .list_session_events_before(s.session_id, before_seq, 3)
+                .expect("page before cursor");
+            before_seq = page.oldest_seq;
+            pages.push(page.events);
+            if !page.has_more {
+                break;
+            }
+        }
+        let reconstructed = pages
+            .into_iter()
+            .rev()
+            .flatten()
+            .collect::<Vec<SessionEventRow>>();
+
+        assert_session_event_rows_eq(&reconstructed, &full);
+    }
+
+    #[test]
+    fn list_session_events_before_reports_has_more_until_oldest_event() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        let seqs = insert_numbered_events(&db, s.session_id, 5);
+
+        let first = db
+            .list_session_events_before(s.session_id, None, 2)
+            .expect("first page");
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![seqs[3], seqs[4]]
+        );
+        assert!(first.has_more);
+        assert_eq!(first.oldest_seq, Some(seqs[3]));
+
+        let second = db
+            .list_session_events_before(s.session_id, first.oldest_seq, 2)
+            .expect("second page");
+        assert_eq!(
+            second
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![seqs[1], seqs[2]]
+        );
+        assert!(second.has_more);
+        assert_eq!(second.oldest_seq, Some(seqs[1]));
+
+        let third = db
+            .list_session_events_before(s.session_id, second.oldest_seq, 2)
+            .expect("third page");
+        assert_eq!(
+            third
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![seqs[0]]
+        );
+        assert!(!third.has_more);
+        assert_eq!(third.oldest_seq, Some(seqs[0]));
+
+        let before_oldest = db
+            .list_session_events_before(s.session_id, Some(0), 2)
+            .expect("before oldest seq");
+        assert!(before_oldest.events.is_empty());
+        assert!(!before_oldest.has_more);
+        assert_eq!(before_oldest.oldest_seq, None);
+    }
+
+    #[test]
+    fn list_session_events_before_clamps_limit() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        let seqs = insert_numbered_events(&db, s.session_id, 501);
+
+        let minimum = db
+            .list_session_events_before(s.session_id, None, 0)
+            .expect("minimum clamped page");
+        assert_eq!(minimum.events.len(), 1);
+        assert_eq!(minimum.events[0].seq, *seqs.last().unwrap());
+        assert!(minimum.has_more);
+        assert_eq!(minimum.oldest_seq, seqs.last().copied());
+
+        let capped = db
+            .list_session_events_before(s.session_id, None, u32::MAX)
+            .expect("maximum clamped page");
+        assert_eq!(capped.events.len(), LIST_SESSION_EVENTS_MAX_LIMIT as usize);
+        assert!(capped.has_more);
+        assert_eq!(capped.oldest_seq, Some(seqs[1]));
+        assert!(
+            capped
+                .events
+                .windows(2)
+                .all(|pair| pair[0].seq < pair[1].seq)
+        );
+    }
+
+    #[test]
+    fn list_session_events_before_hydrates_compaction_payload() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+        let handoff_id = Uuid::new_v4();
+        let payload = json!({
+            "handoff_text": "resume from stored handoff",
+            "brief_text": "stored brief",
+        });
+        db.store_compaction_payload(handoff_id, s.session_id, &payload.to_string())
+            .unwrap();
+        let compacted = db
+            .insert_session_event(
+                s.session_id,
+                SessionEventKind::SessionCompacted,
+                Some("builder"),
+                None,
+                &json!({"handoff_ref": handoff_id.to_string(), "brief_text": "inline brief"}),
+            )
+            .unwrap();
+
+        let full = db.list_session_events(s.session_id).unwrap();
+        let page = db
+            .list_session_events_before(s.session_id, None, 10)
+            .expect("compaction page");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].seq, compacted);
+        assert_eq!(page.events[0].data, payload);
+        assert_session_event_rows_eq(&page.events, &full);
+    }
+
+    #[test]
+    fn list_session_events_before_empty_session_returns_empty_page() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").unwrap();
+
+        let page = db
+            .list_session_events_before(s.session_id, None, 10)
+            .expect("empty session page");
+        assert!(page.events.is_empty());
+        assert!(!page.has_more);
+        assert_eq!(page.oldest_seq, None);
+
+        let unknown = db
+            .list_session_events_before(Uuid::new_v4(), None, 10)
+            .expect("unknown session page");
+        assert!(unknown.events.is_empty());
+        assert!(!unknown.has_more);
+        assert_eq!(unknown.oldest_seq, None);
+    }
+
+    #[test]
+    fn list_session_events_before_does_not_leak_across_sessions() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.create_session("p", "/x", "builder").unwrap();
+        let b = db.create_fork(a.session_id, None).unwrap();
+
+        let a1 = db
+            .insert_session_event(
+                a.session_id,
+                SessionEventKind::UserMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "a-one"}),
+            )
+            .unwrap();
+        let b1 = db
+            .insert_session_event(
+                b.session_id,
+                SessionEventKind::UserMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "b-one"}),
+            )
+            .unwrap();
+        let a2 = db
+            .insert_session_event(
+                a.session_id,
+                SessionEventKind::AssistantMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "a-two"}),
+            )
+            .unwrap();
+        let b2 = db
+            .insert_session_event(
+                b.session_id,
+                SessionEventKind::AssistantMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "b-two"}),
+            )
+            .unwrap();
+
+        let a_page = db
+            .list_session_events_before(a.session_id, None, 10)
+            .expect("session a page");
+        assert_eq!(
+            a_page
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![a1, a2]
+        );
+
+        let b_page = db
+            .list_session_events_before(b.session_id, Some(b2), 10)
+            .expect("session b older page");
+        assert_eq!(
+            b_page
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![b1]
+        );
+        assert!(
+            !b_page
+                .events
+                .iter()
+                .any(|event| event.seq == a1 || event.seq == a2)
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ const TOOL_CALL_ID: &str = "run-approval-call";
 struct RunProvider {
     base_url: String,
     saw_structured_denial: Arc<AtomicBool>,
+    saw_question_headless_guidance: Arc<AtomicBool>,
 }
 
 impl RunProvider {
@@ -21,18 +22,27 @@ impl RunProvider {
         let addr = listener.local_addr().expect("run provider addr");
         let saw_structured_denial = Arc::new(AtomicBool::new(false));
         let denial_probe = saw_structured_denial.clone();
+        let saw_question_headless_guidance = Arc::new(AtomicBool::new(false));
+        let question_probe = saw_question_headless_guidance.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
                 let denial_probe = denial_probe.clone();
+                let question_probe = question_probe.clone();
                 tokio::spawn(async move {
                     let body = read_http_request(&mut stream).await;
                     if body.contains(
                         "noninteractive run: approval auto-denied; re-run with --approve <class> or use the TUI",
                     ) {
                         denial_probe.store(true, Ordering::SeqCst);
+                    }
+                    if body.contains("No interactive client is attached")
+                        && body.contains("Proceed on your best judgment")
+                        && body.contains("state the assumption")
+                    {
+                        question_probe.store(true, Ordering::SeqCst);
                     }
                     if body.contains("cause inference failure") {
                         let payload = r#"{"error":{"message":"injected inference failure"}}"#;
@@ -67,6 +77,7 @@ impl RunProvider {
         Self {
             base_url: format!("http://{addr}/v1"),
             saw_structured_denial,
+            saw_question_headless_guidance,
         }
     }
 }
@@ -455,6 +466,9 @@ async fn run_approval_auto_denied() {
     provider
         .saw_structured_denial
         .store(false, Ordering::SeqCst);
+    provider
+        .saw_question_headless_guidance
+        .store(false, Ordering::SeqCst);
     let mut question_command = home.cockpit();
     question_command.args(["run", "--ephemeral", "--json", "trigger question decision"]);
     let question_output = spawn_run(question_command);
@@ -464,8 +478,10 @@ async fn run_approval_auto_denied() {
         output_text(&question_output)
     );
     assert!(
-        provider.saw_structured_denial.load(Ordering::SeqCst),
-        "question-tool cancellation did not reach the model as a structured denial"
+        provider
+            .saw_question_headless_guidance
+            .load(Ordering::SeqCst),
+        "headless question guidance did not reach the model"
     );
 }
 

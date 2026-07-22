@@ -29,6 +29,10 @@ use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 
 pub struct QuestionTool;
 
+const MAX_QUESTIONS: usize = 20;
+const MIN_OPTIONS: usize = 2;
+const MAX_OPTIONS: usize = 8;
+
 #[derive(Debug, Deserialize)]
 struct QuestionArgs {
     questions: Vec<QuestionArg>,
@@ -45,7 +49,7 @@ struct QuestionArg {
 #[derive(Debug, Deserialize)]
 struct QuestionOptionArg {
     id: String,
-    label: Option<String>,
+    label: String,
     description: Option<String>,
 }
 
@@ -56,20 +60,23 @@ impl Tool for QuestionTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the user questions and wait for answers; batch every question you need into this one call."
+        "Ask the user questions and wait for answers; batch every question you need into this one call; ask only when the choice is costly to reverse or changes what gets built."
     }
 
     fn defensive_description(&self) -> Option<String> {
         Some(
             "Stop and ask the human one or more questions, then block until they answer. Use this \
-             whenever you are genuinely uncertain about scope, intent, or a decision you cannot \
-             safely make alone — it is better to ask than to guess wrong. Put EVERY question you \
-             currently have into this single call (the `questions` array); do not fire off \
-             several separate `question` calls in a row, which makes the user answer one popup \
-             after another. For each question choose `select` (pick one of your proposed \
-             options), `multiselect` (pick any number), or `text` (free-form). Offer concrete \
-             options when you can so the user just clicks. Don't ask about things you can find \
-             out yourself by reading code or running a command."
+             when the choice is costly to reverse, changes what gets built, spends the user's \
+             money or credentials, or is genuinely underdetermined by everything available to \
+             you. Do not ask when the choice is cheap and reversible, when a reasonable default \
+             exists, or when you are the one better positioned to judge; make the call and say \
+             what you chose. Put EVERY question you currently have into this single call (the \
+             `questions` array); do not fire off several separate `question` calls in a row, \
+             which makes the user answer one popup after another. For each question choose \
+             `select` (pick one of your proposed options), `multiselect` (pick any number), or \
+             `text` (free-form). Offer concrete options when you can so the user just clicks. \
+             Don't ask about things you can find out yourself by reading code or running a \
+             command."
                 .to_string(),
         )
     }
@@ -81,6 +88,8 @@ impl Tool for QuestionTool {
                 "questions": {
                     "type": "array",
                     "description": "Questions to ask in this call",
+                    "minItems": 1,
+                    "maxItems": MAX_QUESTIONS,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -89,6 +98,8 @@ impl Tool for QuestionTool {
                             "options": {
                                 "type": "array",
                                 "description": "Proposed options for select/multiselect",
+                                "minItems": MIN_OPTIONS,
+                                "maxItems": MAX_OPTIONS,
                                 "items": {
                                     "type": "object",
                                     "properties": {
@@ -115,6 +126,8 @@ impl Tool for QuestionTool {
                 "questions": {
                     "type": "array",
                     "description": "Every question to ask the user in this one call. Batch them all here rather than calling the tool repeatedly",
+                    "minItems": 1,
+                    "maxItems": MAX_QUESTIONS,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -123,6 +136,8 @@ impl Tool for QuestionTool {
                             "options": {
                                 "type": "array",
                                 "description": "The choices to offer for a `select`/`multiselect` question; omit for a `text` question",
+                                "minItems": MIN_OPTIONS,
+                                "maxItems": MAX_OPTIONS,
                                 "items": {
                                     "type": "object",
                                     "properties": {
@@ -147,6 +162,12 @@ impl Tool for QuestionTool {
         if args.questions.is_empty() {
             return Err(invalid_input("`questions` must be a non-empty array"));
         }
+        if args.questions.len() > MAX_QUESTIONS {
+            return Err(invalid_input(format!(
+                "`questions` has {} entries; maximum is {MAX_QUESTIONS}",
+                args.questions.len()
+            )));
+        }
 
         let mut questions = Vec::with_capacity(args.questions.len());
         for (i, q) in args.questions.iter().enumerate() {
@@ -154,6 +175,10 @@ impl Tool for QuestionTool {
         }
         let set = InterruptQuestionSet { questions };
         let n = set.questions.len();
+
+        if !ctx.interrupts.is_interactive_attached() {
+            return Ok(ToolOutput::text(render_headless_guidance(&set)));
+        }
 
         // A short description doubles as the needs-attention queue label
         // and the dialog title hint. Single-question batches read more
@@ -204,9 +229,16 @@ fn parse_question_arg(q: &QuestionArg, index: usize) -> Result<InterruptQuestion
         }),
         "select" | "multiselect" => {
             let options = parse_options_arg(q);
-            if options.is_empty() {
+            if options.len() < MIN_OPTIONS {
                 return Err(invalid_input(format!(
-                    "question {index}: `{kind}` needs at least one option"
+                    "question {index}: `{kind}` has {} option(s); provide at least {MIN_OPTIONS} options or use `text` for an open-ended question",
+                    options.len()
+                )));
+            }
+            if options.len() > MAX_OPTIONS {
+                return Err(invalid_input(format!(
+                    "question {index}: `{kind}` has {} option(s); maximum is {MAX_OPTIONS}",
+                    options.len()
                 )));
             }
             if kind == "select" {
@@ -240,14 +272,11 @@ fn parse_options_arg(q: &QuestionArg) -> Vec<InterruptOption> {
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .map(|opt| {
-            let label = opt.label.clone().unwrap_or_else(|| opt.id.clone());
-            InterruptOption {
-                id: opt.id.clone(),
-                label,
-                description: opt.description.clone(),
-                secondary: false,
-            }
+        .map(|opt| InterruptOption {
+            id: opt.id.clone(),
+            label: opt.label.clone(),
+            description: opt.description.clone(),
+            secondary: false,
         })
         .collect()
 }
@@ -289,6 +318,20 @@ fn render_answers(set: &InterruptQuestionSet, answers: &[ResolveResponse]) -> St
             Some(ResolveResponse::Batch { .. }) | None => out.push_str("[no answer]"),
             Some(ResolveResponse::Cancel) => out.push_str("[cancelled]"),
         }
+    }
+    out
+}
+
+fn render_headless_guidance(set: &InterruptQuestionSet) -> String {
+    let mut out = "No interactive client is attached, so these questions cannot be answered. Proceed on your best judgment and state the assumption you made for each.".to_string();
+    for (i, question) in set.questions.iter().enumerate() {
+        out.push('\n');
+        out.push_str(&(i + 1).to_string());
+        out.push_str(". ");
+        out.push_str(question_prompt(question));
+        out.push_str(
+            " → unanswered; choose the most reasonable option and say which you chose and why.",
+        );
     }
     out
 }
@@ -337,7 +380,7 @@ mod tests {
     #[test]
     fn parse_multiselect_and_text() {
         let multi = parse_question(
-            &json!({ "type": "multiselect", "prompt": "Tags?", "options": [{ "id": "a", "label": "A" }] }),
+            &json!({ "type": "multiselect", "prompt": "Tags?", "options": [{ "id": "a", "label": "A" }, { "id": "b", "label": "B" }] }),
             0,
         )
         .unwrap();
@@ -349,7 +392,7 @@ mod tests {
     #[test]
     fn select_without_options_is_invalid() {
         let err = parse_question(&json!({ "type": "select", "prompt": "X?" }), 0).unwrap_err();
-        assert!(err.to_string().contains("at least one option"));
+        assert!(err.to_string().contains("0 option(s)"));
     }
 
     #[test]
@@ -405,20 +448,214 @@ mod tests {
         assert!(render_answers(&set, &answers).contains("[cancelled]"));
     }
 
+    fn two_option_question(prompt: &str) -> Value {
+        json!({
+            "type": "select",
+            "prompt": prompt,
+            "options": [
+                { "id": "a", "label": "A" },
+                { "id": "b", "label": "B" }
+            ]
+        })
+    }
+
+    fn sample_call_args() -> Value {
+        json!({
+            "questions": [
+                two_option_question("Pick a database?"),
+                { "type": "text", "prompt": "What name should I use?" }
+            ]
+        })
+    }
+
+    fn strip_descriptions(value: &Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut stripped = serde_json::Map::new();
+                for (key, value) in object {
+                    if key != "description" {
+                        stripped.insert(key.clone(), strip_descriptions(value));
+                    }
+                }
+                Value::Object(stripped)
+            }
+            Value::Array(values) => Value::Array(values.iter().map(strip_descriptions).collect()),
+            other => other.clone(),
+        }
+    }
+
+    fn options_schema(schema: &Value) -> &Value {
+        &schema["properties"]["questions"]["items"]["properties"]["options"]
+    }
+
     #[tokio::test]
-    async fn call_blocks_then_returns_resolved_answers() {
+    async fn question_headless_returns_proceed_guidance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+
+        let out = QuestionTool.call(sample_call_args(), &ctx).await.unwrap();
+
+        assert!(out.content.contains("No interactive client is attached"));
+        assert!(out.content.contains("Proceed on your best judgment"));
+        assert!(out.content.contains("state the assumption"));
+        assert!(!out.content.contains("retry"));
+    }
+
+    #[tokio::test]
+    async fn question_headless_result_echoes_every_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+
+        let out = QuestionTool.call(sample_call_args(), &ctx).await.unwrap();
+
+        assert!(out.content.contains("1. Pick a database?"));
+        assert!(out.content.contains("2. What name should I use?"));
+        assert!(out.content.contains("unanswered"));
+    }
+
+    #[tokio::test]
+    async fn question_headless_persists_no_interrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+
+        QuestionTool.call(sample_call_args(), &ctx).await.unwrap();
+
+        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn question_terse_description_carries_one_ask_rule() {
+        let description = QuestionTool.description();
+        assert!(description.contains("batch every question"));
+        assert!(description.contains("costly to reverse"));
+        assert!(description.contains("changes what gets built"));
+        assert_eq!(description.matches("costly to reverse").count(), 1);
+    }
+
+    #[test]
+    fn question_defensive_description_states_ask_and_proceed() {
+        let description = QuestionTool.defensive_description().unwrap();
+        assert!(description.contains("costly to reverse"));
+        assert!(description.contains("changes what gets built"));
+        assert!(description.contains("cheap and reversible"));
+        assert!(description.contains("make the call"));
+        assert!(description.contains("Put EVERY question"));
+        assert!(description.contains("reading code or running a command"));
+    }
+
+    #[test]
+    fn question_schema_caps_questions_and_options() {
+        for schema in [
+            QuestionTool.parameters(),
+            QuestionTool.defensive_parameters().unwrap(),
+        ] {
+            assert_eq!(schema["properties"]["questions"]["minItems"], 1);
+            assert_eq!(schema["properties"]["questions"]["maxItems"], MAX_QUESTIONS);
+            assert_eq!(options_schema(&schema)["minItems"], MIN_OPTIONS);
+            assert_eq!(options_schema(&schema)["maxItems"], MAX_OPTIONS);
+        }
+    }
+
+    #[test]
+    fn question_schema_tiers_agree_on_shape() {
+        assert_eq!(
+            strip_descriptions(&QuestionTool.parameters()),
+            strip_descriptions(&QuestionTool.defensive_parameters().unwrap())
+        );
+    }
+
+    #[test]
+    fn question_rejects_single_option_select() {
+        let err = parse_question(
+            &json!({
+                "type": "select",
+                "prompt": "Only?",
+                "options": [{ "id": "only", "label": "Only" }]
+            }),
+            0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("1 option(s)"));
+    }
+
+    #[test]
+    fn question_rejects_too_many_options() {
+        let options: Vec<Value> = (0..=MAX_OPTIONS)
+            .map(|i| json!({ "id": format!("opt-{i}"), "label": format!("Option {i}") }))
+            .collect();
+        let err = parse_question(
+            &json!({ "type": "select", "prompt": "Many?", "options": options }),
+            0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("9 option(s)"));
+    }
+
+    #[tokio::test]
+    async fn question_rejects_too_many_questions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let questions: Vec<Value> = (0..=MAX_QUESTIONS)
+            .map(|i| json!({ "type": "text", "prompt": format!("Question {i}?") }))
+            .collect();
+
+        let err = QuestionTool
+            .call(json!({ "questions": questions }), &ctx)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("21 entries"));
+    }
+
+    #[test]
+    fn question_missing_option_label_is_invalid_input() {
+        let err = parse_question(
+            &json!({
+                "type": "select",
+                "prompt": "Missing?",
+                "options": [{ "id": "a", "label": "A" }, { "id": "b" }]
+            }),
+            0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("label"));
+    }
+
+    #[test]
+    fn question_freetext_answer_in_select_still_renders_raw_text() {
+        let q = parse_question(&two_option_question("DB?"), 0).unwrap();
+        let rendered = render_answers(
+            &InterruptQuestionSet { questions: vec![q] },
+            &[ResolveResponse::Single {
+                selected_id: "custom".into(),
+            }],
+        );
+        assert!(rendered.contains("DB? → custom"));
+    }
+
+    #[tokio::test]
+    async fn question_attached_still_raises_and_renders_answers() {
         use crate::engine::interrupt::InterruptHub;
         use std::sync::Arc;
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = crate::tools::common::test_ctx(tmp.path());
-        let hub = Arc::new(InterruptHub::detached());
+        let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        let (events, _receiver) = tokio::sync::broadcast::channel(8);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::redact::RedactionTable::empty(),
+        )));
+        let hub = Arc::new(InterruptHub::new(
+            events,
+            redaction,
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            db.clone(),
+            ctx.session.id,
+        ));
         ctx.interrupts = hub.clone();
         let session_id = ctx.session.id;
-        let db = ctx.session.db.clone();
 
         let args = json!({
             "questions": [
-                { "type": "select", "prompt": "DB?", "options": [{ "id": "pg", "label": "Postgres" }] }
+                { "type": "select", "prompt": "DB?", "options": [{ "id": "pg", "label": "Postgres" }, { "id": "sqlite", "label": "SQLite" }] }
             ]
         });
 

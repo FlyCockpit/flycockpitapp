@@ -173,12 +173,12 @@ async fn run_iteration(
     turn_tx: &mpsc::Sender<TurnEvent>,
 ) -> anyhow::Result<String> {
     let mut next_prompt = Message::user(prompt.to_string());
-    // A loop fork is a leaf with no human on the other end — it can't
-    // raise an answerable interrupt (single async-job authority, GOALS
-    // §22). A detached hub satisfies the shared `turn` signature. Same for
-    // cancellation: a fork isn't tied to the foreground run's ctrl+c slot
-    // (it's cancelled via `jobs(loop.cancel)`), so a fresh never-cancelled
-    // token keeps the signature uniform.
+    // A loop fork is a leaf with no human on the other end. Its toolbox
+    // removes `question`, so it cannot raise an answerable interrupt (single
+    // async-job authority, GOALS §22); a detached hub satisfies the shared
+    // `turn` signature. Same for cancellation: a fork isn't tied to the
+    // foreground run's ctrl+c slot (it's cancelled via `jobs(loop.cancel)`),
+    // so a fresh never-cancelled token keeps the signature uniform.
     let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
     let cancel = tokio_util::sync::CancellationToken::new();
     for _ in 0..MAX_ITERATION_TURNS {
@@ -271,7 +271,7 @@ fn build_fork_agent(
     state: Arc<ForkScheduleState>,
     turn_tx: mpsc::Sender<TurnEvent>,
 ) -> Agent {
-    let mut tools: ToolBox = parent.tools.clone();
+    let mut tools: ToolBox = parent.tools.clone().without("question");
     tools = tools.with(Arc::new(NoteTool::new(state.clone(), turn_tx)));
     tools = tools.with(Arc::new(ForkScheduleTool::new(state)));
     Agent {
@@ -349,6 +349,69 @@ fn fork_history_bytes(history: &[Message]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_model() -> Arc<crate::engine::model::Model> {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "local".to_string(),
+            crate::config::providers::ProviderEntry {
+                url: "http://localhost:1/v1".into(),
+                headers: vec![],
+                ..Default::default()
+            },
+        );
+        let config = crate::config::providers::ProvidersConfig {
+            providers,
+            active_model: Some(crate::config::providers::ActiveModelRef {
+                provider: "local".into(),
+                model: "model".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+            ..Default::default()
+        };
+        Arc::new(
+            crate::engine::model::Model::from_config(
+                &config,
+                Arc::new(crate::redact::RedactionTable::empty()),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn parent_agent_with_question() -> Arc<Agent> {
+        Arc::new(Agent {
+            name: "Build".into(),
+            system: "system".into(),
+            role_prompt: "role".into(),
+            tools: ToolBox::new()
+                .with(Arc::new(crate::tools::question::QuestionTool))
+                .with(Arc::new(crate::tools::read::ReadTool)),
+            model: test_model(),
+            params: crate::engine::model::ModelParams::default(),
+            scan_tool_results: false,
+            llm_mode: crate::config::extended::LlmMode::default(),
+            delegated: false,
+            delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        })
+    }
+
+    #[test]
+    fn question_absent_from_loop_fork_toolbox() {
+        let parent = parent_agent_with_question();
+        assert!(parent.tools.names().contains(&"question"));
+        let state = Arc::new(ForkScheduleState::new("job-1".into()));
+        let (turn_tx, _turn_rx) = mpsc::channel(8);
+
+        let fork = build_fork_agent(&parent, state, turn_tx);
+        let names = fork.tools.names();
+
+        assert!(!names.contains(&"question"), "{names:?}");
+        assert!(names.contains(&"note"), "{names:?}");
+        assert!(names.contains(&"schedule"), "{names:?}");
+        assert!(names.contains(&"read"), "{names:?}");
+    }
 
     #[test]
     fn fork_history_message_cap_keeps_freshest_messages() {

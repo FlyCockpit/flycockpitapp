@@ -188,8 +188,10 @@ fn learn_tool_args(name: &str) -> serde_json::Value {
     serde_json::json!({
         "action": "create",
         "name": name,
-        "description": "Repeat a verified setup workflow",
-        "content": "## When to Use\n\nUse for the verified setup.\n\n## Procedure\n\n1. Run the verified command.\n\n## Pitfalls\n\nDo not invent flags.\n\n## Verification\n\nConfirm the expected output."
+        "params": {
+            "description": "Repeat a verified setup workflow",
+            "content": "## When to Use\n\nUse for the verified setup.\n\n## Procedure\n\n1. Run the verified command.\n\n## Pitfalls\n\nDo not invent flags.\n\n## Verification\n\nConfirm the expected output."
+        }
     })
 }
 

@@ -652,6 +652,25 @@ mod tests {
     }
 
     #[test]
+    fn skill_manage_schema_survives_rig_sanitize() {
+        let tool = crate::tools::skill_manage::SkillManageTool;
+        let schemas = [
+            crate::engine::tool::Tool::parameters(&tool),
+            crate::engine::tool::Tool::defensive_parameters(&tool)
+                .expect("skill_manage has defensive parameters"),
+        ];
+        for schema in schemas {
+            let transformed = for_responses(&schema);
+            let strict = rig::providers::openai::responses_api::ResponsesToolDefinition::function(
+                "skill_manage",
+                "skill_manage",
+                transformed,
+            );
+            assert_objects_are_closed(&strict.parameters);
+        }
+    }
+
+    #[test]
     fn no_builtin_tool_schema_has_an_open_object() {
         let mut violations = Vec::new();
         for tool in crate::engine::builtin::invariant_builtin_tools() {

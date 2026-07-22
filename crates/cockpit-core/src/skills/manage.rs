@@ -3,7 +3,9 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{Value, json};
 
 use super::{
     Skill, SkillFrontmatter, find_by_name, managed_skill_name_valid,
@@ -28,28 +30,243 @@ pub enum SkillManageAction {
     RemoveFile,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl SkillManageAction {
+    pub const ALL: [Self; 6] = [
+        Self::Create,
+        Self::Patch,
+        Self::Edit,
+        Self::Delete,
+        Self::WriteFile,
+        Self::RemoveFile,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Patch => "patch",
+            Self::Edit => "edit",
+            Self::Delete => "delete",
+            Self::WriteFile => "write_file",
+            Self::RemoveFile => "remove_file",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SkillManageArgs {
     pub action: SkillManageAction,
     pub name: String,
-    #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
     pub content: Option<String>,
-    #[serde(default)]
     pub category: Option<String>,
-    #[serde(default)]
     pub root: Option<String>,
-    #[serde(default)]
     pub old_string: Option<String>,
-    #[serde(default)]
     pub new_string: Option<String>,
-    #[serde(default)]
     pub replace_all: bool,
-    #[serde(default)]
     pub path: Option<String>,
-    #[serde(default)]
     pub absorbed_into: Option<String>,
+}
+
+impl SkillManageArgs {
+    fn empty(action: SkillManageAction, name: String) -> Self {
+        Self {
+            action,
+            name,
+            description: None,
+            content: None,
+            category: None,
+            root: None,
+            old_string: None,
+            new_string: None,
+            replace_all: false,
+            path: None,
+            absorbed_into: None,
+        }
+    }
+
+    fn params_value(&self) -> Value {
+        match self.action {
+            SkillManageAction::Create => {
+                let mut params = serde_json::Map::new();
+                if let Some(description) = &self.description {
+                    params.insert("description".to_string(), json!(description));
+                }
+                if let Some(content) = &self.content {
+                    params.insert("content".to_string(), json!(content));
+                }
+                if let Some(category) = &self.category {
+                    params.insert("category".to_string(), json!(category));
+                }
+                if let Some(root) = &self.root {
+                    params.insert("root".to_string(), json!(root));
+                }
+                Value::Object(params)
+            }
+            SkillManageAction::Patch => {
+                let mut params = serde_json::Map::new();
+                if let Some(old_string) = &self.old_string {
+                    params.insert("old_string".to_string(), json!(old_string));
+                }
+                if let Some(new_string) = &self.new_string {
+                    params.insert("new_string".to_string(), json!(new_string));
+                }
+                if self.replace_all {
+                    params.insert("replace_all".to_string(), json!(self.replace_all));
+                }
+                Value::Object(params)
+            }
+            SkillManageAction::Edit => {
+                let mut params = serde_json::Map::new();
+                if let Some(content) = &self.content {
+                    params.insert("content".to_string(), json!(content));
+                }
+                Value::Object(params)
+            }
+            SkillManageAction::Delete => {
+                let mut params = serde_json::Map::new();
+                if let Some(absorbed_into) = &self.absorbed_into {
+                    params.insert("absorbed_into".to_string(), json!(absorbed_into));
+                }
+                Value::Object(params)
+            }
+            SkillManageAction::WriteFile => {
+                let mut params = serde_json::Map::new();
+                if let Some(path) = &self.path {
+                    params.insert("path".to_string(), json!(path));
+                }
+                if let Some(content) = &self.content {
+                    params.insert("content".to_string(), json!(content));
+                }
+                Value::Object(params)
+            }
+            SkillManageAction::RemoveFile => {
+                let mut params = serde_json::Map::new();
+                if let Some(path) = &self.path {
+                    params.insert("path".to_string(), json!(path));
+                }
+                Value::Object(params)
+            }
+        }
+    }
+}
+
+impl Serialize for SkillManageArgs {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("SkillManageArgs", 3)?;
+        state.serialize_field("action", &self.action)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("params", &self.params_value())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SkillManageArgs {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireArgs {
+            action: SkillManageAction,
+            name: String,
+            params: Value,
+        }
+
+        let wire = WireArgs::deserialize(deserializer)?;
+        let action = wire.action;
+        let mut args = SkillManageArgs::empty(action, wire.name);
+        match action {
+            SkillManageAction::Create => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Params {
+                    description: String,
+                    content: String,
+                    #[serde(default)]
+                    category: Option<String>,
+                    #[serde(default)]
+                    root: Option<String>,
+                }
+                let params: Params =
+                    params_for_action(action, wire.params).map_err(serde::de::Error::custom)?;
+                args.description = Some(params.description);
+                args.content = Some(params.content);
+                args.category = params.category;
+                args.root = params.root;
+            }
+            SkillManageAction::Patch => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Params {
+                    old_string: String,
+                    #[serde(default)]
+                    new_string: Option<String>,
+                    #[serde(default)]
+                    replace_all: bool,
+                }
+                let params: Params =
+                    params_for_action(action, wire.params).map_err(serde::de::Error::custom)?;
+                args.old_string = Some(params.old_string);
+                args.new_string = params.new_string;
+                args.replace_all = params.replace_all;
+            }
+            SkillManageAction::Edit => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Params {
+                    content: String,
+                }
+                let params: Params =
+                    params_for_action(action, wire.params).map_err(serde::de::Error::custom)?;
+                args.content = Some(params.content);
+            }
+            SkillManageAction::Delete => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Params {
+                    absorbed_into: String,
+                }
+                let params: Params =
+                    params_for_action(action, wire.params).map_err(serde::de::Error::custom)?;
+                args.absorbed_into = Some(params.absorbed_into);
+            }
+            SkillManageAction::WriteFile => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Params {
+                    path: String,
+                    content: String,
+                }
+                let params: Params =
+                    params_for_action(action, wire.params).map_err(serde::de::Error::custom)?;
+                args.path = Some(params.path);
+                args.content = Some(params.content);
+            }
+            SkillManageAction::RemoveFile => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Params {
+                    path: String,
+                }
+                let params: Params =
+                    params_for_action(action, wire.params).map_err(serde::de::Error::custom)?;
+                args.path = Some(params.path);
+            }
+        }
+        Ok(args)
+    }
+}
+
+fn params_for_action<T: serde::de::DeserializeOwned>(
+    action: SkillManageAction,
+    value: Value,
+) -> std::result::Result<T, String> {
+    serde_json::from_value(value)
+        .map_err(|error| format!("skill_manage `{}` params: {error}", action.as_str()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

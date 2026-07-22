@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde_json::Map;
 use serde_json::Value;
 
 use crate::daemon::proto::{
@@ -138,37 +139,160 @@ async fn approve_write(args: &SkillManageArgs, ctx: &ToolCtx) -> Result<bool> {
 }
 
 fn skill_manage_schema(defensive: bool) -> Value {
-    let content_description = if defensive {
-        "For create: the non-empty markdown body. For edit: the complete replacement SKILL.md, including valid YAML frontmatter. For write_file: support-file contents"
-    } else {
-        "Body, complete SKILL.md, or support-file contents (action-dependent)"
-    };
+    let actions: Vec<&str> = SkillManageAction::ALL
+        .into_iter()
+        .map(SkillManageAction::as_str)
+        .collect();
+    let params_arms: Vec<Value> = SkillManageAction::ALL
+        .into_iter()
+        .map(|action| params_schema_for(action, defensive))
+        .collect();
     serde_json::json!({
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
+                "enum": actions,
                 "description": "Mutation operation"
             },
             "name": { "type": "string", "description": "Exact lowercase skill name" },
-            "description": { "type": "string", "description": "Required only for create" },
-            "content": { "type": "string", "description": content_description },
-            "category": { "type": "string", "description": "Optional single category segment for create" },
-            "root": { "type": "string", "description": "Optional configured skills.scan_dirs root for create" },
-            "old_string": { "type": "string", "description": "Fuzzy find text required for patch" },
-            "new_string": { "type": "string", "description": "Replacement text for patch; empty deletes the span" },
-            "replace_all": { "type": "boolean", "description": "Replace every fuzzy match instead of requiring uniqueness" },
-            "path": { "type": "string", "description": "Support path under references/, templates/, scripts/, or assets/" },
-            "absorbed_into": { "type": "string", "description": "Required for delete: existing umbrella skill that absorbed the deleted skill" }
+            "params": {
+                "description": "Action-specific mutation parameters",
+                "anyOf": params_arms
+            }
         },
-        "required": ["action", "name"],
+        "required": ["action", "name", "params"],
         "additionalProperties": false
     })
 }
 
+fn params_schema_for(action: SkillManageAction, defensive: bool) -> Value {
+    match action {
+        SkillManageAction::Create => object_schema(
+            [
+                property(
+                    "description",
+                    "string",
+                    if defensive {
+                        "Short frontmatter description for the reusable skill"
+                    } else {
+                        "Skill description"
+                    },
+                ),
+                property(
+                    "content",
+                    "string",
+                    if defensive {
+                        "Non-empty markdown body for SKILL.md after the generated frontmatter"
+                    } else {
+                        "Skill body"
+                    },
+                ),
+                property("category", "string", "Single category segment"),
+                property("root", "string", "Configured skills.scan_dirs root"),
+            ],
+            ["description", "content"],
+        ),
+        SkillManageAction::Patch => object_schema(
+            [
+                property(
+                    "old_string",
+                    "string",
+                    if defensive {
+                        "Exact or fuzzy passage copied from the current SKILL.md"
+                    } else {
+                        "Fuzzy find text"
+                    },
+                ),
+                property(
+                    "new_string",
+                    "string",
+                    "Replacement text; omit or use an empty string to delete the span",
+                ),
+                property(
+                    "replace_all",
+                    "boolean",
+                    "Replace every fuzzy match instead of requiring uniqueness",
+                ),
+            ],
+            ["old_string"],
+        ),
+        SkillManageAction::Edit => object_schema(
+            [property(
+                "content",
+                "string",
+                if defensive {
+                    "Complete replacement SKILL.md including valid YAML frontmatter"
+                } else {
+                    "Complete replacement SKILL.md"
+                },
+            )],
+            ["content"],
+        ),
+        SkillManageAction::Delete => object_schema(
+            [property(
+                "absorbed_into",
+                "string",
+                "Existing umbrella skill that documents the deleted skill's behavior",
+            )],
+            ["absorbed_into"],
+        ),
+        SkillManageAction::WriteFile => object_schema(
+            [
+                property(
+                    "path",
+                    "string",
+                    "Support path under references/, templates/, scripts/, or assets/",
+                ),
+                property("content", "string", "Support-file contents"),
+            ],
+            ["path", "content"],
+        ),
+        SkillManageAction::RemoveFile => object_schema(
+            [property(
+                "path",
+                "string",
+                "Support path under references/, templates/, scripts/, or assets/",
+            )],
+            ["path"],
+        ),
+    }
+}
+
+fn object_schema<const P: usize, const R: usize>(
+    properties: [(&'static str, Value); P],
+    required: [&'static str; R],
+) -> Value {
+    let mut map = Map::new();
+    for (name, schema) in properties {
+        map.insert(name.to_string(), schema);
+    }
+    let required: Vec<&str> = required.into_iter().collect();
+    serde_json::json!({
+        "type": "object",
+        "properties": map,
+        "required": required,
+        "additionalProperties": false
+    })
+}
+
+fn property(
+    name: &'static str,
+    kind: &'static str,
+    description: &'static str,
+) -> (&'static str, Value) {
+    (
+        name,
+        serde_json::json!({
+            "type": kind,
+            "description": description
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use super::*;
@@ -283,8 +407,10 @@ mod tests {
         serde_json::json!({
             "action": "create",
             "name": name,
-            "description": "Approval replay skill",
-            "content": "Apply the guarded workflow."
+            "params": {
+                "description": "Approval replay skill",
+                "content": "Apply the guarded workflow."
+            }
         })
     }
 
@@ -292,7 +418,9 @@ mod tests {
         serde_json::json!({
             "action": "edit",
             "name": name,
-            "content": body
+            "params": {
+                "content": body
+            }
         })
     }
 
@@ -300,7 +428,9 @@ mod tests {
         serde_json::json!({
             "action": "delete",
             "name": name,
-            "absorbed_into": "umbrella-skill"
+            "params": {
+                "absorbed_into": "umbrella-skill"
+            }
         })
     }
 
@@ -308,8 +438,10 @@ mod tests {
         serde_json::json!({
             "action": "write_file",
             "name": name,
-            "path": path,
-            "content": content
+            "params": {
+                "path": path,
+                "content": content
+            }
         })
     }
 
@@ -317,7 +449,9 @@ mod tests {
         serde_json::json!({
             "action": "remove_file",
             "name": name,
-            "path": path
+            "params": {
+                "path": path
+            }
         })
     }
 
@@ -325,9 +459,223 @@ mod tests {
         serde_json::json!({
             "action": "patch",
             "name": name,
-            "old_string": old,
-            "new_string": new
+            "params": {
+                "old_string": old,
+                "new_string": new
+            }
         })
+    }
+
+    fn params_any_of(schema: &Value) -> &[Value] {
+        schema["properties"]["params"]["anyOf"]
+            .as_array()
+            .expect("params anyOf")
+    }
+
+    fn string_set(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn value_string_set(values: &Value) -> BTreeSet<String> {
+        values
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|value| value.as_str().expect("string").to_string())
+            .collect()
+    }
+
+    fn property_set(schema: &Value) -> BTreeSet<String> {
+        schema["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn strip_descriptions(value: &Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut stripped = serde_json::Map::new();
+                for (key, value) in object {
+                    if key != "description" {
+                        stripped.insert(key.clone(), strip_descriptions(value));
+                    }
+                }
+                Value::Object(stripped)
+            }
+            Value::Array(values) => Value::Array(values.iter().map(strip_descriptions).collect()),
+            other => other.clone(),
+        }
+    }
+
+    fn minimal_args_for(action: SkillManageAction) -> Value {
+        match action {
+            SkillManageAction::Create => create_value("schema-runtime"),
+            SkillManageAction::Patch => patch_value("schema-runtime", "old", "new"),
+            SkillManageAction::Edit => edit_value("schema-runtime", "content"),
+            SkillManageAction::Delete => delete_value("schema-runtime"),
+            SkillManageAction::WriteFile => {
+                write_file_value("schema-runtime", "references/file.md", "content")
+            }
+            SkillManageAction::RemoveFile => {
+                remove_file_value("schema-runtime", "references/file.md")
+            }
+        }
+    }
+
+    #[test]
+    fn schema_is_a_closed_discriminated_union() {
+        for schema in [skill_manage_schema(false), skill_manage_schema(true)] {
+            assert_eq!(schema["type"], "object");
+            assert_eq!(schema["additionalProperties"], false);
+            assert_eq!(
+                value_string_set(&schema["required"]),
+                string_set(&["action", "name", "params"])
+            );
+            assert_eq!(
+                property_set(&schema),
+                string_set(&["action", "name", "params"])
+            );
+            assert_eq!(
+                value_string_set(&schema["properties"]["action"]["enum"]),
+                SkillManageAction::ALL
+                    .into_iter()
+                    .map(SkillManageAction::as_str)
+                    .map(str::to_string)
+                    .collect()
+            );
+            assert_eq!(params_any_of(&schema).len(), SkillManageAction::ALL.len());
+            for arm in params_any_of(&schema) {
+                assert_eq!(arm["type"], "object");
+                assert_eq!(arm["additionalProperties"], false);
+                assert!(
+                    arm["properties"]
+                        .as_object()
+                        .is_some_and(|props| !props.is_empty())
+                );
+                assert!(
+                    arm["required"]
+                        .as_array()
+                        .is_some_and(|required| !required.is_empty())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_arm_matches_the_runtime_requirements() {
+        let cases = [
+            (
+                SkillManageAction::Create,
+                &["description", "content", "category", "root"][..],
+                &["description", "content"][..],
+            ),
+            (
+                SkillManageAction::Patch,
+                &["old_string", "new_string", "replace_all"][..],
+                &["old_string"][..],
+            ),
+            (SkillManageAction::Edit, &["content"][..], &["content"][..]),
+            (
+                SkillManageAction::Delete,
+                &["absorbed_into"][..],
+                &["absorbed_into"][..],
+            ),
+            (
+                SkillManageAction::WriteFile,
+                &["path", "content"][..],
+                &["path", "content"][..],
+            ),
+            (SkillManageAction::RemoveFile, &["path"][..], &["path"][..]),
+        ];
+
+        for (action, properties, required) in cases {
+            let arm = params_schema_for(action, false);
+            assert_eq!(property_set(&arm), string_set(properties));
+            assert_eq!(value_string_set(&arm["required"]), string_set(required));
+            let args: SkillManageArgs =
+                serde_json::from_value(minimal_args_for(action)).expect("minimal args parse");
+            assert_eq!(args.action, action);
+        }
+    }
+
+    #[test]
+    fn terse_and_defensive_arms_agree_on_shape() {
+        assert_eq!(
+            strip_descriptions(&skill_manage_schema(false)),
+            strip_descriptions(&skill_manage_schema(true))
+        );
+    }
+
+    #[test]
+    fn every_action_has_a_params_arm() {
+        let schema = skill_manage_schema(false);
+        let action_names: BTreeSet<String> = SkillManageAction::ALL
+            .into_iter()
+            .map(SkillManageAction::as_str)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            value_string_set(&schema["properties"]["action"]["enum"]),
+            action_names
+        );
+        assert_eq!(params_any_of(&schema).len(), action_names.len());
+
+        let distinct_arms: BTreeSet<String> = SkillManageAction::ALL
+            .into_iter()
+            .map(|action| params_schema_for(action, false))
+            .map(|schema| serde_json::to_string(&schema).expect("schema serializes"))
+            .collect();
+        assert_eq!(distinct_arms.len(), action_names.len());
+    }
+
+    #[tokio::test]
+    async fn wrong_arm_for_action_is_an_invocation_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        write_config(tmp.path(), &root, false);
+        let (ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        let args = serde_json::json!({
+            "action": "delete",
+            "name": "wrong-arm",
+            "params": { "content": "this belongs to edit" }
+        });
+
+        let error = SkillManageTool.call(args, &ctx).await.unwrap_err();
+
+        assert_eq!(
+            crate::engine::tool::classify_failure(&error),
+            crate::engine::tool::ToolFailKind::Invocation
+        );
+        let message = error.to_string();
+        assert!(message.contains("`delete`"));
+        assert!(message.contains("content"));
+        assert!(!root.join("wrong-arm").exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_flat_args_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        write_config(tmp.path(), &root, false);
+        let (ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
+        let args = serde_json::json!({
+            "action": "create",
+            "name": "legacy-flat",
+            "description": "Old flat shape",
+            "content": "Do not accept this."
+        });
+
+        let error = SkillManageTool.call(args, &ctx).await.unwrap_err();
+
+        assert_eq!(
+            crate::engine::tool::classify_failure(&error),
+            crate::engine::tool::ToolFailKind::Invocation
+        );
+        assert!(error.to_string().contains("params"));
+        assert!(!root.join("legacy-flat").exists());
     }
 
     async fn create_seed_skill(cwd: &std::path::Path, root: &std::path::Path, name: &str) {

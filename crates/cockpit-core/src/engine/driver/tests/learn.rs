@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn learn_saves_conformant_foreground_skill() {
     let (mut driver, tmp, root, requests) = learn_driver(false, "learned-workflow", 2);
-    let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
     let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
     let (turn_tx, _turn_rx) = mpsc::channel(64);
     let prompt = crate::skills::build_learn_prompt("");
@@ -51,7 +51,7 @@ async fn learn_respects_write_gate() {
         session_id,
     ));
     driver.set_interrupt_hub(hub.clone());
-    let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
     let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
     let (turn_tx, _turn_rx) = mpsc::channel(64);
     let task = tokio::spawn(async move {

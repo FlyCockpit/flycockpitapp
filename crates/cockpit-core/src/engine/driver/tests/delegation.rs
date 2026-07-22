@@ -358,7 +358,7 @@ async fn all_unwind_paths_drain_pending_input() {
     ] {
         let (mut driver, _tmp) = test_driver(8);
         let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
-        let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
         let target = driver.active_queue_target();
         for text in ["first", "second"] {
@@ -400,7 +400,7 @@ async fn all_unwind_paths_drain_pending_input() {
 async fn queued_user_fold_records_and_emits_stable_ids() {
     let (driver, _tmp) = test_driver(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
-    let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
     let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
     let target = driver.active_queue_target();
     let (first_id, _) = queue

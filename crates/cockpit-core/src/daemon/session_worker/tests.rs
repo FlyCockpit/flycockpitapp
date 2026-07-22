@@ -57,6 +57,80 @@ fn test_session_handle() -> SessionWorkerHandle {
     SessionWorkerHandle::test_handle(session, locks)
 }
 
+fn queued_user_message_for_test(text: &str) -> crate::engine::message::QueuedUserMessage {
+    crate::engine::message::QueuedUserMessage {
+        id: Uuid::new_v4(),
+        status: crate::engine::message::QueueItemStatus::Queued,
+        text: text.to_string(),
+        display_text: None,
+        target: crate::engine::message::QueueTarget::root("Build"),
+    }
+}
+
+async fn recv_queue_updated_for_test(event_rx: &mut EventReceiver) -> Vec<proto::QueueItem> {
+    match tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+        .await
+        .expect("queue update timed out")
+        .expect("queue update event")
+        .event
+    {
+        proto::Event::QueueUpdated { queue, .. } => queue,
+        other => panic!("expected QueueUpdated, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn queue_updated_is_not_emitted_for_the_initial_empty_snapshot() {
+    let session_id = Uuid::new_v4();
+    let (updates_tx, updates_rx) = watch::channel(Vec::new());
+    let (event_tx, mut event_rx) = broadcast::channel(8);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+    let forward = tokio::spawn(forward_queue_updates(
+        updates_rx, event_tx, redaction, session_id,
+    ));
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), event_rx.recv())
+            .await
+            .is_err(),
+        "initial watch value must not emit QueueUpdated"
+    );
+
+    updates_tx
+        .send(vec![queued_user_message_for_test("real enqueue")])
+        .unwrap();
+    let queue = recv_queue_updated_for_test(&mut event_rx).await;
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].text, "real enqueue");
+
+    drop(updates_tx);
+    forward.await.unwrap();
+}
+
+#[tokio::test]
+async fn queue_updated_is_still_emitted_when_the_queue_is_emptied() {
+    let session_id = Uuid::new_v4();
+    let (updates_tx, updates_rx) = watch::channel(Vec::new());
+    let (event_tx, mut event_rx) = broadcast::channel(8);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+    let forward = tokio::spawn(forward_queue_updates(
+        updates_rx, event_tx, redaction, session_id,
+    ));
+
+    updates_tx
+        .send(vec![queued_user_message_for_test("queued")])
+        .unwrap();
+    let queue = recv_queue_updated_for_test(&mut event_rx).await;
+    assert_eq!(queue.len(), 1);
+
+    updates_tx.send(Vec::new()).unwrap();
+    let queue = recv_queue_updated_for_test(&mut event_rx).await;
+    assert!(queue.is_empty());
+
+    drop(updates_tx);
+    forward.await.unwrap();
+}
+
 #[tokio::test]
 async fn turn_completion_is_delivered_through_the_lossless_channel() {
     let handle = test_session_handle();

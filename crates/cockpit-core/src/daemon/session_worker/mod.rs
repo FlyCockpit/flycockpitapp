@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::daemon::proto;

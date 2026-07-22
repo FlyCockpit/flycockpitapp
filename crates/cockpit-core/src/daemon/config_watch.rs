@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
+#[cfg(test)]
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -15,7 +17,6 @@ const CONFIG_WATCH_QUIET_WINDOW: Duration = Duration::from_millis(300);
 const CONFIG_WATCH_MAX_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(test)]
 pub(crate) struct ConfigWatchSignal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,9 +160,16 @@ pub(crate) fn spawn_config_watcher(
         return None;
     }
 
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let mut watcher = match notify::recommended_watcher(move |result| {
-        let _ = event_tx.send(result);
+    let (event_tx, event_rx) = watch::channel(ConfigWatchSignal);
+    let watch_paths_for_callback = watch_paths.clone();
+    let mut watcher = match notify::recommended_watcher(move |result| match result {
+        Ok(event) if config_watch_event_matches(&watch_paths_for_callback, &event) => {
+            let _ = event_tx.send(ConfigWatchSignal);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "config file watcher event failed");
+        }
     }) {
         Ok(watcher) => watcher,
         Err(error) => {
@@ -194,7 +202,6 @@ pub(crate) fn spawn_config_watcher(
         db,
         config_source,
         handle,
-        watch_paths,
         watcher,
         event_rx,
     )))
@@ -204,9 +211,8 @@ async fn run_config_watcher_task(
     db: Db,
     config_source: ConfigSource,
     handle: SessionWorkerHandle,
-    watch_paths: ConfigWatchPaths,
     watcher: notify::RecommendedWatcher,
-    mut event_rx: mpsc::UnboundedReceiver<notify::Result<Event>>,
+    mut event_rx: watch::Receiver<ConfigWatchSignal>,
 ) {
     let mut debouncer = ConfigWatchDebouncer::default();
     let mut failure_deduper = ConfigRefreshFailureDeduper::default();
@@ -215,11 +221,11 @@ async fn run_config_watcher_task(
             Some(deadline) => {
                 let _keep_watcher_alive = &watcher;
                 tokio::select! {
-                    event = event_rx.recv() => {
-                        let Some(event) = event else {
+                    signal = event_rx.changed() => {
+                        if signal.is_err() {
                             break;
-                        };
-                        handle_notify_event(&watch_paths, event, &mut debouncer);
+                        }
+                        debouncer.signal(Instant::now());
                     }
                     _ = tokio::time::sleep_until(deadline) => {
                         if debouncer.fire_if_due(Instant::now()).is_some()
@@ -238,27 +244,11 @@ async fn run_config_watcher_task(
             }
             None => {
                 let _keep_watcher_alive = &watcher;
-                let Some(event) = event_rx.recv().await else {
+                if event_rx.changed().await.is_err() {
                     break;
-                };
-                handle_notify_event(&watch_paths, event, &mut debouncer);
+                }
+                debouncer.signal(Instant::now());
             }
-        }
-    }
-}
-
-fn handle_notify_event(
-    watch_paths: &ConfigWatchPaths,
-    event: notify::Result<Event>,
-    debouncer: &mut ConfigWatchDebouncer,
-) {
-    match event {
-        Ok(event) if config_watch_event_matches(watch_paths, &event) => {
-            debouncer.signal(Instant::now());
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(error = %error, "config file watcher event failed");
         }
     }
 }

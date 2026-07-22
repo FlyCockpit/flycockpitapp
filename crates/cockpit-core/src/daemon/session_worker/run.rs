@@ -171,6 +171,25 @@ pub(super) fn validate_parked_interrupt_payload(
     Ok(())
 }
 
+pub(super) async fn forward_queue_updates(
+    mut queue_update_rx: watch::Receiver<Vec<crate::engine::message::QueuedUserMessage>>,
+    event_tx: EventSender,
+    redaction: SharedRedactionTable,
+    session_id: Uuid,
+) {
+    while queue_update_rx.changed().await.is_ok() {
+        let queue = queue_update_rx.borrow_and_update().clone();
+        send_current_event(
+            &event_tx,
+            &redaction,
+            proto::Event::QueueUpdated {
+                session_id,
+                queue: queue.into_iter().map(queue_item_to_proto).collect(),
+            },
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_worker(
     session: Arc<Session>,
@@ -331,8 +350,8 @@ pub(super) async fn run_worker(
     // block from the current file each time.
     session.snapshot_guidance_baseline(&project_root);
 
-    let (queue_update_tx, mut queue_update_rx) =
-        mpsc::unbounded_channel::<Vec<crate::engine::message::QueuedUserMessage>>();
+    let (queue_update_tx, queue_update_rx) =
+        watch::channel::<Vec<crate::engine::message::QueuedUserMessage>>(Vec::new());
     let driver_input_queue = crate::engine::message::UserSubmissionQueue::new(queue_update_tx);
     let foreground_input_target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
         root.name.clone(),
@@ -486,18 +505,12 @@ pub(super) async fn run_worker(
         }
         close_pending_turn_completions(&turn_completions_for_forward);
     });
-    let queue_forward = tokio::spawn(async move {
-        while let Some(queue) = queue_update_rx.recv().await {
-            send_current_event(
-                &event_tx_for_queue,
-                &redaction_for_queue,
-                proto::Event::QueueUpdated {
-                    session_id,
-                    queue: queue.into_iter().map(queue_item_to_proto).collect(),
-                },
-            );
-        }
-    });
+    let queue_forward = tokio::spawn(forward_queue_updates(
+        queue_update_rx,
+        event_tx_for_queue,
+        redaction_for_queue,
+        session_id,
+    ));
 
     // Build the driver, then capture its async-job command sender (GOALS
     // §22) so a human-initiated `/schedule cancel` reaches the single

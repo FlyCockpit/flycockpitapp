@@ -231,7 +231,7 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
         .db
         .refresh_session_goal_usage(driver.session.id)
         .unwrap();
-    let (queue_updates_tx, _queue_updates_rx) = mpsc::unbounded_channel();
+    let (queue_updates_tx, _queue_updates_rx) = tokio::sync::watch::channel(Vec::new());
     let input_queue = crate::engine::message::UserSubmissionQueue::new(queue_updates_tx);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
 
@@ -286,7 +286,7 @@ async fn stalled_goal_token_budget_exhaustion_needs_intervention() {
         .db
         .refresh_session_goal_usage(driver.session.id)
         .unwrap();
-    let (queue_updates_tx, _queue_updates_rx) = mpsc::unbounded_channel();
+    let (queue_updates_tx, _queue_updates_rx) = tokio::sync::watch::channel(Vec::new());
     let input_queue = crate::engine::message::UserSubmissionQueue::new(queue_updates_tx);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
 

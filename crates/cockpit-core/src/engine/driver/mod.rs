@@ -2937,8 +2937,9 @@ impl Driver {
     /// conversational agent (GOALS §3b).
     #[cfg(test)]
     async fn run_control(&mut self, control: DriverControl, tx: &mpsc::Sender<TurnEvent>) {
-        let (queue_update_tx, _queue_update_rx) =
-            mpsc::unbounded_channel::<Vec<crate::engine::message::QueuedUserMessage>>();
+        let (queue_update_tx, _queue_update_rx) = tokio::sync::watch::channel::<
+            Vec<crate::engine::message::QueuedUserMessage>,
+        >(Vec::new());
         let input_queue = crate::engine::message::UserSubmissionQueue::new(queue_update_tx);
         self.run_control_with_input_queue(control, &input_queue, tx)
             .await;

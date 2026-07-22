@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use base64::Engine as _;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, watch};
 use uuid::Uuid;
 
 /// Sentinel emitted in wire text by
@@ -155,11 +155,11 @@ struct UserSubmissionQueueState {
 pub struct UserSubmissionQueue {
     inner: Arc<Mutex<UserSubmissionQueueState>>,
     notify: Arc<Notify>,
-    updates: mpsc::UnboundedSender<Vec<QueuedUserMessage>>,
+    updates: watch::Sender<Vec<QueuedUserMessage>>,
 }
 
 impl UserSubmissionQueue {
-    pub fn new(updates: mpsc::UnboundedSender<Vec<QueuedUserMessage>>) -> Self {
+    pub fn new(updates: watch::Sender<Vec<QueuedUserMessage>>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(UserSubmissionQueueState::default())),
             notify: Arc::new(Notify::new()),
@@ -921,8 +921,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_snapshot_channel_is_bounded_and_latest_wins() {
+        let (updates_tx, mut updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+
+        for idx in 0..32 {
+            queue
+                .push(
+                    UserSubmission::text(format!("queued message {idx}")),
+                    target.clone(),
+                )
+                .await;
+        }
+
+        updates_rx.changed().await.unwrap();
+        let latest = updates_rx.borrow_and_update().clone();
+        assert_eq!(latest.len(), 32);
+        assert_eq!(
+            latest.last().map(|item| item.text.as_str()),
+            Some("queued message 31")
+        );
+        assert!(
+            !updates_rx.has_changed().unwrap(),
+            "watch coalesces parked consumers to one pending latest snapshot"
+        );
+    }
+
+    #[tokio::test]
     async fn user_submission_queue_remove_prevents_later_drain_and_keeps_fifo() {
-        let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, mut updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let target = QueueTarget::root("Build");
 
@@ -948,10 +976,9 @@ mod tests {
         assert_eq!(first.text, "first");
         assert_eq!(third.text, "third");
 
-        let mut last = Vec::new();
-        while let Ok(update) = updates_rx.try_recv() {
-            last = update;
-        }
+        updates_rx.changed().await.unwrap();
+        let last = updates_rx.borrow_and_update().clone();
+        assert!(!updates_rx.has_changed().unwrap());
         assert!(
             last.is_empty(),
             "draining publishes an empty queue snapshot"
@@ -960,7 +987,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_remove_after_drain_reports_already_started() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
 
         let (id, _) = queue
@@ -975,7 +1002,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_remove_after_finish_reports_not_found() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
 
         let (id, _) = queue
@@ -991,7 +1018,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_remove_editable_reports_started_only_while_in_flight() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let root = QueueTarget::root("Build");
 
@@ -1017,7 +1044,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_finish_prevents_stale_started_target_mirror_case() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let root = QueueTarget::root("Build");
         let child = QueueTarget::child("builder", 1, "call-1", "default");
@@ -1048,7 +1075,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_finish_is_idempotent_with_requeue_front() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let root = QueueTarget::root("Build");
 
@@ -1065,7 +1092,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_finish_clears_folded_submission_ids() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let root = QueueTarget::root("Build");
 
@@ -1092,7 +1119,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_drain_respects_max_fold() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let target = QueueTarget::root("Build");
         for idx in 0..3 {
@@ -1118,7 +1145,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_requeue_front_restores_started_item() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let target = QueueTarget::root("Build");
         let (id, _) = queue
@@ -1143,7 +1170,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_drains_only_matching_target() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let root = QueueTarget::root("Build");
         let child = QueueTarget::child("builder", 1, "call-1", "default");
@@ -1175,7 +1202,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_bulk_removes_matching_target_fifo() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let root = QueueTarget::root("Build");
         let child = QueueTarget::child("builder", 1, "call-1", "default");
@@ -1214,7 +1241,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_bulk_reports_started_after_partial_removal() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let root = QueueTarget::root("Build");
 
@@ -1242,7 +1269,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_removes_newest_matching_target_only() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let root = QueueTarget::root("Build");
         let child = QueueTarget::child("builder", 1, "call-1", "default");
@@ -1292,7 +1319,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_remove_newest_does_not_steal_other_target() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let child = QueueTarget::child("builder", 1, "call-1", "default");
 
@@ -1318,7 +1345,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_submission_queue_remove_newest_reports_started_at_folding_boundary() {
-        let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let root = QueueTarget::root("Build");
         let child = QueueTarget::child("builder", 1, "call-1", "default");

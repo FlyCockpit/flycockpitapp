@@ -35,7 +35,7 @@ fn user_message_event_data_includes_display_fields() {
 /// yields nothing until a new send.
 #[tokio::test]
 async fn discard_pending_input_drops_all_queued_messages() {
-    let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
     let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
     let target = crate::engine::message::QueueTarget::root("Build");
     // Queue more than MAX_FOLD so we prove the discard has no fold cap —

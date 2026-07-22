@@ -811,9 +811,10 @@ impl QuestionDialog {
 
         // Sandbox-escalation block (run-fail-escalate): the honest framing,
         // the confined attempt's exit + stderr, and the cascade warning that
-        // a remembered scope removes confinement for future runs. Rendered
-        // here in the scrollable prompt region (PageUp/PageDown, Ctrl+E),
-        // never asserting the sandbox blocked the command.
+        // a remembered scope can preauthorize future unconfined reruns after
+        // trusted confined failures. Rendered here in the scrollable prompt
+        // region (PageUp/PageDown, Ctrl+E), never asserting the sandbox
+        // blocked the command.
         if let Some(esc) = self.sandbox_escalation() {
             lines.push(Line::default());
             lines.extend(self.sandbox_escalation_lines(esc, page.options.len() > 1));
@@ -876,8 +877,8 @@ impl QuestionDialog {
             "Granting paths records durable path access at the selected scope, then retries the command inside the sandbox. Run-once re-runs WITHOUT the sandbox now and records no grant."
         } else if rememberable {
             "Approving re-runs it WITHOUT the sandbox now. \"Once\" applies this time only; \
-             a remembered scope (session/project/global) makes future runs of this command \
-             skip the sandbox silently, with no prompt."
+             a remembered scope (session/project/global) lets future trusted confined failures \
+             re-run WITHOUT the sandbox, with no prompt."
         } else {
             "Approving re-runs it WITHOUT the sandbox now. This is a wrapper command and \
              can't be remembered — the choice is once only."
@@ -3379,7 +3380,7 @@ mod tests {
             "the ask is the unconfined re-run: {text}"
         );
         assert!(
-            text.contains("skip the sandbox silently"),
+            text.contains("trusted confined failures"),
             "cascade warning for remembered scopes: {text}"
         );
     }

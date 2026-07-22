@@ -237,13 +237,14 @@ pub enum SandboxAvailability {
     },
 }
 
-/// The gating decision for a single `bash` run, derived purely from the
-/// three inputs so it is unit-testable without a working sandbox.
+/// The gating decision for a single `bash` run, derived purely from
+/// sandbox state and availability so it is unit-testable without a working
+/// sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxGate {
-    /// Run confined (sandbox on, supported, available, not broad-granted).
+    /// Run confined (sandbox on, supported, available).
     Confine,
-    /// Run unconfined (sandbox off, or already broad-granted).
+    /// Run unconfined because sandboxing is off.
     Unconfined,
     /// Refuse: sandboxing is enabled but cannot initialize here. `reason`
     /// is surfaced in the model-facing error; the user is told to run
@@ -251,24 +252,18 @@ pub enum SandboxGate {
     Refuse { reason: String },
 }
 
-/// Decide how to run a `bash` command, given whether sandboxing is on for
-/// this session+platform (`sandbox_on`), whether every constituent command
-/// is already granted broad access (`granted_broad`), and the once-probed
-/// environment availability (`availability`).
+/// Decide whether a `bash` command can run in the shell sandbox, given whether
+/// sandboxing is on for this session+platform (`sandbox_on`) and the
+/// once-probed environment availability (`availability`).
 ///
 /// Pure and total — the seam the unit tests drive with an injected
 /// `availability` so the gating logic is covered without a live bwrap.
 ///
 ///   - sandbox off → `Unconfined`.
-///   - broad-granted → `Unconfined` (the box is skipped regardless).
 ///   - on + available → `Confine`.
 ///   - on + unavailable → `Refuse` (never silently unconfined).
-pub fn gate_decision(
-    sandbox_on: bool,
-    granted_broad: bool,
-    availability: &SandboxAvailability,
-) -> SandboxGate {
-    if !sandbox_on || granted_broad {
+pub fn gate_decision(sandbox_on: bool, availability: &SandboxAvailability) -> SandboxGate {
+    if !sandbox_on {
         return SandboxGate::Unconfined;
     }
     match availability {
@@ -481,17 +476,17 @@ mod tests {
 
     // ---- availability-gating decision (injectable availability) -----------
     //
-    // The gating decision is a pure function of (sandbox_on, granted_broad,
-    // availability), so the three outcomes are covered here without ever
+    // The gating decision is a pure function of (sandbox_on, availability),
+    // so the three outcomes are covered here without ever
     // exercising a real bwrap — the availability result is injected.
 
     #[test]
     fn gate_available_and_enabled_confines() {
         let avail = SandboxAvailability::Available;
         assert_eq!(
-            gate_decision(true, false, &avail),
+            gate_decision(true, &avail),
             SandboxGate::Confine,
-            "sandbox on + available + not broad-granted → confine",
+            "sandbox on + available → confine",
         );
     }
 
@@ -501,7 +496,7 @@ mod tests {
             reason: "bwrap: No permission to create new namespace".to_string(),
             fix_command: None,
         };
-        match gate_decision(true, false, &avail) {
+        match gate_decision(true, &avail) {
             SandboxGate::Refuse { reason } => {
                 assert!(
                     reason.contains("namespace"),
@@ -520,32 +515,32 @@ mod tests {
         };
         // `/sandbox off` → no probe consulted for the decision, run as today.
         assert_eq!(
-            gate_decision(false, false, &avail),
+            gate_decision(false, &avail),
             SandboxGate::Unconfined,
             "sandbox off → unconfined even when unavailable",
         );
     }
 
     #[test]
-    fn gate_broad_grant_skips_box_regardless_of_availability() {
-        // Already broad-granted: the box is skipped even when available, and
-        // an unavailable environment never turns a broad-granted command
-        // into a refusal.
+    fn gate_decision_ignores_grants() {
+        // A command grant authorizes a later unconfined escalation rerun; it
+        // never changes the sandbox gate. This stands in for any grant-derived
+        // fact the caller may have computed.
+        let _grant_would_authorize_escalation = true;
         assert_eq!(
-            gate_decision(true, true, &SandboxAvailability::Available),
-            SandboxGate::Unconfined,
+            gate_decision(true, &SandboxAvailability::Available),
+            SandboxGate::Confine
         );
-        assert_eq!(
-            gate_decision(
-                true,
-                true,
-                &SandboxAvailability::Unavailable {
-                    reason: "x".to_string(),
-                    fix_command: None,
-                }
-            ),
-            SandboxGate::Unconfined,
-        );
+        match gate_decision(
+            true,
+            &SandboxAvailability::Unavailable {
+                reason: "x".to_string(),
+                fix_command: None,
+            },
+        ) {
+            SandboxGate::Refuse { reason } => assert_eq!(reason, "x"),
+            other => panic!("expected Refuse, got {other:?}"),
+        }
     }
 
     // ---- AppArmor-userns diagnosis (Linux only) ---------------------------

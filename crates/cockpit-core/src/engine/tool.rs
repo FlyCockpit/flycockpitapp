@@ -448,18 +448,19 @@ pub struct RepeatGuard {
 /// `bash`-only sandbox-state record for the `tool_call` event (Part B,
 /// data/export — never model-facing). Captures which of the four sandbox
 /// states a `bash` call took so an exported `events.json` is diagnosable:
-/// sandbox-off, broad-grant-skip, confined-success, confined-fail→escalate.
+/// sandbox-off, sandbox-unavailable-refuse, confined-success, and
+/// confined-fail-to-escalate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxMeta {
     /// Sandboxing was on for this session + platform supports it.
     pub enabled: bool,
-    /// The first run actually ran confined (sandbox on, not broad-granted).
+    /// The first run actually ran confined.
     pub confined: bool,
     /// A confined non-zero exit triggered the permission re-run path.
     pub escalated: bool,
-    /// The box was skipped because every simple command was already granted
-    /// broad (Session/Project/Global).
-    pub broad_grant_simple_commands: bool,
+    /// Every simple command had a qualifying stored grant, so a trusted
+    /// confined failure may rerun unconfined without raising a prompt.
+    pub escalation_preauthorized: bool,
     /// The scope chosen on the escalation approval (`once`/`session`/
     /// `project`/`global`), or `None` when not escalated / denied.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1518,7 +1519,7 @@ mod sandbox_meta_tests {
             enabled: true,
             confined: false,
             escalated: false,
-            broad_grant_simple_commands: false,
+            escalation_preauthorized: false,
             approval_scope_recorded: None,
             unavailable_reason: Some(reason.to_string()),
             resource_profiles: Vec::new(),
@@ -1543,7 +1544,7 @@ mod sandbox_meta_tests {
             enabled: true,
             confined: true,
             escalated: false,
-            broad_grant_simple_commands: false,
+            escalation_preauthorized: false,
             approval_scope_recorded: None,
             unavailable_reason: None,
             resource_profiles: Vec::new(),
@@ -1558,7 +1559,7 @@ mod sandbox_meta_tests {
             enabled: true,
             confined: true,
             escalated: false,
-            broad_grant_simple_commands: false,
+            escalation_preauthorized: false,
             approval_scope_recorded: None,
             unavailable_reason: None,
             resource_profiles: vec![SandboxResourceProfileMeta {

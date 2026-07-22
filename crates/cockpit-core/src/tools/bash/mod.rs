@@ -322,15 +322,14 @@ async fn call_bash_inner(
     //     show the one-time per-session notice.
     //   - Sandboxing disabled for this session (`/sandbox off` /
     //     `--no-sandbox`): run unconfined.
-    //   - Otherwise consult part 1: if every constituent simple
-    //     command is already granted broad access (Session/Project/
-    //     Global), skip the box and run with broadened access.
-    //   - Else consult the once-per-process environment probe: if the
+    //   - Otherwise consult the once-per-process environment probe: if the
     //     sandbox can't initialize here (user namespaces blocked, WSL1,
     //     bwrap absent), refuse with an actionable `/sandbox off` error
     //     instead of failing into the escalation prompt.
     //   - Else run sandboxed (cwd + session tmp rw, PATH exec, deny
-    //     outside).
+    //     outside), even when the command key is already granted. A grant
+    //     authorizes a later unconfined rerun only if the confined attempt
+    //     fails with trusted sandbox-escalation metadata.
     let sandbox_enabled =
         ctx.session.sandbox_enabled() && crate::tools::shell_sandbox::shell_sandbox_supported();
     let sandbox_on = sandbox_enabled && !options.force_unconfined;
@@ -340,11 +339,12 @@ async fn call_bash_inner(
     // `Some` on Windows; elsewhere it stays `None`.
     let windows_notice: Option<&'static str> = windows_shell_notice(ctx);
 
-    let granted_broad = if sandbox_on {
-        command_granted_broad(ctx, command).await
+    let escalation_preauthorized_scope = if sandbox_on {
+        command_escalation_preauthorized(ctx, command).await
     } else {
-        false
+        None
     };
+    let escalation_preauthorized = escalation_preauthorized_scope.is_some();
 
     let is_container_run = !options.force_unconfined && ctx.session.sandbox_mode().is_container();
     let mut session_env = ctx
@@ -401,23 +401,20 @@ async fn call_bash_inner(
         .await;
     }
 
-    // Resolve the gating decision. When confinement is actually on the
-    // table (sandbox on, not already broad-granted) we consult the
-    // once-per-process environment probe: if the sandbox cannot
-    // initialize here, refuse with an actionable `/sandbox off` error
-    // rather than letting every command fail into run-fail-escalate. The
-    // probe is skipped entirely for the off / broad-granted paths (no
-    // probe cost, no spawn). The probe needs a real cwd — we pass the
-    // command's resolved cwd (it falls back to a temp dir internally).
-    let availability = if sandbox_on && !granted_broad {
-        crate::tools::shell_sandbox::sandbox_available(&cwd)
-            .await
-            .clone()
+    // Resolve the gating decision. When confinement is on the table we
+    // consult the once-per-process environment probe even if an escalation
+    // grant exists: a grant must not skip the sandbox. If the sandbox cannot
+    // initialize here, refuse with an actionable `/sandbox off` error rather
+    // than letting every command fail into run-fail-escalate. The probe needs
+    // a real cwd — we pass the command's resolved cwd (it falls back to a temp
+    // dir internally).
+    let availability = if sandbox_on {
+        sandbox_availability_for_bash(&cwd).await
     } else {
         // Not consulted on these paths; the gate ignores it.
         crate::tools::shell_sandbox::SandboxAvailability::Available
     };
-    let gate = crate::tools::shell_sandbox::gate_decision(sandbox_on, granted_broad, &availability);
+    let gate = crate::tools::shell_sandbox::gate_decision(sandbox_on, &availability);
 
     if let crate::tools::shell_sandbox::SandboxGate::Refuse { reason } = &gate {
         // Sandbox enabled but cannot initialize: record the accurate
@@ -434,7 +431,7 @@ async fn call_bash_inner(
             enabled: sandbox_enabled,
             confined: false,
             escalated: options.escalated,
-            broad_grant_simple_commands: granted_broad,
+            escalation_preauthorized,
             approval_scope_recorded: options.approval_scope_recorded.clone(),
             // The sandbox-unavailable signal: carry the diagnosed `reason`
             // (incl. the `sudo sysctl …=0` command when diagnosed) out-of-
@@ -469,17 +466,18 @@ async fn call_bash_inner(
     // Part B: the sandbox-state sub-object for the tool_call event. We
     // accumulate the four-state record as the run proceeds and attach it
     // to whichever `ToolOutput` we return (every path), so an export is
-    // diagnosable across sandbox-off / broad-grant-skip / confined-
-    // success / confined-fail→escalate. It is NEVER added to the
+    // diagnosable across sandbox-off / confined-success /
+    // confined-fail→escalate-after-prompt /
+    // confined-fail→escalate-preauthorized. It is NEVER added to the
     // model-facing body (token economy §10).
     let mut meta = crate::engine::tool::SandboxMeta {
         enabled: sandbox_enabled,
         confined: confine,
         escalated: options.escalated,
-        broad_grant_simple_commands: granted_broad,
+        escalation_preauthorized,
         approval_scope_recorded: options.approval_scope_recorded.clone(),
-        // Not the refuse path — the sandbox initialized (or was off /
-        // broad-granted), so there's no unavailable remedy to surface.
+        // Not the refuse path — the sandbox initialized (or was off), so
+        // there's no unavailable remedy to surface.
         unavailable_reason: None,
         resource_profiles: command_resource_plan.metas.clone(),
     };
@@ -492,7 +490,7 @@ async fn call_bash_inner(
             .collect::<Vec<_>>()
             .join("; ");
         return Ok(ToolOutput::text(format!(
-                "Error: command resource profiles cannot expose configured toolchain roots ({issues}). Fix the root environment variables/profile config or use a broad command approval so the command runs without shell confinement."
+                "Error: command resource profiles cannot expose configured toolchain roots ({issues}). Fix the root environment variables/profile config or turn the shell sandbox off explicitly."
             ))
             .with_sandbox(meta));
     }
@@ -561,16 +559,31 @@ async fn call_bash_inner(
     if confine
         && let Some((confined_exit, confined_stderr)) =
             confined_failure_escalation_offer(&final_outcome)
-        && let Some(approver) = ctx.approver.as_ref()
     {
         meta.escalated = true;
-        // The distinct escalation prompt: carries the FIRST confined
-        // attempt's trusted denial detail, captured before the re-run
-        // overwrites `final_outcome`.
-        let decision = approver
-            .approve_command_escalated(command, confined_exit, confined_stderr)
-            .await?;
-        if let crate::approval::Decision::Allow { scope } = decision {
+        let approved_scope = if let Some(scope) = escalation_preauthorized_scope {
+            Some(scope)
+        } else if let Some(approver) = ctx.approver.as_ref() {
+            // The distinct escalation prompt: carries the FIRST confined
+            // attempt's trusted denial detail, captured before the re-run
+            // overwrites `final_outcome`.
+            match approver
+                .approve_command_escalated(command, confined_exit, confined_stderr)
+                .await?
+            {
+                crate::approval::Decision::Allow { scope } => Some(scope),
+                crate::approval::Decision::NoninteractiveDeny => {
+                    // A headless run must give the model the structured reason for
+                    // the refusal, not merely replay the sandbox's opaque stderr.
+                    return Ok(ToolOutput::text(crate::approval::NONINTERACTIVE_RUN_DENIAL)
+                        .with_bash_meta(meta, &resource_meta));
+                }
+                crate::approval::Decision::Deny => None,
+            }
+        } else {
+            None
+        };
+        if let Some(scope) = approved_scope {
             meta.approval_scope_recorded = Some(scope.as_str().to_string());
             let rerun = run_shell(
                 &prefixed,
@@ -617,11 +630,6 @@ async fn call_bash_inner(
                 }
                 RunOutcome::Done(o) => final_outcome = o,
             }
-        } else if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
-            // A headless run must give the model the structured reason for
-            // the refusal, not merely replay the sandbox's opaque stderr.
-            return Ok(ToolOutput::text(crate::approval::NONINTERACTIVE_RUN_DENIAL)
-                .with_bash_meta(meta, &resource_meta));
         }
     }
 
@@ -1151,14 +1159,25 @@ fn push_shell_write_target(targets: &mut Vec<PathBuf>, target: &str, cwd: &Path)
 /// per-operation denial metadata to this caller, so today there is no safe
 /// automatic rerun signal and the original confined failure is preserved.
 fn confined_failure_escalation_offer(_outcome: &ShellOutcome) -> Option<(i32, String)> {
+    #[cfg(test)]
+    if let Some(offer) = TEST_ESCALATION_OFFER.with(|slot| slot.borrow().clone()) {
+        return Some(offer);
+    }
     None
 }
 
-/// Whether *every* simple command in `command` is already granted broad
-/// (Session/Project/Global) access through part 1's store — in which
-/// case the sandboxed run is skipped and the command runs broadened with
-/// no prompt. A wrapper, an ungranted command, or no approver all return
-/// `false` (run sandboxed). Pure store reads — never prompts here.
+async fn sandbox_availability_for_bash(
+    cwd: &Path,
+) -> crate::tools::shell_sandbox::SandboxAvailability {
+    #[cfg(test)]
+    if let Some(availability) = TEST_SANDBOX_AVAILABILITY.with(|slot| slot.borrow().clone()) {
+        return availability;
+    }
+    crate::tools::shell_sandbox::sandbox_available(cwd)
+        .await
+        .clone()
+}
+
 fn command_resource_plan_with_user_grants(
     mut plan: crate::tools::command_resource_profiles::CommandResourcePlan,
     ctx: &ToolCtx,
@@ -1180,21 +1199,31 @@ fn command_resource_plan_with_user_grants(
     plan
 }
 
-async fn command_granted_broad(ctx: &ToolCtx, command: &str) -> bool {
-    let Some(approver) = ctx.approver.as_ref() else {
-        return false;
-    };
+/// Whether *every* simple command in `command` already has a qualifying
+/// command grant. A grant never skips the sandbox; it only preauthorizes the
+/// unconfined rerun when a confined failure produces a trusted escalation
+/// offer. A wrapper, an ungranted command, or no approver all return `None`.
+/// Pure store reads — never prompts here.
+async fn command_escalation_preauthorized(
+    ctx: &ToolCtx,
+    command: &str,
+) -> Option<crate::approval::store::Scope> {
+    let approver = ctx.approver.as_ref()?;
     let classification = crate::approval::classify::classify(command);
     let simple = classification.simple_commands();
     if simple.is_empty() || classification.has_wrapper() {
-        // Empty / unparseable / no simple commands, or any wrapper → run
-        // sandboxed (a wrapper is never persistable, so never "granted
-        // broad").
-        return false;
+        // Empty / unparseable / no simple commands, or any wrapper → not
+        // preauthorized (a wrapper is never persistable).
+        return None;
     }
-    simple
-        .iter()
-        .all(|info| crate::approval::command_grant_allowed_by_policy(approver.store(), info))
+    let mut narrowest = crate::approval::store::Scope::Global;
+    for info in simple {
+        let scope = crate::approval::command_grant_scope_allowed_by_policy(approver.store(), info)?;
+        if scope.rank() < narrowest.rank() {
+            narrowest = scope;
+        }
+    }
+    Some(narrowest)
 }
 
 async fn defensive_human_escalation_offer(
@@ -1259,6 +1288,7 @@ async fn defensive_human_escalation_offer(
 }
 
 /// The combined outcome of one shell run.
+#[derive(Clone)]
 struct ShellOutcome {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -1275,6 +1305,51 @@ enum RunOutcome {
     TimedOut,
     SpawnError(std::io::Error),
     WaitError(std::io::Error),
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+enum TestRunOutcome {
+    Done(ShellOutcome),
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RUN_SHELL_OUTCOMES: std::cell::RefCell<std::collections::VecDeque<(bool, TestRunOutcome)>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static TEST_SANDBOX_AVAILABILITY: std::cell::RefCell<Option<crate::tools::shell_sandbox::SandboxAvailability>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_ESCALATION_OFFER: std::cell::RefCell<Option<(i32, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct BashTestOverrideGuard;
+
+#[cfg(test)]
+impl Drop for BashTestOverrideGuard {
+    fn drop(&mut self) {
+        TEST_RUN_SHELL_OUTCOMES.with(|outcomes| outcomes.borrow_mut().clear());
+        TEST_SANDBOX_AVAILABILITY.with(|availability| *availability.borrow_mut() = None);
+        TEST_ESCALATION_OFFER.with(|offer| *offer.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn set_bash_test_overrides(
+    availability: Option<crate::tools::shell_sandbox::SandboxAvailability>,
+    escalation_offer: Option<(i32, String)>,
+    outcomes: impl IntoIterator<Item = (bool, ShellOutcome)>,
+) -> BashTestOverrideGuard {
+    TEST_SANDBOX_AVAILABILITY.with(|slot| *slot.borrow_mut() = availability);
+    TEST_ESCALATION_OFFER.with(|slot| *slot.borrow_mut() = escalation_offer);
+    TEST_RUN_SHELL_OUTCOMES.with(|slot| {
+        *slot.borrow_mut() = outcomes
+            .into_iter()
+            .map(|(confine, outcome)| (confine, TestRunOutcome::Done(outcome)))
+            .collect();
+    });
+    BashTestOverrideGuard
 }
 
 /// Render the model-facing body from a finished run, prepending a
@@ -1833,7 +1908,7 @@ async fn run_container_bash(
         enabled: true,
         confined: true,
         escalated: false,
-        broad_grant_simple_commands: false,
+        escalation_preauthorized: false,
         approval_scope_recorded: None,
         unavailable_reason: None,
         resource_profiles: command_resource_plan.metas.clone(),
@@ -2060,6 +2135,18 @@ async fn run_shell(
     ctx: &ToolCtx,
     timeout_ms: u64,
 ) -> RunOutcome {
+    #[cfg(test)]
+    if let Some(scripted) = TEST_RUN_SHELL_OUTCOMES.with(|slot| slot.borrow_mut().pop_front()) {
+        let (expected_confine, outcome) = scripted;
+        assert_eq!(
+            confine, expected_confine,
+            "scripted bash run expected confine={expected_confine}, got {confine}"
+        );
+        return match outcome {
+            TestRunOutcome::Done(outcome) => RunOutcome::Done(outcome),
+        };
+    }
+
     let mut cmd = if confine {
         match crate::tools::shell_sandbox::build_sandboxed_command(
             command,

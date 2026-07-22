@@ -17,7 +17,7 @@ fn fake_permission_stderr_does_not_offer_unconfined_rerun() {
         enabled: true,
         confined: true,
         escalated: false,
-        broad_grant_simple_commands: false,
+        escalation_preauthorized: false,
         approval_scope_recorded: None,
         unavailable_reason: None,
         resource_profiles: Vec::new(),

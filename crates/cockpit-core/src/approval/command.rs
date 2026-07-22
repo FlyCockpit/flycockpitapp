@@ -43,8 +43,8 @@ impl Approver {
     /// "failed while sandboxed; re-run without the sandbox?" framing rather
     /// than the first-time-approval wording. The framing rides on the first
     /// prompting constituent so a single dialog presents it. A non-`Once`
-    /// approval here records the grant (future runs of that command skip the
-    /// box silently — the cascade the dialog warns about); the returned
+    /// approval here records the grant so future trusted confined failures of
+    /// that command can rerun unconfined without another prompt; the returned
     /// `Decision::Allow { scope }` lets the caller record the chosen scope in
     /// the tool_call event.
     pub async fn approve_command_escalated(
@@ -274,8 +274,8 @@ impl Approver {
                 step += 1;
             }
             // The escalation framing rides on the FIRST prompting
-            // constituent only, so a single dialog carries it (the box was
-            // skipped per-command, but escalation is a whole-command event).
+            // constituent only, so a single dialog carries it. Preauthorization
+            // is per command key, but escalation is a whole-command event.
             let esc = if prompts && step == 1 {
                 escalation.clone()
             } else {

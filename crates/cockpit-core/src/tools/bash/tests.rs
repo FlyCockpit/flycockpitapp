@@ -387,9 +387,8 @@ async fn nonzero_exit_sets_structured_exit_code() {
 use std::sync::Arc;
 
 use crate::approval::Approver;
-use crate::approval::ID_APPROVE_SESSION;
-use crate::approval::classify::SimpleCommandInfo;
 use crate::approval::store::{GrantStore, Scope};
+use crate::approval::{ID_APPROVE_ONCE, ID_APPROVE_SESSION};
 use crate::daemon::proto::ResolveResponse;
 
 /// Build a sandbox-enabled ctx with an approver + grant store.
@@ -439,6 +438,28 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
         resource_scheduler: None,
         config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+    }
+}
+
+#[cfg(not(windows))]
+fn shell_out(stdout: &str, stderr: &str, exit: i32) -> ShellOutcome {
+    ShellOutcome {
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+        exit,
+        signaled: false,
+        success: exit == 0,
+    }
+}
+
+fn grant_command(ctx: &ToolCtx, command: &str, scope: Scope) {
+    let approver = ctx.approver.as_ref().unwrap();
+    let classification = crate::approval::classify::classify(command);
+    for info in classification.simple_commands() {
+        approver
+            .store()
+            .record_command(info, info.risk.tier, scope)
+            .unwrap();
     }
 }
 
@@ -1129,38 +1150,27 @@ async fn dotdot_as_data_is_not_rejected() {
 }
 
 #[tokio::test]
-async fn granted_broad_skips_the_box() {
+async fn command_escalation_preauthorized_returns_scope() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
-    let approver = ctx.approver.as_ref().unwrap();
-    // Not yet granted → must run sandboxed.
-    assert!(!command_granted_broad(&ctx, "cargo build --release").await);
-    // Grant `cargo build` at Session scope.
-    let info = SimpleCommandInfo {
-        program: "cargo".into(),
-        normalized_program: "cargo".into(),
-        subcommand: Some("build".into()),
-        args: vec!["build".into()],
-        key: crate::approval::classify::ApprovalKey {
-            program: "cargo".into(),
-            subcommand: Some("build".into()),
-        },
-        wrapper: false,
-        risk: Default::default(),
-        span: None,
-    };
-    approver
-        .store()
-        .record_command(&info, info.risk.tier, Scope::Session)
-        .unwrap();
-    // Now the same command is granted broad → skip the box.
-    assert!(command_granted_broad(&ctx, "cargo build --release").await);
-    // A different subcommand is still ungranted → run sandboxed.
-    assert!(!command_granted_broad(&ctx, "cargo test").await);
+    assert_eq!(
+        command_escalation_preauthorized(&ctx, "cargo build --release").await,
+        None
+    );
+
+    grant_command(&ctx, "cargo build --release", Scope::Session);
+    assert_eq!(
+        command_escalation_preauthorized(&ctx, "cargo build --release").await,
+        Some(Scope::Session)
+    );
+    assert_eq!(
+        command_escalation_preauthorized(&ctx, "cargo test").await,
+        None
+    );
 }
 
 #[tokio::test]
-async fn risky_grant_above_policy_cap_does_not_skip_the_box() {
+async fn risky_grant_above_policy_cap_does_not_preauthorize_escalation() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     let approver = ctx.approver.as_ref().unwrap();
@@ -1172,38 +1182,47 @@ async fn risky_grant_above_policy_cap_does_not_skip_the_box() {
 
     assert!(
         approver.store().is_command_granted(&info.key),
-        "the legacy broad grant exists"
+        "the stored grant exists"
     );
-    assert!(
-        !command_granted_broad(&ctx, "rm foo").await,
+    assert_eq!(
+        command_escalation_preauthorized(&ctx, "rm foo").await,
+        None,
         "destructive commands are capped to once by policy"
     );
 }
 
 #[tokio::test]
-async fn wrapper_never_skips_the_box() {
+async fn wrapper_never_preauthorizes_escalation() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
-    // A wrapper can't be persisted, so it can never be "granted
-    // broad" -> always runs sandboxed (and re-prompts on failure).
-    assert!(!command_granted_broad(&ctx, "bash -c 'echo hi'").await);
-    assert!(
-        !command_granted_broad(&ctx, r#"sh -c "printf permission""#).await,
-        "quoted shell wrappers must not skip confinement"
+    // A wrapper can't be persisted, so it can never preauthorize the
+    // unconfined rerun.
+    assert_eq!(
+        command_escalation_preauthorized(&ctx, "bash -c 'echo hi'").await,
+        None
     );
-    assert!(
-        !command_granted_broad(&ctx, r#"env FOO=bar bash -lc 'printf hi'"#).await,
-        "dynamic env wrappers must not skip confinement"
+    assert_eq!(
+        command_escalation_preauthorized(&ctx, r#"sh -c "printf permission""#).await,
+        None,
+        "quoted shell wrappers must not preauthorize escalation"
     );
-    assert!(!command_granted_broad(&ctx, "sudo rm x").await);
+    assert_eq!(
+        command_escalation_preauthorized(&ctx, r#"env FOO=bar bash -lc 'printf hi'"#).await,
+        None,
+        "dynamic env wrappers must not preauthorize escalation"
+    );
+    assert_eq!(
+        command_escalation_preauthorized(&ctx, "sudo rm x").await,
+        None
+    );
 }
 
 #[tokio::test]
-async fn no_approver_never_skips_the_box() {
+async fn no_approver_never_preauthorizes_escalation() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = crate::tools::common::test_ctx(tmp.path());
-    // No approver → can't know any grant → run sandboxed.
-    assert!(!command_granted_broad(&ctx, "ls").await);
+    // No approver -> no grant store to consult.
+    assert_eq!(command_escalation_preauthorized(&ctx, "ls").await, None);
 }
 
 // ---- Part B: tool_call `sandbox` sub-object across the four states ----
@@ -1224,80 +1243,260 @@ async fn sandbox_meta_records_sandbox_off_state() {
     assert!(!meta.enabled, "sandbox off → not enabled");
     assert!(!meta.confined);
     assert!(!meta.escalated);
-    assert!(!meta.broad_grant_simple_commands);
+    assert!(!meta.escalation_preauthorized);
     assert!(meta.approval_scope_recorded.is_none());
     // Model-facing body unchanged: only the command output, no note.
     assert!(out.content.contains("hi"));
     assert!(!out.content.to_lowercase().contains("sandbox"));
 }
 
-/// BROAD-GRANT-SKIP: sandboxing on, but every simple command is already
-/// granted broad, so the box is skipped and the command runs unconfined
-/// (no live confinement needed). The sub-object records
-/// `broad_grant_simple_commands = true`, `confined = false`, and (on a
-/// platform where the sandbox backend exists) `enabled = true`.
+/// A stored grant never changes the initial gate: with the sandbox available,
+/// the first run is still confined. The grant only marks a later trusted
+/// confined failure as preauthorized for an unconfined rerun.
+#[cfg(not(windows))]
 #[tokio::test]
-async fn sandbox_meta_records_broad_grant_skip_state() {
+async fn granted_command_still_runs_confined() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
-    let approver = ctx.approver.as_ref().unwrap();
     let command = "printf hi";
-    // Pre-grant exactly the classified key for `command` so every simple
-    // command is granted broad → `command_granted_broad` is true →
-    // `confine` is false → the run is UNCONFINED (no live confined spawn,
-    // which would re-exec the test binary as the zerobox helper). We
-    // grant the parser's own key so the match is exact regardless of how
-    // `printf hi` decomposes.
-    let classification = crate::approval::classify::classify(command);
-    for info in classification.simple_commands() {
-        approver
-            .store()
-            .record_command(info, info.risk.tier, Scope::Session)
-            .unwrap();
-    }
-    // Sanity: the grant makes the box skippable on a sandbox-supported
-    // platform (so the live call below never confines).
-    let supported = crate::tools::shell_sandbox::shell_sandbox_supported();
-    if supported {
-        assert!(
-            command_granted_broad(&ctx, command).await,
-            "granting the classified key makes the command broad-granted"
-        );
-    }
+    grant_command(&ctx, command, Scope::Session);
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [(true, shell_out("hi", "", 0))],
+    );
 
-    let tool = BashTool::new();
-    let out = tool
+    let out = BashTool::new()
         .call(serde_json::json!({ "command": command }), &ctx)
         .await
         .expect("bash call returns");
     let meta = out.sandbox.expect("bash always populates sandbox meta");
-    // `enabled` mirrors sandbox_on (session-on AND platform supports it).
-    assert_eq!(meta.enabled, supported, "enabled mirrors sandbox_on");
-    // On a sandbox-supported platform the broad grant skips the box.
-    if supported {
-        assert!(
-            meta.broad_grant_simple_commands,
-            "every simple command granted broad → box skipped"
-        );
-    }
-    // Either way the run was not confined (off → never; broad-grant → skip).
-    assert!(!meta.confined, "broad-grant skip never confines");
+    assert!(meta.enabled);
+    assert!(meta.confined);
+    assert!(meta.escalation_preauthorized);
     assert!(!meta.escalated);
     assert!(meta.approval_scope_recorded.is_none());
     assert!(out.content.contains("hi"));
 }
 
-// NOTE: the two CONFINED states (confined-success and
-// confined-fail→escalate) can't be exercised end-to-end through
-// `bash::call`: a live confined spawn re-execs this test binary as the
-// `zerobox-linux-sandbox` helper, which only works from a binary whose
-// `main` ran `arg0::dispatch_linux_sandbox_helper` first (the test
-// harness `main` does not). Per the existing convention we cover the
-// confined-fail→escalate APPROVAL/dialog flow at the approver layer
-// (`escalate_approve_*` / `escalate_deny_*` below) — the exact
-// `approve_command_escalated` call `bash::call` makes — and the
-// sub-object's `confined`/`escalated`/`approval_scope_recorded` mapping
-// is asserted there + in the bash-side state tests above.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn granted_command_escalates_without_prompting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    let command = "printf hi";
+    grant_command(&ctx, command, Scope::Session);
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        Some((13, "sandbox denied".to_string())),
+        [
+            (true, shell_out("", "sandbox denied", 13)),
+            (false, shell_out("hi", "", 0)),
+        ],
+    );
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("bash call returns");
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(meta.enabled);
+    assert!(meta.confined);
+    assert!(meta.escalation_preauthorized);
+    assert!(meta.escalated);
+    assert_eq!(meta.approval_scope_recorded.as_deref(), Some("session"));
+    assert!(out.content.contains("hi"));
+    assert!(
+        ctx.session
+            .db
+            .list_open_interrupts(ctx.session.id)
+            .unwrap()
+            .is_empty(),
+        "preauthorized escalation must not prompt"
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn ungranted_command_still_prompts_on_confined_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    let db = ctx.session.db.clone();
+    let sid = ctx.session.id;
+    let hub = ctx.interrupts.clone();
+    let resolver =
+        tokio::spawn(
+            async move { resolve_next_interrupt(db, sid, hub, ID_APPROVE_ONCE, None).await },
+        );
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        Some((13, "sandbox denied".to_string())),
+        [
+            (true, shell_out("", "sandbox denied", 13)),
+            (false, shell_out("hi", "", 0)),
+        ],
+    );
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf hi" }), &ctx)
+        .await
+        .expect("bash call returns");
+    resolver.await.unwrap();
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(meta.confined);
+    assert!(!meta.escalation_preauthorized);
+    assert!(meta.escalated);
+    assert_eq!(meta.approval_scope_recorded.as_deref(), Some("once"));
+    assert!(out.content.contains("hi"));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn confined_success_never_prompts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [(true, shell_out("ok", "", 0))],
+    );
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf ok" }), &ctx)
+        .await
+        .expect("bash call returns");
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(meta.confined);
+    assert!(!meta.escalated);
+    assert!(!meta.escalation_preauthorized);
+    assert!(meta.approval_scope_recorded.is_none());
+    assert!(
+        ctx.session
+            .db
+            .list_open_interrupts(ctx.session.id)
+            .unwrap()
+            .is_empty(),
+        "confined success must not prompt"
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn wrapper_is_never_preauthorized_for_escalation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    let db = ctx.session.db.clone();
+    let sid = ctx.session.id;
+    let hub = ctx.interrupts.clone();
+    let resolver =
+        tokio::spawn(
+            async move { resolve_next_interrupt(db, sid, hub, ID_APPROVE_ONCE, None).await },
+        );
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        Some((13, "sandbox denied".to_string())),
+        [
+            (true, shell_out("", "sandbox denied", 13)),
+            (false, shell_out("hi", "", 0)),
+        ],
+    );
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "sudo printf hi" }), &ctx)
+        .await
+        .expect("bash call returns");
+    resolver.await.unwrap();
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(meta.confined);
+    assert!(!meta.escalation_preauthorized);
+    assert!(meta.escalated);
+    assert!(meta.approval_scope_recorded.is_none());
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn sandbox_unavailable_still_refuses_with_actionable_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    grant_command(&ctx, "printf hi", Scope::Session);
+    let _guard = set_bash_test_overrides(
+        Some(
+            crate::tools::shell_sandbox::SandboxAvailability::Unavailable {
+                reason: "bwrap absent".to_string(),
+                fix_command: None,
+            },
+        ),
+        Some((13, "sandbox denied".to_string())),
+        [],
+    );
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf hi" }), &ctx)
+        .await
+        .expect("bash call returns");
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(out.content.contains("the shell sandbox cannot start here"));
+    assert!(out.content.contains("/sandbox off"));
+    assert!(meta.enabled);
+    assert!(!meta.confined);
+    assert!(!meta.escalated);
+    assert!(meta.escalation_preauthorized);
+    assert_eq!(meta.unavailable_reason.as_deref(), Some("bwrap absent"));
+    assert!(
+        ctx.session
+            .db
+            .list_open_interrupts(ctx.session.id)
+            .unwrap()
+            .is_empty(),
+        "sandbox-unavailable refusal must not prompt"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn sandbox_meta_distinguishes_escalation_states() {
+    let preauthorized = crate::engine::tool::SandboxMeta {
+        enabled: true,
+        confined: true,
+        escalated: true,
+        escalation_preauthorized: true,
+        approval_scope_recorded: Some("session".to_string()),
+        unavailable_reason: None,
+        resource_profiles: Vec::new(),
+    };
+    let prompted = crate::engine::tool::SandboxMeta {
+        escalation_preauthorized: false,
+        approval_scope_recorded: Some("once".to_string()),
+        ..preauthorized.clone()
+    };
+    let confined_success = crate::engine::tool::SandboxMeta {
+        escalated: false,
+        escalation_preauthorized: false,
+        approval_scope_recorded: None,
+        ..preauthorized.clone()
+    };
+    let unavailable_refuse = crate::engine::tool::SandboxMeta {
+        confined: false,
+        escalated: false,
+        approval_scope_recorded: None,
+        unavailable_reason: Some("bwrap absent".to_string()),
+        ..preauthorized.clone()
+    };
+
+    let preauthorized_value = serde_json::to_value(&preauthorized).unwrap();
+    assert!(
+        preauthorized_value
+            .get("escalation_preauthorized")
+            .is_some()
+    );
+    for other in [prompted, confined_success, unavailable_refuse] {
+        assert_ne!(serde_json::to_value(other).unwrap(), preauthorized_value);
+    }
+
+    let out = ToolOutput::text("model body").with_sandbox(preauthorized);
+    assert_eq!(out.content, "model body");
+    assert!(!out.content.contains("escalation_preauthorized"));
+}
 
 // ---- escalate→approve / escalate→deny dialog paths --------------------
 
@@ -1475,7 +1674,8 @@ async fn defensive_human_escalation_offer_auto_prompts_human() {
 /// distinct variant (carries the confined exit + stderr), the user
 /// approves at session scope, and the decision returns that scope — the
 /// value `bash::call` records as `approval_scope_recorded`. The grant is
-/// persisted (the silent-skip cascade the dialog warns about).
+/// persisted so a future trusted confined failure can rerun unconfined
+/// without prompting.
 #[tokio::test]
 async fn escalate_approve_session_carries_confined_detail_and_records_scope() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1517,7 +1717,8 @@ async fn escalate_approve_session_carries_confined_detail_and_records_scope() {
             scope: Scope::Session
         }
     );
-    // The grant is now remembered → future runs skip the box silently.
+    // The grant is now remembered -> future trusted confined failures can
+    // rerun unconfined without prompting.
     let key = crate::approval::classify::ApprovalKey {
         program: "cat".into(),
         subcommand: None,

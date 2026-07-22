@@ -829,19 +829,28 @@ fn dangerous_policy_flag_matches(configured: &str, arg: &str) -> bool {
     arg == configured || (configured.ends_with('=') && arg.starts_with(configured))
 }
 
+#[cfg(test)]
 pub(crate) fn command_grant_allowed_by_policy(
     store: &GrantStore,
     info: &SimpleCommandInfo,
 ) -> bool {
+    command_grant_scope_allowed_by_policy(store, info).is_some()
+}
+
+pub(crate) fn command_grant_scope_allowed_by_policy(
+    store: &GrantStore,
+    info: &SimpleCommandInfo,
+) -> Option<Scope> {
     if info.wrapper {
-        return false;
+        return None;
     }
     let policy_cfg = store.approval_policy();
     let mut info = info.clone();
     apply_dangerous_flag_policy(&mut info, &policy_cfg);
     let policy = approval_policy_for(&info, &policy_cfg);
-    store.command_grant(&info.key).is_some_and(|grant| {
-        grant.scope.within(policy.max_scope) && info.risk.tier <= grant.granted_tier
+    store.command_grant(&info.key).and_then(|grant| {
+        (grant.scope.within(policy.max_scope) && info.risk.tier <= grant.granted_tier)
+            .then_some(grant.scope)
     })
 }
 
@@ -1663,9 +1672,8 @@ mod tests {
     // ---- permission_decision events (item #5) ----------------------------
 
     /// An already-granted command short-circuits with no prompt and records
-    /// a `permission_decision` event with source `already_granted` — the
-    /// `command_granted_broad`-equivalent path that fires on the next call
-    /// after a session-scope approval.
+    /// a `permission_decision` event with source `already_granted` on the next
+    /// command-approval check after a session-scope approval.
     #[tokio::test]
     async fn already_granted_records_permission_decision() {
         let tmp = tempfile::tempdir().unwrap();

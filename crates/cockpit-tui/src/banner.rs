@@ -9,7 +9,7 @@
 //!
 //! Suppression for the in-TUI banner box (`NO_COLOR` or config
 //! `enabled = false`) is handled by [`suppressed_for_tui`]; callers
-//! skip the box when it returns `true`.
+//! hide the banner panel when it returns `true`.
 
 use cockpit_core::banner::{ResolvedCell, active_cells};
 use ratatui::style::{Color, Style};

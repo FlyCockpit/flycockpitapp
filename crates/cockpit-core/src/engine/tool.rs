@@ -74,6 +74,13 @@ pub enum ToolEffect {
     Dynamic,
 }
 
+/// Shared permission predicate for Cockpit-owned tools. Transport-specific
+/// callers must use this instead of reinterpreting [`ToolEffect`] locally so a
+/// native call and a Monty `mcp.invoke('cockpit', ...)` call agree.
+pub fn tool_requires_permission(tool: &dyn Tool) -> bool {
+    !matches!(tool.effect(), ToolEffect::ReadOnly)
+}
+
 pub const TOOL_PRESENTATION_SUMMARY_CHARS: usize = 240;
 pub const TOOL_PRESENTATION_FULL_CHARS: usize = 2_000;
 
@@ -2241,8 +2248,8 @@ mod llm_mode_tests {
         let expected = [
             ("bash", ToolEffect::Dynamic),
             ("add-package", ToolEffect::Dynamic),
-            ("change_impact", ToolEffect::Dynamic),
-            ("circular", ToolEffect::Dynamic),
+            ("change_impact", ToolEffect::ReadOnly),
+            ("circular", ToolEffect::ReadOnly),
             ("context_pack", ToolEffect::Dynamic),
             ("create_goal", ToolEffect::Dynamic),
             ("defer_to_orchestrator", ToolEffect::Dynamic),
@@ -2250,16 +2257,16 @@ mod llm_mode_tests {
             ("deps", ToolEffect::Dynamic),
             ("editunlock", ToolEffect::Dynamic),
             ("escalate", ToolEffect::Dynamic),
-            ("get_goal", ToolEffect::Dynamic),
+            ("get_goal", ToolEffect::ReadOnly),
             ("glob", ToolEffect::ReadOnly),
             ("grep", ToolEffect::ReadOnly),
             ("handoff", ToolEffect::Dynamic),
             ("harness_invoke", ToolEffect::Dynamic),
             ("harness_list", ToolEffect::Dynamic),
-            ("hot", ToolEffect::Dynamic),
-            ("impact", ToolEffect::Dynamic),
+            ("hot", ToolEffect::ReadOnly),
+            ("impact", ToolEffect::ReadOnly),
             ("list-packages", ToolEffect::Dynamic),
-            ("lsp", ToolEffect::Dynamic),
+            ("lsp", ToolEffect::ReadOnly),
             ("mcp", ToolEffect::Dynamic),
             ("note", ToolEffect::Dynamic),
             ("outline", ToolEffect::Dynamic),
@@ -2289,7 +2296,7 @@ mod llm_mode_tests {
             ("update_goal", ToolEffect::Dynamic),
             ("webfetch", ToolEffect::Dynamic),
             ("websearch", ToolEffect::Dynamic),
-            ("word", ToolEffect::Dynamic),
+            ("word", ToolEffect::ReadOnly),
             ("writeunlock", ToolEffect::Dynamic),
         ];
         let expected: BTreeMap<String, _> = expected

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::daemon::lsp::{LspNavigationRequest, LspOperation};
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 use crate::tools::common::resolve;
 
 pub struct LspTool;
@@ -25,6 +25,10 @@ impl Tool for LspTool {
             "Use LSP only for type-aware hover, definition, or references after cheaper intel/search tools are insufficient; it is read-only and may be unavailable."
                 .to_string(),
         )
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     fn parameters(&self) -> Value {

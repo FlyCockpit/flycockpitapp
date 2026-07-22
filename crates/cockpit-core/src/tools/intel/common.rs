@@ -9,7 +9,9 @@ pub(super) use serde_json::Value;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
-pub(super) use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
+pub(super) use crate::engine::tool::{
+    Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args,
+};
 pub(super) use crate::intel::budget::{BudgetedWriter, retained_truncated_body};
 pub(super) use crate::intel::lang::{Language, regex_outline};
 pub(super) use crate::intel::thin::{ThinLimits, thin_line_output};

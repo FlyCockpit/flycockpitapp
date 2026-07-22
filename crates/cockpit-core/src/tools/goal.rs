@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::db::session_goals::{GoalStatus, GoalUpdateOutcome};
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
+use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args};
 
 pub struct CreateGoalTool;
 pub struct GetGoalTool;
@@ -89,6 +89,12 @@ impl Tool for GetGoalTool {
 
     fn defensive_description(&self) -> Option<String> {
         Some("Read the current goal before terminal `update_goal` calls so completion/blocking decisions use the latest status and budget. Use `include_context` only when detailed settled context is needed; do not use this as a todo/detail reader.".to_string())
+    }
+
+    fn effect(&self) -> ToolEffect {
+        // refresh_session_goal_usage recomputes derived usage bookkeeping; it
+        // does not change user-authored goal state.
+        ToolEffect::ReadOnly
     }
 
     fn parameters(&self) -> Value {

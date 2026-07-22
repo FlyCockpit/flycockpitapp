@@ -371,7 +371,7 @@ pub(crate) async fn execute_ordinary_call(
     } else if repair_outcome.valid {
         if let Some(tool) = env.active_tools.get(resolved_name)
             && env.session.is_btw_fork()
-            && !matches!(tool.effect(), crate::engine::tool::ToolEffect::ReadOnly)
+            && crate::engine::tool::tool_requires_permission(tool.as_ref())
         {
             let label = format!("`{resolved_name}` in /btw side conversation");
             let decision = if let Some(approver) = env.ctx.approver.as_ref() {
@@ -1732,6 +1732,87 @@ mod tests {
         let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "readonly_echo");
+    }
+
+    #[tokio::test]
+    async fn btw_fork_does_not_prompt_for_readonly_intel_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let read_only_tools = ToolBox::new().with(Arc::new(crate::tools::intel::HotTool));
+        let agent = test_agent(read_only_tools.clone());
+        let session = test_btw_session(tmp.path());
+        session.set_approval_mode(ApprovalMode::Yolo);
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &read_only_tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("hot", serde_json::json!({ "limit": 1 }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "hot", Recovery::Clean, None)
+            .await
+            .expect("read-only intel tools intentionally do not prompt in /btw forks");
+
+        assert!(history_has_tool_result(&history, &call.id));
+        assert_eq!(
+            session
+                .db
+                .list_tool_calls_for_session(session.id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let called = Arc::new(AtomicBool::new(false));
+        let dynamic_tools = ToolBox::new().with(Arc::new(NeverCalledTool {
+            name: "dynamic_tool",
+            called: called.clone(),
+        }));
+        let agent = test_agent(dynamic_tools.clone());
+        let session = test_btw_session(tmp.path());
+        session.set_approval_mode(ApprovalMode::Yolo);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &dynamic_tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("dynamic_tool", serde_json::json!({ "text": "blocked" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        let err = execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "dynamic_tool",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .expect_err("dynamic tools still prompt in /btw forks");
+
+        assert!(
+            err.to_string()
+                .contains(crate::approval::NONINTERACTIVE_RUN_DENIAL)
+        );
+        assert!(!called.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

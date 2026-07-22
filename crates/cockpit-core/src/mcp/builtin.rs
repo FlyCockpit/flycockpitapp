@@ -22,7 +22,7 @@ use crate::db::session_log::SessionEventKind;
 use crate::engine::agent::TurnEvent;
 use crate::engine::tool::ToolFailKind;
 use crate::engine::tool::{
-    ContextUsageSnapshot, Tool, ToolCtx, ToolEffect, ToolPresentation, readable_args,
+    ContextUsageSnapshot, Tool, ToolCtx, ToolPresentation, readable_args, tool_requires_permission,
 };
 use crate::mcp::catalog::SearchHit;
 use crate::mcp::protocol::{
@@ -805,7 +805,7 @@ impl ToolOutputBuiltinAdapter {
     }
 
     pub fn into_function(self) -> Result<BuiltinFunction> {
-        if self.tool.effect() != ToolEffect::ReadOnly
+        if tool_requires_permission(self.tool.as_ref())
             && self.approval_seam == NativeToolApprovalSeam::Missing
         {
             bail!(
@@ -844,7 +844,7 @@ async fn invoke_native_tool(ctx: &HostContext, tool: Arc<dyn Tool>, args: Value)
         .native_tool_ctx
         .clone()
         .context("native Monty tool requires a live tool context")?;
-    if tool.effect() != ToolEffect::ReadOnly {
+    if tool_requires_permission(tool.as_ref()) {
         let label = format!("`{}` via cockpit MCP", tool.name());
         let decision = if let Some(approver) = tool_ctx.approver.as_ref() {
             approver.approve_tool_call(&label).await?
@@ -1129,7 +1129,7 @@ impl ValueTypeName for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::tool::{RetainedTruncatedOutput, ToolOutput};
+    use crate::engine::tool::{RetainedTruncatedOutput, ToolEffect, ToolOutput};
     use async_trait::async_trait;
     use std::sync::RwLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1279,6 +1279,126 @@ mod tests {
     fn host(root: &std::path::Path) -> HostContext {
         let ctx = crate::tools::common::test_ctx(root);
         HostContext::from_tool_ctx(&ctx)
+    }
+
+    #[test]
+    fn native_and_monty_permission_outcomes_agree_for_every_builtin_tool() {
+        for tool in crate::engine::builtin::invariant_builtin_tools() {
+            let native_requires_permission = tool_requires_permission(tool.as_ref());
+            let monty_requires_permission = ToolOutputBuiltinAdapter::new(tool.clone())
+                .with_approval_seam(NativeToolApprovalSeam::Missing)
+                .into_function()
+                .is_err();
+
+            assert_eq!(
+                monty_requires_permission,
+                native_requires_permission,
+                "permission outcome drifted for `{}`",
+                tool.name()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_mcp_tool_approval_is_untouched_by_transport_parity() {
+        let mut cfg = crate::mcp::config::McpConfig::default();
+        cfg.servers.insert(
+            "external".into(),
+            crate::mcp::config::ServerConfig {
+                transport: crate::mcp::config::Transport::Stdio,
+                endpoint: None,
+                command: Some("not-executed-by-stub".to_string()),
+                args: vec![],
+                env: BTreeMap::new(),
+                env_credential_refs: BTreeMap::new(),
+                auth: Default::default(),
+                mode: crate::mcp::config::DisclosureMode::Monty,
+                enabled: true,
+                cache_ttl_secs: 3600,
+                connect_timeout_secs: None,
+                timeout_secs: None,
+            },
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let host = HostContext::empty_for_tests().with_test_external_invoke({
+            let calls = calls.clone();
+            move |_server, _tool, _args| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({"unreachable": true}))
+            }
+        });
+
+        let out =
+            crate::mcp::catalog::invoke(&cfg, &host, "external", "echo", serde_json::json!({}))
+                .await
+                .unwrap();
+
+        assert_eq!(out["denied"], true);
+        assert_eq!(out["kind"], "approval_noninteractive_denied");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "external server tool must not run without external MCP approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn monty_readonly_intel_tools_skip_the_approval_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases: Vec<(Arc<dyn Tool>, &str, Value, &str)> = vec![
+            (
+                Arc::new(crate::tools::lsp::LspTool),
+                "lsp",
+                serde_json::json!({"operation": "hover", "file": "src/main.rs"}),
+                "LSP is unavailable",
+            ),
+            (
+                Arc::new(crate::tools::intel::HotTool),
+                "hot",
+                serde_json::json!({"limit": 1}),
+                "",
+            ),
+            (
+                Arc::new(crate::tools::goal::GetGoalTool),
+                "get_goal",
+                serde_json::json!({}),
+                "No goal for this session.",
+            ),
+        ];
+
+        for (tool, name, args, expected_fragment) in cases {
+            ToolOutputBuiltinAdapter::new(tool.clone())
+                .with_approval_seam(NativeToolApprovalSeam::Missing)
+                .into_function()
+                .expect("read-only tools must register without an approval seam");
+            let host = host_with_tool(tmp.path(), tool);
+
+            let out = invoke(&host, name, args).await.unwrap();
+
+            assert_ne!(out["denied"], true, "{name} was denied: {out}");
+            if !expected_fragment.is_empty() {
+                assert!(
+                    out.as_str()
+                        .is_some_and(|text| text.contains(expected_fragment)),
+                    "{name} output was {out}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn monty_dynamic_tools_still_require_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = Arc::new(MontyAdapterTool::new("dynamic_probe", "should not run").mutating());
+        let host = host_with_tool(tmp.path(), tool);
+
+        let out = invoke(&host, "dynamic_probe", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(out["denied"], true);
+        assert_eq!(out["kind"], "approval_noninteractive_denied");
+        assert_eq!(out["tool"], "dynamic_probe");
     }
 
     fn advance_title_turns(session: &Session, turns: usize) {

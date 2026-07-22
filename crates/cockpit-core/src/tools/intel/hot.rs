@@ -21,6 +21,9 @@ impl Tool for HotTool {
                 .to_string(),
         )
     }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",

@@ -56,6 +56,9 @@ impl Tool for ChangeImpactTool {
     fn defensive_description(&self) -> Option<String> {
         Some("Read-only impact hints for current git changes or a ref range. Combines changed files/hunks with indexed symbols, import reverse-deps, call graph, and centrality. Heuristic, not a proof; never stages, writes, or runs tests.".to_string())
     }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",

@@ -102,6 +102,26 @@ fn is_compressed_tool_result_marker_line(line: &str) -> bool {
         && line.contains(" retrieve with tool_result_retrieve]")
 }
 
+fn is_truncated_tool_result_marker_line(line: &str) -> bool {
+    line.starts_with("[truncated")
+        && line.contains(" tool result:")
+        && line.contains(" retrieve with tool_result_retrieve]")
+}
+
+fn strip_truncated_tool_result_marker_lines(body: &str) -> String {
+    let mut out = String::new();
+    let mut stripped = false;
+    for line in body.lines() {
+        if is_truncated_tool_result_marker_line(line) {
+            stripped = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if stripped { out } else { body.to_string() }
+}
+
 fn contains_overlap_marker(body: &str) -> bool {
     let prefix = format!(
         "[elided: {OVERLAP_REASON} — these lines are in a later read; full body in transcript event "
@@ -544,16 +564,17 @@ fn apply_condensed_tool_result_direct(
     candidate: &CondenseCandidate,
     hash: &str,
 ) -> bool {
+    let condensed_body = strip_truncated_tool_result_marker_lines(&candidate.condensed_body);
     let replacement = format!(
         "{}\n{}",
         compressed_tool_result_marker(
             &candidate.tool,
             candidate.original_body.len(),
-            candidate.condensed_body.len(),
+            condensed_body.len(),
             candidate.original_body.lines().count(),
             hash,
         ),
-        candidate.condensed_body
+        condensed_body
     );
     let Some(msg) = history.get_mut(candidate.history_index) else {
         return false;
@@ -1537,6 +1558,39 @@ mod tests {
 
         assert!(is_compressed_tool_result_marker(&marker));
         assert!(is_compressed_tool_result_marker_line(&marker));
+    }
+
+    #[test]
+    fn bash_truncated_body_still_condenses_to_one_compressed_marker() {
+        let original = format!(
+            "[truncated tool result: tool=bash delivered_bytes=8000 stored_bytes=12000 original_bytes=12000 lines=900 hash=aaaaaaaaaaaaaaaaaaaaaaaa retrieve with tool_result_retrieve]\n{}",
+            long_shell_body()
+        );
+        let mut history = vec![
+            assistant_call("c1", "bash", json!({ "command": "cargo test" })),
+            tool_result("c1", &original),
+        ];
+
+        let candidates = condense_candidates(&history);
+        assert_eq!(candidates.len(), 1);
+        assert!(apply_condensed_tool_result(
+            &mut history,
+            &candidates[0],
+            "0123456789abcdefabcdef12"
+        ));
+
+        let body = body_at(&history, 1);
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with(COMPRESSED_RESULT_MARKER_PREFIX))
+                .count(),
+            1,
+            "{body}"
+        );
+        assert_eq!(
+            body.matches("retrieve with tool_result_retrieve").count(),
+            1
+        );
     }
 
     #[test]

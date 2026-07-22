@@ -30,6 +30,7 @@ use crate::engine::tool::{
     ResourceMeta, TOOL_PRESENTATION_SUMMARY_CHARS, Tool, ToolCtx, ToolOutput, ToolOutputSidecar,
     ToolPresentation, single_line_preview, string_field,
 };
+use crate::intel::budget::retained_truncated_body;
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 mod boundary;
@@ -821,6 +822,7 @@ async fn call_bash_inner(
         // Head+tail so the `exit:` line and any stderr at the tail
         // survive — the failure signal usually lives there.
         let mut out = ToolOutput::truncated_text(truncate_head_tail(&body, OUTPUT_BYTE_CAP))
+            .with_truncated_retention(retained_truncated_body(&body))
             .with_bash_meta(meta, &resource_meta);
         if let Some(sidecar) = sidecar {
             out = out.with_output_sidecar(sidecar);
@@ -2225,6 +2227,7 @@ fn render_bash_outcome(
     let sidecar = bash_output_sidecar(command, cwd, &final_outcome, &body, truncated_for_display);
     let mut out = if truncated_for_display {
         ToolOutput::truncated_text(truncate_head_tail(&body, OUTPUT_BYTE_CAP))
+            .with_truncated_retention(retained_truncated_body(&body))
             .with_bash_meta(meta, resource_meta)
     } else {
         ToolOutput::text(body).with_bash_meta(meta, resource_meta)

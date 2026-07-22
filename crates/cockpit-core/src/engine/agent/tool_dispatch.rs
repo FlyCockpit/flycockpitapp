@@ -966,6 +966,7 @@ mod tests {
     use crate::approval::{Approver, store::GrantStore};
     use crate::config::extended::ApprovalMode;
     use crate::engine::message::OneOrMany;
+    use crate::engine::tool::Tool as _;
     use async_trait::async_trait;
     use rig::message::{AssistantContent, ToolFunction, ToolResultContent, UserContent};
     use std::sync::Mutex;
@@ -1283,6 +1284,41 @@ mod tests {
 
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
             Ok(ToolOutput::text("stdout:\nbody\nstderr:\nerr\nexit: 1").with_exit_code(1))
+        }
+    }
+
+    struct BashRetainedTruncatedTool;
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for BashRetainedTruncatedTool {
+        fn name(&self) -> &str {
+            "bash"
+        }
+
+        fn description(&self) -> &str {
+            "Synthetic retained bash output for dispatch retrieval tests."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                },
+                "required": ["command"]
+            })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            let retained = format!("head line\n{}tail line\n", "retained line\n".repeat(700));
+            Ok(
+                ToolOutput::truncated_text("head line\n... [truncated]\ntail line\n")
+                    .with_truncated_retention(crate::engine::tool::RetainedTruncatedOutput {
+                        original_byte_len: retained.len(),
+                        content: retained,
+                        partial: false,
+                    }),
+            )
         }
     }
 
@@ -2434,6 +2470,55 @@ mod tests {
         assert!(stored[0].content.contains("visible line"));
         assert!(stored[0].content.contains("hidden line"));
         assert!(!last_tool_result_text(&history).contains("hidden line"));
+    }
+
+    #[tokio::test]
+    async fn bash_truncated_marker_is_appended_and_retrievable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(BashRetainedTruncatedTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("bash", serde_json::json!({ "command": "synthetic" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "bash", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        let wire = last_tool_result_text(&history);
+        let marker_count = wire
+            .lines()
+            .filter(|line| line.starts_with("[truncated tool result:"))
+            .count();
+        assert_eq!(marker_count, 1, "{wire}");
+        assert!(wire.contains("tool=bash"), "{wire}");
+        let hash = wire
+            .split("hash=")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .expect("truncated marker hash");
+        let retrieved = crate::tools::tool_result_retrieve::ToolResultRetrieveTool
+            .call(serde_json::json!({ "hash": hash }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(retrieved.content.starts_with("head line\n"));
+        assert!(retrieved.content.len() > "head line\n... [truncated]\ntail line\n".len());
     }
 
     #[tokio::test]

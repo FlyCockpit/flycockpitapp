@@ -35,6 +35,107 @@ fn build_test_check_commands_get_output_sidecars() {
     assert_eq!(sidecar.payload["display"]["truncated"], false);
 }
 
+fn large_bash_stdout() -> String {
+    (0..256)
+        .map(|line| format!("line {line:04} {}\n", "x".repeat(96)))
+        .collect()
+}
+
+fn sandbox_meta_for_tests() -> crate::engine::tool::SandboxMeta {
+    crate::engine::tool::SandboxMeta {
+        enabled: false,
+        confined: false,
+        escalated: false,
+        escalation_preauthorized: true,
+        approval_scope_recorded: None,
+        unavailable_reason: None,
+        resource_profiles: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn bash_truncated_output_carries_retention() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stdout = large_bash_stdout();
+    std::fs::write(tmp.path().join("big.txt"), &stdout).unwrap();
+    let command = "cat big.txt";
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command);
+    ctx.session
+        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
+
+    let output = BashTool::new()
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert!(output.truncated);
+    let retention = output
+        .truncated_retention
+        .as_ref()
+        .expect("truncated bash output is retained");
+    assert!(!retention.partial);
+    let rendered_bytes = output
+        .output_sidecar
+        .as_ref()
+        .and_then(|sidecar| sidecar.payload["display"]["rendered_bytes"].as_u64())
+        .expect("truncated bash sidecar records rendered length") as usize;
+    assert_eq!(retention.original_byte_len, rendered_bytes);
+    assert_eq!(retention.content.len(), retention.original_byte_len);
+    assert!(retention.content.starts_with("stdout:\nline 0000"));
+    assert!(retention.content.ends_with("exit: 0\n"));
+}
+
+#[tokio::test]
+async fn bash_untruncated_output_carries_no_retention() {
+    let tmp = tempfile::tempdir().unwrap();
+    let command = "printf ok";
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command);
+
+    let output = BashTool::new()
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert!(!output.truncated);
+    assert!(output.truncated_retention.is_none());
+}
+
+#[test]
+fn bash_truncated_output_carries_retention_on_the_container_render_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stdout = large_bash_stdout();
+    let command = "cat big.txt";
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command);
+    ctx.session
+        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
+    let expected_body = render_output(
+        &shell_out(&stdout, "", 0),
+        false,
+        command,
+        tmp.path(),
+        BashOutputAnnotations::default(),
+    );
+
+    let output = render_bash_outcome(
+        command,
+        tmp.path(),
+        shell_out(&stdout, "", 0),
+        &ctx,
+        sandbox_meta_for_tests(),
+        &None,
+        None,
+    );
+
+    assert!(output.truncated);
+    let retention = output
+        .truncated_retention
+        .as_ref()
+        .expect("container-rendered truncated output is retained");
+    assert_eq!(retention.original_byte_len, expected_body.len());
+    assert_eq!(retention.content, expected_body);
+    assert!(!retention.partial);
+}
+
 #[test]
 fn bash_description_mentions_cap_and_tmpdir_redirection() {
     let tool = BashTool::new();

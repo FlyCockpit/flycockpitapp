@@ -1386,6 +1386,246 @@ mod tests {
         HostContext::from_tool_ctx(&ctx)
     }
 
+    fn is_internal_schema_key(key: &str) -> bool {
+        key.starts_with("x-cockpit")
+    }
+
+    fn sorted_string_array(value: &Value, path: &str) -> Result<Vec<String>, String> {
+        let array = value
+            .as_array()
+            .ok_or_else(|| format!("{path}: expected array, got {}", value.type_name()))?;
+        let mut out = Vec::with_capacity(array.len());
+        for (idx, item) in array.iter().enumerate() {
+            let Some(text) = item.as_str() else {
+                return Err(format!(
+                    "{path}[{idx}]: expected string, got {}",
+                    item.type_name()
+                ));
+            };
+            out.push(text.to_string());
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    fn assert_schema_structure_faithful(
+        source: &Value,
+        rendered: &Value,
+        path: &str,
+    ) -> Result<(), String> {
+        match source {
+            Value::Object(source_obj) => {
+                let rendered_obj = rendered.as_object().ok_or_else(|| {
+                    format!("{path}: expected object, got {}", rendered.type_name())
+                })?;
+
+                for key in source_obj.keys().filter(|key| !is_internal_schema_key(key)) {
+                    if !rendered_obj.contains_key(key) {
+                        return Err(format!("{path}.{key}: missing key"));
+                    }
+                }
+                for key in rendered_obj
+                    .keys()
+                    .filter(|key| !is_internal_schema_key(key))
+                {
+                    if !source_obj.contains_key(key) {
+                        return Err(format!("{path}.{key}: unexpected key"));
+                    }
+                }
+
+                for (key, source_value) in source_obj {
+                    if is_internal_schema_key(key) {
+                        continue;
+                    }
+                    let rendered_value = &rendered_obj[key];
+                    let child_path = format!("{path}.{key}");
+                    match key.as_str() {
+                        "anyOf" | "oneOf" | "allOf" => {
+                            let source_arms = source_value.as_array().ok_or_else(|| {
+                                format!(
+                                    "{child_path}: expected source array, got {}",
+                                    source_value.type_name()
+                                )
+                            })?;
+                            let rendered_arms = rendered_value.as_array().ok_or_else(|| {
+                                format!(
+                                    "{child_path}: expected rendered array, got {}",
+                                    rendered_value.type_name()
+                                )
+                            })?;
+                            if source_arms.len() != rendered_arms.len() {
+                                return Err(format!(
+                                    "{child_path}: expected {} arms, got {}",
+                                    source_arms.len(),
+                                    rendered_arms.len()
+                                ));
+                            }
+                            for (idx, (source_arm, rendered_arm)) in
+                                source_arms.iter().zip(rendered_arms).enumerate()
+                            {
+                                assert_schema_structure_faithful(
+                                    source_arm,
+                                    rendered_arm,
+                                    &format!("{child_path}[{idx}]"),
+                                )?;
+                            }
+                        }
+                        "required" => {
+                            let source_required = sorted_string_array(source_value, &child_path)?;
+                            let rendered_required =
+                                sorted_string_array(rendered_value, &child_path)?;
+                            if source_required != rendered_required {
+                                return Err(format!(
+                                    "{child_path}: required members differ: expected {source_required:?}, got {rendered_required:?}"
+                                ));
+                            }
+                        }
+                        "type" | "const" | "enum" | "additionalProperties" => {
+                            if source_value != rendered_value {
+                                return Err(format!(
+                                    "{child_path}: expected {source_value}, got {rendered_value}"
+                                ));
+                            }
+                        }
+                        _ => {
+                            assert_schema_structure_faithful(
+                                source_value,
+                                rendered_value,
+                                &child_path,
+                            )?;
+                        }
+                    }
+                }
+            }
+            Value::Array(source_array) => {
+                let rendered_array = rendered.as_array().ok_or_else(|| {
+                    format!("{path}: expected array, got {}", rendered.type_name())
+                })?;
+                if source_array.len() != rendered_array.len() {
+                    return Err(format!(
+                        "{path}: expected {} items, got {}",
+                        source_array.len(),
+                        rendered_array.len()
+                    ));
+                }
+                for (idx, (source_item, rendered_item)) in
+                    source_array.iter().zip(rendered_array).enumerate()
+                {
+                    assert_schema_structure_faithful(
+                        source_item,
+                        rendered_item,
+                        &format!("{path}[{idx}]"),
+                    )?;
+                }
+            }
+            _ => {
+                if source != rendered {
+                    return Err(format!("{path}: expected {source}, got {rendered}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_faithful_schema(source: &Value, rendered: &Value, context: &str) {
+        assert_schema_structure_faithful(source, rendered, "$")
+            .unwrap_or_else(|err| panic!("{context}: {err}"));
+    }
+
+    #[test]
+    fn monty_adapter_preserves_schema_structure_for_every_builtin() {
+        let mut checked = Vec::new();
+
+        for tool in crate::engine::builtin::invariant_builtin_tools()
+            .into_iter()
+            .filter(|tool| crate::engine::tool::is_monty_builtin_adaptable(tool.name()))
+        {
+            let Ok(func) = ToolOutputBuiltinAdapter::new(tool.clone()).into_function() else {
+                continue;
+            };
+
+            let normal_schema = tool.parameters();
+            let normal_descriptor = func.descriptor(LlmMode::Normal);
+            assert_faithful_schema(
+                &normal_schema,
+                &normal_descriptor.input_schema,
+                &format!("{} Normal schema", tool.name()),
+            );
+
+            let defensive_schema = tool
+                .defensive_parameters()
+                .unwrap_or_else(|| tool.parameters());
+            let defensive_descriptor = func.descriptor(LlmMode::Defensive);
+            assert_faithful_schema(
+                &defensive_schema,
+                &defensive_descriptor.input_schema,
+                &format!("{} Defensive schema", tool.name()),
+            );
+
+            checked.push(tool.name().to_string());
+        }
+
+        assert!(!checked.is_empty(), "schema guard checked no tools");
+        assert!(
+            checked.iter().any(|name| name == "skill_manage"),
+            "schema guard did not cover skill_manage; checked {checked:?}"
+        );
+    }
+
+    #[test]
+    fn schema_structure_comparator_detects_flattening() {
+        let source = serde_json::json!({
+            "type": "object",
+            "required": ["mode", "payload"],
+            "x-cockpit-internal": true,
+            "properties": {
+                "mode": { "enum": ["read", "write"] },
+                "payload": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "required": ["path"],
+                            "properties": {
+                                "path": { "type": "string" }
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "required": ["id"],
+                            "properties": {
+                                "id": { "const": "known" }
+                            }
+                        }
+                    ]
+                }
+            },
+            "additionalProperties": false
+        });
+        let preserving = source.clone();
+        let flattened = serde_json::json!({
+            "type": "object",
+            "required": ["payload", "mode"],
+            "properties": {
+                "mode": { "enum": ["read", "write"] },
+                "payload": {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }
+            },
+            "additionalProperties": false
+        });
+
+        assert_schema_structure_faithful(&source, &preserving, "$").unwrap();
+        let err = assert_schema_structure_faithful(&source, &flattened, "$").unwrap_err();
+        assert!(
+            err.contains("$.properties.payload.anyOf"),
+            "unexpected comparator error: {err}"
+        );
+    }
+
     #[test]
     fn native_and_monty_permission_outcomes_agree_for_every_builtin_tool() {
         for tool in crate::engine::builtin::invariant_builtin_tools() {

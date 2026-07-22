@@ -961,7 +961,7 @@ struct McpBuiltinToolEntry {
     directly_callable: bool,
 }
 
-fn is_monty_builtin_adaptable(name: &str) -> bool {
+pub(crate) fn is_monty_builtin_adaptable(name: &str) -> bool {
     !matches!(
         name,
         "question"

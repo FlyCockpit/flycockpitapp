@@ -1083,7 +1083,7 @@ fn try_spawn_inner(
 }
 
 pub(crate) fn incompatible_protocol_chip() -> &'static str {
-    "daemon speaks an incompatible protocol; relaunch / upgrade cockpit"
+    "daemon speaks an incompatible protocol; run `cockpit daemon restart`"
 }
 
 pub fn send_control_request(
@@ -2349,11 +2349,11 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn protocol_version_attach_error_uses_incompatible_chip() {
+    fn protocol_mismatch_message_names_daemon_restart() {
         let chip = incompatible_protocol_chip();
         assert_eq!(
             chip,
-            "daemon speaks an incompatible protocol; relaunch / upgrade cockpit"
+            "daemon speaks an incompatible protocol; run `cockpit daemon restart`"
         );
         assert!(!chip.contains("unexpected attach response"));
     }

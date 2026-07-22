@@ -14,7 +14,7 @@
 //! - **Exits** on explicit `Shutdown` (daemon teardown) or when the
 //!   session ends (`Session::end`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -44,7 +44,7 @@ use crate::session::Session;
 /// Lagging clients lose events (consistent with the fire-and-forget
 /// event-stream contract); a client that lags has to reattach to
 /// re-sync.
-const EVENT_BROADCAST_CAPACITY: usize = 1024;
+pub(crate) const EVENT_BROADCAST_CAPACITY: usize = 1024;
 const LOCK_SNAPSHOT_WORK_LIMIT: usize = 4;
 static LOCK_SNAPSHOT_WORK: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -430,7 +430,7 @@ use self::helpers::queue_target_to_proto;
 
 pub use handle::{
     InteractiveClientGuard, SessionConfigHandle, SessionConfigSnapshot, SessionWork,
-    SessionWorkerHandle, spawn,
+    SessionWorkerHandle, TurnOutcome, spawn,
 };
 pub use helpers::DAEMON_NO_SANDBOX_ENV;
 #[allow(unused_imports)]

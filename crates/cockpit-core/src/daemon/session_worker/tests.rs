@@ -49,6 +49,62 @@ fn reasoning_delta(agent: &str, delta: &str) -> proto::Event {
     }
 }
 
+fn test_session_handle() -> SessionWorkerHandle {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+    let locks = Arc::new(LockManager::from_db(db).unwrap());
+    SessionWorkerHandle::test_handle(session, locks)
+}
+
+#[tokio::test]
+async fn turn_completion_is_delivered_through_the_lossless_channel() {
+    let handle = test_session_handle();
+    let completion = handle.watch_turn("turn-1");
+
+    handle.observe_turn_terminal_event_for_test(&proto::Event::AgentIdle {
+        session_id: handle.session_id,
+        turn_id: Some("turn-1".to_string()),
+        reason: crate::engine::IdleReason::Completed,
+    });
+
+    assert!(matches!(
+        completion.await.unwrap(),
+        TurnOutcome::Completed {
+            reason: crate::engine::IdleReason::Completed
+        }
+    ));
+}
+
+#[tokio::test]
+async fn turn_completion_resolves_when_the_turn_finished_before_the_watcher_registered() {
+    let handle = test_session_handle();
+
+    handle.observe_turn_terminal_event_for_test(&proto::Event::AgentIdle {
+        session_id: handle.session_id,
+        turn_id: Some("turn-before-watch".to_string()),
+        reason: crate::engine::IdleReason::GoalComplete,
+    });
+    let completion = handle.watch_turn("turn-before-watch");
+
+    assert!(matches!(
+        completion.await.unwrap(),
+        TurnOutcome::Completed {
+            reason: crate::engine::IdleReason::GoalComplete
+        }
+    ));
+}
+
+#[tokio::test]
+async fn turn_completion_watcher_after_forwarder_close_resolves_closed() {
+    let handle = test_session_handle();
+
+    handle.close_turn_completions_for_test();
+    let completion = handle.watch_turn("late-turn");
+
+    assert!(completion.await.is_err());
+}
+
 #[test]
 fn stream_delta_coalescer_merges_rapid_consecutive_text() {
     let mut c = StreamDeltaCoalescer::default();
@@ -458,12 +514,16 @@ fn recorded_notice_text_is_redacted() {
 #[test]
 fn session_driver_failed_event_is_latched() {
     let (event_tx, mut event_rx) = broadcast::channel(8);
+    let completions = Arc::new(Mutex::new(TurnCompletions::default()));
     let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
     let session_id = Uuid::new_v4();
     let mut driver_failed = false;
+    let mut first_watcher = completions.lock().unwrap().watch("first-turn");
+    let mut second_watcher = completions.lock().unwrap().watch("second-turn");
 
     emit_session_driver_failed_once(
         &event_tx,
+        &completions,
         &redaction,
         session_id,
         &mut driver_failed,
@@ -471,6 +531,7 @@ fn session_driver_failed_event_is_latched() {
     );
     emit_session_driver_failed_once(
         &event_tx,
+        &completions,
         &redaction,
         session_id,
         &mut driver_failed,
@@ -487,6 +548,14 @@ fn session_driver_failed_event_is_latched() {
         event_rx.try_recv().is_err(),
         "failure event is emitted once"
     );
+    assert!(matches!(
+        first_watcher.try_recv().unwrap(),
+        TurnOutcome::Failed { error } if error == "first failure"
+    ));
+    assert!(matches!(
+        second_watcher.try_recv().unwrap(),
+        TurnOutcome::Failed { error } if error == "first failure"
+    ));
 }
 
 #[tokio::test]

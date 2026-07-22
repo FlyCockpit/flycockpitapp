@@ -182,6 +182,7 @@ pub(super) async fn run_worker(
     project_root: PathBuf,
     mut work_rx: mpsc::Receiver<SessionWork>,
     event_tx: EventSender,
+    turn_completions: Arc<Mutex<TurnCompletions>>,
     redaction: SharedRedactionTable,
     live: Arc<LiveState>,
     interactive_clients: Arc<std::sync::atomic::AtomicUsize>,
@@ -348,6 +349,7 @@ pub(super) async fn run_worker(
     // all pass through, so updating here never duplicates the authority.
     let event_tx_for_forward = event_tx.clone();
     let event_tx_for_queue = event_tx.clone();
+    let turn_completions_for_forward = turn_completions.clone();
     let redaction_for_forward = redaction.clone();
     let redaction_for_queue = redaction.clone();
     let foreground_input_target_for_forward = foreground_input_target.clone();
@@ -427,6 +429,7 @@ pub(super) async fn run_worker(
                 }
                 _ => {}
             }
+            resolve_turn_terminal_event(&turn_completions_for_forward, &ev);
             // `send` returns `Err` only when there are no subscribers — that's fine.
             send_current_session_event(
                 &session_for_forward,
@@ -481,6 +484,7 @@ pub(super) async fn run_worker(
                 }
             }
         }
+        close_pending_turn_completions(&turn_completions_for_forward);
     });
     let queue_forward = tokio::spawn(async move {
         while let Some(queue) = queue_update_rx.recv().await {
@@ -850,6 +854,7 @@ pub(super) async fn run_worker(
                 if let Some(error) = outcome.failure_error() {
                     emit_session_driver_failed_once(
                         &event_tx,
+                        &turn_completions,
                         &redaction,
                         session_id,
                         &mut driver_failed,
@@ -971,6 +976,7 @@ pub(super) async fn run_worker(
                     {
                         emit_session_driver_failed_once(
                             &event_tx,
+                            &turn_completions,
                             &redaction,
                             session_id,
                             &mut driver_failed,
@@ -998,6 +1004,7 @@ pub(super) async fn run_worker(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::SetMaxPrimaryRounds { max_rounds },
                         &event_tx,
+                        &turn_completions,
                         &redaction,
                         session_id,
                         &mut driver_failed,
@@ -1274,6 +1281,7 @@ pub(super) async fn run_worker(
                         let message = "driver control channel closed".to_string();
                         emit_session_driver_failed_once(
                             &event_tx,
+                            &turn_completions,
                             &redaction,
                             session_id,
                             &mut driver_failed,
@@ -1357,6 +1365,7 @@ pub(super) async fn run_worker(
                             thinking_mode,
                         },
                         &event_tx,
+                        &turn_completions,
                         &redaction,
                         session_id,
                         &mut driver_failed,
@@ -1391,6 +1400,7 @@ pub(super) async fn run_worker(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::SwapPrimary { name },
                         &event_tx,
+                        &turn_completions,
                         &redaction,
                         session_id,
                         &mut driver_failed,
@@ -1419,6 +1429,7 @@ pub(super) async fn run_worker(
                         &driver_control_tx,
                         persistent_llm_mode_control(resolved),
                         &event_tx,
+                        &turn_completions,
                         &redaction,
                         session_id,
                         &mut driver_failed,
@@ -1433,6 +1444,7 @@ pub(super) async fn run_worker(
                         &driver_control_tx,
                         session_llm_mode_control(mode),
                         &event_tx,
+                        &turn_completions,
                         &redaction,
                         session_id,
                         &mut driver_failed,
@@ -1453,6 +1465,7 @@ pub(super) async fn run_worker(
                             default_depth,
                         },
                         &event_tx,
+                        &turn_completions,
                         &redaction,
                         session_id,
                         &mut driver_failed,
@@ -1548,6 +1561,7 @@ pub(super) async fn run_worker(
                                     scan_ssh_keys,
                                 },
                                 &event_tx,
+                                &turn_completions,
                                 &redaction,
                                 session_id,
                                 &mut driver_failed,
@@ -1582,6 +1596,7 @@ pub(super) async fn run_worker(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::SetPreflight { enabled },
                         &event_tx,
+                        &turn_completions,
                         &redaction,
                         session_id,
                         &mut driver_failed,
@@ -1686,6 +1701,7 @@ pub(super) async fn run_worker(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::SetTandemModels { targets },
                         &event_tx,
+                        &turn_completions,
                         &redaction,
                         session_id,
                         &mut driver_failed,
@@ -1718,6 +1734,7 @@ pub(super) async fn run_worker(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::Prune,
                         &event_tx,
+                        &turn_completions,
                         &redaction,
                         session_id,
                         &mut driver_failed,
@@ -1732,6 +1749,7 @@ pub(super) async fn run_worker(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::Compact,
                         &event_tx,
+                        &turn_completions,
                         &redaction,
                         session_id,
                         &mut driver_failed,
@@ -1746,6 +1764,7 @@ pub(super) async fn run_worker(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::Pin { text },
                         &event_tx,
+                        &turn_completions,
                         &redaction,
                         session_id,
                         &mut driver_failed,

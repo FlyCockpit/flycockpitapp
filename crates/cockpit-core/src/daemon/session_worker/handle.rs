@@ -13,6 +13,7 @@ pub struct SessionWorkerHandle {
     pub trust_policy: crate::config::trust::WorkspaceTrustPolicy,
     work_tx: mpsc::Sender<SessionWork>,
     event_tx: EventSender,
+    turn_completions: Arc<Mutex<TurnCompletions>>,
     redaction: SharedRedactionTable,
     /// Live job/turn status for the `/sessions` browser (GOALS §17f).
     live: Arc<LiveState>,
@@ -44,6 +45,132 @@ pub struct SessionWorkerHandle {
     repair_required: Arc<RwLock<Option<proto::ResumeRepairState>>>,
     foreground: Arc<Mutex<LiveForegroundState>>,
     pub(super) config_snapshot: Arc<RwLock<SessionConfigSnapshot>>,
+}
+
+const RECENT_TURN_COMPLETION_CAPACITY: usize = 64;
+
+/// Terminal outcome of one dispatched turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Completed { reason: proto::IdleReason },
+    Failed { error: String },
+}
+
+#[derive(Debug, Default)]
+pub(super) struct TurnCompletions {
+    pending: HashMap<String, Vec<oneshot::Sender<TurnOutcome>>>,
+    recent: VecDeque<(String, TurnOutcome)>,
+    closed: bool,
+}
+
+impl TurnCompletions {
+    pub(super) fn watch(&mut self, turn_id: &str) -> oneshot::Receiver<TurnOutcome> {
+        let (tx, rx) = oneshot::channel();
+        if self.closed {
+            drop(tx);
+            return rx;
+        }
+        if let Some((_, outcome)) = self
+            .recent
+            .iter()
+            .rev()
+            .find(|(completed_turn_id, _)| completed_turn_id == turn_id)
+        {
+            let _ = tx.send(outcome.clone());
+            return rx;
+        }
+        self.pending
+            .entry(turn_id.to_string())
+            .or_default()
+            .push(tx);
+        rx
+    }
+
+    fn resolve(&mut self, turn_id: String, outcome: TurnOutcome) {
+        if self.closed {
+            return;
+        }
+        if let Some(watchers) = self.pending.remove(&turn_id) {
+            for watcher in watchers {
+                let _ = watcher.send(outcome.clone());
+            }
+        }
+        self.recent.push_back((turn_id, outcome));
+        while self.recent.len() > RECENT_TURN_COMPLETION_CAPACITY {
+            self.recent.pop_front();
+        }
+    }
+
+    fn fail_all_pending(&mut self, error: String) {
+        if self.closed {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        for watchers in pending.into_values() {
+            for watcher in watchers {
+                let _ = watcher.send(TurnOutcome::Failed {
+                    error: error.clone(),
+                });
+            }
+        }
+    }
+
+    fn close_all_pending(&mut self) {
+        self.closed = true;
+        self.pending.clear();
+    }
+
+    #[cfg(test)]
+    fn has_pending(&self, turn_id: &str) -> bool {
+        self.pending
+            .get(turn_id)
+            .is_some_and(|watchers| !watchers.is_empty())
+    }
+}
+
+pub(super) fn resolve_turn_terminal_event(
+    completions: &Arc<Mutex<TurnCompletions>>,
+    event: &proto::Event,
+) {
+    let mut completions = completions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match event {
+        proto::Event::AgentIdle {
+            turn_id: Some(turn_id),
+            reason,
+            ..
+        } => completions.resolve(
+            turn_id.clone(),
+            TurnOutcome::Completed {
+                reason: reason.clone(),
+            },
+        ),
+        proto::Event::SessionDriverFailed {
+            turn_id: Some(turn_id),
+            error,
+            ..
+        } => completions.resolve(
+            turn_id.clone(),
+            TurnOutcome::Failed {
+                error: error.clone(),
+            },
+        ),
+        proto::Event::SessionDriverFailed {
+            turn_id: None,
+            error,
+            ..
+        } => completions.fail_all_pending(error.clone()),
+        proto::Event::AgentIdle { turn_id: None, .. } => {}
+        _ => {}
+    }
+}
+
+pub(super) fn close_pending_turn_completions(completions: &Arc<Mutex<TurnCompletions>>) {
+    completions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .close_all_pending();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,6 +545,7 @@ pub(super) fn sandbox_unavailable_notice_from_availability(
 
 pub(super) fn emit_session_driver_failed_once(
     event_tx: &EventSender,
+    completions: &Arc<Mutex<TurnCompletions>>,
     redaction: &SharedRedactionTable,
     session_id: Uuid,
     driver_failed: &mut bool,
@@ -427,21 +555,20 @@ pub(super) fn emit_session_driver_failed_once(
         return;
     }
     *driver_failed = true;
-    send_current_event(
-        event_tx,
-        redaction,
-        proto::Event::SessionDriverFailed {
-            session_id,
-            turn_id: None,
-            error,
-        },
-    );
+    let event = proto::Event::SessionDriverFailed {
+        session_id,
+        turn_id: None,
+        error,
+    };
+    resolve_turn_terminal_event(completions, &event);
+    send_current_event(event_tx, redaction, event);
 }
 
 pub(super) async fn send_driver_control_or_fail(
     driver_control_tx: &mpsc::Sender<crate::engine::driver::DriverControl>,
     control: crate::engine::driver::DriverControl,
     event_tx: &EventSender,
+    completions: &Arc<Mutex<TurnCompletions>>,
     redaction: &SharedRedactionTable,
     session_id: Uuid,
     driver_failed: &mut bool,
@@ -452,6 +579,7 @@ pub(super) async fn send_driver_control_or_fail(
     tracing::warn!(session_id = %session_id, "driver control channel closed");
     emit_session_driver_failed_once(
         event_tx,
+        completions,
         redaction,
         session_id,
         driver_failed,
@@ -539,6 +667,7 @@ impl SessionWorkerHandle {
             },
             work_tx,
             event_tx,
+            turn_completions: Arc::new(Mutex::new(TurnCompletions::default())),
             redaction,
             live: Arc::new(LiveState::default()),
             interactive_clients: Arc::new(AtomicUsize::new(0)),
@@ -779,6 +908,46 @@ impl SessionWorkerHandle {
     /// own receiver; a lagging receiver drops events (per the design).
     pub fn subscribe(&self) -> EventReceiver {
         self.event_tx.subscribe()
+    }
+
+    /// Await the terminal outcome of `turn_id` on a lossless point-to-point
+    /// channel. Recently observed completions resolve immediately, closing the
+    /// race between queue ack and watcher registration.
+    pub fn watch_turn(&self, turn_id: &str) -> oneshot::Receiver<TurnOutcome> {
+        self.turn_completions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .watch(turn_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_turn_terminal_event_for_test(&self, event: &proto::Event) {
+        resolve_turn_terminal_event(&self.turn_completions, event);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_turn_completions_for_test(&self) {
+        close_pending_turn_completions(&self.turn_completions);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_turn_for_test(&self, turn_id: &str) -> bool {
+        self.turn_completions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .has_pending(turn_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn broadcast_notice_for_test(&self, text: String) {
+        send_current_event(
+            &self.event_tx,
+            &self.redaction,
+            proto::Event::Notice {
+                session_id: self.session_id,
+                text,
+            },
+        );
     }
 
     pub fn redaction_table(&self) -> Arc<RedactionTable> {
@@ -1208,6 +1377,7 @@ pub fn spawn(
         tracing::warn!(error = %error, %session_id, "persisting initial redaction table failed");
     }
     let redaction: SharedRedactionTable = Arc::new(RwLock::new(redact.clone()));
+    let turn_completions = Arc::new(Mutex::new(TurnCompletions::default()));
     let live = Arc::new(LiveState::default());
     // Shared interactive-client counter (GOALS §1/§12). Owned here, handed
     // to the worker's `InterruptHub` and stored on the handle so attach /
@@ -1229,6 +1399,7 @@ pub fn spawn(
         trust_policy: trust_policy.clone(),
         work_tx,
         event_tx: event_tx.clone(),
+        turn_completions: turn_completions.clone(),
         redaction: redaction.clone(),
         live: live.clone(),
         interactive_clients: interactive_clients.clone(),
@@ -1261,6 +1432,7 @@ pub fn spawn(
             project_root,
             work_rx,
             event_tx,
+            turn_completions,
             redaction,
             live,
             interactive_clients,

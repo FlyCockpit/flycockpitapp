@@ -18,7 +18,7 @@ use crate::daemon::proto::{
     ScheduledJobPayload, ScheduledJobSchedule, ScheduledJobSummary,
 };
 use crate::daemon::registry::SessionRegistry;
-use crate::daemon::session_worker::SessionWork;
+use crate::daemon::session_worker::{SessionWork, TurnOutcome};
 use crate::db::Db;
 use crate::db::scheduler::{NewScheduledJobRow, ScheduledJobRow, ScheduledJobRunUpdate};
 
@@ -769,7 +769,6 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
                 return Err(error).context("starting scheduled assistant session");
             }
         };
-        let mut events = handle.subscribe();
         let (respond_to, response_rx) = oneshot::channel();
         handle
             .send_work(SessionWork::UserMessage {
@@ -794,48 +793,20 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
             .await
             .context("scheduled prompt queue ack dropped")?;
         let expected_turn_id = queued_item.id.to_string();
-        tokio::time::timeout(RUN_PROMPT_TIMEOUT, async {
-            loop {
-                match events.recv().await {
-                    Ok(envelope)
-                        if matches!(
-                            &envelope.event,
-                            crate::daemon::proto::Event::AgentIdle { session_id, turn_id, .. }
-                                if *session_id == handle.session_id
-                                    && turn_id.as_deref() == Some(expected_turn_id.as_str())
-                        ) =>
-                    {
-                        return Ok(format!(
-                            "assistant `{assistant}` completed scheduled turn in session {}",
-                            handle.session_id
-                        ));
-                    }
-                    Ok(envelope)
-                        if matches!(
-                            &envelope.event,
-                            crate::daemon::proto::Event::SessionDriverFailed {
-                                session_id,
-                                turn_id,
-                                ..
-                            } if *session_id == handle.session_id
-                                && turn_id
-                                    .as_deref()
-                                    .is_none_or(|turn_id| turn_id == expected_turn_id)
-                        ) =>
-                    {
-                        if let crate::daemon::proto::Event::SessionDriverFailed { error, .. } =
-                            envelope.event
-                        {
-                            bail!("scheduled session driver failed: {error}");
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(error) => bail!("scheduled session event stream closed: {error}"),
-                }
+        let completion = handle.watch_turn(&expected_turn_id);
+        match tokio::time::timeout(RUN_PROMPT_TIMEOUT, completion).await {
+            Ok(Ok(TurnOutcome::Completed { .. })) => Ok(format!(
+                "assistant `{assistant}` completed scheduled turn in session {}",
+                handle.session_id
+            )),
+            Ok(Ok(TurnOutcome::Failed { error })) => {
+                bail!("scheduled session driver failed: {error}")
             }
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("scheduled prompt timed out"))?
+            Ok(Err(_recv_error)) => {
+                bail!("scheduled session worker exited before the turn completed")
+            }
+            Err(_) => bail!("scheduled prompt timed out"),
+        }
     }
 }
 
@@ -1128,6 +1099,7 @@ fn row_to_job(row: ScheduledJobRow) -> Result<ScheduledJob> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -1137,10 +1109,14 @@ mod tests {
     use crate::config::providers::ProvidersConfig;
     use crate::daemon::config_source::ConfigSource;
     use crate::daemon::registry::SessionRegistry;
+    use crate::daemon::session_worker::SessionWorkerHandle;
     use crate::daemon::shutdown::ShutdownSignal;
     use crate::db::workspace_trust::WorkspaceTrustMode;
+    use crate::env_snapshot::EnvSnapshot;
     use crate::locks::LockManager;
-    use tokio::sync::Notify;
+    use crate::session::Session;
+    use tokio::sync::{Notify, mpsc};
+    use uuid::Uuid;
 
     #[derive(Debug)]
     struct ManualClock(std::sync::Mutex<i64>);
@@ -1505,6 +1481,103 @@ mod tests {
             None,
             ConfigSource::fixed(ProvidersConfig::default(), ExtendedConfig::default()),
         )
+    }
+
+    struct PromptRunnerFixture {
+        db: Db,
+        runner: RegistryPromptRunner,
+        session_id: Uuid,
+        handle: SessionWorkerHandle,
+        work_rx: mpsc::Receiver<SessionWork>,
+        job: ScheduledJob,
+    }
+
+    fn prompt_runner_fixture(job_id: &str) -> PromptRunnerFixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let registry = production_registry(db.clone());
+        let session =
+            Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+        let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
+        let (handle, work_rx) =
+            SessionWorkerHandle::test_handle_with_receiver(session.clone(), locks);
+        let join = tokio::spawn(std::future::pending::<()>());
+        registry.insert_test_worker(handle.clone(), join);
+        PromptRunnerFixture {
+            db,
+            runner: RegistryPromptRunner { registry },
+            session_id: session.id,
+            handle,
+            work_rx,
+            job: ScheduledJob {
+                id: job_id.to_string(),
+                owner: "assistant:Build".to_string(),
+                schedule: ScheduledJobSchedule::Once { at: 1_000 },
+                payload: ScheduledJobPayload::RunPrompt {
+                    assistant: "Build".to_string(),
+                    prompt: "summarize the workspace".to_string(),
+                    project_root: tmp.path().to_string_lossy().into_owned(),
+                },
+                enabled: true,
+                missed_run_policy: MissedRunPolicy::Skip,
+                created_at: 1_000,
+                updated_at: 1_000,
+                last_run_at: None,
+                next_run_at: Some(1_000),
+                last_result: None,
+                failure_count: 0,
+                backoff_until: None,
+                disabled_notice: None,
+            },
+        }
+    }
+
+    async fn ack_scheduled_prompt(work_rx: &mut mpsc::Receiver<SessionWork>, turn_id: Uuid) {
+        let work = work_rx.recv().await.expect("scheduled prompt work");
+        let SessionWork::UserMessage {
+            submission,
+            respond_to,
+        } = work
+        else {
+            panic!("expected scheduled user message work");
+        };
+        assert_eq!(submission.text, "summarize the workspace");
+        assert_eq!(
+            submission.origin_principal.as_deref(),
+            Some("daemon_scheduler")
+        );
+        respond_to
+            .send((
+                crate::daemon::proto::QueueItem {
+                    id: turn_id,
+                    status: crate::daemon::proto::QueueItemStatus::Queued,
+                    text: submission.text.clone(),
+                    display_text: None,
+                    target: crate::daemon::proto::QueueTarget {
+                        id: "root".to_string(),
+                        agent: "Build".to_string(),
+                        depth: 0,
+                        task_call_id: None,
+                    },
+                },
+                Vec::new(),
+            ))
+            .expect("runner still waiting for queue ack");
+    }
+
+    async fn wait_for_pending_turn_watcher(handle: &SessionWorkerHandle, turn_id: Uuid) {
+        let turn_id = turn_id.to_string();
+        for _ in 0..100 {
+            if handle.has_pending_turn_for_test(&turn_id) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("turn watcher was not registered for {turn_id}");
+    }
+
+    fn empty_env_snapshot() -> EnvSnapshot {
+        EnvSnapshot::new(EnvSnapshotSource::DaemonStart, HashMap::new())
     }
 
     fn create_helper_assistant(db: &Db, home_dir: std::path::PathBuf) {
@@ -1976,6 +2049,132 @@ mod tests {
         executor.notify.notify_waiters();
         let job = wait_for_job_result(&scheduler, "job-disable").await;
         assert!(!job.enabled);
+    }
+
+    #[tokio::test]
+    async fn event_stream_lag_does_not_fail_the_job() {
+        let PromptRunnerFixture {
+            db,
+            runner,
+            session_id,
+            handle,
+            mut work_rx,
+            job,
+        } = prompt_runner_fixture("job-lag");
+        let turn_id = Uuid::new_v4();
+        let task = tokio::spawn(async move {
+            runner
+                .run_prompt_turn(
+                    &db,
+                    &job,
+                    session_id,
+                    "Build",
+                    "summarize the workspace".to_string(),
+                    empty_env_snapshot(),
+                )
+                .await
+        });
+        ack_scheduled_prompt(&mut work_rx, turn_id).await;
+
+        let mut lagged = handle.subscribe();
+        for i in 0..(crate::daemon::session_worker::EVENT_BROADCAST_CAPACITY + 1) {
+            handle.broadcast_notice_for_test(format!("background event {i}"));
+        }
+        assert!(matches!(
+            lagged.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+        ));
+        handle.observe_turn_terminal_event_for_test(&crate::daemon::proto::Event::AgentIdle {
+            session_id,
+            turn_id: Some(turn_id.to_string()),
+            reason: crate::engine::IdleReason::Completed,
+        });
+
+        let summary = task.await.unwrap().unwrap();
+        assert!(summary.contains("completed scheduled turn"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn worker_death_still_reports_failure() {
+        let PromptRunnerFixture {
+            db,
+            runner,
+            session_id,
+            handle,
+            mut work_rx,
+            job,
+        } = prompt_runner_fixture("job-worker-death");
+        let turn_id = Uuid::new_v4();
+        let task = tokio::spawn(async move {
+            runner
+                .run_prompt_turn(
+                    &db,
+                    &job,
+                    session_id,
+                    "Build",
+                    "summarize the workspace".to_string(),
+                    empty_env_snapshot(),
+                )
+                .await
+        });
+        ack_scheduled_prompt(&mut work_rx, turn_id).await;
+        wait_for_pending_turn_watcher(&handle, turn_id).await;
+
+        handle.close_turn_completions_for_test();
+
+        let err = task.await.unwrap().unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("scheduled session worker exited before the turn completed"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_idle_for_another_turn_does_not_complete_the_job() {
+        let PromptRunnerFixture {
+            db,
+            runner,
+            session_id,
+            handle,
+            mut work_rx,
+            job,
+        } = prompt_runner_fixture("job-foreign-turn");
+        let turn_id = Uuid::new_v4();
+        let task = tokio::spawn(async move {
+            runner
+                .run_prompt_turn(
+                    &db,
+                    &job,
+                    session_id,
+                    "Build",
+                    "summarize the workspace".to_string(),
+                    empty_env_snapshot(),
+                )
+                .await
+        });
+        ack_scheduled_prompt(&mut work_rx, turn_id).await;
+
+        handle.observe_turn_terminal_event_for_test(&crate::daemon::proto::Event::AgentIdle {
+            session_id,
+            turn_id: Some(Uuid::new_v4().to_string()),
+            reason: crate::engine::IdleReason::Completed,
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "foreign turn completion must not finish the scheduled job"
+            );
+        }
+
+        handle.observe_turn_terminal_event_for_test(&crate::daemon::proto::Event::AgentIdle {
+            session_id,
+            turn_id: Some(turn_id.to_string()),
+            reason: crate::engine::IdleReason::Completed,
+        });
+        let summary = task.await.unwrap().unwrap();
+        assert!(summary.contains("completed scheduled turn"), "{summary}");
     }
 
     #[tokio::test]

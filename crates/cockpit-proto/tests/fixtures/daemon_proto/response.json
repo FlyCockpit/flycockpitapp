@@ -946,6 +946,17 @@
               "recovered_pct": 50.0
             }
           ],
+          "by_llm_mode": [
+            {
+              "calls": 2,
+              "hard_fail": 0,
+              "hard_fail_pct": 0.0,
+              "llm_mode": "normal",
+              "malformed_pct": 50.0,
+              "recovered": 1,
+              "recovered_pct": 50.0
+            }
+          ],
           "by_stage": [
             {
               "count": 1,
@@ -960,6 +971,14 @@
               "hard_fail": 0,
               "model": "model-fixture",
               "recovered": 1,
+              "tool": "edit"
+            }
+          ],
+          "hard_fail_shapes": [
+            {
+              "count": 1,
+              "llm_mode": "normal",
+              "shape_fingerprint": "shape-fixture",
               "tool": "edit"
             }
           ]

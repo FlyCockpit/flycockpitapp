@@ -142,10 +142,16 @@ fn print_token_table(t: &TokenSpend) {
 }
 
 fn print_recovery_table(rec: &RecoverySection) {
-    println!("Tool-call recovery");
+    for line in recovery_table_lines(rec) {
+        println!("{line}");
+    }
+}
+
+fn recovery_table_lines(rec: &RecoverySection) -> Vec<String> {
+    let mut out = vec!["Tool-call recovery".to_string()];
     if rec.by_model.is_empty() {
-        println!("  (no data)");
-        return;
+        out.push("  (no data)".to_string());
+        return out;
     }
     let header = ["Model", "Calls", "Malformed%", "Recovered%", "Hard-fail%"];
     let mut rows: Vec<Vec<String>> = Vec::new();
@@ -158,10 +164,27 @@ fn print_recovery_table(rec: &RecoverySection) {
             fmt_pct(m.hard_fail_pct),
         ]);
     }
-    print_aligned(&header, &rows, "  ");
+    out.extend(aligned_lines(&header, &rows, "  "));
+    if !rec.by_llm_mode.is_empty() {
+        out.push(String::new());
+        out.push("  By LLM mode".to_string());
+        let header = ["Mode", "Calls", "Malformed%", "Recovered%", "Hard-fail%"];
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for m in &rec.by_llm_mode {
+            rows.push(vec![
+                m.llm_mode.clone(),
+                m.calls.to_string(),
+                fmt_pct(m.malformed_pct),
+                fmt_pct(m.recovered_pct),
+                fmt_pct(m.hard_fail_pct),
+            ]);
+        }
+        out.extend(aligned_lines(&header, &rows, "  "));
+    }
     // Per-tool / per-stage breakdowns are returned for the TUI's
     // expand-on-Enter view; the CLI keeps the table compact and surfaces
     // them only in json/csv.
+    out
 }
 
 fn print_language_table(lang: &LanguageSection) {
@@ -193,6 +216,12 @@ fn print_language_table(lang: &LanguageSection) {
 /// Print a header + rows as left-aligned, space-padded columns. Column
 /// width is the max of the header and every cell in that column.
 fn print_aligned(header: &[&str], rows: &[Vec<String>], indent: &str) {
+    for line in aligned_lines(header, rows, indent) {
+        println!("{line}");
+    }
+}
+
+fn aligned_lines(header: &[&str], rows: &[Vec<String>], indent: &str) -> Vec<String> {
     let cols = header.len();
     let mut widths: Vec<usize> = header.iter().map(|h| h.len()).collect();
     for row in rows {
@@ -215,10 +244,11 @@ fn print_aligned(header: &[&str], rows: &[Vec<String>], indent: &str) {
         s
     };
     let header_owned: Vec<String> = header.iter().map(|h| h.to_string()).collect();
-    println!("{}", line(&header_owned));
+    let mut out = vec![line(&header_owned)];
     for row in rows {
-        println!("{}", line(row));
+        out.push(line(row));
     }
+    out
 }
 
 // ---- CSV -------------------------------------------------------------------
@@ -316,6 +346,27 @@ fn print_csv(r: &StatsRollup) -> Result<()> {
         }
         w.flush()?;
     }
+    writeln!(out, "\n# recovery_by_llm_mode")?;
+    {
+        let mut w = csv::Writer::from_writer(&mut out);
+        w.write_record([
+            "llm_mode",
+            "calls",
+            "malformed_pct",
+            "recovered_pct",
+            "hard_fail_pct",
+        ])?;
+        for m in &r.recovery.by_llm_mode {
+            w.write_record([
+                m.llm_mode.as_str(),
+                &m.calls.to_string(),
+                &fmt_pct_raw(m.malformed_pct),
+                &fmt_pct_raw(m.recovered_pct),
+                &fmt_pct_raw(m.hard_fail_pct),
+            ])?;
+        }
+        w.flush()?;
+    }
     writeln!(out, "\n# recovery_by_tool")?;
     {
         let mut w = csv::Writer::from_writer(&mut out);
@@ -340,6 +391,20 @@ fn print_csv(r: &StatsRollup) -> Result<()> {
                 s.model.as_str(),
                 s.recovery_kind.as_str(),
                 s.recovery_stage.as_str(),
+                &s.count.to_string(),
+            ])?;
+        }
+        w.flush()?;
+    }
+    writeln!(out, "\n# recovery_hard_fail_shapes")?;
+    {
+        let mut w = csv::Writer::from_writer(&mut out);
+        w.write_record(["llm_mode", "tool", "shape_fingerprint", "count"])?;
+        for s in &r.recovery.hard_fail_shapes {
+            w.write_record([
+                s.llm_mode.as_str(),
+                s.tool.as_str(),
+                s.shape_fingerprint.as_str(),
                 &s.count.to_string(),
             ])?;
         }
@@ -417,7 +482,9 @@ fn csv_cost(c: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::stats::{LanguageRow, NonFileRow, RecoveryRow, TokenRow};
+    use crate::db::stats::{
+        HardFailShapeRow, LanguageRow, NonFileRow, RecoveryModeRow, RecoveryRow, TokenRow,
+    };
 
     fn sample_rollup() -> StatsRollup {
         StatsRollup {
@@ -447,8 +514,23 @@ mod tests {
                     recovered_pct: 1.4,
                     hard_fail_pct: 0.0,
                 }],
+                by_llm_mode: vec![RecoveryModeRow {
+                    llm_mode: "normal".into(),
+                    calls: 145,
+                    recovered: 2,
+                    hard_fail: 0,
+                    malformed_pct: 1.4,
+                    recovered_pct: 1.4,
+                    hard_fail_pct: 0.0,
+                }],
                 by_tool: vec![],
                 by_stage: vec![],
+                hard_fail_shapes: vec![HardFailShapeRow {
+                    llm_mode: "normal".into(),
+                    tool: "edit".into(),
+                    shape_fingerprint: "shape-a".into(),
+                    count: 3,
+                }],
             },
             language: LanguageSection {
                 languages: vec![LanguageRow {
@@ -474,6 +556,33 @@ mod tests {
         let json = serde_json::to_string_pretty(&r).unwrap();
         assert!(json.contains("\"opus\""));
         assert!(json.contains("\"Rust\""));
+    }
+
+    #[test]
+    fn stats_recovery_cli_table_includes_llm_mode() {
+        let r = sample_rollup();
+        let text = recovery_table_lines(&r.recovery).join("\n");
+
+        assert!(text.contains("By LLM mode"));
+        assert!(text.contains("normal"));
+    }
+
+    #[test]
+    fn stats_recovery_cli_table_omits_fingerprint_rows() {
+        let r = sample_rollup();
+        let text = recovery_table_lines(&r.recovery).join("\n");
+
+        assert!(!text.contains("shape-a"));
+    }
+
+    #[test]
+    fn stats_recovery_json_includes_new_collections() {
+        let r = sample_rollup();
+        let json = serde_json::to_string_pretty(&r).unwrap();
+
+        assert!(json.contains("\"by_llm_mode\""));
+        assert!(json.contains("\"hard_fail_shapes\""));
+        assert!(json.contains("\"shape_fingerprint\": \"shape-a\""));
     }
 
     #[test]

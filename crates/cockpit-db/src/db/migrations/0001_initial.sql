@@ -322,6 +322,7 @@ SELECT
     model, provider, project_id, project_root,
     tool, path, language,
     recovery_kind, recovery_stage, hard_fail,
+    llm_mode, shape_fingerprint,
 
     CASE
         WHEN recovery_kind IS NOT NULL

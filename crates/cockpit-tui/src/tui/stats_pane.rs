@@ -490,6 +490,25 @@ fn section_recovery(rec: &RecoverySection, expanded: &[bool], cursor: usize) -> 
             out.extend(recovery_drilldown(rec, &m.model));
         }
     }
+    if !rec.by_llm_mode.is_empty() {
+        out.push(Line::default());
+        out.push(Line::from(Span::styled(
+            "  By LLM mode".to_string(),
+            muted.add_modifier(Modifier::BOLD),
+        )));
+        let header = ["Mode", "Calls", "Malformed%", "Recovered%", "Hard-fail%"];
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for m in &rec.by_llm_mode {
+            rows.push(vec![
+                m.llm_mode.clone(),
+                m.calls.to_string(),
+                fmt_pct(m.malformed_pct),
+                fmt_pct(m.recovered_pct),
+                fmt_pct(m.hard_fail_pct),
+            ]);
+        }
+        out.extend(aligned_table(&header, &rows));
+    }
     out
 }
 
@@ -529,6 +548,22 @@ fn recovery_drilldown(rec: &RecoverySection, model: &str) -> Vec<Line<'static>> 
                     "        {}  {} calls",
                     stage_label(&s.recovery_kind, &s.recovery_stage),
                     s.count
+                ),
+                muted,
+            )));
+        }
+    }
+
+    if !rec.hard_fail_shapes.is_empty() {
+        out.push(Line::from(Span::styled(
+            "      hard-fail shapes (top 20)".to_string(),
+            muted.add_modifier(Modifier::ITALIC),
+        )));
+        for s in &rec.hard_fail_shapes {
+            out.push(Line::from(Span::styled(
+                format!(
+                    "        {} / {} / {}  {} calls",
+                    s.llm_mode, s.tool, s.shape_fingerprint, s.count
                 ),
                 muted,
             )));
@@ -732,7 +767,8 @@ fn fmt_cost(c: Option<f64>) -> String {
 mod tests {
     use super::*;
     use cockpit_db::stats::{
-        LanguageRow, NonFileRow, RecoveryRow, RecoveryStageRow, RecoveryToolRow,
+        HardFailShapeRow, LanguageRow, NonFileRow, RecoveryModeRow, RecoveryRow, RecoveryStageRow,
+        RecoveryToolRow,
     };
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
 
@@ -773,8 +809,10 @@ mod tests {
             },
             recovery: RecoverySection {
                 by_model: Vec::new(),
+                by_llm_mode: Vec::new(),
                 by_tool: Vec::new(),
                 by_stage: Vec::new(),
+                hard_fail_shapes: Vec::new(),
             },
             language: LanguageSection {
                 languages: Vec::new(),
@@ -875,12 +913,29 @@ mod tests {
             recovery_stage: "wrap_bare_string".into(),
             count: 2,
         }];
+        rollup.recovery.by_llm_mode = vec![RecoveryModeRow {
+            llm_mode: "normal".into(),
+            calls: 10,
+            recovered: 2,
+            hard_fail: 1,
+            malformed_pct: 30.0,
+            recovered_pct: 20.0,
+            hard_fail_pct: 10.0,
+        }];
+        rollup.recovery.hard_fail_shapes = vec![HardFailShapeRow {
+            llm_mode: "normal".into(),
+            tool: "editunlock".into(),
+            shape_fingerprint: "shape-a".into(),
+            count: 1,
+        }];
         let mut pane = pane_with(rollup);
 
         // Collapsed: drilldown rows absent.
         let collapsed = render_text(&pane, 80);
         assert!(!collapsed.contains("by tool"));
         assert!(!collapsed.contains("editunlock"));
+        assert!(collapsed.contains("By LLM mode"));
+        assert!(collapsed.contains("normal"));
 
         // Enter on the cursor row (index 0 = qwen) expands it.
         assert!(!pane.handle_key(press(KeyCode::Enter)));
@@ -889,10 +944,67 @@ mod tests {
         assert!(expanded.contains("by tool"));
         assert!(expanded.contains("editunlock"));
         assert!(expanded.contains("shape_repair / wrap_bare_string"));
+        assert!(expanded.contains("hard-fail shapes (top 20)"));
+        assert!(expanded.contains("shape-a"));
 
         // Enter again collapses.
         assert!(!pane.handle_key(press(KeyCode::Enter)));
         assert!(!pane.expanded[0]);
+    }
+
+    #[test]
+    fn stats_pane_recovery_renders_llm_mode_rows() {
+        let mut rollup = empty_rollup();
+        rollup.recovery.by_model = vec![RecoveryRow {
+            model: "qwen".into(),
+            calls: 10,
+            recovered: 2,
+            hard_fail: 1,
+            malformed_pct: 30.0,
+            recovered_pct: 20.0,
+            hard_fail_pct: 10.0,
+        }];
+        rollup.recovery.by_llm_mode = vec![RecoveryModeRow {
+            llm_mode: "defensive".into(),
+            calls: 4,
+            recovered: 1,
+            hard_fail: 0,
+            malformed_pct: 25.0,
+            recovered_pct: 25.0,
+            hard_fail_pct: 0.0,
+        }];
+        let pane = pane_with(rollup);
+
+        let text = render_text(&pane, 80);
+        assert!(text.contains("By LLM mode"));
+        assert!(text.contains("defensive"));
+        assert!(text.contains("25.0%"));
+    }
+
+    #[test]
+    fn stats_pane_recovery_drilldown_shows_hard_fail_shapes() {
+        let mut rollup = empty_rollup();
+        rollup.recovery.by_model = vec![RecoveryRow {
+            model: "qwen".into(),
+            calls: 1,
+            recovered: 0,
+            hard_fail: 1,
+            malformed_pct: 100.0,
+            recovered_pct: 0.0,
+            hard_fail_pct: 100.0,
+        }];
+        rollup.recovery.hard_fail_shapes = vec![HardFailShapeRow {
+            llm_mode: "normal".into(),
+            tool: "edit".into(),
+            shape_fingerprint: "shape-a".into(),
+            count: 1,
+        }];
+        let mut pane = pane_with(rollup);
+        assert!(!pane.handle_key(press(KeyCode::Enter)));
+
+        let text = render_text(&pane, 80);
+        assert!(text.contains("hard-fail shapes (top 20)"));
+        assert!(text.contains("normal / edit / shape-a"));
     }
 
     #[test]

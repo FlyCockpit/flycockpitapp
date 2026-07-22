@@ -296,7 +296,7 @@ pub(super) async fn end_btw_fork(
 /// so a stray discard can never drop a persisted session. Idempotent: an
 /// already-gone session acks without error.
 pub(super) async fn discard_session(
-    state: &mut ClientState,
+    state: &mut MutableClientState,
     ctx: &DaemonContext,
     session_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -471,7 +471,7 @@ pub(super) fn unarchive_session(
 }
 
 pub(super) fn require_attached(
-    state: &ClientState,
+    state: &MutableClientState,
 ) -> std::result::Result<&AttachedSession, ErrorPayload> {
     state.attached.as_ref().ok_or_else(|| ErrorPayload {
         code: ErrorCode::NotAttached,

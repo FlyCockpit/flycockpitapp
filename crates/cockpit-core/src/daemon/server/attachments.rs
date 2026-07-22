@@ -1,7 +1,7 @@
 use super::sessions::*;
 use super::*;
 
-pub(super) fn prune_expired_attachments(state: &mut ClientState) {
+pub(super) fn prune_expired_attachments(state: &mut MutableClientState) {
     let ttl = Duration::from_secs(proto::PENDING_ATTACHMENT_TTL_SECS);
     let now = Instant::now();
     let expired: Vec<_> = state
@@ -64,7 +64,7 @@ pub fn validate_png_attachment_blocking(
 }
 
 pub(super) fn begin_attachment_upload(
-    state: &mut ClientState,
+    state: &mut MutableClientState,
     mime: String,
     byte_len: usize,
     sha256: String,
@@ -74,7 +74,7 @@ pub(super) fn begin_attachment_upload(
 }
 
 pub(super) fn begin_attachment_upload_with_limits(
-    state: &mut ClientState,
+    state: &mut MutableClientState,
     mime: String,
     byte_len: usize,
     sha256: String,
@@ -147,7 +147,7 @@ pub(super) fn begin_attachment_upload_with_limits(
 }
 
 pub(super) fn upload_attachment_chunk(
-    state: &mut ClientState,
+    state: &mut MutableClientState,
     upload_id: Uuid,
     offset: usize,
     data_base64: String,
@@ -182,7 +182,7 @@ pub(super) fn upload_attachment_chunk(
 }
 
 pub(super) async fn finish_attachment_upload(
-    state: &mut ClientState,
+    state: &mut MutableClientState,
     upload_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
     let Some(upload) = state.pending_uploads.remove(&upload_id) else {
@@ -228,7 +228,7 @@ pub(super) async fn finish_attachment_upload(
 }
 
 pub(super) fn consume_image_refs(
-    state: &mut ClientState,
+    state: &mut MutableClientState,
     session_id: Uuid,
     refs: &[proto::ImageAttachmentRef],
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {

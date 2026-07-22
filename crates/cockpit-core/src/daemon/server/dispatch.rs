@@ -6,23 +6,26 @@ use super::*;
 #[cfg(test)]
 pub(super) async fn handle_request(
     request: Request,
-    state: &mut ClientState,
+    state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let mut effects = ClientRequestEffects::default();
-    let result = handle_request_with_effects(request, state, ctx, &mut effects).await;
+    let shared = state.shared_snapshot();
+    let result = handle_serialized_request(request, state, &shared, ctx, &mut effects).await;
     if effects.shutdown_after_response {
         request_shutdown(ctx);
     }
     result
 }
 
-pub(super) async fn handle_request_with_effects(
+pub(super) async fn handle_serialized_request(
     request: Request,
-    state: &mut ClientState,
+    state: &mut MutableClientState,
+    shared: &Arc<SharedClientState>,
     ctx: &Arc<DaemonContext>,
     effects: &mut ClientRequestEffects,
 ) -> std::result::Result<Response, ErrorPayload> {
+    debug_assert_eq!(shared.principal, state.principal);
     prune_expired_attachments(state);
     let request_kind = principal::request_kind(&request);
     let audit_session_id = request_session_id(&request, state);
@@ -1117,6 +1120,266 @@ pub(super) async fn handle_request_with_effects(
     }
 }
 
+pub(super) async fn handle_concurrent_request(
+    request: Request,
+    shared: Arc<SharedClientState>,
+    ctx: Arc<DaemonContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let request_kind = principal::request_kind(&request);
+    let audit_path = request_audit_path(&request);
+    let audit_remote = !shared.principal.is_owner() && is_remote_mutating_request(&request);
+    if let Err(error) = authorize_request_shared(&request, &shared, &ctx) {
+        if audit_remote {
+            audit_remote_request(
+                &ctx,
+                &shared.principal,
+                request_kind,
+                None,
+                audit_path.as_deref(),
+                "denied",
+            );
+        }
+        return Err(error);
+    }
+    if audit_remote {
+        audit_remote_request(
+            &ctx,
+            &shared.principal,
+            request_kind,
+            None,
+            audit_path.as_deref(),
+            "allowed",
+        );
+    }
+    match request {
+        Request::SubagentTranscript {
+            session_id,
+            task_call_id,
+            label,
+        } => {
+            let db = ctx.db.clone();
+            let task_call_id_for_read = task_call_id.clone();
+            let label_for_read = label.clone();
+            let mut history = db
+                .read(move |conn| {
+                    crate::engine::rehydrate::subagent_history_snapshot_conn(
+                        conn,
+                        session_id,
+                        &task_call_id_for_read,
+                        &label_for_read,
+                    )
+                })
+                .await
+                .map_err(internal)?;
+            if !shared.principal.is_owner() {
+                let redact = if let Some(handle) = ctx.registry.live_handle(session_id) {
+                    handle.redaction_table()
+                } else {
+                    let session = crate::session::Session::resume(ctx.db.clone(), session_id)
+                        .map_err(internal)?
+                        .ok_or_else(|| ErrorPayload {
+                            code: ErrorCode::UnknownSession,
+                            message: format!("unknown session {session_id}"),
+                        })?;
+                    std::sync::Arc::new(
+                        session
+                            .persisted_redaction_table()
+                            .map_err(internal)?
+                            .ok_or_else(|| ErrorPayload {
+                                code: ErrorCode::Authorization,
+                                message: "session transcript redaction data is unavailable"
+                                    .to_string(),
+                            })?,
+                    )
+                };
+                history = scrub_history_for_principal(&shared.principal, history, &redact);
+            }
+            Ok(Response::SubagentTranscript {
+                session_id,
+                task_call_id,
+                label,
+                history,
+            })
+        }
+        Request::GoalStatus { session_id } => {
+            ctx.db
+                .refresh_session_goal_usage(session_id)
+                .map_err(internal)?;
+            let goal = ctx
+                .db
+                .current_session_goal(session_id, false)
+                .map_err(internal)?
+                .map(goal_to_proto);
+            Ok(Response::GoalStatus { goal })
+        }
+        Request::ListAssistants => {
+            let assistants = ctx
+                .db
+                .list_assistants()
+                .map_err(internal)?
+                .into_iter()
+                .map(assistant_to_proto)
+                .collect();
+            Ok(Response::Assistants { assistants })
+        }
+        Request::ExportSessionData {
+            session_id,
+            kind,
+            include_generated_artifacts,
+            include_sensitive,
+        } => {
+            export_session_data(
+                &ctx,
+                session_id,
+                kind,
+                include_generated_artifacts,
+                include_sensitive,
+            )
+            .await
+        }
+        Request::FsList {
+            project_root,
+            path,
+            show_hidden,
+        } => crate::daemon::fs_api::fs_list(
+            &ctx,
+            &shared.principal,
+            &project_root,
+            &path,
+            show_hidden,
+        ),
+        Request::FsStat { project_root, path } => {
+            crate::daemon::fs_api::fs_stat(&ctx, &shared.principal, &project_root, &path)
+        }
+        Request::FsRead {
+            project_root,
+            path,
+            base64,
+        } => crate::daemon::fs_api::fs_read(&ctx, &shared.principal, &project_root, &path, base64),
+        Request::GitStatus { project_root } => crate::daemon::fs_api::git_status(&project_root),
+        Request::GitDiffFile { project_root, path } => {
+            crate::daemon::fs_api::git_diff_file(&project_root, &path)
+        }
+        Request::ListSessions {
+            project_id,
+            parent_session_id,
+        } => list_sessions(&ctx, &shared.principal, project_id, parent_session_id).await,
+        Request::ReadSessionMessages {
+            session_id,
+            before_seq,
+            limit,
+        } => {
+            let db = ctx.db.clone();
+            let (messages, has_more) = db
+                .read(move |conn| {
+                    crate::db::Db::read_session_messages_conn(conn, session_id, before_seq, limit)
+                })
+                .await
+                .map_err(internal)?;
+            Ok(Response::SessionMessages {
+                session_id,
+                messages,
+                has_more,
+            })
+        }
+        Request::SessionLiveStatus { session_ids } => {
+            let mut visible_ids = Vec::new();
+            for id in session_ids {
+                if shared.principal.is_owner() {
+                    visible_ids.push(id);
+                    continue;
+                }
+                match ctx.db.get_session(id) {
+                    Ok(Some(row))
+                        if session_access_for_row(&shared.principal, &row)
+                            != SessionAccess::None =>
+                    {
+                        visible_ids.push(id);
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(internal(e)),
+                }
+            }
+            let statuses = visible_ids
+                .into_iter()
+                .filter_map(|id| {
+                    ctx.registry.live_status(id).map(
+                        |(has_active_schedules, processing, _tool_running)| proto::LiveStatus {
+                            session_id: id,
+                            has_active_schedules,
+                            processing,
+                        },
+                    )
+                })
+                .collect();
+            Ok(Response::SessionLiveStatus { statuses })
+        }
+        Request::ListSkills { project_root } => list_skills_shared(&ctx, &shared, project_root),
+        Request::ResourceSnapshot => Ok(Response::ResourceSnapshot {
+            snapshot: resource_scheduler_snapshot(&ctx),
+        }),
+        Request::ListScheduledJobs { owner } => {
+            let scheduler = require_scheduler(&ctx)?;
+            let jobs = scheduler.list_jobs(owner.as_deref()).map_err(internal)?;
+            Ok(Response::ScheduledJobs { jobs })
+        }
+        Request::ListAgents => list_agents_shared(&ctx, &shared),
+        Request::ListModels { provider } => list_models_shared(&ctx, &shared, provider.as_deref()),
+        Request::DaemonStatus => Ok(Response::DaemonStatus {
+            pid: std::process::id(),
+            uptime_secs: ctx.started_at.elapsed().as_secs(),
+            active_sessions: ctx.registry.active_session_ids().len() as u32,
+            socket_path: ctx.paths.socket.display().to_string(),
+            daemon_version: proto::DAEMON_VERSION.to_string(),
+            protocol_version: proto::PROTOCOL_VERSION,
+            paused_sessions: ctx.db.paused_session_work_all().map_err(internal)?.len() as u32,
+            database_path: ctx
+                .db
+                .path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<in-memory>".to_string()),
+            schema_version: ctx.db.schema_version().map_err(internal)?,
+        }),
+        Request::GetUsageCounts { project_id } => {
+            let since = chrono::Utc::now().timestamp() - crate::db::usage_events::USAGE_WINDOW_SECS;
+            let models = ctx
+                .db
+                .usage_counts("model", None, since)
+                .map_err(internal)?;
+            let slash = ctx
+                .db
+                .usage_counts("slash", None, since)
+                .map_err(internal)?;
+            let tags = match project_id.as_deref() {
+                Some(pid) => ctx
+                    .db
+                    .usage_counts("tag", Some(pid), since)
+                    .map_err(internal)?,
+                None => std::collections::HashMap::new(),
+            };
+            Ok(Response::UsageCounts {
+                models,
+                slash,
+                tags,
+            })
+        }
+        Request::StatsRollup {
+            project_id,
+            range,
+            by_role,
+        } => stats_rollup(&ctx, project_id, range, by_role).await,
+        Request::GuidanceEstimate {
+            project_root,
+            provider,
+            model,
+        } => guidance_estimate(&ctx, project_root, provider, model),
+        _ => Err(ErrorPayload {
+            code: ErrorCode::Internal,
+            message: format!("request `{request_kind}` is not marked concurrent"),
+        }),
+    }
+}
+
 pub(super) fn attached_trust_policy(
     ctx: &DaemonContext,
     att: &AttachedSession,
@@ -1127,7 +1390,7 @@ pub(super) fn attached_trust_policy(
 
 pub(super) fn list_agents(
     ctx: &DaemonContext,
-    state: &ClientState,
+    state: &MutableClientState,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_attached(state)?;
     let trust_policy = attached_trust_policy(ctx, att)?;
@@ -1162,7 +1425,7 @@ pub(super) fn list_agents(
 
 pub(super) fn list_models(
     ctx: &DaemonContext,
-    state: &ClientState,
+    state: &MutableClientState,
     requested_provider: Option<&str>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_attached(state)?;
@@ -1197,6 +1460,168 @@ pub(super) fn list_models(
             .then_with(|| a.id.cmp(&b.id))
     });
     Ok(Response::Models { models })
+}
+
+pub(super) fn require_shared_attached(
+    shared: &SharedClientState,
+) -> std::result::Result<&SharedAttachedSession, ErrorPayload> {
+    shared.attached.as_ref().ok_or_else(|| ErrorPayload {
+        code: ErrorCode::NotAttached,
+        message: "client has not attached to a session".into(),
+    })
+}
+
+pub(super) fn attached_trust_policy_shared(
+    ctx: &DaemonContext,
+    att: &SharedAttachedSession,
+) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
+    crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &att.project_root)
+        .map_err(internal)
+}
+
+pub(super) fn list_skills_shared(
+    ctx: &DaemonContext,
+    shared: &SharedClientState,
+    project_root: String,
+) -> std::result::Result<Response, ErrorPayload> {
+    let att = require_shared_attached(shared)?;
+    let cwd = Path::new(&project_root);
+    let trust_policy = attached_trust_policy_shared(ctx, att)?;
+    let (_, extended) = ctx
+        .config_source()
+        .load_with_trust(cwd, &trust_policy)
+        .map_err(internal)?;
+    let activation = crate::skills::ActivationContext::from_tool_names(
+        att.active_tool_names.iter().map(String::as_str),
+    );
+    let skills = crate::skills::discover_for_session(cwd, &extended.skills, &activation)
+        .map_err(internal)?;
+    let skills = skills
+        .into_iter()
+        .map(|s| proto::SkillSummary {
+            name: s.frontmatter.name,
+            description: s.frontmatter.description,
+            source: s.source.display().to_string(),
+            user_invocable: s.frontmatter.user_invocable,
+        })
+        .collect();
+    Ok(Response::Skills { skills })
+}
+
+pub(super) fn list_agents_shared(
+    ctx: &DaemonContext,
+    shared: &SharedClientState,
+) -> std::result::Result<Response, ErrorPayload> {
+    let att = require_shared_attached(shared)?;
+    let trust_policy = attached_trust_policy_shared(ctx, att)?;
+    let (_, cfg) = ctx
+        .config_source()
+        .load_with_trust(&att.project_root, &trust_policy)
+        .map_err(internal)?;
+    let ownable = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        crate::agents::chat_ownable_primaries(&att.project_root)
+    });
+    let mut agents = Vec::with_capacity(ownable.len());
+    for name in &ownable {
+        validate_set_agent_name(name, cfg.experimental_mode, &ownable)?;
+        let def = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            crate::agents::resolve(&att.project_root, name)
+        })
+        .map_err(internal)?
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::Internal,
+            message: format!("chat-ownable agent `{name}` did not resolve"),
+        })?;
+        agents.push(proto::AgentSummary {
+            builtin: crate::agents::is_builtin_agent(name),
+            name: name.clone(),
+            description: def.description,
+            mode: agent_mode_summary(def.mode).to_string(),
+            source: def.source.display().to_string(),
+        });
+    }
+    Ok(Response::Agents { agents })
+}
+
+pub(super) fn list_models_shared(
+    ctx: &DaemonContext,
+    shared: &SharedClientState,
+    requested_provider: Option<&str>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let att = require_shared_attached(shared)?;
+    let trust_policy = attached_trust_policy_shared(ctx, att)?;
+    let (providers, _) = ctx
+        .config_source()
+        .load_with_trust(&att.project_root, &trust_policy)
+        .map_err(internal)?;
+    let active_provider = providers
+        .active_model
+        .as_ref()
+        .map(|model| model.provider.as_str());
+    let provider_filter = requested_provider.or(active_provider);
+    let mut models = Vec::new();
+    for (provider_id, provider) in &providers.providers {
+        if provider_filter.is_some_and(|wanted| wanted != provider_id) {
+            continue;
+        }
+        for model in &provider.models {
+            models.push(proto::ModelSummary {
+                provider: provider_id.clone(),
+                id: model.id.clone(),
+                display_name: model.name.clone(),
+                favorite: model.favorite,
+            });
+        }
+    }
+    models.sort_by(|a, b| {
+        a.provider
+            .cmp(&b.provider)
+            .then_with(|| b.favorite.cmp(&a.favorite))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(Response::Models { models })
+}
+
+pub(super) fn guidance_estimate(
+    ctx: &DaemonContext,
+    project_root: String,
+    provider: Option<String>,
+    model: Option<String>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let cwd = Path::new(&project_root);
+    let (strategy, scale) = ctx.db.resolve_tokenizer(
+        provider.as_deref().unwrap_or(""),
+        model.as_deref().unwrap_or(""),
+    );
+    let system_prompt = crate::engine::builtin::default_chat_system_prompt(cwd, "");
+    let system_tokens = crate::tokens::scaled_estimate(&system_prompt, strategy, scale);
+    let model_instruction_tokens = provider
+        .as_deref()
+        .zip(model.as_deref())
+        .and_then(|(provider, model)| {
+            let (cfg, _) = ctx.config_source().load(cwd).ok()?;
+            cfg.resolve_model_system_prompt(provider, model)
+                .map(|prompt| crate::tokens::scaled_estimate(prompt, strategy, scale))
+        })
+        .unwrap_or(0);
+    match crate::engine::builtin::load_agent_guidance(cwd) {
+        Some((path, body)) => {
+            let tokens = crate::tokens::scaled_estimate(&body, strategy, scale);
+            let file = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            Ok(Response::GuidanceEstimate {
+                file,
+                tokens,
+                system_tokens,
+                model_instruction_tokens,
+            })
+        }
+        None => Ok(Response::GuidanceEstimate {
+            file: None,
+            tokens: 0,
+            system_tokens,
+            model_instruction_tokens,
+        }),
+    }
 }
 
 pub(super) fn agent_mode_summary(mode: crate::agents::AgentMode) -> &'static str {
@@ -1241,7 +1666,7 @@ pub fn request_shutdown(ctx: &Arc<DaemonContext>) {
 /// daemon's auto-off watcher. The OS assertion lives in this process so it
 /// survives the requesting client's exit.
 pub(super) fn set_caffeinate(
-    state: &ClientState,
+    state: &MutableClientState,
     ctx: &Arc<DaemonContext>,
     mode: crate::daemon::caffeinate::CaffeinateMode,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -1369,7 +1794,7 @@ pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn attach(
-    state: &mut ClientState,
+    state: &mut MutableClientState,
     ctx: &DaemonContext,
     session_id: Option<Uuid>,
     since_seq: Option<i64>,

@@ -1487,8 +1487,10 @@ fn test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext>
     )
 }
 
-fn remote_state_with_grants(grants: Vec<crate::daemon::principal::PrincipalGrant>) -> ClientState {
-    ClientState {
+fn remote_state_with_grants(
+    grants: Vec<crate::daemon::principal::PrincipalGrant>,
+) -> MutableClientState {
+    MutableClientState {
         principal: ClientPrincipal::Remote(crate::daemon::principal::RemotePrincipal {
             user_id: "user-1".into(),
             grants,
@@ -1518,8 +1520,8 @@ fn terminal_grant() -> crate::daemon::principal::PrincipalGrant {
     }
 }
 
-fn owner_state() -> ClientState {
-    ClientState {
+fn owner_state() -> MutableClientState {
+    MutableClientState {
         principal: ClientPrincipal::owner(),
         attached: None,
         pending_replay: Vec::new(),
@@ -1918,7 +1920,7 @@ async fn promote_resource_request_moves_queued_request_to_front() {
     assert_eq!(before.running[0].id, running.request_id());
     assert_eq!(before.queued[1].id, queued_b.request_id());
 
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let response = handle_request(
         Request::PromoteResource {
             request_id: queued_b.display_id().to_string(),
@@ -1945,7 +1947,7 @@ async fn promote_resource_request_moves_queued_request_to_front() {
 #[tokio::test]
 async fn promote_resource_request_stale_id_is_nonfatal() {
     let ctx = persistent_test_ctx();
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
 
     let response = handle_request(
         Request::PromoteResource {
@@ -2014,7 +2016,10 @@ async fn retention_tick_runs_one_pass_without_sleep() {
     assert_eq!(rows, 0);
 }
 
-fn attached_state(ctx: &Arc<DaemonContext>, project_root: &std::path::Path) -> (ClientState, Uuid) {
+fn attached_state(
+    ctx: &Arc<DaemonContext>,
+    project_root: &std::path::Path,
+) -> (MutableClientState, Uuid) {
     let (state, session_id, _work_rx) = attached_state_with_worker_receiver(ctx, project_root);
     (state, session_id)
 }
@@ -2022,7 +2027,11 @@ fn attached_state(ctx: &Arc<DaemonContext>, project_root: &std::path::Path) -> (
 fn attached_state_with_worker_receiver(
     ctx: &Arc<DaemonContext>,
     project_root: &std::path::Path,
-) -> (ClientState, Uuid, tokio::sync::mpsc::Receiver<SessionWork>) {
+) -> (
+    MutableClientState,
+    Uuid,
+    tokio::sync::mpsc::Receiver<SessionWork>,
+) {
     ctx.db
         .set_workspace_trust(
             project_root,
@@ -2041,7 +2050,7 @@ fn attached_state_with_worker_receiver(
     let locks = Arc::new(LockManager::from_db(ctx.db.clone()).expect("locks"));
     let (handle, work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
     (
-        ClientState {
+        MutableClientState {
             principal: ClientPrincipal::owner(),
             attached: Some(AttachedSession {
                 handle,
@@ -2058,6 +2067,83 @@ fn attached_state_with_worker_receiver(
         session_row.session_id,
         work_rx,
     )
+}
+
+#[test]
+fn client_state_split_snapshot_republishes_on_attach_and_detach() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, session_id) = attached_state(&ctx, tmp.path());
+
+    let attached = state.shared_snapshot();
+    assert_eq!(
+        attached
+            .attached
+            .as_ref()
+            .map(SharedAttachedSession::session_id),
+        Some(session_id)
+    );
+
+    state.attached = None;
+    let detached = state.shared_snapshot();
+    assert!(detached.attached.is_none());
+}
+
+#[test]
+fn client_state_split_handler_holding_a_stale_snapshot_still_scrubs() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path());
+    state.principal = remote_principal();
+    let table = table_for("stale-secret");
+    let mut stale = (*state.shared_snapshot()).clone();
+    stale.attached = Some(SharedAttachedSession {
+        session_id: state.attached.as_ref().unwrap().handle.session_id,
+        project_root: state.attached.as_ref().unwrap().handle.project_root.clone(),
+        redaction_table: table,
+        active_tool_names: state.attached.as_ref().unwrap().handle.active_tool_names(),
+    });
+    state.attached = None;
+
+    let response = proto::Response::SessionMessages {
+        session_id: Uuid::new_v4(),
+        messages: vec![proto::SessionMessage {
+            seq: 1,
+            ts_ms: 1,
+            role: proto::MessageRole::Agent,
+            text: "stale-secret remains protected".to_string(),
+        }],
+        has_more: false,
+    };
+    let redact = stale
+        .attached
+        .as_ref()
+        .expect("stale snapshot remains attached")
+        .redaction_table();
+    let scrubbed = scrub_proto_response(response, &redact).expect("response scrubs");
+    let rendered = serde_json::to_string(&scrubbed).unwrap();
+    assert!(!rendered.contains("stale-secret"), "{rendered}");
+}
+
+#[tokio::test]
+async fn client_state_split_concurrent_entry_point_authorizes_before_work() {
+    let ctx = test_ctx();
+    let state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        remote_principal(),
+        ctx.terminal_host.clone(),
+    );
+    let shared = state.shared_snapshot();
+    let request = Request::FsRead {
+        project_root: "/not-granted".to_string(),
+        path: "README.md".to_string(),
+        base64: false,
+    };
+
+    let err = handle_concurrent_request(request, shared, ctx)
+        .await
+        .expect_err("unauthorized request should fail before handler work");
+    assert_eq!(err.code, ErrorCode::Authorization);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7578,7 +7664,7 @@ fn command_table_metadata_is_exhaustive_and_stable() {
     }
 }
 
-fn overlay_value(state: &ClientState, key: &str) -> Option<String> {
+fn overlay_value(state: &MutableClientState, key: &str) -> Option<String> {
     state
         .attached
         .as_ref()
@@ -7604,7 +7690,7 @@ fn sample_png() -> Vec<u8> {
     out
 }
 
-fn begin_upload_for(state: &mut ClientState, png: &[u8]) -> Uuid {
+fn begin_upload_for(state: &mut MutableClientState, png: &[u8]) -> Uuid {
     match begin_attachment_upload(
         state,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
@@ -7620,7 +7706,7 @@ fn begin_upload_for(state: &mut ClientState, png: &[u8]) -> Uuid {
 }
 
 fn finish_attachment_upload_for_test(
-    state: &mut ClientState,
+    state: &mut MutableClientState,
     upload_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
     tokio::runtime::Builder::new_current_thread()
@@ -7630,7 +7716,7 @@ fn finish_attachment_upload_for_test(
         .block_on(finish_attachment_upload(state, upload_id))
 }
 
-fn finish_upload_for(state: &mut ClientState, png: &[u8]) -> proto::ImageAttachmentRef {
+fn finish_upload_for(state: &mut MutableClientState, png: &[u8]) -> proto::ImageAttachmentRef {
     let upload_id = begin_upload_for(state, png);
     let data_base64 = base64::engine::general_purpose::STANDARD.encode(png);
     upload_attachment_chunk(state, upload_id, 0, data_base64).unwrap();
@@ -8978,7 +9064,8 @@ async fn attach_replay_precedes_live_events_under_task_split() {
     ctx.registry.insert_test_worker(handle, join);
     assert!(ctx.shutdown.begin_drain());
 
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
+    let mut shared = state.shared_snapshot();
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (event_cmd_tx, mut event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let request_id = Uuid::new_v4();
@@ -8998,6 +9085,7 @@ async fn attach_replay_precedes_live_events_under_task_split() {
             },
         ),
         &mut state,
+        &mut shared,
         &ctx,
         &event_cmd_tx,
         &writer_tx,
@@ -9133,7 +9221,7 @@ async fn client_io_split_global_lag_still_emits_resync_error() {
 #[tokio::test]
 async fn delete_live_session_timeout_leaves_row_intact() {
     let ctx = test_ctx();
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let session = ctx.db.create_session("p", "/x", "Build").unwrap();
     insert_hung_worker(&ctx, session.session_id);
 
@@ -9164,7 +9252,7 @@ async fn delete_live_session_timeout_leaves_row_intact() {
 #[tokio::test]
 async fn archive_live_session_timeout_leaves_row_unarchived() {
     let ctx = test_ctx();
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let session = ctx.db.create_session("p", "/x", "Build").unwrap();
     insert_hung_worker(&ctx, session.session_id);
 
@@ -9195,7 +9283,7 @@ async fn archive_live_session_timeout_leaves_row_unarchived() {
 #[tokio::test]
 async fn discard_live_ephemeral_session_timeout_leaves_row_intact() {
     let ctx = test_ctx();
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let parent = ctx.db.create_session("p", "/x", "Build").unwrap();
     let side = ctx
         .db
@@ -9224,7 +9312,7 @@ async fn discard_live_ephemeral_session_timeout_leaves_row_intact() {
 #[tokio::test]
 async fn btw_create_rpc_returns_existing_fork_atomically() {
     let ctx = test_ctx();
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let parent = ctx.db.create_session("p", "/x", "Build").unwrap();
 
     let first = handle_request(
@@ -9283,7 +9371,7 @@ async fn btw_concurrent_with_parent_turn() {
     );
     let (parent_handle, mut parent_rx) =
         SessionWorkerHandle::test_handle_with_receiver(parent_session, ctx.registry.locks());
-    let mut parent_state = ClientState {
+    let mut parent_state = MutableClientState {
         principal: ClientPrincipal::owner(),
         attached: Some(AttachedSession {
             handle: parent_handle,
@@ -9329,7 +9417,7 @@ async fn btw_concurrent_with_parent_turn() {
     );
     let (btw_handle, mut btw_rx) =
         SessionWorkerHandle::test_handle_with_receiver(btw_session, ctx.registry.locks());
-    let mut btw_state = ClientState {
+    let mut btw_state = MutableClientState {
         principal: ClientPrincipal::owner(),
         attached: Some(AttachedSession {
             handle: btw_handle,
@@ -9399,7 +9487,7 @@ async fn btw_concurrent_with_parent_turn() {
 #[tokio::test]
 async fn btw_end_rpc_discards_fork() {
     let ctx = test_ctx();
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let parent = ctx.db.create_session("p", "/x", "Build").unwrap();
     let created = ctx.db.create_btw_fork(parent.session_id, false).unwrap();
 
@@ -9449,7 +9537,7 @@ async fn btw_rehydrate_reports_live_fork() {
     });
     ctx.registry.insert_test_worker(handle, join);
 
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let response = handle_request(
         Request::Attach {
             session_id: Some(parent.session_id),
@@ -9481,7 +9569,7 @@ async fn btw_rehydrate_reports_live_fork() {
 #[tokio::test]
 async fn cascaded_delete_timeout_stops_before_any_db_mutation() {
     let ctx = test_ctx();
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let root = ctx.db.create_session("p", "/x", "Build").unwrap();
     let child = ctx.db.create_fork(root.session_id, None).unwrap();
     insert_hung_worker(&ctx, child.session_id);
@@ -9541,7 +9629,7 @@ async fn second_stop_request_shortens_to_force() {
 #[tokio::test]
 async fn stop_daemon_grace_override_reaches_shutdown_context() {
     let ctx = test_ctx();
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
 
     let response = handle_request(
         Request::StopDaemon {
@@ -9567,7 +9655,7 @@ async fn stop_daemon_grace_override_reaches_shutdown_context() {
 #[tokio::test]
 async fn record_session_note_persists_event_without_inference() {
     let ctx = test_ctx();
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let s = ctx.db.create_session("p", "/x", "Build").unwrap();
 
     let resp = handle_request(
@@ -9607,7 +9695,7 @@ async fn record_session_note_persists_event_without_inference() {
 #[tokio::test]
 async fn record_session_note_unknown_session_errors() {
     let ctx = test_ctx();
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let err = handle_request(
         Request::RecordSessionNote {
             session_id: Uuid::new_v4(),
@@ -9626,7 +9714,7 @@ async fn record_session_note_unknown_session_errors() {
 #[tokio::test]
 async fn send_user_message_refused_while_draining() {
     let ctx = test_ctx();
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
 
     ctx.shutdown.begin_drain();
 
@@ -9718,7 +9806,8 @@ async fn attach_replays_drain_state_after_attached_response() {
     ctx.registry.insert_test_worker(handle, join);
     assert!(ctx.shutdown.begin_drain());
 
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
+    let mut shared = state.shared_snapshot();
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let request_id = Uuid::new_v4();
@@ -9738,6 +9827,7 @@ async fn attach_replays_drain_state_after_attached_response() {
             },
         ),
         &mut state,
+        &mut shared,
         &ctx,
         &event_cmd_tx,
         &writer_tx,
@@ -9818,7 +9908,7 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
     });
     ctx.registry.insert_test_worker(handle, join);
 
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let response = handle_request(
         Request::Attach {
             session_id: Some(session.session_id),
@@ -9880,7 +9970,7 @@ async fn attach_compatible_reflects_client_protocol_version() {
         )
         .unwrap();
 
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let response = handle_request(
         Request::Attach {
             session_id: None,
@@ -9903,7 +9993,7 @@ async fn attach_compatible_reflects_client_protocol_version() {
         other => panic!("expected Attached, got {other:?}"),
     }
 
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let response = handle_request(
         Request::Attach {
             session_id: None,
@@ -9972,7 +10062,7 @@ async fn attach_resolves_model_from_injected_config_source() {
         )
         .unwrap();
 
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let response = handle_request(
         Request::Attach {
             session_id: None,
@@ -10058,7 +10148,7 @@ async fn server_answers_too_new_request_with_protocol_version_error() {
 #[tokio::test]
 async fn attach_requires_db_workspace_trust_row() {
     let ctx = test_ctx();
-    let mut state = ClientState::detached_for_test();
+    let mut state = MutableClientState::detached_for_test();
     let tmp = tempfile::tempdir().unwrap();
 
     let err = handle_request(

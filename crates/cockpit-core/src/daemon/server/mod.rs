@@ -2090,7 +2090,7 @@ fn validate_peer_uid(peer_uid: libc::uid_t, daemon_uid: libc::uid_t) -> Result<(
 
 // ---- per-client state -----------------------------------------------------
 
-struct ClientState {
+struct MutableClientState {
     principal: ClientPrincipal,
     attached: Option<AttachedSession>,
     pending_replay: Vec<proto::Event>,
@@ -2102,7 +2102,41 @@ struct ClientState {
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
 }
 
-impl ClientState {
+/// Immutable client-state view published by the serialized executor.
+///
+/// Future concurrent handlers receive an `Arc` clone of this snapshot as it
+/// existed when their request was dequeued. If attach/detach happens later,
+/// the older snapshot remains valid for authorization and response scrubbing
+/// of that already-received request.
+#[derive(Clone)]
+pub(super) struct SharedClientState {
+    principal: ClientPrincipal,
+    #[allow(dead_code)]
+    upload_accounting: Arc<StdMutex<UploadAccounting>>,
+    #[allow(dead_code)]
+    terminal_host: crate::daemon::terminal::TerminalHostHandle,
+    attached: Option<SharedAttachedSession>,
+}
+
+#[derive(Clone)]
+pub(super) struct SharedAttachedSession {
+    session_id: Uuid,
+    project_root: PathBuf,
+    redaction_table: Arc<RedactionTable>,
+    active_tool_names: Vec<String>,
+}
+
+impl SharedAttachedSession {
+    pub(super) fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    pub(super) fn redaction_table(&self) -> Arc<RedactionTable> {
+        self.redaction_table.clone()
+    }
+}
+
+impl MutableClientState {
     fn detached_with_principal(
         upload_accounting: Arc<StdMutex<UploadAccounting>>,
         principal: ClientPrincipal,
@@ -2129,6 +2163,20 @@ impl ClientState {
             test_terminal_host(),
         )
     }
+
+    fn shared_snapshot(&self) -> Arc<SharedClientState> {
+        Arc::new(SharedClientState {
+            principal: self.principal.clone(),
+            upload_accounting: self.upload_accounting.clone(),
+            terminal_host: self.terminal_host.clone(),
+            attached: self.attached.as_ref().map(|att| SharedAttachedSession {
+                session_id: att.handle.session_id,
+                project_root: att.handle.project_root.clone(),
+                redaction_table: att.handle.redaction_table(),
+                active_tool_names: att.handle.active_tool_names(),
+            }),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2141,7 +2189,7 @@ fn test_terminal_host() -> crate::daemon::terminal::TerminalHostHandle {
     )
 }
 
-impl Drop for ClientState {
+impl Drop for MutableClientState {
     fn drop(&mut self) {
         release_uploads(
             &self.upload_accounting,
@@ -2337,11 +2385,12 @@ async fn run_in_process_client(
     event_tx: mpsc::Sender<proto::Event>,
 ) {
     let _client_guard = ctx.track_client();
-    let mut state = ClientState::detached_with_principal(
+    let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
         ctx.terminal_host.clone(),
     );
+    let mut shared = state.shared_snapshot();
     let mut global_rx = ctx.subscribe_global();
     let mut session_event_rx: Option<EventReceiver> = None;
 
@@ -2392,6 +2441,7 @@ async fn run_in_process_client(
                     }
                     Some(Err(broadcast::error::RecvError::Closed)) => {
                         state.attached = None;
+                        shared = state.shared_snapshot();
                         session_event_rx = None;
                     }
                     None => unreachable!("event_branch is pending when not attached"),
@@ -2403,8 +2453,18 @@ async fn run_in_process_client(
                 };
                 let is_attach = matches!(&request, Request::Attach { .. });
                 let mut effects = ClientRequestEffects::default();
-                let result = handle_request_with_effects(request, &mut state, &ctx, &mut effects).await;
+                let result = dispatch_request_inline(
+                    request,
+                    &mut state,
+                    &mut shared,
+                    &ctx,
+                    &mut effects,
+                )
+                .await;
                 let attached = matches!(&result, Ok(Response::Attached { .. }));
+                if (is_attach && attached) || state.attached.is_none() {
+                    shared = state.shared_snapshot();
+                }
                 let _ = reply.send(result);
                 if is_attach && attached {
                     for event in std::mem::take(&mut state.pending_replay) {
@@ -2766,20 +2826,31 @@ async fn run_client_executor(
     event_cmd_tx: mpsc::Sender<ClientEventCommand>,
     writer_tx: mpsc::Sender<ClientWriterMessage>,
 ) {
-    let mut state = ClientState::detached_with_principal(
+    let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal,
         ctx.terminal_host.clone(),
     );
+    let mut shared = state.shared_snapshot();
     while let Some(input) = executor_rx.recv().await {
         match input {
             ClientExecutorInput::Frame(frame) => {
-                if !handle_client_frame(frame, &mut state, &ctx, &event_cmd_tx, &writer_tx).await {
+                if !handle_client_frame(
+                    frame,
+                    &mut state,
+                    &mut shared,
+                    &ctx,
+                    &event_cmd_tx,
+                    &writer_tx,
+                )
+                .await
+                {
                     return;
                 }
             }
             ClientExecutorInput::SessionEventsClosed => {
                 state.attached = None;
+                shared = state.shared_snapshot();
             }
         }
     }
@@ -2787,15 +2858,18 @@ async fn run_client_executor(
 
 async fn handle_client_frame(
     frame: RecvFrame,
-    state: &mut ClientState,
+    state: &mut MutableClientState,
+    shared: &mut Arc<SharedClientState>,
     ctx: &Arc<DaemonContext>,
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
 ) -> bool {
     match frame {
-        RecvFrame::Envelope(env) => handle_envelope(*env, state, ctx, event_cmd_tx, writer_tx)
-            .await
-            .is_ok(),
+        RecvFrame::Envelope(env) => {
+            handle_envelope(*env, state, shared, ctx, event_cmd_tx, writer_tx)
+                .await
+                .is_ok()
+        }
         RecvFrame::VersionMismatch { v, kind, id } => {
             if kind == "req"
                 && let Some(id) = id
@@ -2821,9 +2895,27 @@ async fn handle_client_frame(
     }
 }
 
+async fn dispatch_request_inline(
+    request: Request,
+    state: &mut MutableClientState,
+    shared: &mut Arc<SharedClientState>,
+    ctx: &Arc<DaemonContext>,
+    effects: &mut ClientRequestEffects,
+) -> std::result::Result<Response, ErrorPayload> {
+    match principal::request_ordering(&request) {
+        principal::RequestOrdering::Serialized => {
+            self::dispatch::handle_serialized_request(request, state, shared, ctx, effects).await
+        }
+        principal::RequestOrdering::Concurrent => {
+            self::dispatch::handle_concurrent_request(request, shared.clone(), ctx.clone()).await
+        }
+    }
+}
+
 async fn handle_envelope(
     env: Envelope,
-    state: &mut ClientState,
+    state: &mut MutableClientState,
+    shared: &mut Arc<SharedClientState>,
     ctx: &Arc<DaemonContext>,
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
@@ -2832,14 +2924,17 @@ async fn handle_envelope(
         Body::Request { id, request } => {
             let is_attach = matches!(&request, Request::Attach { .. });
             let mut effects = ClientRequestEffects::default();
-            let result = handle_request_with_effects(request, state, ctx, &mut effects).await;
+            let result = dispatch_request_inline(request, state, shared, ctx, &mut effects).await;
             let attached = matches!(&result, Ok(Response::Attached { .. }));
+            if (is_attach && attached) || state.attached.is_none() {
+                *shared = state.shared_snapshot();
+            }
             let envelope = match result {
                 Ok(response) => {
-                    let response = if state.principal.is_owner() {
+                    let response = if shared.principal.is_owner() {
                         Some(response)
-                    } else if let Some(attached) = state.attached.as_ref() {
-                        scrub_proto_response(response, &attached.handle.redaction_table())
+                    } else if let Some(attached) = shared.attached.as_ref() {
+                        scrub_proto_response(response, &attached.redaction_table())
                     } else {
                         // Session-bearing responses without an attachment must
                         // scrub inside their request arm using the target
@@ -2883,9 +2978,7 @@ async fn handle_envelope(
             }
             if is_attach && attached {
                 for event in std::mem::take(&mut state.pending_replay) {
-                    let Some(event) =
-                        scrub_replay_event_for_principal(&state.principal, state, event)
-                    else {
+                    let Some(event) = scrub_replay_event_for_principal(shared, event) else {
                         continue;
                     };
                     if !send_writer_envelope(writer_tx, Envelope::event(event)).await {
@@ -2917,17 +3010,16 @@ async fn handle_envelope(
 }
 
 fn scrub_replay_event_for_principal(
-    principal: &ClientPrincipal,
-    state: &ClientState,
+    shared: &SharedClientState,
     event: proto::Event,
 ) -> Option<proto::Event> {
-    if principal.is_owner() {
+    if shared.principal.is_owner() {
         return Some(event);
     }
-    let Some(attached) = state.attached.as_ref() else {
+    let Some(attached) = shared.attached.as_ref() else {
         return Some(event);
     };
-    scrub_proto_event(event, &attached.handle.redaction_table())
+    scrub_proto_event(event, &attached.redaction_table())
 }
 
 fn envelope_kind(envelope: &Envelope) -> &'static str {
@@ -2975,8 +3067,6 @@ mod dispatch;
 mod sessions;
 #[cfg(test)]
 mod tests;
-
-use self::dispatch::handle_request_with_effects;
 
 pub use attachments::validate_png_attachment_blocking;
 pub use dispatch::request_shutdown;

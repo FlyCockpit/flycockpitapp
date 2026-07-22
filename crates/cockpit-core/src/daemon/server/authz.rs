@@ -52,7 +52,7 @@ pub(super) fn session_access_for_summary(
 
 pub(super) fn attached_session_access(
     principal: &ClientPrincipal,
-    state: &ClientState,
+    state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<SessionAccess, ErrorPayload> {
     if principal.is_owner() {
@@ -77,7 +77,7 @@ pub(super) fn attached_session_access(
 
 pub(super) fn require_remote_session_writer(
     principal: &ClientPrincipal,
-    state: &ClientState,
+    state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     match attached_session_access(principal, state, ctx)? {
@@ -88,6 +88,48 @@ pub(super) fn require_remote_session_writer(
         SessionAccess::None => Err(authorization_error(
             "remote principal cannot access this session",
         )),
+    }
+}
+
+pub(super) fn require_remote_shared_session_writer(
+    principal: &ClientPrincipal,
+    shared: &SharedClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    if principal.is_owner() {
+        return Ok(());
+    }
+    let Some(att) = shared.attached.as_ref() else {
+        return Err(ErrorPayload {
+            code: ErrorCode::NotAttached,
+            message: "client has not attached to a session".into(),
+        });
+    };
+    match ctx.db.get_session(att.session_id()) {
+        Ok(Some(row)) => match session_access_for_row(principal, &row) {
+            SessionAccess::Owner | SessionAccess::Writer => Ok(()),
+            SessionAccess::Readonly => Err(read_only_error(
+                "remote principal has read-only access to this session",
+            )),
+            SessionAccess::None => Err(authorization_error(
+                "remote principal cannot access this session",
+            )),
+        },
+        Ok(None) => {
+            let project_root = att.project_root.to_string_lossy();
+            if principal.can_agent_write_project(&project_root) {
+                Ok(())
+            } else if principal.can_agent_read_project(&project_root) {
+                Err(read_only_error(
+                    "remote principal has read-only access to this session",
+                ))
+            } else {
+                Err(authorization_error(
+                    "remote principal cannot access this session",
+                ))
+            }
+        }
+        Err(e) => Err(internal(e)),
     }
 }
 
@@ -138,7 +180,7 @@ macro_rules! command_request_session_id_match {
 }
 
 #[allow(unused_variables)]
-pub(super) fn request_session_id(request: &Request, state: &ClientState) -> Option<Uuid> {
+pub(super) fn request_session_id(request: &Request, state: &MutableClientState) -> Option<Uuid> {
     proto::command!(command_request_session_id_match, request, state)
 }
 
@@ -205,7 +247,7 @@ pub(super) fn audit_remote_request(
 
 pub(super) fn authorize_attach(
     request: &Request,
-    state: &ClientState,
+    state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &state.principal;
@@ -248,7 +290,7 @@ pub(super) fn authorize_attach(
 
 pub(super) fn authorize_subagent_transcript(
     request: &Request,
-    state: &ClientState,
+    state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &state.principal;
@@ -273,7 +315,7 @@ pub(super) fn authorize_subagent_transcript(
 
 pub(super) fn authorize_read_session_messages(
     request: &Request,
-    state: &ClientState,
+    state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &state.principal;
@@ -298,7 +340,7 @@ pub(super) fn authorize_read_session_messages(
 
 pub(super) fn authorize_begin_attachment_upload(
     request: &Request,
-    state: &ClientState,
+    state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &state.principal;
@@ -323,7 +365,7 @@ pub(super) fn authorize_begin_attachment_upload(
 
 pub(super) fn authorize_attachment_upload_step(
     request: &Request,
-    state: &ClientState,
+    state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &state.principal;
@@ -354,7 +396,7 @@ pub(super) fn authorize_attachment_upload_step(
 
 pub(super) fn authorize_steer_delegation(
     request: &Request,
-    state: &ClientState,
+    state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let Request::SteerDelegation { session_id, .. } = request else {
@@ -365,7 +407,7 @@ pub(super) fn authorize_steer_delegation(
 
 pub(super) fn authorize_lsp_control(
     request: &Request,
-    state: &ClientState,
+    state: &MutableClientState,
     _ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &state.principal;
@@ -378,6 +420,98 @@ pub(super) fn authorize_lsp_control(
         Err(authorization_error(
             "remote principal cannot control project language servers",
         ))
+    }
+}
+
+pub(super) fn authorize_shared_custom(
+    request: &Request,
+    shared: &SharedClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let principal = &shared.principal;
+    match request {
+        Request::Attach {
+            session_id,
+            project_root,
+            ..
+        } => {
+            if let Some(session_id) = session_id {
+                match ctx.db.get_session(*session_id) {
+                    Ok(Some(row)) => match session_access_for_row(principal, &row) {
+                        SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => {
+                            Ok(())
+                        }
+                        SessionAccess::None => Err(authorization_error(
+                            "remote principal cannot access this session",
+                        )),
+                    },
+                    Ok(None) => Err(ErrorPayload {
+                        code: ErrorCode::UnknownSession,
+                        message: format!("unknown session {session_id}"),
+                    }),
+                    Err(e) => Err(internal(e)),
+                }
+            } else if let Some(project_root) = project_root {
+                if principal.can_agent_read_project(project_root) {
+                    Ok(())
+                } else {
+                    Err(authorization_error(
+                        "remote principal cannot create sessions for this project",
+                    ))
+                }
+            } else {
+                Ok(())
+            }
+        }
+        Request::SubagentTranscript { session_id, .. }
+        | Request::ReadSessionMessages { session_id, .. } => {
+            match ctx.db.get_session(*session_id) {
+                Ok(Some(row)) => match session_access_for_row(principal, &row) {
+                    SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => {
+                        Ok(())
+                    }
+                    SessionAccess::None => Err(authorization_error(
+                        "remote principal cannot access this session",
+                    )),
+                },
+                Ok(None) => Err(ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: format!("unknown session {session_id}"),
+                }),
+                Err(e) => Err(internal(e)),
+            }
+        }
+        Request::BeginAttachmentUpload { purpose, .. } => {
+            if matches!(purpose, proto::AttachmentPurpose::TerminalPasteImage { .. }) {
+                if principal.has_terminal() {
+                    Ok(())
+                } else {
+                    Err(authorization_error(
+                        "remote principal cannot paste into terminals",
+                    ))
+                }
+            } else {
+                require_remote_shared_session_writer(principal, shared, ctx)
+            }
+        }
+        Request::UploadAttachmentChunk { .. }
+        | Request::FinishAttachmentUpload { .. }
+        | Request::CancelAttachmentUpload { .. } => {
+            require_remote_shared_session_writer(principal, shared, ctx)
+        }
+        Request::SteerDelegation { session_id, .. } => {
+            require_remote_target_session_writer(principal, ctx, *session_id)
+        }
+        Request::LspControl { project_root, .. } => {
+            if principal.has_terminal() && principal.can_agent_read_project(project_root) {
+                Ok(())
+            } else {
+                Err(authorization_error(
+                    "remote principal cannot control project language servers",
+                ))
+            }
+        }
+        _ => unreachable!("authorize_shared_custom called for non-custom command"),
     }
 }
 
@@ -485,7 +619,7 @@ macro_rules! command_authorize_request_match {
 #[allow(unused_variables)]
 pub(super) fn authorize_request(
     request: &Request,
-    state: &ClientState,
+    state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &state.principal;
@@ -497,6 +631,84 @@ pub(super) fn authorize_request(
         command_authorize_request_match,
         request,
         state,
+        ctx,
+        principal
+    )
+}
+
+macro_rules! command_authorize_shared_value {
+    ($principal:expr, $shared:expr, $ctx:expr, $request:expr, owner_only) => {
+        Err(authorization_error("request requires the local owner"))
+    };
+    ($principal:expr, $shared:expr, $ctx:expr, $request:expr, public_read) => {
+        Ok(())
+    };
+    ($principal:expr, $shared:expr, $ctx:expr, $request:expr, session_writer) => {
+        require_remote_shared_session_writer($principal, $shared, $ctx)
+    };
+    ($principal:expr, $shared:expr, $ctx:expr, $request:expr, terminal) => {{
+        if $principal.has_terminal() {
+            Ok(())
+        } else {
+            Err(authorization_error(
+                "remote principal cannot access terminals",
+            ))
+        }
+    }};
+    ($principal:expr, $shared:expr, $ctx:expr, $request:expr, project_files($project_root:ident)) => {{
+        if $principal.has_project_files($project_root) {
+            Ok(())
+        } else {
+            Err(authorization_error(
+                "remote principal cannot access project files for this project",
+            ))
+        }
+    }};
+    ($principal:expr, $shared:expr, $ctx:expr, $request:expr, project_read($project_root:ident)) => {{
+        if $principal.can_agent_read_project($project_root)
+            || $principal.has_project_files($project_root)
+        {
+            Ok(())
+        } else {
+            Err(authorization_error(
+                "remote principal cannot read this project",
+            ))
+        }
+    }};
+    ($principal:expr, $shared:expr, $ctx:expr, $request:expr, session_row_writer($session_id:ident)) => {
+        authorize_session_row_writer($principal, $ctx, *$session_id)
+    };
+    ($principal:expr, $shared:expr, $ctx:expr, $request:expr, session_row_reader($session_id:ident)) => {
+        authorize_session_row_reader($principal, $ctx, *$session_id)
+    };
+    ($principal:expr, $shared:expr, $ctx:expr, $request:expr, custom($handler:ident)) => {
+        authorize_shared_custom($request, $shared, $ctx)
+    };
+}
+
+macro_rules! command_authorize_shared_request_match {
+    (($request:ident, $shared:ident, $ctx:ident, $principal:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        match $request {
+            $($pattern => command_authorize_shared_value!($principal, $shared, $ctx, $request, $authz $(($authz_arg))?),)+
+        }
+    }};
+}
+
+#[allow(unused_variables)]
+pub(super) fn authorize_request_shared(
+    request: &Request,
+    shared: &SharedClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let principal = &shared.principal;
+    if principal.is_owner() {
+        return Ok(());
+    }
+
+    proto::command!(
+        command_authorize_shared_request_match,
+        request,
+        shared,
         ctx,
         principal
     )

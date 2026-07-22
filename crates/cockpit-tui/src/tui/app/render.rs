@@ -4396,6 +4396,10 @@ mod render_history_spacing_tests {
         render_call_count as markdown_render_call_count,
         reset_render_counters as reset_markdown_counters,
     };
+    use crate::tui::read_highlight::{
+        clear_highlight_caches, grammar_build_count, highlight_run_count, highlight_test_lock,
+        reset_highlight_counters,
+    };
     use crate::tui::theme::TRANSCRIPT_HOVER_BG;
     use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
     use cockpit_core::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
@@ -4493,6 +4497,36 @@ mod render_history_spacing_tests {
             view_offset: 0,
             follow: true,
         }
+    }
+
+    fn expanded_read_tool_box(output: &str) -> HistoryEntry {
+        HistoryEntry::ToolBox {
+            calls: vec![ToolCall {
+                call_id: "call-1".to_string(),
+                tool: "read".to_string(),
+                summary: "src/main.rs".to_string(),
+                full_input: "src/main.rs".to_string(),
+                output: output.to_string(),
+                expanded: true,
+                result_offset: 0,
+                state: ToolCallState::Success,
+                hint: None,
+                mcp_child: None,
+            }],
+            view_offset: 0,
+            follow: true,
+        }
+    }
+
+    fn long_read_output(line_count: usize) -> String {
+        let mut output = String::from("1|fn generated_fixture() {\n");
+        for line in 2..line_count {
+            output.push_str(&format!(
+                "{line}|    let value_{line} = \"scroll {line}\"; // line {line}\n"
+            ));
+        }
+        output.push_str(&format!("{line_count}|}}\n"));
+        output
     }
 
     fn diff_entry(path: &str) -> HistoryEntry {
@@ -5112,6 +5146,33 @@ mod render_history_spacing_tests {
             1,
             "elided tool-call state should invalidate the affected toolbox row"
         );
+    }
+
+    #[test]
+    fn tool_result_scroll_does_not_recompile_grammar() {
+        let _guard = highlight_test_lock();
+        clear_highlight_caches();
+        reset_highlight_counters();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = vec![expanded_read_tool_box(&long_read_output(80))];
+        app.history_render_versions = vec![0; app.history.len()];
+        app.history_render_fingerprints = vec![0; app.history.len()];
+
+        render_history_no_selection(&mut app, 100, 40);
+        for offset in 1..=20 {
+            let HistoryEntry::ToolBox { calls, .. } = &mut app.history[0] else {
+                panic!("expected toolbox");
+            };
+            calls[0].result_offset = offset;
+            render_history_no_selection(&mut app, 100, 40);
+        }
+
+        assert_eq!(grammar_build_count(), 1);
+        assert_eq!(highlight_run_count(), 1);
     }
 
     #[test]

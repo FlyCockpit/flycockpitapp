@@ -393,10 +393,12 @@ fn with_tiered_recall_tools(
     args: &SpawnArgs,
     def: &crate::agents::AgentDef,
     is_assistant: bool,
+    grant: &[String],
 ) -> Result<ToolBox> {
     if !args.interactive {
         return Ok(tb);
     }
+    let grant_has_mcp = grant.iter().any(|tool| tool == "mcp");
     for name in [
         "session_search",
         "session_read",
@@ -406,6 +408,13 @@ fn with_tiered_recall_tools(
         "get_goal",
         "update_goal",
     ] {
+        if is_assistant
+            && !grant_has_mcp
+            && !grant.iter().any(|tool| tool == name)
+            && default_assistant_discoverable_tools().contains(&name)
+        {
+            continue;
+        }
         tb = match effective_tool_tier(def, name, is_assistant) {
             crate::agents::ToolTier::Builtin => add_tool_by_name(tb, name, def, args)?,
             crate::agents::ToolTier::Discoverable => {
@@ -1371,6 +1380,19 @@ fn add_discoverable_tool_by_name(
     Ok(tb.with_discoverable_mcp(tool))
 }
 
+fn validate_discoverable_mcp_reachable(def: &crate::agents::AgentDef, tb: &ToolBox) -> Result<()> {
+    let discoverable = tb.discoverable_mcp_tool_names();
+    if discoverable.is_empty() || tb.names().contains(&"mcp") {
+        return Ok(());
+    }
+
+    bail!(
+        "agent `{}` has discoverable MCP tools [{}] but does not grant `mcp`, so they are unreachable; grant `mcp` or tier them `builtin`",
+        def.name,
+        discoverable.join(", ")
+    );
+}
+
 /// Build an agent by name. Resolution order (overlay model, prompt
 /// `user-definable-agents.md`):
 ///   1. An on-disk override / custom agent ([`crate::agents::resolve`])
@@ -1667,7 +1689,7 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
     }
     if !is_internal_agent_def_name(&def.name) {
         // Cross-session recall tools, gated on interactive spawn.
-        tb = with_tiered_recall_tools(tb, args, def, is_assistant)?;
+        tb = with_tiered_recall_tools(tb, args, def, is_assistant, &grant)?;
         // `seed` (GOALS §3c): a custom read-only noninteractive subagent in
         // normal mode may emit seeds to its caller. The helper re-checks the
         // (now-built) tool surface for write/lock tools, so only a genuinely
@@ -1683,6 +1705,7 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
             tb = with_return_tool(tb, &def.name);
         }
     }
+    validate_discoverable_mcp_reachable(def, &tb)?;
     // Per-agent tool-description overrides (prompt
     // `per-agent-tool-definitions.md`): re-word a granted tool's description
     // for this markdown agent. Applied last so it lands on whatever tool of
@@ -1747,6 +1770,7 @@ fn default_assistant_tools() -> Vec<String> {
     let mut tools = default_custom_tools();
     tools.extend(
         [
+            "mcp",
             "session_search",
             "session_read",
             "create_goal",
@@ -2770,6 +2794,7 @@ mod tests {
                 "read".to_string(),
                 "word".to_string(),
                 "search".to_string(),
+                "mcp".to_string(),
             ]),
             tool_tiers,
             tool_descriptions: std::collections::BTreeMap::new(),
@@ -2981,6 +3006,7 @@ mod tests {
         let agent = agent_from_def(&def, &args).unwrap();
         let names = agent.tools.names();
         assert!(names.contains(&"skill_manage"), "{names:?}");
+        assert!(names.contains(&"mcp"), "{names:?}");
         let host = host_for_agent(&agent, tmp.path());
         for tool in [
             "session_search",
@@ -2995,6 +3021,102 @@ mod tests {
             );
             assert!(crate::mcp::builtin::describe(&host, tool).is_ok());
         }
+    }
+
+    #[test]
+    fn assistant_discoverable_recall_tools_are_reachable_via_mcp() {
+        use crate::agents::{AgentDef, AgentMode};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.assistant_identity_prefix = Some("assistant identity".to_string());
+        let def = AgentDef {
+            name: "helper".to_string(),
+            description: "assistant".to_string(),
+            mode: AgentMode::Primary,
+            model: None,
+            temperature: None,
+            tools: None,
+            tool_tiers: std::collections::BTreeMap::new(),
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: Some(true),
+            permission: None,
+            prompt: "body".to_string(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: tmp.path().join("helper.md"),
+        };
+
+        let agent = agent_from_def(&def, &args).unwrap();
+        let names = agent.tools.names();
+        let discoverable = agent.tools.discoverable_mcp_tool_names();
+
+        assert!(names.contains(&"mcp"), "{names:?}");
+        assert!(
+            !discoverable.is_empty() && names.contains(&"mcp"),
+            "discoverable tools {discoverable:?} must be reachable through `mcp`"
+        );
+        for tool in [
+            "session_search",
+            "session_read",
+            "create_goal",
+            "get_goal",
+            "update_goal",
+        ] {
+            assert!(
+                discoverable.iter().any(|name| name == tool),
+                "{tool} should be discoverable through monty: {discoverable:?}"
+            );
+            assert!(
+                !names.contains(&tool),
+                "{tool} should not be directly injected: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_explicit_grant_without_mcp_is_rejected_at_spawn() {
+        use crate::agents::{AgentDef, AgentMode};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        args.assistant_identity_prefix = Some("assistant identity".to_string());
+        let mut def = AgentDef {
+            name: "helper".to_string(),
+            description: "assistant".to_string(),
+            mode: AgentMode::Primary,
+            model: None,
+            temperature: None,
+            tools: Some(vec!["session_search".to_string(), "read".to_string()]),
+            tool_tiers: std::collections::BTreeMap::new(),
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: Some(true),
+            permission: None,
+            prompt: "body".to_string(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: tmp.path().join("helper.md"),
+        };
+
+        let err = match agent_from_def(&def, &args) {
+            Ok(_) => panic!("assistant explicit grant without mcp unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("session_search"), "{msg}");
+        assert!(msg.contains("mcp"), "{msg}");
+
+        def.tools = Some(vec!["read".to_string()]);
+        let no_discoverable = agent_from_def(&def, &args).unwrap();
+        assert!(
+            no_discoverable
+                .tools
+                .discoverable_mcp_tool_names()
+                .is_empty()
+        );
+
+        def.tools = Some(vec![
+            "session_search".to_string(),
+            "read".to_string(),
+            "mcp".to_string(),
+        ]);
+        agent_from_def(&def, &args).unwrap();
     }
 
     #[test]
@@ -3040,7 +3162,11 @@ mod tests {
             mode: AgentMode::Primary,
             model: None,
             temperature: None,
-            tools: Some(vec!["read".to_string(), "word".to_string()]),
+            tools: Some(vec![
+                "read".to_string(),
+                "word".to_string(),
+                "mcp".to_string(),
+            ]),
             tool_tiers,
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: Some(true),
@@ -4676,7 +4802,11 @@ mod tests {
             mode: AgentMode::Primary,
             model: None,
             temperature: None,
-            tools: Some(vec!["read".to_string(), "bash".to_string()]),
+            tools: Some(vec![
+                "read".to_string(),
+                "bash".to_string(),
+                "mcp".to_string(),
+            ]),
             tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions,
             scan_tool_results: Some(true),

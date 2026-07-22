@@ -10,13 +10,13 @@ impl App {
         }
         // Experimental-mode gate (implementation note):
         // with the flag off, a swap that targets a gated builtin
-        // (`Auto`/`Plan`/`Swarm`/`Build`) is rejected with a one-line
+        // (`Auto`/`Swarm`) is rejected with a one-line
         // history message and does NOT swap. Routed through the same
         // `is_experimental_primary` predicate the hiding uses (no duplicated
         // name list). This is the single chokepoint every swap route
         // (`/plan`/`/swarm`/`/build`, `/agent <gated>`, `Shift+Tab`)
         // passes through; the gated names are already hidden from the cycle /
-        // `/agent` list, so this guards a direct `/plan`-style invocation.
+        // `/agent` list, so this guards a direct `/swarm`-style invocation.
         if cockpit_core::agents::is_experimental_primary(name)
             && !self.config_snapshot.extended.experimental_mode
         {

@@ -936,9 +936,8 @@ fn behavior_default_agent_row_cycles_and_persists() {
     let mut d = fresh_dialog(&tmp);
     assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Auto);
     open_category_on(&mut d, Category::Behavior, SettingId::DefaultPrimaryAgent);
-    // Experimental on so the full Auto→Build→Plan cycle is reachable (the
-    // gate constraint is exercised by the off-mode test below). Set after
-    // entering the category, since `enter_category` reloads `extended`
+    // Experimental on so the full Auto→Build→Plan cycle is reachable. Set
+    // after entering the category, since `enter_category` reloads `extended`
     // from disk.
     d.extended.experimental_mode = true;
     d.handle_key(press(KeyCode::Enter));
@@ -953,9 +952,9 @@ fn behavior_default_agent_row_cycles_and_persists() {
 
 /// Experimental-mode gate (implementation note): the
 /// `ExperimentalMode` toggle flips + persists, and while it is off the
-/// `DefaultPrimaryAgent` cycle never lands on a gated agent.
+/// `DefaultPrimaryAgent` cycle skips Auto but still reaches Plan.
 #[test]
-fn behavior_experimental_mode_toggle_and_gated_default_cycle() {
+fn plan_default_settings_cycle_includes_plan() {
     use cockpit_config::extended::{DefaultPrimaryAgent, ExtendedConfigDoc};
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -969,25 +968,23 @@ fn behavior_experimental_mode_toggle_and_gated_default_cycle() {
     let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
     assert!(reloaded.experimental_mode);
 
-    // While on, pin the default to a gated agent (Plan), then toggle
-    // experimental back off: the toggle pins the default to Build so it
-    // never points at a now-hidden gated agent.
+    // While on, pin the default to Plan, then toggle experimental back off:
+    // Plan stays valid because it is no longer experimental.
     d.extended.default_primary_agent = DefaultPrimaryAgent::Plan;
     d.handle_key(press(KeyCode::Enter)); // experimental → off
     assert!(!d.extended.experimental_mode);
-    assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Build);
+    assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Plan);
 
-    // With experimental off, cycling the default agent never lands on a
-    // gated value — it stays on Build.
+    // With experimental off, cycling skips Auto and alternates between Build
+    // and Plan.
     open_category_on(&mut d, Category::Behavior, SettingId::DefaultPrimaryAgent);
-    for _ in 0..4 {
-        d.handle_key(press(KeyCode::Enter));
-        assert_eq!(
-            d.extended.default_primary_agent,
-            DefaultPrimaryAgent::Build,
-            "cycle must stay on the only enabled value while experimental off"
-        );
-    }
+    d.extended.default_primary_agent = DefaultPrimaryAgent::Auto;
+    d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Build);
+    d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Plan);
+    d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Build);
 }
 
 #[test]

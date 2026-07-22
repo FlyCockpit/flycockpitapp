@@ -420,8 +420,7 @@ impl AgentMode {
 }
 
 /// The chat-owning (primary) agents in their canonical cycle / listing
-/// order: the five builtins first (`Auto`, `Plan`, `Build`, `Swarm`,
-/// `Plan`), then every
+/// order: the four builtins first (`Auto`, `Plan`, `Build`, `Swarm`), then every
 /// user-defined chat-ownable agent (mode `primary` or `all`, excluding the
 /// builtins) in alphabetical order by name. Drives both the `/agent` valid-
 /// choices list and the `Shift+Tab` cycle (`agent-switch-command-
@@ -438,8 +437,8 @@ pub fn chat_ownable_primaries(cwd: &Path) -> Vec<String> {
 
 /// [`chat_ownable_primaries`] with the experimental flag supplied directly
 /// (the production entry reads it via `load_for_cwd`). With `experimental`
-/// off the gated builtins (`Auto`/`Plan`/`Swarm`) are fully
-/// hidden — only `Build` (and user customs) remains; this one filter
+/// off the gated builtins (`Auto`/`Swarm`) are fully
+/// hidden — only `Plan`, `Build`, and user customs remain; this one filter
 /// cascades to every consumer of the chat-ownable list.
 fn chat_ownable_primaries_with(cwd: &Path, experimental: bool) -> Vec<String> {
     // Builtins first, in the prompt-specified cycle order — note this is

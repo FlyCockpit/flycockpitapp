@@ -8758,6 +8758,20 @@ fn set_agent_allows_swarm_when_experimental_mode_on() {
 }
 
 #[test]
+fn plan_default_available_everywhere_when_experimental_off_daemon_set_agent() {
+    let ownable = vec!["Plan".to_string(), "Build".to_string()];
+
+    validate_set_agent_name("Plan", false, &ownable)
+        .expect("Plan is allowed when experimental mode is disabled");
+    let err = validate_set_agent_name("Auto", false, &ownable)
+        .expect_err("Auto remains gated when experimental mode is disabled");
+    assert!(err.message.contains("requires experimental mode"));
+    let err = validate_set_agent_name("Swarm", false, &ownable)
+        .expect_err("Swarm remains gated when experimental mode is disabled");
+    assert!(err.message.contains("requires experimental mode"));
+}
+
+#[test]
 fn set_agent_allows_build_when_experimental_mode_off() {
     let ownable = vec!["Build".to_string()];
 
@@ -8783,10 +8797,12 @@ async fn list_agents_returns_chat_ownable_primaries() {
             .iter()
             .map(|agent| agent.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["Build"]
+        vec!["Plan", "Build"]
     );
-    assert!(agents[0].builtin);
-    assert_eq!(agents[0].mode, "primary");
+    for agent in &agents {
+        assert!(agent.builtin);
+        assert_eq!(agent.mode, "primary");
+    }
 }
 
 #[tokio::test]

@@ -255,7 +255,7 @@ pub(crate) fn initial_active_agent(cfg: &crate::config::extended::ExtendedConfig
     let configured = cfg.default_primary_agent.agent_name();
     // Experimental-mode gate (implementation note): with
     // the flag off, a configured default that points at a gated builtin
-    // (`Auto`/`Plan`/…) silently falls back to `Build`. Returning `&'static
+    // (`Auto`/`Swarm`/…) silently falls back to `Build`. Returning `&'static
     // str` keeps the existing signature: both the configured names and the
     // fallback are statics, so resolve to the canonical static rather than a
     // heap string.

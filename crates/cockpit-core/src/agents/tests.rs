@@ -835,6 +835,26 @@ fn scout_and_multireview_builtin_surfaces_are_read_only() {
 }
 
 #[test]
+fn plan_default_not_experimental() {
+    assert!(!is_experimental_primary("Plan"));
+    assert!(is_experimental_primary("Auto"));
+    assert!(is_experimental_primary("Swarm"));
+}
+
+#[test]
+fn plan_default_available_everywhere_when_experimental_off_agents() {
+    let tmp = tempfile::tempdir().unwrap();
+    project_agents_dir(tmp.path());
+
+    let order = chat_ownable_primaries_with(tmp.path(), false);
+    assert_eq!(order, vec!["Plan", "Build"]);
+    assert_eq!(resolve_primary_for_flag("Plan", false), "Plan");
+    assert_eq!(resolve_primary_for_flag("Build", false), "Build");
+    assert_eq!(resolve_primary_for_flag("Auto", false), "Build");
+    assert_eq!(resolve_primary_for_flag("Swarm", false), "Build");
+}
+
+#[test]
 fn next_primary_in_cycle_wraps_builtins_only() {
     let order: Vec<String> = vec!["Auto".into(), "Plan".into(), "Build".into()];
     assert_eq!(next_primary_in_cycle("Auto", &order), "Plan");

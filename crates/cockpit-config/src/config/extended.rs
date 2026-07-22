@@ -458,7 +458,7 @@ pub struct ExtendedConfig {
 
     /// Experimental-mode gate (implementation note). A
     /// single reusable flag segmenting not-yet-stable features. Off by
-    /// default. Its first use gates the `Auto`/`Plan`/`Swarm`/`Build`
+    /// default. Its first use gates the `Auto`/`Swarm`
     /// builtin primaries (see [`crate::agents::is_experimental_primary`]):
     /// with this off they are fully hidden from the cycle / `/agent` list /
     /// slash swaps and the active primary falls back to `Build`. `/settings`

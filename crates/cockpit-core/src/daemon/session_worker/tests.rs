@@ -743,10 +743,12 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
 #[test]
 fn initial_active_agent_gates_default_to_build_when_off() {
     use crate::config::extended::DefaultPrimaryAgent as D;
-    // Off: a gated configured default (Auto/Plan) resolves to Build.
+    // Off: a gated configured default (Auto) resolves to Build, while Plan
+    // is available by default.
     assert_eq!(initial_active_agent(&cfg_with(D::Auto, false)), "Build");
-    assert_eq!(initial_active_agent(&cfg_with(D::Plan, false)), "Build");
-    // Off: Build is honored (not gated).
+    assert_eq!(initial_active_agent(&cfg_with(D::Plan, false)), "Plan");
+    // Off: Build is honored (not gated). Since the enum default is Auto, this
+    // keeps new sessions on Build while experimental mode is off.
     assert_eq!(initial_active_agent(&cfg_with(D::Build, false)), "Build");
     // On: the configured default is honored.
     assert_eq!(initial_active_agent(&cfg_with(D::Auto, true)), "Auto");
@@ -769,19 +771,22 @@ fn seed_tool_drain_failure_warns_with_session_id_without_payload() {
 }
 
 #[test]
-fn resolve_root_agent_stale_gated_session_falls_back_to_build() {
+fn plan_default_stale_session_keeps_plan() {
     use crate::config::extended::DefaultPrimaryAgent as D;
     let db = crate::db::Db::open_in_memory().unwrap();
-    // A session persisted on a gated primary (`Plan`), experimental off →
-    // loads on `Build`. (`Swarm` is not resume-eligible per
-    // the active-agent filter, so they degrade via the default path —
-    // also `Build` when off.)
+    // A session persisted on Plan loads on Plan with experimental off. Swarm is
+    // still gated, so it continues to fall back through the shared predicate.
     let row = db.create_session("proj", "/proj", "Plan").unwrap();
     assert_eq!(
         resolve_root_agent(row.session_id, &db, &cfg_with(D::Auto, false)),
+        "Plan"
+    );
+    let swarm = db.create_session("proj", "/proj", "Swarm").unwrap();
+    assert_eq!(
+        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Auto, false)),
         "Build"
     );
-    // Same persisted session, experimental on → the stored value stands.
+    // Same persisted Plan session, experimental on → the stored value stands.
     assert_eq!(
         resolve_root_agent(row.session_id, &db, &cfg_with(D::Auto, true)),
         "Plan"

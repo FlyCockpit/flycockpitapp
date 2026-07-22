@@ -728,8 +728,8 @@ impl SettingId {
                  session."
             }
             SettingId::ExperimentalMode => {
-                "Enable not-yet-stable features and agents (Auto, Plan, Swarm, \
-                 Build). Off by default. While off, those agents are hidden \
+                "Enable not-yet-stable features and agents (Auto, Swarm). \
+                 Off by default. While off, those agents are hidden \
                  from the cycle, /agent list, and slash swaps, and a new session \
                  starts on Build."
             }
@@ -1725,18 +1725,11 @@ impl SettingsCx {
             ),
             S::ExperimentalMode => on_off(
                 e.experimental_mode,
-                "on (Auto, Plan, Swarm, Build available)",
-                "off (default — experimental agents hidden)",
+                "on (Auto and Swarm available)",
+                "off (default — Auto and Swarm hidden)",
             ),
             S::DefaultPrimaryAgent => {
-                // With experimental off the only enabled default is `Build`;
-                // the cycle is pinned there (see `cycle_category_setting`), so
-                // show that as the sole option rather than a stale gated value.
-                if e.experimental_mode {
-                    default_primary_agent_label(e.default_primary_agent).to_string()
-                } else {
-                    default_primary_agent_label(DefaultPrimaryAgent::Build).to_string()
-                }
+                default_primary_agent_label(e.default_primary_agent).to_string()
             }
             S::LlmMode => llm_mode_label(e.llm_mode).to_string(),
             S::ApprovalMode => approval_mode_label(e.default_approval_mode).to_string(),
@@ -2436,9 +2429,9 @@ impl SettingsCx {
             S::AttentionDesktop => e.tui.attention.desktop = !e.tui.attention.desktop,
             S::ExperimentalMode => {
                 e.experimental_mode = !e.experimental_mode;
-                // Turning experimental off pins the default agent to the only
-                // enabled value (`Build`) so the stored `defaultPrimaryAgent`
-                // never points at a now-hidden gated agent.
+                // Turning experimental off rewrites only values that are still
+                // gated, so `Plan` remains a valid default while `Auto` falls
+                // back to `Build`.
                 if !e.experimental_mode
                     && cockpit_core::agents::is_experimental_primary(
                         e.default_primary_agent.agent_name(),
@@ -2449,11 +2442,8 @@ impl SettingsCx {
             }
             S::DefaultPrimaryAgent => {
                 // Cycle only among ENABLED values. With experimental off the
-                // sole valid default is `Build`, so the cycle stays put;
-                // routed through the shared `is_experimental_primary` predicate
-                // (no duplicated gated-name list). With it on, cycle the full
-                // `Auto→Build→Plan` set, skipping any value still gated (none
-                // are when on).
+                // `Auto→Build→Plan` enum cycle skips any value still gated
+                // (`Auto` today); with it on, all enum values are reachable.
                 let mut next = e.default_primary_agent.cycled();
                 if !e.experimental_mode {
                     while cockpit_core::agents::is_experimental_primary(next.agent_name()) {

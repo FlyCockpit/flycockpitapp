@@ -42,12 +42,12 @@ pub fn is_builtin_agent(name: &str) -> bool {
 }
 
 /// The builtin primaries gated behind experimental mode
-/// (implementation note): `Auto`, `Plan`, and `Swarm`. The single source of truth for the gated-name set — every
+/// (implementation note): `Auto` and `Swarm`. The single source of truth for the gated-name set — every
 /// gate decision (`chat_ownable_primaries` filtering, the front-door /
 /// stale-session fallback in [`resolve_primary_for_flag`], the `/settings`
 /// `defaultPrimaryAgent` cycle, the slash-swap rejection) derives from this
 /// list, so the names are never duplicated across call sites.
-pub const EXPERIMENTAL_PRIMARY_NAMES: &[&str] = &["Auto", "Plan", "Swarm"];
+pub const EXPERIMENTAL_PRIMARY_NAMES: &[&str] = &["Auto", "Swarm"];
 
 /// True when `name` is a builtin primary gated behind experimental mode.
 /// `Build` (and every user-defined custom primary) is never gated. This is

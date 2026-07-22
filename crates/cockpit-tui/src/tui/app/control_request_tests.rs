@@ -209,6 +209,44 @@ async fn control_request_ack_reports_applied() {
 }
 
 #[tokio::test]
+async fn plan_default_available_everywhere_when_experimental_off_tui_plan_swap() {
+    let mut app = app();
+    assert!(!app.config_snapshot.extended.experimental_mode);
+    let (record_tx, _record_rx) = mpsc::channel(1);
+    let (control_tx, mut control_rx) = mpsc::channel(1);
+    install_runner(&mut app, record_tx, control_tx);
+
+    app.swap_primary_agent("Plan");
+
+    let control = control_rx
+        .recv()
+        .await
+        .expect("/plan should send a SetAgent request");
+    match control.request {
+        Request::SetAgent { name } => assert_eq!(name, "Plan"),
+        other => panic!("expected SetAgent request, got {other:?}"),
+    }
+    assert!(history_lines(&app).is_empty());
+}
+
+#[tokio::test]
+async fn plan_default_swarm_swap_still_requires_experimental_mode() {
+    let mut app = app();
+    assert!(!app.config_snapshot.extended.experimental_mode);
+    let (record_tx, _record_rx) = mpsc::channel(1);
+    let (control_tx, mut control_rx) = mpsc::channel(1);
+    install_runner(&mut app, record_tx, control_tx);
+
+    app.swap_primary_agent("Swarm");
+
+    assert!(control_rx.try_recv().is_err());
+    assert_eq!(
+        history_lines(&app),
+        vec!["`Swarm` requires experimental mode — enable it in `/settings`."]
+    );
+}
+
+#[tokio::test]
 async fn control_request_stale_ack_is_ignored() {
     let mut app = app();
 

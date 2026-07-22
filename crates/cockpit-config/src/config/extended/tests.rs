@@ -1042,6 +1042,17 @@ fn default_primary_agent_defaults_to_auto() {
 }
 
 #[test]
+fn plan_default_config_defaults_stay_unchanged() {
+    let cfg = ExtendedConfig::default();
+    assert!(!cfg.experimental_mode);
+    assert_eq!(cfg.default_primary_agent, DefaultPrimaryAgent::Auto);
+
+    let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
+    assert!(!parsed.experimental_mode);
+    assert_eq!(parsed.default_primary_agent, DefaultPrimaryAgent::Auto);
+}
+
+#[test]
 fn default_primary_agent_round_trips() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");

@@ -163,6 +163,10 @@ pub const MIN_INTERVAL_SECS: u64 = 1;
 /// Default loop iteration cap (GOALS §22).
 pub const DEFAULT_LOOP_LIMIT: u64 = 10;
 
+/// Maximum finite loop iteration cap. Longer-running loops must use
+/// `limit: 0`, which routes through the interactive approval gate.
+pub const MAX_LOOP_LIMIT: u64 = 100;
+
 /// Parse + validate `loop.start` args. Accepts `interval` as either a
 /// number of seconds or a string like `"30s"` / `"2m"` / `"1h"` —
 /// defensive against weak models (priority #1). `limit: 0` means
@@ -199,6 +203,11 @@ pub fn parse_loop_start(args: &Value) -> anyhow::Result<LoopStartArgs> {
         }
         Some(v) => match v.as_u64() {
             Some(0) => None,
+            Some(n) if n > MAX_LOOP_LIMIT => {
+                return Err(invalid_input(format!(
+                    "`limit` {n} exceeds the maximum of {MAX_LOOP_LIMIT} iterations; for genuinely long-running work use `limit: 0` (unbounded), which requires the user's interactive approval, or split the work into a shorter loop"
+                )));
+            }
             Some(n) => Some(n),
             None => {
                 return Err(invalid_input("`limit` must be a non-negative integer"));
@@ -447,6 +456,55 @@ mod tests {
     fn loop_start_limit_zero_is_unlimited() {
         let a = parse_loop_start(&json!({ "interval": 10, "prompt": "p", "limit": 0 })).unwrap();
         assert_eq!(a.limit, None);
+    }
+
+    #[test]
+    fn schedule_loop_limit_rejects_above_ceiling() {
+        let err = parse_loop_start(
+            &json!({ "interval": 10, "prompt": "p", "limit": MAX_LOOP_LIMIT + 1 }),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains(&(MAX_LOOP_LIMIT + 1).to_string()), "{err}");
+        assert!(err.contains(&MAX_LOOP_LIMIT.to_string()), "{err}");
+    }
+
+    #[test]
+    fn schedule_loop_limit_error_names_unbounded_path() {
+        let err = parse_loop_start(&json!({ "interval": 10, "prompt": "p", "limit": 1000 }))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("1000"), "{err}");
+        assert!(err.contains("100"), "{err}");
+        assert!(err.contains("limit: 0"), "{err}");
+        assert!(err.contains("approval"), "{err}");
+    }
+
+    #[test]
+    fn schedule_loop_limit_accepts_ceiling_exactly() {
+        let a =
+            parse_loop_start(&json!({ "interval": 10, "prompt": "p", "limit": MAX_LOOP_LIMIT }))
+                .unwrap();
+
+        assert_eq!(a.limit, Some(MAX_LOOP_LIMIT));
+    }
+
+    #[test]
+    fn schedule_loop_limit_zero_still_means_unbounded() {
+        let a = parse_loop_start(&json!({ "interval": 10, "prompt": "p", "limit": 0 })).unwrap();
+
+        assert_eq!(a.limit, None);
+        assert!(!a.limit_defaulted);
+    }
+
+    #[test]
+    fn schedule_loop_limit_omitted_still_defaults() {
+        let a = parse_loop_start(&json!({ "interval": 10, "prompt": "p" })).unwrap();
+
+        assert_eq!(a.limit, Some(DEFAULT_LOOP_LIMIT));
+        assert!(a.limit_defaulted);
     }
 
     #[test]

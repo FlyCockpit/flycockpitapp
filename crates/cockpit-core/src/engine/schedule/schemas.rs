@@ -19,7 +19,7 @@
 
 use serde_json::{Value, json};
 
-use super::spec::ScheduleAction;
+use super::spec::{MIN_INTERVAL_SECS, ScheduleAction};
 
 /// The per-action schema for `action`'s sub-`args`. Used by the public
 /// `schedule.args` union and the dispatcher's validate-then-repair pass.
@@ -35,7 +35,7 @@ pub fn schema_for(action: ScheduleAction) -> Value {
                 // parser accepts both, so the schema does too (a bare-number
                 // emitter and a duration-string emitter are both clean here;
                 // only a non-numeric, non-duration value disagrees).
-                "interval": { "type": ["integer", "string"] },
+                "interval": { "type": ["integer", "string"], "minimum": MIN_INTERVAL_SECS },
                 "prompt": { "type": "string" },
                 "backoff": { "type": "boolean" },
                 "limit": { "type": "integer", "minimum": 0 },
@@ -128,6 +128,23 @@ mod tests {
         assert!(!v.is_valid(&json!({ "limit": "1", "prompt": "p", "interval": 5 })));
         assert!(v.is_valid(&json!({ "limit": 1, "prompt": "p", "interval": 5 })));
         // A duration-string interval is clean (parser-tolerated).
+        assert!(v.is_valid(&json!({ "interval": "30s", "prompt": "p" })));
+    }
+
+    #[test]
+    fn schedule_loop_interval_schema_rejects_zero() {
+        let schema = schema_for(ScheduleAction::LoopStart);
+        let v = jsonschema::validator_for(&schema).unwrap();
+
+        assert!(!v.is_valid(&json!({ "interval": 0, "prompt": "p" })));
+        assert!(v.is_valid(&json!({ "interval": MIN_INTERVAL_SECS, "prompt": "p" })));
+    }
+
+    #[test]
+    fn schedule_loop_interval_schema_still_accepts_duration_string() {
+        let schema = schema_for(ScheduleAction::LoopStart);
+        let v = jsonschema::validator_for(&schema).unwrap();
+
         assert!(v.is_valid(&json!({ "interval": "30s", "prompt": "p" })));
     }
 

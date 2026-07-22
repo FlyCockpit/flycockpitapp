@@ -41,7 +41,7 @@ pub const SCHEDULE_DESCRIPTION: &str = "Schedule async loop/background work with
 /// weak-model target. Same schema shape — only the prose is richer. Call
 /// `schedule` directly as a native tool with an `action` argument; do not
 /// route it through MCP.
-pub const SCHEDULE_DESCRIPTION_DEFENSIVE: &str = "Run work in the background or on a recurring schedule so the conversation isn't blocked waiting. Call `schedule` directly as a native tool (an `action` argument), not through MCP. Pick the kind of work with `action`: `loop.start` runs a prompt repeatedly on an interval (set `limit=1` for a single delayed/one-shot timer), `loop.cancel` stops a running loop, `background.start` launches a long task that runs detached, `background.tail` shows that task's latest output, `background.cancel` stops it, and `list` shows what is currently scheduled. Put the per-action details in `args`. Use this for things like polling a build, watching for a condition, or kicking off something slow you'll check later — not for ordinary step-by-step work, which you should just do directly.";
+pub const SCHEDULE_DESCRIPTION_DEFENSIVE: &str = "Run work in the background or on a recurring schedule so the conversation isn't blocked waiting. Call `schedule` directly as a native tool (an `action` argument), not through MCP. Pick the kind of work with `action`: `loop.start` runs a prompt repeatedly on an interval (set `limit=1` for a single delayed/one-shot timer), `loop.cancel` stops a running loop, `background.start` launches a long task that runs detached, `background.tail` shows that task's latest output, `background.cancel` stops it, and `list` shows what is currently scheduled. Each `loop.start` iteration is a full model inference that costs tokens and may run while the user is away, so pick the smallest iteration count and the longest interval that still does the job. Put the per-action details in `args`. Use this for things like polling a build, watching for a condition, or kicking off something slow you'll check later — not for ordinary step-by-step work, which you should just do directly.";
 const FORK_SCHEDULE_DESCRIPTION: &str = "Request scheduled work from the main agent or cancel this fork's own loop; forked schedule never launches detached work itself";
 const FORK_SCHEDULE_DESCRIPTION_DEFENSIVE: &str = "Inside a scheduled fork, use `schedule` only to request that the main agent consider new loop/background work, or to cancel this fork's own loop. `loop.start` and `background.start` record requests for the main agent; they do not launch detached work from the fork. `loop.cancel` cancels this fork's loop. Other schedule actions are rejected here.";
 
@@ -485,6 +485,17 @@ mod tests {
                 "`schedule` description should not duplicate schema field `{field}`"
             );
         }
+    }
+
+    #[test]
+    fn schedule_defensive_description_states_iteration_cost() {
+        let description = ScheduleTool.defensive_description().unwrap();
+
+        assert!(description.contains("full model inference"));
+        assert!(description.contains("costs tokens"));
+        assert!(description.contains("while the user is away"));
+        assert!(description.contains("smallest iteration count"));
+        assert!(description.contains("longest interval"));
     }
 
     #[test]

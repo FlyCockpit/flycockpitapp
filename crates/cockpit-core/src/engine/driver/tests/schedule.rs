@@ -75,6 +75,27 @@ async fn dispatch_loop_start_coerces_stringified_numerics_e2e() {
     assert_eq!(dispatch.wire_args["action"], "loop.start");
 }
 
+#[tokio::test(start_paused = true)]
+async fn schedule_loop_limit_stringified_over_ceiling_is_rejected() {
+    let (mut driver, _tmp) = test_driver(8);
+    let result = driver
+        .dispatch_schedule_action_repaired(&serde_json::json!({
+            "action": "loop.start",
+            "args": { "interval": "20000", "limit": "1000", "prompt": "echo hello" }
+        }))
+        .await;
+    let err = match result {
+        Ok(_) => panic!("expected over-ceiling limit to be rejected"),
+        Err(error) => error.to_string(),
+    };
+
+    assert!(err.contains("1000"), "{err}");
+    assert!(err.contains("100"), "{err}");
+    assert!(err.contains("limit: 0"), "{err}");
+    assert!(err.contains("approval"), "{err}");
+    assert!(!driver.schedule.has_loop());
+}
+
 /// The §14 record is populated on the persisted `tool_call` row exactly
 /// like a top-level tool repair: a stringified-numeric `schedule` call stores
 /// `recovery_kind=shape_repair`/`recovery_stage=parse_stringified_number`,

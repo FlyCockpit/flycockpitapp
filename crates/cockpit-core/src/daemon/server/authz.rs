@@ -130,7 +130,7 @@ macro_rules! command_session_id_value {
 }
 
 macro_rules! command_request_session_id_match {
-    (($request:ident, $state:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($request:ident, $state:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
         match $request {
             $($pattern => command_session_id_value!($state, $session $(($session_arg))?),)+
         }
@@ -155,7 +155,7 @@ macro_rules! command_audit_path_value {
 }
 
 macro_rules! command_request_audit_path_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
         match $request {
             $($pattern => command_audit_path_value!($audit_path $(($($audit_arg),+))?),)+
         }
@@ -168,7 +168,7 @@ pub(super) fn request_audit_path(request: &Request) -> Option<String> {
 }
 
 macro_rules! command_is_remote_mutating_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
         match $request {
             $($pattern => $mutating,)+
         }
@@ -475,7 +475,7 @@ macro_rules! command_authorize_value {
 }
 
 macro_rules! command_authorize_request_match {
-    (($request:ident, $state:ident, $ctx:ident, $principal:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($request:ident, $state:ident, $ctx:ident, $principal:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
         match $request {
             $($pattern => command_authorize_value!($principal, $state, $ctx, $request, $authz $(($authz_arg))?),)+
         }

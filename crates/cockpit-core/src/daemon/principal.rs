@@ -169,7 +169,7 @@ fn canonical_if_exists(path: &str) -> PathBuf {
 }
 
 macro_rules! command_request_kind_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
         match $request {
             $($pattern => $kind,)+
         }
@@ -181,10 +181,70 @@ pub fn request_kind(request: &Request) -> &'static str {
     proto::command!(command_request_kind_match, request)
 }
 
+/// Ordering contract asserted by a daemon request table row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestOrdering {
+    /// The request must execute on the serialized client executor.
+    Serialized,
+    /// The handler mutates no client-scoped state, and its result is
+    /// correct against a client-state snapshot taken when the request was
+    /// received.
+    Concurrent,
+}
+
+macro_rules! command_request_ordering_value {
+    (serialized) => {
+        RequestOrdering::Serialized
+    };
+    (concurrent) => {
+        RequestOrdering::Concurrent
+    };
+}
+
+macro_rules! command_request_ordering_match {
+    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        match $request {
+            $($pattern => command_request_ordering_value!($ordering),)+
+        }
+    }};
+}
+
+#[allow(unused_variables)]
+pub fn request_ordering(request: &Request) -> RequestOrdering {
+    proto::command!(command_request_ordering_match, request)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::daemon::relay_envelope::{RelayGrant, RelayGrantScope, RelayPrincipal};
+
+    macro_rules! request_ordering_rows_from_command_table {
+        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+            &[$(($kind, command_request_ordering_value!($ordering))),+]
+        }};
+    }
+
+    macro_rules! request_ordering_row_count_from_command_table {
+        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+            0usize $(+ {
+                let _ = stringify!($pattern);
+                1usize
+            })+
+        }};
+    }
+
+    macro_rules! request_ordering_no_wildcard_check {
+        (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+            let classify_without_wildcard: fn(&Request) -> RequestOrdering = |$request| {
+                match $request {
+                    $($pattern => command_request_ordering_value!($ordering),)+
+                }
+            };
+            let names = &[$($kind),+];
+            (classify_without_wildcard, names)
+        }};
+    }
 
     fn remote(scope: RelayGrantScope, project_root: Option<String>) -> ClientPrincipal {
         ClientPrincipal::from_relay(RelayPrincipal {
@@ -219,5 +279,33 @@ mod tests {
         let principal = remote(RelayGrantScope::ProjectFiles, None);
         assert!(principal.has_project_files("/workspace/app"));
         assert!(principal.has_project_files("/elsewhere"));
+    }
+
+    #[test]
+    fn request_ordering_is_serialized_for_every_variant() {
+        let rows = proto::command!(request_ordering_rows_from_command_table);
+        assert!(
+            rows.len() > 80,
+            "command table should enumerate Request rows"
+        );
+        for (kind, ordering) in rows {
+            assert_eq!(
+                *ordering,
+                RequestOrdering::Serialized,
+                "{kind} should remain serialized in this no-op classifier"
+            );
+        }
+    }
+
+    #[test]
+    fn request_ordering_table_has_no_wildcard_arm() {
+        let (_classify_without_wildcard, names) =
+            proto::command!(request_ordering_no_wildcard_check, request);
+        let row_count = proto::command!(request_ordering_row_count_from_command_table);
+        assert_eq!(names.len(), row_count);
+        assert!(
+            names.len() > 80,
+            "command table should enumerate Request rows"
+        );
     }
 }

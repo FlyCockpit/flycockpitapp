@@ -1219,8 +1219,8 @@ fn export_includes_persisted_approval_grants_snapshot() {
     db.write_blocking(move |conn| {
         conn.execute(
             "INSERT INTO approval_grants \
-                 (session_id, grant_kind, grant_key, granted_at) \
-                 VALUES (?1, 'command', 'grep', ?2)",
+                 (session_id, grant_kind, grant_key, granted_at, risk_tier) \
+                 VALUES (?1, 'command', 'grep', ?2, 'ordinary')",
             rusqlite::params![sid.to_string(), 1_700_000_000_i64],
         )
         .unwrap();
@@ -1251,7 +1251,10 @@ fn export_includes_persisted_approval_grants_snapshot() {
     assert_eq!(approvals["schema"], "cockpit-approval-grants/1");
     let session = &approvals["session"][0];
     assert_eq!(session["session_id"], sid.to_string());
-    assert_eq!(session["grants"]["commands"], json!(["grep"]));
+    assert_eq!(
+        session["grants"]["commands"],
+        json!([{ "key": "grep", "riskTier": "ordinary" }])
+    );
     assert_eq!(
         session["grants"]["paths"],
         json!([{ "key": "/tmp/example", "access": "read-write" }])

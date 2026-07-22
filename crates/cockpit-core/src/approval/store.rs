@@ -32,7 +32,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::approval::classify::{ApprovalKey, RiskTier};
 use crate::config::extended::{ApprovalPolicyConfig, ApprovalPolicyScope};
@@ -162,13 +162,36 @@ pub enum StoreError {
     Io(#[from] anyhow::Error),
 }
 
-/// On-disk shape of a project/global `approvals.json`. Sorted sets keep
+/// On-disk command allow record. The key stays coarse (`program` + first
+/// subcommand) because per-flag keys would turn every flag combination into a
+/// separate prompt. Instead, the grant records the tier shown to the user and
+/// later checks recompute the invocation tier against it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CommandGrantRecord {
+    #[serde(rename = "riskTier")]
+    risk_tier: String,
+}
+
+impl CommandGrantRecord {
+    fn new(tier: RiskTier) -> Self {
+        Self {
+            risk_tier: tier.as_str().to_string(),
+        }
+    }
+
+    fn tier(&self) -> Option<RiskTier> {
+        RiskTier::from_policy_key(&self.risk_tier)
+    }
+}
+
+/// On-disk shape of a project/global `approvals.json`. Sorted maps/sets keep
 /// the file stable (no spurious diffs) and dedup automatically.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ApprovalsFile {
-    /// Command-key allow grants, as storage strings (`"gh pr"`, `"ls"`).
-    #[serde(default)]
-    commands: BTreeSet<String>,
+    /// Command-key allow grants, as storage strings (`"gh pr"`, `"ls"`)
+    /// mapped to the tier shown when the grant was issued.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    commands: BTreeMap<String, CommandGrantRecord>,
     /// Path allow grants, as absolute path / prefix strings mapped to access mode.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     paths: BTreeMap<String, SandboxPathAccess>,
@@ -199,6 +222,12 @@ struct ApprovalsFile {
 pub struct EffectivePathGrant {
     pub path: PathBuf,
     pub access: SandboxPathAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandGrant {
+    pub scope: Scope,
+    pub granted_tier: RiskTier,
 }
 
 /// The grant store. Holds the session DB handle (for Session scope) and
@@ -344,19 +373,34 @@ impl GrantStore {
     /// grants are never stored, so they never show up here.
     #[cfg(test)]
     pub fn is_command_granted(&self, key: &ApprovalKey) -> bool {
-        self.command_grant_scope(key).is_some()
+        self.command_grant(key).is_some()
     }
 
-    pub fn command_grant_scope(&self, key: &ApprovalKey) -> Option<Scope> {
+    pub fn command_grant(&self, key: &ApprovalKey) -> Option<CommandGrant> {
         let s = key.as_storage_str();
-        if self.session_has(GrantKind::Command, &s, Verdict::Allow) {
-            return Some(Scope::Session);
+        if let Some(granted_tier) = self.session_command_grant_tier(&s) {
+            return Some(CommandGrant {
+                scope: Scope::Session,
+                granted_tier,
+            });
         }
-        if self.project_file().is_some_and(|f| f.commands.contains(&s)) {
-            return Some(Scope::Project);
+        if let Some(granted_tier) = self
+            .project_file()
+            .and_then(|f| f.commands.get(&s).and_then(CommandGrantRecord::tier))
+        {
+            return Some(CommandGrant {
+                scope: Scope::Project,
+                granted_tier,
+            });
         }
-        if self.global_file().is_some_and(|f| f.commands.contains(&s)) {
-            return Some(Scope::Global);
+        if let Some(granted_tier) = self
+            .global_file()
+            .and_then(|f| f.commands.get(&s).and_then(CommandGrantRecord::tier))
+        {
+            return Some(CommandGrant {
+                scope: Scope::Global,
+                granted_tier,
+            });
         }
         None
     }
@@ -466,6 +510,7 @@ impl GrantStore {
     pub fn record_command(
         &self,
         info: &crate::approval::classify::SimpleCommandInfo,
+        tier: RiskTier,
         scope: Scope,
     ) -> Result<(), StoreError> {
         if scope == Scope::Once {
@@ -480,6 +525,7 @@ impl GrantStore {
             scope,
             Verdict::Allow,
             None,
+            Some(tier),
         )
     }
 
@@ -503,6 +549,7 @@ impl GrantStore {
             &info.key.as_storage_str(),
             scope,
             Verdict::Reject,
+            None,
             None,
         )
     }
@@ -528,6 +575,7 @@ impl GrantStore {
             scope,
             Verdict::Allow,
             Some(access),
+            None,
         )
     }
 
@@ -544,6 +592,7 @@ impl GrantStore {
             scope,
             Verdict::Reject,
             Some(SandboxPathAccess::ReadWrite),
+            None,
         )
     }
 
@@ -715,6 +764,7 @@ impl GrantStore {
         scope: Scope,
         verdict: Verdict,
         access: Option<SandboxPathAccess>,
+        risk_tier: Option<RiskTier>,
     ) -> Result<(), StoreError> {
         if scope == Scope::Once {
             return Err(StoreError::OnceNotPersistable);
@@ -732,7 +782,7 @@ impl GrantStore {
         match scope {
             Scope::Once => Err(StoreError::OnceNotPersistable),
             Scope::Session => self
-                .session_insert(kind, key, verdict, access)
+                .session_insert(kind, key, verdict, access, risk_tier)
                 .map_err(StoreError::Io),
             Scope::Project => {
                 if self.project_root.is_none() {
@@ -743,7 +793,7 @@ impl GrantStore {
                     .as_ref()
                     .context("no machine-local project approvals dir available")
                     .map_err(StoreError::Io)?;
-                self.file_insert(dir, kind, key, verdict, access)
+                self.file_insert(dir, kind, key, verdict, access, risk_tier)
                     .map_err(StoreError::Io)
             }
             Scope::Global => {
@@ -752,7 +802,7 @@ impl GrantStore {
                     .clone()
                     .context("no global config dir available")
                     .map_err(StoreError::Io)?;
-                self.file_insert(&dir, kind, key, verdict, access)
+                self.file_insert(&dir, kind, key, verdict, access, risk_tier)
                     .map_err(StoreError::Io)
             }
         }
@@ -780,6 +830,24 @@ impl GrantStore {
     }
 
     // ---- session scope (SQLite) ------------------------------------------
+
+    fn session_command_grant_tier(&self, key: &str) -> Option<RiskTier> {
+        self.db
+            .read_blocking(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT risk_tier FROM approval_grants \
+                     WHERE session_id = ?1 AND grant_kind = 'command' AND grant_key = ?2 \
+                       AND verdict = 'allow'",
+                        rusqlite::params![self.session_id.to_string(), key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?)
+            })
+            .ok()
+            .flatten()
+            .and_then(|tier| RiskTier::from_policy_key(&tier))
+    }
 
     fn session_has(&self, kind: GrantKind, key: &str, verdict: Verdict) -> bool {
         self.db
@@ -863,25 +931,28 @@ impl GrantStore {
         key: &str,
         verdict: Verdict,
         access: Option<SandboxPathAccess>,
+        risk_tier: Option<RiskTier>,
     ) -> Result<()> {
         let session_id = self.session_id;
         let key = key.to_owned();
         let access = access.map(SandboxPathAccess::storage_str);
+        let risk_tier = risk_tier.map(RiskTier::as_str);
         self.db.write_blocking(move |conn| {
             // `INSERT OR REPLACE` on the (session_id, grant_kind, grant_key)
             // primary key flips an existing opposite verdict in place — a key
             // can never carry both polarities at session scope.
             conn.execute(
                 "INSERT OR REPLACE INTO approval_grants \
-                 (session_id, grant_kind, grant_key, granted_at, verdict, access) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (session_id, grant_kind, grant_key, granted_at, verdict, access, risk_tier) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     session_id.to_string(),
                     kind.as_str(),
                     key,
                     now_epoch_seconds(),
                     verdict.as_str(),
-                    access
+                    access,
+                    risk_tier
                 ],
             )
             .context("inserting session approval grant")?;
@@ -925,6 +996,7 @@ impl GrantStore {
         key: &str,
         verdict: Verdict,
         access: Option<SandboxPathAccess>,
+        risk_tier: Option<RiskTier>,
     ) -> Result<()> {
         let mut file = load_approvals(dir).unwrap_or_default();
         // Clear the opposite polarity within this same file too, so one
@@ -932,7 +1004,7 @@ impl GrantStore {
         // set (belt-and-braces with `clear_key_everywhere`, which already
         // visited this scope — but this keeps `file_insert` self-consistent).
         verdict_remove(&mut file, kind, verdict.opposite(), key);
-        verdict_insert(&mut file, kind, verdict, key, access);
+        verdict_insert(&mut file, kind, verdict, key, access, risk_tier);
         store_approvals(dir, &file)
     }
 
@@ -956,10 +1028,14 @@ fn verdict_insert(
     verdict: Verdict,
     key: &str,
     access: Option<SandboxPathAccess>,
+    risk_tier: Option<RiskTier>,
 ) {
     match (kind, verdict) {
         (GrantKind::Command, Verdict::Allow) => {
-            file.commands.insert(key.to_string());
+            if let Some(tier) = risk_tier {
+                file.commands
+                    .insert(key.to_string(), CommandGrantRecord::new(tier));
+            }
         }
         (GrantKind::Command, Verdict::Reject) => {
             file.commands_reject.insert(key.to_string());
@@ -981,7 +1057,7 @@ fn verdict_insert(
 
 fn verdict_remove(file: &mut ApprovalsFile, kind: GrantKind, verdict: Verdict, key: &str) -> bool {
     match (kind, verdict) {
-        (GrantKind::Command, Verdict::Allow) => file.commands.remove(key),
+        (GrantKind::Command, Verdict::Allow) => file.commands.remove(key).is_some(),
         (GrantKind::Command, Verdict::Reject) => file.commands_reject.remove(key),
         (GrantKind::Path, Verdict::Allow) => file.paths.remove(key).is_some(),
         (GrantKind::Path, Verdict::Reject) => file.paths_reject.remove(key).is_some(),
@@ -1045,6 +1121,21 @@ impl ManagedGrantKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedCommandGrant {
+    pub key: String,
+    #[serde(rename = "riskTier", serialize_with = "serialize_risk_tier")]
+    pub risk_tier: RiskTier,
+}
+
+fn serialize_risk_tier<S>(tier: &RiskTier, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(tier.as_str())
+}
+
+/// A persisted path grant exposed to the `/permissions` management UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManagedPathGrant {
     pub key: String,
     pub access: SandboxPathAccess,
@@ -1062,7 +1153,7 @@ impl ManagedPathGrant {
 /// reject) is the order the UI renders sections in.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ManagedGrants {
-    pub commands: Vec<String>,
+    pub commands: Vec<ManagedCommandGrant>,
     pub paths: Vec<ManagedPathGrant>,
     pub loop_accept: Vec<String>,
     pub loop_reject: Vec<String>,
@@ -1091,12 +1182,20 @@ impl ManagedGrants {
 /// Read every persisted grant from the `approvals.json` in `dir` (the
 /// machine-local project approvals dir or the global config dir). A missing or
 /// unparseable file reads as no grants — the management UI shows an empty
-/// scope, never an error. Entries come out sorted (the on-disk `BTreeSet`
-/// ordering) so the listing is stable.
+/// scope, never an error. Entries come out sorted by the on-disk `BTreeMap`
+/// / `BTreeSet` ordering, so the listing is stable.
 pub fn list_managed_grants(dir: &Path) -> ManagedGrants {
     let file = load_approvals(dir).unwrap_or_default();
     ManagedGrants {
-        commands: file.commands.into_iter().collect(),
+        commands: file
+            .commands
+            .into_iter()
+            .filter_map(|(key, record)| {
+                record
+                    .tier()
+                    .map(|risk_tier| ManagedCommandGrant { key, risk_tier })
+            })
+            .collect(),
         paths: file
             .paths
             .into_iter()
@@ -1118,7 +1217,7 @@ pub fn list_managed_grants(dir: &Path) -> ManagedGrants {
 pub fn delete_managed_grant(dir: &Path, kind: ManagedGrantKind, key: &str) -> Result<bool> {
     let mut file = load_approvals(dir).unwrap_or_default();
     let removed = match kind {
-        ManagedGrantKind::Command => file.commands.remove(key),
+        ManagedGrantKind::Command => file.commands.remove(key).is_some(),
         ManagedGrantKind::Path => file.paths.remove(key).is_some(),
         ManagedGrantKind::LoopAccept => file.loop_accept.remove(key),
         ManagedGrantKind::LoopReject => file.loop_reject.remove(key),
@@ -1341,11 +1440,93 @@ mod tests {
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("gh", Some("pr"), false);
         assert!(!store.is_command_granted(&info.key));
-        store.record_command(&info, Scope::Session).unwrap();
+        store
+            .record_command(&info, info.risk.tier, Scope::Session)
+            .unwrap();
         assert!(store.is_command_granted(&info.key));
         // A different subcommand still prompts.
         let other = cmd_info("gh", Some("repo"), false);
         assert!(!store.is_command_granted(&other.key));
+    }
+
+    #[test]
+    fn command_grant_records_and_returns_issue_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let mut info = cmd_info("git", Some("push"), false);
+        info.risk.tier = RiskTier::Destructive;
+
+        store
+            .record_command(&info, info.risk.tier, Scope::Session)
+            .unwrap();
+
+        assert_eq!(
+            store.command_grant(&info.key),
+            Some(CommandGrant {
+                scope: Scope::Session,
+                granted_tier: RiskTier::Destructive,
+            })
+        );
+    }
+
+    #[test]
+    fn approvals_file_commands_serializes_as_tier_map() {
+        let file = ApprovalsFile {
+            commands: BTreeMap::from([(
+                "git push".to_string(),
+                CommandGrantRecord::new(RiskTier::Destructive),
+            )]),
+            ..ApprovalsFile::default()
+        };
+
+        let json = serde_json::to_value(&file).unwrap();
+        assert_eq!(
+            json["commands"],
+            serde_json::json!({
+                "git push": {
+                    "riskTier": "destructive"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn unparseable_persisted_tier_is_treated_as_no_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let info = cmd_info("git", Some("push"), false);
+
+        store_approvals(
+            test_project_dir(&store),
+            &ApprovalsFile {
+                commands: BTreeMap::from([(
+                    info.key.as_storage_str(),
+                    CommandGrantRecord {
+                        risk_tier: "catastrophic".to_string(),
+                    },
+                )]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(store.command_grant(&info.key), None);
+        assert!(!store.is_command_granted(&info.key));
+    }
+
+    #[test]
+    fn command_reject_ignores_invocation_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let mut info = cmd_info("git", Some("push"), false);
+
+        store.record_command_reject(&info, Scope::Session).unwrap();
+        info.risk.tier = RiskTier::Destructive;
+
+        assert_eq!(store.command_reject_scope(&info.key), Some(Scope::Session));
     }
 
     #[test]
@@ -1354,7 +1535,9 @@ mod tests {
         let global = tempfile::tempdir().unwrap();
         let (store, sid) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("gh", Some("pr"), false);
-        store.record_command(&info, Scope::Project).unwrap();
+        store
+            .record_command(&info, info.risk.tier, Scope::Project)
+            .unwrap();
 
         // `gh pr create ...` derives the same key → granted, no prompt.
         let create = cmd_info("gh", Some("pr"), false);
@@ -1406,7 +1589,9 @@ mod tests {
         );
 
         let info = cmd_info("gh", Some("pr"), false);
-        store.record_command(&info, Scope::Project).unwrap();
+        store
+            .record_command(&info, info.risk.tier, Scope::Project)
+            .unwrap();
 
         assert!(project_dir.join(APPROVALS_FILE).exists());
         assert!(!project.path().join(".cockpit/approvals.json").exists());
@@ -1425,7 +1610,10 @@ mod tests {
         store_approvals(
             &repo_dir,
             &ApprovalsFile {
-                commands: BTreeSet::from([command.key.as_storage_str()]),
+                commands: BTreeMap::from([(
+                    command.key.as_storage_str(),
+                    CommandGrantRecord::new(RiskTier::Ordinary),
+                )]),
                 paths: BTreeMap::from([(
                     normalize_path(&granted_dir, store.cwd()),
                     SandboxPathAccess::ReadWrite,
@@ -1448,7 +1636,9 @@ mod tests {
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("cargo", Some("build"), false);
-        store.record_command(&info, Scope::Global).unwrap();
+        store
+            .record_command(&info, info.risk.tier, Scope::Global)
+            .unwrap();
 
         // A *different* project (different root) still sees the global
         // grant, because global applies everywhere.
@@ -1486,7 +1676,10 @@ mod tests {
         store_approvals(
             &project_dir,
             &ApprovalsFile {
-                commands: BTreeSet::from(["cargo test".to_string()]),
+                commands: BTreeMap::from([(
+                    "cargo test".to_string(),
+                    CommandGrantRecord::new(RiskTier::Ordinary),
+                )]),
                 ..ApprovalsFile::default()
             },
         )
@@ -1508,10 +1701,12 @@ mod tests {
 
         assert!(!store.is_command_granted(&info.key));
         assert!(matches!(
-            store.record_command(&info, Scope::Project),
+            store.record_command(&info, info.risk.tier, Scope::Project),
             Err(StoreError::NoProjectRoot)
         ));
-        store.record_command(&info, Scope::Session).unwrap();
+        store
+            .record_command(&info, info.risk.tier, Scope::Session)
+            .unwrap();
         assert!(store.is_command_granted(&info.key));
         crate::config::trust::clear_runtime_policy_for_tests();
     }
@@ -1523,7 +1718,9 @@ mod tests {
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let wrapper = cmd_info("bash", None, true);
         for scope in [Scope::Session, Scope::Project, Scope::Global] {
-            let err = store.record_command(&wrapper, scope).unwrap_err();
+            let err = store
+                .record_command(&wrapper, wrapper.risk.tier, scope)
+                .unwrap_err();
             assert!(
                 matches!(err, StoreError::WrapperNotPersistable(_)),
                 "scope {scope:?} should reject wrapper, got {err:?}"
@@ -1540,7 +1737,7 @@ mod tests {
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("ls", None, false);
         assert!(matches!(
-            store.record_command(&info, Scope::Once),
+            store.record_command(&info, info.risk.tier, Scope::Once),
             Err(StoreError::OnceNotPersistable)
         ));
         assert!(!store.is_command_granted(&info.key));
@@ -1690,7 +1887,11 @@ mod tests {
         let before = now_epoch_seconds();
 
         store
-            .record_command(&cmd_info("grep", None, false), Scope::Session)
+            .record_command(
+                &cmd_info("grep", None, false),
+                RiskTier::Ordinary,
+                Scope::Session,
+            )
             .unwrap();
 
         let (value, sqlite_type): (i64, String) = store
@@ -1851,8 +2052,12 @@ mod tests {
 
         // Allow at project + global, then reject at session: the session
         // reject must clear BOTH the project and the global allow.
-        store.record_command(&info, Scope::Project).unwrap();
-        store.record_command(&info, Scope::Global).unwrap();
+        store
+            .record_command(&info, info.risk.tier, Scope::Project)
+            .unwrap();
+        store
+            .record_command(&info, info.risk.tier, Scope::Global)
+            .unwrap();
         assert!(store.is_command_granted(&info.key));
         store.record_command_reject(&info, Scope::Session).unwrap();
         assert!(store.is_command_rejected(&info.key));
@@ -1862,7 +2067,9 @@ mod tests {
         );
 
         // Now allow again at project: the allow must clear the session reject.
-        store.record_command(&info, Scope::Project).unwrap();
+        store
+            .record_command(&info, info.risk.tier, Scope::Project)
+            .unwrap();
         assert!(store.is_command_granted(&info.key));
         assert!(
             !store.is_command_rejected(&info.key),
@@ -1934,33 +2141,24 @@ mod tests {
         assert!(!store.is_path_rejected(&p));
     }
 
-    /// Pre-existing `approval_grants` rows (written before the `verdict`
-    /// column) read as allows after the migration backfills `verdict='allow'`.
     #[test]
-    fn pre_migration_rows_read_as_allows() {
+    fn tierless_command_allow_rows_are_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("cargo", Some("test"), false);
         let key = info.key.as_storage_str();
-        // Simulate a legacy row for the verdict column: insert WITHOUT
-        // `verdict` so the migration's column default (`'allow'`) supplies it.
-        store
-            .db
-            .write_blocking(move |conn| {
-                conn.execute(
-                    "INSERT INTO approval_grants \
+        let inserted = store.db.write_blocking(move |conn| {
+            conn.execute(
+                "INSERT INTO approval_grants \
                      (session_id, grant_kind, grant_key, granted_at) \
                      VALUES (?1, 'command', ?2, ?3)",
-                    rusqlite::params![store.session_id.to_string(), key, 1_700_000_000_i64],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        assert!(
-            store.is_command_granted(&info.key),
-            "legacy row reads as allow"
-        );
+                rusqlite::params![store.session_id.to_string(), key, 1_700_000_000_i64],
+            )?;
+            Ok(())
+        });
+        assert!(inserted.is_err(), "command allow rows must carry risk_tier");
+        assert!(!store.is_command_granted(&info.key));
         assert!(!store.is_command_rejected(&info.key));
     }
 
@@ -2117,10 +2315,18 @@ mod tests {
         );
         point_project_scope(&mut store, dir.path(), dir.path());
         store
-            .record_command(&cmd_info("gh", Some("pr"), false), Scope::Project)
+            .record_command(
+                &cmd_info("gh", Some("pr"), false),
+                RiskTier::Ordinary,
+                Scope::Project,
+            )
             .unwrap();
         store
-            .record_command(&cmd_info("cargo", Some("build"), false), Scope::Project)
+            .record_command(
+                &cmd_info("cargo", Some("build"), false),
+                RiskTier::Ordinary,
+                Scope::Project,
+            )
             .unwrap();
         store
             .record_path(
@@ -2138,12 +2344,51 @@ mod tests {
         // Commands are sorted; both present.
         assert_eq!(
             grants.commands,
-            vec!["cargo build".to_string(), "gh pr".to_string()]
+            vec![
+                ManagedCommandGrant {
+                    key: "cargo build".to_string(),
+                    risk_tier: RiskTier::Ordinary,
+                },
+                ManagedCommandGrant {
+                    key: "gh pr".to_string(),
+                    risk_tier: RiskTier::Ordinary,
+                },
+            ]
         );
         assert_eq!(grants.paths.len(), 1);
         assert_eq!(grants.loop_accept, vec![sig]);
         assert!(grants.loop_reject.is_empty());
         assert!(!grants.is_empty());
+    }
+
+    #[test]
+    fn managed_grants_expose_command_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session =
+            crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "builder")
+                .unwrap();
+        let mut store = GrantStore::new(
+            db,
+            session.id,
+            dir.path().to_path_buf(),
+            SessionConfigHandle::from_disk_for_tests(dir.path()),
+        );
+        point_project_scope(&mut store, dir.path(), dir.path());
+        let mut info = cmd_info("git", Some("push"), false);
+        info.risk.tier = RiskTier::Destructive;
+        store
+            .record_command(&info, info.risk.tier, Scope::Project)
+            .unwrap();
+
+        let grants = list_managed_grants(test_project_dir(&store));
+        assert_eq!(
+            grants.commands,
+            vec![ManagedCommandGrant {
+                key: "git push".to_string(),
+                risk_tier: RiskTier::Destructive,
+            }]
+        );
     }
 
     #[test]
@@ -2168,17 +2413,31 @@ mod tests {
         );
         point_project_scope(&mut store, dir.path(), dir.path());
         store
-            .record_command(&cmd_info("gh", Some("pr"), false), Scope::Project)
+            .record_command(
+                &cmd_info("gh", Some("pr"), false),
+                RiskTier::Ordinary,
+                Scope::Project,
+            )
             .unwrap();
         store
-            .record_command(&cmd_info("cargo", Some("build"), false), Scope::Project)
+            .record_command(
+                &cmd_info("cargo", Some("build"), false),
+                RiskTier::Ordinary,
+                Scope::Project,
+            )
             .unwrap();
         let project_dir = test_project_dir(&store).to_path_buf();
 
         // Deleting one command leaves the other intact.
         assert!(delete_managed_grant(&project_dir, ManagedGrantKind::Command, "gh pr").unwrap());
         let grants = list_managed_grants(&project_dir);
-        assert_eq!(grants.commands, vec!["cargo build".to_string()]);
+        assert_eq!(
+            grants.commands,
+            vec![ManagedCommandGrant {
+                key: "cargo build".to_string(),
+                risk_tier: RiskTier::Ordinary,
+            }]
+        );
 
         // The removal is durable: a fresh store no longer treats it as granted.
         assert!(!store.is_command_granted(&ApprovalKey {
@@ -2519,7 +2778,9 @@ mod tests {
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("gh", Some("pr"), false);
-        store.record_command(&info, Scope::Project).unwrap();
+        store
+            .record_command(&info, info.risk.tier, Scope::Project)
+            .unwrap();
         assert!(store.is_command_granted(&info.key));
 
         // Delete the grant straight from the file, as the permissions pane does.
@@ -2543,7 +2804,9 @@ mod tests {
         assert!(!crate::approval::command_grant_allowed_by_policy(
             &store, &info
         ));
-        store.record_command(&info, Scope::Session).unwrap();
+        store
+            .record_command(&info, info.risk.tier, Scope::Session)
+            .unwrap();
         assert!(crate::approval::command_grant_allowed_by_policy(
             &store, &info
         ));

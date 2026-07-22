@@ -372,13 +372,13 @@ impl Approver {
 
     /// Whether this constituent will raise a prompt rather than being
     /// allowed silently: a wrapper (never persistable) always prompts;
-    /// otherwise it prompts only when not already granted.
+    /// otherwise it prompts only when not already granted at a scope and
+    /// issue tier that cover this invocation.
     fn will_prompt(&self, info: &SimpleCommandInfo, policy: &ApprovalPromptPolicy) -> bool {
         info.wrapper
-            || !self
-                .store
-                .command_grant_scope(&info.key)
-                .is_some_and(|scope| scope.within(policy.max_scope))
+            || !self.store.command_grant(&info.key).is_some_and(|grant| {
+                grant.scope.within(policy.max_scope) && info.risk.tier <= grant.granted_tier
+            })
     }
 
     /// Decide one simple command: granted → allow; else prompt. `step` /
@@ -407,12 +407,17 @@ impl Approver {
             // driver (`approve_command_inner`).
             return Ok(CommandStepDecision::Decision(Decision::Deny));
         }
-        if !info.wrapper
-            && let Some(scope) = self.store.command_grant_scope(&info.key)
-            && scope.within(policy.max_scope)
+        let stored_grant = (!info.wrapper)
+            .then(|| self.store.command_grant(&info.key))
+            .flatten();
+        if let Some(grant) = stored_grant
+            && grant.scope.within(policy.max_scope)
+            && info.risk.tier <= grant.granted_tier
         {
             // Already remembered at some applicable scope.
-            return Ok(CommandStepDecision::Decision(Decision::Allow { scope }));
+            return Ok(CommandStepDecision::Decision(Decision::Allow {
+                scope: grant.scope,
+            }));
         }
         // The heading still shows the approval key — the exact thing a grant
         // would cover (`gh pr`, `cargo build`, `ls`) — so a "remember" choice
@@ -428,6 +433,11 @@ impl Approver {
             context.step,
             context.step_count,
         );
+        let notice = stored_grant
+            .filter(|grant| {
+                grant.scope.within(policy.max_scope) && info.risk.tier > grant.granted_tier
+            })
+            .map(|grant| out_tiered_prompt_notice(full_command, info, grant.granted_tier));
         let choice = self
             .prompt(
                 &label,
@@ -435,7 +445,10 @@ impl Approver {
                 detail,
                 context.escalation.clone(),
                 &policy.offered_scopes,
-                context.batch_count,
+                PromptExtras {
+                    batch_count: context.batch_count,
+                    notice,
+                },
             )
             .await?;
         match choice {
@@ -458,7 +471,7 @@ impl Approver {
                 // never reach here at a non-Once scope: the prompt only
                 // offered Once for wrappers. The store rejects it anyway as
                 // a belt-and-braces guard.
-                self.store.record_command(info, scope)?;
+                self.store.record_command(info, info.risk.tier, scope)?;
                 Ok(CommandStepDecision::Decision(Decision::Allow { scope }))
             }
             // `Reject(Once)` is mapped to `Deny` upstream; only a persistable
@@ -473,6 +486,35 @@ impl Approver {
             }
         }
     }
+}
+
+fn out_tiered_prompt_notice(
+    full_command: &str,
+    info: &SimpleCommandInfo,
+    granted_tier: RiskTier,
+) -> String {
+    let reasons = display_risk_reasons(info);
+    format!(
+        "`{full_command}` is riskier than what you approved for `{}`\n({} vs {}): {reasons}.",
+        info.key.as_storage_str(),
+        info.risk.tier.as_str(),
+        granted_tier.as_str()
+    )
+}
+
+fn display_risk_reasons(info: &SimpleCommandInfo) -> String {
+    let flags: Vec<&str> = info
+        .args
+        .iter()
+        .filter_map(|arg| arg.starts_with('-').then_some(arg.as_str()))
+        .collect();
+    if !flags.is_empty() {
+        return flags.join(", ");
+    }
+    if !info.risk.reasons.is_empty() {
+        return info.risk.reasons.join(", ");
+    }
+    info.risk.tier.as_str().to_string()
 }
 
 #[cfg(test)]
@@ -506,5 +548,19 @@ mod tests {
         let dynamic_commands = dynamic.simple_commands();
         let prompting: Vec<_> = dynamic_commands.iter().zip(policies.iter()).collect();
         assert_eq!(batch_count_for_prompting(&prompting), None);
+    }
+
+    #[test]
+    fn out_tiered_prompt_names_tier_delta_and_reasons() {
+        let info = classify::classify("git push --force origin main")
+            .simple_commands()
+            .first()
+            .cloned()
+            .expect("simple command");
+
+        assert_eq!(
+            out_tiered_prompt_notice("git push --force origin main", &info, RiskTier::Ordinary,),
+            "`git push --force origin main` is riskier than what you approved for `git push`\n(destructive vs ordinary): --force."
+        );
     }
 }

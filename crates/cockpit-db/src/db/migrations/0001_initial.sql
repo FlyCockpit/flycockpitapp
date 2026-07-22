@@ -15,7 +15,7 @@
 -- Exact identity for the amended pre-release squash. Unlike the
 -- `schema_version` migration ledger, this changes whenever 0001 is amended so
 -- an older development database cannot silently masquerade as current.
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 
 -- ---- assistants ------------------------------------------------------------
 
@@ -628,10 +628,13 @@ CREATE TABLE compaction_shadows (
 --
 -- `grant_kind` is 'command' (keyed by argv[0]+subcommand, e.g. `gh pr`)
 -- or 'path'. Wrapper/eval commands are NEVER persisted here — the store
--- layer rejects them before insert. `verdict` carries the polarity; the
--- (session_id, grant_kind, grant_key) PK means allow and reject for the
--- same key can never coexist — the recorder flips the verdict in place
--- via INSERT OR REPLACE.
+-- layer rejects them before insert. `risk_tier` records the command tier
+-- displayed when an allow grant was issued, so future invocations of the
+-- same coarse command key only skip the prompt when their recomputed tier
+-- is no higher. Path grants and command rejects carry no tier.
+-- `verdict` carries the polarity; the (session_id, grant_kind, grant_key)
+-- PK means allow and reject for the same key can never coexist — the
+-- recorder flips the verdict in place via INSERT OR REPLACE.
 
 CREATE TABLE approval_grants (
     session_id  TEXT    NOT NULL,
@@ -644,6 +647,12 @@ CREATE TABLE approval_grants (
         CHECK (
             (grant_kind = 'path' AND access IN ('read', 'read-write'))
             OR (grant_kind <> 'path' AND access IS NULL)
+        ),
+    risk_tier   TEXT
+        CHECK (
+            (grant_kind = 'command' AND verdict = 'allow' AND risk_tier IS NOT NULL
+             AND risk_tier IN ('ordinary','mutating','destructive','privileged','dynamic'))
+            OR ((grant_kind <> 'command' OR verdict <> 'allow') AND risk_tier IS NULL)
         ),
     PRIMARY KEY (session_id, grant_kind, grant_key),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE

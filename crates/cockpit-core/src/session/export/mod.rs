@@ -1134,7 +1134,7 @@ fn session_approval_snapshot(db: &Db, bundle: &[SessionRow]) -> Result<Vec<Value
     for session in bundle {
         let session_id = session.session_id.to_string();
         let (commands, paths, loop_accept, loop_reject): (
-            Vec<String>,
+            Vec<Value>,
             Vec<Value>,
             Vec<String>,
             Vec<String>,
@@ -1148,10 +1148,27 @@ fn session_approval_snapshot(db: &Db, bundle: &[SessionRow]) -> Result<Vec<Value
                 }
                 Ok(values)
             };
+            let read_commands = || -> Result<Vec<Value>> {
+                let mut stmt = conn.prepare(
+                    "SELECT grant_key, risk_tier FROM approval_grants \
+                     WHERE session_id = ?1 AND grant_kind = 'command' AND verdict = 'allow' \
+                     ORDER BY grant_key",
+                )?;
+                let rows = stmt.query_map([session_id.as_str()], |row| {
+                    let key: String = row.get(0)?;
+                    let risk_tier: String = row.get(1)?;
+                    Ok(json!({ "key": key, "riskTier": risk_tier }))
+                })?;
+                let mut values = Vec::new();
+                for row in rows {
+                    values.push(row?);
+                }
+                Ok(values)
+            };
             let read_paths = || -> Result<Vec<Value>> {
                 let mut stmt = conn.prepare(
                     "SELECT grant_key, access FROM approval_grants \
-                     WHERE session_id = ?1 AND grant_kind = 'path' \
+                     WHERE session_id = ?1 AND grant_kind = 'path' AND verdict = 'allow' \
                      ORDER BY grant_key",
                 )?;
                 let rows = stmt.query_map([session_id.as_str()], |row| {
@@ -1167,11 +1184,7 @@ fn session_approval_snapshot(db: &Db, bundle: &[SessionRow]) -> Result<Vec<Value
             };
 
             Ok((
-                read_keys(
-                    "SELECT grant_key FROM approval_grants \
-                     WHERE session_id = ?1 AND grant_kind = 'command' \
-                     ORDER BY grant_key",
-                )?,
+                read_commands()?,
                 read_paths()?,
                 read_keys(
                     "SELECT signature FROM loop_guard_rules \

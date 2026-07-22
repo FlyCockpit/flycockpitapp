@@ -203,11 +203,11 @@ impl PermissionsPane {
                         }
                     }
                     ManagedGrantKind::Command => {
-                        for key in &sv.grants.commands {
+                        for grant in &sv.grants.commands {
                             rows.push(DeletableRow {
                                 dir: dir.clone(),
                                 kind,
-                                key: key.clone(),
+                                key: grant.key.clone(),
                             });
                         }
                     }
@@ -342,9 +342,9 @@ impl PermissionsPane {
                         }
                     }
                     ManagedGrantKind::Command => {
-                        for key in &sv.grants.commands {
+                        for grant in &sv.grants.commands {
                             let selected = row_idx == self.list.cursor();
-                            lines.push(grant_row(key, selected));
+                            lines.push(command_grant_row(grant, selected));
                             row_idx += 1;
                         }
                     }
@@ -503,6 +503,13 @@ fn grant_row(key: &str, selected: bool) -> Line<'static> {
     grant_row_spans(key, None, selected)
 }
 
+fn command_grant_row(
+    grant: &cockpit_core::approval::store::ManagedCommandGrant,
+    selected: bool,
+) -> Line<'static> {
+    grant_row_spans(&grant.key, Some(grant.risk_tier.as_str()), selected)
+}
+
 fn path_grant_row(
     grant: &cockpit_core::approval::store::ManagedPathGrant,
     selected: bool,
@@ -576,8 +583,18 @@ mod tests {
             .iter()
             .map(|grant| (grant.key.clone(), grant.access))
             .collect::<std::collections::BTreeMap<_, _>>();
+        let commands = grants
+            .commands
+            .iter()
+            .map(|grant| {
+                (
+                    grant.key.clone(),
+                    serde_json::json!({ "riskTier": grant.risk_tier.as_str() }),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
         let file = serde_json::json!({
-            "commands": grants.commands,
+            "commands": commands,
             "paths": paths,
             "loop_accept": grants.loop_accept,
             "loop_reject": grants.loop_reject,
@@ -587,7 +604,13 @@ mod tests {
 
     fn grants(commands: &[&str], paths: &[&str]) -> ManagedGrants {
         ManagedGrants {
-            commands: commands.iter().map(|s| s.to_string()).collect(),
+            commands: commands
+                .iter()
+                .map(|s| cockpit_core::approval::store::ManagedCommandGrant {
+                    key: s.to_string(),
+                    risk_tier: cockpit_core::approval::classify::RiskTier::Ordinary,
+                })
+                .collect(),
             paths: paths
                 .iter()
                 .map(|s| cockpit_core::approval::store::ManagedPathGrant {
@@ -734,7 +757,13 @@ mod tests {
         pane.handle_key(press(KeyCode::Char('d')));
         // The focused grant is gone from the file...
         let after = list_managed_grants(proj.path());
-        assert_eq!(after.commands, vec!["gh pr".to_string()]);
+        assert_eq!(
+            after.commands,
+            vec![cockpit_core::approval::store::ManagedCommandGrant {
+                key: "gh pr".to_string(),
+                risk_tier: cockpit_core::approval::classify::RiskTier::Ordinary,
+            }]
+        );
         // ...and from the in-memory view; the other remains.
         let text = render_text(&pane);
         assert!(text.contains("gh pr"));

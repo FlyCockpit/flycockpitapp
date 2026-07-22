@@ -153,10 +153,14 @@ impl Approver {
         detail: Option<CommandDetail>,
         escalation: Option<SandboxEscalation>,
         offered_scopes: &[Scope],
-        batch_count: Option<u32>,
+        extras: PromptExtras,
     ) -> Result<ApprovalChoice> {
-        let description = prompt_description(label, wrapper, detail.as_ref(), escalation.as_ref());
-        let question = approval_question(
+        let mut description =
+            prompt_description(label, wrapper, detail.as_ref(), escalation.as_ref());
+        if let Some(notice) = extras.notice.as_deref() {
+            description = format!("{notice}\n{description}");
+        }
+        let mut question = approval_question(
             label,
             wrapper,
             GrantKind::Command,
@@ -164,8 +168,14 @@ impl Approver {
             detail,
             escalation,
             offered_scopes,
-            batch_count,
+            extras.batch_count,
         );
+        if let Some(notice) = extras.notice.as_deref() {
+            let InterruptQuestion::Single { prompt, .. } = &mut question else {
+                unreachable!("approval_question always returns Single")
+            };
+            *prompt = format!("{notice}\n{prompt}");
+        }
         let response = self.raise_and_wait(&description, question).await?;
         Ok(response_to_approval_choice(&response, wrapper))
     }

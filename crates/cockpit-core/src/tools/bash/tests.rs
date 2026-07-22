@@ -1151,7 +1151,7 @@ async fn granted_broad_skips_the_box() {
     };
     approver
         .store()
-        .record_command(&info, Scope::Session)
+        .record_command(&info, info.risk.tier, Scope::Session)
         .unwrap();
     // Now the same command is granted broad → skip the box.
     assert!(command_granted_broad(&ctx, "cargo build --release").await);
@@ -1167,7 +1167,7 @@ async fn risky_grant_above_policy_cap_does_not_skip_the_box() {
     let info = crate::approval::classify::classify("rm foo").simple_commands()[0].clone();
     approver
         .store()
-        .record_command(&info, Scope::Session)
+        .record_command(&info, info.risk.tier, Scope::Session)
         .unwrap();
 
     assert!(
@@ -1252,7 +1252,7 @@ async fn sandbox_meta_records_broad_grant_skip_state() {
     for info in classification.simple_commands() {
         approver
             .store()
-            .record_command(info, Scope::Session)
+            .record_command(info, info.risk.tier, Scope::Session)
             .unwrap();
     }
     // Sanity: the grant makes the box skippable on a sandbox-supported

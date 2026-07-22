@@ -699,6 +699,12 @@ impl ApprovalPromptPolicy {
     }
 }
 
+#[derive(Default)]
+pub(super) struct PromptExtras {
+    pub batch_count: Option<u32>,
+    pub notice: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct PermissionDecisionAudit {
     risk_tier: String,
@@ -834,9 +840,9 @@ pub(crate) fn command_grant_allowed_by_policy(
     let mut info = info.clone();
     apply_dangerous_flag_policy(&mut info, &policy_cfg);
     let policy = approval_policy_for(&info, &policy_cfg);
-    store
-        .command_grant_scope(&info.key)
-        .is_some_and(|scope| scope.within(policy.max_scope))
+    store.command_grant(&info.key).is_some_and(|grant| {
+        grant.scope.within(policy.max_scope) && info.risk.tier <= grant.granted_tier
+    })
 }
 
 fn default_max_scope_for_risk(tier: RiskTier) -> Scope {
@@ -884,7 +890,9 @@ fn dedup_strings(values: &mut Vec<String>) {
 mod tests {
     use super::*;
     use crate::approval::classify::ApprovalKey;
-    use crate::config::extended::DangerousFlagRule;
+    use crate::config::extended::{ApprovalPolicyScope, DangerousFlagRule};
+    use crate::daemon::session_worker::SessionConfigSnapshot;
+    use std::sync::RwLock;
 
     fn approver(cwd: &std::path::Path) -> (Approver, uuid::Uuid) {
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -899,6 +907,42 @@ mod tests {
         );
         let hub = Arc::new(InterruptHub::detached());
         (Approver::new(store, db, sid, "builder", hub), sid)
+    }
+
+    fn approver_with_policy(
+        cwd: &std::path::Path,
+        policy: crate::config::extended::ApprovalPolicyConfig,
+    ) -> Approver {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session =
+            crate::session::Session::create(db.clone(), cwd.to_path_buf(), "builder").unwrap();
+        let extended = crate::config::extended::ExtendedConfig {
+            approval_policy: policy,
+            ..Default::default()
+        };
+        let snapshot = SessionConfigSnapshot::new(
+            1,
+            crate::config::providers::ProvidersConfig::default(),
+            extended,
+        );
+        let store = GrantStore::new(
+            db.clone(),
+            session.id,
+            cwd.to_path_buf(),
+            crate::daemon::session_worker::SessionConfigHandle::new(Arc::new(RwLock::new(
+                snapshot,
+            ))),
+        );
+        let hub = Arc::new(InterruptHub::detached());
+        Approver::new(store, db, session.id, "builder", hub)
+    }
+
+    fn policy_with_destructive_session_scope() -> crate::config::extended::ApprovalPolicyConfig {
+        let mut policy = crate::config::extended::ApprovalPolicyConfig::default();
+        policy
+            .risk_max_scope
+            .insert("destructive".to_string(), ApprovalPolicyScope::Session);
+        policy
     }
 
     /// All `permission_decision` events recorded for the approver's session,
@@ -1457,12 +1501,14 @@ mod tests {
         let info = classify::classify("rm foo").simple_commands()[0].clone();
         approver
             .store
-            .record_command(&info, Scope::Session)
+            .record_command(&info, info.risk.tier, Scope::Session)
             .unwrap();
-        assert_eq!(
-            approver.store.command_grant_scope(&info.key),
-            Some(Scope::Session)
-        );
+        let grant = approver
+            .store
+            .command_grant(&info.key)
+            .expect("session grant recorded");
+        assert_eq!(grant.scope, Scope::Session);
+        assert_eq!(grant.granted_tier, info.risk.tier);
 
         let resolver = resolve_sequence(&approver, &[ID_APPROVE_ONCE]);
         let decision = approver.approve_command("rm foo").await.unwrap();
@@ -1473,6 +1519,97 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["source"], "user_prompt");
         assert_eq!(events[0]["approval_policy"]["policy_cap"], "once");
+    }
+
+    #[tokio::test]
+    async fn grant_does_not_apply_when_invocation_tier_exceeds_granted_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_policy(tmp.path(), policy_with_destructive_session_scope());
+        let ordinary = classify::classify("git push origin main").simple_commands()[0].clone();
+        approver
+            .store
+            .record_command(&ordinary, RiskTier::Ordinary, Scope::Session)
+            .unwrap();
+
+        let resolver = resolve_sequence_collecting_prompts(&approver, &[ID_APPROVE_ONCE]);
+        let decision = approver
+            .approve_command("git push --force origin main")
+            .await
+            .unwrap();
+        let prompts = resolver.await.unwrap();
+
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("is riskier than what you approved"));
+    }
+
+    #[tokio::test]
+    async fn grant_applies_when_invocation_tier_is_at_or_below_granted_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let destructive =
+            classify::classify("git push --force origin main").simple_commands()[0].clone();
+        approver
+            .store
+            .record_command(&destructive, RiskTier::Destructive, Scope::Session)
+            .unwrap();
+
+        let ordinary = classify::classify("git push origin main").simple_commands()[0].clone();
+        assert!(command_grant_allowed_by_policy(&approver.store, &ordinary));
+        // No client is attached; if this prompted it would block.
+        let decision = approver
+            .approve_command("git push origin main")
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            Decision::Allow {
+                scope: Scope::Session
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn reapproval_upgrades_stored_grant_tier_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_policy(tmp.path(), policy_with_destructive_session_scope());
+        let ordinary = classify::classify("git push origin main").simple_commands()[0].clone();
+        approver
+            .store
+            .record_command(&ordinary, RiskTier::Ordinary, Scope::Session)
+            .unwrap();
+
+        let resolver = resolve_sequence(&approver, &[ID_APPROVE_SESSION]);
+        let decision = approver
+            .approve_command("git push --force origin main")
+            .await
+            .unwrap();
+        resolver.await.unwrap();
+
+        assert_eq!(
+            decision,
+            Decision::Allow {
+                scope: Scope::Session
+            }
+        );
+        let grant = approver
+            .store
+            .command_grant(&ordinary.key)
+            .expect("grant upgraded");
+        assert_eq!(grant.scope, Scope::Session);
+        assert_eq!(grant.granted_tier, RiskTier::Destructive);
+
+        // A lower-tier later invocation is covered silently by the upgraded grant.
+        let later = approver
+            .approve_command("git push origin main")
+            .await
+            .unwrap();
+        assert_eq!(
+            later,
+            Decision::Allow {
+                scope: Scope::Session
+            }
+        );
     }
 
     #[tokio::test]
@@ -1512,7 +1649,7 @@ mod tests {
         };
         approver
             .store
-            .record_command(&info, Scope::Session)
+            .record_command(&info, info.risk.tier, Scope::Session)
             .unwrap();
         // No client is attached; if this prompted it would block forever.
         // It returns immediately because the grant short-circuits.
@@ -1548,7 +1685,7 @@ mod tests {
         };
         approver
             .store
-            .record_command(&info, Scope::Session)
+            .record_command(&info, info.risk.tier, Scope::Session)
             .unwrap();
         let decision = approver
             .approve_command("cargo build --release")
@@ -2031,7 +2168,7 @@ mod tests {
         };
         approver
             .store
-            .record_command(&git_info, Scope::Session)
+            .record_command(&git_info, git_info.risk.tier, Scope::Session)
             .unwrap();
 
         let db = approver.db.clone();

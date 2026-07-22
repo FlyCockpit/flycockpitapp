@@ -82,7 +82,7 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// is intentionally strict until the first public release: developers move a
 /// stale database aside and let Cockpit recreate it rather than running a
 /// compatibility migration.
-pub const EXPECTED_SCHEMA_VERSION: i64 = 5;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 6;
 
 thread_local! {
     static OPEN_DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1341,5 +1341,46 @@ mod tests {
             })
             .unwrap();
         assert_eq!(view_count, 1);
+    }
+
+    #[test]
+    fn approval_grants_has_risk_tier_column() {
+        let db = Db::open_in_memory().unwrap();
+        let columns: Vec<(String, String)> = db
+            .read_blocking(|conn| {
+                let mut stmt = conn.prepare("PRAGMA table_info(approval_grants)")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?;
+                let mut columns = Vec::new();
+                for row in rows {
+                    columns.push(row?);
+                }
+                Ok(columns)
+            })
+            .unwrap();
+
+        assert!(
+            columns
+                .iter()
+                .any(|(name, ty)| name == "risk_tier" && ty == "TEXT"),
+            "approval_grants.risk_tier TEXT column missing; columns were {columns:?}"
+        );
+    }
+
+    #[test]
+    fn no_second_migration_file_exists() {
+        let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("db")
+            .join("migrations");
+        let mut migrations: Vec<String> = std::fs::read_dir(&migrations_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".sql"))
+            .collect();
+        migrations.sort();
+
+        assert_eq!(migrations, vec!["0001_initial.sql"]);
     }
 }

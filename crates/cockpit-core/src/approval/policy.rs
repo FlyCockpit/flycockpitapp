@@ -111,7 +111,14 @@ impl Approver {
         // right shape for a non-persistable per-call approval. Nothing is
         // recorded; a later identical call prompts again.
         let choice = self
-            .prompt(label, true, None, None, &[Scope::Once], None)
+            .prompt(
+                label,
+                true,
+                None,
+                None,
+                &[Scope::Once],
+                PromptExtras::default(),
+            )
             .await?;
         let decision = match choice {
             // Wrapper mode: reject-once is mapped to `Deny` upstream, so a

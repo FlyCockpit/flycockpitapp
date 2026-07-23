@@ -101,7 +101,7 @@ impl SubagentFailureEnvelope {
         Some(Self {
             provider: failure.provider.clone(),
             model: failure.model.clone(),
-            error_class: failure.class.clone(),
+            error_class: failure.class.as_str(),
             elapsed_ms: failure.elapsed_ms,
             fallback_tried,
             suggested_action: crate::engine::agent::suggested_action_for_failure_class(

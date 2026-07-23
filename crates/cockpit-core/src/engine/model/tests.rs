@@ -239,7 +239,10 @@ async fn ttft_threshold_with_backup_warns_then_times_out() {
     let (res, phase, events) = run_drain(&mut stream, &timeout, true).await;
 
     let err = res.expect_err("backup-configured TTFT threshold must abort");
-    assert_eq!(stream_timeout_kind(&err), Some("timeout_ttft"));
+    assert_eq!(
+        classify_inference_failure(&err),
+        InferenceErrorClass::TimeoutTtft
+    );
     assert_eq!(phase, InferencePhase::Prep);
     assert!(events.iter().any(|event| {
         matches!(
@@ -266,7 +269,10 @@ async fn idle_threshold_with_backup_warns_then_times_out() {
     let (res, phase, events) = run_drain(&mut stream, &timeout, true).await;
 
     let err = res.expect_err("backup-configured idle threshold must abort");
-    assert_eq!(stream_timeout_kind(&err), Some("timeout_idle"));
+    assert_eq!(
+        classify_inference_failure(&err),
+        InferenceErrorClass::TimeoutIdle
+    );
     assert_eq!(phase, InferencePhase::FirstToken);
     assert!(events.iter().any(|event| {
         matches!(
@@ -875,7 +881,7 @@ async fn responses_identity_failure_maps_to_inference_failure() {
         .expect_err("orphan Responses tool result must fail before provider dispatch");
 
     let failure = as_inference_failure(&err).expect("typed inference failure");
-    assert_eq!(failure.class, "responses_tool_identity");
+    assert_eq!(failure.class, InferenceErrorClass::ResponsesToolIdentity);
     assert_eq!(failure.phase, "prep");
     assert!(failure.detail.contains("orphan_tool_result"));
     assert!(failure.detail.contains("missing-call"));
@@ -1783,29 +1789,41 @@ fn assembled_request_cache_key_is_openai_only() {
 #[test]
 fn failure_engages_backup_trigger_set() {
     // Timeouts → fall back.
-    assert!(failure_engages_backup("timeout_ttft"));
-    assert!(failure_engages_backup("timeout_idle"));
+    assert!(failure_engages_backup(&InferenceErrorClass::TimeoutTtft));
+    assert!(failure_engages_backup(&InferenceErrorClass::TimeoutIdle));
     // Connection / transport error → fall back.
-    assert!(failure_engages_backup("network"));
+    assert!(failure_engages_backup(&InferenceErrorClass::Network));
     // Pre-dispatch tool capability failures may fall back to a compatible backup.
-    assert!(failure_engages_backup("missing_tool_entitlement"));
-    assert!(failure_engages_backup("client_side_tools_unsupported"));
+    assert!(failure_engages_backup(
+        &InferenceErrorClass::MissingToolEntitlement {
+            feature: "client_side_tools".to_string()
+        }
+    ));
+    assert!(failure_engages_backup(
+        &InferenceErrorClass::ClientSideToolsUnsupported
+    ));
     // Non-retryable 5xx → fall back (sample across the range).
-    assert!(failure_engages_backup("http_500"));
-    assert!(failure_engages_backup("http_502"));
-    assert!(failure_engages_backup("http_599"));
+    assert!(failure_engages_backup(&InferenceErrorClass::Http(500)));
+    assert!(failure_engages_backup(&InferenceErrorClass::Http(502)));
+    assert!(failure_engages_backup(&InferenceErrorClass::Http(599)));
     // 4xx → hard-fail, no fallback (request/auth/config errors).
-    assert!(!failure_engages_backup("http_400"));
-    assert!(!failure_engages_backup("http_401"));
-    assert!(!failure_engages_backup("http_403"));
-    assert!(!failure_engages_backup("http_404"));
+    assert!(!failure_engages_backup(&InferenceErrorClass::Http(400)));
+    assert!(!failure_engages_backup(&InferenceErrorClass::Http(401)));
+    assert!(!failure_engages_backup(&InferenceErrorClass::Http(403)));
+    assert!(!failure_engages_backup(&InferenceErrorClass::Http(404)));
     // 429 (if it ever surfaced terminally) is a 4xx → no direct fallback;
     // the retry layer is what handles rate-limit by retrying the same model.
-    assert!(!failure_engages_backup("http_429"));
+    assert!(!failure_engages_backup(&InferenceErrorClass::Http(429)));
     // Unknown / malformed class → conservative no-fallback.
-    assert!(!failure_engages_backup("http_"));
-    assert!(!failure_engages_backup("weird"));
-    assert!(!failure_engages_backup("http_abc"));
+    assert!(!failure_engages_backup(&InferenceErrorClass::Other(
+        "http_".to_string()
+    )));
+    assert!(!failure_engages_backup(&InferenceErrorClass::Other(
+        "weird".to_string()
+    )));
+    assert!(!failure_engages_backup(&InferenceErrorClass::Other(
+        "http_abc".to_string()
+    )));
 }
 
 #[test]
@@ -1870,14 +1888,15 @@ fn unsupported_api_error_detection_is_narrow() {
     );
     assert!(!is_endpoint_mismatch_error(&text_only_404));
 
-    // A non-400 HttpError with the code is not a swap trigger (the swap is
-    // 400-only on the HttpError path; a real 500/etc. is a different fault).
+    // The unified detector uses the broad phrase-list union. A body that names
+    // the unsupported API code is treated as endpoint mismatch even when the
+    // status itself is not the old narrow 400 shape.
     let http_500 =
         CompletionError::HttpError(rig::http_client::Error::InvalidStatusCodeWithMessage(
             reqwest::StatusCode::from_u16(500).unwrap(),
             "{\"error\":{\"code\":\"unsupported_api_for_model\"}}".to_string(),
         ));
-    assert!(!is_endpoint_mismatch_error(&http_500));
+    assert!(is_endpoint_mismatch_error(&http_500));
 
     // A bare transport error / timeout sentinel never triggers a swap.
     assert!(!is_endpoint_mismatch_error(
@@ -3288,7 +3307,7 @@ async fn terminal_failure_preserves_configured_provider_identity() {
     let failure = as_inference_failure(&err).expect("typed inference failure");
     assert_eq!(failure.provider, "lmstudio");
     assert_eq!(failure.model, "local-model");
-    assert_eq!(failure.class, "http_401", "{failure:?}");
+    assert_eq!(failure.class, InferenceErrorClass::Http(401), "{failure:?}");
     assert_eq!(
         auth_failure_kind(failure),
         Some(crate::daemon::proto::AuthFailureKind::CredentialsRejected { status: 401 })
@@ -3338,7 +3357,12 @@ async fn grok_multi_agent_tools_without_entitlement_blocks_before_network() {
     let failure = as_inference_failure(&err).expect("typed inference failure");
     assert_eq!(failure.provider, "grok-oauth");
     assert_eq!(failure.model, "grok-4.20-multi-agent-0309");
-    assert_eq!(failure.class, "missing_tool_entitlement");
+    assert_eq!(
+        failure.class,
+        InferenceErrorClass::MissingToolEntitlement {
+            feature: crate::config::providers::XAI_MULTI_AGENT_TOOLS_ENTITLEMENT.to_string()
+        }
+    );
     assert!(failure.detail.contains("blocked before network dispatch"));
     assert!(failure_engages_backup(&failure.class));
     assert!(
@@ -4621,7 +4645,7 @@ async fn utility_timeout_cancels_hung_request() {
         .await
         .expect_err("hung utility request should time out");
     let failure = as_inference_failure(&err).expect("timeout should be typed");
-    assert_eq!(failure.class, "utility_timeout");
+    assert_eq!(failure.class, InferenceErrorClass::UtilityTimeout);
     assert_eq!(failure.phase, "utility_dispatch");
 }
 

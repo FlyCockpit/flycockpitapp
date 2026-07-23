@@ -109,19 +109,20 @@ pub enum InferenceErrorClass {
     Network,
     /// Non-retryable HTTP response, carrying the status code.
     Http(u16),
-}
-
-impl InferenceErrorClass {
-    /// Stable string form: `timeout_ttft` / `timeout_idle` / `network` /
-    /// `http_<status>`.
-    pub fn as_str(&self) -> String {
-        match self {
-            InferenceErrorClass::TimeoutTtft => "timeout_ttft".to_string(),
-            InferenceErrorClass::TimeoutIdle => "timeout_idle".to_string(),
-            InferenceErrorClass::Network => "network".to_string(),
-            InferenceErrorClass::Http(status) => format!("http_{status}"),
-        }
-    }
+    /// A bounded utility-model request exceeded its call-site budget.
+    UtilityTimeout,
+    /// The provider requires an entitlement for client-side tools.
+    MissingToolEntitlement { feature: String },
+    /// Client-side tools cannot be used with this model.
+    ClientSideToolsUnsupported,
+    /// Responses tool-call identity normalization failed before dispatch.
+    ResponsesToolIdentity,
+    /// Provider credentials/configuration are absent.
+    ProviderNotConfigured,
+    /// Provider reported a rate or usage limit without a concrete HTTP class.
+    ProviderRateLimit,
+    /// A novel class preserved exactly at the string boundary.
+    Other(String),
 }
 
 /// A well-typed, terminal inference failure — the clean hard-fail seam a
@@ -139,7 +140,7 @@ pub struct InferenceFailure {
     pub provider: String,
     pub model: String,
     pub phase: String,
-    pub class: String,
+    pub class: InferenceErrorClass,
     pub elapsed_ms: u64,
     pub retry_attempts: u32,
     /// Human-readable underlying reason (the source error's message), shown
@@ -162,34 +163,20 @@ pub fn auth_failure_kind(
 ) -> Option<crate::daemon::proto::AuthFailureKind> {
     use crate::daemon::proto::AuthFailureKind;
 
-    let detail = failure.detail.to_ascii_lowercase();
-    if detail.contains("subscription auth expired")
-        || detail.contains("oauth token expired")
-        || detail.contains("oauth credential expired")
-        || detail.contains("oauth token was revoked")
-    {
+    if super::rig_boundary::is_oauth_expired_detail(&failure.detail) {
         return Some(AuthFailureKind::OAuthExpired {
             provider: failure.provider.clone(),
         });
     }
-    if failure.class == "missing_tool_entitlement" {
-        let feature = failure
-            .detail
-            .split('`')
-            .nth(1)
-            .filter(|feature| !feature.trim().is_empty())
-            .unwrap_or("client_side_tools")
-            .to_string();
-        return Some(AuthFailureKind::MissingEntitlement { feature });
+    if let InferenceErrorClass::MissingToolEntitlement { feature } = &failure.class {
+        return Some(AuthFailureKind::MissingEntitlement {
+            feature: feature.clone(),
+        });
     }
-    if failure.class == "provider_not_configured" {
+    if matches!(failure.class, InferenceErrorClass::ProviderNotConfigured) {
         return Some(AuthFailureKind::ProviderNotConfigured);
     }
-    match failure
-        .class
-        .strip_prefix("http_")
-        .and_then(|value| value.parse::<u16>().ok())
-    {
+    match failure.class.provider_status() {
         Some(status @ (401 | 403)) => Some(AuthFailureKind::CredentialsRejected { status }),
         _ => None,
     }
@@ -217,19 +204,19 @@ pub fn auth_failure_kind(
 ///
 /// Operates on the `class` string so the driver can decide from the typed
 /// [`InferenceFailure`] without re-deriving the taxonomy.
-pub fn failure_engages_backup(class: &str) -> bool {
+pub fn failure_engages_backup(class: &InferenceErrorClass) -> bool {
     match class {
-        "timeout_ttft"
-        | "timeout_idle"
-        | "network"
-        | "missing_tool_entitlement"
-        | "client_side_tools_unsupported" => true,
-        other => other
-            .strip_prefix("http_")
-            .and_then(|s| s.parse::<u16>().ok())
-            // 5xx → fall back; every 4xx (and anything else) hard-fails.
-            .map(|status| (500..=599).contains(&status))
-            .unwrap_or(false),
+        InferenceErrorClass::TimeoutTtft
+        | InferenceErrorClass::TimeoutIdle
+        | InferenceErrorClass::Network
+        | InferenceErrorClass::MissingToolEntitlement { .. }
+        | InferenceErrorClass::ClientSideToolsUnsupported => true,
+        InferenceErrorClass::Http(status) => (500..=599).contains(status),
+        InferenceErrorClass::UtilityTimeout
+        | InferenceErrorClass::ResponsesToolIdentity
+        | InferenceErrorClass::ProviderNotConfigured
+        | InferenceErrorClass::ProviderRateLimit
+        | InferenceErrorClass::Other(_) => false,
     }
 }
 
@@ -246,167 +233,6 @@ pub struct InferenceTiming {
     pub first_token_ms: Option<u64>,
     /// Milliseconds from dispatch to stream completion.
     pub completed_ms: u64,
-}
-
-/// Sentinel embedded in a [`rig::completion::CompletionError`] carrying a
-/// stream-timeout verdict so it crosses the retry boundary fail-fast (the
-/// retry taxonomy classifies `RequestError` as `FailFast`). Distinct from
-/// [`AttemptCancelled`] so `complete_captured` can map it to a
-/// `timeout_ttft` / `timeout_idle` [`InferenceFailure`] rather than a
-/// cancellation.
-#[derive(Debug, thiserror::Error)]
-#[error("inference stream timed out ({0})")]
-struct StreamTimeout(&'static str);
-
-/// Build the TTFT-timeout sentinel as a `CompletionError`.
-pub(super) fn ttft_timeout() -> rig::completion::CompletionError {
-    rig::completion::CompletionError::RequestError(Box::new(StreamTimeout("timeout_ttft")))
-}
-
-/// Build the idle-timeout sentinel as a `CompletionError`.
-pub(super) fn idle_timeout() -> rig::completion::CompletionError {
-    rig::completion::CompletionError::RequestError(Box::new(StreamTimeout("timeout_idle")))
-}
-
-/// Detect the [`StreamTimeout`] sentinel, returning its kind tag when present.
-pub(super) fn stream_timeout_kind(err: &rig::completion::CompletionError) -> Option<&'static str> {
-    if let rig::completion::CompletionError::RequestError(inner) = err {
-        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(inner.as_ref());
-        while let Some(e) = current {
-            if let Some(st) = e.downcast_ref::<StreamTimeout>() {
-                return Some(st.0);
-            }
-            current = e.source();
-        }
-    }
-    None
-}
-
-/// Classify a terminal [`rig::completion::CompletionError`] into the
-/// failure taxonomy recorded on the event + dispatch-time record
-/// (implementation note). Our own
-/// [`StreamTimeout`] sentinels map to `timeout_ttft` / `timeout_idle`; an
-/// HTTP status maps to `http_<status>`; everything else on the transport
-/// path is `network`. The cancellation sentinel is handled before this is
-/// called, so it never produces `Cancelled` here (that class is reserved for
-/// the dispatch-time record's cancel transition).
-pub(super) fn classify_inference_failure(
-    err: &rig::completion::CompletionError,
-) -> InferenceErrorClass {
-    if let Some(kind) = stream_timeout_kind(err) {
-        return match kind {
-            "timeout_ttft" => InferenceErrorClass::TimeoutTtft,
-            _ => InferenceErrorClass::TimeoutIdle,
-        };
-    }
-    if let Some(status) = http_status_of(err) {
-        return InferenceErrorClass::Http(status);
-    }
-    InferenceErrorClass::Network
-}
-
-/// Extract the HTTP status code an error carries, if any — for the
-/// `http_<status>` failure class. Mirrors the status surfaces the retry
-/// taxonomy reads (`src/engine/retry.rs`): rig's status variants plus a
-/// status-carrying inner `reqwest::Error`.
-fn http_status_of(err: &rig::completion::CompletionError) -> Option<u16> {
-    if let rig::completion::CompletionError::ProviderError(message) = err {
-        // rig's streaming OpenAI-compatible path converts a non-success
-        // response into `ProviderError` and preserves the concrete status in
-        // this stable leading phrase. Keep the parse deliberately narrow so
-        // digits from an arbitrary provider body cannot become a status.
-        let digits = message
-            .strip_prefix("Invalid status code ")?
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>();
-        return digits
-            .parse::<u16>()
-            .ok()
-            .filter(|status| (100..=599).contains(status));
-    }
-    let rig::completion::CompletionError::HttpError(http_err) = err else {
-        return None;
-    };
-    use rig::http_client::Error as H;
-    match http_err {
-        H::InvalidStatusCode(status) | H::InvalidStatusCodeWithMessage(status, _) => {
-            Some(status.as_u16())
-        }
-        H::Instance(boxed) => {
-            let mut current: Option<&(dyn std::error::Error + 'static)> = Some(boxed.as_ref());
-            while let Some(e) = current {
-                if let Some(re) = e.downcast_ref::<reqwest::Error>() {
-                    return re.status().map(|s| s.as_u16());
-                }
-                current = e.source();
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-/// The provider error `code` that signals a model is not served over the
-/// endpoint that was tried — the narrow trigger for the bidirectional
-/// endpoint-swap fallback (implementation note).
-const UNSUPPORTED_API_CODE: &str = "unsupported_api_for_model";
-
-/// `true` when `err` is the `unsupported_api_for_model` signal — an OpenAI-
-/// compatible 400 whose JSON body carries `"code":"unsupported_api_for_model"`
-/// (implementation note). rig surfaces this as the
-/// first stream item: a [`CompletionError::ProviderError`] whose string is the
-/// `to_string()` of the underlying `InvalidStatusCodeWithMessage(400, body)`,
-/// so the body (with the `code`) is embedded in the message. We match on the
-/// `code` substring — **not** merely the 400 status — so other 400s (bad
-/// request, context length, auth) never trigger an endpoint retry. The
-/// `HttpError(InvalidStatusCodeWithMessage(..))` shape is also matched
-/// defensively in case a transport-layer path ever surfaces it directly.
-fn is_unsupported_api_error(err: &rig::completion::CompletionError) -> bool {
-    match err {
-        rig::completion::CompletionError::ProviderError(msg) => msg.contains(UNSUPPORTED_API_CODE),
-        rig::completion::CompletionError::HttpError(
-            rig::http_client::Error::InvalidStatusCodeWithMessage(status, body),
-        ) => status.as_u16() == 400 && body.contains(UNSUPPORTED_API_CODE),
-        _ => false,
-    }
-}
-
-pub(super) fn is_endpoint_mismatch_error(err: &rig::completion::CompletionError) -> bool {
-    if is_unsupported_api_error(err) {
-        return true;
-    }
-    match err {
-        rig::completion::CompletionError::ProviderError(msg) => {
-            let lower = msg.to_ascii_lowercase();
-            lower.contains("method not allowed")
-                || lower.contains("unknown route")
-                || lower.contains("unknown path")
-                || lower.contains("unknown endpoint")
-                || lower.contains("no route")
-                || lower.contains("no path")
-                || lower.contains("route not found")
-                || lower.contains("path not found")
-                || lower.contains("endpoint not found")
-        }
-        rig::completion::CompletionError::HttpError(
-            rig::http_client::Error::InvalidStatusCodeWithMessage(status, body),
-        ) => {
-            let code = status.as_u16();
-            if code == 404 || code == 405 || (code == 400 && body.contains(UNSUPPORTED_API_CODE)) {
-                return true;
-            }
-            let lower = body.to_ascii_lowercase();
-            lower.contains("unknown route")
-                || lower.contains("unknown path")
-                || lower.contains("no route")
-                || lower.contains("route not found")
-        }
-        rig::completion::CompletionError::HttpError(
-            rig::http_client::Error::InvalidStatusCode(status),
-        ) => matches!(status.as_u16(), 404 | 405),
-        _ => false,
-    }
 }
 
 /// Persist a self-healed wire-API endpoint back into config
@@ -458,54 +284,4 @@ pub(super) fn persist_wire_api(
     if let Err(e) = doc.write(&cfg) {
         tracing::warn!(error = %e, "persist wire_api: writing config failed");
     }
-}
-
-/// Human-readable detail for the inline error. A pure timeout needs none
-/// (the class + ceiling already say everything); a network / HTTP failure
-/// carries the underlying message so the user sees *what* failed.
-pub(super) fn failure_detail(
-    err: &rig::completion::CompletionError,
-    class: &InferenceErrorClass,
-) -> String {
-    match class {
-        InferenceErrorClass::TimeoutTtft | InferenceErrorClass::TimeoutIdle => String::new(),
-        _ => err.to_string(),
-    }
-}
-
-pub(super) fn provider_rejected_xai_multi_agent_tools(detail: &str) -> bool {
-    let detail = detail.to_ascii_lowercase();
-    detail.contains("client-side tools")
-        && detail.contains("multi-agent")
-        && detail.contains("beta access")
-}
-
-/// Sentinel embedded in a [`rig::completion::CompletionError`] when a
-/// retry *attempt* is aborted by ctrl+c (as opposed to a transport
-/// failure). It is wrapped in `RequestError`, which the retry taxonomy
-/// classifies fail-fast, so [`retry::with_retry`] returns at once
-/// instead of retrying; `complete_captured` then maps it to
-/// [`InferenceCancelled`].
-#[derive(Debug, thiserror::Error)]
-#[error("inference attempt cancelled by user")]
-struct AttemptCancelled;
-
-/// Build the cancellation sentinel as a `CompletionError`.
-pub(super) fn attempt_cancelled() -> rig::completion::CompletionError {
-    rig::completion::CompletionError::RequestError(Box::new(AttemptCancelled))
-}
-
-/// Detect the [`AttemptCancelled`] sentinel in a `CompletionError`.
-pub(super) fn is_attempt_cancelled(err: &rig::completion::CompletionError) -> bool {
-    if let rig::completion::CompletionError::RequestError(inner) = err {
-        // Walk the boxed error chain for the marker.
-        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(inner.as_ref());
-        while let Some(e) = current {
-            if e.downcast_ref::<AttemptCancelled>().is_some() {
-                return true;
-            }
-            current = e.source();
-        }
-    }
-    false
 }

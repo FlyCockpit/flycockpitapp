@@ -1716,7 +1716,7 @@ mod tests {
                 agent: "Build".to_string(),
                 provider: "openai".to_string(),
                 model: "gpt-5".to_string(),
-                error_class: "network".to_string(),
+                error_class: crate::engine::model::InferenceErrorClass::Network.as_str(),
                 detail: "inference failed".to_string(),
                 auth_failure: None,
             },

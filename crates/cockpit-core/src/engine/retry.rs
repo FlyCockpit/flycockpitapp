@@ -44,6 +44,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::agent::TurnEvent;
+use crate::engine::model::InferenceErrorClass;
 
 /// First backoff interval (before jitter). Doubles each repeated
 /// failure up to [`BACKOFF_CAP`].
@@ -85,17 +86,18 @@ pub enum RetryDecision {
 }
 
 pub(crate) fn failure_retry_decision_and_rationale(
-    class: &str,
+    class: &InferenceErrorClass,
     provider_status: Option<u16>,
 ) -> (&'static str, &'static str) {
     match class {
-        "timeout_ttft" => ("fail_fast", "time_to_first_token_timeout"),
-        "timeout_idle" => ("fail_fast", "stream_idle_timeout"),
-        "network" => (
+        InferenceErrorClass::TimeoutTtft => ("fail_fast", "time_to_first_token_timeout"),
+        InferenceErrorClass::TimeoutIdle => ("fail_fast", "stream_idle_timeout"),
+        InferenceErrorClass::Network => (
             "terminal_after_retry_layer",
             "transport_or_provider_failure_after_retry_layer",
         ),
-        "missing_tool_entitlement" | "client_side_tools_unsupported" => {
+        InferenceErrorClass::MissingToolEntitlement { .. }
+        | InferenceErrorClass::ClientSideToolsUnsupported => {
             ("fail_fast", "client_side_capability_block")
         }
         _ if provider_status.is_some_and(|status| status == 429 || status == 503) => (
@@ -108,20 +110,24 @@ pub(crate) fn failure_retry_decision_and_rationale(
         _ if provider_status.is_some_and(|status| (400..=499).contains(&status)) => {
             ("fail_fast", "non_retryable_http_status")
         }
-        _ => ("fail_fast", "non_retryable_or_unclassified_failure"),
+        InferenceErrorClass::UtilityTimeout
+        | InferenceErrorClass::ResponsesToolIdentity
+        | InferenceErrorClass::ProviderNotConfigured
+        | InferenceErrorClass::ProviderRateLimit
+        | InferenceErrorClass::Http(_)
+        | InferenceErrorClass::Other(_) => ("fail_fast", "non_retryable_or_unclassified_failure"),
     }
 }
 
-pub(crate) fn is_usage_limit_failure(class: &str, provider_status: Option<u16>) -> bool {
-    if provider_status == Some(429) {
-        return true;
-    }
-    let normalized = class.to_ascii_lowercase();
-    normalized == "http_429"
-        || normalized.contains("rate_limit")
-        || normalized.contains("rate_limited")
-        || normalized.contains("usage_limit")
-        || normalized.contains("quota")
+pub(crate) fn is_usage_limit_failure(
+    class: &InferenceErrorClass,
+    provider_status: Option<u16>,
+) -> bool {
+    provider_status == Some(429)
+        || matches!(
+            class,
+            InferenceErrorClass::Http(429) | InferenceErrorClass::ProviderRateLimit
+        )
 }
 
 /// Classify a [`CompletionError`] into the retry taxonomy.
@@ -136,7 +142,7 @@ pub(crate) fn is_usage_limit_failure(class: &str, provider_status: Option<u16>) 
 /// | `HttpError(Instance(e))`, non-reqwest inner error | opaque transport box | conservative `Retry` (it is on the transport path) |
 /// | `HttpError(Protocol \| StreamEnded \| NoHeaders \| InvalidContentType \| InvalidHeaderValue)` | framing/header faults, not auth | see notes below |
 /// | `JsonError` / `UrlError` / `RequestError` / `ResponseError` | serialization / bad URL / request-build / malformed body | `FailFast` |
-/// | `ProviderError(_)` | provider-formatted error string, usually with **no status code exposed** | narrow status parse for clear transient `429`/`503`, otherwise `FailFast` (see note) |
+/// | provider-formatted error string | usually has **no status code exposed** | narrow status parse for clear transient `429`/`503`, otherwise `FailFast` (see note) |
 ///
 /// ### Deliberate, documented edge calls
 ///
@@ -158,7 +164,7 @@ pub(crate) fn is_usage_limit_failure(class: &str, provider_status: Option<u16>) 
 ///   status (`429` or `503`) and otherwise keep the
 ///   conservative **fail-fast** default. This avoids treating generic
 ///   prose like "rate limited" as retryable while still covering
-///   provider bodies that surface as `ProviderError("HTTP 503 …")`.
+///   provider bodies that surface as provider-formatted `HTTP 503` strings.
 /// - **`Protocol` / `NoHeaders` / `InvalidContentType` /
 ///   `InvalidHeaderValue`**: malformed framing or our own bad header —
 ///   not a dropped link and not transient, so `FailFast`.
@@ -184,50 +190,17 @@ pub fn classify(err: &CompletionError) -> RetryDecision {
         | CompletionError::ResponseError(_) => RetryDecision::FailFast,
         // Provider-formatted error string: only retry when it clearly
         // carries a transient HTTP status; otherwise fail fast.
-        CompletionError::ProviderError(msg) => classify_provider_error(msg),
-    }
-}
-
-fn classify_provider_error(msg: &str) -> RetryDecision {
-    match provider_error_status(msg) {
-        Some(status) => classify_status(status, None),
-        None => RetryDecision::FailFast,
-    }
-}
-
-fn provider_error_status(msg: &str) -> Option<u16> {
-    let lower = msg.to_ascii_lowercase();
-    for marker in ["status", "http", "code", "error"] {
-        if let Some(status) = status_after_marker(&lower, marker)
-            && is_provider_status_retry_candidate(status)
+        err if crate::engine::model::rig_boundary::provider_error_status_for_retry(err)
+            .is_some() =>
         {
-            return Some(status);
+            classify_status(
+                crate::engine::model::rig_boundary::provider_error_status_for_retry(err)
+                    .expect("guarded provider status"),
+                None,
+            )
         }
+        _ => RetryDecision::FailFast,
     }
-    if lower.contains("service unavailable") {
-        return Some(503);
-    }
-    None
-}
-
-fn status_after_marker(lower: &str, marker: &str) -> Option<u16> {
-    let idx = lower.find(marker)?;
-    let rest = &lower[idx + marker.len()..];
-    let start = rest.find(|c: char| c.is_ascii_digit())?;
-    let digits: String = rest[start..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .take(3)
-        .collect();
-    if digits.len() == 3 {
-        digits.parse::<u16>().ok()
-    } else {
-        None
-    }
-}
-
-fn is_provider_status_retry_candidate(status: u16) -> bool {
-    status == 429 || status == 503
 }
 
 fn classify_http(err: &rig::http_client::Error) -> RetryDecision {
@@ -682,40 +655,40 @@ mod tests {
     #[test]
     fn failure_retry_decision_rationale_covers_representative_arms() {
         assert_eq!(
-            failure_retry_decision_and_rationale("timeout_ttft", None),
+            failure_retry_decision_and_rationale(&InferenceErrorClass::TimeoutTtft, None),
             ("fail_fast", "time_to_first_token_timeout")
         );
         assert_eq!(
-            failure_retry_decision_and_rationale("network", None),
+            failure_retry_decision_and_rationale(&InferenceErrorClass::Network, None),
             (
                 "terminal_after_retry_layer",
                 "transport_or_provider_failure_after_retry_layer"
             )
         );
         assert_eq!(
-            failure_retry_decision_and_rationale("http_429", Some(429)),
+            failure_retry_decision_and_rationale(&InferenceErrorClass::Http(429), Some(429)),
             (
                 "terminal_after_retry_layer",
                 "retryable_http_status_terminal"
             )
         );
         assert_eq!(
-            failure_retry_decision_and_rationale("http_503", Some(503)),
+            failure_retry_decision_and_rationale(&InferenceErrorClass::Http(503), Some(503)),
             (
                 "terminal_after_retry_layer",
                 "retryable_http_status_terminal"
             )
         );
         assert_eq!(
-            failure_retry_decision_and_rationale("http_502", Some(502)),
+            failure_retry_decision_and_rationale(&InferenceErrorClass::Http(502), Some(502)),
             ("terminal_after_retry_layer", "server_http_status_terminal")
         );
         assert_eq!(
-            failure_retry_decision_and_rationale("http_400", Some(400)),
+            failure_retry_decision_and_rationale(&InferenceErrorClass::Http(400), Some(400)),
             ("fail_fast", "non_retryable_http_status")
         );
         assert_eq!(
-            failure_retry_decision_and_rationale("weird", None),
+            failure_retry_decision_and_rationale(&InferenceErrorClass::Other("weird".into()), None),
             ("fail_fast", "non_retryable_or_unclassified_failure")
         );
     }
@@ -778,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_error_status_strings_retry_only_clear_transients() {
+    fn provider_error_strings_retry_only_clear_transients() {
         assert_eq!(
             classify(&CompletionError::ProviderError(
                 "HTTP 503 Service Unavailable: upstream overloaded".into()

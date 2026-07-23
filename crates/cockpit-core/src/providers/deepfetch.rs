@@ -343,7 +343,12 @@ pub(crate) fn classify_endpoint_probe(raw: ProbeRawOutcome) -> EndpointProbeOutc
             Ok(StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED) => {
                 EndpointProbeOutcome::Incompatible
             }
-            _ if is_endpoint_mismatch_error_text(&error.body) => EndpointProbeOutcome::Incompatible,
+            _ if crate::engine::model::rig_boundary::is_endpoint_mismatch_error_text(
+                &error.body,
+            ) =>
+            {
+                EndpointProbeOutcome::Incompatible
+            }
             _ => EndpointProbeOutcome::Inconclusive(error.body),
         },
     }
@@ -366,18 +371,6 @@ pub(crate) fn classify_context_probe(raw: ProbeRawOutcome) -> ContextProbeOutcom
                 .unwrap_or_else(|| ContextProbeOutcome::Inconclusive(error.body)),
         },
     }
-}
-
-fn is_endpoint_mismatch_error_text(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("use the responses api")
-        || lower.contains("use /v1/responses")
-        || lower.contains("unsupported_api_for_model")
-        || lower.contains("not supported on this endpoint")
-        || lower.contains("not supported with this endpoint")
-        || lower.contains("chat completions endpoint")
-        || lower.contains("responses endpoint")
-        || lower.contains("unsupported endpoint")
 }
 
 pub(crate) fn choose_probed_wire_api(
@@ -782,7 +775,7 @@ mod tests {
         assert_eq!(
             classify_endpoint_probe(ProbeRawOutcome::HttpError(ProbeHttpError {
                 status: 400,
-                body: "unsupported_api_for_model".into(),
+                body: crate::engine::model::rig_boundary::UNSUPPORTED_API_CODE.into(),
             })),
             EndpointProbeOutcome::Incompatible
         );

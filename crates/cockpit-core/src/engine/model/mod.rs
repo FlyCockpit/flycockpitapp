@@ -57,6 +57,7 @@ mod failure;
 mod http_client;
 mod outbound_guard;
 mod redact;
+pub(crate) mod rig_boundary;
 mod wire;
 pub(crate) mod wire_schema;
 
@@ -93,6 +94,8 @@ use http_client::*;
 use outbound_guard::*;
 #[allow(unused_imports)]
 use redact::*;
+#[allow(unused_imports)]
+use rig_boundary::*;
 #[allow(unused_imports)]
 use wire::*;
 

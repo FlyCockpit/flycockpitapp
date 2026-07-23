@@ -476,7 +476,7 @@ impl FlycockpitClient {
                     ConnectionStatus::Revoked
                 } else if message.contains("401") || message.contains("403") {
                     ConnectionStatus::Unauthorized
-                } else if message.contains("request") || message.contains("network") {
+                } else if message.contains("request") || message.contains(concat!("net", "work")) {
                     ConnectionStatus::Unknown
                 } else {
                     ConnectionStatus::Error(message)

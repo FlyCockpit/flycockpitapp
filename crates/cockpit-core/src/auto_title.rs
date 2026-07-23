@@ -148,8 +148,12 @@ fn is_utility_model_unset_error(e: &anyhow::Error) -> bool {
 fn is_title_call_timeout_error(e: &anyhow::Error) -> bool {
     e.downcast_ref::<tokio::time::error::Elapsed>().is_some()
         || e.to_string().contains("deadline has elapsed")
-        || crate::engine::model::as_inference_failure(e)
-            .is_some_and(|failure| failure.class == "utility_timeout")
+        || crate::engine::model::as_inference_failure(e).is_some_and(|failure| {
+            matches!(
+                failure.class,
+                crate::engine::model::InferenceErrorClass::UtilityTimeout
+            )
+        })
 }
 
 fn auto_title_failure_notice(e: &anyhow::Error) -> &'static str {

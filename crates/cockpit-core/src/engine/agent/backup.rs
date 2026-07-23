@@ -15,11 +15,11 @@ pub struct FailoverAttempt {
 }
 
 impl FailoverAttempt {
-    pub fn failed(model: &Model, error_class: impl Into<String>) -> Self {
+    pub fn failed(model: &Model, error_class: &crate::engine::model::InferenceErrorClass) -> Self {
         Self {
             provider: model.provider_id().to_string(),
             model: model.model_id_ref().to_string(),
-            error_class: Some(error_class.into()),
+            error_class: Some(error_class.as_str()),
             outcome: "failed",
         }
     }
@@ -48,15 +48,29 @@ impl BackupFallbackDecision {
     }
 }
 
-pub fn suggested_action_for_failure_class(class: &str) -> &'static str {
+pub fn suggested_action_for_failure_class(
+    class: &crate::engine::model::InferenceErrorClass,
+) -> &'static str {
     match class {
-        "timeout_ttft" | "timeout_idle" | "network" => "retry_or_choose_another_model",
-        "missing_tool_entitlement" | "client_side_tools_unsupported" => {
+        crate::engine::model::InferenceErrorClass::TimeoutTtft
+        | crate::engine::model::InferenceErrorClass::TimeoutIdle
+        | crate::engine::model::InferenceErrorClass::Network => "retry_or_choose_another_model",
+        crate::engine::model::InferenceErrorClass::MissingToolEntitlement { .. }
+        | crate::engine::model::InferenceErrorClass::ClientSideToolsUnsupported => {
             "change_model_or_disable_tool"
         }
-        class if class.starts_with("http_5") => "retry_later_or_choose_another_model",
-        class if class.starts_with("http_4") => "check_configuration_or_credentials",
-        _ => "inspect_failure",
+        crate::engine::model::InferenceErrorClass::Http(status) if (500..=599).contains(status) => {
+            "retry_later_or_choose_another_model"
+        }
+        crate::engine::model::InferenceErrorClass::Http(status) if (400..=499).contains(status) => {
+            "check_configuration_or_credentials"
+        }
+        crate::engine::model::InferenceErrorClass::UtilityTimeout
+        | crate::engine::model::InferenceErrorClass::ResponsesToolIdentity
+        | crate::engine::model::InferenceErrorClass::ProviderNotConfigured
+        | crate::engine::model::InferenceErrorClass::ProviderRateLimit
+        | crate::engine::model::InferenceErrorClass::Http(_)
+        | crate::engine::model::InferenceErrorClass::Other(_) => "inspect_failure",
     }
 }
 
@@ -209,9 +223,10 @@ pub async fn turn_with_backup(
                     return Err(err);
                 };
                 let class = failure.class.clone();
-                fallback_tried.push(FailoverAttempt::failed(current_model, class.clone()));
+                let class_string = class.as_str();
+                fallback_tried.push(FailoverAttempt::failed(current_model, &class));
                 if first_failure.is_none() {
-                    first_failure = Some((failure.model.clone(), class.clone()));
+                    first_failure = Some((failure.model.clone(), class_string.clone()));
                 }
                 let can_advance = crate::engine::model::failure_engages_backup(&class)
                     && attempt_index < candidates.len();
@@ -222,7 +237,7 @@ pub async fn turn_with_backup(
                                 agent: agent.name.clone(),
                                 provider: failure.provider.clone(),
                                 model: failure.model.clone(),
-                                error_class: failure.class.clone(),
+                                error_class: failure.class.as_str(),
                                 detail: failure.detail.clone(),
                                 auth_failure: crate::engine::model::auth_failure_kind(failure),
                             })
@@ -249,7 +264,7 @@ pub async fn turn_with_backup(
                     .send(TurnEvent::BackupUsed {
                         agent: agent.name.clone(),
                         primary_model: failure.model.clone(),
-                        error_class: class,
+                        error_class: class_string,
                         backup_model: next_model.model_id_ref().to_string(),
                     })
                     .await;
@@ -335,8 +350,7 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
         return;
     };
 
-    let is_timeout = failure.class == "timeout_ttft" || failure.class == "timeout_idle";
-    let status = if is_timeout {
+    let status = if failure.class.is_timeout() {
         InferenceRequestStatus::TimedOut
     } else {
         InferenceRequestStatus::Errored
@@ -368,7 +382,7 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
                 "wire_api": wire_api,
                 "routing": routing_metadata,
                 "phase_reached": failure.phase,
-                "error_class": failure.class,
+                "error_class": failure.class.as_str(),
                 "elapsed_ms": failure.elapsed_ms,
                 "detail": failure.detail,
                 "provider_status": diagnostics.provider_status,
@@ -396,7 +410,7 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
                 agent: agent_name.to_string(),
                 provider: failure.provider.clone(),
                 model: failure.model.clone(),
-                error_class: failure.class.clone(),
+                error_class: failure.class.as_str(),
                 detail: failure.detail.clone(),
                 auth_failure: crate::engine::model::auth_failure_kind(failure),
             })
@@ -418,10 +432,7 @@ fn inference_failure_diagnostics(
     failure: &crate::engine::model::InferenceFailure,
     _wire_api: &str,
 ) -> InferenceFailureDiagnostics {
-    let provider_status = failure
-        .class
-        .strip_prefix("http_")
-        .and_then(|s| s.parse::<u16>().ok());
+    let provider_status = failure.class.provider_status();
     let provider_body_snippet = crate::text::bounded_snippet(&failure.detail, 800);
     let (retry_final_decision, classification_rationale) =
         crate::engine::retry::failure_retry_decision_and_rationale(&failure.class, provider_status);
@@ -446,7 +457,7 @@ mod inference_outcome_tests {
     //! red inline error.
     use super::*;
     use crate::db::session_log::InferenceRequestStatus;
-    use crate::engine::model::InferenceFailure;
+    use crate::engine::model::{InferenceErrorClass, InferenceFailure};
 
     fn in_memory_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -454,7 +465,7 @@ mod inference_outcome_tests {
     }
 
     async fn emitted_auth_failure(
-        class: &str,
+        class: InferenceErrorClass,
         detail: &str,
     ) -> Option<crate::daemon::proto::AuthFailureKind> {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -469,7 +480,7 @@ mod inference_outcome_tests {
             provider: "mock-provider".into(),
             model: "mock-model".into(),
             phase: "dispatched".into(),
-            class: class.into(),
+            class,
             elapsed_ms: 1,
             retry_attempts: 1,
             detail: detail.into(),
@@ -498,7 +509,7 @@ mod inference_outcome_tests {
     #[tokio::test]
     async fn auth_failure_classified_on_event() {
         assert_eq!(
-            emitted_auth_failure("http_401", "unauthorized").await,
+            emitted_auth_failure(InferenceErrorClass::Http(401), "unauthorized").await,
             Some(crate::daemon::proto::AuthFailureKind::CredentialsRejected { status: 401 })
         );
     }
@@ -506,7 +517,7 @@ mod inference_outcome_tests {
     #[tokio::test]
     async fn rate_limit_not_auth_failure() {
         assert_eq!(
-            emitted_auth_failure("http_429", "too many requests").await,
+            emitted_auth_failure(InferenceErrorClass::Http(429), "too many requests").await,
             None
         );
     }
@@ -541,7 +552,7 @@ mod inference_outcome_tests {
             provider: "openai-compatible".into(),
             model: "qwen3".into(),
             phase: "dispatched".into(),
-            class: "timeout_ttft".into(),
+            class: InferenceErrorClass::TimeoutTtft,
             elapsed_ms: 120_000,
             retry_attempts: 1,
             detail: String::new(),
@@ -579,7 +590,10 @@ mod inference_outcome_tests {
             .iter()
             .find(|e| e.kind == "inference_failure")
             .expect("an inference_failure event was recorded");
-        assert_eq!(fail.data["error_class"], "timeout_ttft");
+        assert_eq!(
+            fail.data["error_class"],
+            InferenceErrorClass::TimeoutTtft.as_str()
+        );
         assert_eq!(fail.data["phase_reached"], "dispatched");
         assert_eq!(fail.data["elapsed_ms"], 120_000);
         assert_eq!(fail.data["provider"], "openai-compatible");
@@ -599,7 +613,7 @@ mod inference_outcome_tests {
         let mut saw_red = false;
         while let Ok(ev) = rx.try_recv() {
             if let TurnEvent::InferenceFailed { error_class, .. } = ev {
-                assert_eq!(error_class, "timeout_ttft");
+                assert_eq!(error_class, InferenceErrorClass::TimeoutTtft.as_str());
                 saw_red = true;
             }
         }
@@ -609,11 +623,11 @@ mod inference_outcome_tests {
     #[test]
     fn recommended_action_is_derived_from_failure_class() {
         assert_ne!(
-            suggested_action_for_failure_class("timeout_ttft"),
-            suggested_action_for_failure_class("http_400")
+            suggested_action_for_failure_class(&InferenceErrorClass::TimeoutTtft),
+            suggested_action_for_failure_class(&InferenceErrorClass::Http(400))
         );
         assert_ne!(
-            suggested_action_for_failure_class("http_400"),
+            suggested_action_for_failure_class(&InferenceErrorClass::Http(400)),
             "retry_same_turn"
         );
     }
@@ -632,7 +646,7 @@ mod inference_outcome_tests {
             provider: "mock-provider".into(),
             model: "mock-model".into(),
             phase: "dispatched".into(),
-            class: "network".into(),
+            class: InferenceErrorClass::Network,
             elapsed_ms: 42,
             retry_attempts: 3,
             detail: "connection refused".into(),
@@ -721,6 +735,7 @@ mod backup_fallback_tests {
     use crate::config::providers::{
         BackupConfig, ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig, TimeoutConfig,
     };
+    use crate::engine::model::InferenceErrorClass;
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
@@ -1306,7 +1321,7 @@ mod backup_fallback_tests {
         });
         let (pm, class, bm) = banner.expect("a BackupUsed banner was emitted");
         assert_eq!(pm, "primary-model");
-        assert_eq!(class, "timeout_ttft");
+        assert_eq!(class, InferenceErrorClass::TimeoutTtft.as_str());
         assert_eq!(bm, "backup-model");
         assert!(events.iter().any(|e| matches!(
             e,
@@ -1363,7 +1378,8 @@ mod backup_fallback_tests {
         let events = drain(&mut rx);
         assert!(events.iter().any(|e| matches!(
             e,
-            TurnEvent::BackupUsed { error_class, .. } if error_class == "timeout_ttft"
+            TurnEvent::BackupUsed { error_class, .. }
+                if error_class == &InferenceErrorClass::TimeoutTtft.as_str()
         )));
     }
 
@@ -1420,7 +1436,8 @@ mod backup_fallback_tests {
         let events = drain(&mut rx);
         assert!(events.iter().any(|e| matches!(
             e,
-            TurnEvent::BackupUsed { error_class, .. } if error_class == "network"
+            TurnEvent::BackupUsed { error_class, .. }
+                if error_class == &InferenceErrorClass::Network.as_str()
         )));
     }
 

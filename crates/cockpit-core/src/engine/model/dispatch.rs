@@ -271,7 +271,7 @@ impl Model {
                 provider: self.provider_label().to_string(),
                 model: self.model_id().to_string(),
                 phase: "utility_dispatch".to_string(),
-                class: "utility_timeout".to_string(),
+                class: InferenceErrorClass::UtilityTimeout,
                 elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                 retry_attempts: 1,
                 detail: format!(
@@ -871,7 +871,7 @@ impl Model {
                     provider: self.provider_id().to_string(),
                     model: self.model_id().to_string(),
                     phase: phase.as_str().to_string(),
-                    class: class.as_str(),
+                    class,
                     elapsed_ms,
                     retry_attempts: retry_attempts
                         .load(std::sync::atomic::Ordering::SeqCst)
@@ -925,7 +925,9 @@ impl Model {
                     provider: self.provider_id().to_string(),
                     model: self.model_id().to_string(),
                     phase: "prep".to_string(),
-                    class: "missing_tool_entitlement".to_string(),
+                    class: InferenceErrorClass::MissingToolEntitlement {
+                        feature: entitlement.to_string(),
+                    },
                     elapsed_ms: 0,
                     retry_attempts: 1,
                     detail: format!(
@@ -937,7 +939,7 @@ impl Model {
                 provider: self.provider_id().to_string(),
                 model: self.model_id().to_string(),
                 phase: "prep".to_string(),
-                class: "client_side_tools_unsupported".to_string(),
+                class: InferenceErrorClass::ClientSideToolsUnsupported,
                 elapsed_ms: 0,
                 retry_attempts: 1,
                 detail: "client-side tools are unsupported for this model; primary model was blocked before network dispatch. Choose a tool-compatible model or configure a compatible backup model."
@@ -1014,7 +1016,7 @@ impl Model {
                             provider: self.provider_id().to_string(),
                             model: self.model_id().to_string(),
                             phase: InferencePhase::Prep.as_str().to_string(),
-                            class: "responses_tool_identity".to_string(),
+                            class: InferenceErrorClass::ResponsesToolIdentity,
                             elapsed_ms: prep_started.elapsed().as_millis() as u64,
                             retry_attempts: 1,
                             detail: err.to_string(),

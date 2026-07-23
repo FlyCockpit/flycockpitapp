@@ -2627,14 +2627,14 @@ impl Driver {
                         .await;
                     if !self.handle_goal_usage_limit_failure(f, tx).await {
                         self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
-                            class: f.class.clone(),
+                            class: f.class.as_str(),
                         });
                     }
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::InferenceFailed {
                             provider: f.provider.clone(),
                             model: f.model.clone(),
-                            class: f.class.clone(),
+                            class: f.class.as_str(),
                             phase: f.phase.clone(),
                         },
                         input_rx,
@@ -3365,10 +3365,7 @@ impl Driver {
     fn inference_failure_provider_status(
         failure: &crate::engine::model::InferenceFailure,
     ) -> Option<u16> {
-        failure
-            .class
-            .strip_prefix("http_")
-            .and_then(|s| s.parse::<u16>().ok())
+        failure.class.provider_status()
     }
 
     async fn handle_goal_usage_limit_failure(
@@ -3721,10 +3718,7 @@ impl Driver {
                     "blocked_attempts": goal.blocked_attempts,
                 })
             });
-        let provider_status = failure
-            .class
-            .strip_prefix("http_")
-            .and_then(|s| s.parse::<u16>().ok());
+        let provider_status = failure.class.provider_status();
         let (retry_final_decision, classification_rationale) =
             crate::engine::retry::failure_retry_decision_and_rationale(
                 &failure.class,
@@ -3744,7 +3738,7 @@ impl Driver {
             "model": failure.model,
             "wire_api": agent.model.wire_api_label(),
             "phase_reached": failure.phase,
-            "error_class": failure.class,
+            "error_class": failure.class.as_str(),
             "elapsed_ms": failure.elapsed_ms,
             "provider_status": provider_status,
             "provider_body_snippet": provider_body_snippet,
@@ -5673,14 +5667,14 @@ impl Driver {
                         .await;
                     if !self.handle_goal_usage_limit_failure(f, tx).await {
                         self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
-                            class: f.class.clone(),
+                            class: f.class.as_str(),
                         });
                     }
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::InferenceFailed {
                             provider: f.provider.clone(),
                             model: f.model.clone(),
-                            class: f.class.clone(),
+                            class: f.class.as_str(),
                             phase: f.phase.clone(),
                         },
                         input_rx,

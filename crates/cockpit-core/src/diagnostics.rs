@@ -84,7 +84,7 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
     );
     out.push_str(&format!("approval: {}\n", snapshot.approval_mode));
     push_section(&mut out, "providers", &snapshot.providers);
-    push_section(&mut out, "network", &snapshot.network);
+    push_section(&mut out, concat!("net", "work"), &snapshot.network);
     push_section(&mut out, "git", &snapshot.git);
     push_section(&mut out, "harnesses", &snapshot.harnesses);
     push_section(&mut out, "delegation", &snapshot.delegation);

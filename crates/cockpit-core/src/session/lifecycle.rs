@@ -204,6 +204,7 @@ impl Session {
             container_network_enabled: AtomicBool::new(false),
             sandbox_escalation_enabled: AtomicBool::new(true),
             sandbox_escalation_notice_state: AtomicBool::new(true),
+            safety_gate_degrade_notice_key: Mutex::new(None),
             mcp_reserved_cockpit_notice_sent: AtomicBool::new(false),
             agent_compact_requested: AtomicBool::new(false),
             // Default `manual` until the spawn path applies the config default.

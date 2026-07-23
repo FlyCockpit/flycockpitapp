@@ -16,15 +16,12 @@
 //! `risk`. The result re-check itself reuses `injection_check` directly —
 //! we do not reimplement the nonce/`risk` mechanism here.
 //!
-//! ## Fail CLOSED (the opposite of the inbound injection scan)
+//! ## Reasoned unavailability
 //!
-//! The inbound prompt-injection scan fails *open* — a missing/broken
-//! utility model proceeds unscanned. The command-safety gate fails
-//! **closed**: when the verdict can't be obtained
-//! ([`SafetyOutcome::Unavailable`]), the gated call is treated as
-//! requiring user approval rather than silently running. Running a command
-//! the gate couldn't vet would defeat `auto` mode's whole purpose, so the
-//! safe default is "ask the user".
+//! Unlike the inbound prompt-injection scan, command-safety callers need to
+//! distinguish "no utility model is configured" from "the configured model
+//! could not return a usable verdict" so `auto` approval can surface stable,
+//! actionable degradation notices and keep probing for recovery.
 
 use serde_json::json;
 
@@ -53,8 +50,18 @@ pub enum SafetyOutcome {
     Rated(SafetyVerdict),
     /// The verdict could not be obtained (no utility model, unbuildable
     /// model, the call errored / timed out, or the model returned no usable
-    /// verdict). Callers **fail closed** — escalate to the user.
-    Unavailable,
+    /// verdict). Callers decide how to degrade based on the reason.
+    Unavailable(SafetyUnavailableReason),
+}
+
+/// Why the safety gate could not obtain a utility-model verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyUnavailableReason {
+    /// No guard/utility model reference is configured.
+    Unset,
+    /// A model was configured, but could not be used or did not return a
+    /// usable verdict.
+    Unusable,
 }
 
 /// The `safety` tool definition advertised to the utility model. Two
@@ -103,9 +110,9 @@ fn build_eval_message(tool: &str, payload: &str) -> String {
 /// `provider_model` is the `"provider:model-id"` selector (the utility
 /// model). `tool` is the gated tool's name (`bash`/`mcp`)
 /// and `payload` is the single command/call to judge — the model sees ONLY
-/// this, never conversation history. Returns [`SafetyOutcome::Unavailable`]
-/// for every failure path (unset/unparseable/unbuildable model, send error,
-/// timeout, no usable verdict) so callers fail **closed**.
+/// this, never conversation history. Returns reasoned
+/// [`SafetyOutcome::Unavailable`] variants for failure paths so callers can
+/// surface stable configuration guidance.
 pub async fn evaluate(
     provider_model: Option<&str>,
     providers: &ProvidersConfig,
@@ -115,8 +122,11 @@ pub async fn evaluate(
     tool: &str,
     payload: &str,
 ) -> SafetyOutcome {
+    let Some(model_ref) = provider_model else {
+        return SafetyOutcome::Unavailable(SafetyUnavailableReason::Unset);
+    };
     match evaluate_inner(
-        provider_model,
+        model_ref,
         providers,
         redact,
         trusted_only,
@@ -127,12 +137,12 @@ pub async fn evaluate(
     .await
     {
         Some(verdict) => SafetyOutcome::Rated(verdict),
-        None => SafetyOutcome::Unavailable,
+        None => SafetyOutcome::Unavailable(SafetyUnavailableReason::Unusable),
     }
 }
 
 async fn evaluate_inner(
-    provider_model: Option<&str>,
+    model_ref: &str,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -140,7 +150,6 @@ async fn evaluate_inner(
     tool: &str,
     payload: &str,
 ) -> Option<SafetyVerdict> {
-    let model_ref = provider_model?;
     let model = match crate::engine::model::Model::from_ref_trusted_only(
         providers,
         model_ref,
@@ -284,8 +293,8 @@ mod tests {
         .await;
         assert_eq!(
             outcome,
-            SafetyOutcome::Unavailable,
-            "an unset utility model must be Unavailable (caller fails closed)"
+            SafetyOutcome::Unavailable(SafetyUnavailableReason::Unset),
+            "an unset utility model must surface the unset reason"
         );
     }
 
@@ -302,7 +311,10 @@ mod tests {
             "ls",
         )
         .await;
-        assert_eq!(outcome, SafetyOutcome::Unavailable);
+        assert_eq!(
+            outcome,
+            SafetyOutcome::Unavailable(SafetyUnavailableReason::Unusable)
+        );
     }
 
     #[test]

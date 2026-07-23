@@ -3,6 +3,10 @@ use super::*;
 #[cfg(test)]
 use super::recheck::{RecheckAction, result_recheck_action};
 
+pub(super) const AUTO_GATE_UNSET_NOTICE: &str = "Auto approval needs a utility model to pre-screen commands; falling back to manual approval — \
+     set utility_model (provider:model) in your config to enable it.";
+pub(super) const AUTO_GATE_UNUSABLE_NOTICE: &str = "The configured utility model is unreachable; Auto approval is falling back to manual asks until it recovers.";
+
 /// What the command-safety gate decided for one call.
 #[derive(Clone)]
 pub(super) enum GateOutcome {
@@ -29,6 +33,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static SAFETY_GATE_EVALUATE_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static SAFETY_GATE_EVALUATE_OVERRIDE:
+        std::cell::RefCell<std::collections::VecDeque<crate::engine::safety_gate::SafetyOutcome>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 #[cfg(test)]
@@ -50,11 +57,21 @@ impl Drop for SafetyGateTestOverrideGuard {
 #[cfg(test)]
 fn reset_safety_gate_evaluate_calls() {
     SAFETY_GATE_EVALUATE_CALLS.with(|calls| calls.set(0));
+    SAFETY_GATE_EVALUATE_OVERRIDE.with(|slot| slot.borrow_mut().clear());
 }
 
 #[cfg(test)]
 fn safety_gate_evaluate_calls() -> usize {
     SAFETY_GATE_EVALUATE_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn set_safety_gate_evaluate_outcomes(
+    outcomes: impl IntoIterator<Item = crate::engine::safety_gate::SafetyOutcome>,
+) {
+    SAFETY_GATE_EVALUATE_OVERRIDE.with(|slot| {
+        *slot.borrow_mut() = outcomes.into_iter().collect();
+    });
 }
 
 /// Decide a single gated call under the session's approval mode
@@ -66,7 +83,8 @@ fn safety_gate_evaluate_calls() -> usize {
 /// - `yolo` → run everything unprompted.
 /// - `auto` → judge the single call (no history) via the utility model:
 ///   `safe` runs; `unsafe` escalates to the user; utility-model unavailable
-///   fails CLOSED (escalates). A user denial blocks dispatch.
+///   degrades to the manual-equivalent downstream approval path. A user
+///   denial blocks dispatch.
 ///
 /// The evaluator also reports whether the result needs an injection
 /// re-check; that flag is threaded back on [`GateOutcome::Run`].
@@ -94,7 +112,7 @@ pub(super) async fn safety_gate_decision_with_configs(
     providers: &crate::config::providers::ProvidersConfig,
 ) -> GateOutcome {
     use crate::config::extended::ApprovalMode;
-    use crate::engine::safety_gate::{SafetyOutcome, evaluate};
+    use crate::engine::safety_gate::{SafetyOutcome, SafetyUnavailableReason};
 
     if !is_gated_tool(tool) {
         return GateOutcome::Run { recheck: false };
@@ -103,9 +121,15 @@ pub(super) async fn safety_gate_decision_with_configs(
         // `manual`: the utility-model gate is not invoked because the human
         // is the gate. Bash asks in its grant-or-ask paths when a command
         // would run unconfined; `escalate` prompts through its Manual route.
-        ApprovalMode::Manual => return GateOutcome::Run { recheck: false },
+        ApprovalMode::Manual => {
+            ctx.session.clear_safety_gate_degrade_notice();
+            return GateOutcome::Run { recheck: false };
+        }
         // `yolo`: everything runs unprompted and unverified.
-        ApprovalMode::Yolo => return GateOutcome::Run { recheck: false },
+        ApprovalMode::Yolo => {
+            ctx.session.clear_safety_gate_degrade_notice();
+            return GateOutcome::Run { recheck: false };
+        }
         ApprovalMode::Auto => {}
     }
     if let Some(block) = standing_reject_gate_block(tool, args, ctx) {
@@ -121,6 +145,11 @@ pub(super) async fn safety_gate_decision_with_configs(
         };
     }
 
+    if model_ref.is_none() {
+        emit_degrade_notice_if_needed(ctx, tx, SafetyUnavailableReason::Unset, model_ref).await;
+        return GateOutcome::Run { recheck: false };
+    }
+
     // `auto` mode. The utility model judges this single call with no
     // conversation history. The guard's own model override falls back to the
     // utility model (same chain the injection guard uses).
@@ -130,9 +159,7 @@ pub(super) async fn safety_gate_decision_with_configs(
         "safety gate: evaluating gated call"
     );
     let payload = gate_payload(tool, args);
-    #[cfg(test)]
-    SAFETY_GATE_EVALUATE_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let outcome = evaluate(
+    let outcome = evaluate_for_gate(
         model_ref,
         providers,
         ctx.redact.clone(),
@@ -145,15 +172,17 @@ pub(super) async fn safety_gate_decision_with_configs(
 
     match outcome {
         SafetyOutcome::Rated(verdict) if verdict.safe => {
+            ctx.session.clear_safety_gate_degrade_notice();
             // Safe → run without prompting.
             GateOutcome::Run {
                 recheck: verdict.recheck_result,
             }
         }
         SafetyOutcome::Rated(verdict) => {
+            ctx.session.clear_safety_gate_degrade_notice();
             // Unsafe → escalate to the user. A denial blocks dispatch.
             // If the user approves, still honor the result re-check flag.
-            match escalate_gated_call(tool, args, ctx, false, tx).await {
+            match escalate_gated_call(tool, args, ctx, false, tx, true).await {
                 GateApproval::Allow => GateOutcome::Run {
                     recheck: verdict.recheck_result,
                 },
@@ -165,26 +194,67 @@ pub(super) async fn safety_gate_decision_with_configs(
                 }),
             }
         }
-        SafetyOutcome::Unavailable => {
-            // Fail CLOSED: the gate couldn't vet the call, so treat it as
-            // requiring user approval rather than silently running it.
-            match escalate_gated_call(tool, args, ctx, true, tx).await {
-                // Approved → run, and (conservatively) re-check the result:
-                // the eval that would have set the flag never completed, so a
-                // call the user only let through under an unavailable gate
-                // still gets its result vetted if it's a network tool.
-                GateApproval::Allow => GateOutcome::Run {
-                    recheck: tool != "bash",
-                },
-                GateApproval::Parked => GateOutcome::Parked,
-                GateApproval::Deny => GateOutcome::Block(gate_block(tool, true)),
-                GateApproval::NoninteractiveDeny => GateOutcome::Block(GateBlock {
-                    message: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
-                    status: "blocked_safety_gate",
-                }),
-            }
+        SafetyOutcome::Unavailable(reason) => {
+            emit_degrade_notice_if_needed(ctx, tx, reason, model_ref).await;
+            GateOutcome::Run { recheck: false }
         }
     }
+}
+
+async fn emit_degrade_notice_if_needed(
+    ctx: &ToolCtx,
+    tx: &mpsc::Sender<TurnEvent>,
+    reason: crate::engine::safety_gate::SafetyUnavailableReason,
+    model_ref: Option<&str>,
+) {
+    let (key, notice) = match reason {
+        crate::engine::safety_gate::SafetyUnavailableReason::Unset => {
+            ("unset", AUTO_GATE_UNSET_NOTICE)
+        }
+        crate::engine::safety_gate::SafetyUnavailableReason::Unusable => {
+            ("unusable", AUTO_GATE_UNUSABLE_NOTICE)
+        }
+    };
+    if ctx
+        .session
+        .safety_gate_degrade_notice_needed(key, model_ref)
+    {
+        let _ = tx
+            .send(TurnEvent::Notice {
+                text: notice.to_string(),
+            })
+            .await;
+    }
+}
+
+async fn evaluate_for_gate(
+    model_ref: Option<&str>,
+    providers: &crate::config::providers::ProvidersConfig,
+    redact: std::sync::Arc<crate::redact::RedactionTable>,
+    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
+    tool: &str,
+    payload: &str,
+) -> crate::engine::safety_gate::SafetyOutcome {
+    #[cfg(test)]
+    {
+        SAFETY_GATE_EVALUATE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        if let Some(outcome) =
+            SAFETY_GATE_EVALUATE_OVERRIDE.with(|slot| slot.borrow_mut().pop_front())
+        {
+            return outcome;
+        }
+    }
+    crate::engine::safety_gate::evaluate(
+        model_ref,
+        providers,
+        redact,
+        trusted_only,
+        shutdown_gate,
+        tool,
+        payload,
+    )
+    .await
 }
 
 fn standing_reject_gate_block(tool: &str, args: &Value, ctx: &ToolCtx) -> Option<GateBlock> {
@@ -358,6 +428,7 @@ async fn escalate_gated_call(
     ctx: &ToolCtx,
     unavailable: bool,
     tx: &mpsc::Sender<TurnEvent>,
+    emit_reason_notice: bool,
 ) -> GateApproval {
     let Some(approver) = ctx.approver.as_ref() else {
         // No human to ask → fail closed (do not silently run).
@@ -372,7 +443,9 @@ async fn escalate_gated_call(
     } else {
         format!("safety gate flagged this `{tool}` call as unsafe — asking before running it")
     };
-    let _ = tx.send(TurnEvent::Notice { text: reason }).await;
+    if emit_reason_notice {
+        let _ = tx.send(TurnEvent::Notice { text: reason }).await;
+    }
 
     let decision = if tool == "bash" {
         let command = args.get("command").and_then(Value::as_str).unwrap_or("");
@@ -714,14 +787,28 @@ mod safety_gate_tests {
         let providers = crate::config::providers::ProvidersConfig::default();
 
         reset_safety_gate_evaluate_calls();
-        let outcome =
-            safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
+        set_safety_gate_evaluate_outcomes([
+            crate::engine::safety_gate::SafetyOutcome::Unavailable(
+                crate::engine::safety_gate::SafetyUnavailableReason::Unusable,
+            ),
+        ]);
+        let outcome = safety_gate_decision_with_configs(
+            "bash",
+            &args,
+            &ctx,
+            &tx,
+            Some("openai:gpt-test"),
+            &providers,
+        )
+        .await;
 
         match outcome {
-            GateOutcome::Block(block) => assert_eq!(block.status, "blocked_safety_gate"),
-            GateOutcome::Run { .. } | GateOutcome::Parked => {
-                panic!("unconfigured utility model with no client should fail closed")
+            GateOutcome::Run { recheck: false } => {}
+            GateOutcome::Run { recheck: true } => panic!("degraded gate must not request recheck"),
+            GateOutcome::Block(block) => {
+                panic!("degraded gate must not block, got {}", block.status)
             }
+            GateOutcome::Parked => panic!("degraded gate must not park"),
         }
         assert_eq!(safety_gate_evaluate_calls(), 1);
     }
@@ -746,8 +833,20 @@ mod safety_gate_tests {
         let providers = crate::config::providers::ProvidersConfig::default();
 
         reset_safety_gate_evaluate_calls();
-        let outcome =
-            safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
+        set_safety_gate_evaluate_outcomes([
+            crate::engine::safety_gate::SafetyOutcome::Unavailable(
+                crate::engine::safety_gate::SafetyUnavailableReason::Unusable,
+            ),
+        ]);
+        let outcome = safety_gate_decision_with_configs(
+            "bash",
+            &args,
+            &ctx,
+            &tx,
+            Some("openai:gpt-test"),
+            &providers,
+        )
+        .await;
 
         match outcome {
             GateOutcome::Run { recheck: false } => {}
@@ -864,6 +963,273 @@ mod safety_gate_tests {
         assert_eq!(safety_gate_evaluate_calls(), 0);
     }
 
+    fn assert_next_notice(rx: &mut mpsc::Receiver<TurnEvent>, expected: &str) {
+        match rx.try_recv() {
+            Ok(TurnEvent::Notice { text }) => assert_eq!(text, expected),
+            other => panic!("expected notice `{expected}`, got {other:?}"),
+        }
+    }
+
+    fn assert_no_notice(rx: &mut mpsc::Receiver<TurnEvent>) {
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "unexpected notice/event queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_degrade_unset_warns_once_and_asks_manual_equivalent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let (tx, mut rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "gh pr create" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+
+        reset_safety_gate_evaluate_calls();
+        for i in 0..3 {
+            let outcome =
+                safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
+            assert!(
+                matches!(outcome, GateOutcome::Run { recheck: false }),
+                "degraded auto should hand off to downstream manual-equivalent approval"
+            );
+            if i == 0 {
+                assert_next_notice(&mut rx, AUTO_GATE_UNSET_NOTICE);
+            } else {
+                assert_no_notice(&mut rx);
+            }
+        }
+        assert_eq!(
+            safety_gate_evaluate_calls(),
+            0,
+            "unset model has nothing to probe"
+        );
+
+        ctx.session.set_approval_mode(ApprovalMode::Manual);
+        let manual =
+            safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
+        assert!(matches!(manual, GateOutcome::Run { recheck: false }));
+        assert_no_notice(&mut rx);
+
+        ctx.session.set_approval_mode(ApprovalMode::Auto);
+        let reentered =
+            safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
+        assert!(matches!(reentered, GateOutcome::Run { recheck: false }));
+        assert_next_notice(&mut rx, AUTO_GATE_UNSET_NOTICE);
+    }
+
+    #[tokio::test]
+    async fn gate_degrade_unusable_warns_once_but_keeps_probing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let (tx, mut rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "gh pr create" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+
+        reset_safety_gate_evaluate_calls();
+        set_safety_gate_evaluate_outcomes([
+            crate::engine::safety_gate::SafetyOutcome::Unavailable(
+                crate::engine::safety_gate::SafetyUnavailableReason::Unusable,
+            ),
+            crate::engine::safety_gate::SafetyOutcome::Unavailable(
+                crate::engine::safety_gate::SafetyUnavailableReason::Unusable,
+            ),
+            crate::engine::safety_gate::SafetyOutcome::Unavailable(
+                crate::engine::safety_gate::SafetyUnavailableReason::Unusable,
+            ),
+        ]);
+
+        for i in 0..3 {
+            let outcome = safety_gate_decision_with_configs(
+                "bash",
+                &args,
+                &ctx,
+                &tx,
+                Some("openai:gpt-test"),
+                &providers,
+            )
+            .await;
+            assert!(matches!(outcome, GateOutcome::Run { recheck: false }));
+            assert_eq!(safety_gate_evaluate_calls(), i + 1);
+            if i == 0 {
+                assert_next_notice(&mut rx, AUTO_GATE_UNUSABLE_NOTICE);
+            } else {
+                assert_no_notice(&mut rx);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_degrade_recovery_resumes_auto_and_rearms_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let (tx, mut rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "gh pr create" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+
+        reset_safety_gate_evaluate_calls();
+        set_safety_gate_evaluate_outcomes([
+            crate::engine::safety_gate::SafetyOutcome::Unavailable(
+                crate::engine::safety_gate::SafetyUnavailableReason::Unusable,
+            ),
+            crate::engine::safety_gate::SafetyOutcome::Rated(
+                crate::engine::safety_gate::SafetyVerdict {
+                    safe: true,
+                    recheck_result: true,
+                },
+            ),
+            crate::engine::safety_gate::SafetyOutcome::Unavailable(
+                crate::engine::safety_gate::SafetyUnavailableReason::Unusable,
+            ),
+            crate::engine::safety_gate::SafetyOutcome::Unavailable(
+                crate::engine::safety_gate::SafetyUnavailableReason::Unusable,
+            ),
+        ]);
+
+        let first = safety_gate_decision_with_configs(
+            "bash",
+            &args,
+            &ctx,
+            &tx,
+            Some("openai:gpt-test"),
+            &providers,
+        )
+        .await;
+        assert!(matches!(first, GateOutcome::Run { recheck: false }));
+        assert_next_notice(&mut rx, AUTO_GATE_UNUSABLE_NOTICE);
+
+        let recovered = safety_gate_decision_with_configs(
+            "bash",
+            &args,
+            &ctx,
+            &tx,
+            Some("openai:gpt-test"),
+            &providers,
+        )
+        .await;
+        assert!(matches!(recovered, GateOutcome::Run { recheck: true }));
+        assert_no_notice(&mut rx);
+
+        let regressed = safety_gate_decision_with_configs(
+            "bash",
+            &args,
+            &ctx,
+            &tx,
+            Some("openai:gpt-test"),
+            &providers,
+        )
+        .await;
+        assert!(matches!(regressed, GateOutcome::Run { recheck: false }));
+        assert_next_notice(&mut rx, AUTO_GATE_UNUSABLE_NOTICE);
+
+        let still_regressed = safety_gate_decision_with_configs(
+            "bash",
+            &args,
+            &ctx,
+            &tx,
+            Some("openai:gpt-test"),
+            &providers,
+        )
+        .await;
+        assert!(matches!(
+            still_regressed,
+            GateOutcome::Run { recheck: false }
+        ));
+        assert_no_notice(&mut rx);
+        assert_eq!(safety_gate_evaluate_calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn gate_degrade_config_refresh_upgrades_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let shared = Arc::new(std::sync::RwLock::new(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        ));
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::new(shared.clone());
+        let (tx, mut rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "gh pr create" });
+
+        reset_safety_gate_evaluate_calls();
+        let unset = safety_gate_decision("bash", &args, &ctx, &tx).await;
+        assert!(matches!(unset, GateOutcome::Run { recheck: false }));
+        assert_next_notice(&mut rx, AUTO_GATE_UNSET_NOTICE);
+        assert_eq!(safety_gate_evaluate_calls(), 0);
+
+        {
+            let mut snapshot = shared.write().unwrap();
+            snapshot.generation = snapshot.generation.saturating_add(1);
+            snapshot.extended.utility_model = Some("openai:gpt-test".to_string());
+        }
+        set_safety_gate_evaluate_outcomes([crate::engine::safety_gate::SafetyOutcome::Rated(
+            crate::engine::safety_gate::SafetyVerdict {
+                safe: true,
+                recheck_result: false,
+            },
+        )]);
+
+        let upgraded = safety_gate_decision("bash", &args, &ctx, &tx).await;
+        assert!(matches!(upgraded, GateOutcome::Run { recheck: false }));
+        assert_no_notice(&mut rx);
+        assert_eq!(safety_gate_evaluate_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn gate_degrade_unrelated_config_change_no_rewarn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let shared = Arc::new(std::sync::RwLock::new(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        ));
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::new(shared.clone());
+        let (tx, mut rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "gh pr create" });
+
+        reset_safety_gate_evaluate_calls();
+        let first = safety_gate_decision("bash", &args, &ctx, &tx).await;
+        assert!(matches!(first, GateOutcome::Run { recheck: false }));
+        assert_next_notice(&mut rx, AUTO_GATE_UNSET_NOTICE);
+
+        {
+            let mut snapshot = shared.write().unwrap();
+            snapshot.generation = snapshot.generation.saturating_add(1);
+            snapshot.extended.max_primary_rounds =
+                snapshot.extended.max_primary_rounds.saturating_add(1);
+        }
+
+        let second = safety_gate_decision("bash", &args, &ctx, &tx).await;
+        assert!(matches!(second, GateOutcome::Run { recheck: false }));
+        assert_no_notice(&mut rx);
+        assert_eq!(safety_gate_evaluate_calls(), 0);
+    }
+
+    #[test]
+    fn gate_degrade_notice_copy_names_remedy() {
+        assert_eq!(
+            AUTO_GATE_UNSET_NOTICE,
+            "Auto approval needs a utility model to pre-screen commands; falling back to manual approval — set utility_model (provider:model) in your config to enable it."
+        );
+        assert!(AUTO_GATE_UNSET_NOTICE.contains("utility_model"));
+        assert!(AUTO_GATE_UNSET_NOTICE.contains("provider:model"));
+        assert_eq!(
+            AUTO_GATE_UNUSABLE_NOTICE,
+            "The configured utility model is unreachable; Auto approval is falling back to manual asks until it recovers."
+        );
+        assert!(AUTO_GATE_UNUSABLE_NOTICE.contains("unreachable"));
+        assert!(AUTO_GATE_UNUSABLE_NOTICE.contains("recovers"));
+    }
+
     struct SleepTool;
 
     #[async_trait]
@@ -919,32 +1285,28 @@ mod safety_gate_tests {
     }
 
     #[tokio::test]
-    async fn auto_mode_fails_closed_when_utility_model_unset_and_no_client() {
-        // `auto` + no utility model configured → safety eval is Unavailable →
-        // fail CLOSED: escalate to the user. With no approver/interactive
-        // client to ask, the call is BLOCKED (not silently run) — the
-        // opposite of the inbound scan's fail-open.
+    async fn gate_degrade_unset_no_client_denies_at_dispatch() {
+        // `auto` + no utility model configured degrades to manual-equivalent
+        // dispatch. The gate itself does not approve the command; downstream
+        // bash/MCP approval paths still fail closed when no approver exists.
         let tmp = tempfile::tempdir().unwrap();
         let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "ls" });
         let providers = crate::config::providers::ProvidersConfig::default();
         let outcome =
             safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
-        match outcome {
-            GateOutcome::Block(block) => {
-                assert!(
-                    block.message.contains("safety gate"),
-                    "got: {}",
-                    block.message
-                );
-                assert_eq!(block.status, "blocked_safety_gate");
-            }
-            GateOutcome::Run { .. } => {
-                panic!("auto mode must NOT silently run when the gate is unavailable")
-            }
-            GateOutcome::Parked => panic!("no-client gate escalation must block, not park"),
-        }
+        assert!(matches!(outcome, GateOutcome::Run { recheck: false }));
+        assert_next_notice(&mut rx, AUTO_GATE_UNSET_NOTICE);
+
+        let tools = ToolBox::new().with(Arc::new(crate::tools::bash::BashTool::new()));
+        let (result, _duration_ms) = dispatch_one_timed(&tools, "bash", args, &ctx, None).await;
+        let output = result.expect("bash denial is a model-facing tool output");
+        assert!(
+            output.content.contains("approval was denied"),
+            "{}",
+            output.content
+        );
     }
 
     #[tokio::test]
@@ -1006,7 +1368,7 @@ mod safety_gate_tests {
         let first_payload = payload.clone();
         let first = tokio::spawn(async move {
             crate::engine::interrupt::with_interrupt_park_payload(first_payload, async {
-                escalate_gated_call("mcp", &first_args, &first_ctx, true, &first_tx).await
+                escalate_gated_call("mcp", &first_args, &first_ctx, true, &first_tx, true).await
             })
             .await
         });
@@ -1041,7 +1403,7 @@ mod safety_gate_tests {
             question,
             async {
                 crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-                    escalate_gated_call("mcp", &args, &ctx, true, &tx).await
+                    escalate_gated_call("mcp", &args, &ctx, true, &tx, true).await
                 })
                 .await
             },

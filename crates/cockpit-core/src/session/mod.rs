@@ -140,6 +140,7 @@ pub struct Session {
     /// any allowed escalation.
     sandbox_escalation_enabled: AtomicBool,
     sandbox_escalation_notice_state: AtomicBool,
+    safety_gate_degrade_notice_key: Mutex<Option<(String, Option<String>)>>,
     mcp_reserved_cockpit_notice_sent: AtomicBool,
     agent_compact_requested: AtomicBool,
     /// Command-approval mode for this session right now

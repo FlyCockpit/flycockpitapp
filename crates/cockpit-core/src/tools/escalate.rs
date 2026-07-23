@@ -182,7 +182,7 @@ pub(crate) fn escalation_route(
             Some(SafetyOutcome::Rated(verdict)) if verdict.safe => {
                 EscalationRoute::RunUnconfinedOnce
             }
-            Some(SafetyOutcome::Rated(_)) | Some(SafetyOutcome::Unavailable) | None => {
+            Some(SafetyOutcome::Rated(_)) | Some(SafetyOutcome::Unavailable(_)) | None => {
                 EscalationRoute::PromptHuman
             }
         },
@@ -490,7 +490,9 @@ mod tests {
         assert_eq!(
             escalation_route(
                 crate::config::extended::ApprovalMode::Auto,
-                Some(SafetyOutcome::Unavailable)
+                Some(SafetyOutcome::Unavailable(
+                    crate::engine::safety_gate::SafetyUnavailableReason::Unusable
+                ))
             ),
             EscalationRoute::PromptHuman
         );

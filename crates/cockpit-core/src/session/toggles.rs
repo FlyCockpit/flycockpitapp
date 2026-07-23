@@ -91,6 +91,27 @@ impl Session {
         })
     }
 
+    pub(crate) fn safety_gate_degrade_notice_needed(
+        &self,
+        reason: &str,
+        model_ref: Option<&str>,
+    ) -> bool {
+        let key = (
+            reason.to_string(),
+            model_ref.map(std::string::ToString::to_string),
+        );
+        let mut last = self.safety_gate_degrade_notice_key.lock().unwrap();
+        if last.as_ref() == Some(&key) {
+            return false;
+        }
+        *last = Some(key);
+        true
+    }
+
+    pub(crate) fn clear_safety_gate_degrade_notice(&self) {
+        *self.safety_gate_degrade_notice_key.lock().unwrap() = None;
+    }
+
     pub fn mcp_reserved_cockpit_server_notice(&self) -> Option<String> {
         if self
             .mcp_reserved_cockpit_notice_sent
@@ -134,6 +155,9 @@ impl Session {
         &self,
         mode: crate::config::extended::ApprovalMode,
     ) -> crate::config::extended::ApprovalMode {
+        if self.approval_mode() != mode {
+            self.clear_safety_gate_degrade_notice();
+        }
         self.approval_mode
             .store(approval_mode_to_u8(mode), Ordering::Relaxed);
         mode

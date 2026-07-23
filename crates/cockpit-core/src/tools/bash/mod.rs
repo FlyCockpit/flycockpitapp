@@ -575,6 +575,12 @@ async fn call_bash_inner(
                     ToolOutput::text(crate::approval::NONINTERACTIVE_RUN_DENIAL).with_sandbox(meta)
                 );
             }
+            crate::approval::Decision::StandingReject { scope } => {
+                return Ok(ToolOutput::text(crate::approval::standing_reject_refusal(
+                    "bash", scope,
+                ))
+                .with_sandbox(meta));
+            }
             crate::approval::Decision::Deny => {
                 return Ok(ToolOutput::text(UNCONFINED_COMMAND_DENIAL).with_sandbox(meta));
             }
@@ -677,6 +683,12 @@ async fn call_bash_inner(
                     // the refusal, not merely replay the sandbox's opaque stderr.
                     return Ok(ToolOutput::text(crate::approval::NONINTERACTIVE_RUN_DENIAL)
                         .with_bash_meta(meta, &resource_meta));
+                }
+                crate::approval::Decision::StandingReject { scope } => {
+                    return Ok(ToolOutput::text(crate::approval::standing_reject_refusal(
+                        "bash", scope,
+                    ))
+                    .with_bash_meta(meta, &resource_meta));
                 }
                 crate::approval::Decision::Deny => None,
             }

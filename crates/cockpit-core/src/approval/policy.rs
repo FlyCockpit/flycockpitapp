@@ -22,6 +22,25 @@ impl Approver {
         &self.store
     }
 
+    pub fn command_standing_reject_scope(&self, command: &str) -> Option<Scope> {
+        let classification = crate::approval::classify::classify(command);
+        classification
+            .simple_commands()
+            .iter()
+            .filter(|info| !info.wrapper)
+            .find_map(|info| self.store.command_reject_scope(&info.key))
+    }
+
+    pub fn record_standing_reject_decision(&self, tool: &str, target: &str, scope: Scope) {
+        self.record_permission_decision(
+            tool,
+            target,
+            &[],
+            Decision::StandingReject { scope },
+            DecisionSource::StandingReject,
+        );
+    }
+
     /// Record one resolved permission decision into the session timeline
     /// (and thus the export's `events.json`). Best-effort: a DB write
     /// failure is logged, never propagated — recording the audit trail must
@@ -60,7 +79,9 @@ impl Approver {
         let offered: Vec<&str> = scopes.iter().map(|s| s.as_str()).collect();
         let (decision_str, scope) = match decision {
             Decision::Allow { scope } => ("allow", Some(scope.as_str())),
-            Decision::Deny | Decision::NoninteractiveDeny => ("deny", None),
+            Decision::Deny | Decision::StandingReject { .. } | Decision::NoninteractiveDeny => {
+                ("deny", None)
+            }
         };
         let mut data = serde_json::json!({
             "tool": tool,
@@ -150,8 +171,8 @@ impl Approver {
     pub async fn approve_mcp_tool(&self, server: &str, tool: &str) -> Result<Decision> {
         let target = crate::approval::store::mcp_tool_key(server, tool);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
-        if self.store.mcp_tool_reject_scope(server, tool).is_some() {
-            let decision = Decision::Deny;
+        if let Some(scope) = self.store.mcp_tool_reject_scope(server, tool) {
+            let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "mcp_tool",
                 &target,

@@ -268,6 +268,7 @@ pub(crate) async fn execute_ordinary_call(
     };
     let mut recheck_result = false;
     let mut gate_memo = replay_gate_memo;
+    let mut gate_block_status = "blocked_safety_gate";
     let gate_block: Option<String> =
         if repair_outcome.valid && !loop_guard_reject && super::is_gated_tool(resolved_name) {
             let gate_future = crate::engine::interrupt::with_interrupt_park_payload(
@@ -285,7 +286,10 @@ pub(crate) async fn execute_ordinary_call(
                 GateOutcome::Parked => {
                     return Err(crate::engine::interrupt::InterruptParked.into());
                 }
-                GateOutcome::Block(msg) => Some(msg),
+                GateOutcome::Block(block) => {
+                    gate_block_status = block.status;
+                    Some(block.message)
+                }
             }
         } else {
             None
@@ -418,6 +422,12 @@ pub(crate) async fn execute_ordinary_call(
                     return Err(invalid_input(
                         "btw side conversation: mutating tool call denied",
                     ));
+                }
+                crate::approval::Decision::StandingReject { scope } => {
+                    return Err(invalid_input(crate::approval::standing_reject_refusal(
+                        resolved_name,
+                        scope,
+                    )));
                 }
             }
         }
@@ -869,7 +879,7 @@ pub(crate) async fn execute_ordinary_call(
         } else if loop_guard_reject {
             "blocked_loop_guard"
         } else if gate_blocked {
-            "blocked_safety_gate"
+            gate_block_status
         } else if hard_fail {
             "failed"
         } else {
@@ -2395,8 +2405,10 @@ mod tests {
         );
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
-        let _gate =
-            set_safety_gate_test_override(GateOutcome::Block(gate_block_message("bash", true)));
+        let _gate = set_safety_gate_test_override(GateOutcome::Block(GateBlock {
+            message: gate_block_message("bash", true),
+            status: "blocked_safety_gate",
+        }));
 
         execute_ordinary_call(&env, &mut history, &call, "bash", Recovery::Clean, None)
             .await
@@ -2432,6 +2444,59 @@ mod tests {
         assert!(
             matches!(rx.recv().await, Some(TurnEvent::ToolError { error, .. }) if error.contains("command-safety gate"))
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_standing_reject_gate_records_blocked_standing_reject() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(NeverCalledTool {
+            name: "bash",
+            called: called.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        session.set_approval_mode(ApprovalMode::Auto);
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx_with_approver(session.clone(), tmp.path(), &tx);
+        let approver = ctx.approver.as_ref().unwrap();
+        let classification = crate::approval::classify::classify("gh pr create");
+        let info = classification.simple_commands().iter().next().unwrap();
+        approver
+            .store()
+            .record_command_reject(info, crate::approval::store::Scope::Session)
+            .unwrap();
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("bash", serde_json::json!({ "command": "gh pr create" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "bash", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        assert!(!called.load(Ordering::SeqCst));
+        let wire = last_tool_result_text(&history);
+        assert!(wire.contains("rejected at session scope"), "{wire}");
+        let event = session
+            .db
+            .list_session_events(session.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "tool_call_completed")
+            .expect("tool_call_completed event");
+        assert_eq!(event.data["status"], "blocked_standing_reject");
     }
 
     #[tokio::test]

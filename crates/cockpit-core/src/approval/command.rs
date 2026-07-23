@@ -227,25 +227,21 @@ impl Approver {
         // `StandingReject` source and an empty offered-scope set (no prompt
         // was raised) so the timeline reflects a reject decision, not a plain
         // deny (§14). A wrapper is never persistable, so it can't be rejected.
-        if simple_commands
-            .iter()
-            .zip(policies.iter())
-            .any(|(i, policy)| {
-                !i.wrapper
-                    && self
-                        .store
-                        .command_reject_scope(&i.key)
-                        .is_some_and(|scope| scope.within(policy.max_scope))
-            })
-        {
+        if let Some(scope) = simple_commands.iter().find_map(|i| {
+            if i.wrapper {
+                return None;
+            }
+            self.store.command_reject_scope(&i.key)
+        }) {
+            let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "bash",
                 command,
                 &[],
-                Decision::Deny,
+                decision,
                 DecisionSource::StandingReject,
             );
-            return Ok(Decision::Deny);
+            return Ok(decision);
         }
 
         // Pre-compute which constituents will actually prompt (a wrapper, or
@@ -328,13 +324,18 @@ impl Approver {
                 unreachable!()
             };
             match decision {
-                Decision::Deny | Decision::NoninteractiveDeny => {
+                Decision::Deny | Decision::StandingReject { .. } | Decision::NoninteractiveDeny => {
+                    let source = if matches!(decision, Decision::StandingReject { .. }) {
+                        DecisionSource::StandingReject
+                    } else {
+                        DecisionSource::UserPrompt
+                    };
                     self.record_permission_decision_with_audit(
                         "bash",
                         command,
                         &offered,
                         decision,
-                        DecisionSource::UserPrompt,
+                        source,
                         Some(audit.clone()),
                     );
                     return Ok(decision);
@@ -383,7 +384,9 @@ impl Approver {
                 )
                 .await?
             {
-                denial @ (Decision::Deny | Decision::NoninteractiveDeny) => {
+                denial @ (Decision::Deny
+                | Decision::StandingReject { .. }
+                | Decision::NoninteractiveDeny) => {
                     return Ok(Some(denial));
                 }
                 Decision::Allow { scope } => {
@@ -421,15 +424,14 @@ impl Approver {
         // persistable in either polarity, so it can never carry a standing
         // reject — only non-wrappers are queried.
         if !info.wrapper
-            && self
-                .store
-                .command_reject_scope(&info.key)
-                .is_some_and(|scope| scope.within(policy.max_scope))
+            && let Some(scope) = self.store.command_reject_scope(&info.key)
         {
             // Auto-deny with no prompt; the caller surfaces the terse guidance
             // error. The `StandingReject` source is recorded by the chain
             // driver (`approve_command_inner`).
-            return Ok(CommandStepDecision::Decision(Decision::Deny));
+            return Ok(CommandStepDecision::Decision(Decision::StandingReject {
+                scope,
+            }));
         }
         let stored_grant = (!info.wrapper)
             .then(|| self.store.command_grant(&info.key))

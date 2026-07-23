@@ -930,6 +930,14 @@ async fn invoke_native_tool(ctx: &HostContext, tool: Arc<dyn Tool>, args: Value)
                     "message": "native tool call denied"
                 }));
             }
+            crate::approval::Decision::StandingReject { scope } => {
+                return Ok(serde_json::json!({
+                    "denied": true,
+                    "kind": "approval_denied",
+                    "tool": tool.name(),
+                    "message": crate::approval::standing_reject_refusal(tool.name(), scope)
+                }));
+            }
             crate::approval::Decision::NoninteractiveDeny => {
                 return Ok(serde_json::json!({
                     "denied": true,

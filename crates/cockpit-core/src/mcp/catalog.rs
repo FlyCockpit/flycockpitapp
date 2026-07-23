@@ -115,6 +115,9 @@ pub async fn invoke(
     match approve_external_mcp_tool(host, server, tool).await? {
         crate::approval::Decision::Allow { .. } => {}
         crate::approval::Decision::Deny => return Ok(mcp_tool_denial(server, tool, false)),
+        crate::approval::Decision::StandingReject { scope } => {
+            return Ok(mcp_tool_standing_reject_denial(server, tool, scope));
+        }
         crate::approval::Decision::NoninteractiveDeny => {
             return Ok(mcp_tool_denial(server, tool, true));
         }
@@ -165,6 +168,20 @@ fn mcp_tool_denial(server: &str, tool: &str, noninteractive: bool) -> Value {
             "message": "external MCP tool call denied"
         })
     }
+}
+
+fn mcp_tool_standing_reject_denial(
+    server: &str,
+    tool: &str,
+    scope: crate::approval::store::Scope,
+) -> Value {
+    serde_json::json!({
+        "denied": true,
+        "kind": "approval_denied",
+        "server": server,
+        "tool": tool,
+        "message": crate::approval::standing_reject_refusal("mcp", scope)
+    })
 }
 
 fn sanitize_tool_descriptors(tools: Vec<ToolDescriptor>) -> Vec<ToolDescriptor> {

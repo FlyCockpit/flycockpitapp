@@ -133,6 +133,9 @@ impl Tool for EscalateTool {
         let grant_offer =
             validate_grant_offer(args.suggested_paths, args.access.into(), &command_cwd)?;
         match approval_for_escalation(ctx, command, &row, grant_offer.as_ref()).await? {
+            EscalationApproval::StandingReject { scope } => Ok(ToolOutput::text(
+                crate::approval::standing_reject_refusal("bash", scope),
+            )),
             EscalationApproval::Deny => Ok(ToolOutput::text(
                 "Escalation denied by user or policy; the command was not rerun.",
             )),
@@ -155,6 +158,9 @@ impl Tool for EscalateTool {
 enum EscalationApproval {
     GrantAndRetryConfined,
     RunUnconfinedOnce,
+    StandingReject {
+        scope: crate::approval::store::Scope,
+    },
     Deny,
     NoninteractiveDeny,
 }
@@ -226,6 +232,14 @@ async fn approval_for_escalation(
         ApprovalMode::Yolo => Ok(EscalationApproval::RunUnconfinedOnce),
         ApprovalMode::Manual => prompt_user(ctx, command, row, grant_offer).await,
         ApprovalMode::Auto => {
+            if let Some((approver, scope)) = ctx.approver.as_ref().and_then(|approver| {
+                approver
+                    .command_standing_reject_scope(command)
+                    .map(|scope| (approver, scope))
+            }) {
+                approver.record_standing_reject_decision("bash", command, scope);
+                return Ok(EscalationApproval::StandingReject { scope });
+            }
             let (extended, providers) = ctx.config.configs();
             let outcome = evaluate(
                 extended.guard_model_ref(),
@@ -254,6 +268,10 @@ async fn prompt_user(
     let Some(approver) = ctx.approver.as_ref() else {
         return Ok(EscalationApproval::Deny);
     };
+    if let Some(scope) = approver.command_standing_reject_scope(command) {
+        approver.record_standing_reject_decision("bash", command, scope);
+        return Ok(EscalationApproval::StandingReject { scope });
+    }
     let confined_exit = row.exit_code.unwrap_or(1);
     let confined_detail = if let Some(reason) = &row.sandbox_unavailable_reason {
         format!("sandbox unavailable: {reason}")
@@ -476,6 +494,47 @@ mod tests {
             ),
             EscalationRoute::PromptHuman
         );
+    }
+
+    #[tokio::test]
+    async fn standing_reject_escalate_copy_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, approver, _db, _session_id, _hub) = ctx_with_approver(tmp.path());
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Auto);
+        ctx.session.set_sandbox_escalation_enabled(true);
+        record_bash_call(&ctx, "call-standing-reject", Some(1));
+        let classification = crate::approval::classify::classify("printf escalated");
+        let info = classification.simple_commands().iter().next().unwrap();
+        approver
+            .store()
+            .record_command_reject(info, crate::approval::store::Scope::Session)
+            .unwrap();
+
+        let out = EscalateTool
+            .call(json!({ "call_id": "call-standing-reject" }), &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.content,
+            crate::approval::standing_reject_refusal(
+                "bash",
+                crate::approval::store::Scope::Session
+            )
+        );
+        let event = ctx
+            .session
+            .db
+            .list_session_events(ctx.session.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "permission_decision")
+            .expect("standing reject records permission decision");
+        assert_eq!(event.data["tool"], "bash");
+        assert_eq!(event.data["target"], "printf escalated");
+        assert_eq!(event.data["decision"], "deny");
+        assert_eq!(event.data["source"], "standing_reject");
     }
 
     #[tokio::test]

@@ -95,6 +95,8 @@ pub enum Decision {
     Allow { scope: Scope },
     /// Access is denied (the user dismissed the prompt).
     Deny,
+    /// Access is denied by a saved user reject decision at the given scope.
+    StandingReject { scope: Scope },
     /// A `cockpit run` client denied the parked decision in-process. Tool
     /// callers preserve this distinction so the model receives the stable
     /// noninteractive denial instead of generic interactive-dismissal copy.
@@ -109,6 +111,31 @@ pub const NONINTERACTIVE_RUN_DENIAL: &str =
 impl Decision {
     pub fn is_allowed(&self) -> bool {
         matches!(self, Decision::Allow { .. })
+    }
+
+    pub fn standing_reject_scope(&self) -> Option<Scope> {
+        match self {
+            Decision::StandingReject { scope } => Some(*scope),
+            _ => None,
+        }
+    }
+}
+
+pub fn standing_reject_refusal(tool: &str, scope: Scope) -> String {
+    format!(
+        "`{tool}` was not run: this command or tool call is disallowed by a saved user decision \
+         (rejected at {} scope). Do not retry it; use a different approach or ask the user to \
+         change the saved decision.",
+        standing_reject_scope_label(scope)
+    )
+}
+
+fn standing_reject_scope_label(scope: Scope) -> &'static str {
+    match scope {
+        Scope::Once => "once",
+        Scope::Session => "session",
+        Scope::Project => "project",
+        Scope::Global => "global",
     }
 }
 
@@ -1028,6 +1055,16 @@ mod tests {
         );
         let hub = Arc::new(InterruptHub::detached());
         (Approver::new(store, db, sid, "builder", hub), sid)
+    }
+
+    fn init_git_repo(path: &std::path::Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        crate::config::trust::clear_runtime_policy_for_tests();
     }
 
     fn approver_with_policy(
@@ -2089,7 +2126,12 @@ mod tests {
         // No client attached: this returns immediately because the standing
         // reject short-circuits (it never raises a prompt).
         let decision = approver.approve_command("gh pr create").await.unwrap();
-        assert_eq!(decision, Decision::Deny);
+        assert_eq!(
+            decision,
+            Decision::StandingReject {
+                scope: Scope::Session
+            }
+        );
 
         let events = permission_events(&approver);
         assert_eq!(events.len(), 1, "one decision recorded");
@@ -2101,6 +2143,45 @@ mod tests {
         assert!(ev["scope"].is_null(), "a deny carries no scope");
         // No prompt was raised → no scopes were offered.
         assert_eq!(ev["offered_scopes"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn standing_reject_copy_names_scope() {
+        for scope in [Scope::Session, Scope::Project, Scope::Global] {
+            let env = tempfile::tempdir().unwrap();
+            let _home =
+                cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
+            let project = tempfile::tempdir_in(env.path()).unwrap();
+            init_git_repo(project.path());
+            let (approver, _) = approver(project.path());
+            let info = SimpleCommandInfo {
+                program: "gh".into(),
+                normalized_program: "gh".into(),
+                subcommand: Some("pr".into()),
+                args: vec!["pr".into()],
+                key: ApprovalKey {
+                    program: "gh".into(),
+                    subcommand: Some("pr".into()),
+                },
+                wrapper: false,
+                risk: Default::default(),
+                span: None,
+            };
+            approver.store.record_command_reject(&info, scope).unwrap();
+
+            let decision = approver.approve_command("gh pr create").await.unwrap();
+            assert_eq!(decision, Decision::StandingReject { scope });
+            let copy = standing_reject_refusal("bash", decision.standing_reject_scope().unwrap());
+            assert!(
+                copy.contains(&format!(
+                    "rejected at {} scope",
+                    standing_reject_scope_label(scope)
+                )),
+                "{copy}"
+            );
+            assert!(!copy.contains("external MCP tool call denied"), "{copy}");
+            assert!(!copy.contains("user declined"), "{copy}");
+        }
     }
 
     /// The escalation path (`approve_command_escalated`) honors a standing
@@ -2131,7 +2212,12 @@ mod tests {
             .approve_command_escalated("cat /etc/secret", 13, "denied".into())
             .await
             .unwrap();
-        assert_eq!(decision, Decision::Deny);
+        assert_eq!(
+            decision,
+            Decision::StandingReject {
+                scope: Scope::Session
+            }
+        );
         let events = permission_events(&approver);
         assert_eq!(events.last().unwrap()["source"], "standing_reject");
     }
@@ -2185,7 +2271,12 @@ mod tests {
 
         // A later attempt short-circuits with no prompt (detached hub).
         let again = approver.approve_command("gh pr create").await.unwrap();
-        assert_eq!(again, Decision::Deny);
+        assert_eq!(
+            again,
+            Decision::StandingReject {
+                scope: Scope::Session
+            }
+        );
         let last = permission_events(&approver);
         assert_eq!(last.last().unwrap()["source"], "standing_reject");
     }

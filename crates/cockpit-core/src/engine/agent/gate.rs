@@ -14,13 +14,21 @@ pub(super) enum GateOutcome {
     Parked,
     /// Skip dispatch; the string is the model-readable tool result
     /// (`invalid_input`) explaining why the call was withheld.
-    Block(String),
+    Block(GateBlock),
+}
+
+#[derive(Clone)]
+pub(super) struct GateBlock {
+    pub message: String,
+    pub status: &'static str,
 }
 
 #[cfg(test)]
 thread_local! {
     static SAFETY_GATE_TEST_OVERRIDE: std::cell::RefCell<Option<GateOutcome>> =
         const { std::cell::RefCell::new(None) };
+    static SAFETY_GATE_EVALUATE_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -37,6 +45,16 @@ impl Drop for SafetyGateTestOverrideGuard {
     fn drop(&mut self) {
         SAFETY_GATE_TEST_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
     }
+}
+
+#[cfg(test)]
+fn reset_safety_gate_evaluate_calls() {
+    SAFETY_GATE_EVALUATE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn safety_gate_evaluate_calls() -> usize {
+    SAFETY_GATE_EVALUATE_CALLS.with(std::cell::Cell::get)
 }
 
 /// Decide a single gated call under the session's approval mode
@@ -81,15 +99,6 @@ pub(super) async fn safety_gate_decision_with_configs(
     if !is_gated_tool(tool) {
         return GateOutcome::Run { recheck: false };
     }
-    if let Some(payload) = crate::engine::interrupt::current_interrupt_park_payload()
-        && payload.tool == tool
-        && payload.args == *args
-        && let Some(gate) = payload.gate
-    {
-        return GateOutcome::Run {
-            recheck: gate.recheck_result,
-        };
-    }
     match ctx.session.approval_mode() {
         // `manual`: the utility-model gate is not invoked because the human
         // is the gate. Bash asks in its grant-or-ask paths when a command
@@ -98,6 +107,18 @@ pub(super) async fn safety_gate_decision_with_configs(
         // `yolo`: everything runs unprompted and unverified.
         ApprovalMode::Yolo => return GateOutcome::Run { recheck: false },
         ApprovalMode::Auto => {}
+    }
+    if let Some(block) = standing_reject_gate_block(tool, args, ctx) {
+        return GateOutcome::Block(block);
+    }
+    if let Some(payload) = crate::engine::interrupt::current_interrupt_park_payload()
+        && payload.tool == tool
+        && payload.args == *args
+        && let Some(gate) = payload.gate
+    {
+        return GateOutcome::Run {
+            recheck: gate.recheck_result,
+        };
     }
 
     // `auto` mode. The utility model judges this single call with no
@@ -109,6 +130,8 @@ pub(super) async fn safety_gate_decision_with_configs(
         "safety gate: evaluating gated call"
     );
     let payload = gate_payload(tool, args);
+    #[cfg(test)]
+    SAFETY_GATE_EVALUATE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let outcome = evaluate(
         model_ref,
         providers,
@@ -135,10 +158,11 @@ pub(super) async fn safety_gate_decision_with_configs(
                     recheck: verdict.recheck_result,
                 },
                 GateApproval::Parked => GateOutcome::Parked,
-                GateApproval::Deny => GateOutcome::Block(gate_block_message(tool, false)),
-                GateApproval::NoninteractiveDeny => {
-                    GateOutcome::Block(crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string())
-                }
+                GateApproval::Deny => GateOutcome::Block(gate_block(tool, false)),
+                GateApproval::NoninteractiveDeny => GateOutcome::Block(GateBlock {
+                    message: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+                    status: "blocked_safety_gate",
+                }),
             }
         }
         SafetyOutcome::Unavailable => {
@@ -153,12 +177,150 @@ pub(super) async fn safety_gate_decision_with_configs(
                     recheck: tool != "bash",
                 },
                 GateApproval::Parked => GateOutcome::Parked,
-                GateApproval::Deny => GateOutcome::Block(gate_block_message(tool, true)),
-                GateApproval::NoninteractiveDeny => {
-                    GateOutcome::Block(crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string())
-                }
+                GateApproval::Deny => GateOutcome::Block(gate_block(tool, true)),
+                GateApproval::NoninteractiveDeny => GateOutcome::Block(GateBlock {
+                    message: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+                    status: "blocked_safety_gate",
+                }),
             }
         }
+    }
+}
+
+fn standing_reject_gate_block(tool: &str, args: &Value, ctx: &ToolCtx) -> Option<GateBlock> {
+    let approver = ctx.approver.as_ref()?;
+    match tool {
+        "bash" => {
+            let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+            let scope = approver.command_standing_reject_scope(command)?;
+            approver.record_standing_reject_decision("bash", command, scope);
+            Some(standing_reject_block("bash", scope))
+        }
+        "mcp" => {
+            let script = args.get("script").and_then(Value::as_str)?;
+            for invocation in static_mcp_invocations(script) {
+                if let Some(scope) = approver
+                    .store()
+                    .mcp_tool_reject_scope(&invocation.server, &invocation.tool)
+                {
+                    let target =
+                        crate::approval::store::mcp_tool_key(&invocation.server, &invocation.tool);
+                    approver.record_standing_reject_decision("mcp_tool", &target, scope);
+                    return Some(standing_reject_block("mcp", scope));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+struct StaticMcpInvocation {
+    server: String,
+    tool: String,
+}
+
+fn static_mcp_invocations(script: &str) -> Vec<StaticMcpInvocation> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(script, None) else {
+        return Vec::new();
+    };
+    let mut invocations = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call"
+            && let Some(invocation) = static_mcp_invocation_from_call(node, script.as_bytes())
+        {
+            invocations.push(invocation);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    invocations
+}
+
+fn static_mcp_invocation_from_call(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<StaticMcpInvocation> {
+    let function = node.child_by_field_name("function")?;
+    if function.utf8_text(source).ok()? != "mcp.invoke" {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut static_args = Vec::new();
+    let mut cursor = arguments.walk();
+    for child in arguments.named_children(&mut cursor) {
+        if child.kind() == "string" {
+            static_args.push(decode_python_string_literal(child.utf8_text(source).ok()?)?);
+        } else if static_args.len() < 2 {
+            return None;
+        }
+        if static_args.len() == 2 {
+            return Some(StaticMcpInvocation {
+                server: static_args.remove(0),
+                tool: static_args.remove(0),
+            });
+        }
+    }
+    None
+}
+
+fn decode_python_string_literal(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let start = raw.find(['"', '\''])?;
+    if raw[..start]
+        .chars()
+        .any(|ch| matches!(ch, 'f' | 'F' | 'b' | 'B'))
+    {
+        return None;
+    }
+    let quote = raw.as_bytes()[start] as char;
+    let triple = raw[start..].starts_with(&format!("{quote}{quote}{quote}"));
+    let body_start = start + if triple { 3 } else { 1 };
+    let terminator = if triple {
+        format!("{quote}{quote}{quote}")
+    } else {
+        quote.to_string()
+    };
+    let body_end = raw[body_start..].rfind(&terminator)? + body_start;
+    let body = &raw[body_start..body_end];
+    if raw[..start].chars().any(|ch| matches!(ch, 'r' | 'R')) {
+        return Some(body.to_string());
+    }
+    let mut decoded = String::new();
+    let mut chars = body.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => decoded.push('\n'),
+            Some('r') => decoded.push('\r'),
+            Some('t') => decoded.push('\t'),
+            Some('\\') => decoded.push('\\'),
+            Some('\'') => decoded.push('\''),
+            Some('"') => decoded.push('"'),
+            Some(other) => decoded.push(other),
+            None => return None,
+        }
+    }
+    Some(decoded)
+}
+
+fn standing_reject_block(tool: &str, scope: crate::approval::store::Scope) -> GateBlock {
+    GateBlock {
+        message: crate::approval::standing_reject_refusal(tool, scope),
+        status: "blocked_standing_reject",
     }
 }
 
@@ -222,6 +384,7 @@ async fn escalate_gated_call(
     match decision {
         Ok(crate::approval::Decision::Allow { .. }) => GateApproval::Allow,
         Ok(crate::approval::Decision::NoninteractiveDeny) => GateApproval::NoninteractiveDeny,
+        Ok(crate::approval::Decision::StandingReject { .. }) => GateApproval::Deny,
         Err(error) if crate::engine::interrupt::is_parked(&error) => GateApproval::Parked,
         Ok(crate::approval::Decision::Deny) | Err(_) => GateApproval::Deny,
     }
@@ -230,8 +393,13 @@ async fn escalate_gated_call(
 /// The model-readable tool result when a gated call is withheld (denied at
 /// the safety-gate escalation). Reads as an invocation error so the model
 /// changes course rather than treating it as a hard abort.
+#[cfg(test)]
 pub(super) fn gate_block_message(tool: &str, unavailable: bool) -> String {
-    if unavailable {
+    gate_block(tool, unavailable).message
+}
+
+fn gate_block(tool: &str, unavailable: bool) -> GateBlock {
+    let message = if unavailable {
         format!(
             "`{tool}` was not run: the command-safety gate could not reach the utility model and \
              the user declined to run it unverified. Try a different approach or ask the user."
@@ -241,6 +409,10 @@ pub(super) fn gate_block_message(tool: &str, unavailable: bool) -> String {
             "`{tool}` was not run: the command-safety gate flagged it as unsafe and the user \
              declined. Do not retry the same call — choose a safer approach."
         )
+    };
+    GateBlock {
+        message,
+        status: "blocked_safety_gate",
     }
 }
 
@@ -251,7 +423,9 @@ mod safety_gate_tests {
     use std::time::Duration;
 
     use crate::approval::Approver;
+    use crate::approval::classify::classify;
     use crate::approval::store::GrantStore;
+    use crate::approval::store::Scope;
     use crate::config::extended::ApprovalMode;
     use crate::engine::injection_check::CheckOutcome;
     use crate::engine::tool::{Tool, ToolCtx};
@@ -320,6 +494,16 @@ mod safety_gate_tests {
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }
+    }
+
+    fn init_git_repo(path: &std::path::Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        crate::config::trust::clear_runtime_policy_for_tests();
     }
 
     fn attach_approver_with_hub(
@@ -487,6 +671,199 @@ mod safety_gate_tests {
         assert!(matches!(outcome, GateOutcome::Run { recheck: false }));
     }
 
+    #[tokio::test]
+    async fn standing_reject_gate_blocks_before_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let approver = ctx.approver.as_ref().unwrap();
+        let classification = classify("gh pr create");
+        let info = classification.simple_commands().iter().next().unwrap();
+        approver
+            .store()
+            .record_command_reject(info, Scope::Session)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "gh pr create" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+
+        reset_safety_gate_evaluate_calls();
+        let outcome =
+            safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
+
+        match outcome {
+            GateOutcome::Block(block) => {
+                assert_eq!(block.status, "blocked_standing_reject");
+                assert!(
+                    block.message.contains("rejected at session scope"),
+                    "{}",
+                    block.message
+                );
+            }
+            GateOutcome::Run { .. } => panic!("standing reject must block before dispatch"),
+            GateOutcome::Parked => panic!("standing reject must not park"),
+        }
+        assert_eq!(safety_gate_evaluate_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn standing_reject_gate_passthrough_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let (tx, _rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "gh pr create" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+
+        reset_safety_gate_evaluate_calls();
+        let outcome =
+            safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
+
+        match outcome {
+            GateOutcome::Block(block) => assert_eq!(block.status, "blocked_safety_gate"),
+            GateOutcome::Run { .. } | GateOutcome::Parked => {
+                panic!("unconfigured utility model with no client should fail closed")
+            }
+        }
+        assert_eq!(safety_gate_evaluate_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn standing_reject_allow_flip_unblocks_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let approver = ctx.approver.as_ref().unwrap();
+        let classification = classify("gh pr create");
+        let info = classification.simple_commands().iter().next().unwrap();
+        approver
+            .store()
+            .record_command_reject(info, Scope::Session)
+            .unwrap();
+        approver
+            .store()
+            .record_command(info, info.risk.tier, Scope::Session)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "gh pr create" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+
+        reset_safety_gate_evaluate_calls();
+        let outcome =
+            safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
+
+        match outcome {
+            GateOutcome::Run { recheck: false } => {}
+            GateOutcome::Run { recheck: true } => {
+                panic!("bash gate allow must not request recheck")
+            }
+            GateOutcome::Block(block) => {
+                panic!("allow flip must unblock gate, got {}", block.status)
+            }
+            GateOutcome::Parked => panic!("allow flip must not park"),
+        }
+        assert_eq!(safety_gate_evaluate_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn standing_reject_gate_covers_mcp() {
+        let env = tempfile::tempdir().unwrap();
+        let _home =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
+        let project = tempfile::tempdir_in(env.path()).unwrap();
+        init_git_repo(project.path());
+        let ctx = gate_ctx(project.path(), ApprovalMode::Auto, true);
+        let approver = ctx.approver.as_ref().unwrap();
+        approver
+            .store()
+            .record_mcp_tool_reject("example", "mutate", Scope::Project)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let args =
+            serde_json::json!({ "script": "result = mcp.invoke('example', 'mutate', {'x': 1})" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+
+        reset_safety_gate_evaluate_calls();
+        let outcome =
+            safety_gate_decision_with_configs("mcp", &args, &ctx, &tx, None, &providers).await;
+
+        match outcome {
+            GateOutcome::Block(block) => {
+                assert_eq!(block.status, "blocked_standing_reject");
+                assert!(
+                    block.message.contains("rejected at project scope"),
+                    "{}",
+                    block.message
+                );
+            }
+            GateOutcome::Run { .. } => panic!("MCP standing reject must block before dispatch"),
+            GateOutcome::Parked => panic!("MCP standing reject must not park"),
+        }
+        assert_eq!(safety_gate_evaluate_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn standing_reject_precedes_replay_gate_memo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let approver = ctx.approver.as_ref().unwrap();
+        let classification = classify("gh pr create");
+        let info = classification.simple_commands().iter().next().unwrap();
+        approver
+            .store()
+            .record_command_reject(info, Scope::Session)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "gh pr create" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+        let payload = crate::db::needs_attention::InterruptParkPayload {
+            tool: "bash".to_string(),
+            args: args.clone(),
+            call_id: "call-1".to_string(),
+            resume: crate::db::needs_attention::InterruptResumeAnchor {
+                agent_id: "builder".to_string(),
+                call_id: "call-1".to_string(),
+                provider_call_id: None,
+                assistant_seq: None,
+                call_origin: crate::db::needs_attention::InterruptCallOrigin::Foreground,
+            },
+            gate: Some(crate::db::needs_attention::InterruptGateMemo {
+                recheck_result: true,
+            }),
+        };
+
+        reset_safety_gate_evaluate_calls();
+        let outcome = crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+            safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await
+        })
+        .await;
+
+        match outcome {
+            GateOutcome::Block(block) => assert_eq!(block.status, "blocked_standing_reject"),
+            GateOutcome::Run { .. } => panic!("standing reject must override replay gate memo"),
+            GateOutcome::Parked => panic!("standing reject must not park"),
+        }
+        assert_eq!(safety_gate_evaluate_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn standing_reject_yolo_bypass_pinned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Yolo, true);
+        let approver = ctx.approver.as_ref().unwrap();
+        let classification = classify("gh pr create");
+        let info = classification.simple_commands().iter().next().unwrap();
+        approver
+            .store()
+            .record_command_reject(info, Scope::Session)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "gh pr create" });
+
+        reset_safety_gate_evaluate_calls();
+        let outcome = safety_gate_decision("bash", &args, &ctx, &tx).await;
+
+        assert!(matches!(outcome, GateOutcome::Run { recheck: false }));
+        assert_eq!(safety_gate_evaluate_calls(), 0);
+    }
+
     struct SleepTool;
 
     #[async_trait]
@@ -555,8 +932,13 @@ mod safety_gate_tests {
         let outcome =
             safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
         match outcome {
-            GateOutcome::Block(msg) => {
-                assert!(msg.contains("safety gate"), "got: {msg}");
+            GateOutcome::Block(block) => {
+                assert!(
+                    block.message.contains("safety gate"),
+                    "got: {}",
+                    block.message
+                );
+                assert_eq!(block.status, "blocked_safety_gate");
             }
             GateOutcome::Run { .. } => {
                 panic!("auto mode must NOT silently run when the gate is unavailable")

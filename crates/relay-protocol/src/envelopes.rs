@@ -53,56 +53,60 @@ pub enum DaemonControlTarget {
     Control,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AttentionEventType {
-    QuestionRaised,
-    ApprovalNeeded,
-    TurnDone,
-    TurnError,
-    ScheduleDone,
-    Unknown(String),
-}
-
-impl AttentionEventType {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::QuestionRaised => "QUESTION_RAISED",
-            Self::ApprovalNeeded => "APPROVAL_NEEDED",
-            Self::TurnDone => "TURN_DONE",
-            Self::TurnError => "TURN_ERROR",
-            Self::ScheduleDone => "SCHEDULE_DONE",
-            Self::Unknown(raw) => raw.as_str(),
+macro_rules! attention_event_type {
+    ($($variant:ident => $wire:literal),+ $(,)?) => {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum AttentionEventType {
+            $($variant,)+
+            Unknown(String),
         }
-    }
-}
 
-impl Serialize for AttentionEventType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
+        impl AttentionEventType {
+            pub fn canonical_variants() -> impl Iterator<Item = Self> {
+                [$(Self::$variant,)+].into_iter()
+            }
 
-impl<'de> Deserialize<'de> for AttentionEventType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        match value.as_str() {
-            "QUESTION_RAISED" => Ok(Self::QuestionRaised),
-            "APPROVAL_NEEDED" => Ok(Self::ApprovalNeeded),
-            "TURN_DONE" => Ok(Self::TurnDone),
-            "TURN_ERROR" => Ok(Self::TurnError),
-            "SCHEDULE_DONE" => Ok(Self::ScheduleDone),
-            "" => Err(serde::de::Error::custom(
-                "expected non-empty attention event type",
-            )),
-            _ => Ok(Self::Unknown(value)),
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $wire,)+
+                    Self::Unknown(raw) => raw.as_str(),
+                }
+            }
         }
-    }
+
+        impl Serialize for AttentionEventType {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for AttentionEventType {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                match value.as_str() {
+                    $($wire => Ok(Self::$variant),)+
+                    "" => Err(serde::de::Error::custom(
+                        "expected non-empty attention event type",
+                    )),
+                    _ => Ok(Self::Unknown(value)),
+                }
+            }
+        }
+    };
+}
+
+attention_event_type! {
+    ApprovalNeeded => "APPROVAL_NEEDED",
+    QuestionRaised => "QUESTION_RAISED",
+    TurnDone => "TURN_DONE",
+    TurnError => "TURN_ERROR",
+    ScheduleDone => "SCHEDULE_DONE",
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,6 +417,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::Path;
 
@@ -598,11 +603,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn attention_event_type_matches_shared_fixture() {
+        let fixture = attention_kind_fixture();
+        let canonical = AttentionEventType::canonical_variants()
+            .map(|event_type| event_type.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(canonical, fixture);
+        for event_type in fixture {
+            let parsed = serde_json::from_value::<AttentionEventType>(json!(event_type)).unwrap();
+            assert_eq!(parsed.as_str(), event_type);
+            assert!(!matches!(parsed, AttentionEventType::Unknown(_)));
+            assert_eq!(serde_json::to_value(parsed).unwrap(), json!(event_type));
+        }
+    }
+
     fn fixture_root() -> &'static Path {
         Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../packages/relay-protocol/fixtures"
         ))
+    }
+
+    fn attention_kind_fixture() -> BTreeSet<String> {
+        let path = fixture_root().join("attention/attention-kinds.json");
+        let kinds: Vec<String> = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let unique = kinds.iter().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            kinds.len(),
+            "attention fixture has duplicates"
+        );
+        unique
     }
 
     fn assert_roundtrip<T>(raw: &str)

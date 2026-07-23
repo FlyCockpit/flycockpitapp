@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
+  attentionEventTypeSchema,
   attentionNotificationPayloadSchema,
   clientRelayFrameSchema,
   daemonClientRelayFrameSchema,
@@ -80,6 +81,12 @@ describe("relay protocol fixtures", () => {
       }
     }
   });
+
+  it("attention event type matches shared kind fixture", () => {
+    const kinds = readAttentionKinds();
+    expect(new Set(kinds).size).toBe(kinds.length);
+    expect(attentionEventTypeSchema.options).toEqual(kinds);
+  });
 });
 
 function isValidFixtureName(name: string): name is ValidFixtureName {
@@ -88,6 +95,12 @@ function isValidFixtureName(name: string): name is ValidFixtureName {
 
 function readJson(name: string) {
   return JSON.parse(readFileSync(join(fixturesRoot, name), "utf8")) as unknown;
+}
+
+function readAttentionKinds() {
+  return z
+    .array(z.string().min(1))
+    .parse(JSON.parse(readFileSync(join(fixturesRoot, "attention/attention-kinds.json"), "utf8")));
 }
 
 function stableJson(value: unknown): string {

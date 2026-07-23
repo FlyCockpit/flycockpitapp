@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@flycockpit/db", () => ({
@@ -36,6 +38,7 @@ const {
   decideNotificationDelivery,
   ingestAttentionNotification,
   normalizeAttentionPayload,
+  notificationDefaults,
   parseRelayAttentionIngest,
   publishToast,
 } = await import("./notifications");
@@ -65,6 +68,22 @@ const basePayload = {
   fixedStringBody: "Open the session to review the request.",
   ts: "2026-07-06T00:00:00.000Z",
 };
+
+function readAttentionKinds(): string[] {
+  const raw: unknown = JSON.parse(
+    readFileSync(
+      join(import.meta.dirname, "../../../relay-protocol/fixtures/attention/attention-kinds.json"),
+      "utf8",
+    ),
+  );
+  expect(Array.isArray(raw)).toBe(true);
+  if (!Array.isArray(raw)) return [];
+  for (const value of raw) {
+    expect(typeof value).toBe("string");
+    expect(value).not.toBe("");
+  }
+  return raw as string[];
+}
 
 function seedBaseDb(overrides?: {
   targetUserId?: string;
@@ -157,6 +176,20 @@ describe("notification delivery decision", () => {
         duplicateInWindow: true,
       }),
     ).toEqual({ channel: "none", deliveredVia: "SUPPRESSED_DUPLICATE" });
+  });
+});
+
+describe("attention notification defaults", () => {
+  it("notificationDefaults covers every shared attention kind", () => {
+    const kinds = readAttentionKinds();
+    expect(new Set(kinds).size).toBe(kinds.length);
+
+    for (const kind of kinds) {
+      expect(notificationDefaults(kind as Parameters<typeof notificationDefaults>[0])).toEqual({
+        title: expect.any(String),
+        body: expect.any(String),
+      });
+    }
   });
 });
 

@@ -30,8 +30,8 @@ export const channelIdSchema = z.string().trim().min(1).max(128);
 export const relayClientIdSchema = z.string().trim().min(1).max(128);
 
 export const attentionEventTypeSchema = z.enum([
-  "QUESTION_RAISED",
   "APPROVAL_NEEDED",
+  "QUESTION_RAISED",
   "TURN_DONE",
   "TURN_ERROR",
   "SCHEDULE_DONE",

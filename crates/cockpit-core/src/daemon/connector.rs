@@ -1008,6 +1008,7 @@ impl Backoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1093,6 +1094,20 @@ mod tests {
         )
         .unwrap();
         serde_json::to_value(payload).unwrap()
+    }
+
+    fn attention_kind_fixture() -> BTreeSet<String> {
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/relay-protocol/fixtures/attention/attention-kinds.json");
+        let kinds: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(fixture_path).unwrap()).unwrap();
+        let unique = kinds.iter().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            kinds.len(),
+            "attention fixture has duplicates"
+        );
+        unique
     }
 
     async fn relay_pair() -> (
@@ -1662,6 +1677,68 @@ mod tests {
             assert_eq!(parsed.fixed_string_body.as_deref(), Some(body));
             assert!(parsed.target_principal.is_none());
         }
+    }
+
+    #[test]
+    fn attention_connector_kinds_match_shared_fixture() {
+        let (_tmp, ctx) = test_context();
+        let session_id = test_session_id(&ctx);
+        let events = [
+            interrupt_event(session_id, true),
+            interrupt_event(session_id, false),
+            Event::AgentIdle {
+                session_id,
+                turn_id: Some("turn-1".to_string()),
+                reason: crate::daemon::proto::IdleReason::Completed,
+            },
+            Event::SessionPersistFailed {
+                session_id,
+                error: "persist failed".to_string(),
+            },
+            Event::SessionDriverFailed {
+                session_id,
+                turn_id: Some("turn-1".to_string()),
+                error: "driver failed".to_string(),
+            },
+            Event::InferenceFailed {
+                session_id,
+                agent: "Build".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                error_class: "network".to_string(),
+                detail: "inference failed".to_string(),
+                auth_failure: None,
+            },
+            Event::ScheduleCompleted {
+                session_id,
+                job_id: "job-1".to_string(),
+                label: "Nightly".to_string(),
+                kind: "background".to_string(),
+                failed: false,
+            },
+        ];
+
+        let emitted = events
+            .iter()
+            .map(|event| {
+                attention_payload_for_event_with_meta(
+                    event,
+                    &ctx,
+                    "evt-test".to_string(),
+                    "2026-07-10T00:00:00.000Z".to_string(),
+                )
+                .unwrap()
+                .event_type
+                .as_str()
+                .to_string()
+            })
+            .collect::<BTreeSet<_>>();
+        let canonical = AttentionEventType::canonical_variants()
+            .map(|event_type| event_type.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(emitted, attention_kind_fixture());
+        assert_eq!(canonical, attention_kind_fixture());
     }
 
     #[test]

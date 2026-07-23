@@ -10020,7 +10020,10 @@ async fn attach_replay_precedes_live_events_under_task_split() {
             .recv()
             .await
             .expect("live subscription command"),
-        ClientEventCommand::Attach(_)
+        ClientEventCommand::Attach {
+            session_id: _,
+            rx: _
+        }
     ));
 }
 
@@ -10132,7 +10135,10 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
             .recv()
             .await
             .expect("live subscription command"),
-        ClientEventCommand::Attach(_)
+        ClientEventCommand::Attach {
+            session_id: _,
+            rx: _
+        }
     ));
     slow_release.notify_waiters();
     match concurrent.join_next().await.expect("slow read joins") {
@@ -10152,6 +10158,7 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
 async fn client_io_split_detach_silences_session_events() {
     let ctx = test_ctx();
     let (session_tx, session_rx) = broadcast::channel(8);
+    let session_id = Uuid::new_v4();
     let (_global_tx, global_rx) = broadcast::channel(8);
     let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, _executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
@@ -10166,7 +10173,10 @@ async fn client_io_split_detach_silences_session_events() {
     ));
 
     event_cmd_tx
-        .send(ClientEventCommand::Attach(session_rx))
+        .send(ClientEventCommand::Attach {
+            session_id,
+            rx: session_rx,
+        })
         .await
         .unwrap();
     session_tx
@@ -10198,26 +10208,29 @@ async fn client_io_split_detach_silences_session_events() {
 }
 
 #[tokio::test]
-async fn client_io_split_global_lag_still_emits_resync_error() {
+async fn broadcast_lag_emits_typed_event_not_internal_error() {
     let ctx = test_ctx();
-    let (global_tx, global_rx) = broadcast::channel(1);
-    global_tx
+    let (session_tx, session_rx) = broadcast::channel(1);
+    let (_global_tx, global_rx) = broadcast::channel(8);
+    let session_id = Uuid::new_v4();
+
+    session_tx
         .send(test_event_envelope(proto::Event::LspNotice {
             text: "first".to_string(),
         }))
         .unwrap();
-    global_tx
+    session_tx
         .send(test_event_envelope(proto::Event::LspNotice {
             text: "second".to_string(),
         }))
         .unwrap();
-    global_tx
+    session_tx
         .send(test_event_envelope(proto::Event::LspNotice {
             text: "third".to_string(),
         }))
         .unwrap();
 
-    let (_event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, _executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let event_task = tokio::spawn(run_client_event_forwarder(
@@ -10228,23 +10241,176 @@ async fn client_io_split_global_lag_still_emits_resync_error() {
         executor_tx,
         writer_tx,
     ));
+    event_cmd_tx
+        .send(ClientEventCommand::Attach {
+            session_id,
+            rx: session_rx,
+        })
+        .await
+        .unwrap();
 
-    let mut saw_error = false;
+    let mut saw_lag = false;
     for _ in 0..3 {
         let body = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             recv_writer_body(&mut writer_rx, "writer envelope"),
         )
         .await
-        .expect("resync envelope");
-        if let Body::Error { error, .. } = body {
-            assert!(error.message.contains("global event stream lagged"));
-            saw_error = true;
+        .expect("lag envelope");
+        match body {
+            Body::Event {
+                event:
+                    proto::Event::EventStreamLagged {
+                        session_id: Some(observed),
+                        dropped,
+                    },
+            } => {
+                assert_eq!(observed, session_id);
+                assert_eq!(dropped, 2);
+                saw_lag = true;
+                break;
+            }
+            Body::Error { error, .. } => {
+                assert!(
+                    !error.message.contains("event stream lagged"),
+                    "lag must not be surfaced as an Internal error"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_lag, "broadcast lag should emit a typed event");
+    event_task.abort();
+}
+
+#[tokio::test]
+async fn in_process_broadcast_lag_emits_typed_event() {
+    let base = test_ctx();
+    let (global_events, _) = broadcast::channel(1);
+    let ctx = Arc::new(DaemonContext {
+        db: base.db.clone(),
+        registry: base.registry.clone(),
+        paths: base.paths.clone(),
+        started_at: base.started_at,
+        caffeinate: base.caffeinate.clone(),
+        global_events,
+        global_redaction: base.global_redaction.clone(),
+        terminal_host: base.terminal_host.clone(),
+        client_count: base.client_count.clone(),
+        shutdown: base.shutdown.clone(),
+        shutdown_grace_override: StdMutex::new(None),
+        env_baseline: base.env_baseline.clone(),
+        upload_accounting: base.upload_accounting.clone(),
+        connector_wake: base.connector_wake.clone(),
+        scheduler: base.scheduler.clone(),
+        credential_store_path: None,
+        config_source: base.config_source.clone(),
+    });
+    let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
+
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), client.next_event())
+            .await
+            .expect("initial event")
+            .expect("in-process client should emit startup state"),
+        proto::Event::CaffeinateState { .. }
+    ));
+
+    for text in ["first", "second", "third"] {
+        ctx.broadcast_global(proto::Event::LspNotice {
+            text: text.to_string(),
+        });
+    }
+
+    let mut saw_lag = false;
+    for _ in 0..4 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), client.next_event())
+            .await
+            .expect("event")
+            .expect("in-process client should remain connected");
+        if let proto::Event::EventStreamLagged {
+            session_id: None,
+            dropped,
+        } = event
+        {
+            assert_eq!(dropped, 2);
+            saw_lag = true;
             break;
         }
     }
-    assert!(saw_error, "global lag should emit a synthetic error");
-    event_task.abort();
+    assert!(saw_lag, "in-process broadcast lag should emit typed event");
+}
+
+#[tokio::test(start_paused = true)]
+async fn in_process_full_event_queue_emits_lag_marker() {
+    const DROPPED: usize = 7;
+    let base = test_ctx();
+    let (global_events, _) = broadcast::channel(IN_PROCESS_EVENT_QUEUE + DROPPED + 16);
+    let ctx = Arc::new(DaemonContext {
+        db: base.db.clone(),
+        registry: base.registry.clone(),
+        paths: base.paths.clone(),
+        started_at: base.started_at,
+        caffeinate: base.caffeinate.clone(),
+        global_events,
+        global_redaction: base.global_redaction.clone(),
+        terminal_host: base.terminal_host.clone(),
+        client_count: base.client_count.clone(),
+        shutdown: base.shutdown.clone(),
+        shutdown_grace_override: StdMutex::new(None),
+        env_baseline: base.env_baseline.clone(),
+        upload_accounting: base.upload_accounting.clone(),
+        connector_wake: base.connector_wake.clone(),
+        scheduler: base.scheduler.clone(),
+        credential_store_path: None,
+        config_source: base.config_source.clone(),
+    });
+    let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
+
+    assert!(matches!(
+        client
+            .next_event()
+            .await
+            .expect("in-process client should emit startup state"),
+        proto::Event::CaffeinateState { .. }
+    ));
+
+    for i in 0..(IN_PROCESS_EVENT_QUEUE + DROPPED) {
+        ctx.broadcast_global(proto::Event::LspNotice {
+            text: format!("event-{i}"),
+        });
+    }
+
+    client
+        .request_ok(Request::DaemonStatus)
+        .await
+        .expect("full in-process event queue must not block requests");
+
+    let mut saw_lag = false;
+    for _ in 0..=IN_PROCESS_EVENT_QUEUE {
+        match client
+            .next_event()
+            .await
+            .expect("lag marker should arrive after queued events")
+        {
+            proto::Event::EventStreamLagged {
+                session_id: None,
+                dropped,
+            } => {
+                assert_eq!(dropped, DROPPED as u64);
+                saw_lag = true;
+                break;
+            }
+            proto::Event::EventStreamLagged { session_id, .. } => {
+                panic!("global queue overflow should not carry session id {session_id:?}");
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_lag,
+        "full in-process queue should emit typed lag marker"
+    );
 }
 
 #[tokio::test]

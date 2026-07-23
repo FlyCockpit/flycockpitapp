@@ -1595,6 +1595,10 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | GitignoreAllow { session_id, .. }
         | PausedWorkAvailable { session_id, .. }
         | WaitingForLock { session_id, .. } => *session_id,
+        EventStreamLagged {
+            session_id: Some(session_id),
+            ..
+        } => *session_id,
         // Daemon-global events carry no session_id: they reach every
         // client regardless of attachment.
         CaffeinateState { .. }
@@ -1605,6 +1609,9 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | TerminalViewers { .. }
         | TerminalClosed { .. }
         | LspNotice { .. }
+        | EventStreamLagged {
+            session_id: None, ..
+        }
         | EnvDriftWarning { .. }
         | Unknown => return None,
     })
@@ -2312,6 +2319,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         },
         ConfigSnapshot { snapshot } => TurnEvent::ConfigSnapshot { snapshot },
         InterruptRaised { .. }
+        | EventStreamLagged { .. }
         | SessionEnded { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }

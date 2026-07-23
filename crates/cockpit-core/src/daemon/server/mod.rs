@@ -513,6 +513,10 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             terminal_id: _,
             count: _,
         }
+        | proto::Event::EventStreamLagged {
+            session_id: _,
+            dropped: _,
+        }
         | proto::Event::DaemonDraining { forced: _ } => {}
         proto::Event::ThinkingStarted {
             session_id: _,
@@ -2504,9 +2508,12 @@ async fn run_in_process_client(
     let mut session_event_rx: Option<EventReceiver> = None;
     let concurrent_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENT_REQUESTS));
     let mut concurrent_tasks = JoinSet::new();
+    let mut pending_lag = PendingEventLag::default();
 
-    if event_tx.send(ctx.caffeinate_state_event()).await.is_err() {
-        return;
+    match event_tx.try_send(ctx.caffeinate_state_event()) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => return,
+        Err(mpsc::error::TrySendError::Closed(_)) => return,
     }
 
     loop {
@@ -2519,6 +2526,16 @@ async fn run_in_process_client(
 
         tokio::select! {
             biased;
+            permit = event_tx.reserve(), if pending_lag.has_dropped() => {
+                match permit {
+                    Ok(permit) => {
+                        if let Some(event) = pending_lag.take_event() {
+                            permit.send(event);
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
             Some(joined) = concurrent_tasks.join_next(), if !concurrent_tasks.is_empty() => {
                 if let Err(error) = joined {
                     tracing::warn!(%error, "in-process concurrent request task failed");
@@ -2527,17 +2544,18 @@ async fn run_in_process_client(
             global = global_rx.recv() => {
                 match global {
                     Ok(envelope) => {
-                        if event_tx.send(envelope.event).await.is_err() {
+                        if !try_send_in_process_event(&event_tx, envelope.event, None, &mut pending_lag) {
                             return;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(missed = n, "in-process client global event stream lagged");
-                        if event_tx.send(ctx.caffeinate_state_event()).await.is_err() {
+                        pending_lag.record_many(n, None);
+                        if !try_send_in_process_event(&event_tx, ctx.caffeinate_state_event(), None, &mut pending_lag) {
                             return;
                         }
                         if let Some(event) = ctx.drain_state_event()
-                            && event_tx.send(event).await.is_err()
+                            && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
                         {
                             return;
                         }
@@ -2548,12 +2566,26 @@ async fn run_in_process_client(
             event = event_branch => {
                 match event {
                     Some(Ok(envelope)) => {
-                        if event_tx.send(envelope.event).await.is_err() {
+                        let session_id = state
+                            .attached
+                            .as_ref()
+                            .map(|attached| attached.handle.session_id);
+                        if !try_send_in_process_event(
+                            &event_tx,
+                            envelope.event,
+                            session_id,
+                            &mut pending_lag,
+                        ) {
                             return;
                         }
                     }
                     Some(Err(broadcast::error::RecvError::Lagged(n))) => {
                         tracing::warn!(missed = n, "in-process client event stream lagged; reattach to resync");
+                        let session_id = state
+                            .attached
+                            .as_ref()
+                            .map(|attached| attached.handle.session_id);
+                        pending_lag.record_many(n, session_id);
                     }
                     Some(Err(broadcast::error::RecvError::Closed)) => {
                         state.attached = None;
@@ -2596,13 +2628,17 @@ async fn run_in_process_client(
                 }
                 let _ = reply.send(result);
                 if is_attach && attached {
+                    let session_id = state
+                        .attached
+                        .as_ref()
+                        .map(|attached| attached.handle.session_id);
                     for event in std::mem::take(&mut state.pending_replay) {
-                        if event_tx.send(event).await.is_err() {
+                        if !try_send_in_process_event(&event_tx, event, session_id, &mut pending_lag) {
                             return;
                         }
                     }
                     if let Some(event) = ctx.drain_state_event()
-                        && event_tx.send(event).await.is_err()
+                        && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
                     {
                         return;
                     }
@@ -2614,6 +2650,64 @@ async fn run_in_process_client(
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct PendingEventLag {
+    dropped: u64,
+    session_id: Option<Uuid>,
+}
+
+impl PendingEventLag {
+    fn has_dropped(&self) -> bool {
+        self.dropped > 0
+    }
+
+    fn record_drop(&mut self, session_id: Option<Uuid>) {
+        self.record_many(1, session_id);
+    }
+
+    fn record_many(&mut self, dropped: u64, session_id: Option<Uuid>) {
+        if dropped == 0 {
+            return;
+        }
+        if self.dropped == 0 {
+            self.session_id = session_id;
+        } else if self.session_id != session_id {
+            self.session_id = None;
+        }
+        self.dropped = self.dropped.saturating_add(dropped);
+    }
+
+    fn take_event(&mut self) -> Option<proto::Event> {
+        if self.dropped == 0 {
+            return None;
+        }
+        let event = proto::Event::EventStreamLagged {
+            session_id: self.session_id,
+            dropped: self.dropped,
+        };
+        self.dropped = 0;
+        self.session_id = None;
+        Some(event)
+    }
+}
+
+fn try_send_in_process_event(
+    event_tx: &mpsc::Sender<proto::Event>,
+    event: proto::Event,
+    session_id: Option<Uuid>,
+    pending_lag: &mut PendingEventLag,
+) -> bool {
+    match event_tx.try_send(event) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(event)) => {
+            tracing::warn!(?event, "in-process client event queue full; dropping event");
+            pending_lag.record_drop(session_id);
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
     }
 }
 
@@ -2753,7 +2847,7 @@ enum ClientWriterMessage {
 }
 
 enum ClientEventCommand {
-    Attach(EventReceiver),
+    Attach { session_id: Uuid, rx: EventReceiver },
     Detach,
 }
 
@@ -2842,6 +2936,7 @@ async fn run_client_event_forwarder(
     writer_tx: mpsc::Sender<ClientWriterMessage>,
 ) {
     let mut session_event_rx: Option<EventReceiver> = None;
+    let mut session_id: Option<Uuid> = None;
     loop {
         let session_branch = async {
             match session_event_rx.as_mut() {
@@ -2854,10 +2949,12 @@ async fn run_client_event_forwarder(
             biased;
             cmd = event_cmd_rx.recv() => {
                 match cmd {
-                    Some(ClientEventCommand::Attach(rx)) => {
+                    Some(ClientEventCommand::Attach { session_id: id, rx }) => {
+                        session_id = Some(id);
                         session_event_rx = Some(rx);
                     }
                     Some(ClientEventCommand::Detach) => {
+                        session_id = None;
                         session_event_rx = None;
                     }
                     None => return,
@@ -2890,15 +2987,10 @@ async fn run_client_event_forwarder(
                         }
                         if !send_writer_envelope(
                             &writer_tx,
-                            Envelope::error(
-                                None,
-                                ErrorPayload {
-                                    code: ErrorCode::Internal,
-                                    message: format!(
-                                        "global event stream lagged by {n}; resyncing"
-                                    ),
-                                },
-                            ),
+                            Envelope::event(proto::Event::EventStreamLagged {
+                                session_id: None,
+                                dropped: n,
+                            }),
                         )
                         .await
                         {
@@ -2927,17 +3019,15 @@ async fn run_client_event_forwarder(
                         tracing::warn!(missed = n, "client event stream lagged; reattach to resync");
                         let _ = send_writer_envelope(
                             &writer_tx,
-                            Envelope::error(
-                                None,
-                                ErrorPayload {
-                                    code: ErrorCode::Internal,
-                                    message: format!("event stream lagged by {n}; re-attach"),
-                                },
-                            ),
+                            Envelope::event(proto::Event::EventStreamLagged {
+                                session_id,
+                                dropped: n,
+                            }),
                         )
                         .await;
                     }
                     Some(Err(broadcast::error::RecvError::Closed)) => {
+                        session_id = None;
                         session_event_rx = None;
                         let _ = executor_tx.send(ClientExecutorInput::SessionEventsClosed).await;
                     }
@@ -3138,7 +3228,15 @@ async fn handle_envelope(
                     let _ = send_writer_envelope(writer_tx, Envelope::event(event)).await;
                 }
                 if let Some(rx) = effects.session_event_rx.take() {
-                    let _ = event_cmd_tx.send(ClientEventCommand::Attach(rx)).await;
+                    let session_id = state
+                        .attached
+                        .as_ref()
+                        .map(|attached| attached.handle.session_id);
+                    if let Some(session_id) = session_id {
+                        let _ = event_cmd_tx
+                            .send(ClientEventCommand::Attach { session_id, rx })
+                            .await;
+                    }
                 }
             } else if state.attached.is_none() {
                 let _ = event_cmd_tx.send(ClientEventCommand::Detach).await;

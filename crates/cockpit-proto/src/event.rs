@@ -699,6 +699,17 @@ pub enum Event {
         text: String,
     },
 
+    /// The receiver of this stream missed events and its view is incomplete.
+    ///
+    /// Re-attach with `since_seq = last_applied_seq` and apply the resulting
+    /// [`Self::HistoryReplay`]. `session_id` is `None` when the loss happened
+    /// on the daemon-global bus.
+    EventStreamLagged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        dropped: u64,
+    },
+
     /// The utility-model skill auto-selector injected a skill onto this
     /// turn's wire message (`auto-injected-skill-transcript-
     /// visibility.md`). The client renders a distinct `/{name} · injected
@@ -1318,6 +1329,7 @@ macro_rules! event_variants {
             (Event::UserMessageRetracted { .. }, "user_message_retracted");
             (Event::Notice { .. }, "notice");
             (Event::LspNotice { .. }, "lsp_notice");
+            (Event::EventStreamLagged { .. }, "event_stream_lagged");
             (Event::SkillAutoInjected { .. }, "skill_auto_injected");
             (Event::ToolStart { .. }, "tool_start");
             (Event::ToolEnd { .. }, "tool_end");

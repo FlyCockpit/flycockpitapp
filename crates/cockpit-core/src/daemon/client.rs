@@ -34,10 +34,10 @@ static OWN_EPHEMERAL_PATHS: OnceLock<Mutex<Option<crate::daemon::DaemonPaths>>> 
 /// Outbound queue depth. Generous — request payloads are tiny.
 const REQUEST_QUEUE: usize = 64;
 
-/// Inbound event queue depth. Lagging consumers drop the oldest
-/// events; the TUI is expected to drain fast enough to keep up. If it
-/// can't, the right answer is "reattach" (the server re-sends the
-/// current session state on `Attach`).
+/// Inbound event queue depth. Lagging consumers drop incoming events and get a
+/// typed lag marker once capacity returns. If the TUI cannot keep up, the
+/// right answer is "reattach" (the server re-sends the current session state
+/// on `Attach`).
 const EVENT_QUEUE: usize = 1024;
 
 /// Default request timeout. Most requests are < 50ms; we set a
@@ -239,6 +239,8 @@ async fn run_io(
     let mut pending: HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>> =
         HashMap::new();
     let mut inbound_burst = InboundBurst::default();
+    let mut dropped_events: u64 = 0;
+    let mut attached_session: Option<Uuid> = None;
 
     loop {
         if inbound_burst.should_probe_outbound() {
@@ -258,6 +260,22 @@ async fn run_io(
         tokio::select! {
             biased;
 
+            permit = event_tx.reserve(), if dropped_events > 0 => {
+                match permit {
+                    Ok(permit) => {
+                        let dropped = dropped_events;
+                        permit.send(proto::Event::EventStreamLagged {
+                            session_id: None,
+                            dropped,
+                        });
+                        dropped_events = 0;
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+
             // Inbound envelope from the daemon.
             recv = proto.recv() => {
                 inbound_burst.record_inbound();
@@ -271,6 +289,9 @@ async fn run_io(
                             Body::Response { id, response } => {
                                 let response = *response;
                                 if let Some(tx) = pending.remove(&id) {
+                                    if let Response::Attached { session_id, .. } = &response {
+                                        attached_session = Some(*session_id);
+                                    }
                                     let _ = tx.send(Ok(response));
                                 } else if is_nil_daemon_status_hello(id, &response) {
                                     tracing::debug!("daemon hello status received");
@@ -289,15 +310,20 @@ async fn run_io(
                                     }
                                     None => {
                                         tracing::warn!(?error, "out-of-band daemon error");
+                                        let text = format!("daemon error: {error}");
+                                        let event = match attached_session {
+                                            Some(session_id) => proto::Event::Notice {
+                                                session_id,
+                                                text,
+                                            },
+                                            None => proto::Event::LspNotice { text },
+                                        };
+                                        try_forward_event(&event_tx, event, &mut dropped_events);
                                     }
                                 }
                             }
                             Body::Event { event } => {
-                                if event_tx.send(event).await.is_err() {
-                                    // The consumer dropped — we're
-                                    // closing soon. Keep reading so
-                                    // we don't fill OS buffers.
-                                }
+                                try_forward_event(&event_tx, event, &mut dropped_events);
                             }
                             Body::Request { id, request } => {
                                 tracing::warn!(id = %id, ?request, "daemon sent a request to a client; ignoring");
@@ -360,6 +386,41 @@ async fn run_io(
             code: proto::ErrorCode::Internal,
             message: "daemon connection closed".into(),
         }));
+    }
+
+    if dropped_events > 0 {
+        emit_lag_marker_on_close(&event_tx, dropped_events).await;
+    }
+}
+
+#[cfg(unix)]
+async fn emit_lag_marker_on_close(event_tx: &mpsc::Sender<proto::Event>, dropped: u64) {
+    if dropped == 0 {
+        return;
+    }
+    if let Ok(permit) = event_tx.reserve().await {
+        permit.send(proto::Event::EventStreamLagged {
+            session_id: None,
+            dropped,
+        });
+    }
+}
+
+#[cfg(unix)]
+fn try_forward_event(
+    event_tx: &mpsc::Sender<proto::Event>,
+    event: proto::Event,
+    dropped_events: &mut u64,
+) {
+    match event_tx.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            *dropped_events = dropped_events.saturating_add(1);
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            // The consumer dropped; keep reading the socket so OS buffers do
+            // not fill while request senders wind down through their channel.
+        }
     }
 }
 
@@ -627,6 +688,72 @@ mod tests {
     use super::*;
     use crate::daemon::DaemonPaths;
 
+    fn lsp_event(text: impl Into<String>) -> proto::Event {
+        proto::Event::LspNotice { text: text.into() }
+    }
+
+    fn daemon_status_response() -> Response {
+        Response::DaemonStatus {
+            pid: 1,
+            uptime_secs: 2,
+            active_sessions: 0,
+            socket_path: "/tmp/cockpit.sock".to_string(),
+            daemon_version: proto::DAEMON_VERSION.to_string(),
+            protocol_version: proto::PROTOCOL_VERSION,
+            paused_sessions: 0,
+            database_path: ":memory:".to_string(),
+            schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+        }
+    }
+
+    fn attach_request(session_id: Option<Uuid>) -> Request {
+        Request::Attach {
+            session_id,
+            since_seq: None,
+            project_root: Some("/tmp".into()),
+            no_sandbox: false,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
+        }
+    }
+
+    fn attached_response(session_id: Uuid) -> Response {
+        Response::Attached {
+            session_id,
+            short_id: "abc123".to_string(),
+            project_root: "/tmp".to_string(),
+            project_id: "project".to_string(),
+            active_agent: "Build".to_string(),
+            active_agent_path: Vec::new(),
+            foreground_target: None,
+            active_subagent: None,
+            active_model_state: None,
+            history: Vec::new(),
+            paused_work: Vec::new(),
+            repair_required: None,
+            daemon_version: proto::DAEMON_VERSION.to_string(),
+            compatible: true,
+            env_baseline: None,
+            env_session: None,
+            env_drift: None,
+            env_policy_applied: crate::env_snapshot::EnvDriftPolicy::Daemon,
+            btw_fork: None,
+        }
+    }
+
+    async fn recv_request_id(daemon: &mut ProtoStream<UnixStream>) -> Uuid {
+        match daemon.recv().await.unwrap().unwrap() {
+            proto::RecvFrame::Envelope(env) => match env.body {
+                Body::Request { id, .. } => id,
+                other => panic!("expected request body, got {other:?}"),
+            },
+            other => panic!("expected request envelope, got {other:?}"),
+        }
+    }
+
     fn temp_ephemeral_paths(root: &std::path::Path, stem: &str) -> DaemonPaths {
         DaemonPaths {
             socket: root.join(format!("{stem}.sock")),
@@ -695,6 +822,165 @@ mod tests {
         assert!(remove_pending_request(&mut pending, id).is_some());
         assert!(pending.is_empty());
         assert!(remove_pending_request(&mut pending, id).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_event_queue_does_not_block_pending_requests() {
+        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+
+        let daemon_task = tokio::spawn(async move {
+            for i in 0..(EVENT_QUEUE + 100) {
+                daemon
+                    .send(&Envelope::event(lsp_event(format!("event-{i}"))))
+                    .await
+                    .unwrap();
+            }
+            let id = recv_request_id(&mut daemon).await;
+            daemon
+                .send(&Envelope::response(id, daemon_status_response()))
+                .await
+                .unwrap();
+        });
+
+        let response = client
+            .request(Request::DaemonStatus)
+            .await
+            .unwrap()
+            .expect("full event queue must not block request handling");
+        assert!(matches!(response, Response::DaemonStatus { .. }));
+        daemon_task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_events_emit_exactly_one_lag_marker() {
+        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+        const DROPPED: usize = 7;
+
+        let daemon_task = tokio::spawn(async move {
+            for i in 0..EVENT_QUEUE {
+                daemon
+                    .send(&Envelope::event(lsp_event(format!("pre-{i}"))))
+                    .await
+                    .unwrap();
+            }
+            for i in 0..DROPPED {
+                daemon
+                    .send(&Envelope::event(lsp_event(format!("drop-{i}"))))
+                    .await
+                    .unwrap();
+            }
+
+            let id = recv_request_id(&mut daemon).await;
+            daemon
+                .send(&Envelope::response(id, daemon_status_response()))
+                .await
+                .unwrap();
+        });
+
+        client
+            .request(Request::DaemonStatus)
+            .await
+            .unwrap()
+            .expect("request proves all pre-lag frames were read before the response");
+
+        for expected in 0..2 {
+            assert!(matches!(
+                client.next_event().await,
+                Some(proto::Event::LspNotice { text }) if text == format!("pre-{expected}")
+            ));
+        }
+
+        for expected in 2..EVENT_QUEUE {
+            assert!(matches!(
+                client.next_event().await,
+                Some(proto::Event::LspNotice { text }) if text == format!("pre-{expected}")
+            ));
+        }
+
+        assert!(matches!(
+            client.next_event().await,
+            Some(proto::Event::EventStreamLagged {
+                session_id: None,
+                dropped
+            }) if dropped == DROPPED as u64
+        ));
+        match tokio::time::timeout(Duration::from_millis(1), client.next_event()).await {
+            Err(_) | Ok(None) => {}
+            Ok(Some(event)) => assert!(
+                !matches!(event, proto::Event::EventStreamLagged { .. }),
+                "one contiguous lag episode should produce exactly one marker"
+            ),
+        }
+        daemon_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn out_of_band_lag_error_is_surfaced_not_discarded() {
+        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+        let session_id = Uuid::new_v4();
+
+        let request = client.request(attach_request(Some(session_id)));
+        let daemon_reply = async {
+            let attach_id = recv_request_id(&mut daemon).await;
+            daemon
+                .send(&Envelope::response(
+                    attach_id,
+                    attached_response(session_id),
+                ))
+                .await
+                .unwrap();
+            daemon
+                .send(&Envelope::error(
+                    None,
+                    ErrorPayload {
+                        code: proto::ErrorCode::Internal,
+                        message: format!("event stream {} by 9; re-attach", "lagged"),
+                    },
+                ))
+                .await
+                .unwrap();
+        };
+
+        let (result, _) = tokio::join!(request, daemon_reply);
+        result.unwrap().expect("attach succeeds");
+        assert!(matches!(
+            client.next_event().await,
+            Some(proto::Event::Notice {
+                session_id: observed,
+                text
+            }) if observed == session_id
+                && text.contains(&format!("event stream {} by 9; re-attach", "lagged"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn pre_attach_out_of_band_error_is_surfaced_not_discarded() {
+        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+
+        daemon
+            .send(&Envelope::error(
+                None,
+                ErrorPayload {
+                    code: proto::ErrorCode::Internal,
+                    message: "daemon boot warning".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client.next_event().await,
+            Some(proto::Event::LspNotice { text })
+                if text.contains("daemon boot warning")
+        ));
     }
 
     #[tokio::test]

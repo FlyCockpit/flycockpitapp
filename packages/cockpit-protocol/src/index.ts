@@ -615,6 +615,7 @@ export const knownEventKindSchema = z.enum([
   "daemon_draining",
   "delegation_recursion_state",
   "env_drift_warning",
+  "event_stream_lagged",
   "foreground_input_target",
   "gitignore_allow",
   "history_replay",
@@ -703,7 +704,14 @@ const interruptResolvedDataSchema = z
     seq: z.number().int().optional(),
   })
   .passthrough();
+const eventStreamLaggedDataSchema = z
+  .object({
+    session_id: uuidSchema.optional(),
+    dropped: z.number().int().nonnegative(),
+  })
+  .passthrough();
 const structuredEventDataSchemas = {
+  event_stream_lagged: eventStreamLaggedDataSchema,
   history_replay: historyReplayDataSchema,
   interrupt_raised: interruptRaisedDataSchema,
   interrupt_resolved: interruptResolvedDataSchema,

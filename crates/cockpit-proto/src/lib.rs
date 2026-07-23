@@ -392,7 +392,7 @@ pub enum IdleReason {
     NeedsIntervention { code: String },
     BudgetLimited,
     UsageLimited,
-    Error { class: String },
+    Error { class: InferenceErrorClass },
     Interrupted,
 }
 
@@ -799,7 +799,7 @@ fn default_client_protocol_version() -> u32 {
 // below, carrying `session_id` so the client can route it.)
 
 mod event;
-pub use event::{AuthFailureKind, Event};
+pub use event::{AuthFailureKind, Event, InferenceErrorClass};
 
 // ---- Errors ----------------------------------------------------------------
 

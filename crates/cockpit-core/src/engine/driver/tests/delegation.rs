@@ -323,7 +323,7 @@ async fn unwind_stack_to_root_inference_failure_delivers_diagnostics() {
         StackUnwindReason::InferenceFailed {
             provider: "lmstudio".into(),
             model: "local".into(),
-            class: crate::engine::model::InferenceErrorClass::TimeoutTtft.as_str(),
+            class: crate::engine::model::InferenceErrorClass::TimeoutTtft,
             phase: "ttft".into(),
         },
         "provider=lmstudio, model=local, class=timeout_ttft, phase=ttft",
@@ -353,7 +353,7 @@ async fn all_unwind_paths_drain_pending_input() {
         StackUnwindReason::InferenceFailed {
             provider: "lmstudio".into(),
             model: "local".into(),
-            class: crate::engine::model::InferenceErrorClass::Network.as_str(),
+            class: crate::engine::model::InferenceErrorClass::Network,
             phase: "dispatch".into(),
         },
     ] {

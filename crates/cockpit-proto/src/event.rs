@@ -1,7 +1,322 @@
 use super::*;
 use serde::ser::SerializeMap;
+use std::str::FromStr;
 
 // ---- Events ----------------------------------------------------------------
+
+const CLASS_TIMEOUT_TTFT: &str = "timeout_ttft";
+const CLASS_TIMEOUT_IDLE: &str = "timeout_idle";
+const CLASS_NETWORK: &str = "network";
+const CLASS_HTTP_PREFIX: &str = "http_";
+const CLASS_UTILITY_TIMEOUT: &str = "utility_timeout";
+const CLASS_MISSING_TOOL_ENTITLEMENT: &str = "missing_tool_entitlement";
+const CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED: &str = "client_side_tools_unsupported";
+const CLASS_RESPONSES_TOOL_IDENTITY: &str = "responses_tool_identity";
+const CLASS_PROVIDER_NOT_CONFIGURED: &str = "provider_not_configured";
+const CLASS_PROVIDER_RATE_LIMIT: &str = "provider_rate_limit";
+const DEFAULT_MISSING_TOOL_FEATURE: &str = "client_side_tools";
+
+/// Why a turn's inference failed.
+///
+/// The flat string produced by [`Self::as_str`] remains the stable display
+/// text for every existing class. Serde carries data-bearing classes as
+/// objects so the wire does not have to scrape values back out of prose.
+///
+/// Note `cancelled` is not a class: cancellation is recorded as a separate
+/// dispatch status before an [`InferenceFailure`](Event::InferenceFailed)
+/// exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InferenceErrorClass {
+    /// No first token within the configured TTFT ceiling.
+    TimeoutTtft,
+    /// Inter-token gap exceeded the configured idle ceiling.
+    TimeoutIdle,
+    /// Connection / transport failure with no HTTP status.
+    Network,
+    /// Non-retryable HTTP response, carrying the status code.
+    Http(u16),
+    /// A bounded utility-model request exceeded its call-site budget.
+    UtilityTimeout,
+    /// The provider requires an entitlement for client-side tools.
+    MissingToolEntitlement { feature: String },
+    /// Client-side tools cannot be used with this model.
+    ClientSideToolsUnsupported,
+    /// Responses tool-call identity normalization failed before dispatch.
+    ResponsesToolIdentity,
+    /// Provider credentials/configuration are absent.
+    ProviderNotConfigured,
+    /// Provider reported a rate or usage limit without a concrete HTTP class.
+    ProviderRateLimit,
+    /// A novel class preserved exactly at the string boundary.
+    Other(String),
+}
+
+impl InferenceErrorClass {
+    /// Stable string form used for display text and legacy flat values.
+    pub fn as_str(&self) -> String {
+        match self {
+            Self::TimeoutTtft => CLASS_TIMEOUT_TTFT.to_string(),
+            Self::TimeoutIdle => CLASS_TIMEOUT_IDLE.to_string(),
+            Self::Network => CLASS_NETWORK.to_string(),
+            Self::Http(status) => format!("{CLASS_HTTP_PREFIX}{status}"),
+            Self::UtilityTimeout => CLASS_UTILITY_TIMEOUT.to_string(),
+            Self::MissingToolEntitlement { .. } => CLASS_MISSING_TOOL_ENTITLEMENT.to_string(),
+            Self::ClientSideToolsUnsupported => CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED.to_string(),
+            Self::ResponsesToolIdentity => CLASS_RESPONSES_TOOL_IDENTITY.to_string(),
+            Self::ProviderNotConfigured => CLASS_PROVIDER_NOT_CONFIGURED.to_string(),
+            Self::ProviderRateLimit => CLASS_PROVIDER_RATE_LIMIT.to_string(),
+            Self::Other(value) => value.clone(),
+        }
+    }
+
+    pub fn provider_status(&self) -> Option<u16> {
+        match self {
+            Self::Http(status) => Some(*status),
+            _ => None,
+        }
+    }
+
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::TimeoutTtft | Self::TimeoutIdle)
+    }
+}
+
+impl fmt::Display for InferenceErrorClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.as_str())
+    }
+}
+
+impl FromStr for InferenceErrorClass {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let class = match value {
+            CLASS_TIMEOUT_TTFT => Self::TimeoutTtft,
+            CLASS_TIMEOUT_IDLE => Self::TimeoutIdle,
+            CLASS_NETWORK => Self::Network,
+            CLASS_UTILITY_TIMEOUT => Self::UtilityTimeout,
+            CLASS_MISSING_TOOL_ENTITLEMENT => Self::MissingToolEntitlement {
+                feature: DEFAULT_MISSING_TOOL_FEATURE.to_string(),
+            },
+            CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED => Self::ClientSideToolsUnsupported,
+            CLASS_RESPONSES_TOOL_IDENTITY => Self::ResponsesToolIdentity,
+            CLASS_PROVIDER_NOT_CONFIGURED => Self::ProviderNotConfigured,
+            CLASS_PROVIDER_RATE_LIMIT => Self::ProviderRateLimit,
+            value => match value
+                .strip_prefix(CLASS_HTTP_PREFIX)
+                .and_then(|s| s.parse::<u16>().ok())
+            {
+                Some(status) if (100..=599).contains(&status) => Self::Http(status),
+                _ => Self::Other(value.to_string()),
+            },
+        };
+        Ok(class)
+    }
+}
+
+impl Serialize for InferenceErrorClass {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Http(status) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("kind", "http")?;
+                map.serialize_entry("status", status)?;
+                map.end()
+            }
+            Self::MissingToolEntitlement { feature } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("kind", CLASS_MISSING_TOOL_ENTITLEMENT)?;
+                map.serialize_entry("feature", feature)?;
+                map.end()
+            }
+            _ => serializer.serialize_str(&self.as_str()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for InferenceErrorClass {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(class) = value.as_str() {
+            return Ok(Self::from_str(class).expect("infallible class parse"));
+        }
+        let kind = value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::missing_field("kind"))?;
+        match kind {
+            "http" => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    status: u16,
+                }
+                serde_json::from_value::<Wire>(value)
+                    .map(|wire| Self::Http(wire.status))
+                    .map_err(serde::de::Error::custom)
+            }
+            CLASS_MISSING_TOOL_ENTITLEMENT => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    feature: String,
+                }
+                serde_json::from_value::<Wire>(value)
+                    .map(|wire| Self::MissingToolEntitlement {
+                        feature: wire.feature,
+                    })
+                    .map_err(serde::de::Error::custom)
+            }
+            CLASS_TIMEOUT_TTFT => Ok(Self::TimeoutTtft),
+            CLASS_TIMEOUT_IDLE => Ok(Self::TimeoutIdle),
+            CLASS_NETWORK => Ok(Self::Network),
+            CLASS_UTILITY_TIMEOUT => Ok(Self::UtilityTimeout),
+            CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED => Ok(Self::ClientSideToolsUnsupported),
+            CLASS_RESPONSES_TOOL_IDENTITY => Ok(Self::ResponsesToolIdentity),
+            CLASS_PROVIDER_NOT_CONFIGURED => Ok(Self::ProviderNotConfigured),
+            CLASS_PROVIDER_RATE_LIMIT => Ok(Self::ProviderRateLimit),
+            other => Ok(Self::Other(other.to_string())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_class_wire_tests {
+    use super::*;
+
+    #[test]
+    fn error_class_wire_json_shape_is_pinned_for_every_variant() {
+        let cases = [
+            (InferenceErrorClass::TimeoutTtft, json!("timeout_ttft")),
+            (InferenceErrorClass::TimeoutIdle, json!("timeout_idle")),
+            (InferenceErrorClass::Network, json!("network")),
+            (
+                InferenceErrorClass::Http(502),
+                json!({ "kind": "http", "status": 502 }),
+            ),
+            (
+                InferenceErrorClass::UtilityTimeout,
+                json!("utility_timeout"),
+            ),
+            (
+                InferenceErrorClass::MissingToolEntitlement {
+                    feature: "xai_multi_agent_tools_beta".to_string(),
+                },
+                json!({
+                    "kind": "missing_tool_entitlement",
+                    "feature": "xai_multi_agent_tools_beta"
+                }),
+            ),
+            (
+                InferenceErrorClass::ClientSideToolsUnsupported,
+                json!("client_side_tools_unsupported"),
+            ),
+            (
+                InferenceErrorClass::ResponsesToolIdentity,
+                json!("responses_tool_identity"),
+            ),
+            (
+                InferenceErrorClass::ProviderNotConfigured,
+                json!("provider_not_configured"),
+            ),
+            (
+                InferenceErrorClass::ProviderRateLimit,
+                json!("provider_rate_limit"),
+            ),
+            (
+                InferenceErrorClass::Other("future_error".to_string()),
+                json!("future_error"),
+            ),
+        ];
+        for (class, expected) in cases {
+            assert_eq!(serde_json::to_value(&class).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<InferenceErrorClass>(expected).unwrap(),
+                class
+            );
+        }
+    }
+
+    #[test]
+    fn error_class_wire_unknown_value_deserializes_to_other() {
+        let class: InferenceErrorClass = serde_json::from_value(json!("future_error")).unwrap();
+        assert_eq!(
+            class,
+            InferenceErrorClass::Other("future_error".to_string())
+        );
+    }
+
+    #[test]
+    fn error_class_wire_missing_entitlement_feature_survives_the_wire() {
+        let class = InferenceErrorClass::MissingToolEntitlement {
+            feature: "xai_multi_agent_tools_beta".to_string(),
+        };
+        let json = serde_json::to_value(&class).unwrap();
+        let parsed: InferenceErrorClass = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, class);
+    }
+
+    #[test]
+    fn error_class_wire_inference_failed_event_round_trips() {
+        let event = Event::InferenceFailed {
+            session_id: Uuid::nil(),
+            agent: "Build".to_string(),
+            provider: "xai".to_string(),
+            model: "grok".to_string(),
+            error_class: InferenceErrorClass::MissingToolEntitlement {
+                feature: "xai_multi_agent_tools_beta".to_string(),
+            },
+            detail: "missing entitlement".to_string(),
+            auth_failure: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json["data"]["error_class"],
+            json!({
+                "kind": "missing_tool_entitlement",
+                "feature": "xai_multi_agent_tools_beta"
+            })
+        );
+        let parsed = serde_json::from_value::<Event>(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn error_class_wire_backup_used_event_round_trips() {
+        let event = Event::BackupUsed {
+            session_id: Uuid::nil(),
+            agent: "Build".to_string(),
+            primary_model: "primary".to_string(),
+            error_class: InferenceErrorClass::Http(500),
+            backup_model: "backup".to_string(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json["data"]["error_class"],
+            json!({ "kind": "http", "status": 500 })
+        );
+        let parsed = serde_json::from_value::<Event>(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn error_class_wire_idle_reason_error_round_trips() {
+        let reason = IdleReason::Error {
+            class: InferenceErrorClass::ProviderRateLimit,
+        };
+        let json = serde_json::to_value(&reason).unwrap();
+        assert_eq!(
+            json,
+            json!({ "kind": "error", "class": "provider_rate_limit" })
+        );
+        assert_eq!(serde_json::from_value::<IdleReason>(json).unwrap(), reason);
+    }
+}
 
 /// Structured recovery classification for send-time credential and entitlement
 /// failures. Rate limits, timeouts, and transport failures are intentionally
@@ -490,7 +805,7 @@ pub enum Event {
         agent: String,
         provider: String,
         model: String,
-        error_class: String,
+        error_class: InferenceErrorClass,
         detail: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_failure: Option<AuthFailureKind>,
@@ -513,7 +828,7 @@ pub enum Event {
         session_id: Uuid,
         agent: String,
         primary_model: String,
-        error_class: String,
+        error_class: InferenceErrorClass,
         backup_model: String,
     },
 

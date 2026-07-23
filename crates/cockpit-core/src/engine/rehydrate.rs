@@ -918,28 +918,30 @@ pub fn subagent_history_snapshot_conn(
 fn inference_failure_summary(data: &serde_json::Value) -> String {
     let provider = data.get("provider").and_then(|v| v.as_str()).unwrap_or("");
     let model = data.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    let class = data
+    let class_value = data
         .get("error_class")
         .or_else(|| data.get("class"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("inference_error");
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::String("inference_error".to_string()));
     let detail = data
         .get("detail")
         .or_else(|| data.get("full_detail"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let parsed_class = class
-        .parse::<crate::engine::model::InferenceErrorClass>()
-        .expect("inference error class parse is infallible");
-    let reason = match parsed_class {
+    let parsed_class =
+        serde_json::from_value::<crate::engine::model::InferenceErrorClass>(class_value.clone())
+            .unwrap_or_else(|_| {
+                crate::engine::model::InferenceErrorClass::Other(class_value.to_string())
+            });
+    let reason = match &parsed_class {
         crate::engine::model::InferenceErrorClass::TimeoutTtft => {
             "no first token within the timeout".to_string()
         }
         crate::engine::model::InferenceErrorClass::TimeoutIdle => {
             "stream stalled past the idle timeout".to_string()
         }
-        _ if detail.trim().is_empty() => class.to_string(),
-        _ => format!("{class}: {}", crate::text::first_line(detail, 200)),
+        _ if detail.trim().is_empty() => parsed_class.to_string(),
+        _ => format!("{}: {}", parsed_class, crate::text::first_line(detail, 200)),
     };
     if provider.is_empty() && model.is_empty() {
         format!("Inference failed: {reason}")
@@ -2259,7 +2261,7 @@ mod tests {
             json!({
                 "provider": "local",
                 "model": "bad",
-                "error_class": crate::engine::model::InferenceErrorClass::Network.as_str(),
+                "error_class": crate::engine::model::InferenceErrorClass::Network,
                 "detail": "first line\nsecond line",
             }),
         )
@@ -2375,7 +2377,7 @@ mod tests {
             json!({
                 "provider": "local",
                 "model": "bad",
-                "error_class": crate::engine::model::InferenceErrorClass::Network.as_str(),
+                "error_class": crate::engine::model::InferenceErrorClass::Network,
                 "detail": "first line\nsecond line",
             }),
         )
@@ -2398,6 +2400,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn error_class_wire_legacy_flat_string_row_still_reads_and_renders() {
+        let s = root_session();
+        let legacy = r#"{
+            "provider": "local",
+            "model": "bad",
+            "phase_reached": "dispatched",
+            "error_class": "network",
+            "detail": "first line\nsecond line",
+            "elapsed_ms": 37
+        }"#;
+        record_inference_failure(&s, serde_json::from_str(legacy).unwrap()).await;
+
+        let snapshot = history_snapshot(&s.db, s.id, "Build").await.unwrap();
+        assert_eq!(snapshot.len(), 1);
+        match &snapshot[0] {
+            proto::HistoryEntry::InferenceError {
+                summary, detail, ..
+            } => {
+                assert_eq!(summary, "Inference failed (local/bad): network: first line");
+                assert_eq!(detail, "first line\nsecond line");
+            }
+            other => panic!("snapshot[0] should be InferenceError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn history_snapshot_handles_old_inference_failure_without_detail() {
         let s = root_session();
         record_inference_failure(
@@ -2405,7 +2433,7 @@ mod tests {
             json!({
                 "provider": "local",
                 "model": "slow",
-                "error_class": crate::engine::model::InferenceErrorClass::TimeoutTtft.as_str(),
+                "error_class": crate::engine::model::InferenceErrorClass::TimeoutTtft,
             }),
         )
         .await;

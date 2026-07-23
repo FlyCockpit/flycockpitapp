@@ -85,7 +85,7 @@ pub(in crate::engine::driver) struct DelegationPartialProgress {
 pub(in crate::engine::driver) struct SubagentFailureEnvelope {
     pub(in crate::engine::driver) provider: String,
     pub(in crate::engine::driver) model: String,
-    pub(in crate::engine::driver) error_class: String,
+    pub(in crate::engine::driver) error_class: crate::engine::model::InferenceErrorClass,
     pub(in crate::engine::driver) elapsed_ms: u64,
     pub(in crate::engine::driver) fallback_tried: Vec<crate::engine::agent::FailoverAttempt>,
     pub(in crate::engine::driver) suggested_action: String,
@@ -101,7 +101,7 @@ impl SubagentFailureEnvelope {
         Some(Self {
             provider: failure.provider.clone(),
             model: failure.model.clone(),
-            error_class: failure.class.as_str(),
+            error_class: failure.class.clone(),
             elapsed_ms: failure.elapsed_ms,
             fallback_tried,
             suggested_action: crate::engine::agent::suggested_action_for_failure_class(

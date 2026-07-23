@@ -405,7 +405,11 @@ pub(super) fn render_failed_subagent_failure(
     if !envelope.fallback_tried.is_empty() {
         out.push_str("\n\nFallback chain:");
         for attempt in &envelope.fallback_tried {
-            let class = attempt.error_class.as_deref().unwrap_or("none");
+            let class = attempt
+                .error_class
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "none".to_string());
             out.push_str(&format!(
                 "\n- {}/{}: {} ({class})",
                 attempt.provider, attempt.model, attempt.outcome

@@ -96,11 +96,12 @@ pub enum SessionEventKind {
     /// (implementation note): a TTFT /
     /// idle timeout, a connection error, or a non-retryable HTTP response.
     /// Carries `provider`, `model`, `phase_reached`
-    /// (`prep`/`dispatched`/`first_token`/`streaming`), `error_class`
-    /// (`timeout_ttft`/`timeout_idle`/`network`/`http_<status>`/`cancelled`),
-    /// and `elapsed_ms`. Keyed by the same `call_id` as the dispatch-time
-    /// `inference_request` record. Data/export only — never enters the model's
-    /// context (the user-facing inline error is a separate UI surface).
+    /// (`prep`/`dispatched`/`first_token`/`streaming`), typed `error_class`,
+    /// and `elapsed_ms`. Cancellation is not an error class; it is recorded as
+    /// the separate [`InferenceRequestStatus::Cancelled`] dispatch status.
+    /// Keyed by the same `call_id` as the dispatch-time `inference_request`
+    /// record. Data/export only — never enters the model's context (the
+    /// user-facing inline error is a separate UI surface).
     InferenceFailure,
     /// A terminal inference failure aborted a turn and the driver captured the
     /// prompt/progress needed for an explicit retry. Data/export only; the
@@ -1416,6 +1417,64 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].seq, committed);
         assert_eq!(events[0].data, json!({"text": "committed"}));
+    }
+
+    #[tokio::test]
+    async fn error_class_wire_session_log_payload_round_trips() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let data = json!({
+            "provider": "xai",
+            "model": "grok",
+            "phase_reached": "prep",
+            "error_class": {
+                "kind": "missing_tool_entitlement",
+                "feature": "xai_multi_agent_tools_beta"
+            },
+            "elapsed_ms": 7,
+        });
+
+        db.insert_session_event(
+            session.session_id,
+            SessionEventKind::InferenceFailure,
+            Some("Build"),
+            Some("call-1"),
+            &data,
+        )
+        .await
+        .unwrap();
+
+        let events = db.list_session_events(session.session_id).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "inference_failure");
+        assert_eq!(events[0].data, data);
+    }
+
+    #[tokio::test]
+    async fn error_class_wire_legacy_flat_string_row_still_reads() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let legacy = r#"{
+            "provider": "openai-compatible",
+            "model": "qwen3",
+            "phase_reached": "dispatched",
+            "error_class": "network",
+            "elapsed_ms": 37
+        }"#;
+
+        db.insert_session_event(
+            session.session_id,
+            SessionEventKind::InferenceFailure,
+            Some("Build"),
+            Some("call-legacy"),
+            &serde_json::from_str::<Value>(legacy).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let events = db.list_session_events(session.session_id).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["error_class"], "network");
     }
 
     #[tokio::test]

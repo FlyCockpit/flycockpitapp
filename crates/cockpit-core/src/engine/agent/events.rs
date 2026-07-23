@@ -261,9 +261,9 @@ pub enum TurnEvent {
         agent: String,
         provider: String,
         model: String,
-        /// Stable error class (`timeout_ttft` / `timeout_idle` / `network` /
-        /// `http_<status>`).
-        error_class: String,
+        /// Typed error class whose display text matches the legacy flat
+        /// string form.
+        error_class: crate::engine::model::InferenceErrorClass,
         /// Human-readable reason shown after provider/model (empty for a pure
         /// timeout, whose class already says everything).
         detail: String,
@@ -283,10 +283,9 @@ pub enum TurnEvent {
         agent: String,
         /// The primary model id that failed (e.g. `qwen3.6-plus-free`).
         primary_model: String,
-        /// The failure class that engaged the backup (`timeout_ttft` /
-        /// `timeout_idle` / `network` / `http_<status>`), rendered
-        /// human-readable.
-        error_class: String,
+        /// The failure class that engaged the backup, rendered
+        /// human-readable by the TUI.
+        error_class: crate::engine::model::InferenceErrorClass,
         /// The backup model id that answered (e.g. `claude-sonnet-4-6`).
         backup_model: String,
     },

@@ -5,95 +5,8 @@ use super::failure::InferenceErrorClass;
 /// provider probing so the two call sites cannot drift.
 pub(crate) const UNSUPPORTED_API_CODE: &str = "unsupported_api_for_model";
 
-const CLASS_TIMEOUT_TTFT: &str = "timeout_ttft";
-const CLASS_TIMEOUT_IDLE: &str = "timeout_idle";
-const CLASS_NETWORK: &str = "network";
-const CLASS_HTTP_PREFIX: &str = "http_";
-const CLASS_UTILITY_TIMEOUT: &str = "utility_timeout";
-const CLASS_MISSING_TOOL_ENTITLEMENT: &str = "missing_tool_entitlement";
-const CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED: &str = "client_side_tools_unsupported";
-const CLASS_RESPONSES_TOOL_IDENTITY: &str = "responses_tool_identity";
-const CLASS_PROVIDER_NOT_CONFIGURED: &str = "provider_not_configured";
-const CLASS_PROVIDER_RATE_LIMIT: &str = "provider_rate_limit";
-const DEFAULT_MISSING_TOOL_FEATURE: &str = "client_side_tools";
 const STREAM_TIMEOUT_TTFT: &str = "timeout_ttft";
 const STREAM_TIMEOUT_IDLE: &str = "timeout_idle";
-
-impl InferenceErrorClass {
-    /// Stable string form for the current wire/DB boundary.
-    ///
-    /// `MissingToolEntitlement` is intentionally lossy here until
-    /// `engine-error-taxonomy-wire` carries the feature across the boundary:
-    /// the persisted string stays byte-identical to the existing flat class,
-    /// while live in-process failures carry the concrete feature on the enum.
-    pub fn as_str(&self) -> String {
-        match self {
-            InferenceErrorClass::TimeoutTtft => CLASS_TIMEOUT_TTFT.to_string(),
-            InferenceErrorClass::TimeoutIdle => CLASS_TIMEOUT_IDLE.to_string(),
-            InferenceErrorClass::Network => CLASS_NETWORK.to_string(),
-            InferenceErrorClass::Http(status) => format!("{CLASS_HTTP_PREFIX}{status}"),
-            InferenceErrorClass::UtilityTimeout => CLASS_UTILITY_TIMEOUT.to_string(),
-            InferenceErrorClass::MissingToolEntitlement { .. } => {
-                CLASS_MISSING_TOOL_ENTITLEMENT.to_string()
-            }
-            InferenceErrorClass::ClientSideToolsUnsupported => {
-                CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED.to_string()
-            }
-            InferenceErrorClass::ResponsesToolIdentity => CLASS_RESPONSES_TOOL_IDENTITY.to_string(),
-            InferenceErrorClass::ProviderNotConfigured => CLASS_PROVIDER_NOT_CONFIGURED.to_string(),
-            InferenceErrorClass::ProviderRateLimit => CLASS_PROVIDER_RATE_LIMIT.to_string(),
-            InferenceErrorClass::Other(value) => value.clone(),
-        }
-    }
-
-    pub fn provider_status(&self) -> Option<u16> {
-        match self {
-            InferenceErrorClass::Http(status) => Some(*status),
-            _ => None,
-        }
-    }
-
-    pub fn is_timeout(&self) -> bool {
-        matches!(
-            self,
-            InferenceErrorClass::TimeoutTtft | InferenceErrorClass::TimeoutIdle
-        )
-    }
-}
-
-impl std::fmt::Display for InferenceErrorClass {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.as_str())
-    }
-}
-
-impl std::str::FromStr for InferenceErrorClass {
-    type Err = std::convert::Infallible;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let class = match value {
-            CLASS_TIMEOUT_TTFT => Self::TimeoutTtft,
-            CLASS_TIMEOUT_IDLE => Self::TimeoutIdle,
-            CLASS_NETWORK => Self::Network,
-            CLASS_UTILITY_TIMEOUT => Self::UtilityTimeout,
-            CLASS_MISSING_TOOL_ENTITLEMENT => Self::MissingToolEntitlement {
-                feature: DEFAULT_MISSING_TOOL_FEATURE.to_string(),
-            },
-            CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED => Self::ClientSideToolsUnsupported,
-            CLASS_RESPONSES_TOOL_IDENTITY => Self::ResponsesToolIdentity,
-            CLASS_PROVIDER_NOT_CONFIGURED => Self::ProviderNotConfigured,
-            CLASS_PROVIDER_RATE_LIMIT => Self::ProviderRateLimit,
-            value => match value
-                .strip_prefix(CLASS_HTTP_PREFIX)
-                .and_then(|s| s.parse::<u16>().ok())
-            {
-                Some(status) if (100..=599).contains(&status) => Self::Http(status),
-                _ => Self::Other(value.to_string()),
-            },
-        };
-        Ok(class)
-    }
-}
 
 /// Sentinel embedded in a [`rig::completion::CompletionError`] carrying a
 /// stream-timeout verdict so it crosses the retry boundary fail-fast. Distinct
@@ -415,15 +328,15 @@ mod tests {
     }
 
     #[test]
-    fn error_taxonomy_missing_entitlement_current_wire_string_is_lossy_until_wire_prompt() {
+    fn error_taxonomy_missing_entitlement_display_string_stays_flat() {
         let class = InferenceErrorClass::MissingToolEntitlement {
             feature: "xai_multi_agent_tools_beta".to_string(),
         };
-        assert_eq!(class.as_str(), CLASS_MISSING_TOOL_ENTITLEMENT);
+        assert_eq!(class.as_str(), "missing_tool_entitlement");
         assert_eq!(
             InferenceErrorClass::from_str(&class.as_str()).unwrap(),
             InferenceErrorClass::MissingToolEntitlement {
-                feature: DEFAULT_MISSING_TOOL_FEATURE.to_string()
+                feature: "client_side_tools".to_string()
             }
         );
     }

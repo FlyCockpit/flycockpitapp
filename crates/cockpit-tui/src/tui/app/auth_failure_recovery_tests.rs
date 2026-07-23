@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::{App, Overlay};
 use cockpit_core::daemon::proto::AuthFailureKind;
 use cockpit_core::engine::TurnEvent;
+use cockpit_core::engine::model::InferenceErrorClass;
 
 fn write_provider(root: &std::path::Path, template: Option<&str>, url: &str) {
     let cockpit = root.join(".cockpit");
@@ -29,7 +30,7 @@ fn auth_event(kind: AuthFailureKind) -> TurnEvent {
         agent: "subagent".into(),
         provider: "p".into(),
         model: "m".into(),
-        error_class: "http_403".into(),
+        error_class: InferenceErrorClass::Http(403),
         detail: "credentials rejected".into(),
         auth_failure: Some(kind),
     }

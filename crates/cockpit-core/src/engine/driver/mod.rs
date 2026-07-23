@@ -397,7 +397,7 @@ enum StackUnwindReason {
     InferenceFailed {
         provider: String,
         model: String,
-        class: String,
+        class: crate::engine::model::InferenceErrorClass,
         phase: String,
     },
 }
@@ -2627,14 +2627,14 @@ impl Driver {
                         .await;
                     if !self.handle_goal_usage_limit_failure(f, tx).await {
                         self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
-                            class: f.class.as_str(),
+                            class: f.class.clone(),
                         });
                     }
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::InferenceFailed {
                             provider: f.provider.clone(),
                             model: f.model.clone(),
-                            class: f.class.as_str(),
+                            class: f.class.clone(),
                             phase: f.phase.clone(),
                         },
                         input_rx,
@@ -3738,7 +3738,7 @@ impl Driver {
             "model": failure.model,
             "wire_api": agent.model.wire_api_label(),
             "phase_reached": failure.phase,
-            "error_class": failure.class.as_str(),
+            "error_class": failure.class,
             "elapsed_ms": failure.elapsed_ms,
             "provider_status": provider_status,
             "provider_body_snippet": provider_body_snippet,
@@ -5667,14 +5667,14 @@ impl Driver {
                         .await;
                     if !self.handle_goal_usage_limit_failure(f, tx).await {
                         self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
-                            class: f.class.as_str(),
+                            class: f.class.clone(),
                         });
                     }
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::InferenceFailed {
                             provider: f.provider.clone(),
                             model: f.model.clone(),
-                            class: f.class.as_str(),
+                            class: f.class.clone(),
                             phase: f.phase.clone(),
                         },
                         input_rx,

@@ -10,7 +10,7 @@ pub const MAX_FAILOVER_CANDIDATES: usize = 4;
 pub struct FailoverAttempt {
     pub provider: String,
     pub model: String,
-    pub error_class: Option<String>,
+    pub error_class: Option<crate::engine::model::InferenceErrorClass>,
     pub outcome: &'static str,
 }
 
@@ -19,7 +19,7 @@ impl FailoverAttempt {
         Self {
             provider: model.provider_id().to_string(),
             model: model.model_id_ref().to_string(),
-            error_class: Some(error_class.as_str()),
+            error_class: Some(error_class.clone()),
             outcome: "failed",
         }
     }
@@ -37,7 +37,7 @@ impl FailoverAttempt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupFallbackDecision {
     pub primary_model: String,
-    pub error_class: String,
+    pub error_class: crate::engine::model::InferenceErrorClass,
     pub backup_model: String,
     pub fallback_tried: Vec<FailoverAttempt>,
 }
@@ -160,7 +160,7 @@ pub async fn turn_with_backup(
     }
 
     let mut fallback_tried = Vec::new();
-    let mut first_failure: Option<(String, String)> = None;
+    let mut first_failure: Option<(String, crate::engine::model::InferenceErrorClass)> = None;
     let mut attempt_index = 0usize;
     loop {
         let current_model: &Model = if attempt_index == 0 {
@@ -223,10 +223,9 @@ pub async fn turn_with_backup(
                     return Err(err);
                 };
                 let class = failure.class.clone();
-                let class_string = class.as_str();
                 fallback_tried.push(FailoverAttempt::failed(current_model, &class));
                 if first_failure.is_none() {
-                    first_failure = Some((failure.model.clone(), class_string.clone()));
+                    first_failure = Some((failure.model.clone(), class.clone()));
                 }
                 let can_advance = crate::engine::model::failure_engages_backup(&class)
                     && attempt_index < candidates.len();
@@ -237,7 +236,7 @@ pub async fn turn_with_backup(
                                 agent: agent.name.clone(),
                                 provider: failure.provider.clone(),
                                 model: failure.model.clone(),
-                                error_class: failure.class.as_str(),
+                                error_class: failure.class.clone(),
                                 detail: failure.detail.clone(),
                                 auth_failure: crate::engine::model::auth_failure_kind(failure),
                             })
@@ -264,7 +263,7 @@ pub async fn turn_with_backup(
                     .send(TurnEvent::BackupUsed {
                         agent: agent.name.clone(),
                         primary_model: failure.model.clone(),
-                        error_class: class_string,
+                        error_class: class,
                         backup_model: next_model.model_id_ref().to_string(),
                     })
                     .await;
@@ -382,7 +381,7 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
                 "wire_api": wire_api,
                 "routing": routing_metadata,
                 "phase_reached": failure.phase,
-                "error_class": failure.class.as_str(),
+                "error_class": failure.class,
                 "elapsed_ms": failure.elapsed_ms,
                 "detail": failure.detail,
                 "provider_status": diagnostics.provider_status,
@@ -410,7 +409,7 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
                 agent: agent_name.to_string(),
                 provider: failure.provider.clone(),
                 model: failure.model.clone(),
-                error_class: failure.class.as_str(),
+                error_class: failure.class.clone(),
                 detail: failure.detail.clone(),
                 auth_failure: crate::engine::model::auth_failure_kind(failure),
             })
@@ -590,10 +589,7 @@ mod inference_outcome_tests {
             .iter()
             .find(|e| e.kind == "inference_failure")
             .expect("an inference_failure event was recorded");
-        assert_eq!(
-            fail.data["error_class"],
-            InferenceErrorClass::TimeoutTtft.as_str()
-        );
+        assert_eq!(fail.data["error_class"], serde_json::json!("timeout_ttft"));
         assert_eq!(fail.data["phase_reached"], "dispatched");
         assert_eq!(fail.data["elapsed_ms"], 120_000);
         assert_eq!(fail.data["provider"], "openai-compatible");
@@ -613,7 +609,7 @@ mod inference_outcome_tests {
         let mut saw_red = false;
         while let Ok(ev) = rx.try_recv() {
             if let TurnEvent::InferenceFailed { error_class, .. } = ev {
-                assert_eq!(error_class, InferenceErrorClass::TimeoutTtft.as_str());
+                assert_eq!(error_class, InferenceErrorClass::TimeoutTtft);
                 saw_red = true;
             }
         }
@@ -996,7 +992,7 @@ mod backup_fallback_tests {
         });
         let (pm, class, bm) = banner.expect("a BackupUsed banner was emitted");
         assert_eq!(pm, "primary-model");
-        assert_eq!(class, "http_500");
+        assert_eq!(class, InferenceErrorClass::Http(500));
         assert_eq!(bm, "backup-model");
         // The backup's text reached the UI.
         assert!(events.iter().any(|e| matches!(
@@ -1321,7 +1317,7 @@ mod backup_fallback_tests {
         });
         let (pm, class, bm) = banner.expect("a BackupUsed banner was emitted");
         assert_eq!(pm, "primary-model");
-        assert_eq!(class, InferenceErrorClass::TimeoutTtft.as_str());
+        assert_eq!(class, InferenceErrorClass::TimeoutTtft);
         assert_eq!(bm, "backup-model");
         assert!(events.iter().any(|e| matches!(
             e,
@@ -1379,7 +1375,7 @@ mod backup_fallback_tests {
         assert!(events.iter().any(|e| matches!(
             e,
             TurnEvent::BackupUsed { error_class, .. }
-                if error_class == &InferenceErrorClass::TimeoutTtft.as_str()
+                if error_class == &InferenceErrorClass::TimeoutTtft
         )));
     }
 
@@ -1437,7 +1433,7 @@ mod backup_fallback_tests {
         assert!(events.iter().any(|e| matches!(
             e,
             TurnEvent::BackupUsed { error_class, .. }
-                if error_class == &InferenceErrorClass::Network.as_str()
+                if error_class == &InferenceErrorClass::Network
         )));
     }
 

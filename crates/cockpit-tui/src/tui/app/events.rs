@@ -661,12 +661,7 @@ impl App {
                 // a pure timeout's class already says everything).
                 self.reconnect = None;
                 self.finalize_pending();
-                let reason = match error_class.as_str() {
-                    "timeout_ttft" => "no first token within the timeout".to_string(),
-                    "timeout_idle" => "stream stalled past the idle timeout".to_string(),
-                    other if detail.is_empty() => other.to_string(),
-                    other => format!("{other}: {}", cockpit_core::text::first_line(&detail, 200)),
-                };
+                let reason = inference_failure_reason(&error_class, &detail);
                 let summary = format!("Inference failed ({provider}/{model}): {reason}");
                 self.history.push(HistoryEntry::InferenceError {
                     detail,
@@ -714,12 +709,7 @@ impl App {
                 // happened — never enters model context (wire-vs-user split,
                 // GOALS §14). The spinner keeps running: the backup turn is
                 // still in flight, so we do NOT finalize/end the working span.
-                let reason = match error_class.as_str() {
-                    "timeout_ttft" => "timeout".to_string(),
-                    "timeout_idle" => "timeout".to_string(),
-                    "network" => "connection error".to_string(),
-                    other => other.to_string(),
-                };
+                let reason = backup_failure_reason(&error_class);
                 self.history.push(HistoryEntry::BackupWarning {
                     line: format!(
                         "primary `{primary_model}` failed ({reason}) — answered with backup `{backup_model}`."
@@ -1690,6 +1680,31 @@ impl App {
         update: SubagentRoutingUpdate,
     ) -> bool {
         amend_subagent_routing_in(&mut self.history, child, task_call_id, label, update)
+    }
+}
+
+fn inference_failure_reason(
+    error_class: &cockpit_core::engine::model::InferenceErrorClass,
+    detail: &str,
+) -> String {
+    match error_class {
+        cockpit_core::engine::model::InferenceErrorClass::TimeoutTtft => {
+            "no first token within the timeout".to_string()
+        }
+        cockpit_core::engine::model::InferenceErrorClass::TimeoutIdle => {
+            "stream stalled past the idle timeout".to_string()
+        }
+        other if detail.is_empty() => other.to_string(),
+        other => format!("{other}: {}", cockpit_core::text::first_line(detail, 200)),
+    }
+}
+
+fn backup_failure_reason(error_class: &cockpit_core::engine::model::InferenceErrorClass) -> String {
+    match error_class {
+        cockpit_core::engine::model::InferenceErrorClass::TimeoutTtft
+        | cockpit_core::engine::model::InferenceErrorClass::TimeoutIdle => "timeout".to_string(),
+        cockpit_core::engine::model::InferenceErrorClass::Network => "connection error".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -2874,6 +2889,7 @@ pub(super) fn amend_subagent_routing_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cockpit_core::engine::model::InferenceErrorClass;
     use serde_json::json;
 
     #[test]
@@ -2982,6 +2998,135 @@ mod tests {
         assert_eq!(read_multiline_summary, default_multiline_summary);
         assert_eq!(read_multiline_full, default_multiline_full);
         assert!(read_multiline_full.contains('\n'));
+    }
+
+    #[test]
+    fn error_class_wire_inline_error_text_is_unchanged() {
+        let cases = [
+            (
+                InferenceErrorClass::TimeoutTtft,
+                "",
+                "Inference failed (p/m): no first token within the timeout",
+            ),
+            (
+                InferenceErrorClass::TimeoutIdle,
+                "",
+                "Inference failed (p/m): stream stalled past the idle timeout",
+            ),
+            (
+                InferenceErrorClass::Network,
+                "first line\nsecond line",
+                "Inference failed (p/m): network: first line",
+            ),
+            (
+                InferenceErrorClass::Http(500),
+                "first line\nsecond line",
+                "Inference failed (p/m): http_500: first line",
+            ),
+            (
+                InferenceErrorClass::UtilityTimeout,
+                "",
+                "Inference failed (p/m): utility_timeout",
+            ),
+            (
+                InferenceErrorClass::MissingToolEntitlement {
+                    feature: "xai_multi_agent_tools_beta".to_string(),
+                },
+                "",
+                "Inference failed (p/m): missing_tool_entitlement",
+            ),
+            (
+                InferenceErrorClass::ClientSideToolsUnsupported,
+                "",
+                "Inference failed (p/m): client_side_tools_unsupported",
+            ),
+            (
+                InferenceErrorClass::ResponsesToolIdentity,
+                "",
+                "Inference failed (p/m): responses_tool_identity",
+            ),
+            (
+                InferenceErrorClass::ProviderNotConfigured,
+                "",
+                "Inference failed (p/m): provider_not_configured",
+            ),
+            (
+                InferenceErrorClass::ProviderRateLimit,
+                "",
+                "Inference failed (p/m): provider_rate_limit",
+            ),
+        ];
+
+        for (class, detail, expected) in cases {
+            let reason = inference_failure_reason(&class, detail);
+            assert_eq!(format!("Inference failed (p/m): {reason}"), expected);
+        }
+    }
+
+    #[test]
+    fn error_class_wire_backup_banner_text_is_unchanged() {
+        let cases = [
+            (
+                InferenceErrorClass::TimeoutTtft,
+                "primary `primary` failed (timeout) — answered with backup `backup`.",
+            ),
+            (
+                InferenceErrorClass::TimeoutIdle,
+                "primary `primary` failed (timeout) — answered with backup `backup`.",
+            ),
+            (
+                InferenceErrorClass::Network,
+                "primary `primary` failed (connection error) — answered with backup `backup`.",
+            ),
+            (
+                InferenceErrorClass::Http(500),
+                "primary `primary` failed (http_500) — answered with backup `backup`.",
+            ),
+            (
+                InferenceErrorClass::UtilityTimeout,
+                "primary `primary` failed (utility_timeout) — answered with backup `backup`.",
+            ),
+            (
+                InferenceErrorClass::MissingToolEntitlement {
+                    feature: "xai_multi_agent_tools_beta".to_string(),
+                },
+                "primary `primary` failed (missing_tool_entitlement) — answered with backup `backup`.",
+            ),
+            (
+                InferenceErrorClass::ClientSideToolsUnsupported,
+                "primary `primary` failed (client_side_tools_unsupported) — answered with backup `backup`.",
+            ),
+            (
+                InferenceErrorClass::ResponsesToolIdentity,
+                "primary `primary` failed (responses_tool_identity) — answered with backup `backup`.",
+            ),
+            (
+                InferenceErrorClass::ProviderNotConfigured,
+                "primary `primary` failed (provider_not_configured) — answered with backup `backup`.",
+            ),
+            (
+                InferenceErrorClass::ProviderRateLimit,
+                "primary `primary` failed (provider_rate_limit) — answered with backup `backup`.",
+            ),
+        ];
+
+        for (class, expected) in cases {
+            let reason = backup_failure_reason(&class);
+            assert_eq!(
+                format!("primary `primary` failed ({reason}) — answered with backup `backup`."),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn error_class_wire_unknown_class_renders_without_panicking() {
+        let class = InferenceErrorClass::Other("future_error".to_string());
+        assert_eq!(
+            inference_failure_reason(&class, ""),
+            "future_error".to_string()
+        );
+        assert_eq!(backup_failure_reason(&class), "future_error".to_string());
     }
 
     #[test]

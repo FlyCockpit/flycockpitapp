@@ -164,12 +164,12 @@ fn failed_report_renders_compact_deterministic_prose() {
     let envelope = SubagentFailureEnvelope {
         provider: "flaky".to_string(),
         model: "bad-model".to_string(),
-        error_class: crate::engine::model::InferenceErrorClass::TimeoutTtft.as_str(),
+        error_class: crate::engine::model::InferenceErrorClass::TimeoutTtft,
         elapsed_ms: 120_000,
         fallback_tried: vec![crate::engine::agent::FailoverAttempt {
             provider: "flaky".to_string(),
             model: "bad-model".to_string(),
-            error_class: Some(crate::engine::model::InferenceErrorClass::TimeoutTtft.as_str()),
+            error_class: Some(crate::engine::model::InferenceErrorClass::TimeoutTtft),
             outcome: "failed",
         }],
         suggested_action: "retry_or_choose_another_model".to_string(),

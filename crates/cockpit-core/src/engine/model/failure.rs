@@ -1,5 +1,7 @@
 use super::*;
 
+pub use crate::daemon::proto::InferenceErrorClass;
+
 /// Sentinel error returned by [`Model::complete_captured`] when the
 /// in-flight inference was aborted by a user ctrl+c (a `CancelTurn`
 /// request). Distinct from a provider/transport failure so the driver
@@ -88,41 +90,6 @@ impl InferencePhase {
 /// dispatch must not undo a prior attempt that reached `first_token`).
 pub(super) fn bump_phase(tracker: &std::sync::atomic::AtomicU8, phase: InferencePhase) {
     tracker.fetch_max(phase.rank(), std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Why a turn's inference failed
-/// (implementation note). Recorded on
-/// the failure event + the terminal dispatch-time record. Data/export only.
-///
-/// Note `cancelled` is **not** a variant here: a ctrl+c unwind keeps its
-/// dedicated [`InferenceCancelled`] sentinel and never becomes an
-/// [`InferenceFailure`], so it can't reach this taxonomy. The DB-side
-/// `cancelled` *status* ([`crate::db::session_log::InferenceRequestStatus`])
-/// is recorded directly on the cancel path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InferenceErrorClass {
-    /// No first token within the configured TTFT ceiling.
-    TimeoutTtft,
-    /// Inter-token gap exceeded the configured idle ceiling.
-    TimeoutIdle,
-    /// Connection / transport failure with no HTTP status.
-    Network,
-    /// Non-retryable HTTP response, carrying the status code.
-    Http(u16),
-    /// A bounded utility-model request exceeded its call-site budget.
-    UtilityTimeout,
-    /// The provider requires an entitlement for client-side tools.
-    MissingToolEntitlement { feature: String },
-    /// Client-side tools cannot be used with this model.
-    ClientSideToolsUnsupported,
-    /// Responses tool-call identity normalization failed before dispatch.
-    ResponsesToolIdentity,
-    /// Provider credentials/configuration are absent.
-    ProviderNotConfigured,
-    /// Provider reported a rate or usage limit without a concrete HTTP class.
-    ProviderRateLimit,
-    /// A novel class preserved exactly at the string boundary.
-    Other(String),
 }
 
 /// A well-typed, terminal inference failure — the clean hard-fail seam a

@@ -5,7 +5,7 @@ async fn child_failure_carries_structured_envelope_to_parent() {
     let fallback_tried = vec![crate::engine::agent::FailoverAttempt {
         provider: "flaky".to_string(),
         model: "primary".to_string(),
-        error_class: Some(crate::engine::model::InferenceErrorClass::Network.as_str()),
+        error_class: Some(crate::engine::model::InferenceErrorClass::Network),
         outcome: "failed",
     }];
     let error = NoninteractiveRunError::new(
@@ -33,7 +33,7 @@ async fn child_failure_carries_structured_envelope_to_parent() {
     assert_eq!(carried.model, "primary");
     assert_eq!(
         carried.error_class,
-        crate::engine::model::InferenceErrorClass::Network.as_str()
+        crate::engine::model::InferenceErrorClass::Network
     );
     assert_eq!(carried.elapsed_ms, 37);
     assert_eq!(carried.fallback_tried, fallback_tried);
@@ -46,19 +46,19 @@ async fn failover_walk_completes_before_parent_sees_envelope() {
         crate::engine::agent::FailoverAttempt {
             provider: "dead".to_string(),
             model: "primary".to_string(),
-            error_class: Some(crate::engine::model::InferenceErrorClass::TimeoutTtft.as_str()),
+            error_class: Some(crate::engine::model::InferenceErrorClass::TimeoutTtft),
             outcome: "failed",
         },
         crate::engine::agent::FailoverAttempt {
             provider: "dead2".to_string(),
             model: "backup".to_string(),
-            error_class: Some("http_500".to_string()),
+            error_class: Some(crate::engine::model::InferenceErrorClass::Http(500)),
             outcome: "failed",
         },
         crate::engine::agent::FailoverAttempt {
             provider: "healthy".to_string(),
             model: "fallback".to_string(),
-            error_class: Some(crate::engine::model::InferenceErrorClass::TimeoutIdle.as_str()),
+            error_class: Some(crate::engine::model::InferenceErrorClass::TimeoutIdle),
             outcome: "failed",
         },
     ];
@@ -97,13 +97,13 @@ async fn failover_walk_completes_before_parent_sees_envelope() {
 async fn child_routing_metadata_carries_fallback_chain() {
     let decision = crate::engine::agent::BackupFallbackDecision {
         primary_model: "primary".to_string(),
-        error_class: crate::engine::model::InferenceErrorClass::TimeoutTtft.as_str(),
+        error_class: crate::engine::model::InferenceErrorClass::TimeoutTtft,
         backup_model: "healthy".to_string(),
         fallback_tried: vec![
             crate::engine::agent::FailoverAttempt {
                 provider: "dead".to_string(),
                 model: "primary".to_string(),
-                error_class: Some(crate::engine::model::InferenceErrorClass::TimeoutTtft.as_str()),
+                error_class: Some(crate::engine::model::InferenceErrorClass::TimeoutTtft),
                 outcome: "failed",
             },
             crate::engine::agent::FailoverAttempt {

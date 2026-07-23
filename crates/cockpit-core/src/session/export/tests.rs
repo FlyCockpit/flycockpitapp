@@ -395,7 +395,7 @@ async fn transcript_json_includes_inference_error_summary_and_detail() {
         json!({
             "provider": "p",
             "model": "m",
-            "error_class": crate::engine::model::InferenceErrorClass::Network.as_str(),
+            "error_class": crate::engine::model::InferenceErrorClass::Network,
             "detail": "first line\nrequest id: abc",
         }),
         1_000,
@@ -1487,7 +1487,7 @@ async fn export_of_hung_turn_has_inference_record_and_failure_event() {
                 "provider": "openai-compatible",
                 "model": "qwen3",
                 "phase_reached": "dispatched",
-                "error_class": crate::engine::model::InferenceErrorClass::TimeoutTtft.as_str(),
+                "error_class": crate::engine::model::InferenceErrorClass::TimeoutTtft,
                 "elapsed_ms": 120_000,
             }),
         )
@@ -1508,7 +1508,7 @@ async fn export_of_hung_turn_has_inference_record_and_failure_event() {
         .expect("failure event present");
     assert_eq!(
         fail["data"]["error_class"],
-        crate::engine::model::InferenceErrorClass::TimeoutTtft.as_str()
+        serde_json::json!("timeout_ttft")
     );
     assert_eq!(fail["data"]["phase_reached"], "dispatched");
     let file = fail["file"].as_str().expect("failure event names a file");

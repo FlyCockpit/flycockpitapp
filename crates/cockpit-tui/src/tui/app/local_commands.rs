@@ -305,7 +305,7 @@ impl App {
                 preflight_pending,
                 persist_failed,
                 ..
-            } = &mut self.history[idx]
+            } = self.history.get_mut(idx).expect("matched history index")
             {
                 *preflight_pending = false;
                 *persist_failed = true;

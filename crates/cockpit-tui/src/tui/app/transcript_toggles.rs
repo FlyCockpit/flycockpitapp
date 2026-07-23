@@ -53,7 +53,7 @@ impl App {
                 HistoryEntry::Agent { reasoning, expanded, .. }
                     if !reasoning.trim().is_empty() && !*expanded)
         });
-        for entry in &mut self.history {
+        for entry in self.history.iter_mut() {
             if let HistoryEntry::Agent {
                 expanded,
                 reasoning,

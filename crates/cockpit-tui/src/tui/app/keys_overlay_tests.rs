@@ -84,7 +84,11 @@ fn fake_side_conversation(tmp: &std::path::Path) -> SideConversation {
         saved_runner: None,
         saved_history: vec![HistoryEntry::Plain {
             line: "main history".to_string(),
-        }],
+        }]
+        .into(),
+        saved_history_render_versions: std::collections::HashMap::new(),
+        saved_history_render_fingerprints: std::collections::HashMap::new(),
+        saved_history_render_cache: std::collections::HashMap::new(),
         saved_queue: vec![input::optimistic_queue_item(
             "queued main message".to_string(),
         )],

@@ -21,6 +21,7 @@ mod events;
 mod exit_tail;
 mod export_actions;
 pub(in crate::tui) mod help_overlay;
+mod history_log;
 mod input;
 mod local_commands;
 mod model_controls;
@@ -113,6 +114,7 @@ use cockpit_core::engine::{
 };
 use cockpit_core::git::{self, RepoStatus};
 use cockpit_core::welcome::{self, LaunchBundle, LaunchInfo};
+pub(super) use history_log::{HistoryEntryId, HistoryLog};
 
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const ANIMATION_TICK: Duration = Duration::from_millis(100);
@@ -1054,7 +1056,10 @@ pub(super) struct SideConversation {
     pub(super) socket: std::path::PathBuf,
     /// Saved main-session view, restored on exit.
     saved_runner: Option<Result<AgentRunner, String>>,
-    saved_history: Vec<HistoryEntry>,
+    saved_history: HistoryLog,
+    saved_history_render_versions: HashMap<HistoryEntryId, u64>,
+    saved_history_render_fingerprints: HashMap<HistoryEntryId, u64>,
+    saved_history_render_cache: HashMap<HistoryEntryId, HistoryRenderCacheEntry>,
     saved_queue: Vec<QueuedUserMessage>,
     saved_pending: Option<PendingMsg>,
     saved_prunable_tokens: u64,
@@ -1469,7 +1474,7 @@ pub struct App {
     /// the newest entry (cursor going `1 → 0`). `None` when not in
     /// history mode or when entry happened from an empty composer.
     pub(super) staged_draft: Option<String>,
-    pub(super) history: Vec<HistoryEntry>,
+    pub(super) history: HistoryLog,
     /// In-flight assistant turn (between `ThinkingStarted` and the
     /// matching `AssistantText`/tool boundary). When `Some`, the
     /// renderer appends a live entry to the bottom of the history
@@ -1768,13 +1773,13 @@ pub struct App {
     /// Per-history-entry render versions. Versions are bumped when a cheap
     /// shape fingerprint changes, letting render-cache validation compare a
     /// small integer instead of hashing full transcript text every frame.
-    pub(super) history_render_versions: Vec<u64>,
-    pub(super) history_render_fingerprints: Vec<u64>,
+    pub(super) history_render_versions: HashMap<HistoryEntryId, u64>,
+    pub(super) history_render_fingerprints: HashMap<HistoryEntryId, u64>,
     pub(super) next_history_render_version: u64,
     /// Per-history-index render cache for stable transcript entries. The
     /// signature includes the entry content plus render-affecting settings and
     /// chrome state; stale indices are evicted at the end of `render_history`.
-    pub(super) history_render_cache: HashMap<usize, HistoryRenderCacheEntry>,
+    pub(super) history_render_cache: HashMap<HistoryEntryId, HistoryRenderCacheEntry>,
     /// Cached render output for the live pending assistant message. The
     /// signature is based on pending text/reasoning/width, so unrelated frame
     /// ticks do not reparse the same markdown buffer.
@@ -2555,11 +2560,11 @@ pub(super) struct SubagentViewMeta {
 #[derive(Clone)]
 pub(super) struct StoredTranscriptView {
     pub(super) meta: TranscriptViewMeta,
-    pub(super) history: Vec<HistoryEntry>,
+    pub(super) history: HistoryLog,
     pub(super) pending: Option<PendingMsg>,
-    pub(super) history_render_versions: Vec<u64>,
-    pub(super) history_render_fingerprints: Vec<u64>,
-    pub(super) history_render_cache: HashMap<usize, HistoryRenderCacheEntry>,
+    pub(super) history_render_versions: HashMap<HistoryEntryId, u64>,
+    pub(super) history_render_fingerprints: HashMap<HistoryEntryId, u64>,
+    pub(super) history_render_cache: HashMap<HistoryEntryId, HistoryRenderCacheEntry>,
     pub(super) pending_render_cache: Option<PendingRenderCacheEntry>,
     pub(super) chat_scroll_offset: usize,
 }
@@ -2827,7 +2832,7 @@ impl App {
             prompt_history: Vec::new(),
             prompt_history_cursor: 0,
             staged_draft: None,
-            history: Vec::new(),
+            history: HistoryLog::default(),
             pending: None,
             transcript_view: TranscriptViewMeta::Main,
             transcript_view_stack: Vec::new(),
@@ -2900,8 +2905,8 @@ impl App {
             estimate_at_last_usage: 0,
             history_estimate_cache: Cell::new(None),
             pending_token_cache: Cell::new(None),
-            history_render_versions: Vec::new(),
-            history_render_fingerprints: Vec::new(),
+            history_render_versions: HashMap::new(),
+            history_render_fingerprints: HashMap::new(),
             next_history_render_version: 1,
             history_render_cache: HashMap::new(),
             pending_render_cache: None,

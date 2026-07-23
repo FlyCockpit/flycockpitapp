@@ -1530,36 +1530,42 @@ impl App {
     }
 
     pub(super) fn sync_history_render_versions(&mut self) {
-        if self.history_render_versions.len() > self.history.len() {
-            self.history_render_versions.truncate(self.history.len());
-            self.history_render_fingerprints
-                .truncate(self.history.len());
-            self.history_render_cache
-                .retain(|idx, _| *idx < self.history.len());
-        }
+        let live_ids: std::collections::HashSet<_> = self.history.ids().iter().copied().collect();
 
-        for idx in 0..self.history.len() {
-            let fingerprint = history_entry_render_fingerprint(&self.history[idx]);
-            if idx >= self.history_render_versions.len() {
+        for (idx, entry) in self.history.iter().enumerate() {
+            let id = self
+                .history
+                .id_at(idx)
+                .expect("history entry ids stay in lockstep");
+            let fingerprint = history_entry_render_fingerprint(entry);
+            let changed = self
+                .history_render_fingerprints
+                .get(&id)
+                .is_none_or(|stored| *stored != fingerprint);
+            if changed {
                 self.history_render_versions
-                    .push(self.next_history_render_version);
-                self.history_render_fingerprints.push(fingerprint);
+                    .insert(id, self.next_history_render_version);
+                self.history_render_fingerprints.insert(id, fingerprint);
                 self.next_history_render_version = self.next_history_render_version.wrapping_add(1);
                 if self.next_history_render_version == 0 {
                     self.next_history_render_version = 1;
                 }
-                continue;
-            }
-
-            if self.history_render_fingerprints[idx] != fingerprint {
-                self.history_render_versions[idx] = self.next_history_render_version;
-                self.history_render_fingerprints[idx] = fingerprint;
+            } else if !self.history_render_versions.contains_key(&id) {
+                self.history_render_versions
+                    .insert(id, self.next_history_render_version);
                 self.next_history_render_version = self.next_history_render_version.wrapping_add(1);
                 if self.next_history_render_version == 0 {
                     self.next_history_render_version = 1;
                 }
             }
         }
+
+        self.history_render_versions
+            .retain(|id, _| live_ids.contains(id));
+        self.history_render_fingerprints
+            .retain(|id, _| live_ids.contains(id));
+        self.history_render_cache
+            .retain(|id, _| live_ids.contains(id));
     }
 
     pub(super) fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
@@ -1583,6 +1589,10 @@ impl App {
         let mut msg_abs_line: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::new();
         for (idx, entry) in self.history.iter().enumerate() {
+            let entry_id = self
+                .history
+                .id_at(idx)
+                .expect("history entry ids stay in lockstep");
             // Pinned-message chrome (`pinned-messages`): the pick-mode arrow
             // (when this entry is the pick selection) and/or the clickable
             // mouse controls (`[fork]` + `[pin]`/`[unpin]`, only when mouse
@@ -1613,7 +1623,10 @@ impl App {
             });
             let entry_base = all.len();
             let preflight_dots_ms = self.started_at.elapsed().as_millis();
-            let version = self.history_render_versions[idx];
+            let version = *self
+                .history_render_versions
+                .get(&entry_id)
+                .expect("history render version is synced before render");
             let sig = history_render_signature(
                 entry,
                 version,
@@ -1626,7 +1639,7 @@ impl App {
                 preflight_dots_ms,
                 pin,
             );
-            let rendered = match self.history_render_cache.get(&idx) {
+            let rendered = match self.history_render_cache.get(&entry_id) {
                 Some(cached) if cached.sig == sig => Rc::clone(&cached.rendered),
                 _ => {
                     let rendered = Rc::new(render_entry(
@@ -1644,7 +1657,7 @@ impl App {
                         pin,
                     ));
                     self.history_render_cache.insert(
-                        idx,
+                        entry_id,
                         HistoryRenderCacheEntry {
                             sig,
                             rendered: Rc::clone(&rendered),
@@ -1803,9 +1816,6 @@ impl App {
         } else {
             self.pending_render_cache = None;
         }
-        self.history_render_cache
-            .retain(|idx, _| *idx < self.history.len());
-
         if let Some(view) = self.active_subagent_view() {
             if let Some(line) = self.active_subagent_countdown_line() {
                 row_meta.push(ChatRowMeta::other());
@@ -4400,7 +4410,7 @@ mod render_history_spacing_tests {
         App, ChatCopyTarget, ChatRowKind, ControlChip, Selection, TranscriptFind,
         affordance_target_for_row, extract_selection_plaintext,
     };
-    use crate::tui::app::{AffordanceTarget, SandboxDownNotice};
+    use crate::tui::app::{AffordanceTarget, SandboxDownNotice, SideConversation};
     use crate::tui::composer::VimMode;
     use crate::tui::history::{
         HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, SubagentRoutingChips, ToolCall,
@@ -4604,14 +4614,33 @@ mod render_history_spacing_tests {
         render_history_no_selection(app, width, height);
     }
 
+    fn assert_history_render_maps_only_live_ids(app: &App) {
+        let live_ids: std::collections::HashSet<_> = app.history.ids().iter().copied().collect();
+        assert!(
+            app.history_render_versions
+                .keys()
+                .all(|id| live_ids.contains(id))
+        );
+        assert!(
+            app.history_render_fingerprints
+                .keys()
+                .all(|id| live_ids.contains(id))
+        );
+        assert!(
+            app.history_render_cache
+                .keys()
+                .all(|id| live_ids.contains(id))
+        );
+    }
+
     #[test]
     fn running_subagent_row_exposes_open_target() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.daemon_prompt = None;
         app.history.push(running_subagent());
-        app.history_render_versions = vec![0; app.history.len()];
-        app.history_render_fingerprints = vec![0; app.history.len()];
+        app.history_render_versions.clear();
+        app.history_render_fingerprints.clear();
 
         render_history_no_selection(&mut app, 80, 6);
 
@@ -4637,8 +4666,8 @@ mod render_history_spacing_tests {
         app.daemon_prompt = None;
         app.history.push(user("root prompt"));
         app.history.push(running_subagent());
-        app.history_render_versions = vec![0; app.history.len()];
-        app.history_render_fingerprints = vec![0; app.history.len()];
+        app.history_render_versions.clear();
+        app.history_render_fingerprints.clear();
 
         assert!(app.open_subagent_view_for_history_index(1));
         assert!(app.active_subagent_view().is_some());
@@ -4655,13 +4684,38 @@ mod render_history_spacing_tests {
     }
 
     #[test]
+    fn subagent_view_swap_keeps_render_maps_with_their_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.daemon_prompt = None;
+        app.launch.banner_enabled = false;
+        app.history.push(user("root prompt"));
+        app.history.push(running_subagent());
+
+        render_history_no_selection(&mut app, 80, 8);
+        let root_id = app.history.id_at(0).unwrap();
+        let before = Rc::clone(&app.history_render_cache.get(&root_id).unwrap().rendered);
+
+        assert!(app.open_subagent_view_for_history_index(1));
+        render_history_no_selection(&mut app, 80, 8);
+        assert_history_render_maps_only_live_ids(&app);
+
+        assert!(app.return_from_subagent_view());
+        render_history_no_selection(&mut app, 80, 8);
+        let after = Rc::clone(&app.history_render_cache.get(&root_id).unwrap().rendered);
+
+        assert!(Rc::ptr_eq(&before, &after));
+        assert_history_render_maps_only_live_ids(&app);
+    }
+
+    #[test]
     fn subagent_report_while_view_open_settles_parent_view() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.daemon_prompt = None;
         app.history.push(running_subagent());
-        app.history_render_versions = vec![0; app.history.len()];
-        app.history_render_fingerprints = vec![0; app.history.len()];
+        app.history_render_versions.clear();
+        app.history_render_fingerprints.clear();
 
         assert!(app.open_subagent_view_for_history_index(0));
         app.apply_event(cockpit_core::engine::agent::TurnEvent::SubagentReport {
@@ -4888,7 +4942,8 @@ mod render_history_spacing_tests {
 
         app.history = (0..40)
             .map(|index| user(&format!("overflow message {index}")))
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         let _ = render_app_buffer(&mut app, WIDTH, HEIGHT);
         assert!(
             app.chat_row_meta
@@ -4961,7 +5016,7 @@ mod render_history_spacing_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
-        app.history = vec![user("question"), agent("answer")];
+        app.history = vec![user("question"), agent("answer")].into();
 
         assert_eq!(render_calls_after(&mut app, 80, 8), 2);
         app.working_msg_idx = app.working_msg_idx.wrapping_add(1);
@@ -4983,7 +5038,7 @@ mod render_history_spacing_tests {
         app.launch.session_id = Some(session_id);
         app.pinned_seqs_session = Some(session_id);
         app.pinned_seqs_cache.insert(42);
-        app.history = vec![pinned_user("pin me", 42)];
+        app.history = vec![pinned_user("pin me", 42)].into();
 
         reset_open_default_call_count();
         assert_eq!(render_calls_after(&mut app, 80, 8), 1);
@@ -5183,7 +5238,7 @@ mod render_history_spacing_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
-        app.history = vec![agent("**answer**")];
+        app.history = vec![agent("**answer**")].into();
 
         assert_eq!(render_calls_after(&mut app, 80, 8), 1);
         assert_eq!(render_calls_after(&mut app, 81, 8), 1);
@@ -5211,7 +5266,7 @@ mod render_history_spacing_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
         app.use_emojis = false;
-        app.history = vec![pinned_user("pin me", 42), tool_box()];
+        app.history = vec![pinned_user("pin me", 42), tool_box()].into();
 
         assert_eq!(render_calls_after(&mut app, 80, 8), 2);
 
@@ -5240,9 +5295,9 @@ mod render_history_spacing_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
         app.use_emojis = false;
-        app.history = vec![expanded_read_tool_box(&long_read_output(80))];
-        app.history_render_versions = vec![0; app.history.len()];
-        app.history_render_fingerprints = vec![0; app.history.len()];
+        app.history = vec![expanded_read_tool_box(&long_read_output(80))].into();
+        app.history_render_versions.clear();
+        app.history_render_fingerprints.clear();
 
         render_history_no_selection(&mut app, 100, 40);
         for offset in 1..=20 {
@@ -5262,7 +5317,7 @@ mod render_history_spacing_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
-        app.history = vec![agent("answer"), preflight_user("pending")];
+        app.history = vec![agent("answer"), preflight_user("pending")].into();
 
         assert_eq!(render_calls_after(&mut app, 80, 8), 2);
         if let HistoryEntry::Agent { expanded, .. } = &mut app.history[0] {
@@ -5299,7 +5354,8 @@ mod render_history_spacing_tests {
         app.launch.banner_enabled = false;
         app.history = vec![HistoryEntry::Plain {
             line: "visible text".to_string(),
-        }];
+        }]
+        .into();
 
         render_history_no_selection(&mut app, 20, 4);
         assert!(app.chat_text_grid.is_empty());
@@ -5318,7 +5374,7 @@ mod render_history_spacing_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
-        app.history = vec![user("findable target")];
+        app.history = vec![user("findable target")].into();
 
         render_history_no_selection(&mut app, 40, 8);
         assert!(app.chat_find_lines.is_empty());
@@ -5345,15 +5401,124 @@ mod render_history_spacing_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
-        app.history = vec![agent("stable cached text")];
+        app.history = vec![agent("stable cached text")].into();
 
         render_history_no_selection(&mut app, 80, 8);
-        let first = Rc::clone(&app.history_render_cache.get(&0).unwrap().rendered);
+        let id = app.history.id_at(0).unwrap();
+        let first = Rc::clone(&app.history_render_cache.get(&id).unwrap().rendered);
 
         render_history_no_selection(&mut app, 80, 8);
-        let second = Rc::clone(&app.history_render_cache.get(&0).unwrap().rendered);
+        let second = Rc::clone(&app.history_render_cache.get(&id).unwrap().rendered);
 
         assert!(Rc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn mid_list_insert_preserves_render_cache_for_following_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..10)
+            .map(|index| agent(&format!("stable cached text {index}")))
+            .collect::<Vec<_>>()
+            .into();
+
+        render_history_no_selection(&mut app, 80, 20);
+        let last_id = app.history.id_at(9).unwrap();
+        let before = Rc::clone(&app.history_render_cache.get(&last_id).unwrap().rendered);
+
+        app.history.insert(3, agent("inserted row"));
+        render_history_no_selection(&mut app, 80, 20);
+        let after = Rc::clone(&app.history_render_cache.get(&last_id).unwrap().rendered);
+
+        assert!(Rc::ptr_eq(&before, &after));
+    }
+
+    #[test]
+    fn stale_history_render_cache_ids_are_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![agent("first"), agent("second"), agent("third")].into();
+
+        render_history_no_selection(&mut app, 80, 10);
+        let removed_id = app.history.id_at(0).unwrap();
+        assert!(app.history_render_cache.contains_key(&removed_id));
+
+        app.history.remove(0);
+        render_history_no_selection(&mut app, 80, 10);
+
+        assert_eq!(app.history_render_cache.len(), app.history.len());
+        assert!(!app.history_render_cache.contains_key(&removed_id));
+        assert!(!app.history_render_versions.contains_key(&removed_id));
+        assert!(!app.history_render_fingerprints.contains_key(&removed_id));
+        assert_history_render_maps_only_live_ids(&app);
+    }
+
+    #[test]
+    fn side_snapshot_restores_history_render_maps_with_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![agent("main root")].into();
+
+        render_history_no_selection(&mut app, 80, 10);
+        let main_id = app.history.id_at(0).unwrap();
+        let main_cached = Rc::clone(&app.history_render_cache.get(&main_id).unwrap().rendered);
+
+        let saved_main = SideConversation {
+            side_session_id: uuid::Uuid::new_v4(),
+            socket: tmp.path().join("missing-daemon.sock"),
+            saved_runner: None,
+            saved_history: app.history.clone(),
+            saved_history_render_versions: app.history_render_versions.clone(),
+            saved_history_render_fingerprints: app.history_render_fingerprints.clone(),
+            saved_history_render_cache: app.history_render_cache.clone(),
+            saved_queue: Vec::new(),
+            saved_pending: None,
+            saved_prunable_tokens: 0,
+            saved_cache_cold: false,
+            saved_elided_event_ids: std::collections::HashSet::new(),
+            saved_active_schedules: std::collections::BTreeMap::new(),
+            saved_pending_stop_confirm: None,
+            saved_chat_scroll_offset: 0,
+            saved_project_id: None,
+            saved_session_id: None,
+            saved_session_short_id: None,
+            saved_current_session_persisted: true,
+        };
+
+        app.history = vec![agent("side root"), agent("colliding cached text")].into();
+        app.history_render_versions.clear();
+        app.history_render_fingerprints.clear();
+        app.history_render_cache.clear();
+        render_history_no_selection(&mut app, 80, 10);
+        let side_collision_id = app.history.id_at(1).unwrap();
+        let side_cached = Rc::clone(
+            &app.history_render_cache
+                .get(&side_collision_id)
+                .unwrap()
+                .rendered,
+        );
+
+        app.restore_side_snapshot(saved_main);
+        app.history.push(agent("colliding cached text"));
+        let main_collision_id = app.history.id_at(1).unwrap();
+        assert_eq!(side_collision_id, main_collision_id);
+
+        render_history_no_selection(&mut app, 80, 10);
+        let restored_main_cached =
+            Rc::clone(&app.history_render_cache.get(&main_id).unwrap().rendered);
+        let new_main_cached = Rc::clone(
+            &app.history_render_cache
+                .get(&main_collision_id)
+                .unwrap()
+                .rendered,
+        );
+
+        assert!(Rc::ptr_eq(&main_cached, &restored_main_cached));
+        assert!(!Rc::ptr_eq(&side_cached, &new_main_cached));
+        assert_history_render_maps_only_live_ids(&app);
     }
 
     #[test]
@@ -5391,7 +5556,7 @@ mod render_history_spacing_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = true;
-        app.history = vec![user("short")];
+        app.history = vec![user("short")].into();
 
         render_history_no_selection(&mut app, 100, 24);
 
@@ -5417,7 +5582,8 @@ mod render_history_spacing_tests {
         app.launch.banner_enabled = false;
         app.history = vec![HistoryEntry::Plain {
             line: "visible text".to_string(),
-        }];
+        }]
+        .into();
         app.chat_scroll_offset = 2;
         app.transcript_find = Some(TranscriptFind {
             query: "missing".to_string(),
@@ -5441,7 +5607,8 @@ mod render_history_spacing_tests {
         app.launch.banner_enabled = false;
         app.history = vec![HistoryEntry::Plain {
             line: "alpha needle omega".to_string(),
-        }];
+        }]
+        .into();
         app.transcript_find = Some(TranscriptFind {
             query: "needle".to_string(),
             matches: Vec::new(),
@@ -5471,7 +5638,8 @@ mod render_history_spacing_tests {
             agent("thinking before tool"),
             tool_box(),
             agent("after tool"),
-        ];
+        ]
+        .into();
 
         render_history(&mut app, 80, 12);
 
@@ -5521,7 +5689,7 @@ mod render_history_spacing_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
         app.use_emojis = false;
-        app.history = vec![compact_boundary("handoff line")];
+        app.history = vec![compact_boundary("handoff line")].into();
 
         render_history(&mut app, 80, 20);
         let call_row = find_row(&app, "compact:");
@@ -5569,7 +5737,8 @@ mod render_history_spacing_tests {
         app.launch.banner_enabled = false;
         app.history = vec![HistoryEntry::Plain {
             line: "abcdefghijklmnopqrstuvwxyz".to_string(),
-        }];
+        }]
+        .into();
 
         render_history(&mut app, 10, 6);
 
@@ -5589,7 +5758,8 @@ mod render_history_spacing_tests {
         app.launch.banner_enabled = false;
         app.history = vec![HistoryEntry::Plain {
             line: "abcdefghijklmnopqrstuvwxyz".to_string(),
-        }];
+        }]
+        .into();
 
         render_history(&mut app, 10, 5);
 
@@ -5609,7 +5779,8 @@ mod render_history_spacing_tests {
         app.history = vec![
             user("question"),
             expanded_tool_box("abcdefghijklmnopqrstuv"),
-        ];
+        ]
+        .into();
 
         render_history(&mut app, 12, 10);
 
@@ -5630,7 +5801,8 @@ mod render_history_spacing_tests {
             agent("assistant answer"),
             expanded_tool_box("tool output"),
             diff_entry("src/lib.rs"),
-        ];
+        ]
+        .into();
 
         render_history(&mut app, 40, 12);
 
@@ -5713,7 +5885,7 @@ mod render_history_spacing_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
         app.mouse_capture = true;
-        app.history = vec![pinned_user("pin me", 42)];
+        app.history = vec![pinned_user("pin me", 42)].into();
 
         render_history(&mut app, 80, 8);
         let row = app
@@ -5769,7 +5941,7 @@ mod render_history_spacing_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
         app.use_emojis = false;
-        app.history = vec![agent("assistant answer"), expanded_tool_box("tool output")];
+        app.history = vec![agent("assistant answer"), expanded_tool_box("tool output")].into();
 
         render_history(&mut app, 80, 8);
         let agent_row = find_row(&app, "assistant answer");
@@ -5794,7 +5966,7 @@ mod render_history_spacing_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
-        app.history = vec![agent("older answer"), agent("newer answer")];
+        app.history = vec![agent("older answer"), agent("newer answer")].into();
 
         render_history(&mut app, 80, 8);
         let older = find_row(&app, "older answer");
@@ -5810,7 +5982,7 @@ mod render_history_spacing_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
-        app.history = vec![user("copy this user message"), agent("assistant")];
+        app.history = vec![user("copy this user message"), agent("assistant")].into();
 
         render_history(&mut app, 80, 8);
         let row = find_row(&app, "copy this user message");
@@ -5832,7 +6004,8 @@ mod render_history_spacing_tests {
         app.history = vec![
             user("userwrapabcdefghijklmnopqrstuvwxyz"),
             agent("agentwrapabcdefghijklmnopqrstuvwxyz"),
-        ];
+        ]
+        .into();
 
         render_history(&mut app, 24, 16);
 
@@ -5874,7 +6047,7 @@ mod render_history_spacing_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
-        app.history = vec![user("question"), agent("answer")];
+        app.history = vec![user("question"), agent("answer")].into();
 
         render_history(&mut app, 80, 8);
         let blank = app
@@ -5892,7 +6065,7 @@ mod render_history_spacing_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
-        app.history = vec![diff_entry("src/main.rs")];
+        app.history = vec![diff_entry("src/main.rs")].into();
 
         render_history(&mut app, 80, 8);
         let row = find_row(&app, "src/main.rs");
@@ -5917,7 +6090,8 @@ mod render_history_spacing_tests {
             HistoryEntry::Plain {
                 line: "after chip".to_string(),
             },
-        ];
+        ]
+        .into();
         app.selection = Some(Selection {
             anchor: (0, 0),
             focus: (79, 23),
@@ -5941,7 +6115,8 @@ mod render_history_spacing_tests {
             .map(|idx| HistoryEntry::Plain {
                 line: format!("line {idx}"),
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         app.chat_scroll_offset = 3;
         app.selection = Some(Selection {
             anchor: (0, 0),
@@ -5975,7 +6150,8 @@ mod render_history_spacing_tests {
         app.launch.banner_enabled = false;
         app.history = vec![HistoryEntry::Plain {
             line: "abcdefghijklmnopqrstuv".to_string(),
-        }];
+        }]
+        .into();
 
         render_history(&mut app, 10, 4);
 
@@ -6004,7 +6180,8 @@ mod render_history_spacing_tests {
         app.launch.banner_enabled = false;
         app.history = vec![HistoryEntry::Plain {
             line: "abcdefghijklmnopqrstuvwxyz".to_string(),
-        }];
+        }]
+        .into();
 
         render_history(&mut app, 8, 3);
         let narrow_total = app.chat_total_lines;
@@ -6026,7 +6203,8 @@ mod render_history_spacing_tests {
             .map(|idx| HistoryEntry::Plain {
                 line: format!("line {idx}"),
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
 
         let buffer = render_history_buffer(&mut app, 24, 4);
         let rows = buffer_rows(&buffer, 24, 4);
@@ -6052,7 +6230,8 @@ mod render_history_spacing_tests {
             .map(|idx| HistoryEntry::Plain {
                 line: format!("line {idx}"),
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         app.chat_scroll_offset = 2;
 
         let buffer = render_history_buffer(&mut app, 2, 3);
@@ -6075,7 +6254,8 @@ mod render_history_spacing_tests {
             .map(|idx| HistoryEntry::Plain {
                 line: format!("line {idx}"),
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         app.chat_scroll_offset = 3;
         let before = buffer_rows(&render_history_buffer(&mut app, 24, 4), 24, 4)[0].clone();
 
@@ -6100,7 +6280,8 @@ mod render_history_spacing_tests {
             .map(|idx| HistoryEntry::Plain {
                 line: format!("line {idx}"),
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         app.chat_scroll_offset = 3;
         let before = buffer_rows(&render_history_buffer(&mut app, 24, 4), 24, 4)[0].clone();
 
@@ -6131,7 +6312,8 @@ mod render_history_spacing_tests {
             .map(|idx| HistoryEntry::Plain {
                 line: format!("line {idx}"),
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         app.chat_scroll_offset = 0;
         app.history.push(HistoryEntry::Plain {
             line: "latest".to_string(),
@@ -6152,7 +6334,8 @@ mod render_history_spacing_tests {
             .map(|idx| HistoryEntry::Plain {
                 line: format!("context {idx}"),
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         app.history.push(HistoryEntry::User {
             text: "new question".to_string(),
             cleaned: None,
@@ -6192,7 +6375,8 @@ mod render_history_spacing_tests {
             .map(|idx| HistoryEntry::Plain {
                 line: format!("line {idx}"),
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         app.chat_scroll_offset = 3;
         app.busy = true;
 

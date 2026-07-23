@@ -1477,7 +1477,8 @@ mod affordance_hover_tests {
             calls: vec![tool_call("first"), tool_call("second")],
             view_offset: 0,
             follow: true,
-        }];
+        }]
+        .into();
         app.chat_row_meta = vec![
             meta(None, Some(0), Some((0, 0)), None),
             meta(None, Some(0), Some((0, 1)), None),
@@ -1518,7 +1519,8 @@ mod affordance_hover_tests {
             calls: vec![tool_call("first")],
             view_offset: 0,
             follow: true,
-        }];
+        }]
+        .into();
 
         let regions = app.build_affordance_scroll_regions();
         assert_eq!(
@@ -1564,7 +1566,7 @@ mod affordance_hover_tests {
     fn reasoning_window_scrolls_until_both_edges() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
-        app.history = vec![reasoning_agent(0)];
+        app.history = vec![reasoning_agent(0)].into();
         app.affordance_scroll_regions = vec![AffordanceScrollRegion {
             target: AffordanceTarget::ReasoningWindow { history_index: 0 },
             row_start: 2,
@@ -1606,7 +1608,7 @@ mod affordance_hover_tests {
             max_offset: 3,
         });
         app.chat_row_meta = vec![row];
-        app.history = vec![reasoning_agent(1)];
+        app.history = vec![reasoning_agent(1)].into();
 
         let regions = app.build_affordance_scroll_regions();
         assert_eq!(

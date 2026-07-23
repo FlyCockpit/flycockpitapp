@@ -84,7 +84,8 @@ fn copy_selection_prefers_single_user_message_markdown_source() {
         seq: None,
         preflight_pending: false,
         persist_failed: false,
-    }];
+    }]
+    .into();
     app.chat_area = Some(Rect::new(0, 0, 12, 2));
     app.chat_text_grid = vec![cells("- item", 12), cells("    code", 12)];
     app.chat_row_meta = vec![message_meta(0), message_meta(0)];
@@ -117,7 +118,8 @@ fn copy_selection_prefers_single_agent_message_markdown_source() {
         reasoning_offset: 0,
         think_duration: None,
         seq: None,
-    }];
+    }]
+    .into();
     app.chat_area = Some(Rect::new(0, 0, 12, 1));
     app.chat_text_grid = vec![cells("quoted", 12)];
     app.chat_row_meta = vec![message_meta(0)];
@@ -160,7 +162,8 @@ fn copy_selection_cross_message_falls_back_to_plaintext() {
             think_duration: None,
             seq: None,
         },
-    ];
+    ]
+    .into();
     app.chat_area = Some(Rect::new(0, 0, 8, 2));
     app.chat_text_grid = vec![cells("bold", 8), cells("plain", 8)];
     app.chat_row_meta = vec![message_meta(0), message_meta(1)];

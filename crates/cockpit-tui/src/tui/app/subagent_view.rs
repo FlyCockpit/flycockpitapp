@@ -80,10 +80,10 @@ impl App {
         let previous = self.capture_transcript_view();
         self.transcript_view_stack.push(previous);
         self.transcript_view = TranscriptViewMeta::Subagent(meta);
-        self.history = history;
+        self.history = history.into();
         self.pending = None;
-        self.history_render_versions = vec![0; self.history.len()];
-        self.history_render_fingerprints = vec![0; self.history.len()];
+        self.history_render_versions = std::collections::HashMap::new();
+        self.history_render_fingerprints = std::collections::HashMap::new();
         self.history_render_cache.clear();
         self.pending_render_cache = None;
         self.chat_scroll_offset = 0;
@@ -197,9 +197,6 @@ impl App {
             persist_failed: false,
         });
         self.push_plain("steer queued for next turn boundary".to_string());
-        self.history_render_versions.resize(self.history.len(), 0);
-        self.history_render_fingerprints
-            .resize(self.history.len(), 0);
         let req = cockpit_core::daemon::proto::Request::SteerDelegation {
             session_id,
             task_call_id: view.task_call_id,

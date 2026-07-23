@@ -775,22 +775,13 @@ impl App {
                     .is_some_and(|view| view.task_call_id == task_call_id && view.label == label);
                 let amended = if active_matches {
                     if let Some(parent) = self.transcript_view_stack.last_mut() {
-                        let amended = amend_subagent_routing_in(
+                        amend_subagent_routing_in(
                             &mut parent.history,
                             &child,
                             &task_call_id,
                             &label,
                             update.clone(),
-                        );
-                        if amended {
-                            parent
-                                .history_render_versions
-                                .resize(parent.history.len(), 0);
-                            parent
-                                .history_render_fingerprints
-                                .resize(parent.history.len(), 0);
-                        }
-                        amended
+                        )
                     } else {
                         self.amend_subagent_routing(&child, &task_call_id, &label, update.clone())
                     }
@@ -836,12 +827,6 @@ impl App {
                             &label,
                             update.clone(),
                         );
-                        parent
-                            .history_render_versions
-                            .resize(parent.history.len(), 0);
-                        parent
-                            .history_render_fingerprints
-                            .resize(parent.history.len(), 0);
                     } else {
                         self.settle_subagent(&agent, &task_call_id, &label, update.clone());
                     }
@@ -2744,8 +2729,34 @@ fn subagent_routing_chips_from_value(value: &serde_json::Value) -> SubagentRouti
     }
 }
 
+pub(super) trait SubagentHistoryEntries {
+    fn iter_mut_entries(&mut self) -> std::slice::IterMut<'_, HistoryEntry>;
+    fn push_entry(&mut self, entry: HistoryEntry);
+}
+
+impl SubagentHistoryEntries for HistoryLog {
+    fn iter_mut_entries(&mut self) -> std::slice::IterMut<'_, HistoryEntry> {
+        self.iter_mut()
+    }
+
+    fn push_entry(&mut self, entry: HistoryEntry) {
+        self.push(entry);
+    }
+}
+
+#[cfg(test)]
+impl SubagentHistoryEntries for Vec<HistoryEntry> {
+    fn iter_mut_entries(&mut self) -> std::slice::IterMut<'_, HistoryEntry> {
+        self.iter_mut()
+    }
+
+    fn push_entry(&mut self, entry: HistoryEntry) {
+        Vec::push(self, entry);
+    }
+}
+
 pub(super) fn settle_subagent_in(
-    history: &mut Vec<HistoryEntry>,
+    history: &mut impl SubagentHistoryEntries,
     child: &str,
     task_call_id: &str,
     label: &str,
@@ -2760,28 +2771,31 @@ pub(super) fn settle_subagent_in(
     } = update;
     let status = classify_subagent_status(child, &report, failed);
     let auto_expand = status.is_some();
-    let found = history.iter_mut().rev().find_map(|entry| match entry {
-        HistoryEntry::Subagent {
-            child: c,
-            task_call_id: call,
-            label: entry_label,
-            spawned_at,
-            outcome: outcome @ None,
-            expanded,
-            trusted_only: entry_trusted_only,
-            model_trusted: entry_model_trusted,
-            routing: entry_routing,
-            ..
-        } if c == child && call == task_call_id && entry_label == label => Some((
-            spawned_at,
-            outcome,
-            expanded,
-            entry_trusted_only,
-            entry_model_trusted,
-            entry_routing,
-        )),
-        _ => None,
-    });
+    let found = history
+        .iter_mut_entries()
+        .rev()
+        .find_map(|entry| match entry {
+            HistoryEntry::Subagent {
+                child: c,
+                task_call_id: call,
+                label: entry_label,
+                spawned_at,
+                outcome: outcome @ None,
+                expanded,
+                trusted_only: entry_trusted_only,
+                model_trusted: entry_model_trusted,
+                routing: entry_routing,
+                ..
+            } if c == child && call == task_call_id && entry_label == label => Some((
+                spawned_at,
+                outcome,
+                expanded,
+                entry_trusted_only,
+                entry_model_trusted,
+                entry_routing,
+            )),
+            _ => None,
+        });
     match found {
         Some((
             spawned_at,
@@ -2804,7 +2818,7 @@ pub(super) fn settle_subagent_in(
                 *expanded = true;
             }
         }
-        None => history.push(HistoryEntry::Subagent {
+        None => history.push_entry(HistoryEntry::Subagent {
             parent: String::new(),
             child: child.to_string(),
             task_call_id: task_call_id.to_string(),
@@ -2825,14 +2839,16 @@ pub(super) fn settle_subagent_in(
 }
 
 pub(super) fn amend_subagent_routing_in(
-    history: &mut [HistoryEntry],
+    history: &mut impl SubagentHistoryEntries,
     child: &str,
     task_call_id: &str,
     label: &str,
     update: SubagentRoutingUpdate,
 ) -> bool {
-    let Some((entry_trusted_only, entry_model_trusted, entry_routing)) =
-        history.iter_mut().rev().find_map(|entry| match entry {
+    let Some((entry_trusted_only, entry_model_trusted, entry_routing)) = history
+        .iter_mut_entries()
+        .rev()
+        .find_map(|entry| match entry {
             HistoryEntry::Subagent {
                 child: c,
                 task_call_id: call,

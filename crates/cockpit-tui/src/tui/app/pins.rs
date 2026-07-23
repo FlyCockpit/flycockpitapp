@@ -1062,7 +1062,7 @@ mod tests {
     fn copy_pick_enter_selects_last_message() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = test_app(tmp.path());
-        app.history = vec![user(Some(1)), agent(Some(2)), user(Some(3))];
+        app.history = vec![user(Some(1)), agent(Some(2)), user(Some(3))].into();
 
         app.enter_copy_pick_mode();
 
@@ -1078,7 +1078,7 @@ mod tests {
     fn copy_pick_refused_while_overlay_open() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = test_app(tmp.path());
-        app.history = vec![user(Some(1))];
+        app.history = vec![user(Some(1))].into();
         app.context_menu = Some(ContextMenu {
             preferred_origin: (0, 0),
             clicked_chat_row: 0,
@@ -1097,7 +1097,7 @@ mod tests {
         let mut app = test_app(tmp.path());
         app.agent_runner = Some(Ok(runner()));
         app.current_session_persisted = true;
-        app.history = vec![user(Some(11)), agent(Some(12))];
+        app.history = vec![user(Some(11)), agent(Some(12))].into();
 
         app.handle_fork_command("");
 
@@ -1115,7 +1115,7 @@ mod tests {
     fn fork_pick_esc_cancels() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = test_app(tmp.path());
-        app.history = vec![user(Some(11))];
+        app.history = vec![user(Some(11))].into();
         app.enter_fork_pick_mode();
 
         app.cancel_fork_pick();
@@ -1128,7 +1128,7 @@ mod tests {
     fn fork_pick_navigation_and_keyboard_ownership() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = test_app(tmp.path());
-        app.history = vec![user(Some(11)), agent(Some(12))];
+        app.history = vec![user(Some(11)), agent(Some(12))].into();
         app.enter_fork_pick_mode();
 
         app.handle_key(key(KeyCode::Char('k')));
@@ -1155,7 +1155,7 @@ mod tests {
     fn copy_pick_tab_noop_without_code_block() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = test_app(tmp.path());
-        app.history = vec![agent(Some(1))];
+        app.history = vec![agent(Some(1))].into();
         app.enter_copy_pick_mode();
 
         app.copy_pick_cycle_target(1);
@@ -1176,7 +1176,8 @@ mod tests {
             reasoning_offset: 0,
             think_duration: None,
             seq: Some(1),
-        }];
+        }]
+        .into();
         app.enter_copy_pick_mode();
         app.copy_pick_cycle_target(1);
 

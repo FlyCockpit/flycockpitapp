@@ -385,6 +385,83 @@ pub enum Response {
     #[serde(other)]
     Unknown,
 }
+#[macro_export]
+macro_rules! response_variants {
+    ($with_variants:ident $(, $context:ident)*) => {
+        $with_variants! { ($($context),*) [
+            (Response::Ack, "ack");
+            (Response::UserMessageQueued { .. }, "user_message_queued");
+            (Response::DelegationSteer { .. }, "delegation_steer");
+            (Response::AttachmentUploadStarted { .. }, "attachment_upload_started");
+            (Response::AttachmentChunkAccepted { .. }, "attachment_chunk_accepted");
+            (Response::AttachmentUploaded { .. }, "attachment_uploaded");
+            (Response::TerminalPasteImage { .. }, "terminal_paste_image");
+            (Response::RemoveQueuedUserMessageResult { .. }, "remove_queued_user_message_result");
+            (Response::RemoveQueuedUserMessagesResult { .. }, "remove_queued_user_messages_result");
+            (Response::Attached { .. }, "attached");
+            (Response::SubagentTranscript { .. }, "subagent_transcript");
+            (Response::Sessions { .. }, "sessions");
+            (Response::SessionMessages { .. }, "session_messages");
+            (Response::HistoryPage { .. }, "history_page");
+            (Response::NoteRecorded { .. }, "note_recorded");
+            (Response::GoalStatus { .. }, "goal_status");
+            (Response::GoalUpdated { .. }, "goal_updated");
+            (Response::GoalCleared { .. }, "goal_cleared");
+            (Response::Assistants { .. }, "assistants");
+            (Response::AssistantSessionCreated { .. }, "assistant_session_created");
+            (Response::AutoTitle { .. }, "auto_title");
+            (Response::ExportSessionData { .. }, "export_session_data");
+            (Response::Curator { .. }, "curator");
+            (Response::SessionLiveStatus { .. }, "session_live_status");
+            (Response::Forked { .. }, "forked");
+            (Response::BtwFork { .. }, "btw_fork");
+            (Response::Skills { .. }, "skills");
+            (Response::ResourceSnapshot { .. }, "resource_snapshot");
+            (Response::PromoteResourceResult { .. }, "promote_resource_result");
+            (Response::ScheduledJob { .. }, "scheduled_job");
+            (Response::ScheduledJobs { .. }, "scheduled_jobs");
+            (Response::ScheduledJobDeleted { .. }, "scheduled_job_deleted");
+            (Response::ScheduledJobRunQueued { .. }, "scheduled_job_run_queued");
+            (Response::Agents { .. }, "agents");
+            (Response::Models { .. }, "models");
+            (Response::FsList { .. }, "fs_list");
+            (Response::FsStat { .. }, "fs_stat");
+            (Response::FsRead { .. }, "fs_read");
+            (Response::FsWrite { .. }, "fs_write");
+            (Response::GitStatus { .. }, "git_status");
+            (Response::GitDiffFile { .. }, "git_diff_file");
+            (Response::TerminalOpened { .. }, "terminal_opened");
+            (Response::LspControlResult { .. }, "lsp_control_result");
+            (Response::DaemonStatus { .. }, "daemon_status");
+            (Response::UsageCounts { .. }, "usage_counts");
+            (Response::StatsRollup { .. }, "stats_rollup");
+            (Response::GuidanceEstimate { .. }, "guidance_estimate");
+            (Response::SandboxState { .. }, "sandbox_state");
+            (Response::SandboxEscalationState { .. }, "sandbox_escalation_state");
+            (Response::RedactionState { .. }, "redaction_state");
+            (Response::PreflightState { .. }, "preflight_state");
+            (Response::TrustedOnlyState { .. }, "trusted_only_state");
+            (Response::ApprovalModeState { .. }, "approval_mode_state");
+            (Response::DelegationRecursionState { .. }, "delegation_recursion_state");
+            (Response::CaffeinateState { .. }, "caffeinate_state");
+            (Response::PausedWork { .. }, "paused_work");
+            (Response::Unknown, "__unknown");
+        ] }
+    };
+}
+
+impl Response {
+    pub fn wire_tag(&self) -> &'static str {
+        macro_rules! wire_tag {
+            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
+                match self {
+                    $($pattern => $tag,)+
+                }
+            };
+        }
+        response_variants!(wire_tag)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveModelState {

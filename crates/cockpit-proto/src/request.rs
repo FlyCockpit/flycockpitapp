@@ -751,6 +751,117 @@ pub enum Request {
     #[serde(other)]
     Unknown,
 }
+#[macro_export]
+macro_rules! request_variants {
+    ($with_variants:ident $(, $context:ident)*) => {
+        $with_variants! { ($($context),*) [
+            (Request::Attach { .. }, "attach");
+            (Request::SubagentTranscript { .. }, "subagent_transcript");
+            (Request::SendUserMessage { .. }, "send_user_message");
+            (Request::SteerDelegation { .. }, "steer_delegation");
+            (Request::BeginAttachmentUpload { .. }, "begin_attachment_upload");
+            (Request::UploadAttachmentChunk { .. }, "upload_attachment_chunk");
+            (Request::FinishAttachmentUpload { .. }, "finish_attachment_upload");
+            (Request::CancelAttachmentUpload { .. }, "cancel_attachment_upload");
+            (Request::RemoveQueuedUserMessage { .. }, "remove_queued_user_message");
+            (Request::RemoveNewestQueuedUserMessage { .. }, "remove_newest_queued_user_message");
+            (Request::RemoveEditableQueuedUserMessages { .. }, "remove_editable_queued_user_messages");
+            (Request::ResumePausedWork { .. }, "resume_paused_work");
+            (Request::CancelPausedWork { .. }, "cancel_paused_work");
+            (Request::RepairResume { .. }, "repair_resume");
+            (Request::GoalStatus { .. }, "goal_status");
+            (Request::SetGoalStatus { .. }, "set_goal_status");
+            (Request::ClearGoal { .. }, "clear_goal");
+            (Request::ListAssistants, "list_assistants");
+            (Request::CreateAssistantSession { .. }, "create_assistant_session");
+            (Request::AutoTitle { .. }, "auto_title");
+            (Request::ExportSessionData { .. }, "export_session_data");
+            (Request::Curator { .. }, "curator");
+            (Request::CancelTurn, "cancel_turn");
+            (Request::FsList { .. }, "fs_list");
+            (Request::FsStat { .. }, "fs_stat");
+            (Request::FsRead { .. }, "fs_read");
+            (Request::FsWrite { .. }, "fs_write");
+            (Request::FsCreateDir { .. }, "fs_create_dir");
+            (Request::FsRename { .. }, "fs_rename");
+            (Request::FsDelete { .. }, "fs_delete");
+            (Request::GitStatus { .. }, "git_status");
+            (Request::GitDiffFile { .. }, "git_diff_file");
+            (Request::OpenTerminal { .. }, "open_terminal");
+            (Request::AttachTerminal { .. }, "attach_terminal");
+            (Request::TerminalInput { .. }, "terminal_input");
+            (Request::TerminalResize { .. }, "terminal_resize");
+            (Request::CloseTerminal { .. }, "close_terminal");
+            (Request::LspControl { .. }, "lsp_control");
+            (Request::ResolveInterrupt { .. }, "resolve_interrupt");
+            (Request::ListSessions { .. }, "list_sessions");
+            (Request::ReadSessionMessages { .. }, "read_session_messages");
+            (Request::ReadHistoryPage { .. }, "read_history_page");
+            (Request::SessionLiveStatus { .. }, "session_live_status");
+            (Request::ArchiveSession { .. }, "archive_session");
+            (Request::UnarchiveSession { .. }, "unarchive_session");
+            (Request::ForkSession { .. }, "fork_session");
+            (Request::DiscardSession { .. }, "discard_session");
+            (Request::CreateBtwFork { .. }, "create_btw_fork");
+            (Request::EndBtwFork { .. }, "end_btw_fork");
+            (Request::RenameSession { .. }, "rename_session");
+            (Request::ShareSession { .. }, "share_session");
+            (Request::RecordSessionNote { .. }, "record_session_note");
+            (Request::DeleteSession { .. }, "delete_session");
+            (Request::ListSkills { .. }, "list_skills");
+            (Request::ResourceSnapshot, "resource_snapshot");
+            (Request::PromoteResource { .. }, "promote_resource");
+            (Request::CreateScheduledJob { .. }, "create_scheduled_job");
+            (Request::ListScheduledJobs { .. }, "list_scheduled_jobs");
+            (Request::DeleteScheduledJob { .. }, "delete_scheduled_job");
+            (Request::SetScheduledJobEnabled { .. }, "set_scheduled_job_enabled");
+            (Request::RunScheduledJob { .. }, "run_scheduled_job");
+            (Request::ListAgents, "list_agents");
+            (Request::ListModels { .. }, "list_models");
+            (Request::SetActiveModel { .. }, "set_active_model");
+            (Request::SetAgent { .. }, "set_agent");
+            (Request::SetLlmMode { .. }, "set_llm_mode");
+            (Request::SetSessionLlmMode { .. }, "set_session_llm_mode");
+            (Request::SetApprovalMode { .. }, "set_approval_mode");
+            (Request::SetDelegationRecursion { .. }, "set_delegation_recursion");
+            (Request::SetSandbox { .. }, "set_sandbox");
+            (Request::SetSandboxEscalation { .. }, "set_sandbox_escalation");
+            (Request::SetPreflight { .. }, "set_preflight");
+            (Request::SetTrustedOnly { .. }, "set_trusted_only");
+            (Request::SetRedaction { .. }, "set_redaction");
+            (Request::SetTandemModels { .. }, "set_tandem_models");
+            (Request::SetCaffeinate { .. }, "set_caffeinate");
+            (Request::CancelSchedule { .. }, "cancel_schedule");
+            (Request::Prune, "prune");
+            (Request::Compact, "compact");
+            (Request::Pin { .. }, "pin");
+            (Request::StoreFlycockpitCredential { .. }, "store_flycockpit_credential");
+            (Request::ClearFlycockpitCredential, "clear_flycockpit_credential");
+            (Request::DaemonStatus, "daemon_status");
+            (Request::RefreshEnv { .. }, "refresh_env");
+            (Request::RefreshConfig, "refresh_config");
+            (Request::RecordUsage { .. }, "record_usage");
+            (Request::GetUsageCounts { .. }, "get_usage_counts");
+            (Request::StatsRollup { .. }, "stats_rollup");
+            (Request::GuidanceEstimate { .. }, "guidance_estimate");
+            (Request::StopDaemon { .. }, "stop_daemon");
+            (Request::Unknown, "__unknown");
+        ] }
+    };
+}
+
+impl Request {
+    pub fn wire_tag(&self) -> &'static str {
+        macro_rules! wire_tag {
+            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
+                match self {
+                    $($pattern => $tag,)+
+                }
+            };
+        }
+        request_variants!(wire_tag)
+    }
+}
 
 // Keep daemon command metadata centralized. Callers provide a local callback
 // macro so each module can expand the same exhaustive Request table into the

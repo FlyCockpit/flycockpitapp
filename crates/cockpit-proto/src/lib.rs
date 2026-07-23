@@ -1585,12 +1585,14 @@ mod proto_fixture_tests {
 
     use super::*;
 
+    const UNKNOWN_SENTINEL: &str = "__unknown";
+
     #[test]
     fn proto_fixture_request_full_shapes_round_trip() {
         assert_enum_fixture::<Request>(
             "request",
             "request.json",
-            enum_variant_kinds(include_str!("request.rs"), "Request"),
+            fixture_expected_kinds(request_variant_tags()),
         );
     }
 
@@ -1599,7 +1601,7 @@ mod proto_fixture_tests {
         assert_enum_fixture::<Response>(
             "response",
             "response.json",
-            enum_variant_kinds(include_str!("response.rs"), "Response"),
+            fixture_expected_kinds(response_variant_tags()),
         );
     }
 
@@ -1608,19 +1610,53 @@ mod proto_fixture_tests {
         assert_enum_fixture::<Event>(
             "event",
             "event.json",
-            enum_variant_kinds(include_str!("event.rs"), "Event"),
+            fixture_expected_kinds(event_variant_tags()),
         );
+    }
+
+    #[test]
+    fn wire_tag_matches_serde_tag_for_every_request_fixture() {
+        assert_fixture_wire_tags::<Request>("request", "request.json", Request::wire_tag);
+    }
+
+    #[test]
+    fn wire_tag_matches_serde_tag_for_every_response_fixture() {
+        assert_fixture_wire_tags::<Response>("response", "response.json", Response::wire_tag);
+    }
+
+    #[test]
+    fn wire_tag_matches_serde_tag_for_every_event_fixture() {
+        assert_fixture_wire_tags::<Event>("event", "event.json", Event::wire_tag);
+    }
+
+    #[test]
+    fn wire_tag_unknown_sentinel_appears_once_per_enum_and_is_never_a_fixture_key() {
+        for (name, file_name, tags) in [
+            ("request", "request.json", request_variant_tags()),
+            ("response", "response.json", response_variant_tags()),
+            ("event", "event.json", event_variant_tags()),
+        ] {
+            assert_eq!(
+                tags.iter().filter(|tag| **tag == UNKNOWN_SENTINEL).count(),
+                1,
+                "{name} table must contain exactly one unknown sentinel"
+            );
+            let fixture_keys = read_fixture(file_name)
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            assert!(
+                !fixture_keys.contains(UNKNOWN_SENTINEL),
+                "{name} fixture must not include the unknown sentinel"
+            );
+        }
     }
 
     fn assert_enum_fixture<T>(tag: &str, file_name: &str, expected_kinds: Vec<String>)
     where
         T: DeserializeOwned + Serialize,
     {
-        let path = fixture_root().join(file_name);
-        let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        let fixtures: Map<String, Value> = serde_json::from_str(&raw)
-            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        let fixtures = read_fixture(file_name);
         let expected = expected_kinds.into_iter().collect::<BTreeSet<_>>();
         let actual = fixtures.keys().cloned().collect::<BTreeSet<_>>();
         assert_eq!(
@@ -1646,60 +1682,81 @@ mod proto_fixture_tests {
         }
     }
 
+    fn assert_fixture_wire_tags<T>(
+        tag: &str,
+        file_name: &str,
+        wire_tag: impl Fn(&T) -> &'static str,
+    ) where
+        T: DeserializeOwned,
+    {
+        for (kind, value) in read_fixture(file_name) {
+            assert_eq!(
+                value.get(tag).and_then(Value::as_str),
+                Some(kind.as_str()),
+                "{file_name}:{kind} must carry its serde tag"
+            );
+            let parsed: T = serde_json::from_value(value)
+                .unwrap_or_else(|error| panic!("deserialize {file_name}:{kind}: {error}"));
+            assert_eq!(
+                wire_tag(&parsed),
+                kind,
+                "{file_name}:{kind} table wire tag must match serde tag"
+            );
+        }
+    }
+
+    fn read_fixture(file_name: &str) -> Map<String, Value> {
+        let path = fixture_root().join(file_name);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+    }
+
+    fn fixture_expected_kinds(tags: Vec<&'static str>) -> Vec<String> {
+        assert_eq!(
+            tags.iter().filter(|tag| **tag == UNKNOWN_SENTINEL).count(),
+            1,
+            "variant table must contain exactly one unknown sentinel"
+        );
+        tags.into_iter()
+            .filter(|tag| *tag != UNKNOWN_SENTINEL)
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn request_variant_tags() -> Vec<&'static str> {
+        macro_rules! collect_tags {
+            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
+                vec![$($tag),+]
+            };
+        }
+        crate::request_variants!(collect_tags)
+    }
+
+    fn response_variant_tags() -> Vec<&'static str> {
+        macro_rules! collect_tags {
+            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
+                vec![$($tag),+]
+            };
+        }
+        crate::response_variants!(collect_tags)
+    }
+
+    fn event_variant_tags() -> Vec<&'static str> {
+        macro_rules! collect_tags {
+            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
+                vec![$($tag),+]
+            };
+        }
+        crate::event_variants!(collect_tags)
+    }
+
     fn fixture_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
             .join("daemon_proto")
-    }
-
-    fn enum_variant_kinds(source: &str, enum_name: &str) -> Vec<String> {
-        let mut in_enum = false;
-        let mut brace_depth = 0usize;
-        let mut out = Vec::new();
-        for line in source.lines() {
-            let trimmed = line.trim();
-            if !in_enum {
-                if trimmed == format!("pub enum {enum_name} {{") {
-                    in_enum = true;
-                    brace_depth = 1;
-                }
-                continue;
-            }
-
-            if brace_depth == 1
-                && let Some(first) = trimmed.chars().next()
-                && first.is_ascii_uppercase()
-            {
-                let name = trimmed.split([' ', '{', ',']).next().expect("variant name");
-                if name == "Unknown" {
-                    continue;
-                }
-                out.push(to_snake_case(name));
-            }
-
-            brace_depth += line.chars().filter(|ch| *ch == '{').count();
-            brace_depth = brace_depth.saturating_sub(line.chars().filter(|ch| *ch == '}').count());
-            if brace_depth == 0 {
-                break;
-            }
-        }
-        out
-    }
-
-    fn to_snake_case(name: &str) -> String {
-        let mut out = String::new();
-        for (index, ch) in name.chars().enumerate() {
-            if ch.is_ascii_uppercase() {
-                if index > 0 {
-                    out.push('_');
-                }
-                out.push(ch.to_ascii_lowercase());
-            } else {
-                out.push(ch);
-            }
-        }
-        out
     }
 
     fn canonical(value: Value) -> Value {

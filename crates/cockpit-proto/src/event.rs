@@ -980,6 +980,96 @@ pub enum Event {
     #[serde(other)]
     Unknown,
 }
+#[macro_export]
+macro_rules! event_variants {
+    ($with_variants:ident $(, $context:ident)*) => {
+        $with_variants! { ($($context),*) [
+            (Event::EnvDriftWarning { .. }, "env_drift_warning");
+            (Event::ConfigSnapshot { .. }, "config_snapshot");
+            (Event::QueueUpdated { .. }, "queue_updated");
+            (Event::ForegroundInputTarget { .. }, "foreground_input_target");
+            (Event::ActiveModelState { .. }, "active_model_state");
+            (Event::ThinkingStarted { .. }, "thinking_started");
+            (Event::Reconnecting { .. }, "reconnecting");
+            (Event::InferenceWarning { .. }, "inference_warning");
+            (Event::AssistantTextDelta { .. }, "assistant_text_delta");
+            (Event::ReasoningDelta { .. }, "reasoning_delta");
+            (Event::AssistantText { .. }, "assistant_text");
+            (Event::UserMessageRecorded { .. }, "user_message_recorded");
+            (Event::QueuedUserMessagesFolded { .. }, "queued_user_messages_folded");
+            (Event::SessionPersistFailed { .. }, "session_persist_failed");
+            (Event::SessionDriverFailed { .. }, "session_driver_failed");
+            (Event::PreflightStarted { .. }, "preflight_started");
+            (Event::UserMessageRetracted { .. }, "user_message_retracted");
+            (Event::Notice { .. }, "notice");
+            (Event::LspNotice { .. }, "lsp_notice");
+            (Event::SkillAutoInjected { .. }, "skill_auto_injected");
+            (Event::ToolStart { .. }, "tool_start");
+            (Event::ToolEnd { .. }, "tool_end");
+            (Event::ResourceWait { .. }, "resource_wait");
+            (Event::ResourceStart { .. }, "resource_start");
+            (Event::ResourceClear { .. }, "resource_clear");
+            (Event::ToolError { .. }, "tool_error");
+            (Event::InferenceFailed { .. }, "inference_failed");
+            (Event::InferenceSucceeded { .. }, "inference_succeeded");
+            (Event::BackupUsed { .. }, "backup_used");
+            (Event::SubagentSpawned { .. }, "subagent_spawned");
+            (Event::SubagentRouting { .. }, "subagent_routing");
+            (Event::SubagentReport { .. }, "subagent_report");
+            (Event::NestedTurn { .. }, "nested_turn");
+            (Event::Usage { .. }, "usage");
+            (Event::InterruptRaised { .. }, "interrupt_raised");
+            (Event::InterruptQueueChanged { .. }, "interrupt_queue_changed");
+            (Event::InterruptResolved { .. }, "interrupt_resolved");
+            (Event::HistoryReplay { .. }, "history_replay");
+            (Event::AgentIdle { .. }, "agent_idle");
+            (Event::PrimarySwapped { .. }, "primary_swapped");
+            (Event::LlmModeChanged { .. }, "llm_mode_changed");
+            (Event::SessionEnded { .. }, "session_ended");
+            (Event::ScheduleStarted { .. }, "schedule_started");
+            (Event::ScheduleProgress { .. }, "schedule_progress");
+            (Event::ScheduleNote { .. }, "schedule_note");
+            (Event::ScheduleCompleted { .. }, "schedule_completed");
+            (Event::ContextProjection { .. }, "context_projection");
+            (Event::Pruned { .. }, "pruned");
+            (Event::CompactReady { .. }, "compact_ready");
+            (Event::SandboxState { .. }, "sandbox_state");
+            (Event::SandboxEscalationState { .. }, "sandbox_escalation_state");
+            (Event::SandboxUnavailable { .. }, "sandbox_unavailable");
+            (Event::CommandCapabilityUnavailable { .. }, "command_capability_unavailable");
+            (Event::RedactionState { .. }, "redaction_state");
+            (Event::PreflightState { .. }, "preflight_state");
+            (Event::TrustedOnlyState { .. }, "trusted_only_state");
+            (Event::ApprovalModeState { .. }, "approval_mode_state");
+            (Event::DelegationRecursionState { .. }, "delegation_recursion_state");
+            (Event::TandemState { .. }, "tandem_state");
+            (Event::GitignoreAllow { .. }, "gitignore_allow");
+            (Event::CaffeinateState { .. }, "caffeinate_state");
+            (Event::ConnectorStatus { .. }, "connector_status");
+            (Event::TerminalOutput { .. }, "terminal_output");
+            (Event::TerminalClipboard { .. }, "terminal_clipboard");
+            (Event::TerminalViewers { .. }, "terminal_viewers");
+            (Event::TerminalClosed { .. }, "terminal_closed");
+            (Event::DaemonDraining { .. }, "daemon_draining");
+            (Event::PausedWorkAvailable { .. }, "paused_work_available");
+            (Event::WaitingForLock { .. }, "waiting_for_lock");
+            (Event::Unknown, "__unknown");
+        ] }
+    };
+}
+
+impl Event {
+    pub fn wire_tag(&self) -> &'static str {
+        macro_rules! wire_tag {
+            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
+                match self {
+                    $($pattern => $tag,)+
+                }
+            };
+        }
+        event_variants!(wire_tag)
+    }
+}
 
 fn default_idle_reason() -> IdleReason {
     IdleReason::Completed

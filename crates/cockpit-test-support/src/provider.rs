@@ -308,7 +308,7 @@ async fn handle_connection(
             &mut stream,
             status,
             "application/json",
-            &format!("{{\"error\":\"path status override {status}\"}}"),
+            &format!("{{\"error\":\"no route for {}\"}}", parsed.path),
         )
         .await;
         return;

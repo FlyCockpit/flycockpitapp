@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::providers::{ModelEntry, ProviderEntry, TimeoutConfig, WireApi};
+use cockpit_test_support::provider::{CapturedRequest, ScriptedProvider, Turn, Usage, WireDialect};
 use futures::{FutureExt, StreamExt};
 
 #[tokio::test]
@@ -2420,8 +2421,6 @@ fn built_model_exposes_configured_provider_id() {
 // placeholder, never verbatim.
 
 use std::sync::Arc as TestArc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
 /// A known env-var-style secret + its placeholder for the chokepoint
 /// tests. Long enough to clear the prune floor.
@@ -2715,303 +2714,192 @@ fn native_anthropic_reasoning_text_is_redacted_but_signature_is_preserved() {
     assert!(wire.contains("sig-secret-safe"), "{wire}");
 }
 
-/// Read a full HTTP/1.1 request (headers + Content-Length body) from
-/// `stream`, returning the body bytes as a string.
-async fn read_http_body(stream: &mut tokio::net::TcpStream) -> String {
-    read_http_request(stream).await.1
+fn request_body_string(request: &CapturedRequest) -> String {
+    request.body.to_string()
 }
 
-async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (String, String) {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    loop {
-        let n = match stream.read(&mut tmp).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        buf.extend_from_slice(&tmp[..n]);
-        let s = String::from_utf8_lossy(&buf);
-        if let Some(idx) = s.find("\r\n\r\n") {
-            let header = &s[..idx];
-            let body_start = idx + 4;
-            let content_len = header
-                .lines()
-                .find_map(|l| {
-                    let l = l.to_ascii_lowercase();
-                    l.strip_prefix("content-length:")
-                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                })
-                .unwrap_or(0);
-            if buf.len() >= body_start + content_len {
-                return (
-                    header.to_string(),
-                    String::from_utf8_lossy(&buf[body_start..body_start + content_len]).to_string(),
-                );
-            }
-        }
-    }
-    (String::from_utf8_lossy(&buf).to_string(), String::new())
+fn request_header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
-fn request_header_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
-    let needle = format!("{}:", name.to_ascii_lowercase());
-    header.lines().find_map(|line| {
-        let lower = line.to_ascii_lowercase();
-        lower
-            .starts_with(&needle)
-            .then(|| line.split_once(':').map(|(_, value)| value.trim()))?
+fn chat_text_json(text: &str) -> serde_json::Value {
+    json!({
+        "id": "c",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "m",
+        "system_fingerprint": null,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": text },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
     })
 }
 
-/// A local server that captures the **first** request body and replies
-/// with a minimal non-streaming chat-completions JSON (for the
-/// `text_completion` / `text_completion_with_system` / `tool_completion`
-/// paths, which POST and parse a single JSON response). Returns the bound
-/// `base_url` + a oneshot receiver for the captured request body.
-async fn json_capture_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let body = read_http_body(&mut stream).await;
-            let _ = tx.send(body);
-            let payload = "{\"id\":\"c\",\"object\":\"chat.completion\",\"model\":\"m\",\
-                    \"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\
-                    \"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}";
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-            let _ = stream.flush().await;
-        }
-    });
-    (format!("http://{addr}/v1"), rx)
+fn chat_tool_json() -> serde_json::Value {
+    json!({
+        "id": "c",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "m",
+        "system_fingerprint": null,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "lookup", "arguments": "{}" }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+    })
 }
 
-async fn utility_json_capture_server(
-    max_requests: usize,
-) -> (
-    String,
-    tokio::sync::mpsc::Receiver<(String, serde_json::Value)>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::mpsc::channel::<(String, serde_json::Value)>(max_requests.max(1));
-    tokio::spawn(async move {
-        for _ in 0..max_requests {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                break;
-            };
-            let (header, body) = read_http_request(&mut stream).await;
-            let request_line = header.lines().next().unwrap_or("").to_string();
-            let body_json = serde_json::from_str::<serde_json::Value>(&body)
-                .unwrap_or(serde_json::Value::String(body));
-            let _ = tx.send((request_line.clone(), body_json.clone())).await;
-            let is_tool_request = body_json
-                .get("tools")
-                .and_then(|tools| tools.as_array())
-                .is_some_and(|tools| !tools.is_empty());
-            let payload = if request_line.contains("/responses") {
-                if is_tool_request {
-                    r#"{"id":"resp_1","object":"response","created_at":1,"status":"completed","error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{}","status":"completed"}],"tools":[]}"#
-                } else {
-                    r#"{"id":"resp_1","object":"response","created_at":1,"status":"completed","error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"output":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","annotations":[],"text":"ok"}]}],"tools":[]}"#
-                }
-            } else if is_tool_request {
-                r#"{"id":"c","object":"chat.completion","created":0,"model":"m","system_fingerprint":null,"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
-            } else {
-                r#"{"id":"c","object":"chat.completion","created":0,"model":"m","system_fingerprint":null,"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
-            };
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-            let _ = stream.flush().await;
-        }
-    });
-    (format!("http://{addr}/v1"), rx)
+fn responses_text_json(text: &str) -> serde_json::Value {
+    json!({
+        "id": "resp_1",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": "m",
+        "usage": {
+            "input_tokens": 1,
+            "input_tokens_details": { "cached_tokens": 0 },
+            "output_tokens": 1,
+            "output_tokens_details": { "reasoning_tokens": 0 },
+            "total_tokens": 2
+        },
+        "output": [{
+            "type": "message",
+            "id": "msg_1",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "annotations": [], "text": text }]
+        }],
+        "tools": []
+    })
 }
 
-async fn hanging_utility_server() -> (String, tokio::sync::mpsc::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::mpsc::channel::<String>(1);
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let (header, _body) = read_http_request(&mut stream).await;
-            let request_line = header.lines().next().unwrap_or("").to_string();
-            let _ = tx.send(request_line).await;
-            std::future::pending::<()>().await;
-        }
-    });
-    (format!("http://{addr}/v1"), rx)
+fn responses_tool_json() -> serde_json::Value {
+    json!({
+        "id": "resp_1",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": "m",
+        "usage": {
+            "input_tokens": 1,
+            "input_tokens_details": { "cached_tokens": 0 },
+            "output_tokens": 1,
+            "output_tokens_details": { "reasoning_tokens": 0 },
+            "total_tokens": 2
+        },
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "lookup",
+            "arguments": "{}",
+            "status": "completed"
+        }],
+        "tools": []
+    })
 }
 
-async fn header_capture_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let (header, _body) = read_http_request(&mut stream).await;
-            let _ = tx.send(header);
-            let payload = "{\"id\":\"c\",\"object\":\"chat.completion\",\"model\":\"m\",\
-                    \"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\
-                    \"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}";
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-            let _ = stream.flush().await;
-        }
-    });
-    (format!("http://{addr}/v1"), rx)
+fn raw_json_turn_for_wire(wire_api: WireApi, tool_request: bool) -> Turn {
+    let body = match (wire_api, tool_request) {
+        (WireApi::Responses, false) => responses_text_json("ok"),
+        (WireApi::Responses, true) => responses_tool_json(),
+        (_, false) => chat_text_json("ok"),
+        (_, true) => chat_tool_json(),
+    };
+    Turn::RawJson(body)
 }
 
-/// A local server that captures the first request body and replies with a
-/// minimal valid SSE chat-completions stream (for the streaming
-/// `complete_captured` path). Returns the bound `base_url` + a receiver
-/// for the captured request body.
-async fn sse_capture_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let body = read_http_body(&mut stream).await;
-            let _ = tx.send(body);
-            let payload = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}],\"usage\":null}\n\n\
-                    data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"total_tokens\":2}}\n\n\
-                    data: [DONE]\n\n";
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-            let _ = stream.flush().await;
-        }
-    });
-    (format!("http://{addr}/v1"), rx)
+async fn provider_with_turns(turns: impl IntoIterator<Item = Turn>) -> ScriptedProvider {
+    let mut builder = ScriptedProvider::builder();
+    for turn in turns {
+        builder = builder.turn(turn);
+    }
+    builder.start().await
 }
 
-async fn http_error_server(status: u16, reason: &'static str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let _ = read_http_body(&mut stream).await;
-            let payload = format!("{{\"error\":{{\"message\":\"{reason}\"}}}}");
-            let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-                payload.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.flush().await;
+async fn wait_for_captured_request(provider: &ScriptedProvider) -> CapturedRequest {
+    for _ in 0..100 {
+        if let Some(request) = provider.captured().into_iter().next() {
+            return request;
         }
-    });
-    format!("http://{addr}/v1")
+        tokio::task::yield_now().await;
+    }
+    panic!("scripted provider did not capture a request");
 }
 
-/// Capture rig's fully serialized native-Anthropic streaming body. A 400
-/// response is sufficient: these tests assert the outbound seam, and the
-/// non-retryable response keeps the harness minimal and deterministic.
-async fn anthropic_capture_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let body = read_http_body(&mut stream).await;
-            let _ = tx.send(body);
-            let payload = r#"{"type":"error","error":{"type":"invalid_request_error","message":"capture complete"}}"#;
-            let resp = format!(
-                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-            let _ = stream.flush().await;
-        }
-    });
-    (format!("http://{addr}/v1"), rx)
+async fn json_capture_provider() -> ScriptedProvider {
+    provider_with_turns([Turn::RawJson(chat_text_json("ok"))]).await
 }
 
-async fn anthropic_header_capture_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let (header, _body) = read_http_request(&mut stream).await;
-            let _ = tx.send(header);
-            let payload = r#"{"type":"error","error":{"type":"invalid_request_error","message":"capture complete"}}"#;
-            let resp = format!(
-                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-            let _ = stream.flush().await;
-        }
-    });
-    (format!("http://{addr}/v1"), rx)
+async fn sse_capture_provider() -> ScriptedProvider {
+    ScriptedProvider::builder()
+        .turn(Turn::Text("ok".into()))
+        .start()
+        .await
 }
 
-/// A local server that captures the request line, headers, and body for
-/// native ChatGPT/Codex Responses calls, then returns a minimal valid
-/// Responses API SSE stream. The bound URL intentionally includes the
-/// Codex path prefix so rig's `/responses` append produces
-/// `/backend-api/codex/responses`.
-async fn chatgpt_responses_capture_server()
--> (String, tokio::sync::oneshot::Receiver<(String, String)>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel::<(String, String)>();
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let (header, body) = read_http_request(&mut stream).await;
-            let _ = tx.send((header, body));
-            let payload = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
-                    data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":1,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":2},\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"ok\"}]}],\"tools\":[]}}\n\n";
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-            let _ = stream.flush().await;
-        }
-    });
-    (format!("http://{addr}/backend-api/codex"), rx)
+async fn http_error_provider(status: u16, reason: &'static str) -> ScriptedProvider {
+    ScriptedProvider::builder()
+        .turn(Turn::HttpError {
+            status,
+            body: format!(r#"{{"error":{{"message":"{reason}"}}}}"#),
+        })
+        .start()
+        .await
 }
 
-async fn sse_usage_alias_server() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let _body = read_http_body(&mut stream).await;
-            let payload = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}],\"usage\":null}\n\n\
-                    data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}\n\n\
-                    data: [DONE]\n\n";
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-            let _ = stream.flush().await;
-        }
-    });
-    format!("http://{addr}/v1")
+async fn anthropic_capture_provider() -> ScriptedProvider {
+    ScriptedProvider::builder()
+        .dialect(WireDialect::Anthropic)
+        .turn(Turn::HttpError {
+            status: 400,
+            body: r#"{"type":"error","error":{"type":"invalid_request_error","message":"capture complete"}}"#.into(),
+        })
+        .start()
+        .await
+}
+
+async fn responses_404_then_chat_ok_provider(max_requests: usize) -> ScriptedProvider {
+    ScriptedProvider::builder()
+        .path_status_for("/v1/responses", 404, max_requests)
+        .turn(Turn::Text("ok".into()))
+        .repeat_last()
+        .start()
+        .await
+}
+
+async fn chat_404_then_responses_ok_provider(max_requests: usize) -> ScriptedProvider {
+    ScriptedProvider::builder()
+        .path_status_for("/v1/chat/completions", 404, max_requests)
+        .turn(Turn::Text("ok".into()))
+        .repeat_last()
+        .start()
+        .await
 }
 
 fn simple_tool() -> ToolDefinition {
@@ -3041,10 +2929,10 @@ async fn capture_anthropic_body(
     resolved_max_tokens: u64,
     params: ModelParams,
 ) -> serde_json::Value {
-    let (url, rx) = anthropic_capture_server().await;
+    let mut provider = anthropic_capture_provider().await;
     let model = native_anthropic_model_at(
         TestArc::new(RedactionTable::empty()),
-        url,
+        provider.base_url(),
         resolved_max_tokens,
     );
     let prepared = model
@@ -3067,7 +2955,7 @@ async fn capture_anthropic_body(
         )
         .await;
     assert!(result.is_err(), "capture server deliberately returns 400");
-    serde_json::from_str(&rx.await.expect("captured Anthropic body")).unwrap()
+    provider.next_request().await.body
 }
 
 fn resolve_native_reasoning_params(
@@ -3134,7 +3022,8 @@ async fn capture_openai_body(
         ReasoningEffortRequestMapping, WireApi,
     };
 
-    let (url, rx) = sse_capture_server().await;
+    let mut provider = sse_capture_provider().await;
+    let url = provider.base_url();
     let resolved = resolved_local_request(url);
     let model = build_openai_model_from_resolved(
         "openai-compatible",
@@ -3215,7 +3104,7 @@ async fn capture_openai_body(
         )
         .await
         .unwrap();
-    serde_json::from_str(&rx.await.expect("captured OpenAI body")).unwrap()
+    provider.next_request().await.body
 }
 
 #[tokio::test]
@@ -3358,7 +3247,8 @@ async fn deepseek_params_unchanged() {
 async fn terminal_failure_preserves_configured_provider_identity() {
     use crate::config::providers::WireApi;
 
-    let url = http_error_server(401, "Unauthorized").await;
+    let provider = http_error_provider(401, "Unauthorized").await;
+    let url = provider.base_url();
     let resolved = resolved_local_request(url);
     let model = build_openai_model_from_resolved(
         "lmstudio",
@@ -3408,7 +3298,8 @@ async fn terminal_failure_preserves_configured_provider_identity() {
 #[tokio::test]
 async fn grok_multi_agent_tools_without_entitlement_blocks_before_network() {
     use crate::config::providers::WireApi;
-    let (url, rx) = sse_capture_server().await;
+    let provider = sse_capture_provider().await;
+    let url = provider.base_url();
     let resolved = resolved_local_request(url);
     let model = build_openai_model_from_resolved(
         "grok-oauth",
@@ -3451,9 +3342,7 @@ async fn grok_multi_agent_tools_without_entitlement_blocks_before_network() {
     assert!(failure.detail.contains("blocked before network dispatch"));
     assert!(failure_engages_backup(&failure.class));
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(100), rx)
-            .await
-            .is_err(),
+        provider.captured().is_empty(),
         "local server received a request despite pre-dispatch block"
     );
 }
@@ -3461,7 +3350,8 @@ async fn grok_multi_agent_tools_without_entitlement_blocks_before_network() {
 #[tokio::test]
 async fn grok_multi_agent_tools_with_entitlement_allows_dispatch() {
     use crate::config::providers::WireApi;
-    let (url, rx) = sse_capture_server().await;
+    let mut provider = sse_capture_provider().await;
+    let url = provider.base_url();
     let resolved = resolved_local_request(url);
     let model = build_openai_model_from_resolved(
         "grok-oauth",
@@ -3497,14 +3387,15 @@ async fn grok_multi_agent_tools_with_entitlement_allows_dispatch() {
         )
         .await;
     assert!(result.is_ok(), "{result:#?}");
-    let body = rx.await.unwrap();
+    let body = request_body_string(&provider.next_request().await);
     assert!(body.contains("lookup"), "tool was not dispatched: {body}");
 }
 
 #[tokio::test]
 async fn grok_non_multi_agent_tools_are_not_rejected_by_multi_agent_gate() {
     use crate::config::providers::WireApi;
-    let (url, rx) = sse_capture_server().await;
+    let mut provider = sse_capture_provider().await;
+    let url = provider.base_url();
     let resolved = resolved_local_request(url);
     let model = build_openai_model_from_resolved(
         "grok-oauth",
@@ -3540,7 +3431,7 @@ async fn grok_non_multi_agent_tools_are_not_rejected_by_multi_agent_gate() {
         )
         .await;
     assert!(result.is_ok(), "{result:#?}");
-    assert!(rx.await.unwrap().contains("grok-4.3"));
+    assert!(request_body_string(&provider.next_request().await).contains("grok-4.3"));
 }
 
 /// Build an OpenAI-compat `Model` pointed at `base_url` carrying `redact`.
@@ -3635,91 +3526,11 @@ fn outbound_guard_shared_by_dispatch_and_embedder() {
     );
 }
 
-async fn responses_404_then_chat_ok_server(
-    max_requests: usize,
-) -> (String, tokio::sync::mpsc::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::mpsc::channel::<String>(max_requests.max(1));
-    tokio::spawn(async move {
-        for _ in 0..max_requests {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                break;
-            };
-            let (header, _body) = read_http_request(&mut stream).await;
-            let request_line = header.lines().next().unwrap_or("").to_string();
-            let _ = tx.send(request_line.clone()).await;
-            if request_line.contains("/responses") {
-                let payload = "{\"error\":\"no route for /v1/responses\"}";
-                let resp = format!(
-                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    payload.len(),
-                    payload
-                );
-                let _ = stream.write_all(resp.as_bytes()).await;
-            } else {
-                let payload = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}],\"usage\":null}\n\n\
-                        data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"total_tokens\":2}}\n\n\
-                        data: [DONE]\n\n";
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    payload.len(),
-                    payload
-                );
-                let _ = stream.write_all(resp.as_bytes()).await;
-            }
-            let _ = stream.flush().await;
-        }
-    });
-    (format!("http://{addr}/v1"), rx)
-}
-
-async fn chat_404_then_responses_ok_server_with_limit(
-    max_requests: usize,
-) -> (String, tokio::sync::mpsc::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::mpsc::channel::<String>(max_requests.max(1));
-    tokio::spawn(async move {
-        for _ in 0..max_requests {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                break;
-            };
-            let (header, _body) = read_http_request(&mut stream).await;
-            let request_line = header.lines().next().unwrap_or("").to_string();
-            let _ = tx.send(request_line.clone()).await;
-            if request_line.contains("/chat/completions") {
-                let payload = "{\"error\":\"no route for /v1/chat/completions\"}";
-                let resp = format!(
-                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    payload.len(),
-                    payload
-                );
-                let _ = stream.write_all(resp.as_bytes()).await;
-            } else {
-                let payload = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
-                        data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"m\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":1,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":2},\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"ok\"}]}],\"tools\":[]}}\n\n";
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    payload.len(),
-                    payload
-                );
-                let _ = stream.write_all(resp.as_bytes()).await;
-            }
-            let _ = stream.flush().await;
-        }
-    });
-    (format!("http://{addr}/v1"), rx)
-}
-
-async fn chat_404_then_responses_ok_server() -> (String, tokio::sync::mpsc::Receiver<String>) {
-    chat_404_then_responses_ok_server_with_limit(2).await
-}
-
 #[tokio::test]
 async fn approved_responses_404_retries_chat_and_persists_completions() {
     use crate::config::providers::WireApi;
-    let (url, mut requests) = responses_404_then_chat_ok_server(2).await;
+    let mut provider = responses_404_then_chat_ok_provider(2).await;
+    let url = provider.base_url();
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
@@ -3786,8 +3597,20 @@ async fn approved_responses_404_retries_chat_and_persists_completions() {
         )
         .await
         .expect("approved endpoint swap succeeds");
-    assert!(requests.recv().await.unwrap().contains("/responses"));
-    assert!(requests.recv().await.unwrap().contains("/chat/completions"));
+    assert!(
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/responses")
+    );
+    assert!(
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/chat/completions")
+    );
     assert_eq!(
         captured["tools"][0]["parameters"]["properties"]["optional"]["type"], "string",
         "capture must match the successful chat-completions retry"
@@ -3804,7 +3627,8 @@ async fn approved_responses_404_retries_chat_and_persists_completions() {
 async fn approved_chat_404_retries_responses_and_captures_final_wire() {
     use crate::config::providers::WireApi;
 
-    let (url, mut requests) = chat_404_then_responses_ok_server().await;
+    let mut provider = chat_404_then_responses_ok_provider(2).await;
+    let url = provider.base_url();
     let resolved = resolved_local_request(url);
     let model = build_openai_model_from_resolved(
         "p",
@@ -3851,8 +3675,20 @@ async fn approved_chat_404_retries_responses_and_captures_final_wire() {
         .await
         .expect("approved endpoint swap succeeds");
 
-    assert!(requests.recv().await.unwrap().contains("/chat/completions"));
-    assert!(requests.recv().await.unwrap().contains("/responses"));
+    assert!(
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/chat/completions")
+    );
+    assert!(
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/responses")
+    );
     assert_eq!(
         captured["tools"][0]["parameters"]["properties"]["optional"]["type"],
         serde_json::json!(["string", "null"]),
@@ -4005,7 +3841,8 @@ async fn confirmed_swap_suppresses_prompt_on_later_turns() {
     use crate::config::providers::WireApi;
     let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
-    let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(3).await;
+    let mut provider = chat_404_then_responses_ok_provider(3).await;
+    let url = provider.base_url();
     let resolved = resolved_local_request(url.clone());
     let model = build_openai_model_from_resolved(
         "p",
@@ -4052,13 +3889,28 @@ async fn confirmed_swap_suppresses_prompt_on_later_turns() {
             .await
             .expect("endpoint recovery should succeed");
     }
-    assert!(requests.recv().await.unwrap().contains("/chat/completions"));
-    assert!(requests.recv().await.unwrap().contains("/responses"));
-    assert!(requests.recv().await.unwrap().contains("/responses"));
     assert!(
-        requests.try_recv().is_err(),
-        "second turn must not hit stale chat endpoint"
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/chat/completions")
     );
+    assert!(
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/responses")
+    );
+    assert!(
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/responses")
+    );
+    assert_eq!(provider.request_count(), 3);
     assert_eq!(
         approvals.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -4075,7 +3927,8 @@ async fn confirmed_endpoint_survives_probe_cache_expiry() {
     use crate::config::providers::WireApi;
     let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
-    let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(3).await;
+    let mut provider = chat_404_then_responses_ok_provider(3).await;
+    let url = provider.base_url();
     let resolved = resolved_local_request(url.clone());
     let model = build_openai_model_from_resolved(
         "p",
@@ -4129,9 +3982,27 @@ async fn confirmed_endpoint_survives_probe_cache_expiry() {
         )
         .await
         .expect("session-confirmed endpoint survives stale probe cache");
-    assert!(requests.recv().await.unwrap().contains("/chat/completions"));
-    assert!(requests.recv().await.unwrap().contains("/responses"));
-    assert!(requests.recv().await.unwrap().contains("/responses"));
+    assert!(
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/chat/completions")
+    );
+    assert!(
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/responses")
+    );
+    assert!(
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/responses")
+    );
 }
 
 #[tokio::test]
@@ -4139,7 +4010,8 @@ async fn works_recorded_per_documented_contract() {
     use crate::config::providers::WireApi;
     let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
-    let (url, _rx) = sse_capture_server().await;
+    let provider = sse_capture_provider().await;
+    let url = provider.base_url();
     let model = build_openai_model_from_resolved(
         "p",
         &resolved_local_request(url.clone()),
@@ -4180,7 +4052,8 @@ async fn works_recorded_per_documented_contract() {
     );
 
     endpoint_probes().lock().unwrap().clear();
-    let (url, _requests) = chat_404_then_responses_ok_server_with_limit(2).await;
+    let provider = chat_404_then_responses_ok_provider(2).await;
+    let url = provider.base_url();
     let model = build_openai_model_from_resolved(
         "p",
         &resolved_local_request(url.clone()),
@@ -4228,7 +4101,8 @@ async fn explicit_wire_api_pin_wins_over_learned() {
     use crate::config::providers::WireApi;
     let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
-    let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(1).await;
+    let mut provider = chat_404_then_responses_ok_provider(1).await;
+    let url = provider.base_url();
     record_endpoint_observation(
         "p",
         "m",
@@ -4287,7 +4161,13 @@ async fn explicit_wire_api_pin_wins_over_learned() {
         result.is_err(),
         "explicit chat pin must not silently use learned responses"
     );
-    assert!(requests.recv().await.unwrap().contains("/chat/completions"));
+    assert!(
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/chat/completions")
+    );
     assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
@@ -4343,7 +4223,8 @@ async fn declined_swap_does_not_confirm_or_pin() {
     use crate::config::providers::WireApi;
     let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
-    let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(1).await;
+    let mut provider = chat_404_then_responses_ok_provider(1).await;
+    let url = provider.base_url();
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
@@ -4395,7 +4276,13 @@ async fn declined_swap_does_not_confirm_or_pin() {
         result.is_err(),
         "declined swap should surface the original mismatch"
     );
-    assert!(requests.recv().await.unwrap().contains("/chat/completions"));
+    assert!(
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/chat/completions")
+    );
     assert_eq!(model.confirmed_wire_api_for_base_url(&url), None);
     let doc = crate::config::providers::ConfigDoc::load(&path).unwrap();
     assert_eq!(doc.providers().resolve_wire_api("p", "m"), WireApi::Auto);
@@ -4406,7 +4293,8 @@ async fn utility_model_resolves_without_recovery_context() {
     use crate::config::providers::WireApi;
     let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
-    let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(1).await;
+    let mut provider = chat_404_then_responses_ok_provider(1).await;
+    let url = provider.base_url();
     record_endpoint_observation(
         "p",
         "m",
@@ -4416,7 +4304,7 @@ async fn utility_model_resolves_without_recovery_context() {
     );
     let model = build_openai_model_from_resolved(
         "p",
-        &resolved_local_request(url),
+        &resolved_local_request(url.clone()),
         "m",
         &crate::config::providers::TimeoutConfig::default(),
         false,
@@ -4447,14 +4335,27 @@ async fn utility_model_resolves_without_recovery_context() {
         )
         .await
         .expect("utility/headless model should resolve learned endpoint without prompting");
-    assert!(requests.recv().await.unwrap().contains("/responses"));
+    assert!(
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/responses")
+    );
 }
 
 #[tokio::test]
 async fn utility_and_streaming_share_endpoint_resolution() {
+    use crate::config::providers::WireApi;
     let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
-    let (url, mut requests) = utility_json_capture_server(3).await;
+    let mut provider = provider_with_turns([
+        raw_json_turn_for_wire(WireApi::Responses, false),
+        raw_json_turn_for_wire(WireApi::Responses, false),
+        raw_json_turn_for_wire(WireApi::Responses, true),
+    ])
+    .await;
+    let url = provider.base_url();
     record_endpoint_observation(
         "p",
         "m",
@@ -4496,7 +4397,7 @@ async fn utility_and_streaming_share_endpoint_resolution() {
         .unwrap();
     model.tool_completion("system", "hi", &tool).await.unwrap();
     for call in ["text", "text_with_system", "tool"] {
-        let (request_line, _body) = requests.recv().await.unwrap();
+        let request_line = provider.next_request().await.request_line;
         assert!(
             request_line.contains("/responses"),
             "{call} utility call used wrong endpoint: {request_line}"
@@ -4506,11 +4407,13 @@ async fn utility_and_streaming_share_endpoint_resolution() {
 
 #[tokio::test]
 async fn text_completion_honors_responses_pin() {
-    let (url, mut requests) = utility_json_capture_server(1).await;
+    let mut provider =
+        provider_with_turns([raw_json_turn_for_wire(WireApi::Responses, false)]).await;
+    let url = provider.base_url();
     let model = openai_model_at_with_wire(&url, WireApi::Responses, true);
     let response = model.text_completion("hi").await.unwrap();
     assert_eq!(response, "ok");
-    let (request_line, _body) = requests.recv().await.unwrap();
+    let request_line = provider.next_request().await.request_line;
     assert!(request_line.contains("/responses"), "{request_line}");
     assert!(
         !request_line.contains("/chat/completions"),
@@ -4520,14 +4423,18 @@ async fn text_completion_honors_responses_pin() {
 
 #[tokio::test]
 async fn text_completion_with_system_honors_responses_pin() {
-    let (url, mut requests) = utility_json_capture_server(1).await;
+    let mut provider =
+        provider_with_turns([raw_json_turn_for_wire(WireApi::Responses, false)]).await;
+    let url = provider.base_url();
     let model = openai_model_at_with_wire(&url, WireApi::Responses, true);
     let response = model
         .text_completion_with_system("system instructions", "hi")
         .await
         .unwrap();
     assert_eq!(response, "ok");
-    let (request_line, body) = requests.recv().await.unwrap();
+    let request = provider.next_request().await;
+    let request_line = request.request_line;
+    let body = request.body;
     assert!(request_line.contains("/responses"), "{request_line}");
     assert!(
         body.to_string().contains("system instructions"),
@@ -4537,14 +4444,16 @@ async fn text_completion_with_system_honors_responses_pin() {
 
 #[tokio::test]
 async fn tool_completion_honors_responses_pin() {
-    let (url, mut requests) = utility_json_capture_server(1).await;
+    let mut provider =
+        provider_with_turns([raw_json_turn_for_wire(WireApi::Responses, true)]).await;
+    let url = provider.base_url();
     let model = openai_model_at_with_wire(&url, WireApi::Responses, true);
     let calls = model
         .tool_completion("system", "hi", &simple_tool())
         .await
         .unwrap();
     assert_eq!(calls.len(), 1);
-    let (request_line, _body) = requests.recv().await.unwrap();
+    let request_line = provider.next_request().await.request_line;
     assert!(request_line.contains("/responses"), "{request_line}");
     assert!(
         !request_line.contains("/chat/completions"),
@@ -4554,7 +4463,13 @@ async fn tool_completion_honors_responses_pin() {
 
 #[tokio::test]
 async fn utility_honors_completions_pin() {
-    let (url, mut requests) = utility_json_capture_server(3).await;
+    let mut provider = provider_with_turns([
+        raw_json_turn_for_wire(WireApi::Completions, false),
+        raw_json_turn_for_wire(WireApi::Completions, false),
+        raw_json_turn_for_wire(WireApi::Completions, true),
+    ])
+    .await;
+    let url = provider.base_url();
     let model = openai_model_at_with_wire(&url, WireApi::Completions, true);
     model.text_completion("hi").await.unwrap();
     model
@@ -4566,7 +4481,7 @@ async fn utility_honors_completions_pin() {
         .await
         .unwrap();
     for call in ["text", "text_with_system", "tool"] {
-        let (request_line, _body) = requests.recv().await.unwrap();
+        let request_line = provider.next_request().await.request_line;
         assert!(
             request_line.contains("/chat/completions"),
             "{call} utility call used wrong endpoint: {request_line}"
@@ -4577,7 +4492,13 @@ async fn utility_honors_completions_pin() {
 
 #[tokio::test]
 async fn utility_openai_arm_applies_max_tokens_cap() {
-    let (url, mut requests) = utility_json_capture_server(3).await;
+    let mut provider = provider_with_turns([
+        raw_json_turn_for_wire(WireApi::Completions, false),
+        raw_json_turn_for_wire(WireApi::Completions, false),
+        raw_json_turn_for_wire(WireApi::Completions, true),
+    ])
+    .await;
+    let url = provider.base_url();
     let model = openai_model_at_with_wire(&url, WireApi::Completions, true);
     model
         .text_completion_for(UtilityCallSite::AutoTitle, "hi")
@@ -4593,7 +4514,7 @@ async fn utility_openai_arm_applies_max_tokens_cap() {
         .unwrap();
 
     for call in ["text", "text_with_system", "tool"] {
-        let (_request_line, body) = requests.recv().await.unwrap();
+        let body = provider.next_request().await.body;
         assert_eq!(
             body["max_tokens"], UTILITY_MAX_TOKENS_CAP,
             "{call} did not apply the utility max_tokens cap: {body}"
@@ -4603,20 +4524,24 @@ async fn utility_openai_arm_applies_max_tokens_cap() {
 
 #[tokio::test]
 async fn utility_max_tokens_respects_model_limits() {
-    let (url, mut requests) = utility_json_capture_server(1).await;
+    let mut provider =
+        provider_with_turns([raw_json_turn_for_wire(WireApi::Completions, false)]).await;
+    let url = provider.base_url();
     let model =
         openai_model_at_with_wire_and_utility_limit(&url, WireApi::Completions, true, Some(128));
     model
         .text_completion_for(UtilityCallSite::AutoTitle, "hi")
         .await
         .unwrap();
-    let (_request_line, body) = requests.recv().await.unwrap();
+    let body = provider.next_request().await.body;
     assert_eq!(body["max_tokens"], 128, "{body}");
 }
 
 #[tokio::test]
 async fn utility_params_applied_on_openai_arm() {
-    let (url, mut requests) = utility_json_capture_server(1).await;
+    let mut provider =
+        provider_with_turns([raw_json_turn_for_wire(WireApi::Completions, false)]).await;
+    let url = provider.base_url();
     let model = openai_model_at_with_wire(&url, WireApi::Completions, true);
     let params = ModelParams {
         temperature: Some(0.77),
@@ -4629,7 +4554,7 @@ async fn utility_params_applied_on_openai_arm() {
         .text_completion_with_params(UtilityCallSite::Predict, params, "hi")
         .await
         .unwrap();
-    let (_request_line, body) = requests.recv().await.unwrap();
+    let body = provider.next_request().await.body;
     assert_eq!(body["temperature"], 0.77, "{body}");
     assert_eq!(body["max_tokens"], 99, "{body}");
     assert_eq!(body["prompt_cache_key"], "session-cache-key", "{body}");
@@ -4638,7 +4563,12 @@ async fn utility_params_applied_on_openai_arm() {
 
 #[tokio::test]
 async fn utility_safety_calls_pin_temperature_zero() {
-    let (url, mut requests) = utility_json_capture_server(2).await;
+    let mut provider = provider_with_turns([
+        raw_json_turn_for_wire(WireApi::Completions, true),
+        raw_json_turn_for_wire(WireApi::Completions, true),
+    ])
+    .await;
+    let url = provider.base_url();
     let model = openai_model_at_with_wire(&url, WireApi::Completions, true);
     let hot = ModelParams {
         temperature: Some(1.9),
@@ -4666,22 +4596,23 @@ async fn utility_safety_calls_pin_temperature_zero() {
         .unwrap();
 
     for call in ["safety", "injection"] {
-        let (_request_line, body) = requests.recv().await.unwrap();
+        let body = provider.next_request().await.body;
         assert_eq!(body["temperature"], 0.0, "{call}: {body}");
     }
 }
 
 #[tokio::test(start_paused = true)]
 async fn utility_timeout_cancels_hung_request() {
-    let (url, mut accepted) = hanging_utility_server().await;
+    let provider = provider_with_turns([Turn::Hang]).await;
+    let url = provider.base_url();
     let model = openai_model_at_with_wire(&url, WireApi::Completions, true);
     let call = model.text_completion_for(UtilityCallSite::Predict, "hi");
     tokio::pin!(call);
 
     tokio::select! {
         _ = &mut call => panic!("utility request completed before timeout"),
-        request_line = accepted.recv() => {
-            let request_line = request_line.expect("server should observe request");
+        request = wait_for_captured_request(&provider) => {
+            let request_line = request.request_line;
             assert!(request_line.contains("/chat/completions"), "{request_line}");
         }
     }
@@ -4719,7 +4650,8 @@ fn utility_turn_blocking_budget_tighter() {
 
 #[tokio::test]
 async fn utility_drain_abandons_background_calls() {
-    let (url, mut requests) = utility_json_capture_server(1).await;
+    let provider = provider_with_turns([raw_json_turn_for_wire(WireApi::Completions, false)]).await;
+    let url = provider.base_url();
     let gate = crate::daemon::shutdown::ShutdownSignal::new();
     let model = openai_model_at_with_wire(&url, WireApi::Completions, true)
         .with_shutdown_gate(gate.clone());
@@ -4730,14 +4662,16 @@ async fn utility_drain_abandons_background_calls() {
         .expect_err("background utility calls should gate during drain");
     assert!(is_gated(&err), "{err:#}");
     assert!(
-        requests.try_recv().is_err(),
+        provider.captured().is_empty(),
         "background drain gate should reject before provider dispatch"
     );
 }
 
 #[tokio::test]
 async fn utility_drain_turn_gating_follows_turn() {
-    let (url, mut requests) = utility_json_capture_server(1).await;
+    let mut provider =
+        provider_with_turns([raw_json_turn_for_wire(WireApi::Completions, true)]).await;
+    let url = provider.base_url();
     let gate = crate::daemon::shutdown::ShutdownSignal::new();
     let model = openai_model_at_with_wire(&url, WireApi::Completions, true)
         .with_shutdown_gate(gate.clone());
@@ -4751,7 +4685,7 @@ async fn utility_drain_turn_gating_follows_turn() {
         )
         .await
         .unwrap();
-    let (request_line, _body) = requests.recv().await.unwrap();
+    let request_line = provider.next_request().await.request_line;
     assert!(request_line.contains("/chat/completions"), "{request_line}");
 }
 
@@ -4793,7 +4727,8 @@ fn utility_params_seam_covers_all_arms() {
 async fn utility_never_prompts_or_pins() {
     let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
-    let (url, mut requests) = chat_404_then_responses_ok_server_with_limit(1).await;
+    let mut provider = chat_404_then_responses_ok_provider(1).await;
+    let url = provider.base_url();
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
@@ -4821,11 +4756,14 @@ async fn utility_never_prompts_or_pins() {
         openai_model_at_with_wire(&url, WireApi::Auto, false).with_config_path(path.clone());
     let result = model.text_completion("hi").await;
     assert!(result.is_err(), "mismatch should surface on utility calls");
-    assert!(requests.recv().await.unwrap().contains("/chat/completions"));
     assert!(
-        requests.try_recv().is_err(),
-        "utility mismatch must not retry on the alternate endpoint"
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/chat/completions")
     );
+    assert_eq!(provider.request_count(), 1);
     assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(model.confirmed_wire_api_for_base_url(&url), None);
     let doc = crate::config::providers::ConfigDoc::load(&path).unwrap();
@@ -4836,7 +4774,9 @@ async fn utility_never_prompts_or_pins() {
 async fn utility_consumes_learned_endpoint() {
     let _guard = endpoint_probe_test_guard_async().await;
     endpoint_probes().lock().unwrap().clear();
-    let (url, mut requests) = utility_json_capture_server(1).await;
+    let mut provider =
+        provider_with_turns([raw_json_turn_for_wire(WireApi::Responses, false)]).await;
+    let url = provider.base_url();
     record_endpoint_observation(
         "p",
         "m",
@@ -4846,13 +4786,15 @@ async fn utility_consumes_learned_endpoint() {
     );
     let model = openai_model_at_with_wire(&url, WireApi::Auto, false);
     model.text_completion("hi").await.unwrap();
-    let (request_line, _body) = requests.recv().await.unwrap();
+    let request_line = provider.next_request().await.request_line;
     assert!(request_line.contains("/responses"), "{request_line}");
 }
 
 #[tokio::test]
 async fn tool_completion_responses_identity_behavior() {
-    let (url, mut requests) = utility_json_capture_server(1).await;
+    let mut provider =
+        provider_with_turns([raw_json_turn_for_wire(WireApi::Responses, true)]).await;
+    let url = provider.base_url();
     let model = openai_model_at_with_wire(&url, WireApi::Responses, true);
     let tool = ToolDefinition {
         name: "lookup".into(),
@@ -4866,7 +4808,9 @@ async fn tool_completion_responses_identity_behavior() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].id, "fc_1");
     assert_eq!(calls[0].call_id.as_deref(), Some("call_1"));
-    let (request_line, body) = requests.recv().await.unwrap();
+    let request = provider.next_request().await;
+    let request_line = request.request_line;
+    let body = request.body;
     assert!(request_line.contains("/responses"), "{request_line}");
     assert_eq!(
         body["tools"][0]["parameters"]["properties"]["optional"]["type"],
@@ -4886,9 +4830,10 @@ async fn tool_completion_responses_identity_behavior() {
 #[tokio::test]
 async fn headless_responses_404_does_not_retry_or_hang() {
     use crate::config::providers::WireApi;
-    let (url, mut requests) = responses_404_then_chat_ok_server(1).await;
+    let mut provider = responses_404_then_chat_ok_provider(1).await;
+    let url = provider.base_url();
     let entry = ProviderEntry {
-        url,
+        url: url.clone(),
         headers: vec![],
         ..ProviderEntry::default()
     };
@@ -4929,16 +4874,33 @@ async fn headless_responses_404_does_not_retry_or_hang() {
     .await
     .expect("headless endpoint mismatch must not hang");
     assert!(result.is_err(), "headless mismatch should surface");
-    assert!(requests.recv().await.unwrap().contains("/responses"));
     assert!(
-        requests.try_recv().is_err(),
+        provider
+            .next_request()
+            .await
+            .request_line
+            .contains("/responses")
+    );
+    assert_eq!(
+        provider.request_count(),
+        1,
         "must not issue alternate retry"
     );
 }
 
 #[tokio::test]
 async fn streaming_usage_accepts_input_output_aliases() {
-    let url = sse_usage_alias_server().await;
+    let provider = ScriptedProvider::builder()
+        .turn(Turn::Text("ok".into()))
+        .with_usage(Usage {
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            total_tokens: 7,
+            use_alias_names: true,
+        })
+        .start()
+        .await;
+    let url = provider.base_url();
     let entry = ProviderEntry {
         url,
         headers: vec![],
@@ -4970,9 +4932,9 @@ async fn streaming_usage_accepts_input_output_aliases() {
 async fn native_anthropic_dispatch_sends_canonical_user_agent() {
     use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
 
-    let (url, rx) = anthropic_header_capture_server().await;
+    let mut provider = anthropic_capture_provider().await;
     let resolved = ResolvedRequest {
-        base_url: url,
+        base_url: provider.base_url(),
         headers: vec![ResolvedHeader {
             name: "x-api-key".to_string(),
             value: "anthropic-key".to_string(),
@@ -4998,9 +4960,9 @@ async fn native_anthropic_dispatch_sends_canonical_user_agent() {
     .expect("native Anthropic model must build");
 
     let _ = model.text_completion("hi").await;
-    let headers = rx.await.unwrap();
+    let request = provider.next_request().await;
     assert_eq!(
-        request_header_value(&headers, "user-agent"),
+        request_header_value(&request.headers, "user-agent"),
         Some(crate::user_agent::user_agent())
     );
 }
@@ -5009,7 +4971,12 @@ async fn native_anthropic_dispatch_sends_canonical_user_agent() {
 async fn native_chatgpt_dispatch_sends_codex_responses_shape() {
     use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
 
-    let (url, rx) = chatgpt_responses_capture_server().await;
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::Responses)
+        .turn(Turn::Text("ok".into()))
+        .start()
+        .await;
+    let url = provider.base_url().trim_end_matches("/v1").to_string() + "/backend-api/codex";
     let resolved = ResolvedRequest {
         base_url: url,
         headers: vec![
@@ -5071,25 +5038,46 @@ async fn native_chatgpt_dispatch_sends_codex_responses_shape() {
         "native ChatGPT stream should parse: {result:#?}"
     );
 
-    let (header, body) = rx.await.unwrap();
-    let header_lc = header.to_ascii_lowercase();
+    let request = provider.next_request().await;
     assert!(
-        header_lc.starts_with("post /backend-api/codex/responses http/1.1"),
-        "wrong request line: {header}"
+        request
+            .request_line
+            .to_ascii_lowercase()
+            .starts_with("post /backend-api/codex/responses http/1.1"),
+        "wrong request line: {}",
+        request.request_line
     );
-    assert!(header_lc.contains("authorization: bearer codex-access-token"));
-    assert!(header_lc.contains("chatgpt-account-id: acc_123"));
-    assert_eq!(request_header_value(&header, "originator"), Some("cockpit"));
     assert_eq!(
-        request_header_value(&header, "user-agent"),
+        request_header_value(&request.headers, "authorization"),
+        Some("Bearer codex-access-token")
+    );
+    assert_eq!(
+        request_header_value(&request.headers, "chatgpt-account-id"),
+        Some("acc_123")
+    );
+    assert_eq!(
+        request_header_value(&request.headers, "originator"),
+        Some("cockpit")
+    );
+    assert_eq!(
+        request_header_value(&request.headers, "user-agent"),
         Some(crate::user_agent::user_agent())
     );
-    assert!(header_lc.contains("openai-beta: responses=experimental"));
-    assert!(header_lc.contains("accept: text/event-stream"));
-    assert!(header_lc.contains("content-type: application/json"));
-    assert!(header_lc.contains("session_id: "));
+    assert_eq!(
+        request_header_value(&request.headers, "openai-beta"),
+        Some("responses=experimental")
+    );
+    assert_eq!(
+        request_header_value(&request.headers, "accept"),
+        Some("text/event-stream")
+    );
+    assert_eq!(
+        request_header_value(&request.headers, "content-type"),
+        Some("application/json")
+    );
+    assert!(request_header_value(&request.headers, "session_id").is_some());
 
-    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let body = request.body;
     assert_eq!(body["model"], json!("gpt-5-codex"));
     assert_eq!(
         body["instructions"],
@@ -5156,9 +5144,9 @@ fn stale_codex_openai_compatible_config_gets_corrective_error() {
 async fn openai_compatible_dispatch_sends_canonical_user_agent_and_resolved_extra_headers() {
     use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
 
-    let (url, rx) = header_capture_server().await;
+    let mut provider = json_capture_provider().await;
     let resolved = ResolvedRequest {
-        base_url: url,
+        base_url: provider.base_url(),
         headers: vec![
             ResolvedHeader {
                 name: "Authorization".to_string(),
@@ -5195,25 +5183,30 @@ async fn openai_compatible_dispatch_sends_canonical_user_agent_and_resolved_extr
     .expect("model must build");
 
     let _ = model.text_completion("hi").await;
-    let headers = rx.await.unwrap();
-    let headers_lc = headers.to_ascii_lowercase();
-    assert!(headers_lc.contains("authorization: bearer access-token"));
-    assert!(headers_lc.contains("chatgpt-account-id: acc_123"));
+    let request = provider.next_request().await;
     assert_eq!(
-        request_header_value(&headers, "originator"),
+        request_header_value(&request.headers, "authorization"),
+        Some("Bearer access-token")
+    );
+    assert_eq!(
+        request_header_value(&request.headers, "chatgpt-account-id"),
+        Some("acc_123")
+    );
+    assert_eq!(
+        request_header_value(&request.headers, "originator"),
         Some("cockpit")
     );
     assert_eq!(
-        request_header_value(&headers, "user-agent"),
+        request_header_value(&request.headers, "user-agent"),
         Some(crate::user_agent::user_agent())
     );
 }
 
 #[tokio::test]
 async fn user_configured_user_agent_wins() {
-    let (url, rx) = header_capture_server().await;
+    let mut provider = json_capture_provider().await;
     let entry = ProviderEntry {
-        url,
+        url: provider.base_url(),
         headers: vec![
             crate::config::providers::HeaderSpec {
                 name: "Authorization".to_string(),
@@ -5236,9 +5229,9 @@ async fn user_configured_user_agent_wins() {
     .expect("model must build");
 
     let _ = model.text_completion("hi").await;
-    let headers = rx.await.unwrap();
+    let request = provider.next_request().await;
     assert_eq!(
-        request_header_value(&headers, "user-agent"),
+        request_header_value(&request.headers, "user-agent"),
         Some("custom-client/9.9")
     );
 }
@@ -5249,12 +5242,12 @@ async fn user_configured_user_agent_wins() {
 #[tokio::test]
 async fn text_completion_scrubs_outbound_prompt() {
     let (_tmp, redact) = secret_table();
-    let (url, rx) = json_capture_server().await;
-    let model = model_at(&url, redact);
+    let mut provider = json_capture_provider().await;
+    let model = model_at(&provider.base_url(), redact);
     let _ = model
         .text_completion(&format!("please use the token {SECRET} now"))
         .await;
-    let body = rx.await.unwrap();
+    let body = request_body_string(&provider.next_request().await);
     assert!(body.contains(PLACEHOLDER), "placeholder absent: {body}");
     assert!(!body.contains(SECRET), "secret leaked verbatim: {body}");
 }
@@ -5264,15 +5257,15 @@ async fn text_completion_scrubs_outbound_prompt() {
 #[tokio::test]
 async fn text_completion_with_system_scrubs_system_and_prompt() {
     let (_tmp, redact) = secret_table();
-    let (url, rx) = json_capture_server().await;
-    let model = model_at(&url, redact);
+    let mut provider = json_capture_provider().await;
+    let model = model_at(&provider.base_url(), redact);
     let _ = model
         .text_completion_with_system(
             &format!("system carries {SECRET}"),
             &format!("preflight input with {SECRET}"),
         )
         .await;
-    let body = rx.await.unwrap();
+    let body = request_body_string(&provider.next_request().await);
     assert!(body.contains(PLACEHOLDER), "placeholder absent: {body}");
     assert!(!body.contains(SECRET), "secret leaked verbatim: {body}");
 }
@@ -5283,8 +5276,8 @@ async fn text_completion_with_system_scrubs_system_and_prompt() {
 #[tokio::test]
 async fn tool_completion_scrubs_injection_scan_input() {
     let (_tmp, redact) = secret_table();
-    let (url, rx) = json_capture_server().await;
-    let model = model_at(&url, redact);
+    let mut provider = json_capture_provider().await;
+    let model = model_at(&provider.base_url(), redact);
     let tool = ToolDefinition {
         name: "risk".into(),
         description: "rate".into(),
@@ -5297,7 +5290,7 @@ async fn tool_completion_scrubs_injection_scan_input() {
             &tool,
         )
         .await;
-    let body = rx.await.unwrap();
+    let body = request_body_string(&provider.next_request().await);
     assert!(body.contains(PLACEHOLDER), "placeholder absent: {body}");
     assert!(!body.contains(SECRET), "secret leaked verbatim: {body}");
     // The injection *instruction* survives the scrub (only the value is
@@ -5311,7 +5304,13 @@ async fn tool_completion_scrubs_injection_scan_input() {
 #[tokio::test]
 async fn utility_redaction_chokepoint_preserved() {
     let (_tmp, redact) = secret_table();
-    let (url, mut requests) = utility_json_capture_server(3).await;
+    let mut provider = provider_with_turns([
+        raw_json_turn_for_wire(WireApi::Responses, false),
+        raw_json_turn_for_wire(WireApi::Responses, false),
+        raw_json_turn_for_wire(WireApi::Responses, true),
+    ])
+    .await;
+    let url = provider.base_url();
     let model =
         openai_model_at_with_wire_and_redact(&url, WireApi::Responses, true, redact.clone());
     let tool = ToolDefinition {
@@ -5345,9 +5344,10 @@ async fn utility_redaction_chokepoint_preserved() {
         "text_completion_with_system",
         "tool_completion",
     ] {
-        let (request_line, body) = requests.recv().await.unwrap();
+        let request = provider.next_request().await;
+        let request_line = request.request_line;
         assert!(request_line.contains("/responses"), "{request_line}");
-        let body = body.to_string();
+        let body = request.body.to_string();
         assert!(
             body.contains(PLACEHOLDER),
             "{call} placeholder absent: {body}"
@@ -5365,8 +5365,8 @@ async fn utility_redaction_chokepoint_preserved() {
 #[tokio::test]
 async fn complete_captured_scrubs_user_message_and_tool_result() {
     let (_tmp, redact) = secret_table();
-    let (url, rx) = sse_capture_server().await;
-    let model = model_at(&url, redact);
+    let mut provider = sse_capture_provider().await;
+    let model = model_at(&provider.base_url(), redact);
 
     // History carries a tool result whose body is a `cat .env` leak.
     let tool_result = Message::User {
@@ -5394,7 +5394,7 @@ async fn complete_captured_scrubs_user_message_and_tool_result() {
             None,
         )
         .await;
-    let body = rx.await.unwrap();
+    let body = request_body_string(&provider.next_request().await);
     assert!(body.contains(PLACEHOLDER), "placeholder absent: {body}");
     assert!(
         !body.contains(SECRET),
@@ -5408,10 +5408,10 @@ async fn complete_captured_scrubs_user_message_and_tool_result() {
 #[tokio::test]
 async fn disabled_table_passes_text_through_unchanged() {
     // text_completion
-    let (url, rx) = json_capture_server().await;
-    let model = model_at(&url, disabled_table());
+    let mut provider = json_capture_provider().await;
+    let model = model_at(&provider.base_url(), disabled_table());
     let _ = model.text_completion(&format!("token {SECRET} here")).await;
-    let body = rx.await.unwrap();
+    let body = request_body_string(&provider.next_request().await);
     assert!(
         body.contains(SECRET),
         "disabled table must pass the secret through: {body}"
@@ -5419,8 +5419,8 @@ async fn disabled_table_passes_text_through_unchanged() {
     assert!(!body.contains(PLACEHOLDER));
 
     // complete_captured
-    let (url2, rx2) = sse_capture_server().await;
-    let model2 = model_at(&url2, disabled_table());
+    let mut provider2 = sse_capture_provider().await;
+    let model2 = model_at(&provider2.base_url(), disabled_table());
     let prompt = Message::user(format!("token {SECRET} here"));
     let (tx, _ev) = mpsc::channel::<TurnEvent>(64);
     let cancel = CancellationToken::new();
@@ -5437,7 +5437,7 @@ async fn disabled_table_passes_text_through_unchanged() {
             None,
         )
         .await;
-    let body2 = rx2.await.unwrap();
+    let body2 = request_body_string(&provider2.next_request().await);
     assert!(
         body2.contains(SECRET),
         "disabled table must pass through: {body2}"

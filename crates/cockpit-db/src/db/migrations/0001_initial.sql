@@ -1014,7 +1014,7 @@ CREATE TABLE session_goals (
 -- At most one goal in a non-terminal status per session.
 CREATE UNIQUE INDEX idx_session_goals_one_open
     ON session_goals(session_id)
-    WHERE status IN ('draft', 'active', 'paused', 'blocked', 'budget_limited', 'usage_limited');
+    WHERE status IN ('active', 'paused', 'blocked', 'budget_limited', 'usage_limited');
 
 CREATE INDEX idx_session_goals_session_status
     ON session_goals(session_id, status, updated_at DESC);

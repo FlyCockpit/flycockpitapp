@@ -71,13 +71,61 @@ fn goal_mutating_action_and_context_delta_reset_progress_counters() {
 
     record_goal_tool_event(
         &driver,
-        "update_goal",
-        serde_json::json!({"status": "active", "context_delta": "edited src/lib.rs"}),
+        "goal",
+        serde_json::json!({
+            "action": "update",
+            "status": "active",
+            "context_delta": "edited src/lib.rs"
+        }),
     );
     let context = driver.observe_goal_progress_turn().unwrap();
     assert!(context.context_delta);
     assert_eq!(driver.goal_turns_since_goal_context_delta, 0);
     assert_eq!(driver.goal_turns_since_mutating_action, 1);
+}
+
+#[test]
+fn delegation_brief_todo_block_omits_append_note_instruction() {
+    let (driver, _tmp) = test_driver(1);
+    let todo = driver
+        .session
+        .db
+        .create_task_todo(driver.session.id, "ship child task", 0)
+        .unwrap();
+
+    let brief = driver.assign_todos_to_task(
+        "Do the task.".to_string(),
+        &[todo.id],
+        "call-1",
+        "label",
+        "builder",
+    );
+
+    assert!(brief.contains("Assigned todos (durable state):"));
+    assert!(!brief.contains("append_note"));
+    assert!(!brief.contains("todo(action=\"append_note\")"));
+}
+
+#[test]
+fn delegation_brief_todo_block_keeps_todo_delta_instruction() {
+    let (driver, _tmp) = test_driver(1);
+    let todo = driver
+        .session
+        .db
+        .create_task_todo(driver.session.id, "ship child task", 0)
+        .unwrap();
+
+    let brief = driver.assign_todos_to_task(
+        "Do the task.".to_string(),
+        &[todo.id],
+        "call-1",
+        "label",
+        "builder",
+    );
+
+    assert!(brief.contains("fenced `todo_delta` JSON object"));
+    assert!(brief.contains("\"todos\""));
+    assert!(brief.contains("\"suggested_edits\""));
 }
 
 #[test]

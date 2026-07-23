@@ -15,7 +15,7 @@
 //! - [`unlock`] — release without write.
 //! - [`editunlock`] — cascade-based search/replace (plan §13b).
 //! - [`task`] — structural; the engine intercepts this name.
-//! - [`todo`] / [`todo_read`] — durable task-backed todo state.
+//! - [`todo`] — durable task-backed todo state.
 
 pub mod bash;
 pub mod command_resource_profiles;
@@ -55,7 +55,6 @@ pub mod task;
 pub mod task_repair;
 pub mod text_search;
 pub mod todo;
-pub mod todo_read;
 pub mod tool_result_retrieve;
 pub mod unlock;
 pub mod web;

@@ -1284,8 +1284,8 @@ fn build_goal_clarification_prompt(objective: &str) -> String {
          Act as Build. First investigate the working directory read-only using normal tools and identify relevant repo facts. \
          Then propose a clarified goal for user review with exactly these parts: `goal` (terse, stable, acceptance-oriented), \
          `context` (repo findings, constraints, relevant files, user preferences), acceptance criteria, and an initial task/todo breakdown when useful. \
-         Continue the clarification loop until the user confirms. Only after confirmation call create_goal(objective, context, token_budget if specified). \
-         After create_goal, continue normal Build execution toward the active goal using get_goal/update_goal and durable todos."
+         Continue the clarification loop until the user confirms. Only after confirmation call goal(action=\"create\", objective, context, token_budget if specified). \
+         After goal creation, continue normal Build execution toward the active goal using goal(action=\"get\"), goal(action=\"update\"), and durable todos."
     )
 }
 

@@ -382,10 +382,7 @@ fn with_recall_tools(tb: ToolBox, args: &SpawnArgs) -> ToolBox {
     tb.with(Arc::new(crate::tools::session_search::SessionSearchTool))
         .with(Arc::new(crate::tools::session_read::SessionReadTool))
         .with(Arc::new(crate::tools::todo::TodoTool))
-        .with(Arc::new(crate::tools::todo_read::TodoReadTool))
-        .with(Arc::new(crate::tools::goal::CreateGoalTool))
-        .with(Arc::new(crate::tools::goal::GetGoalTool))
-        .with(Arc::new(crate::tools::goal::UpdateGoalTool))
+        .with(Arc::new(crate::tools::goal::GoalTool))
 }
 
 fn with_tiered_recall_tools(
@@ -399,15 +396,7 @@ fn with_tiered_recall_tools(
         return Ok(tb);
     }
     let grant_has_mcp = grant.iter().any(|tool| tool == "mcp");
-    for name in [
-        "session_search",
-        "session_read",
-        "todo",
-        "todo_read",
-        "create_goal",
-        "get_goal",
-        "update_goal",
-    ] {
+    for name in ["session_search", "session_read", "todo", "goal"] {
         if is_assistant
             && !grant_has_mcp
             && !grant.iter().any(|tool| tool == name)
@@ -495,10 +484,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "session_search",
         "session_read",
         "todo",
-        "todo_read",
-        "create_goal",
-        "get_goal",
-        "update_goal",
+        "goal",
         "readlock",
         "writeunlock",
         "editunlock",
@@ -682,31 +668,13 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         BuiltinToolInventoryItem {
             family: "Planning",
             name: "todo",
-            summary: "Update the session todo list.",
+            summary: "Manage session todos and notes.",
             condition: Some("interactive sessions"),
         },
         BuiltinToolInventoryItem {
             family: "Planning",
-            name: "todo_read",
-            summary: "Read the session todo list.",
-            condition: Some("interactive sessions"),
-        },
-        BuiltinToolInventoryItem {
-            family: "Planning",
-            name: "create_goal",
-            summary: "Create a resumable session goal.",
-            condition: Some("interactive sessions"),
-        },
-        BuiltinToolInventoryItem {
-            family: "Planning",
-            name: "get_goal",
-            summary: "Read the current session goal.",
-            condition: Some("interactive sessions"),
-        },
-        BuiltinToolInventoryItem {
-            family: "Planning",
-            name: "update_goal",
-            summary: "Update the current session goal.",
+            name: "goal",
+            summary: "Create, read, or update the session goal.",
             condition: Some("interactive sessions"),
         },
         BuiltinToolInventoryItem {
@@ -886,12 +854,9 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::session_search::SessionSearchTool),
         Arc::new(tools::session_read::SessionReadTool),
         Arc::new(tools::todo::TodoTool),
-        Arc::new(tools::todo_read::TodoReadTool),
         Arc::new(tools::tool_result_retrieve::ToolResultRetrieveTool),
         Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
-        Arc::new(tools::goal::CreateGoalTool),
-        Arc::new(tools::goal::GetGoalTool),
-        Arc::new(tools::goal::UpdateGoalTool),
+        Arc::new(tools::goal::GoalTool),
         Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
         Arc::new(tools::seed::SeedEmitTool),
         Arc::new(tools::grep::GrepTool),
@@ -957,10 +922,7 @@ fn materialize_tool_by_name(
         "plan_edit" => tb.with(Arc::new(tools::plan_doc::PlanEditTool)),
         "start_build" => tb.with(Arc::new(tools::plan_doc::StartBuildTool)),
         "todo" => tb.with(Arc::new(tools::todo::TodoTool)),
-        "todo_read" => tb.with(Arc::new(tools::todo_read::TodoReadTool)),
-        "create_goal" => tb.with(Arc::new(tools::goal::CreateGoalTool)),
-        "get_goal" => tb.with(Arc::new(tools::goal::GetGoalTool)),
-        "update_goal" => tb.with(Arc::new(tools::goal::UpdateGoalTool)),
+        "goal" => tb.with(Arc::new(tools::goal::GoalTool)),
         "defer_to_orchestrator" => tb.with(Arc::new(tools::defer::DeferTool)),
         "harness_list" => tb.with(Arc::new(tools::harness::HarnessListTool)),
         "harness_invoke" => tb.with(Arc::new(tools::harness::HarnessInvokeTool)),
@@ -1310,9 +1272,7 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "harness_invoke",
             "session_search",
             "session_read",
-            "create_goal",
-            "get_goal",
-            "update_goal",
+            "goal",
             "lsp",
         ],
         "Auto" | "Multireview" => &[
@@ -1320,9 +1280,7 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "harness_invoke",
             "session_search",
             "session_read",
-            "create_goal",
-            "get_goal",
-            "update_goal",
+            "goal",
             "lsp",
         ],
         _ => &[],
@@ -1338,13 +1296,7 @@ fn default_disabled_tools_for(name: &str) -> &'static [&'static str] {
 }
 
 fn default_assistant_discoverable_tools() -> &'static [&'static str] {
-    &[
-        "session_search",
-        "session_read",
-        "create_goal",
-        "get_goal",
-        "update_goal",
-    ]
+    &["session_search", "session_read", "goal"]
 }
 
 fn effective_tool_tier(
@@ -1773,9 +1725,7 @@ fn default_assistant_tools() -> Vec<String> {
             "mcp",
             "session_search",
             "session_read",
-            "create_goal",
-            "get_goal",
-            "update_goal",
+            "goal",
             "skill_manage",
         ]
         .into_iter()
@@ -2954,9 +2904,7 @@ mod tests {
             "harness_invoke",
             "session_search",
             "session_read",
-            "create_goal",
-            "get_goal",
-            "update_goal",
+            "goal",
         ] {
             assert!(
                 !names.contains(&tool),
@@ -2982,7 +2930,6 @@ mod tests {
             "deps",
             "context_pack",
             "todo",
-            "todo_read",
         ] {
             assert!(names.contains(&tool), "{tool} should be directly injected");
         }
@@ -3030,13 +2977,7 @@ mod tests {
         assert!(names.contains(&"skill_manage"), "{names:?}");
         assert!(names.contains(&"mcp"), "{names:?}");
         let host = host_for_agent(&agent, tmp.path());
-        for tool in [
-            "session_search",
-            "session_read",
-            "create_goal",
-            "get_goal",
-            "update_goal",
-        ] {
+        for tool in ["session_search", "session_read", "goal"] {
             assert!(
                 !names.contains(&tool),
                 "{tool} should not be directly injected"
@@ -3076,13 +3017,7 @@ mod tests {
             !discoverable.is_empty() && names.contains(&"mcp"),
             "discoverable tools {discoverable:?} must be reachable through `mcp`"
         );
-        for tool in [
-            "session_search",
-            "session_read",
-            "create_goal",
-            "get_goal",
-            "update_goal",
-        ] {
+        for tool in ["session_search", "session_read", "goal"] {
             assert!(
                 discoverable.iter().any(|name| name == tool),
                 "{tool} should be discoverable through monty: {discoverable:?}"
@@ -4318,6 +4253,30 @@ mod tests {
                     || extra_custom_tool_reserved_names().contains(&name),
                 "`{name}` is inventoried but not backed by a runtime/reserved tool name"
             );
+        }
+    }
+
+    #[test]
+    fn known_agent_tool_names_matches_materialize_tool_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let names = known_agent_tool_names();
+        assert!(names.contains(&"todo"));
+        assert!(names.contains(&"goal"));
+        for removed in [
+            format!("todo_{}", "read"),
+            format!("create_{}", "goal"),
+            format!("get_{}", "goal"),
+            format!("update_{}", "goal"),
+        ] {
+            assert!(
+                !names.contains(&removed.as_str()),
+                "{removed} should not be grantable"
+            );
+        }
+        for name in ["todo", "goal"] {
+            let tb = materialize_tool_by_name(ToolBox::new(), name, None, &args).unwrap();
+            assert_eq!(tb.names(), vec![name]);
         }
     }
 

@@ -1836,12 +1836,6 @@ mod tests {
                 serde_json::json!({"limit": 1}),
                 "",
             ),
-            (
-                Arc::new(crate::tools::goal::GetGoalTool),
-                "get_goal",
-                serde_json::json!({}),
-                "No goal for this session.",
-            ),
         ];
 
         for (tool, name, args, expected_fragment) in cases {

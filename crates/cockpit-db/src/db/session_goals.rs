@@ -11,7 +11,6 @@ use crate::db::{Db, sql::placeholders};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalStatus {
-    Draft,
     Active,
     Paused,
     Blocked,
@@ -23,7 +22,6 @@ pub enum GoalStatus {
 impl GoalStatus {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Draft => "draft",
             Self::Active => "active",
             Self::Paused => "paused",
             Self::Blocked => "blocked",
@@ -35,7 +33,6 @@ impl GoalStatus {
 
     pub fn parse(s: &str) -> Result<Self> {
         match s {
-            "draft" => Ok(Self::Draft),
             "active" => Ok(Self::Active),
             "paused" => Ok(Self::Paused),
             "blocked" => Ok(Self::Blocked),
@@ -70,8 +67,7 @@ pub enum GoalUpdateOutcome {
 }
 
 pub const BLOCK_ATTEMPTS_REQUIRED: i64 = 3;
-const OPEN_STATUS_VALUES: [&str; 6] = [
-    "draft",
+const OPEN_STATUS_VALUES: [&str; 5] = [
     "active",
     "paused",
     "blocked",
@@ -169,11 +165,10 @@ impl Db {
                        AND status IN ({open_statuses})
                      ORDER BY CASE status
                          WHEN 'active' THEN 0
-                         WHEN 'draft' THEN 1
-                         WHEN 'paused' THEN 2
-                         WHEN 'blocked' THEN 3
-                         WHEN 'budget_limited' THEN 4
-                         WHEN 'usage_limited' THEN 5
+                         WHEN 'paused' THEN 1
+                         WHEN 'blocked' THEN 2
+                         WHEN 'budget_limited' THEN 3
+                         WHEN 'usage_limited' THEN 4
                      END, updated_at DESC
                      LIMIT 1"
                     ),
@@ -219,11 +214,13 @@ impl Db {
                     if clean_opt(evidence.as_deref()).is_none() {
                         anyhow::bail!("complete requires evidence");
                     }
-                    let read_at = goal
-                        .last_read_at
-                        .ok_or_else(|| anyhow::anyhow!("complete requires get_goal first"))?;
+                    let read_at = goal.last_read_at.ok_or_else(|| {
+                        anyhow::anyhow!("complete requires goal(action=\"get\") first")
+                    })?;
                     if read_at < goal.updated_at {
-                        anyhow::bail!("goal changed since last get_goal; reread before complete");
+                        anyhow::bail!(
+                            "goal changed since last goal(action=\"get\"); reread before complete"
+                        );
                     }
                 }
                 GoalStatus::Blocked => {
@@ -250,7 +247,6 @@ impl Db {
                 | GoalStatus::Paused
                 | GoalStatus::BudgetLimited
                 | GoalStatus::UsageLimited => {}
-                GoalStatus::Draft => anyhow::bail!("update_goal cannot set draft"),
             }
 
             let context = append_context(goal.context.as_deref(), context_delta.as_deref());
@@ -453,7 +449,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn complete_requires_get_goal_after_latest_update() {
+    fn goal_status_parse_rejects_draft() {
+        assert!(GoalStatus::parse("draft").is_err());
+    }
+
+    #[test]
+    fn complete_requires_goal_get_after_latest_update() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/tmp/goal-test", "Build").unwrap();
         db.create_session_goal(
@@ -474,7 +475,7 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(err.contains("get_goal"));
+        assert!(err.contains("goal(action=\"get\")"));
         db.current_session_goal(session.session_id, true).unwrap();
         let out = db
             .update_session_goal(

@@ -115,20 +115,12 @@ async fn live_model_switch_routes_next_request_to_new_model() {
     // The primary identity is unchanged — only the bound model swapped.
     assert_eq!(driver.stack[0].agent.name, "Build");
     let names = driver.stack[0].agent.tools.names();
-    for tool in ["todo", "todo_read"] {
-        assert!(
-            names.contains(&tool),
-            "rebuilt foreground Build must preserve interactive direct `{tool}` tool: {names:?}"
-        );
-    }
+    assert!(
+        names.contains(&"todo"),
+        "rebuilt foreground Build must preserve interactive direct `todo` tool: {names:?}"
+    );
     let discoverable = driver.stack[0].agent.tools.discoverable_mcp_tool_names();
-    for tool in [
-        "create_goal",
-        "get_goal",
-        "update_goal",
-        "session_read",
-        "session_search",
-    ] {
+    for tool in ["goal", "session_read", "session_search"] {
         assert!(
             discoverable.iter().any(|name| name == tool),
             "rebuilt foreground Build must preserve interactive discoverable `{tool}` tool: {discoverable:?}"

@@ -192,17 +192,17 @@ pub enum ParkedReplayOutcome {
 /// concat-joining a hundred would bloat the next inference. If we
 /// hit this cap, extras stay in the channel for the *next* fold.
 const MAX_FOLD: usize = 16;
-const GOAL_IDLE_CONTINUATION: &str = "An active goal is still in progress, but recent turns did not record concrete progress.\n\nRead the current goal, decide the next concrete action, and continue working. This turn must produce visible progress: edit/write a file, run the relevant gate, update the goal with a non-empty context_delta, or provide a concrete blocker that is shown to the user. If the goal is complete, call update_goal with status \"complete\" and evidence. If truly blocked, call update_goal with status \"blocked\" and explain the blocker. Otherwise use tools to make progress.";
-const GOAL_IDLE_CONTINUATION_STRONG: &str = "An active goal is still in progress and repeated recent turns did not edit/write a file, run the gate, commit, or record progress with update_goal(context_delta=...). You must choose one exit: call a tool that makes concrete progress, call get_goal then update_goal(status=\"complete\", evidence=...), call update_goal(status=\"active\", context_delta=...) to record real progress, or call update_goal(status=\"blocked\", blocker=...) only for a true blocker. Do not finish this turn silently.";
+const GOAL_IDLE_CONTINUATION: &str = "An active goal is still in progress, but recent turns did not record concrete progress.\n\nRead the current goal, decide the next concrete action, and continue working. This turn must produce visible progress: edit/write a file, run the relevant gate, update the goal with a non-empty context_delta, or provide a concrete blocker that is shown to the user. If the goal is complete, call goal with action \"update\", status \"complete\", and evidence. If truly blocked, call goal with action \"update\", status \"blocked\", and explain the blocker. Otherwise use tools to make progress.";
+const GOAL_IDLE_CONTINUATION_STRONG: &str = "An active goal is still in progress and repeated recent turns did not edit/write a file, run the gate, commit, or record progress with goal(action=\"update\", context_delta=...). You must choose one exit: call a tool that makes concrete progress, call goal(action=\"get\") then goal(action=\"update\", status=\"complete\", evidence=...), call goal(action=\"update\", status=\"active\", context_delta=...) to record real progress, or call goal(action=\"update\", status=\"blocked\", blocker=...) only for a true blocker. Do not finish this turn silently.";
 const GOAL_IDLE_CONTINUATION_STRONGEST: &str = "An active goal is still in progress and the no-progress budget is being consumed by repeated read/search/prose-only turns. Stop researching in circles: make a concrete change, run the relevant validation gate, record a non-empty goal context_delta that explains durable progress, or surface the exact blocker. Do not bypass approvals, sandboxing, or safety checks.";
-const GOAL_WATCHDOG_CONTINUATION: &str = "An active goal is still in progress, and background work has been pending for 10 minutes.\n\nCheck the status of the pending background task(s). If one is hung, decide whether to cancel, retry, inspect logs, or continue with other work. If the goal is complete, call update_goal(status=\"complete\"). If blocked, call update_goal(status=\"blocked\").";
+const GOAL_WATCHDOG_CONTINUATION: &str = "An active goal is still in progress, and background work has been pending for 10 minutes.\n\nCheck the status of the pending background task(s). If one is hung, decide whether to cancel, retry, inspect logs, or continue with other work. If the goal is complete, call goal(action=\"update\", status=\"complete\"). If blocked, call goal(action=\"update\", status=\"blocked\").";
 const GOAL_WATCHDOG_DELAY: Duration = Duration::from_secs(600);
 const GOAL_NO_PROGRESS_NUDGE_BOUND: u16 = 2;
 /// Finite continuation cap for goals created without an explicit token budget.
 /// Large enough for ordinary multi-turn runs, but not unbounded if the agent
 /// repeatedly fails to make durable progress.
 const GOAL_DEFAULT_CONTINUATION_TOKEN_CAP: i64 = 200_000;
-const GOAL_USAGE_LIMIT_AUTO_RESUME: &str = "An active goal was paused because the provider reported a usage or rate limit. The backoff window has elapsed.\n\nResume the goal from the current context. If the provider is still rate-limiting, stop after the failed turn and leave the goal usage-limited. If the goal is complete, call update_goal(status=\"complete\"). If truly blocked for a non-usage-limit reason, call update_goal(status=\"blocked\").";
+const GOAL_USAGE_LIMIT_AUTO_RESUME: &str = "An active goal was paused because the provider reported a usage or rate limit. The backoff window has elapsed.\n\nResume the goal from the current context. If the provider is still rate-limiting, stop after the failed turn and leave the goal usage-limited. If the goal is complete, call goal(action=\"update\", status=\"complete\"). If truly blocked for a non-usage-limit reason, call goal(action=\"update\", status=\"blocked\").";
 const GOAL_USAGE_LIMIT_BACKOFF_BASE: Duration = Duration::from_secs(30);
 const GOAL_USAGE_LIMIT_BACKOFF_MAX: Duration = Duration::from_secs(300);
 const GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS: u8 = 3;
@@ -1257,7 +1257,7 @@ impl Driver {
             }
         }
         block.push_str(
-            "\nAppend notes while working with `todo(action=\"append_note\")` when available. End your final report with a fenced `todo_delta` JSON object: {\"todos\":[{\"id\":\"...\",\"status\":\"completed|in_progress|pending|cancelled\",\"summary\":\"one line\",\"notes\":[{\"kind\":\"summary|finding|decision|artifact|blocker|handoff\",\"body\":\"...\"}],\"suggested_edits\":[\"...\"]}]}.\n",
+            "\nEnd your final report with a fenced `todo_delta` JSON object: {\"todos\":[{\"id\":\"...\",\"status\":\"completed|in_progress|pending|cancelled\",\"summary\":\"one line\",\"notes\":[{\"kind\":\"summary|finding|decision|artifact|blocker|handoff\",\"body\":\"...\"}],\"suggested_edits\":[\"...\"]}]}.\n",
         );
         format!("{brief}{block}")
     }
@@ -3526,10 +3526,14 @@ impl Driver {
     fn goal_event_has_context_delta(data: &serde_json::Value) -> bool {
         data.get("tool")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|tool| tool == "update_goal")
+            .is_some_and(|tool| tool == "goal")
             && data
                 .get("wire_input")
                 .or_else(|| data.get("original_input"))
+                .and_then(|input| {
+                    (input.get("action").and_then(serde_json::Value::as_str) == Some("update"))
+                        .then_some(input)
+                })
                 .and_then(|input| input.get("context_delta"))
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|delta| !delta.trim().is_empty())

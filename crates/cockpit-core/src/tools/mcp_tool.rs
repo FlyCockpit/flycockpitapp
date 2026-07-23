@@ -49,12 +49,7 @@ pub(crate) fn discoverable_tool_adverts(toolbox: &ToolBox) -> Vec<String> {
         "prior sessions",
         &["session_search", "session_read"],
     );
-    push_family_advert(
-        &names,
-        &mut adverts,
-        "goal state",
-        &["create_goal", "get_goal", "update_goal"],
-    );
+    push_family_advert(&names, &mut adverts, "goal state", &["goal"]);
     push_family_advert(&names, &mut adverts, "code navigation", &["lsp"]);
     push_family_advert(&names, &mut adverts, "skill management", &["skill_manage"]);
     adverts
@@ -265,9 +260,7 @@ mod tests {
             .with_discoverable_mcp(Arc::new(crate::tools::harness::HarnessInvokeTool))
             .with_discoverable_mcp(Arc::new(crate::tools::session_search::SessionSearchTool))
             .with_discoverable_mcp(Arc::new(crate::tools::session_read::SessionReadTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::goal::CreateGoalTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::goal::GetGoalTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::goal::UpdateGoalTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::goal::GoalTool))
             .with_discoverable_mcp(Arc::new(crate::tools::lsp::LspTool))
             .with_discoverable_mcp(Arc::new(crate::tools::skill_manage::SkillManageTool));
 

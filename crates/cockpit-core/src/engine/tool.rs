@@ -1853,16 +1853,10 @@ mod llm_mode_tests {
         assert!(context_pack.contains("never prints file contents"));
         assert!(context_pack.contains("read"));
 
-        for name in ["create_goal", "get_goal", "update_goal"] {
-            let description = tool_by_name(name).description().to_ascii_lowercase();
-            assert!(
-                description.contains("goal")
-                    && (description.contains("only")
-                        || description.contains("before")
-                        || description.contains("evidence")),
-                "`{name}` normal description lacks goal guardrail: {description}"
-            );
-        }
+        let goal = tool_by_name("goal").description().to_ascii_lowercase();
+        assert!(goal.contains("goal"));
+        assert!(goal.contains("control-plane"));
+        assert!(goal.contains("driver"));
 
         let note = tool_by_name("note").description().to_ascii_lowercase();
         assert!(note.contains("live progress note"));
@@ -1904,16 +1898,11 @@ mod llm_mode_tests {
             ("writeunlock", &["readlock", "editunlock"]),
             ("editunlock", &["writeunlock", "unlock"]),
             ("unlock", &["readlock", "writeunlock", "editunlock"]),
-            (
-                "plan_read",
-                &["plan_edit", "plan_write", "todo", "get_goal"],
-            ),
-            ("plan_write", &["plan_edit", "todo", "create_goal"]),
+            ("plan_read", &["plan_edit", "plan_write", "todo", "goal"]),
+            ("plan_write", &["plan_edit", "todo", "goal"]),
             ("plan_edit", &["plan_read", "plan_write"]),
             ("todo", &["task"]),
-            ("create_goal", &["goal"]),
-            ("get_goal", &["update_goal"]),
-            ("update_goal", &["get_goal"]),
+            ("goal", &["todo"]),
         ];
         for (name, siblings) in cases {
             let description = tool_by_name(name).description().to_ascii_lowercase();
@@ -2310,13 +2299,12 @@ mod llm_mode_tests {
             ("change_impact", ToolEffect::ReadOnly),
             ("circular", ToolEffect::ReadOnly),
             ("context_pack", ToolEffect::Dynamic),
-            ("create_goal", ToolEffect::Dynamic),
             ("defer_to_orchestrator", ToolEffect::Dynamic),
             ("delegation_payload_retrieve", ToolEffect::Dynamic),
             ("deps", ToolEffect::Dynamic),
             ("editunlock", ToolEffect::Dynamic),
             ("escalate", ToolEffect::Dynamic),
-            ("get_goal", ToolEffect::ReadOnly),
+            ("goal", ToolEffect::Dynamic),
             ("glob", ToolEffect::ReadOnly),
             ("grep", ToolEffect::ReadOnly),
             ("handoff", ToolEffect::Dynamic),
@@ -2348,11 +2336,9 @@ mod llm_mode_tests {
             ("symbol_find", ToolEffect::Dynamic),
             ("task", ToolEffect::Dynamic),
             ("todo", ToolEffect::Dynamic),
-            ("todo_read", ToolEffect::Dynamic),
             ("tool_result_retrieve", ToolEffect::Dynamic),
             ("tree", ToolEffect::Dynamic),
             ("unlock", ToolEffect::Dynamic),
-            ("update_goal", ToolEffect::Dynamic),
             ("webfetch", ToolEffect::Dynamic),
             ("websearch", ToolEffect::Dynamic),
             ("word", ToolEffect::ReadOnly),

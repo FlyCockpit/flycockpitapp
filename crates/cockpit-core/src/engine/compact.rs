@@ -159,7 +159,7 @@ impl StateAppendix {
                 out.push_str(t);
                 out.push('\n');
             }
-            out.push_str("- Full details/notes: call `todo_read(id_or_name=...)`\n");
+            out.push_str("- Full details/notes: call `todo(action=\"detail\", id_or_name=...)`\n");
         }
         if !self.pinned_messages.is_empty() {
             out.push_str("\n**Pinned messages (verbatim — load-bearing):**\n");
@@ -767,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn task_todo_overview_renders_completed_active_and_retrieval_tool() {
+    fn compact_appendix_todo_pointer_names_detail_action() {
         let completed = crate::db::task_todos::TaskTodo {
             id: uuid::Uuid::new_v4(),
             session_id: uuid::Uuid::new_v4(),
@@ -800,7 +800,7 @@ mod tests {
         let rendered = appendix.render();
         assert!(rendered.contains("Completed: wire todo deltas - delta applied"));
         assert!(rendered.contains("Pending: finish retrieval"));
-        assert!(rendered.contains("todo_read(id_or_name=...)"));
+        assert!(rendered.contains("todo(action=\"detail\", id_or_name=...)"));
         assert!(rendered.contains("Omitted lower-priority/completed todos: 1"));
     }
 

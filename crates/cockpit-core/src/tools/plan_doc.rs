@@ -21,7 +21,7 @@ impl Tool for PlanReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read the current virtual plan document before `plan_edit`/`plan_write`; use `todo` for task tracking and `get_goal`/`update_goal` for session objective"
+        "Read the current virtual plan document before `plan_edit`/`plan_write`; use `todo` for task tracking and `goal` for session objective"
     }
 
     fn defensive_description(&self) -> Option<String> {
@@ -45,7 +45,7 @@ impl Tool for PlanWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Create/replace full plan; expected_revision required whenever plan document exists; use `plan_edit` for revisions, `todo` for tasks, `create_goal`/`update_goal` for status"
+        "Create/replace full plan; expected_revision required whenever plan document exists; use `plan_edit` for revisions, `todo` for tasks, `goal` for status"
     }
 
     fn defensive_description(&self) -> Option<String> {

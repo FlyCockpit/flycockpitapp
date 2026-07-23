@@ -35,9 +35,11 @@
 //!     (so the former holder must re-read before writing), and wakes
 //!     waiters.
 //!
-//! Deferred to a later milestone:
+//! Hash-based drift checks:
 //!
-//!   - File-hash-based opportunistic-reacquire path.
+//!   - Read records carry a best-effort content hash. A write that relies on
+//!     a read record rather than a held lock is rejected if the file changed
+//!     after the read, or if the recorded hash is unknown.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -100,9 +102,11 @@ struct LockState {
     /// Kept in lock-step with `held` — every `held` insert/remove has a
     /// matching `touched` insert/remove.
     touched: HashMap<PathBuf, i64>,
-    /// `(session_id, agent_id) → set of paths the agent has read this
-    /// session`. Required by the §3c pre-write guard.
-    read_tracker: HashMap<(Uuid, AgentId), HashSet<PathBuf>>,
+    /// `(session_id, agent_id) → path → content hash captured when the agent
+    /// read it in this session`. Required by the §3c pre-write guard. `None`
+    /// means the record was restored without a known hash and cannot authorize
+    /// a write.
+    read_tracker: HashMap<(Uuid, AgentId), HashMap<PathBuf, Option<u64>>>,
     /// Canonical paths whose persisted release failed after the in-memory
     /// lock was force-released. The next acquire may overwrite the stale DB
     /// owner row for these paths only.

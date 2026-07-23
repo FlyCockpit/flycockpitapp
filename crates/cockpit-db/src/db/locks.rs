@@ -23,6 +23,14 @@ pub struct LockStateRow {
     pub acquired_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct LockReadRow {
+    pub session_id: Uuid,
+    pub agent_id: String,
+    pub path: String,
+    pub read_hash: Option<u64>,
+}
+
 impl Db {
     /// Record a freshly-acquired lock. Idempotent — re-acquiring by the
     /// same `(path, agent_id)` updates `acquired_at`.
@@ -95,16 +103,25 @@ impl Db {
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    pub fn lock_note_read(&self, path: &Path, agent_id: &str, session_id: Uuid) -> Result<()> {
+    pub fn lock_note_read(
+        &self,
+        path: &Path,
+        agent_id: &str,
+        session_id: Uuid,
+        read_hash: Option<u64>,
+    ) -> Result<()> {
         let now = Utc::now().timestamp();
         let p = path_string(path);
         let agent_id = agent_id.to_owned();
+        let read_hash = read_hash.map(|hash| hash as i64);
         self.write_blocking(move |conn| {
             conn.execute(
-                "INSERT INTO lock_reads (session_id, agent_id, path, read_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(session_id, agent_id, path) DO UPDATE SET read_at = excluded.read_at",
-                params![session_id.to_string(), agent_id, p, now],
+                "INSERT INTO lock_reads (session_id, agent_id, path, read_at, read_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(session_id, agent_id, path) DO UPDATE SET
+                     read_at = excluded.read_at,
+                     read_hash = excluded.read_hash",
+                params![session_id.to_string(), agent_id, p, now, read_hash],
             )
             .context("upserting lock_reads")?;
             Ok(())
@@ -121,20 +138,24 @@ impl Db {
         path: &Path,
         agent_id: &str,
         session_id: Uuid,
+        read_hash: Option<u64>,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
         let p = path_string(path);
         let agent_id = agent_id.to_owned();
+        let read_hash = read_hash.map(|hash| hash as i64);
         self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin lock_acquire_with_read tx")?;
             guarded_lock_acquire(&tx, &p, &agent_id, session_id, now)?;
             tx.execute(
-                "INSERT INTO lock_reads (session_id, agent_id, path, read_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(session_id, agent_id, path) DO UPDATE SET read_at = excluded.read_at",
-                params![session_id.to_string(), agent_id, p, now],
+                "INSERT INTO lock_reads (session_id, agent_id, path, read_at, read_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(session_id, agent_id, path) DO UPDATE SET
+                     read_at = excluded.read_at,
+                     read_hash = excluded.read_hash",
+                params![session_id.to_string(), agent_id, p, now, read_hash],
             )
             .context("upserting lock_reads")?;
             tx.commit().context("commit lock_acquire_with_read tx")?;
@@ -155,10 +176,12 @@ impl Db {
         path: &Path,
         agent_id: &str,
         session_id: Uuid,
+        read_hash: Option<u64>,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
         let p = path_string(path);
         let agent_id = agent_id.to_owned();
+        let read_hash = read_hash.map(|hash| hash as i64);
         self.write_blocking(move |conn| {
             let tx = conn
                 .unchecked_transaction()
@@ -174,10 +197,12 @@ impl Db {
             )
             .context("forcing lock_state acquire")?;
             tx.execute(
-                "INSERT INTO lock_reads (session_id, agent_id, path, read_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(session_id, agent_id, path) DO UPDATE SET read_at = excluded.read_at",
-                params![session_id.to_string(), agent_id, p, now],
+                "INSERT INTO lock_reads (session_id, agent_id, path, read_at, read_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(session_id, agent_id, path) DO UPDATE SET
+                     read_at = excluded.read_at,
+                     read_hash = excluded.read_hash",
+                params![session_id.to_string(), agent_id, p, now, read_hash],
             )
             .context("upserting lock_reads")?;
             tx.commit()
@@ -269,8 +294,8 @@ impl Db {
             )
             .context("transferring lock_state owner")?;
             tx.execute(
-                "INSERT OR REPLACE INTO lock_reads (session_id, agent_id, path, read_at)
-                 SELECT session_id, ?3, path, read_at
+                "INSERT OR REPLACE INTO lock_reads (session_id, agent_id, path, read_at, read_hash)
+                 SELECT session_id, ?3, path, read_at, read_hash
                  FROM lock_reads
                  WHERE session_id = ?1 AND agent_id = ?2",
                 params![session_id.to_string(), from_agent, to_agent],
@@ -383,10 +408,10 @@ impl Db {
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    pub fn list_lock_reads(&self) -> Result<Vec<(Uuid, String, String)>> {
+    pub fn list_lock_reads(&self) -> Result<Vec<LockReadRow>> {
         self.read_blocking(|conn| {
             let mut stmt = conn
-                .prepare("SELECT session_id, agent_id, path FROM lock_reads")
+                .prepare("SELECT session_id, agent_id, path, read_hash FROM lock_reads")
                 .context("preparing list_lock_reads")?;
             let rows = stmt
                 .query_map([], |row| {
@@ -398,11 +423,15 @@ impl Db {
                             Box::new(e),
                         )
                     })?;
-                    Ok((
+                    let read_hash = row
+                        .get::<_, Option<i64>>("read_hash")?
+                        .map(|hash| hash as u64);
+                    Ok(LockReadRow {
                         session_id,
-                        row.get::<_, String>("agent_id")?,
-                        row.get::<_, String>("path")?,
-                    ))
+                        agent_id: row.get::<_, String>("agent_id")?,
+                        path: row.get::<_, String>("path")?,
+                        read_hash,
+                    })
                 })
                 .context("querying lock_reads")?;
             let mut out = Vec::new();
@@ -574,11 +603,34 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").unwrap();
         let p = std::path::PathBuf::from("/x/a.rs");
-        db.lock_note_read(&p, "builder", s.session_id).unwrap();
-        db.lock_note_read(&p, "builder", s.session_id).unwrap();
+        db.lock_note_read(&p, "builder", s.session_id, Some(7))
+            .unwrap();
+        db.lock_note_read(&p, "builder", s.session_id, Some(8))
+            .unwrap();
         let reads = db.list_reads_for_session(s.session_id).unwrap();
         assert_eq!(reads.len(), 1);
         assert_eq!(reads[0].0, "builder");
+    }
+
+    #[test]
+    fn lock_reads_read_hash_column_round_trips() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "a").unwrap();
+        let with_hash = std::path::PathBuf::from("/x/with.rs");
+        let without_hash = std::path::PathBuf::from("/x/without.rs");
+
+        db.lock_note_read(&with_hash, "builder", s.session_id, Some(u64::MAX - 3))
+            .unwrap();
+        db.lock_note_read(&without_hash, "builder", s.session_id, None)
+            .unwrap();
+
+        let mut reads = db.list_lock_reads().unwrap();
+        reads.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].path, "/x/with.rs");
+        assert_eq!(reads[0].read_hash, Some(u64::MAX - 3));
+        assert_eq!(reads[1].path, "/x/without.rs");
+        assert_eq!(reads[1].read_hash, None);
     }
 
     #[expect(
@@ -616,7 +668,7 @@ mod tests {
         .unwrap();
 
         let err = db
-            .lock_acquire_with_read(&p, "builder", s.session_id)
+            .lock_acquire_with_read(&p, "builder", s.session_id, Some(1))
             .unwrap_err();
 
         assert!(
@@ -637,7 +689,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").unwrap();
         let p = std::path::PathBuf::from("/x/main.rs");
-        db.lock_acquire_with_read(&p, "builder", s.session_id)
+        db.lock_acquire_with_read(&p, "builder", s.session_id, Some(11))
             .unwrap();
         db.write_blocking(move |conn| {
             conn.execute_batch(
@@ -677,8 +729,10 @@ mod tests {
         let s2 = db.create_session("p", "/y", "a").unwrap();
         let p1 = std::path::PathBuf::from("/x/a.rs");
         let p2 = std::path::PathBuf::from("/y/b.rs");
-        db.lock_note_read(&p1, "builder", s1.session_id).unwrap();
-        db.lock_note_read(&p2, "builder", s2.session_id).unwrap();
+        db.lock_note_read(&p1, "builder", s1.session_id, Some(1))
+            .unwrap();
+        db.lock_note_read(&p2, "builder", s2.session_id, Some(2))
+            .unwrap();
 
         let reads = db.list_lock_reads().unwrap();
         assert_eq!(reads.len(), 2);
@@ -688,7 +742,7 @@ mod tests {
 
         let reads = db.list_lock_reads().unwrap();
         assert_eq!(reads.len(), 1);
-        assert_eq!(reads[0].0, s2.session_id);
-        assert_eq!(reads[0].2, "/y/b.rs");
+        assert_eq!(reads[0].session_id, s2.session_id);
+        assert_eq!(reads[0].path, "/y/b.rs");
     }
 }

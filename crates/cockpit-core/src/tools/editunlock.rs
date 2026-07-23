@@ -130,9 +130,9 @@ impl Tool for EditunlockTool {
                     return Ok(crate::assistants::identity::tool_refusal(message));
                 }
             };
-        let write_guard = ctx
-            .locks
-            .begin_write(&path, &ctx.agent_id, ctx.session.id)?;
+        let write_guard =
+            ctx.locks
+                .begin_write(&path, &ctx.agent_id, ctx.session.id, self.name())?;
 
         let existing =
             std::fs::read(&path).map_err(|e| anyhow::anyhow!("read `{}`: {e}", path.display()))?;
@@ -627,6 +627,32 @@ mod tests {
             .unwrap();
 
         std::fs::read_to_string(&file).unwrap()
+    }
+
+    #[tokio::test]
+    async fn editunlock_without_prior_read_is_rejected_and_names_editunlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("edit.txt");
+        std::fs::write(&file, "old\n").unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+
+        let err = EditunlockTool
+            .call(
+                serde_json::json!({
+                    "path": "edit.txt",
+                    "old_string": "old",
+                    "new_string": "new",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("readlock it first"), "{msg}");
+        assert!(msg.contains("retry editunlock"), "{msg}");
+        assert!(!msg.contains("retry writeunlock"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
     }
 
     #[test]

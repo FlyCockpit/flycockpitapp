@@ -99,7 +99,7 @@ impl Tool for WriteunlockTool {
         let write_guard = if exists {
             Some(
                 ctx.locks
-                    .begin_write(&path, &ctx.agent_id, ctx.session.id)?,
+                    .begin_write(&path, &ctx.agent_id, ctx.session.id, self.name())?,
             )
         } else {
             None

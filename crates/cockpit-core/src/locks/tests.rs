@@ -369,7 +369,7 @@ fn transfer_agent_locks_moves_holder_and_read_guard() {
     assert_eq!(held[0].agent_id, "Swarm");
     let reads = db.list_lock_reads().unwrap();
     assert_eq!(reads.len(), 1);
-    assert_eq!(reads[0].1, "Swarm");
+    assert_eq!(reads[0].agent_id, "Swarm");
 }
 
 #[test]
@@ -584,9 +584,11 @@ fn write_guard_serializes_two_read_but_unlocked_writers() {
     lm.note_read(&p, "writer-b", sid_b);
     assert!(lm.holder(&p).is_none());
 
-    let guard = lm.begin_write(&p, "writer-a", sid_a).unwrap();
+    let guard = lm
+        .begin_write(&p, "writer-a", sid_a, "writeunlock")
+        .unwrap();
     let err = lm
-        .begin_write(&p, "writer-b", sid_b)
+        .begin_write(&p, "writer-b", sid_b, "writeunlock")
         .unwrap_err()
         .to_string();
 
@@ -598,17 +600,179 @@ fn write_guard_serializes_two_read_but_unlocked_writers() {
 }
 
 #[test]
+fn sequential_read_record_writers_second_write_rejected_as_stale() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("shared.rs");
+    fs::write(&p, "base").unwrap();
+    let (db, sid_a) = setup();
+    let sid_b = db.create_session("p", "/b", "builder").unwrap().session_id;
+    let lm = LockManager::in_memory(db);
+    lm.note_read(&p, "writer-a", sid_a);
+    lm.note_read(&p, "writer-b", sid_b);
+
+    let guard = lm
+        .begin_write(&p, "writer-a", sid_a, "writeunlock")
+        .unwrap();
+    fs::write(&p, "writer-a landed").unwrap();
+    assert!(guard.release_after_write());
+
+    let err = lm
+        .begin_write(&p, "writer-b", sid_b, "writeunlock")
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("changed on disk since you read it"), "{msg}");
+    assert!(msg.contains("readlock it again"), "{msg}");
+    assert!(msg.contains("redo your edit"), "{msg}");
+    assert!(lm.holder(&p).is_none());
+}
+
+#[test]
+fn read_record_write_allowed_when_file_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("same.rs");
+    fs::write(&p, "same").unwrap();
+    let (db, sid) = setup();
+    let lm = LockManager::in_memory(db);
+    lm.note_read(&p, "builder", sid);
+
+    let guard = lm.begin_write(&p, "builder", sid, "writeunlock").unwrap();
+
+    assert_eq!(lm.holder(&p), Some((sid, "builder".to_string())));
+    drop(guard);
+    assert!(lm.holder(&p).is_none());
+}
+
+#[test]
+fn lock_holder_write_skips_staleness_check() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("held.rs");
+    fs::write(&p, "first").unwrap();
+    let (db, sid) = setup();
+    let lm = LockManager::in_memory(db);
+    lm.acquire(&p, "builder", sid).unwrap();
+    fs::write(&p, "external change").unwrap();
+
+    let guard = lm.begin_write(&p, "builder", sid, "writeunlock").unwrap();
+
+    assert_eq!(lm.holder(&p), Some((sid, "builder".to_string())));
+    drop(guard);
+}
+
+#[test]
+fn unknown_read_hash_rejects_write() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("unknown.rs");
+    fs::write(&p, "body").unwrap();
+    let (db, sid) = setup();
+    let lm = LockManager::in_memory(db);
+    lm.note_read(&p, "builder", sid);
+    let canon = std::fs::canonicalize(&p).unwrap();
+    {
+        let mut state = crate::sync::lock_or_recover(&lm.inner);
+        state
+            .read_tracker
+            .get_mut(&(sid, "builder".to_string()))
+            .unwrap()
+            .insert(canon, None);
+    }
+
+    let err = lm
+        .begin_write(&p, "builder", sid, "writeunlock")
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("readlock it again"), "{err}");
+    assert!(err.contains("redo your edit"), "{err}");
+}
+
+#[test]
+fn stale_write_rejection_is_invocation_kind() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("stale.rs");
+    fs::write(&p, "old").unwrap();
+    let (db, sid) = setup();
+    let lm = LockManager::in_memory(db);
+    lm.note_read(&p, "builder", sid);
+    fs::write(&p, "new").unwrap();
+
+    let err = lm
+        .begin_write(&p, "builder", sid, "writeunlock")
+        .unwrap_err();
+
+    assert_eq!(
+        crate::engine::tool::classify_failure(&err),
+        crate::engine::tool::ToolFailKind::Invocation
+    );
+}
+
+#[test]
+fn write_guard_rejections_classify_as_invocation() {
+    let tmp = TempDir::new().unwrap();
+    let held = touch(tmp.path(), "held.rs");
+    let unread = touch(tmp.path(), "unread.rs");
+    let (db, sid) = setup();
+    let lm = LockManager::in_memory(db);
+    lm.acquire(&held, "holder", sid).unwrap();
+
+    let busy_begin = lm
+        .begin_write(&held, "other", sid, "writeunlock")
+        .unwrap_err();
+    let unread_begin = lm
+        .begin_write(&unread, "other", sid, "writeunlock")
+        .unwrap_err();
+    let busy_check = lm.check_write_permitted(&held, "other", sid).unwrap_err();
+    let unread_check = lm.check_write_permitted(&unread, "other", sid).unwrap_err();
+
+    for err in [busy_begin, unread_begin, busy_check, unread_check] {
+        assert_eq!(
+            crate::engine::tool::classify_failure(&err),
+            crate::engine::tool::ToolFailKind::Invocation,
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn read_hash_round_trips_through_lock_reads() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("round.rs");
+    fs::write(&p, "v1").unwrap();
+    let (db, sid) = setup();
+    {
+        let lm = LockManager::in_memory(db.clone());
+        lm.note_read(&p, "builder", sid);
+    }
+
+    let restored = LockManager::from_db(db.clone()).unwrap();
+    let guard = restored
+        .begin_write(&p, "builder", sid, "writeunlock")
+        .unwrap();
+    drop(guard);
+
+    let restored = LockManager::from_db(db).unwrap();
+    fs::write(&p, "v2").unwrap();
+    let err = restored
+        .begin_write(&p, "builder", sid, "writeunlock")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("changed on disk since you read it"), "{err}");
+}
+
+#[test]
 fn missing_path_spellings_normalize_to_existing_parent() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("src");
     fs::create_dir(&dir).unwrap();
     let direct = dir.join("new.rs");
+    fs::write(&direct, "body").unwrap();
     let dotted = dir.join(".").join("new.rs");
     let (db, sid) = setup();
     let lm = LockManager::in_memory(db);
 
     lm.note_read(&direct, "builder", sid);
-    let guard = lm.begin_write(&dotted, "builder", sid).unwrap();
+    let guard = lm
+        .begin_write(&dotted, "builder", sid, "writeunlock")
+        .unwrap();
 
     assert_eq!(lm.holder(&direct), Some((sid, "builder".to_string())));
     assert_eq!(lm.holder(&dotted), Some((sid, "builder".to_string())));
@@ -855,7 +1019,8 @@ fn sweep_skips_path_reacquired_by_other_holder_between_phases() {
 
     let reclaimed = lm
         .sweep_expired_with_hook(now, || {
-            db.lock_acquire_with_read(&canon, "builder", other).unwrap();
+            db.lock_acquire_with_read(&canon, "builder", other, Some(1))
+                .unwrap();
             let mut state = crate::sync::lock_or_recover(&lm.inner);
             state
                 .held
@@ -865,7 +1030,7 @@ fn sweep_skips_path_reacquired_by_other_holder_between_phases() {
                 .read_tracker
                 .entry((other, "builder".to_string()))
                 .or_default()
-                .insert(canon.clone());
+                .insert(canon.clone(), Some(1));
         })
         .unwrap();
 
@@ -893,14 +1058,15 @@ fn sweep_skips_holder_refreshed_between_collect_and_mutate() {
 
     let reclaimed = lm
         .sweep_expired_with_hook(now, || {
-            db.lock_acquire_with_read(&canon, "builder", sid).unwrap();
+            db.lock_acquire_with_read(&canon, "builder", sid, Some(1))
+                .unwrap();
             let mut state = crate::sync::lock_or_recover(&lm.inner);
             state.touched.insert(canon.clone(), now);
             state
                 .read_tracker
                 .entry((sid, "builder".to_string()))
                 .or_default()
-                .insert(canon.clone());
+                .insert(canon.clone(), Some(1));
         })
         .unwrap();
 
@@ -977,7 +1143,7 @@ async fn sweep_returns_only_actually_evicted_count() {
 
     let reclaimed = lm
         .sweep_expired_with_hook(now, || {
-            db.lock_acquire_with_read(&survived_canon, "builder", other)
+            db.lock_acquire_with_read(&survived_canon, "builder", other, Some(1))
                 .unwrap();
             let mut state = crate::sync::lock_or_recover(&lm.inner);
             state
@@ -988,7 +1154,7 @@ async fn sweep_returns_only_actually_evicted_count() {
                 .read_tracker
                 .entry((other, "builder".to_string()))
                 .or_default()
-                .insert(survived_canon.clone());
+                .insert(survived_canon.clone(), Some(1));
         })
         .unwrap();
 
@@ -1135,7 +1301,7 @@ async fn waiter_woken_when_holder_lock_expires() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn acquire_wait_times_out_with_holder_context() {
+async fn wait_timeout_message_is_guidance_shaped() {
     let tmp = TempDir::new().unwrap();
     let p = touch(tmp.path(), "held.rs");
     let (db, sid_a) = setup();
@@ -1159,11 +1325,13 @@ async fn acquire_wait_times_out_with_holder_context() {
     assert!(err.contains("timed out"), "{err}");
     assert!(err.contains("held.rs"), "{err}");
     assert!(err.contains("holder"), "{err}");
+    assert!(err.contains("Work on something else"), "{err}");
+    assert!(err.contains("retry this path later"), "{err}");
     assert_eq!(lm.holder(&p), Some((sid_a, "holder".to_string())));
 }
 
 #[tokio::test(start_paused = true)]
-async fn acquire_wait_reports_wait_for_cycle_with_paths_and_holders() {
+async fn wait_cycle_message_directs_unlock_and_reacquire_in_order() {
     let tmp = TempDir::new().unwrap();
     let a = touch(tmp.path(), "a.rs");
     let b = touch(tmp.path(), "b.rs");
@@ -1199,6 +1367,8 @@ async fn acquire_wait_reports_wait_for_cycle_with_paths_and_holders() {
     assert!(err.contains("agent-b"), "{err}");
     assert!(err.contains("a.rs"), "{err}");
     assert!(err.contains("b.rs"), "{err}");
+    assert!(err.contains("unlock the paths you currently hold"), "{err}");
+    assert!(err.contains("re-acquire them in path order"), "{err}");
     cancel_a.cancel();
     let out = wait_a.await.expect("join").unwrap();
     assert_eq!(out, AcquireWait::Cancelled);

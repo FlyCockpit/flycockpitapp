@@ -283,6 +283,7 @@ CREATE TABLE lock_reads (
     agent_id    TEXT    NOT NULL,
     path        TEXT    NOT NULL,
     read_at     INTEGER NOT NULL,
+    read_hash   INTEGER,
     PRIMARY KEY (session_id, agent_id, path),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );

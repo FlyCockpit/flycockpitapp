@@ -34,7 +34,9 @@ impl LockManager {
         state.waiting.insert(waiter.clone(), edge);
         if let Some(cycle) = wait_cycle(&state, waiter) {
             state.waiting.remove(waiter);
-            bail!("lock wait cycle detected: {cycle}");
+            bail!(
+                "lock wait cycle detected: {cycle}. Do not keep waiting on this cycle; unlock the paths you currently hold, then re-acquire them in path order before retrying."
+            );
         }
         Ok(())
     }

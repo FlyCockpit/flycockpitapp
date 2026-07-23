@@ -16,12 +16,12 @@ impl LockManager {
             state.held.insert(path, (row.session_id, row.agent_id));
         }
 
-        for (session_id, agent_id, path) in db.list_lock_reads().context("loading lock reads")? {
+        for row in db.list_lock_reads().context("loading lock reads")? {
             state
                 .read_tracker
-                .entry((session_id, agent_id))
+                .entry((row.session_id, row.agent_id))
                 .or_default()
-                .insert(PathBuf::from(path));
+                .insert(PathBuf::from(row.path), row.read_hash);
         }
 
         Ok(Self {
@@ -55,6 +55,7 @@ impl LockManager {
     #[allow(dead_code)]
     pub fn acquire(&self, path: &Path, agent: &str, session: Uuid) -> Result<()> {
         let canon = canonicalize(path);
+        let read_hash = file_hash(&canon);
         let mut state = crate::sync::lock_or_recover(&self.inner);
         match state.held.get(&canon) {
             Some((s, a)) if *s == session && a == agent => return Ok(()),
@@ -72,7 +73,7 @@ impl LockManager {
             .read_tracker
             .entry((session, agent.to_string()))
             .or_default()
-            .insert(canon.clone());
+            .insert(canon.clone(), read_hash);
         let was_forced_released = state.forced_released.contains(&canon);
 
         // Persist before returning so a crash here doesn't leak the
@@ -80,11 +81,11 @@ impl LockManager {
         drop(state);
         let acquire_result = if was_forced_released {
             self.db
-                .lock_force_acquire_with_read(&canon, agent, session)
+                .lock_force_acquire_with_read(&canon, agent, session, read_hash)
                 .context("persisting forced lock_acquire/read")
         } else {
             self.db
-                .lock_acquire_with_read(&canon, agent, session)
+                .lock_acquire_with_read(&canon, agent, session, read_hash)
                 .context("persisting lock_acquire/read")
         };
         if let Err(error) = acquire_result {
@@ -119,6 +120,7 @@ impl LockManager {
         agent: &str,
         session: Uuid,
     ) -> Result<Option<(Uuid, AgentId)>> {
+        let read_hash = file_hash(canon);
         let mut state = crate::sync::lock_or_recover(&self.inner);
         match state.held.get(canon) {
             Some((s, a)) if *s == session && a == agent => return Ok(None),
@@ -133,16 +135,16 @@ impl LockManager {
             .read_tracker
             .entry((session, agent.to_string()))
             .or_default()
-            .insert(canon.to_path_buf());
+            .insert(canon.to_path_buf(), read_hash);
         let was_forced_released = state.forced_released.contains(canon);
         drop(state);
         let acquire_result = if was_forced_released {
             self.db
-                .lock_force_acquire_with_read(canon, agent, session)
+                .lock_force_acquire_with_read(canon, agent, session, read_hash)
                 .context("persisting forced lock_acquire/read")
         } else {
             self.db
-                .lock_acquire_with_read(canon, agent, session)
+                .lock_acquire_with_read(canon, agent, session, read_hash)
                 .context("persisting lock_acquire/read")
         };
         if let Err(error) = acquire_result {
@@ -244,7 +246,10 @@ impl LockManager {
                 _ = tokio::time::sleep(LOCK_WAIT_TIMEOUT) => {
                     let context = self.wait_context(&waiter_key);
                     self.clear_waiter(&waiter_key);
-                    bail!("lock wait timed out after {}s{context}", LOCK_WAIT_TIMEOUT.as_secs());
+                    bail!(
+                        "lock wait timed out after {}s{context}. Work on something else and retry this path later instead of immediately re-issuing the same readlock.",
+                        LOCK_WAIT_TIMEOUT.as_secs()
+                    );
                 }
                 _ = &mut notified => {}
             }
@@ -478,7 +483,8 @@ impl LockManager {
     /// subsequent `writeunlock` is permitted.
     pub fn note_read(&self, path: &Path, agent: &str, session: Uuid) {
         let canon = canonicalize(path);
-        if let Err(e) = self.db.lock_note_read(&canon, agent, session) {
+        let read_hash = file_hash(&canon);
+        if let Err(e) = self.db.lock_note_read(&canon, agent, session, read_hash) {
             tracing::warn!(error = %e, "persisting note_read failed");
             return;
         }
@@ -488,7 +494,7 @@ impl LockManager {
                 .read_tracker
                 .entry((session, agent.to_string()))
                 .or_default()
-                .insert(canon.clone());
+                .insert(canon.clone(), read_hash);
         }
     }
 
@@ -502,7 +508,7 @@ impl LockManager {
         state
             .read_tracker
             .get(&(session, agent.to_string()))
-            .map(|s| s.contains(&canon))
+            .map(|s| s.contains_key(&canon))
             .unwrap_or(false)
     }
 
@@ -528,6 +534,7 @@ impl LockManager {
         path: &Path,
         agent: &str,
         session: Uuid,
+        tool_name: &str,
     ) -> Result<WriteGuard<'a>> {
         let canon = canonicalize(path);
         let agent_id = agent.to_string();
@@ -536,21 +543,30 @@ impl LockManager {
             let mut state = crate::sync::lock_or_recover(&self.inner);
             match state.held.get(&canon) {
                 Some((s, a)) if *s == session && a == agent => {}
-                Some((s, a)) => bail!(
-                    "cannot write `{}` — `{a}` holds the lock in session {s}; wait for it to release or pick a different file",
-                    canon.display()
-                ),
+                Some((s, a)) => {
+                    return Err(crate::engine::tool::invalid_input(format!(
+                        "cannot write `{}` — `{a}` holds the lock in session {s}; wait for it to release or pick a different file",
+                        canon.display()
+                    )));
+                }
                 None => {
-                    let has_read = state
+                    let read_hash = state
                         .read_tracker
                         .get(&(session, agent_id.clone()))
-                        .map(|s| s.contains(&canon))
-                        .unwrap_or(false);
-                    if !has_read {
-                        bail!(
-                            "{}",
-                            ValidationCorrection::write_requires_readlock(&canon).model_message()
-                        );
+                        .and_then(|s| s.get(&canon).copied());
+                    match read_hash {
+                        None => {
+                            return Err(crate::engine::tool::invalid_input(
+                                ValidationCorrection::write_requires_readlock(&canon, tool_name)
+                                    .model_message(),
+                            ));
+                        }
+                        Some(Some(expected)) if file_hash(&canon) == Some(expected) => {}
+                        Some(_) => {
+                            return Err(crate::engine::tool::invalid_input(stale_read_message(
+                                &canon,
+                            )));
+                        }
                     }
                     state
                         .held
@@ -624,29 +640,48 @@ impl LockManager {
     /// in this session). Returns `Ok(())` if the write is permitted.
     #[allow(dead_code)]
     pub fn check_write_permitted(&self, path: &Path, agent: &str, session: Uuid) -> Result<()> {
+        self.check_write_permitted_for_tool(path, agent, session, "writeunlock")
+    }
+
+    #[allow(dead_code)]
+    pub fn check_write_permitted_for_tool(
+        &self,
+        path: &Path,
+        agent: &str,
+        session: Uuid,
+        tool_name: &str,
+    ) -> Result<()> {
         let canon = canonicalize(path);
         let state = crate::sync::lock_or_recover(&self.inner);
         match state.held.get(&canon) {
             Some((s, a)) if *s == session && a == agent => Ok(()),
-            Some((_, a)) => bail!(
+            Some((_, a)) => Err(crate::engine::tool::invalid_input(format!(
                 "cannot write `{}` — `{a}` holds the lock; wait for it to release or pick a different file",
                 canon.display()
-            ),
+            ))),
             None => {
-                let has_read = state
+                let read_hash = state
                     .read_tracker
                     .get(&(session, agent.to_string()))
-                    .map(|s| s.contains(&canon))
-                    .unwrap_or(false);
-                if has_read {
-                    Ok(())
-                } else {
-                    bail!(
-                        "{}",
-                        ValidationCorrection::write_requires_readlock(&canon).model_message()
-                    )
+                    .and_then(|s| s.get(&canon).copied());
+                match read_hash {
+                    None => Err(crate::engine::tool::invalid_input(
+                        ValidationCorrection::write_requires_readlock(&canon, tool_name)
+                            .model_message(),
+                    )),
+                    Some(Some(expected)) if file_hash(&canon) == Some(expected) => Ok(()),
+                    Some(_) => Err(crate::engine::tool::invalid_input(stale_read_message(
+                        &canon,
+                    ))),
                 }
             }
         }
     }
+}
+
+fn stale_read_message(path: &Path) -> String {
+    format!(
+        "cannot write `{}`: it changed on disk since you read it — readlock it again, re-check the current contents, and redo your edit",
+        path.display()
+    )
 }

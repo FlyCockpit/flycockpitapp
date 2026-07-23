@@ -324,7 +324,7 @@ mod tests {
 
         let guard = ctx
             .locks
-            .begin_write(&target, &ctx.agent_id, ctx.session.id)
+            .begin_write(&target, &ctx.agent_id, ctx.session.id, "writeunlock")
             .unwrap();
 
         let err = write_and_release(&ctx, &target, b"new", guard).unwrap_err();

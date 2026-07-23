@@ -27,7 +27,7 @@ pub(super) struct ParkedReplayCompletion {
     interrupt_id: uuid::Uuid,
     decision: Option<proto::InterruptDecision>,
     was_active: bool,
-    result: std::result::Result<(), String>,
+    result: std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
 }
 
 pub(super) fn redaction_failed_interrupt_decision_payload(
@@ -95,30 +95,42 @@ pub(super) fn finish_parked_replay_completion(
     session_id: uuid::Uuid,
     completion: ParkedReplayCompletion,
 ) {
-    if let Err(error) = completion.result {
-        let _ = session
-            .db
-            .mark_interrupt_interrupted(completion.interrupt_id);
-        tracing::warn!(
-            %error,
+    let outcome = match completion.result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = session
+                .db
+                .mark_interrupt_interrupted(completion.interrupt_id);
+            tracing::warn!(
+                %error,
+                interrupt_id = %completion.interrupt_id,
+                "parked interrupt replay failed"
+            );
+            send_current_session_event(
+                session,
+                event_tx,
+                redaction,
+                proto::Event::Notice {
+                    session_id,
+                    text: format!(
+                        "Interrupted parked request {}: {error}",
+                        completion.interrupt_id
+                    ),
+                },
+                NoticeSource::DaemonDirect,
+            );
+            interrupts.emit_queue_state();
+            return;
+        }
+    };
+    if matches!(
+        outcome,
+        crate::engine::driver::ParkedReplayOutcome::ParkedAgain
+    ) {
+        tracing::debug!(
             interrupt_id = %completion.interrupt_id,
-            "parked interrupt replay failed"
+            "parked interrupt replay parked on a later prompt"
         );
-        send_current_session_event(
-            session,
-            event_tx,
-            redaction,
-            proto::Event::Notice {
-                session_id,
-                text: format!(
-                    "Interrupted parked request {}: {error}",
-                    completion.interrupt_id
-                ),
-            },
-            NoticeSource::DaemonDirect,
-        );
-        interrupts.emit_queue_state();
-        return;
     }
     if let Err(error) = session
         .db
@@ -143,6 +155,13 @@ pub(super) fn finish_parked_replay_completion(
             seq,
         },
     );
+    if matches!(
+        outcome,
+        crate::engine::driver::ParkedReplayOutcome::ParkedAgain
+    ) {
+        interrupts.emit_active_from_db();
+        return;
+    }
     if completion.was_active {
         interrupts.emit_active_from_db();
     } else {
@@ -1201,6 +1220,49 @@ pub(super) async fn run_worker(
                             interrupts.emit_queue_state();
                             continue;
                         };
+                        let Some(questions) = row.questions.clone().or_else(|| {
+                            row.question.clone().map(|question| {
+                                crate::daemon::proto::InterruptQuestionSet {
+                                    questions: vec![question],
+                                }
+                            })
+                        }) else {
+                            let _ = session.db.mark_interrupt_interrupted(interrupt_id);
+                            send_current_session_event(
+                                &session,
+                                &event_tx,
+                                &redaction,
+                                proto::Event::Notice {
+                                    session_id,
+                                    text: format!(
+                                        "Interrupted parked request {interrupt_id}: missing replay question."
+                                    ),
+                                },
+                                NoticeSource::DaemonDirect,
+                            );
+                            interrupts.emit_queue_state();
+                            continue;
+                        };
+                        let occurrence = match session
+                            .db
+                            .interrupt_question_occurrence(interrupt_id)
+                        {
+                            Ok(occurrence) => occurrence,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    %interrupt_id,
+                                    "failed to compute parked interrupt replay occurrence; using first occurrence"
+                                );
+                                1
+                            }
+                        };
+                        let question = crate::engine::interrupt::PreResolvedInterruptQuestion {
+                            agent: row.agent_id.clone(),
+                            description: row.description.clone(),
+                            questions,
+                            occurrence,
+                        };
                         let driver_control_tx = driver_control_tx.clone();
                         let replay_completion_tx = replay_completion_tx.clone();
                         let replay_response = response.clone();
@@ -1210,8 +1272,9 @@ pub(super) async fn run_worker(
                                 .send(
                                     crate::engine::driver::DriverControl::ReplayParkedInterrupt {
                                         interrupt_id,
-                                        payload,
+                                        payload: Box::new(payload),
                                         response: replay_response,
+                                        question: Box::new(question),
                                         respond_to,
                                     },
                                 )

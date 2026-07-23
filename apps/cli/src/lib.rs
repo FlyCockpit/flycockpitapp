@@ -309,6 +309,16 @@ pub mod integration {
             .await
         }
 
+        pub async fn approve_interrupt_project(&self, interrupt_id: Uuid) -> Result<()> {
+            self.resolve_interrupt(
+                interrupt_id,
+                crate::daemon::proto::ResolveResponse::Single {
+                    selected_id: crate::approval::ID_APPROVE_PROJECT.to_string(),
+                },
+            )
+            .await
+        }
+
         pub async fn deny_interrupt(&self, interrupt_id: Uuid) -> Result<()> {
             self.resolve_interrupt(
                 interrupt_id,

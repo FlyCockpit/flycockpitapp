@@ -391,6 +391,7 @@ mod tests {
                 assistant_seq: None,
                 call_origin: ctx.skill_write_origin,
             },
+            gate: None,
         };
         let task_ctx = ctx.clone();
         let task = tokio::spawn(async move {
@@ -424,6 +425,62 @@ mod tests {
                 "content": "Apply the guarded workflow."
             }
         })
+    }
+
+    fn replay_question_from_row(
+        db: &crate::db::Db,
+        interrupt_id: uuid::Uuid,
+    ) -> crate::engine::interrupt::PreResolvedInterruptQuestion {
+        let row = db
+            .get_interrupt(interrupt_id)
+            .unwrap()
+            .expect("parked skill approval row");
+        crate::engine::interrupt::PreResolvedInterruptQuestion {
+            agent: row.agent_id,
+            description: row.description,
+            questions: row.questions.expect("parked skill approval question set"),
+            occurrence: 1,
+        }
+    }
+
+    fn skill_write_replay_question(
+        ctx: &ToolCtx,
+        args: &Value,
+    ) -> crate::engine::interrupt::PreResolvedInterruptQuestion {
+        let args: SkillManageArgs = typed_args(args.clone()).unwrap();
+        let question = InterruptQuestion::Single {
+            prompt: format!(
+                "Allow skill {:?} for `{}`? The exact tool call will be replayed only if approved.",
+                args.action, args.name
+            ),
+            options: vec![
+                InterruptOption {
+                    id: crate::approval::ID_APPROVE.to_string(),
+                    label: "Allow once".to_string(),
+                    description: Some("Apply this exact skill mutation".to_string()),
+                    secondary: false,
+                },
+                InterruptOption {
+                    id: crate::approval::ID_REJECT.to_string(),
+                    label: "Deny".to_string(),
+                    description: Some("Leave the skill library unchanged".to_string()),
+                    secondary: false,
+                },
+            ],
+            allow_freetext: false,
+            command_detail: None,
+            permission: true,
+            approval_class: None,
+            sandbox_escalation: None,
+        };
+        crate::engine::interrupt::PreResolvedInterruptQuestion {
+            agent: ctx.agent_id.clone(),
+            description: format!("Skill write: {:?} `{}`", args.action, args.name),
+            questions: InterruptQuestionSet {
+                questions: vec![question],
+            },
+            occurrence: 1,
+        }
     }
 
     fn edit_value(name: &str, body: &str) -> Value {
@@ -718,11 +775,13 @@ mod tests {
                 .await;
 
         assert!(!root.join("default-gated/SKILL.md").exists());
-        let output = crate::engine::interrupt::with_pre_resolved_interrupt(
+        let question = replay_question_from_row(&db, interrupt_id);
+        let output = crate::engine::interrupt::with_pre_resolved_interrupt_question(
             interrupt_id,
             ResolveResponse::Single {
                 selected_id: crate::approval::ID_APPROVE.to_string(),
             },
+            question,
             SkillManageTool.call(args, &ctx),
         )
         .await
@@ -990,6 +1049,7 @@ mod tests {
                 assistant_seq: None,
                 call_origin: ctx.skill_write_origin,
             },
+            gate: None,
         };
         let task_ctx = ctx.clone();
         let task_args = args.clone();
@@ -1015,11 +1075,13 @@ mod tests {
         assert_eq!(parked.tool, "skill_manage");
         assert_eq!(parked.args, args);
 
-        let output = crate::engine::interrupt::with_pre_resolved_interrupt(
+        let question = replay_question_from_row(&db, interrupt_id);
+        let output = crate::engine::interrupt::with_pre_resolved_interrupt_question(
             interrupt_id,
             ResolveResponse::Single {
                 selected_id: crate::approval::ID_APPROVE.to_string(),
             },
+            question,
             SkillManageTool.call(args, &ctx),
         )
         .await
@@ -1036,11 +1098,14 @@ mod tests {
             .config =
             crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
         let denied_args = create_value("denied-after-config-drift");
-        let denied = crate::engine::interrupt::with_pre_resolved_interrupt(
-            uuid::Uuid::new_v4(),
+        let denied_id = uuid::Uuid::new_v4();
+        let denied_question = skill_write_replay_question(&ctx, &denied_args);
+        let denied = crate::engine::interrupt::with_pre_resolved_interrupt_question(
+            denied_id,
             ResolveResponse::Single {
                 selected_id: crate::approval::ID_REJECT.to_string(),
             },
+            denied_question,
             SkillManageTool.call(denied_args, &ctx),
         )
         .await

@@ -49,22 +49,53 @@ use crate::daemon::{EventSender, SharedRedactionTable, send_current_event};
 use crate::db::needs_attention::InterruptParkPayload;
 
 tokio::task_local! {
-    static CURRENT_INTERRUPT_PARK_PAYLOAD: InterruptParkPayload;
+    static CURRENT_INTERRUPT_PARK_PAYLOAD: RefCell<InterruptParkPayload>;
 }
 
 tokio::task_local! {
-    static CURRENT_PRE_RESOLVED_INTERRUPT: RefCell<Option<(Uuid, ResolveResponse)>>;
+    static CURRENT_PRE_RESOLVED_INTERRUPTS: RefCell<PreResolvedInterrupts>;
+}
+
+#[derive(Debug, Clone)]
+pub struct PreResolvedInterruptQuestion {
+    pub agent: String,
+    pub description: String,
+    pub questions: InterruptQuestionSet,
+    pub occurrence: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreResolvedInterrupt {
+    pub interrupt_id: Uuid,
+    pub response: ResolveResponse,
+    pub question: Option<PreResolvedInterruptQuestion>,
+}
+
+#[derive(Debug, Default)]
+struct PreResolvedInterrupts {
+    answers: HashMap<Uuid, PreResolvedInterrupt>,
+    seen_questions: HashMap<String, usize>,
 }
 
 pub async fn with_interrupt_park_payload<F>(payload: InterruptParkPayload, fut: F) -> F::Output
 where
     F: std::future::Future,
 {
-    CURRENT_INTERRUPT_PARK_PAYLOAD.scope(payload, fut).await
+    CURRENT_INTERRUPT_PARK_PAYLOAD
+        .scope(RefCell::new(payload), fut)
+        .await
 }
 
 pub fn current_interrupt_park_payload() -> Option<InterruptParkPayload> {
-    CURRENT_INTERRUPT_PARK_PAYLOAD.try_with(Clone::clone).ok()
+    CURRENT_INTERRUPT_PARK_PAYLOAD
+        .try_with(|payload| payload.borrow().clone())
+        .ok()
+}
+
+pub fn set_current_interrupt_gate_memo(gate: crate::db::needs_attention::InterruptGateMemo) {
+    let _ = CURRENT_INTERRUPT_PARK_PAYLOAD.try_with(|payload| {
+        payload.borrow_mut().gate = Some(gate);
+    });
 }
 
 pub async fn with_pre_resolved_interrupt<F>(
@@ -75,24 +106,143 @@ pub async fn with_pre_resolved_interrupt<F>(
 where
     F: std::future::Future,
 {
-    CURRENT_PRE_RESOLVED_INTERRUPT
-        .scope(RefCell::new(Some((interrupt_id, response))), fut)
+    with_pre_resolved_interrupts(
+        vec![PreResolvedInterrupt {
+            interrupt_id,
+            response,
+            question: None,
+        }],
+        fut,
+    )
+    .await
+}
+
+pub async fn with_pre_resolved_interrupt_question<F>(
+    interrupt_id: Uuid,
+    response: ResolveResponse,
+    question: PreResolvedInterruptQuestion,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    with_pre_resolved_interrupts(
+        vec![PreResolvedInterrupt {
+            interrupt_id,
+            response,
+            question: Some(question),
+        }],
+        fut,
+    )
+    .await
+}
+
+pub async fn with_pre_resolved_interrupts<F>(
+    interrupts: Vec<PreResolvedInterrupt>,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    let answers = interrupts
+        .into_iter()
+        .map(|entry| (entry.interrupt_id, entry))
+        .collect();
+    CURRENT_PRE_RESOLVED_INTERRUPTS
+        .scope(
+            RefCell::new(PreResolvedInterrupts {
+                answers,
+                seen_questions: HashMap::new(),
+            }),
+            async {
+                let output = fut.await;
+                discard_unconsumed_pre_resolved_interrupts();
+                output
+            },
+        )
         .await
 }
 
-fn take_pre_resolved_interrupt() -> Option<(Uuid, ResolveResponse)> {
-    CURRENT_PRE_RESOLVED_INTERRUPT
-        .try_with(|slot| slot.borrow_mut().take())
+fn take_matching_pre_resolved_interrupt(
+    agent: &str,
+    description: &str,
+    questions: &InterruptQuestionSet,
+) -> Option<(Uuid, ResolveResponse)> {
+    let interrupt_id = matching_pre_resolved_interrupt_id(agent, description, questions)?;
+    take_pre_resolved_interrupt(interrupt_id).map(|response| (interrupt_id, response))
+}
+
+fn matching_pre_resolved_interrupt_id(
+    agent: &str,
+    description: &str,
+    questions: &InterruptQuestionSet,
+) -> Option<Uuid> {
+    CURRENT_PRE_RESOLVED_INTERRUPTS
+        .try_with(|slot| {
+            let mut state = slot.borrow_mut();
+            let key = question_key(agent, description, questions)?;
+            let occurrence = {
+                let seen = state.seen_questions.entry(key.clone()).or_default();
+                *seen += 1;
+                *seen
+            };
+            state.answers.iter().find_map(|(interrupt_id, entry)| {
+                let question = entry.question.as_ref()?;
+                (question.occurrence == occurrence
+                    && question_key(&question.agent, &question.description, &question.questions)
+                        .as_deref()
+                        == Some(key.as_str()))
+                .then_some(*interrupt_id)
+            })
+        })
         .ok()
         .flatten()
+}
+
+fn take_pre_resolved_interrupt(interrupt_id: Uuid) -> Option<ResolveResponse> {
+    CURRENT_PRE_RESOLVED_INTERRUPTS
+        .try_with(|slot| {
+            slot.borrow_mut()
+                .answers
+                .remove(&interrupt_id)
+                .map(|entry| entry.response)
+        })
+        .ok()
+        .flatten()
+}
+
+fn question_key(
+    agent: &str,
+    description: &str,
+    questions: &InterruptQuestionSet,
+) -> Option<String> {
+    serde_json::to_string(&serde_json::json!({
+        "agent": agent,
+        "description": description,
+        "questions": questions,
+    }))
+    .ok()
+}
+
+fn discard_unconsumed_pre_resolved_interrupts() {
+    let _ = CURRENT_PRE_RESOLVED_INTERRUPTS.try_with(|slot| {
+        let mut state = slot.borrow_mut();
+        for interrupt_id in state.answers.keys() {
+            tracing::warn!(
+                %interrupt_id,
+                "pre-resolved interrupt answer was not consumed during replay"
+            );
+        }
+        state.answers.clear();
+    });
 }
 
 /// Whether the current tool invocation is replaying a previously parked
 /// interrupt. Tools with config-controlled gates must still consume this
 /// decision even if their configuration changed while the call was parked.
 pub fn pre_resolved_interrupt_pending() -> bool {
-    CURRENT_PRE_RESOLVED_INTERRUPT
-        .try_with(|slot| slot.borrow().is_some())
+    CURRENT_PRE_RESOLVED_INTERRUPTS
+        .try_with(|slot| !slot.borrow().answers.is_empty())
         .unwrap_or(false)
 }
 
@@ -450,7 +600,9 @@ pub async fn raise_and_wait(
     set: InterruptQuestionSet,
     log_label: &str,
 ) -> InterruptOutcome {
-    if let Some((_interrupt_id, response)) = take_pre_resolved_interrupt() {
+    if let Some((_interrupt_id, response)) =
+        take_matching_pre_resolved_interrupt(agent, description, &set)
+    {
         return InterruptOutcome::Resolved(response);
     }
     let payload = current_interrupt_park_payload();
@@ -598,7 +750,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_resolved_replay_answer_is_consumed_once() {
+    async fn interrupt_replay_answer_requires_matching_id() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "builder").unwrap();
         let (hub, _events) = attached_hub(db.clone(), session.session_id);
@@ -618,14 +770,14 @@ mod tests {
                         .resolve_interrupt(
                             row.interrupt_id,
                             &ResolveResponse::Single {
-                                selected_id: "second".into(),
+                                selected_id: "first-live".into(),
                             },
                         )
                         .unwrap();
                     assert!(resolver_hub.resolve(
                         row.interrupt_id,
                         ResolveResponse::Single {
-                            selected_id: "second".into(),
+                            selected_id: "first-live".into(),
                         }
                     ));
                     break;
@@ -634,12 +786,24 @@ mod tests {
             }
         });
 
-        let (first, second) = with_pre_resolved_interrupt(
-            Uuid::new_v4(),
+        let stored_id = Uuid::new_v4();
+        let wrong_id = Uuid::new_v4();
+        let (first, second) = with_pre_resolved_interrupt_question(
+            stored_id,
             ResolveResponse::Single {
-                selected_id: "first".into(),
+                selected_id: "second-stored".into(),
+            },
+            PreResolvedInterruptQuestion {
+                agent: "builder".into(),
+                description: "second".into(),
+                questions: question_set(),
+                occurrence: 1,
             },
             async {
+                assert!(
+                    take_pre_resolved_interrupt(wrong_id).is_none(),
+                    "a different interrupt id must not consume the stored answer"
+                );
                 let first = raise_and_wait(
                     &db,
                     &hub,
@@ -650,6 +814,10 @@ mod tests {
                     "test",
                 )
                 .await;
+                assert!(
+                    pre_resolved_interrupt_pending(),
+                    "the non-matching live raise must leave the stored answer available"
+                );
                 let second = raise_and_wait(
                     &db,
                     &hub,
@@ -666,10 +834,229 @@ mod tests {
         .await;
 
         assert!(
-            matches!(first, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "first")
+            matches!(first, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "first-live")
         );
         assert!(
-            matches!(second, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "second")
+            matches!(second, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "second-stored")
+        );
+        assert_eq!(
+            db.list_open_interrupts(session.session_id).unwrap().len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_replay_multiple_parked_answers_keyed_by_id() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let hub = Arc::new(hub);
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+
+        let (second, first) = with_pre_resolved_interrupts(
+            vec![
+                PreResolvedInterrupt {
+                    interrupt_id: first_id,
+                    response: ResolveResponse::Single {
+                        selected_id: "first-stored".into(),
+                    },
+                    question: Some(PreResolvedInterruptQuestion {
+                        agent: "builder".into(),
+                        description: "first".into(),
+                        questions: question_set(),
+                        occurrence: 1,
+                    }),
+                },
+                PreResolvedInterrupt {
+                    interrupt_id: second_id,
+                    response: ResolveResponse::Single {
+                        selected_id: "second-stored".into(),
+                    },
+                    question: Some(PreResolvedInterruptQuestion {
+                        agent: "builder".into(),
+                        description: "second".into(),
+                        questions: question_set(),
+                        occurrence: 1,
+                    }),
+                },
+            ],
+            async {
+                let second = raise_and_wait(
+                    &db,
+                    &hub,
+                    session.session_id,
+                    "builder",
+                    "second",
+                    question_set(),
+                    "test",
+                )
+                .await;
+                let first = raise_and_wait(
+                    &db,
+                    &hub,
+                    session.session_id,
+                    "builder",
+                    "first",
+                    question_set(),
+                    "test",
+                )
+                .await;
+                (second, first)
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(second, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "second-stored")
+        );
+        assert!(
+            matches!(first, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "first-stored")
+        );
+        assert_eq!(
+            db.list_open_interrupts(session.session_id).unwrap().len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_replay_duplicate_prompt_shape_uses_persisted_occurrence() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let hub = Arc::new(hub);
+        let resolver_db = db.clone();
+        let resolver_hub = hub.clone();
+        let session_id = session.session_id;
+        tokio::spawn(async move {
+            loop {
+                if let Some(row) = resolver_db
+                    .list_open_interrupts(session_id)
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                {
+                    let response = ResolveResponse::Single {
+                        selected_id: "first-live".into(),
+                    };
+                    resolver_db
+                        .resolve_interrupt(row.interrupt_id, &response)
+                        .unwrap();
+                    assert!(resolver_hub.resolve(row.interrupt_id, response));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        let stored_id = Uuid::new_v4();
+        let (first, second) = with_pre_resolved_interrupt_question(
+            stored_id,
+            ResolveResponse::Single {
+                selected_id: "second-stored".into(),
+            },
+            PreResolvedInterruptQuestion {
+                agent: "builder".into(),
+                description: "same prompt".into(),
+                questions: question_set(),
+                occurrence: 2,
+            },
+            async {
+                let first = raise_and_wait(
+                    &db,
+                    &hub,
+                    session.session_id,
+                    "builder",
+                    "same prompt",
+                    question_set(),
+                    "test",
+                )
+                .await;
+                assert!(
+                    pre_resolved_interrupt_pending(),
+                    "first identical raise must not consume the second occurrence answer"
+                );
+                let second = raise_and_wait(
+                    &db,
+                    &hub,
+                    session.session_id,
+                    "builder",
+                    "same prompt",
+                    question_set(),
+                    "test",
+                )
+                .await;
+                (first, second)
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(first, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "first-live")
+        );
+        assert!(
+            matches!(second, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "second-stored")
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_replay_unconsumed_answer_discarded() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let hub = Arc::new(hub);
+        let resolver_db = db.clone();
+        let resolver_hub = hub.clone();
+        let session_id = session.session_id;
+        tokio::spawn(async move {
+            loop {
+                if let Some(row) = resolver_db
+                    .list_open_interrupts(session_id)
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                {
+                    let response = ResolveResponse::Single {
+                        selected_id: "live".into(),
+                    };
+                    resolver_db
+                        .resolve_interrupt(row.interrupt_id, &response)
+                        .unwrap();
+                    assert!(resolver_hub.resolve(row.interrupt_id, response));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        let resolved = with_pre_resolved_interrupt_question(
+            Uuid::new_v4(),
+            ResolveResponse::Single {
+                selected_id: "stale".into(),
+            },
+            PreResolvedInterruptQuestion {
+                agent: "builder".into(),
+                description: "never raised".into(),
+                questions: question_set(),
+                occurrence: 1,
+            },
+            async {
+                raise_and_wait(
+                    &db,
+                    &hub,
+                    session.session_id,
+                    "builder",
+                    "live prompt",
+                    question_set(),
+                    "test",
+                )
+                .await
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(resolved, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "live")
         );
         assert_eq!(
             db.list_open_interrupts(session.session_id).unwrap().len(),

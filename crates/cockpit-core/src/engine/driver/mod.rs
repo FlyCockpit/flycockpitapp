@@ -93,9 +93,10 @@ pub enum DriverControl {
     /// interrupt seam so approval/question behavior matches the live path.
     ReplayParkedInterrupt {
         interrupt_id: uuid::Uuid,
-        payload: crate::db::needs_attention::InterruptParkPayload,
+        payload: Box<crate::db::needs_attention::InterruptParkPayload>,
         response: crate::daemon::proto::ResolveResponse,
-        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+        question: Box<crate::engine::interrupt::PreResolvedInterruptQuestion>,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<ParkedReplayOutcome, String>>,
     },
     /// Swap the **primary** (root-frame) agent in place (`/plan` → `Plan`,
     /// `/build` → `Build`, `plan.md §4.6.d`). Handled at the idle boundary
@@ -177,6 +178,12 @@ pub enum DriverControl {
     SetTandemModels {
         targets: Vec<crate::engine::schedule::TandemTarget>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkedReplayOutcome {
+    Completed,
+    ParkedAgain,
 }
 
 /// Maximum number of queued user messages to fold into a single
@@ -2367,6 +2374,7 @@ impl Driver {
         interrupt_id: uuid::Uuid,
         payload: crate::db::needs_attention::InterruptParkPayload,
         response: crate::daemon::proto::ResolveResponse,
+        question: crate::engine::interrupt::PreResolvedInterruptQuestion,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
         use rig::message::ToolFunction;
@@ -2461,18 +2469,26 @@ impl Driver {
             loop_guard_threshold: self.loop_guard_threshold,
             cwd: &self.cwd,
         };
-        crate::engine::interrupt::with_pre_resolved_interrupt(interrupt_id, response, async {
-            let frame = self.stack.last_mut().context("driver stack is empty")?;
-            crate::engine::agent::tool_dispatch::execute_ordinary_call(
-                &env,
-                &mut frame.history,
-                &call,
-                &payload.tool,
-                crate::db::tool_calls::Recovery::Clean,
-                None,
-            )
-            .await
-        })
+        crate::engine::interrupt::with_pre_resolved_interrupt_question(
+            interrupt_id,
+            response,
+            question,
+            async {
+                let frame = self.stack.last_mut().context("driver stack is empty")?;
+                crate::engine::interrupt::with_interrupt_park_payload(payload.clone(), async {
+                    crate::engine::agent::tool_dispatch::execute_ordinary_call(
+                        &env,
+                        &mut frame.history,
+                        &call,
+                        &payload.tool,
+                        crate::db::tool_calls::Recovery::Clean,
+                        None,
+                    )
+                    .await
+                })
+                .await
+            },
+        )
         .await
     }
 
@@ -3062,15 +3078,31 @@ impl Driver {
                 interrupt_id,
                 payload,
                 response,
+                question,
                 respond_to,
             } => {
-                let result = async {
-                    self.replay_parked_interrupt_call(interrupt_id, payload, response, tx)
-                        .await?;
-                    self.continue_after_parked_interrupt_replay(input_queue, tx)
-                        .await
-                }
+                let result = match Box::pin(self.replay_parked_interrupt_call(
+                    interrupt_id,
+                    *payload,
+                    response,
+                    *question,
+                    tx,
+                ))
                 .await
+                {
+                    Ok(()) => {
+                        async {
+                            self.continue_after_parked_interrupt_replay(input_queue, tx)
+                                .await?;
+                            Ok(ParkedReplayOutcome::Completed)
+                        }
+                        .await
+                    }
+                    Err(error) if crate::engine::interrupt::is_parked(&error) => {
+                        Ok(ParkedReplayOutcome::ParkedAgain)
+                    }
+                    Err(error) => Err(error),
+                }
                 .map_err(|error| format!("{error:#}"));
                 let _ = respond_to.send(result);
             }

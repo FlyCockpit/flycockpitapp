@@ -15,7 +15,7 @@
 -- Exact identity for the amended pre-release squash. Unlike the
 -- `schema_version` migration ledger, this changes whenever 0001 is amended so
 -- an older development database cannot silently masquerade as current.
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 
 -- ---- assistants ------------------------------------------------------------
 
@@ -309,6 +309,7 @@ CREATE TABLE needs_attention (
     parked_args_json TEXT,                          -- verbatim replay wire args; same exposure boundary as session_events.wire_input_json
     parked_call_id TEXT,                            -- assistant tool-call id for parked replay, or NULL
     parked_resume_json TEXT,                        -- serialized resume anchor, or NULL
+    parked_gate_json TEXT,                          -- serialized per-call gate replay memo, or NULL
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 

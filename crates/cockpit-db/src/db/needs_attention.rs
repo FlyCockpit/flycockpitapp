@@ -80,12 +80,19 @@ pub enum InterruptCallOrigin {
     BackgroundReview,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterruptGateMemo {
+    pub recheck_result: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InterruptParkPayload {
     pub tool: String,
     pub args: Value,
     pub call_id: String,
     pub resume: InterruptResumeAnchor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<InterruptGateMemo>,
 }
 
 // Full hydrated mirror of the `needs_attention` row; its fields back the
@@ -199,14 +206,20 @@ impl Db {
             .map(|payload| serde_json::to_string(&payload.resume))
             .transpose()
             .context("serializing parked resume anchor")?;
+        let parked_gate_json = parked
+            .and_then(|payload| payload.gate.as_ref())
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serializing parked gate memo")?;
         let agent_id = agent_id.to_owned();
         let description = description.to_owned();
         self.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO needs_attention
                  (interrupt_id, session_id, agent_id, description, questions_json, raised_at,
-                  state, parked_tool, parked_args_json, parked_call_id, parked_resume_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10)",
+                  state, parked_tool, parked_args_json, parked_call_id, parked_resume_json,
+                  parked_gate_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10, ?11)",
                 params![
                     interrupt_id.to_string(),
                     session_id.to_string(),
@@ -218,6 +231,7 @@ impl Db {
                     parked_args_json,
                     parked_call_id,
                     parked_resume_json,
+                    parked_gate_json,
                 ],
             )
             .context("inserting needs_attention (questions)")?;
@@ -260,7 +274,8 @@ impl Db {
                 .prepare(
                     "SELECT interrupt_id, session_id, agent_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
-                            state, parked_tool, parked_args_json, parked_call_id, parked_resume_json
+                            state, parked_tool, parked_args_json, parked_call_id,
+                            parked_resume_json, parked_gate_json
                        FROM needs_attention
                       WHERE session_id = ?1 AND state IN ('open', 'parked')
                       ORDER BY raised_at ASC, rowid ASC",
@@ -287,7 +302,8 @@ impl Db {
                 .prepare(
                     "SELECT interrupt_id, session_id, agent_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
-                            state, parked_tool, parked_args_json, parked_call_id, parked_resume_json
+                            state, parked_tool, parked_args_json, parked_call_id,
+                            parked_resume_json, parked_gate_json
                        FROM needs_attention
                       WHERE session_id = ?1 AND state IN ('open', 'parked', 'executing')
                       ORDER BY raised_at ASC, rowid ASC",
@@ -314,7 +330,8 @@ impl Db {
                 .prepare(
                     "SELECT interrupt_id, session_id, agent_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
-                            state, parked_tool, parked_args_json, parked_call_id, parked_resume_json
+                            state, parked_tool, parked_args_json, parked_call_id,
+                            parked_resume_json, parked_gate_json
                        FROM needs_attention
                       WHERE interrupt_id = ?1",
                 )
@@ -326,6 +343,55 @@ impl Db {
                 Some(row) => Ok(Some(row.context("decoding needs_attention row")?)),
                 None => Ok(None),
             }
+        })
+    }
+
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
+    pub fn interrupt_question_occurrence(&self, interrupt_id: Uuid) -> Result<usize> {
+        self.read_blocking(move |conn| {
+            let (rowid, session_id, agent_id, description, questions_json): (
+                i64,
+                String,
+                String,
+                String,
+                Option<String>,
+            ) = conn
+                .query_row(
+                    "SELECT rowid, session_id, agent_id, description, questions_json
+                       FROM needs_attention
+                      WHERE interrupt_id = ?1",
+                    [interrupt_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .context("querying interrupt question occurrence target")?;
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM needs_attention
+                      WHERE session_id = ?1
+                        AND rowid <= ?2
+                        AND agent_id = ?3
+                        AND description = ?4
+                        AND (
+                            questions_json = ?5
+                            OR (questions_json IS NULL AND ?5 IS NULL)
+                        )",
+                    params![session_id, rowid, agent_id, description, questions_json],
+                    |row| row.get(0),
+                )
+                .context("querying interrupt question occurrence")?;
+            Ok(count.max(1) as usize)
         })
     }
 
@@ -585,6 +651,7 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
     let parked_args_json: Option<String> = row.get("parked_args_json")?;
     let parked_call_id: Option<String> = row.get("parked_call_id")?;
     let parked_resume_json: Option<String> = row.get("parked_resume_json")?;
+    let parked_gate_json: Option<String> = row.get("parked_gate_json")?;
     let parked = match (
         parked_tool,
         parked_args_json,
@@ -606,11 +673,23 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
                     Box::new(e),
                 )
             })?;
+            let gate = parked_gate_json
+                .map(|gate_json| {
+                    serde_json::from_str(&gate_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })
+                })
+                .transpose()?;
             Some(InterruptParkPayload {
                 tool,
                 args,
                 call_id,
                 resume,
+                gate,
             })
         }
         _ => None,
@@ -810,6 +889,9 @@ mod tests {
                 assistant_seq: Some(42),
                 call_origin: InterruptCallOrigin::BackgroundReview,
             },
+            gate: Some(InterruptGateMemo {
+                recheck_result: true,
+            }),
         };
         let iid = db
             .raise_interrupt_questions_with_payload(
@@ -883,6 +965,7 @@ mod tests {
                 assistant_seq: Some(42),
                 call_origin: InterruptCallOrigin::Foreground,
             },
+            gate: None,
         };
         let iid = db
             .raise_interrupt_questions_with_payload(

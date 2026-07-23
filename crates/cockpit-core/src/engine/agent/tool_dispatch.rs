@@ -248,18 +248,48 @@ pub(crate) async fn execute_ordinary_call(
     // dispatch. The verdict also says whether the result needs a
     // post-run injection re-check (handled after dispatch). Only
     // evaluated for schema-valid, non-loop-rejected gated calls.
-    let mut recheck_result = false;
-    let gate_block: Option<String> = if repair_outcome.valid && !loop_guard_reject {
-        match safety_gate_decision(resolved_name, &args, env.ctx, env.tx).await {
-            GateOutcome::Run { recheck } => {
-                recheck_result = recheck;
-                None
-            }
-            GateOutcome::Block(msg) => Some(msg),
-        }
-    } else {
-        None
+    let replay_gate_memo = crate::engine::interrupt::current_interrupt_park_payload()
+        .filter(|payload| {
+            payload.tool == resolved_name && payload.args == args && payload.call_id == tc.id
+        })
+        .and_then(|payload| payload.gate);
+    let base_park_payload = InterruptParkPayload {
+        tool: resolved_name.to_string(),
+        args: args.clone(),
+        call_id: tc.id.clone(),
+        resume: InterruptResumeAnchor {
+            agent_id: env.agent.name.clone(),
+            call_id: tc.id.clone(),
+            provider_call_id: tc.call_id.clone(),
+            assistant_seq: None,
+            call_origin: env.ctx.skill_write_origin,
+        },
+        gate: replay_gate_memo,
     };
+    let mut recheck_result = false;
+    let mut gate_memo = replay_gate_memo;
+    let gate_block: Option<String> =
+        if repair_outcome.valid && !loop_guard_reject && super::is_gated_tool(resolved_name) {
+            let gate_future = crate::engine::interrupt::with_interrupt_park_payload(
+                base_park_payload.clone(),
+                safety_gate_decision(resolved_name, &args, env.ctx, env.tx),
+            );
+            match Box::pin(gate_future).await {
+                GateOutcome::Run { recheck } => {
+                    recheck_result = recheck;
+                    gate_memo = Some(crate::db::needs_attention::InterruptGateMemo {
+                        recheck_result: recheck,
+                    });
+                    None
+                }
+                GateOutcome::Parked => {
+                    return Err(crate::engine::interrupt::InterruptParked.into());
+                }
+                GateOutcome::Block(msg) => Some(msg),
+            }
+        } else {
+            None
+        };
     let guard = crate::config::extended::resolve_injection_guard(env.cwd);
     if should_scan_tool_result(
         resolved_name,
@@ -402,6 +432,7 @@ pub(crate) async fn execute_ordinary_call(
                 assistant_seq,
                 call_origin: env.ctx.skill_write_origin,
             },
+            gate: gate_memo,
         };
         crate::engine::interrupt::with_interrupt_park_payload(payload, async {
             dispatch_one_timed(
@@ -1228,6 +1259,60 @@ mod tests {
         }
     }
 
+    struct GatedInterruptWaitTool;
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for GatedInterruptWaitTool {
+        fn name(&self) -> &str {
+            "bash"
+        }
+
+        fn description(&self) -> &str {
+            "Bash-shaped interrupt waiter for gate replay tests."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                },
+                "required": ["command"]
+            })
+        }
+
+        async fn call(&self, _args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+            let set = crate::daemon::proto::InterruptQuestionSet {
+                questions: vec![crate::daemon::proto::InterruptQuestion::Single {
+                    prompt: "Inner approval?".to_string(),
+                    options: vec![crate::daemon::proto::InterruptOption {
+                        id: "allow".to_string(),
+                        label: "Allow".to_string(),
+                        description: None,
+                        secondary: false,
+                    }],
+                    allow_freetext: false,
+                    command_detail: None,
+                    permission: true,
+                    approval_class: None,
+                    sandbox_escalation: None,
+                }],
+            };
+            let response = crate::engine::interrupt::raise_and_wait(
+                &ctx.session.db,
+                &ctx.interrupts,
+                ctx.session.id,
+                &ctx.agent_id,
+                "inner approval",
+                set,
+                "gated interrupt wait test",
+            )
+            .await
+            .into_response()?;
+            Ok(ToolOutput::text(format!("{response:?}")))
+        }
+    }
+
     struct NeverCalledTool {
         name: &'static str,
         called: Arc<AtomicBool>,
@@ -1432,6 +1517,29 @@ mod tests {
         ctx
     }
 
+    fn tool_ctx_with_attached_approver(
+        session: Arc<Session>,
+        root: &std::path::Path,
+        tx: &mpsc::Sender<TurnEvent>,
+        interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    ) -> ToolCtx {
+        let mut ctx = tool_ctx_with_interrupts(session.clone(), root, tx, interrupts.clone());
+        let store = GrantStore::new(
+            session.db.clone(),
+            session.id,
+            root.to_path_buf(),
+            ctx.config.clone(),
+        );
+        ctx.approver = Some(Arc::new(Approver::new(
+            store,
+            session.db.clone(),
+            session.id,
+            "Build",
+            interrupts,
+        )));
+        ctx
+    }
+
     fn tool_ctx_with_approver(
         session: Arc<Session>,
         root: &std::path::Path,
@@ -1576,6 +1684,23 @@ mod tests {
             .find(|row| row.state == crate::db::needs_attention::InterruptState::Parked)
             .map(|row| row.interrupt_id)
             .expect("parked interrupt row")
+    }
+
+    fn parked_replay_question(
+        session: &Session,
+        interrupt_id: Uuid,
+    ) -> crate::engine::interrupt::PreResolvedInterruptQuestion {
+        let row = session
+            .db
+            .get_interrupt(interrupt_id)
+            .unwrap()
+            .expect("parked interrupt row");
+        crate::engine::interrupt::PreResolvedInterruptQuestion {
+            agent: row.agent_id,
+            description: row.description,
+            questions: row.questions.expect("parked interrupt question set"),
+            occurrence: 1,
+        }
     }
 
     fn assistant_call_args(history: &[Message]) -> Value {
@@ -1963,17 +2088,23 @@ mod tests {
                 .unwrap(),
             "duplicate parked answer must not claim execution twice"
         );
-        crate::engine::interrupt::with_pre_resolved_interrupt(interrupt_id, response, async {
-            execute_ordinary_call(
-                &env,
-                &mut history,
-                &call,
-                "interrupt_wait",
-                Recovery::Clean,
-                None,
-            )
-            .await
-        })
+        let question = parked_replay_question(&session, interrupt_id);
+        crate::engine::interrupt::with_pre_resolved_interrupt_question(
+            interrupt_id,
+            response,
+            question,
+            async {
+                execute_ordinary_call(
+                    &env,
+                    &mut history,
+                    &call,
+                    "interrupt_wait",
+                    Recovery::Clean,
+                    None,
+                )
+                .await
+            },
+        )
         .await
         .unwrap();
         assert_eq!(history.len(), 2);
@@ -1990,7 +2121,8 @@ mod tests {
         let tools = ToolBox::new().with(Arc::new(crate::tools::question::QuestionTool));
         let agent = test_agent(tools.clone());
         let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
-        let ctx = tool_ctx_with_interrupts(session.clone(), tmp.path(), &tx, interrupts.clone());
+        let ctx =
+            tool_ctx_with_attached_approver(session.clone(), tmp.path(), &tx, interrupts.clone());
         let env = DispatchEnv {
             agent: &agent,
             session: &session,
@@ -2046,10 +2178,16 @@ mod tests {
                 .unwrap(),
             "duplicate parked answer must not claim execution twice"
         );
-        crate::engine::interrupt::with_pre_resolved_interrupt(interrupt_id, response, async {
-            execute_ordinary_call(&env, &mut history, &call, "question", Recovery::Clean, None)
-                .await
-        })
+        let question = parked_replay_question(&session, interrupt_id);
+        crate::engine::interrupt::with_pre_resolved_interrupt_question(
+            interrupt_id,
+            response,
+            question,
+            async {
+                execute_ordinary_call(&env, &mut history, &call, "question", Recovery::Clean, None)
+                    .await
+            },
+        )
         .await
         .unwrap();
         assert_eq!(history.len(), 2);
@@ -2057,6 +2195,57 @@ mod tests {
         let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].call_id, call.id);
+    }
+
+    #[tokio::test]
+    async fn interrupt_replay_gate_memo_is_persisted_with_inner_park() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        session.set_approval_mode(ApprovalMode::Auto);
+        let interrupts = attached_interrupt_hub(&session);
+        let tools = ToolBox::new().with(Arc::new(GatedInterruptWaitTool));
+        let agent = test_agent(tools.clone());
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+        let ctx = tool_ctx_with_interrupts(session.clone(), tmp.path(), &tx, interrupts.clone());
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &agent.model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("bash", serde_json::json!({ "command": "echo inner" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        let _gate = set_safety_gate_test_override(GateOutcome::Run { recheck: true });
+        let parker = tokio::spawn(park_next_interrupt(
+            session.db.clone(),
+            session.id,
+            interrupts,
+        ));
+
+        let err = execute_ordinary_call(&env, &mut history, &call, "bash", Recovery::Clean, None)
+            .await
+            .expect_err("inner prompt should park dispatch");
+        parker.await.unwrap();
+
+        assert!(crate::engine::interrupt::is_parked(&err), "{err:#}");
+        let interrupt_id = parked_interrupt_id(&session);
+        let row = session
+            .db
+            .get_interrupt(interrupt_id)
+            .unwrap()
+            .expect("parked inner approval row");
+        let gate = row
+            .parked
+            .as_ref()
+            .and_then(|payload| payload.gate)
+            .expect("inner parked payload carries gate memo");
+        assert!(gate.recheck_result);
     }
 
     #[tokio::test]

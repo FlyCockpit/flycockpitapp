@@ -9,6 +9,9 @@ pub(super) enum GateOutcome {
     /// Proceed to dispatch. `recheck` is whether the call's result must be
     /// injection-re-checked afterward.
     Run { recheck: bool },
+    /// The human escalation prompt parked. Dispatch must stop without
+    /// fabricating a denial result.
+    Parked,
     /// Skip dispatch; the string is the model-readable tool result
     /// (`invalid_input`) explaining why the call was withheld.
     Block(String),
@@ -78,6 +81,15 @@ pub(super) async fn safety_gate_decision_with_configs(
     if !is_gated_tool(tool) {
         return GateOutcome::Run { recheck: false };
     }
+    if let Some(payload) = crate::engine::interrupt::current_interrupt_park_payload()
+        && payload.tool == tool
+        && payload.args == *args
+        && let Some(gate) = payload.gate
+    {
+        return GateOutcome::Run {
+            recheck: gate.recheck_result,
+        };
+    }
     match ctx.session.approval_mode() {
         // `manual`: the utility-model gate is not invoked because the human
         // is the gate. Bash asks in its grant-or-ask paths when a command
@@ -122,6 +134,7 @@ pub(super) async fn safety_gate_decision_with_configs(
                 GateApproval::Allow => GateOutcome::Run {
                     recheck: verdict.recheck_result,
                 },
+                GateApproval::Parked => GateOutcome::Parked,
                 GateApproval::Deny => GateOutcome::Block(gate_block_message(tool, false)),
                 GateApproval::NoninteractiveDeny => {
                     GateOutcome::Block(crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string())
@@ -139,6 +152,7 @@ pub(super) async fn safety_gate_decision_with_configs(
                 GateApproval::Allow => GateOutcome::Run {
                     recheck: tool != "bash",
                 },
+                GateApproval::Parked => GateOutcome::Parked,
                 GateApproval::Deny => GateOutcome::Block(gate_block_message(tool, true)),
                 GateApproval::NoninteractiveDeny => {
                     GateOutcome::Block(crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string())
@@ -171,6 +185,7 @@ pub(super) fn gate_payload(tool: &str, args: &Value) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateApproval {
     Allow,
+    Parked,
     Deny,
     NoninteractiveDeny,
 }
@@ -207,6 +222,7 @@ async fn escalate_gated_call(
     match decision {
         Ok(crate::approval::Decision::Allow { .. }) => GateApproval::Allow,
         Ok(crate::approval::Decision::NoninteractiveDeny) => GateApproval::NoninteractiveDeny,
+        Err(error) if crate::engine::interrupt::is_parked(&error) => GateApproval::Parked,
         Ok(crate::approval::Decision::Deny) | Err(_) => GateApproval::Deny,
     }
 }
@@ -303,6 +319,74 @@ mod safety_gate_tests {
             resource_scheduler: None,
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    fn attach_approver_with_hub(
+        ctx: &mut ToolCtx,
+        hub: Arc<crate::engine::interrupt::InterruptHub>,
+    ) {
+        let store = GrantStore::new(
+            ctx.session.db.clone(),
+            ctx.session.id,
+            ctx.cwd.clone(),
+            ctx.config.clone(),
+        );
+        ctx.interrupts = hub.clone();
+        ctx.approver = Some(Arc::new(Approver::new(
+            store,
+            ctx.session.db.clone(),
+            ctx.session.id,
+            &ctx.agent_id,
+            hub,
+        )));
+    }
+
+    fn attached_interrupt_hub(ctx: &ToolCtx) -> Arc<crate::engine::interrupt::InterruptHub> {
+        let (events, _receiver) = tokio::sync::broadcast::channel(16);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::redact::RedactionTable::empty(),
+        )));
+        Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            redaction,
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            ctx.session.db.clone(),
+            ctx.session.id,
+        ))
+    }
+
+    async fn wait_for_open_interrupt(ctx: &ToolCtx) -> uuid::Uuid {
+        for _ in 0..1000 {
+            if let Some(row) = ctx
+                .session
+                .db
+                .list_open_interrupts(ctx.session.id)
+                .unwrap()
+                .first()
+            {
+                return row.interrupt_id;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("timed out waiting for gate interrupt");
+    }
+
+    fn replay_question_from_row(
+        ctx: &ToolCtx,
+        interrupt_id: uuid::Uuid,
+    ) -> crate::engine::interrupt::PreResolvedInterruptQuestion {
+        let row = ctx
+            .session
+            .db
+            .get_interrupt(interrupt_id)
+            .unwrap()
+            .expect("parked gate row");
+        crate::engine::interrupt::PreResolvedInterruptQuestion {
+            agent: row.agent_id,
+            description: row.description,
+            questions: row.questions.expect("gate question set"),
+            occurrence: 1,
         }
     }
 
@@ -477,7 +561,111 @@ mod safety_gate_tests {
             GateOutcome::Run { .. } => {
                 panic!("auto mode must NOT silently run when the gate is unavailable")
             }
+            GateOutcome::Parked => panic!("no-client gate escalation must block, not park"),
         }
+    }
+
+    #[tokio::test]
+    async fn interrupt_replay_reuses_memoized_gate_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let (tx, _rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "ls" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+        let payload = crate::db::needs_attention::InterruptParkPayload {
+            tool: "bash".to_string(),
+            args: args.clone(),
+            call_id: "call-1".to_string(),
+            resume: crate::db::needs_attention::InterruptResumeAnchor {
+                agent_id: "builder".to_string(),
+                call_id: "call-1".to_string(),
+                provider_call_id: None,
+                assistant_seq: None,
+                call_origin: crate::db::needs_attention::InterruptCallOrigin::Foreground,
+            },
+            gate: Some(crate::db::needs_attention::InterruptGateMemo {
+                recheck_result: true,
+            }),
+        };
+
+        let outcome = crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+            safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await
+        })
+        .await;
+
+        assert!(matches!(outcome, GateOutcome::Run { recheck: true }));
+    }
+
+    #[tokio::test]
+    async fn interrupt_replay_gate_escalation_parks_and_replays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let hub = attached_interrupt_hub(&ctx);
+        attach_approver_with_hub(&mut ctx, hub.clone());
+        let ctx = Arc::new(ctx);
+        let (tx, _rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "server": "example", "tool": "mutate" });
+        let payload = crate::db::needs_attention::InterruptParkPayload {
+            tool: "mcp".to_string(),
+            args: args.clone(),
+            call_id: "call-1".to_string(),
+            resume: crate::db::needs_attention::InterruptResumeAnchor {
+                agent_id: "builder".to_string(),
+                call_id: "call-1".to_string(),
+                provider_call_id: None,
+                assistant_seq: None,
+                call_origin: crate::db::needs_attention::InterruptCallOrigin::Foreground,
+            },
+            gate: None,
+        };
+        let first_ctx = ctx.clone();
+        let first_tx = tx.clone();
+        let first_args = args.clone();
+        let first_payload = payload.clone();
+        let first = tokio::spawn(async move {
+            crate::engine::interrupt::with_interrupt_park_payload(first_payload, async {
+                escalate_gated_call("mcp", &first_args, &first_ctx, true, &first_tx).await
+            })
+            .await
+        });
+
+        let interrupt_id = wait_for_open_interrupt(&ctx).await;
+        let row = ctx
+            .session
+            .db
+            .get_interrupt(interrupt_id)
+            .unwrap()
+            .expect("parked gate row");
+        assert!(
+            row.parked.is_some(),
+            "gate interrupt must carry replay payload"
+        );
+        assert_eq!(hub.park_all_registered(), 1);
+        assert_eq!(first.await.unwrap(), GateApproval::Parked);
+
+        let response = crate::daemon::proto::ResolveResponse::Single {
+            selected_id: crate::approval::ID_APPROVE.to_string(),
+        };
+        assert!(
+            ctx.session
+                .db
+                .begin_parked_interrupt_execution(interrupt_id, &response)
+                .unwrap()
+        );
+        let question = replay_question_from_row(&ctx, interrupt_id);
+        let replayed = crate::engine::interrupt::with_pre_resolved_interrupt_question(
+            interrupt_id,
+            response,
+            question,
+            async {
+                crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+                    escalate_gated_call("mcp", &args, &ctx, true, &tx).await
+                })
+                .await
+            },
+        )
+        .await;
+        assert_eq!(replayed, GateApproval::Allow);
     }
 
     #[test]

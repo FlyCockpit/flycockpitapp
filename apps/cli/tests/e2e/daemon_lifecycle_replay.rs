@@ -132,6 +132,7 @@ struct InterruptRow {
     parked_tool: Option<String>,
     parked_args_json: Option<String>,
     parked_call_id: Option<String>,
+    parked_gate_json: Option<String>,
     response_json: Option<String>,
 }
 
@@ -142,7 +143,8 @@ fn open_db(path: &Path) -> Connection {
 fn interrupt_row(db_path: &Path, interrupt_id: Uuid) -> InterruptRow {
     let conn = open_db(db_path);
     conn.query_row(
-        "SELECT state, parked_tool, parked_args_json, parked_call_id, response_json
+        "SELECT state, parked_tool, parked_args_json, parked_call_id, parked_gate_json,
+                response_json
            FROM needs_attention
           WHERE interrupt_id = ?1",
         params![interrupt_id.to_string()],
@@ -152,7 +154,8 @@ fn interrupt_row(db_path: &Path, interrupt_id: Uuid) -> InterruptRow {
                 parked_tool: row.get(1)?,
                 parked_args_json: row.get(2)?,
                 parked_call_id: row.get(3)?,
-                response_json: row.get(4)?,
+                parked_gate_json: row.get(4)?,
+                response_json: row.get(5)?,
             })
         },
     )
@@ -211,6 +214,16 @@ fn tool_call_command(db_path: &Path, session_id: Uuid) -> String {
         .as_str()
         .expect("tool command")
         .to_string()
+}
+
+fn tool_call_output(db_path: &Path, session_id: Uuid) -> String {
+    let conn = open_db(db_path);
+    conn.query_row(
+        "SELECT output FROM tool_call_events WHERE session_id = ?1 AND call_id = ?2",
+        params![session_id.to_string(), TOOL_CALL_ID],
+        |row| row.get(0),
+    )
+    .expect("tool call output")
 }
 
 fn assert_replay_payload(row: &InterruptRow) {
@@ -312,6 +325,46 @@ async fn wait_for_replay(
     }
 }
 
+async fn drive_auto_replay_to_tool_call(
+    client: &cockpit_cli::integration::DaemonClient,
+    daemon: &SpawnedDaemon,
+    session_id: Uuid,
+) {
+    let mut seen = Vec::new();
+    for _ in 0..32 {
+        if tool_call_count(&daemon.db_path(), session_id) == 1 {
+            return;
+        }
+        let event = client
+            .next_event(Duration::from_secs(20))
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "daemon event while driving auto replay: {err}; seen: {seen:#?}\nlog tail:\n{}",
+                    log_tail(daemon.home())
+                )
+            });
+        seen.push(format!("{event:?}"));
+        match event {
+            DaemonEvent::Notice { text, .. } if text.contains("safety gate unavailable") => {
+                panic!("replay re-raised the memoized safety gate: {text}");
+            }
+            DaemonEvent::InterruptRaised {
+                session_id: got,
+                interrupt_id,
+                ..
+            } if got == session_id => {
+                client
+                    .approve_interrupt_project(interrupt_id)
+                    .await
+                    .expect("approve follow-up replay interrupt");
+            }
+            _ => {}
+        }
+    }
+    panic!("auto replay did not reach tool call; seen: {seen:#?}");
+}
+
 async fn create_parked_session_with_hook(
     pause_replay_executing: bool,
 ) -> (ScriptedProvider, SpawnedDaemon, AttachedSession, Uuid) {
@@ -341,6 +394,49 @@ async fn create_parked_session_with_hook(
 
 async fn create_parked_session() -> (ScriptedProvider, SpawnedDaemon, AttachedSession, Uuid) {
     create_parked_session_with_hook(false).await
+}
+
+async fn create_auto_gate_parked_session_with_hook(
+    pause_replay_executing: bool,
+) -> (ScriptedProvider, SpawnedDaemon, AttachedSession, Uuid) {
+    let provider = ScriptedProvider::start().await;
+    let mut home = IsolatedHome::new();
+    if pause_replay_executing {
+        home.set_env("COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING", "1");
+    }
+    home.write_local_provider_config(&provider.base_url);
+    std::fs::write(
+        home.config_dir().join("config.json"),
+        r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox_escalation_enabled":true,"defaultApprovalMode":"auto"}"#,
+    )
+    .expect("write auto approval replay config");
+    home.trust_project();
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    let client = daemon.client().await;
+    let attached = client
+        .attach(daemon.project_path(), None, None, true)
+        .await
+        .expect("attach session");
+
+    client
+        .send_user_message("trigger auto lifecycle approval")
+        .await
+        .expect("send user message");
+    let gate_interrupt =
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("initial")).await;
+    client
+        .approve_interrupt_once(gate_interrupt)
+        .await
+        .expect("approve gate interrupt");
+    let parked_interrupt =
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("initial")).await;
+
+    (provider, daemon, attached, parked_interrupt)
+}
+
+async fn create_auto_gate_parked_session()
+-> (ScriptedProvider, SpawnedDaemon, AttachedSession, Uuid) {
+    create_auto_gate_parked_session_with_hook(false).await
 }
 
 async fn restart_daemon_gracefully(daemon: &SpawnedDaemon) {
@@ -493,6 +589,102 @@ fn lifecycle_sigkill_open_interrupt_reconciles_and_replays_once() {
             .expect("duplicate approve request");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 1);
+    });
+}
+
+#[test]
+fn lifecycle_auto_gate_unavailable_park_replay_runs_approved_command() {
+    run_daemon_replay_test(async {
+        let (_provider, daemon, attached, interrupt_id) = create_auto_gate_parked_session().await;
+
+        restart_daemon_gracefully(&daemon).await;
+
+        let row = interrupt_row(&daemon.db_path(), interrupt_id);
+        assert_eq!(row.state, "parked");
+        assert_replay_payload(&row);
+        assert!(
+            row.parked_gate_json.is_some(),
+            "parked inner prompt must carry the already-approved gate memo"
+        );
+        assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 0);
+
+        let client = daemon.client().await;
+        client
+            .attach(daemon.project_path(), Some(attached.session_id), None, true)
+            .await
+            .expect("reattach session");
+        assert_eq!(
+            wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
+            interrupt_id
+        );
+
+        client
+            .approve_interrupt_project(interrupt_id)
+            .await
+            .expect("approve parked interrupt");
+        drive_auto_replay_to_tool_call(&client, &daemon, attached.session_id).await;
+        let output = tool_call_output(&daemon.db_path(), attached.session_id);
+        assert!(
+            !output.contains("declined") && !output.contains("not run"),
+            "approved replay must not be recorded as declined: {output}"
+        );
+        assert_eq!(
+            tool_call_command(&daemon.db_path(), attached.session_id),
+            COMMAND
+        );
+    });
+}
+
+#[test]
+fn lifecycle_auto_gate_unavailable_sigkill_park_replay_runs_approved_command() {
+    run_daemon_replay_test(async {
+        let (_provider, daemon, attached, interrupt_id) = create_auto_gate_parked_session().await;
+
+        let row = interrupt_row(&daemon.db_path(), interrupt_id);
+        assert_eq!(row.state, "open");
+        assert_replay_payload(&row);
+        assert!(
+            row.parked_gate_json.is_some(),
+            "open inner prompt must carry the already-approved gate memo"
+        );
+        assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 0);
+
+        daemon.sigkill().await;
+        daemon.restart_same_home().await;
+
+        let client = daemon.client().await;
+        client
+            .attach(daemon.project_path(), Some(attached.session_id), None, true)
+            .await
+            .expect("reattach session");
+        wait_until(
+            "auto gate crash-surviving interrupt parked",
+            Duration::from_secs(5),
+            || {
+                let db_path = daemon.db_path();
+                async move { interrupt_row(&db_path, interrupt_id).state == "parked" }
+            },
+        )
+        .await;
+        assert_eq!(
+            wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
+            interrupt_id
+        );
+
+        client
+            .approve_interrupt_project(interrupt_id)
+            .await
+            .expect("approve parked interrupt");
+        drive_auto_replay_to_tool_call(&client, &daemon, attached.session_id).await;
+        let output = tool_call_output(&daemon.db_path(), attached.session_id);
+        assert!(
+            !output.contains("declined") && !output.contains("not run"),
+            "approved replay must not be recorded as declined: {output}"
+        );
+        assert_eq!(
+            tool_call_command(&daemon.db_path(), attached.session_id),
+            COMMAND
+        );
     });
 }
 

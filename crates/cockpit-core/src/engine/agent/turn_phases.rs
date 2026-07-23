@@ -1472,6 +1472,15 @@ fn inject_turn_start_system_messages(
     {
         history.push(Message::System { content: nudge });
     }
+    if active_tool_names.contains(&"mcp")
+        && let Some(nudge) =
+            crate::tools::mcp_tool::turn_start_advert_message(active_tools, session)
+        && !history
+            .iter()
+            .any(|message| matches!(message, Message::System { content } if content == &nudge))
+    {
+        history.push(Message::System { content: nudge });
+    }
 }
 
 #[cfg(test)]
@@ -1612,6 +1621,68 @@ mod tests {
                 |message| !matches!(message, Message::System { content } if content.contains("rename_session"))
             ),
             "suppressed unactionable nudge must not carry into a later turn"
+        );
+    }
+
+    #[test]
+    fn advert_nudge_injected_once_at_turn_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        let toolbox = ToolBox::new()
+            .with(Arc::new(crate::tools::mcp_tool::McpTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::intel::WordTool));
+        let mut history = Vec::new();
+
+        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+
+        let adverts: Vec<_> = history
+            .iter()
+            .filter_map(|message| match message {
+                Message::System { content }
+                    if content.contains("Available built-in cockpit functions") =>
+                {
+                    Some(content)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(adverts.len(), 1, "{history:?}");
+        assert!(adverts[0].contains("intel tail"), "{}", adverts[0]);
+        assert!(adverts[0].contains("word"), "{}", adverts[0]);
+        assert!(
+            adverts[0].contains("mcp.invoke(\"cockpit\""),
+            "{}",
+            adverts[0]
+        );
+
+        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+        let advert_count = history
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    Message::System { content }
+                        if content.contains("Available built-in cockpit functions")
+                )
+            })
+            .count();
+        assert_eq!(advert_count, 1, "same advert should not be duplicated");
+    }
+
+    #[test]
+    fn no_advert_nudge_when_catalog_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        let mut history = Vec::new();
+
+        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+
+        assert!(
+            history.iter().all(
+                |message| !matches!(message, Message::System { content } if content.contains("Available built-in cockpit functions"))
+            ),
+            "{history:?}"
         );
     }
 

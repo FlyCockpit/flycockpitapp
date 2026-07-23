@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::engine::agent::TurnEvent;
-use crate::engine::tool::{Tool, ToolBox, ToolCtx, ToolDescOverride, ToolOutput, invalid_input};
+use crate::engine::tool::{Tool, ToolBox, ToolCtx, ToolOutput, invalid_input};
 
 pub struct McpTool;
 
@@ -27,28 +27,6 @@ const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sand
      `hits = mcp.search(\"calendar\")` then `hits`. If the script returns `None`, \
      printed output is captured and returned as a fallback. The sandbox has no filesystem, \
      network, or environment access.";
-
-pub(crate) fn mcp_description_override_for_adverts(adverts: &[String]) -> Option<ToolDescOverride> {
-    if adverts.is_empty() {
-        return None;
-    }
-    let advert_text = adverts
-        .iter()
-        .map(|line| format!("- {}", line.trim()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let suffix = format!("\n\nAvailable built-in cockpit functions:\n{advert_text}");
-    Some(ToolDescOverride {
-        normal: Some(format!("{NORMAL_DESCRIPTION}{suffix}")),
-        frontier: Some(format!("{NORMAL_DESCRIPTION}{suffix}")),
-        defensive: Some(format!("{DEFENSIVE_DESCRIPTION}{suffix}")),
-    })
-}
-
-pub(crate) fn apply_mcp_description_adverts(toolbox: &mut ToolBox, adverts: &[String]) -> bool {
-    let override_text = mcp_description_override_for_adverts(adverts).unwrap_or_default();
-    toolbox.set_override_if_changed("mcp", override_text)
-}
 
 pub(crate) fn discoverable_tool_adverts(toolbox: &ToolBox) -> Vec<String> {
     let names = toolbox.discoverable_mcp_tool_names();
@@ -82,6 +60,40 @@ pub(crate) fn discoverable_tool_adverts(toolbox: &ToolBox) -> Vec<String> {
     adverts
 }
 
+pub(crate) fn turn_start_advert_message(
+    toolbox: &ToolBox,
+    session: &crate::session::Session,
+) -> Option<String> {
+    let mut adverts = discoverable_tool_adverts(toolbox);
+    if session
+        .db
+        .current_session_goal(session.id, false)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        adverts.push(
+            "A goal is active; if context pressure builds (check mcp.invoke(\"cockpit\", \"context_usage\", {})), you may schedule compaction via mcp.invoke(\"cockpit\", \"request_compact\", {})."
+                .to_string(),
+        );
+    }
+    advert_message_from_lines(&adverts)
+}
+
+pub(crate) fn advert_message_from_lines(adverts: &[String]) -> Option<String> {
+    if adverts.is_empty() {
+        return None;
+    }
+    let advert_text = adverts
+        .iter()
+        .map(|line| format!("- {}", line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "Available built-in cockpit functions:\n{advert_text}"
+    ))
+}
+
 fn push_family_advert(
     names: &[String],
     adverts: &mut Vec<String>,
@@ -100,41 +112,6 @@ fn push_family_advert(
         "{family}: {} via mcp.invoke(\"cockpit\", ...).",
         present.join("/")
     ));
-}
-
-pub(crate) fn current_mcp_description_adverts(
-    session: &crate::session::Session,
-    _cwd: &std::path::Path,
-    config: &crate::daemon::session_worker::SessionConfigHandle,
-) -> Vec<String> {
-    let auto_title_configured = config.extended().auto_title_model_ref().is_some();
-    mcp_description_adverts_for_session(session, auto_title_configured)
-}
-
-fn mcp_description_adverts_for_session(
-    session: &crate::session::Session,
-    auto_title_configured: bool,
-) -> Vec<String> {
-    let mut adverts = Vec::new();
-    if session.agent_rename_session_available(auto_title_configured) {
-        adverts.push(
-            "This session may be named via mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": ...})."
-                .to_string(),
-        );
-    }
-    if session
-        .db
-        .current_session_goal(session.id, false)
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        adverts.push(
-            "A goal is active; if context pressure builds (check mcp.invoke(\"cockpit\", \"context_usage\", {})), you may schedule compaction via mcp.invoke(\"cockpit\", \"request_compact\", {})."
-                .to_string(),
-        );
-    }
-    adverts
 }
 
 #[async_trait]
@@ -204,41 +181,10 @@ mod tests {
     use super::*;
     use crate::config::extended::LlmMode;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct CountingMcpTool {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl Tool for CountingMcpTool {
-        fn name(&self) -> &str {
-            "mcp"
-        }
-
-        fn description(&self) -> &str {
-            NORMAL_DESCRIPTION
-        }
-
-        fn parameters(&self) -> Value {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            serde_json::json!({ "type": "object", "properties": {} })
-        }
-
-        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
-            Ok(ToolOutput::text("ok"))
-        }
-    }
-
-    fn write_config(root: &std::path::Path, body: &str) {
-        let dir = root.join(".cockpit");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.json"), body).unwrap();
-    }
-
-    fn mcp_description(toolbox: &ToolBox) -> String {
+    fn mcp_description(toolbox: &ToolBox, mode: LlmMode) -> String {
         toolbox
-            .definitions(LlmMode::Normal)
+            .definitions(mode)
             .into_iter()
             .find(|definition| definition.name == "mcp")
             .unwrap()
@@ -278,40 +224,35 @@ mod tests {
     }
 
     #[test]
-    fn mcp_description_unchanged_when_no_adverts() {
-        let mut toolbox = ToolBox::new().with(Arc::new(McpTool));
-        let before = serde_json::to_string(&toolbox.definitions(LlmMode::Normal)).unwrap();
+    fn mcp_description_is_static_across_catalog_change() {
+        let disabled = ToolBox::new().with(Arc::new(McpTool));
+        let discoverable = ToolBox::new()
+            .with(Arc::new(McpTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::intel::WordTool));
 
-        assert!(!apply_mcp_description_adverts(&mut toolbox, &[]));
-
-        let after = serde_json::to_string(&toolbox.definitions(LlmMode::Normal)).unwrap();
-        assert_eq!(before, after);
+        assert_eq!(
+            mcp_description(&disabled, LlmMode::Normal),
+            mcp_description(&discoverable, LlmMode::Normal)
+        );
+        assert_eq!(
+            mcp_description(&disabled, LlmMode::Defensive),
+            mcp_description(&discoverable, LlmMode::Defensive)
+        );
     }
 
     #[test]
-    fn mcp_description_includes_adverts() {
-        let mut toolbox = ToolBox::new().with(Arc::new(McpTool));
-        let adverts = vec!["`cockpit.test_count` - Count test values".to_string()];
+    fn mcp_description_has_no_advert_suffix() {
+        let toolbox = ToolBox::new()
+            .with(Arc::new(McpTool))
+            .with_discoverable_mcp(Arc::new(crate::tools::intel::WordTool));
 
-        assert!(apply_mcp_description_adverts(&mut toolbox, &adverts));
+        let normal = mcp_description(&toolbox, LlmMode::Normal);
+        let defensive = mcp_description(&toolbox, LlmMode::Defensive);
 
-        let definition = toolbox
-            .definitions(LlmMode::Normal)
-            .into_iter()
-            .find(|definition| definition.name == "mcp")
-            .unwrap();
-        assert!(
-            definition
-                .description
-                .contains("Available built-in cockpit functions"),
-            "{}",
-            definition.description
-        );
-        assert!(
-            definition.description.contains("cockpit.test_count"),
-            "{}",
-            definition.description
-        );
+        assert_eq!(normal, NORMAL_DESCRIPTION);
+        assert_eq!(defensive, DEFENSIVE_DESCRIPTION);
+        assert!(!normal.contains("Available built-in cockpit functions"));
+        assert!(!defensive.contains("Available built-in cockpit functions"));
     }
 
     #[test]
@@ -352,140 +293,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn advert_flip_invalidates_definition_cache_only_on_change() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut toolbox = ToolBox::new().with(Arc::new(CountingMcpTool {
-            calls: calls.clone(),
-        }));
-
-        let _ = toolbox.definitions(LlmMode::Normal);
-        let _ = toolbox.definitions(LlmMode::Normal);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        assert!(!apply_mcp_description_adverts(&mut toolbox, &[]));
-        let _ = toolbox.definitions(LlmMode::Normal);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let first = vec!["`cockpit.test_count` - Count test values".to_string()];
-        assert!(apply_mcp_description_adverts(&mut toolbox, &first));
-        let _ = toolbox.definitions(LlmMode::Normal);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-        assert!(!apply_mcp_description_adverts(&mut toolbox, &first));
-        let _ = toolbox.definitions(LlmMode::Normal);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-        let second = vec!["`cockpit.other` - Other test values".to_string()];
-        assert!(apply_mcp_description_adverts(&mut toolbox, &second));
-        let _ = toolbox.definitions(LlmMode::Normal);
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
-    }
-
-    #[test]
-    fn advert_matches_gate() {
-        for auto_title_configured in [false, true] {
-            for titled in [false, true] {
-                for past_threshold in [false, true] {
-                    for user_renamed in [false, true] {
-                        for ephemeral in [false, true] {
-                            let tmp = tempfile::tempdir().unwrap();
-                            if auto_title_configured {
-                                write_config(
-                                    tmp.path(),
-                                    r#"{ "utility_model": "openai:gpt-4.1-mini" }"#,
-                                );
-                            } else {
-                                write_config(
-                                    tmp.path(),
-                                    r#"{ "utility_model": null, "auto_title": null }"#,
-                                );
-                            }
-                            let ctx = if ephemeral {
-                                let db = crate::db::Db::open_in_memory().unwrap();
-                                let parent = crate::session::Session::create(
-                                    db.clone(),
-                                    tmp.path().to_path_buf(),
-                                    "Build",
-                                )
-                                .unwrap();
-                                let side = db.create_ephemeral_fork(parent.id, None).unwrap();
-                                let session = Arc::new(
-                                    crate::session::Session::resume(db, side.session_id)
-                                        .unwrap()
-                                        .unwrap(),
-                                );
-                                crate::engine::tool::ToolCtx {
-                                    session,
-                                    ..crate::tools::common::test_ctx(tmp.path())
-                                }
-                            } else {
-                                crate::tools::common::test_ctx(tmp.path())
-                            };
-                            if past_threshold {
-                                for turn in 1..=8 {
-                                    let _ = ctx.session.note_user_content(&format!("turn {turn}"));
-                                }
-                            } else {
-                                for turn in 1..=3 {
-                                    let _ = ctx.session.note_user_content(&format!("turn {turn}"));
-                                }
-                            }
-                            if titled && !ephemeral {
-                                assert!(ctx.session.set_auto_title("robot title").unwrap());
-                            }
-                            if user_renamed {
-                                ctx.session
-                                    .db
-                                    .rename_session(ctx.session.id, "manual")
-                                    .unwrap();
-                            }
-
-                            let adverts = mcp_description_adverts_for_session(
-                                &ctx.session,
-                                auto_title_configured,
-                            );
-                            let has_rename_advert = adverts
-                                .iter()
-                                .any(|advert| advert.contains("rename_session"));
-                            assert_eq!(
-                                has_rename_advert,
-                                ctx.session
-                                    .agent_rename_session_available(auto_title_configured),
-                                "auto_title_configured={auto_title_configured} titled={titled} past_threshold={past_threshold} user_renamed={user_renamed} ephemeral={ephemeral}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn description_byte_identical_when_no_advert() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
-        let ctx = crate::tools::common::test_ctx(tmp.path());
-        let mut toolbox = ToolBox::new().with(Arc::new(McpTool));
-        for turn in 1..=3 {
-            let _ = ctx.session.note_user_content(&format!("turn {turn}"));
-        }
-
-        let adverts = current_mcp_description_adverts(
-            &ctx.session,
-            tmp.path(),
-            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
-        );
-        assert!(
-            !adverts
-                .iter()
-                .any(|advert| advert.contains("rename_session"))
-        );
-        assert!(!apply_mcp_description_adverts(&mut toolbox, &adverts));
-        let desc = mcp_description(&toolbox);
-        assert_eq!(desc, NORMAL_DESCRIPTION);
-    }
-
     #[tokio::test]
     async fn model_context_invariance_with_child_events() {
         let tmp = tempfile::tempdir().unwrap();
@@ -513,7 +320,7 @@ mod tests {
     fn advert_compact_follows_goal_state() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
-        let mut toolbox = ToolBox::new().with(Arc::new(McpTool));
+        let toolbox = ToolBox::new().with(Arc::new(McpTool));
 
         ctx.session
             .db
@@ -525,25 +332,12 @@ mod tests {
                 None,
             )
             .unwrap();
-        let adverts = current_mcp_description_adverts(
-            &ctx.session,
-            tmp.path(),
-            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
-        );
-        assert!(apply_mcp_description_adverts(&mut toolbox, &adverts));
-        let desc = mcp_description(&toolbox);
-        assert!(desc.contains("request_compact"), "{desc}");
-        assert!(desc.contains("context_usage"), "{desc}");
+        let message = turn_start_advert_message(&toolbox, &ctx.session).unwrap();
+        assert!(message.contains("request_compact"), "{message}");
+        assert!(message.contains("context_usage"), "{message}");
 
         ctx.session.db.clear_session_goal(ctx.session.id).unwrap();
-        let adverts = current_mcp_description_adverts(
-            &ctx.session,
-            tmp.path(),
-            &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
-        );
-        assert!(apply_mcp_description_adverts(&mut toolbox, &adverts));
-        let desc = mcp_description(&toolbox);
-        assert!(!desc.contains("request_compact"), "{desc}");
+        assert!(turn_start_advert_message(&toolbox, &ctx.session).is_none());
     }
 
     #[tokio::test]

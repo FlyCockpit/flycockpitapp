@@ -1675,6 +1675,106 @@ mod proto_fixture_tests {
     }
 }
 
+#[cfg(test)]
+mod forward_open_guard_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use tokio::io::duplex;
+
+    #[test]
+    fn forward_open_guard_no_deny_unknown_fields_in_proto_src() {
+        let mut violations = Vec::new();
+        collect_deny_unknown_fields_violations(&src_root(), &mut violations);
+        assert!(
+            violations.is_empty(),
+            "cockpit-proto wire structs must stay forward-open for additive compatibility \
+             (see proto-additive-forward-compat); remove serde deny_unknown_fields from: {}",
+            violations.join(", ")
+        );
+    }
+
+    #[test]
+    fn forward_open_guard_struct_payload_accepts_unknown_field() {
+        let value = read_forward_fixture("response-extra-field.json");
+        let response: Response =
+            serde_json::from_value(value).expect("future response fixture should parse");
+        match response {
+            Response::ApprovalModeState { mode } => assert_eq!(mode, ApprovalMode::Auto),
+            other => panic!("expected approval mode response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_open_guard_frame_accepts_unknown_top_level_variant() {
+        let mut value = read_forward_fixture("unknown-top-level-variant.json");
+        value["v"] = serde_json::json!(PROTOCOL_VERSION);
+        let (a, b) = duplex(4096);
+        let mut left = ProtoStream::new(a);
+        let mut right = ProtoStream::new(b);
+        left.send_raw_line(value.to_string()).await.unwrap();
+
+        match right.recv().await.unwrap().expect("frame") {
+            RecvFrame::Unknown { v, kind, tag, id } => {
+                assert_eq!(v, PROTOCOL_VERSION);
+                assert_eq!(kind, "req");
+                assert_eq!(tag.as_deref(), Some("future_request"));
+                assert_eq!(
+                    id,
+                    Some(Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap())
+                );
+            }
+            other => panic!("expected unknown frame, got {other:?}"),
+        }
+    }
+
+    fn collect_deny_unknown_fields_violations(path: &Path, violations: &mut Vec<String>) {
+        for entry in std::fs::read_dir(path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+        {
+            let entry = entry.unwrap_or_else(|error| panic!("read dir entry: {error}"));
+            let path = entry.path();
+            if path.is_dir() {
+                collect_deny_unknown_fields_violations(&path, violations);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let mut in_serde_attr = false;
+            for (index, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("#[serde") {
+                    in_serde_attr = true;
+                }
+                if in_serde_attr && line.contains("deny_unknown_fields") {
+                    violations.push(format!("{}:{}", path.display(), index + 1));
+                }
+                if in_serde_attr && line.contains(']') {
+                    in_serde_attr = false;
+                }
+            }
+        }
+    }
+
+    fn src_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    fn read_forward_fixture(file_name: &str) -> serde_json::Value {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("forward_compat")
+            .join(file_name);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+    }
+}
+
 // ---- Tests -----------------------------------------------------------------
 
 #[cfg(test)]

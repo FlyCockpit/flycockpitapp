@@ -1,0 +1,9 @@
+{
+  "response": "approval_mode_state",
+  "data": {
+    "mode": "auto",
+    "some_future_field": {
+      "ignored": true
+    }
+  }
+}

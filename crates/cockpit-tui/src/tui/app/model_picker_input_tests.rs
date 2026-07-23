@@ -166,3 +166,97 @@ fn chrome_renders_session_derived_active_model() {
     );
     assert!(app.launch.active_model_diverged);
 }
+
+#[test]
+fn config_drift_state_retains_config_model_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let cockpit = tmp.path().join(".cockpit");
+    fs::create_dir(&cockpit).unwrap();
+    write_config(&cockpit.join("config.json"));
+
+    let mut app = App::new(Some(tmp.path()), false);
+    app.daemon_prompt = None;
+    app.apply_event(cockpit_core::engine::TurnEvent::ActiveModelState {
+        provider: "session-p".to_string(),
+        model: "session-m".to_string(),
+        config_provider: Some("config-p".to_string()),
+        config_model: Some("config-m".to_string()),
+        diverged: true,
+        generation: 2,
+    });
+
+    let drift = app.config_drift.as_ref().expect("drift state retained");
+    assert_eq!(drift.config_label(), "config-p/config-m");
+    assert_eq!(app.session_model_label(), "session-p/session-m");
+}
+
+#[test]
+fn config_drift_resolution_autocloses_dialog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let cockpit = tmp.path().join(".cockpit");
+    fs::create_dir(&cockpit).unwrap();
+    write_config(&cockpit.join("config.json"));
+
+    let mut app = App::new(Some(tmp.path()), false);
+    app.daemon_prompt = None;
+    app.apply_event(cockpit_core::engine::TurnEvent::ActiveModelState {
+        provider: "session-p".to_string(),
+        model: "session-m".to_string(),
+        config_provider: Some("p".to_string()),
+        config_model: Some("a".to_string()),
+        diverged: true,
+        generation: 2,
+    });
+    app.open_config_drift_dialog();
+    assert!(matches!(app.overlay, Overlay::ConfigDrift(_)));
+
+    app.apply_event(cockpit_core::engine::TurnEvent::ActiveModelState {
+        provider: "p".to_string(),
+        model: "a".to_string(),
+        config_provider: Some("p".to_string()),
+        config_model: Some("a".to_string()),
+        diverged: false,
+        generation: 3,
+    });
+
+    assert!(!app.launch.active_model_diverged);
+    assert!(app.config_drift.is_none());
+    assert!(matches!(app.overlay, Overlay::None));
+}
+
+#[test]
+fn config_drift_stale_generation_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let cockpit = tmp.path().join(".cockpit");
+    fs::create_dir(&cockpit).unwrap();
+    write_config(&cockpit.join("config.json"));
+
+    let mut app = App::new(Some(tmp.path()), false);
+    app.daemon_prompt = None;
+    app.apply_event(cockpit_core::engine::TurnEvent::ActiveModelState {
+        provider: "p".to_string(),
+        model: "a".to_string(),
+        config_provider: Some("p".to_string()),
+        config_model: Some("a".to_string()),
+        diverged: false,
+        generation: 3,
+    });
+    app.apply_event(cockpit_core::engine::TurnEvent::ActiveModelState {
+        provider: "stale-p".to_string(),
+        model: "stale-m".to_string(),
+        config_provider: Some("config-p".to_string()),
+        config_model: Some("config-m".to_string()),
+        diverged: true,
+        generation: 2,
+    });
+
+    assert!(!app.launch.active_model_diverged);
+    assert_eq!(
+        app.launch.active_model,
+        Some(("p".to_string(), "a".to_string()))
+    );
+    assert!(app.config_drift.is_none());
+}

@@ -13,6 +13,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,15 @@ fn press(code: KeyCode) -> KeyEvent {
 fn click(column: u16, row: u16) -> MouseEvent {
     MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    }
+}
+
+fn move_to(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Moved,
         column,
         row,
         modifiers: KeyModifiers::empty(),
@@ -218,6 +228,126 @@ fn footer_mouse_capture_gates_footer_hits_and_second_click_opens() {
 
     app.handle_mouse(click(3, 9));
     assert!(app.footer_agent_picker.is_some());
+}
+
+#[test]
+fn config_drift_click_opens_dialog_not_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_model_config(tmp.path());
+    let mut app = app(&tmp);
+    app.mouse_capture = true;
+    app.launch.active_model = Some(("session-p".to_string(), "session-m".to_string()));
+    app.launch.active_model_diverged = true;
+    app.config_drift = Some(super::ConfigDriftState {
+        config_provider: Some("p".to_string()),
+        config_model: Some("a".to_string()),
+    });
+    app.footer_hit_areas = vec![
+        FooterHitArea {
+            control: crate::tui::chrome::FooterControl::Model,
+            rect: Rect::new(2, 9, 8, 1),
+        },
+        FooterHitArea {
+            control: crate::tui::chrome::FooterControl::ConfigDrift,
+            rect: Rect::new(10, 9, 16, 1),
+        },
+    ];
+
+    app.handle_mouse(click(12, 9));
+    assert!(matches!(app.overlay, Overlay::ConfigDrift(_)));
+    assert!(!matches!(app.overlay, Overlay::ModelPicker(_)));
+
+    app.overlay = Overlay::None;
+    app.footer_selection = Some(crate::tui::chrome::FooterControl::Model);
+    app.handle_mouse(click(4, 9));
+    assert!(matches!(app.overlay, Overlay::ModelPicker(_)));
+}
+
+#[test]
+fn config_drift_hover_restyles_span() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    app.mouse_capture = true;
+    app.footer_hit_areas = vec![FooterHitArea {
+        control: crate::tui::chrome::FooterControl::ConfigDrift,
+        rect: Rect::new(10, 9, 16, 1),
+    }];
+
+    app.handle_mouse(move_to(12, 9));
+    assert_eq!(
+        app.hovered_footer_control,
+        Some(crate::tui::chrome::FooterControl::ConfigDrift)
+    );
+
+    let mut info = app.launch.clone();
+    info.active_model = Some(("p".to_string(), "a".to_string()));
+    info.active_model_diverged = true;
+    let status = crate::tui::chrome::left_status(
+        &info,
+        app.llm_mode,
+        &app.agent_path,
+        app.hovered_footer_control,
+        app.sandbox_escalation_enabled,
+    );
+    let drift = status
+        .spans
+        .iter()
+        .find(|span| span.content == " model ≠ config")
+        .expect("drift span rendered");
+    assert!(drift.style.add_modifier.contains(Modifier::UNDERLINED));
+
+    app.handle_mouse(move_to(0, 0));
+    assert_eq!(app.hovered_footer_control, None);
+}
+
+#[test]
+fn config_drift_dialog_switch_action_switches_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_model_config(tmp.path());
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
+    app.launch.active_model = Some(("session-p".to_string(), "session-m".to_string()));
+    app.launch.active_model_diverged = true;
+    app.config_drift = Some(super::ConfigDriftState {
+        config_provider: Some("p".to_string()),
+        config_model: Some("a".to_string()),
+    });
+
+    app.open_config_drift_dialog();
+    app.handle_key(press(KeyCode::Enter));
+
+    match control_rx.try_recv().expect("switch sends request").request {
+        Request::SetActiveModel {
+            provider, model, ..
+        } => {
+            assert_eq!(provider, "p");
+            assert_eq!(model, "a");
+        }
+        other => panic!("expected active-model switch, got {other:?}"),
+    }
+    assert!(matches!(app.overlay, Overlay::None));
+}
+
+#[test]
+fn config_drift_dialog_keep_closes_without_switch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_model_config(tmp.path());
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
+    app.launch.active_model = Some(("session-p".to_string(), "session-m".to_string()));
+    app.launch.active_model_diverged = true;
+    app.config_drift = Some(super::ConfigDriftState {
+        config_provider: Some("p".to_string()),
+        config_model: Some("a".to_string()),
+    });
+
+    app.open_config_drift_dialog();
+    app.handle_key(press(KeyCode::Down));
+    app.handle_key(press(KeyCode::Enter));
+
+    assert!(control_rx.try_recv().is_err());
+    assert!(matches!(app.overlay, Overlay::None));
 }
 
 #[test]

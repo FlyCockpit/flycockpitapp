@@ -50,7 +50,9 @@ impl App {
                 self.hovered_suggestion = None;
                 self.hovered_control_chip = None;
                 self.hovered_affordance = None;
+                self.hovered_footer_control = None;
             }
+            self.update_hovered_footer_control(mouse.column, mouse.row);
             return;
         }
         if self.mouse_capture
@@ -253,6 +255,7 @@ impl App {
                 return;
             }
             Overlay::ModelPicker(_)
+            | Overlay::ConfigDrift(_)
             | Overlay::Multireview(_)
             | Overlay::Usage(_)
             | Overlay::Resources(_)
@@ -304,6 +307,10 @@ impl App {
             })
         {
             self.selection = None;
+            if hit.control == crate::tui::chrome::FooterControl::ConfigDrift {
+                self.open_config_drift_dialog();
+                return;
+            }
             let already_selected = self.footer_selection == Some(hit.control);
             self.footer_selection = Some(hit.control);
             self.footer_agent_picker = None;
@@ -312,6 +319,7 @@ impl App {
                 match hit.control {
                     crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
                     crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
+                    crate::tui::chrome::FooterControl::ConfigDrift => {}
                     crate::tui::chrome::FooterControl::Mode => self.open_footer_mode_picker(),
                 }
             }
@@ -541,6 +549,23 @@ impl App {
         });
     }
 
+    fn update_hovered_footer_control(&mut self, column: u16, row: u16) {
+        if !self.mouse_capture {
+            self.hovered_footer_control = None;
+            return;
+        }
+        self.hovered_footer_control = self
+            .footer_hit_areas
+            .iter()
+            .find(|hit| {
+                row >= hit.rect.y
+                    && row < hit.rect.y + hit.rect.height
+                    && column >= hit.rect.x
+                    && column < hit.rect.x + hit.rect.width
+            })
+            .map(|hit| hit.control);
+    }
+
     /// Route a mouse event to the embedded pane (GOALS §1i). Returns
     /// `true` when consumed: a divider drag-resize, a click that focuses
     /// the pane, or an event forwarded to the child's PTY. Returns
@@ -626,7 +651,10 @@ impl App {
             || self.daemon_prompt.is_some()
             || self.context_menu.is_some()
             || self.keys_overlay.is_some()
-            || matches!(self.overlay, Overlay::ModelPicker(_))
+            || matches!(
+                self.overlay,
+                Overlay::ModelPicker(_) | Overlay::ConfigDrift(_)
+            )
             || self.footer_agent_picker.is_some()
             || self.footer_mode_picker.is_some()
             || matches!(

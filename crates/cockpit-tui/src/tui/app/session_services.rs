@@ -165,6 +165,8 @@ impl App {
             self.apply_active_model_state(
                 state.provider,
                 state.model,
+                state.config_provider,
+                state.config_model,
                 state.diverged,
                 state.generation,
             );
@@ -202,6 +204,8 @@ impl App {
             self.apply_active_model_state(
                 state.provider,
                 state.model,
+                state.config_provider,
+                state.config_model,
                 state.diverged,
                 state.generation,
             );

@@ -132,13 +132,99 @@ impl App {
             &self.auth_failure_annotations,
             chrono::Utc::now().timestamp(),
         ) {
-            Ok(picker) => {
+            Ok(mut picker) => {
+                picker.set_config_drift(self.model_picker_drift());
                 self.overlay = Overlay::ModelPicker(picker);
             }
             Err(e) => {
                 self.push_plain(format!("/model: {e}"));
             }
         }
+    }
+
+    pub(super) fn open_config_drift_dialog(&mut self) {
+        let can_switch = self
+            .config_drift
+            .as_ref()
+            .and_then(ConfigDriftState::config_active_model)
+            .is_some();
+        self.footer_selection = None;
+        self.footer_agent_picker = None;
+        self.footer_mode_picker = None;
+        self.overlay = Overlay::ConfigDrift(
+            crate::tui::config_drift_dialog::ConfigDriftDialog::new(can_switch),
+        );
+    }
+
+    pub(super) fn apply_config_drift_action(
+        &mut self,
+        action: crate::tui::config_drift_dialog::ConfigDriftAction,
+    ) {
+        self.overlay = Overlay::None;
+        match action {
+            crate::tui::config_drift_dialog::ConfigDriftAction::SwitchToConfig => {
+                if let Some(active) = self
+                    .config_drift
+                    .as_ref()
+                    .and_then(ConfigDriftState::config_active_model)
+                {
+                    self.notify_active_model_selected(
+                        active,
+                        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+                    );
+                }
+            }
+            crate::tui::config_drift_dialog::ConfigDriftAction::KeepSession => {}
+            crate::tui::config_drift_dialog::ConfigDriftAction::OpenPicker => {
+                self.open_model_picker();
+            }
+        }
+    }
+
+    pub(super) fn refresh_config_drift_surfaces(&mut self) {
+        if !self.launch.active_model_diverged {
+            if matches!(self.overlay, Overlay::ConfigDrift(_)) {
+                self.overlay = Overlay::None;
+            }
+            if let Overlay::ModelPicker(picker) = &mut self.overlay {
+                picker.set_config_drift(None);
+            }
+            return;
+        }
+
+        let drift = self.model_picker_drift();
+        if let Overlay::ModelPicker(picker) = &mut self.overlay {
+            picker.set_config_drift(drift);
+        }
+        let can_switch = self
+            .config_drift
+            .as_ref()
+            .and_then(ConfigDriftState::config_active_model)
+            .is_some();
+        if let Overlay::ConfigDrift(dialog) = &mut self.overlay
+            && dialog.can_switch() != can_switch
+        {
+            self.overlay = Overlay::ConfigDrift(
+                crate::tui::config_drift_dialog::ConfigDriftDialog::new(can_switch),
+            );
+        }
+    }
+
+    pub(super) fn model_picker_drift(&self) -> Option<crate::tui::model_picker::ModelPickerDrift> {
+        let state = self.config_drift.as_ref()?;
+        Some(crate::tui::model_picker::ModelPickerDrift {
+            session_label: self.session_model_label(),
+            config_label: state.config_label(),
+            config_model: state.config_active_model(),
+        })
+    }
+
+    pub(super) fn session_model_label(&self) -> String {
+        self.launch
+            .active_model
+            .as_ref()
+            .map(|(provider, model)| format!("{provider}/{model}"))
+            .unwrap_or_else(|| "session model unknown".to_string())
     }
 
     pub(super) fn record_auth_failure(

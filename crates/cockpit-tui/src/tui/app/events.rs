@@ -218,11 +218,19 @@ impl App {
             TurnEvent::ActiveModelState {
                 provider,
                 model,
+                config_provider,
+                config_model,
                 diverged,
                 generation,
-                ..
             } => {
-                self.apply_active_model_state(provider, model, diverged, generation);
+                self.apply_active_model_state(
+                    provider,
+                    model,
+                    config_provider,
+                    config_model,
+                    diverged,
+                    generation,
+                );
             }
             TurnEvent::ConfigSnapshot { snapshot } => {
                 self.apply_config_snapshot(*snapshot);
@@ -1455,6 +1463,8 @@ impl App {
         &mut self,
         provider: String,
         model: String,
+        config_provider: Option<String>,
+        config_model: Option<String>,
         diverged: bool,
         generation: u64,
     ) {
@@ -1465,6 +1475,11 @@ impl App {
         self.launch.provider_line = format!("{provider} / {model}");
         self.launch.active_model = Some((provider, model));
         self.launch.active_model_diverged = diverged;
+        self.config_drift = diverged.then_some(ConfigDriftState {
+            config_provider,
+            config_model,
+        });
+        self.refresh_config_drift_surfaces();
         // Favorite/trust/capabilities/llm-mode are projected off the held
         // daemon snapshot (`tui-config-single-source`) — no disk read.
         self.refresh_active_model_projection();

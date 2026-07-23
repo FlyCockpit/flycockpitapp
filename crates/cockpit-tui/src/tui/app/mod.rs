@@ -133,6 +133,42 @@ pub(super) struct FooterHitArea {
     rect: Rect,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ConfigDriftState {
+    config_provider: Option<String>,
+    config_model: Option<String>,
+}
+
+impl ConfigDriftState {
+    pub(super) fn config_active_model(&self) -> Option<cockpit_config::providers::ActiveModelRef> {
+        let provider = non_empty(self.config_provider.as_deref())?;
+        let model = non_empty(self.config_model.as_deref())?;
+        Some(cockpit_config::providers::ActiveModelRef {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+        })
+    }
+
+    pub(super) fn config_label(&self) -> String {
+        match (
+            non_empty(self.config_provider.as_deref()),
+            non_empty(self.config_model.as_deref()),
+        ) {
+            (Some(provider), Some(model)) => format!("{provider}/{model}"),
+            _ => "config model unknown".to_string(),
+        }
+    }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
+}
+
 #[cfg(test)]
 mod auth_failure_recovery_tests;
 #[cfg(test)]
@@ -921,6 +957,7 @@ pub(super) enum Overlay {
     #[default]
     None,
     ModelPicker(crate::tui::model_picker::ModelPickerDialog),
+    ConfigDrift(crate::tui::config_drift_dialog::ConfigDriftDialog),
     Multireview(crate::tui::multireview_dialog::MultireviewDialog),
     Stats(crate::tui::stats_pane::StatsPane),
     Usage(crate::tui::usage_pane::UsagePane),
@@ -943,6 +980,7 @@ impl Overlay {
     pub(super) fn dialog_height(&self) -> u16 {
         match self {
             Self::ModelPicker(_) => crate::tui::model_picker::DIALOG_HEIGHT,
+            Self::ConfigDrift(_) => 0,
             Self::Quick(_) => 14,
             Self::Multireview(_) => crate::tui::multireview_dialog::DIALOG_HEIGHT,
             _ => 0,
@@ -954,6 +992,7 @@ impl Overlay {
         match self {
             Self::None => None,
             Self::ModelPicker(_) => Some(KeyContext::ModelPicker),
+            Self::ConfigDrift(_) => Some(KeyContext::ModelPicker),
             Self::Multireview(_) => Some(KeyContext::Settings),
             Self::Sessions(_) => Some(KeyContext::Sessions),
             Self::Permissions(_) => Some(KeyContext::Permissions),
@@ -1790,11 +1829,17 @@ pub struct App {
     /// daemon's `LlmModeChanged` event so the `/llm-mode` toggle + cache-break
     /// warning resolve against the authoritative current value.
     pub(super) llm_mode: cockpit_config::extended::LlmMode,
+    /// Config-side active model fields for the current session drift indicator.
+    /// `launch.active_model` remains the session-side value; this stores only
+    /// the optional config pair carried by `ActiveModelState`.
+    pub(super) config_drift: Option<ConfigDriftState>,
     /// Root primary plus active interactive subagent path for footer chrome.
     pub(super) agent_path: Vec<String>,
     /// Footer control selected by mouse; arrow/enter keys operate on it until
     /// Esc or ordinary typing clears it.
     pub(super) footer_selection: Option<crate::tui::chrome::FooterControl>,
+    /// Footer control currently under the mouse, used only for hover styling.
+    pub(super) hovered_footer_control: Option<crate::tui::chrome::FooterControl>,
     /// Absolute hit rectangles recorded by the last status render.
     pub(super) footer_hit_areas: Vec<FooterHitArea>,
     /// Agent picker opened from the footer agent segment.
@@ -2870,8 +2915,10 @@ impl App {
             prunable_tokens: 0,
             cache_cold: true,
             llm_mode,
+            config_drift: None,
             agent_path: initial_agent_path,
             footer_selection: None,
+            hovered_footer_control: None,
             footer_hit_areas: Vec::new(),
             footer_agent_picker: None,
             footer_mode_picker: None,

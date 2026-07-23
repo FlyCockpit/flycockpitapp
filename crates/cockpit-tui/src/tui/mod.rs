@@ -21,6 +21,7 @@ pub mod banner_box;
 pub mod chat;
 pub mod chrome;
 pub mod composer;
+pub mod config_drift_dialog;
 pub mod context_menu;
 pub mod context_pane;
 pub mod daemon_prompt;

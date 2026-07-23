@@ -265,7 +265,7 @@ fn tui_config_count_stable_across_interactions() {
         snapshot: Box::new(pushed),
     });
     // /model change: apply an active-model state.
-    app.apply_active_model_state("p".to_string(), "a".to_string(), false, 1);
+    app.apply_active_model_state("p".to_string(), "a".to_string(), None, None, false, 1);
     // turn-event application: a foreground-target event re-runs skill discovery.
     app.apply_event(cockpit_core::engine::TurnEvent::ForegroundInputTarget {
         target: cockpit_core::engine::message::QueueTarget::root("Build"),

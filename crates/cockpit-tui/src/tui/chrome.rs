@@ -49,6 +49,7 @@ pub fn status_line_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
 pub enum FooterControl {
     Agent,
     Model,
+    ConfigDrift,
     Mode,
 }
 
@@ -132,18 +133,30 @@ pub fn left_status(
                 selected_style(model_style, selected == Some(FooterControl::Model)),
             ),
         );
-        if info.active_model_diverged {
-            push_span(
-                &mut spans,
-                &mut col,
-                Span::styled(" != config".to_string(), Style::default().fg(WARNING_TEXT)),
-            );
-        }
         hits.push(FooterHit {
             control: FooterControl::Model,
             start,
             end: col,
         });
+        if info.active_model_diverged {
+            let drift_start = col;
+            push_span(
+                &mut spans,
+                &mut col,
+                Span::styled(
+                    " model ≠ config".to_string(),
+                    selected_style(
+                        Style::default().fg(WARNING_TEXT),
+                        selected == Some(FooterControl::ConfigDrift),
+                    ),
+                ),
+            );
+            hits.push(FooterHit {
+                control: FooterControl::ConfigDrift,
+                start: drift_start,
+                end: col,
+            });
+        }
     }
 
     push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
@@ -434,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn chrome_shows_active_model_divergence_badge() {
+    fn config_drift_status_copy_renders_when_diverged() {
         let mut info = launch_info("Build");
         info.active_model_diverged = true;
 
@@ -447,7 +460,8 @@ mod tests {
         )
         .spans;
 
-        assert!(spans.iter().any(|span| span.content == " != config"));
+        assert!(spans.iter().any(|span| span.content == " model ≠ config"));
+        assert!(!spans.iter().any(|span| span.content == " != config"));
 
         info.active_model_diverged = false;
         let spans = left_status(
@@ -458,6 +472,7 @@ mod tests {
             true,
         )
         .spans;
+        assert!(!spans.iter().any(|span| span.content == " model ≠ config"));
         assert!(!spans.iter().any(|span| span.content == " != config"));
     }
 

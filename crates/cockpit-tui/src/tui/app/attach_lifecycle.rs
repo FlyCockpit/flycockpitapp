@@ -161,6 +161,8 @@ impl App {
                 self.apply_active_model_state(
                     state.provider.clone(),
                     state.model.clone(),
+                    state.config_provider.clone(),
+                    state.config_model.clone(),
                     state.diverged,
                     state.generation,
                 );

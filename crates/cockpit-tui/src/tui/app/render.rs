@@ -1080,6 +1080,19 @@ impl App {
                 dialog.sync_viewport(rects.compact, frame.area().height);
                 dialog.render(frame, rects.compact);
             }
+        } else if matches!(self.overlay, Overlay::ConfigDrift(_)) {
+            self.render_history(frame, rects.body);
+            let overlay = std::mem::take(&mut self.overlay);
+            if let Overlay::ConfigDrift(mut dialog) = overlay {
+                let session = self.session_model_label();
+                let config = self
+                    .config_drift
+                    .as_ref()
+                    .map(|state| state.config_label())
+                    .unwrap_or_else(|| "config model unknown".to_string());
+                dialog.render(frame, rects.compact, &session, &config);
+                self.overlay = Overlay::ConfigDrift(dialog);
+            }
         } else if self.dialog.is_active() {
             self.dialog
                 .render(frame, rects.body, &mut self.link_registry);
@@ -1089,6 +1102,9 @@ impl App {
                 Overlay::ModelPicker(mut picker) => {
                     picker.render(frame, rects.body);
                     self.overlay = Overlay::ModelPicker(picker);
+                }
+                Overlay::ConfigDrift(dialog) => {
+                    self.overlay = Overlay::ConfigDrift(dialog);
                 }
                 Overlay::Multireview(dialog) => {
                     dialog.render(frame, rects.body);
@@ -3161,7 +3177,7 @@ impl App {
             &self.launch,
             self.llm_mode,
             &self.agent_path,
-            self.footer_selection,
+            self.hovered_footer_control.or(self.footer_selection),
             self.sandbox_escalation_enabled,
         );
         let mut left = status.spans;

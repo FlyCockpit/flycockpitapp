@@ -50,6 +50,7 @@ pub struct ModelPickerDialog {
     cfg: ProvidersConfig,
     entries: Vec<Entry>,
     active_model: Option<(String, String)>,
+    drift: Option<ModelPickerDrift>,
     filter: TextField,
     /// Cursor and top visible index of the scroll window over the filtered list.
     pick: ScrollList,
@@ -57,6 +58,13 @@ pub struct ModelPickerDialog {
     error: Option<String>,
     done: bool,
     row_hits: Vec<Option<RowHit>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPickerDrift {
+    pub session_label: String,
+    pub config_label: String,
+    pub config_model: Option<ActiveModelRef>,
 }
 
 #[derive(Clone)]
@@ -255,6 +263,7 @@ impl ModelPickerDialog {
             cfg,
             entries,
             active_model,
+            drift: None,
             filter: TextField::default(),
             pick: ScrollList::at(cursor, scroll),
             step: Step::Pick,
@@ -266,6 +275,14 @@ impl ModelPickerDialog {
 
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    pub fn set_config_drift(&mut self, drift: Option<ModelPickerDrift>) {
+        if self.drift == drift {
+            return;
+        }
+        self.drift = drift;
+        self.retarget_pick_position();
     }
 
     #[cfg(test)]
@@ -334,19 +351,32 @@ impl ModelPickerDialog {
 
     fn handle_pick_key(&mut self, key: KeyEvent) -> bool {
         let visible = self.filtered_indices();
+        let drift_offset = usize::from(self.drift_switch_model().is_some());
+        let total = visible.len() + drift_offset;
         // Arrow keys navigate (with wrap); `j`/`k` stay literal text for
         // the filter, since this step is typing-driven.
         match key.code {
             KeyCode::Up => {
-                self.pick.move_by(-1, visible.len());
-                self.pick.clamp_windowed(visible.len(), MODEL_WINDOW);
+                self.pick.move_by(-1, total);
+                self.pick.clamp_windowed(total, MODEL_WINDOW);
             }
             KeyCode::Down => {
-                self.pick.move_by(1, visible.len());
-                self.pick.clamp_windowed(visible.len(), MODEL_WINDOW);
+                self.pick.move_by(1, total);
+                self.pick.clamp_windowed(total, MODEL_WINDOW);
             }
             KeyCode::Enter => {
-                if let Some(&i) = visible.get(self.pick.cursor()) {
+                if self.pick.cursor() == 0
+                    && let Some(active) = self.drift_switch_model().cloned()
+                {
+                    return self.commit_active_model(
+                        active.provider,
+                        active.model,
+                        active.reasoning_effort,
+                        active.thinking_mode,
+                    );
+                }
+                let entry_cursor = self.pick.cursor().saturating_sub(drift_offset);
+                if let Some(&i) = visible.get(entry_cursor) {
                     let entry = self.entries[i].clone();
                     if let Some(capability) = entry
                         .reasoning_effort
@@ -396,6 +426,10 @@ impl ModelPickerDialog {
     }
 
     fn retarget_pick_position(&mut self) {
+        if self.drift_switch_model().is_some() {
+            self.pick = ScrollList::at(0, 0);
+            return;
+        }
         let (cursor, scroll) = initial_pick_position(
             &self.entries,
             self.active_model.as_ref(),
@@ -533,6 +567,44 @@ impl ModelPickerDialog {
             Span::styled(filter_after.to_string(), Style::default().fg(Color::White)),
         ]));
         lines.push(Line::default());
+        let drift_offset = usize::from(self.drift_switch_model().is_some());
+        if let Some(drift) = &self.drift {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "This session is running {}, but your config's active model is {}.",
+                    drift.session_label, drift.config_label
+                ),
+                Style::default().fg(Color::Indexed(178)),
+            )));
+            if let Some(active) = &drift.config_model {
+                let highlighted = self.pick.cursor() == 0;
+                let marker = if highlighted { "▸ " } else { "  " };
+                let style = if highlighted {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(marker.to_string()),
+                    Span::styled(
+                        format!(
+                            "Switch to config model: {}/{}",
+                            active.provider, active.model
+                        ),
+                        style,
+                    ),
+                ]));
+                let row = area.y + lines.len() as u16 - 1;
+                if row < area.y + area.height
+                    && let Some(slot) = self.row_hits.get_mut(row as usize)
+                {
+                    *slot = Some(RowHit::Pick { cursor: 0 });
+                }
+            }
+            lines.push(Line::default());
+        }
 
         let visible = self.filtered_indices();
         if visible.is_empty() {
@@ -547,15 +619,21 @@ impl ModelPickerDialog {
             let mut seen_other = false;
             let both_sections = visible.iter().any(|&idx| self.entries[idx].is_favorite)
                 && visible.iter().any(|&idx| !self.entries[idx].is_favorite);
-            let window = pick_window(area.height, self.error.is_some(), both_sections);
+            let banner_rows = lines.len().saturating_sub(2);
+            let window = pick_window(
+                area.height.saturating_sub(banner_rows as u16),
+                self.error.is_some(),
+                both_sections,
+            );
             // Scroll window: same scrolloff=1 behavior as the @-popup.
             let offset = crate::tui::nav::windowed_scroll(
                 self.pick.cursor(),
                 self.pick.scroll(),
-                visible.len(),
+                visible.len() + drift_offset,
                 window,
             );
-            for (i, &idx) in visible.iter().enumerate().skip(offset).take(window) {
+            let entry_offset = offset.saturating_sub(drift_offset);
+            for (i, &idx) in visible.iter().enumerate().skip(entry_offset).take(window) {
                 let e = &self.entries[idx];
                 if e.is_favorite && !seen_fav {
                     lines.push(Line::from(Span::styled(
@@ -571,7 +649,8 @@ impl ModelPickerDialog {
                     )));
                     seen_other = true;
                 }
-                let highlighted = i == self.pick.cursor();
+                let cursor = i + drift_offset;
+                let highlighted = cursor == self.pick.cursor();
                 let is_active_model = self.is_active_entry(e);
                 let marker = if highlighted { "▸ " } else { "  " };
                 let label_style = if highlighted {
@@ -624,7 +703,7 @@ impl ModelPickerDialog {
                 if row < area.y + area.height
                     && let Some(slot) = self.row_hits.get_mut(row as usize)
                 {
-                    *slot = Some(RowHit::Pick { cursor: i });
+                    *slot = Some(RowHit::Pick { cursor });
                 }
             }
         }
@@ -751,6 +830,12 @@ impl ModelPickerDialog {
             .as_ref()
             .map(|(provider, model)| provider == &entry.provider_id && model == &entry.model_id)
             .unwrap_or(false)
+    }
+
+    fn drift_switch_model(&self) -> Option<&ActiveModelRef> {
+        self.drift
+            .as_ref()
+            .and_then(|drift| drift.config_model.as_ref())
     }
 
     fn initial_reasoning_cursor(
@@ -998,6 +1083,7 @@ mod tests {
             cfg: ProvidersConfig::default(),
             entries: Vec::new(),
             active_model: None,
+            drift: None,
             filter: TextField::default(),
             pick: ScrollList::new(),
             step: Step::Pick,
@@ -1107,6 +1193,7 @@ mod tests {
             cfg: ProvidersConfig::default(),
             entries,
             active_model: None,
+            drift: None,
             filter: TextField::default(),
             pick: ScrollList::new(),
             step: Step::Pick,
@@ -1121,6 +1208,7 @@ mod tests {
             cfg: ProvidersConfig::default(),
             entries,
             active_model: None,
+            drift: None,
             filter: TextField::default(),
             pick: ScrollList::new(),
             step: Step::Pick,
@@ -1156,6 +1244,67 @@ mod tests {
         let rendered = rendered_text(&mut d, 60, 12);
 
         assert!(rendered.contains("filter: aXb"), "{rendered}");
+    }
+
+    #[test]
+    fn config_drift_model_picker_banner_parity() {
+        let mut normal = dialog_with(vec![entry("a")]);
+        let rendered = rendered_text(&mut normal, 100, 20);
+        assert!(!rendered.contains("This session is running"), "{rendered}");
+        assert!(!rendered.contains("Switch to config model"), "{rendered}");
+
+        let mut drifted = dialog_with(vec![entry("a")]);
+        drifted.set_config_drift(Some(ModelPickerDrift {
+            session_label: "other/old".to_string(),
+            config_label: "p/a".to_string(),
+            config_model: Some(ActiveModelRef {
+                provider: "p".to_string(),
+                model: "a".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+        }));
+        let rendered = rendered_text(&mut drifted, 100, 20);
+        assert!(
+            rendered.contains("This session is running other/old"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Switch to config model: p/a"),
+            "{rendered}"
+        );
+
+        assert!(drifted.handle_key(press(KeyCode::Enter)));
+        let active = drifted
+            .selected_active_model()
+            .expect("selected active model");
+        assert_eq!(active.provider, "p");
+        assert_eq!(active.model, "a");
+    }
+
+    #[test]
+    fn config_drift_model_picker_refresh_preserves_cursor_when_unchanged() {
+        let drift = ModelPickerDrift {
+            session_label: "other/old".to_string(),
+            config_label: "p/config".to_string(),
+            config_model: Some(ActiveModelRef {
+                provider: "p".to_string(),
+                model: "config".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+            }),
+        };
+        let mut dialog = dialog_with(vec![entry("a"), entry("b")]);
+        dialog.set_config_drift(Some(drift.clone()));
+        assert!(!dialog.handle_key(press(KeyCode::Down)));
+
+        dialog.set_config_drift(Some(drift));
+        assert!(dialog.handle_key(press(KeyCode::Enter)));
+        let active = dialog
+            .selected_active_model()
+            .expect("selected active model");
+        assert_eq!(active.provider, "p");
+        assert_eq!(active.model, "a");
     }
 
     #[test]
@@ -1519,6 +1668,7 @@ mod tests {
             cfg: ProvidersConfig::default(),
             entries,
             active_model,
+            drift: None,
             filter: TextField::default(),
             pick: ScrollList::at(cursor, scroll),
             step: Step::Pick,

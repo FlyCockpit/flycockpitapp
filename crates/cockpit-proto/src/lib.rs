@@ -461,10 +461,10 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// such as removals, renames, and type changes bump
 /// [`MIN_SUPPORTED_PROTOCOL_VERSION`] and are the only class that narrows the
 /// compatibility window.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Oldest wire schema version this binary accepts.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 3;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1576,6 +1576,10 @@ fn codec_error(err: LinesCodecError) -> io::Error {
 
 #[cfg(test)]
 mod proto_fixture_tests {
+    //! Fixture release ritual: when `PROTOCOL_VERSION` is bumped, copy the
+    //! current `vN/` directory to `vN+1/` and let the strict tests re-point to
+    //! the new current version. Never edit a frozen `v*/` directory.
+
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
@@ -1586,6 +1590,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
+    const RELEASED_PROTOCOL_VERSIONS: &[u32] = &[1];
+    const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
     fn proto_fixture_request_full_shapes_round_trip() {
@@ -1652,6 +1658,53 @@ mod proto_fixture_tests {
         }
     }
 
+    #[test]
+    fn frozen_fixture_every_released_version_still_deserializes() {
+        for version in RELEASED_PROTOCOL_VERSIONS {
+            assert_frozen_fixture_deserializes::<Request>(*version, "request.json");
+            assert_frozen_fixture_deserializes::<Response>(*version, "response.json");
+            assert_frozen_fixture_deserializes::<Event>(*version, "event.json");
+        }
+    }
+
+    #[test]
+    fn frozen_fixture_released_version_list_matches_directories() {
+        let listed = RELEASED_PROTOCOL_VERSIONS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !listed.is_empty(),
+            "released protocol version list is empty"
+        );
+        let directories = released_fixture_directories();
+        assert!(
+            !directories.is_empty(),
+            "daemon_proto has no v*/ fixture directories"
+        );
+        assert_eq!(
+            directories, listed,
+            "released protocol version list must match daemon_proto/v*/ directories"
+        );
+        for version in listed {
+            assert_fixture_directory_files(version);
+        }
+    }
+
+    #[test]
+    fn frozen_fixture_current_version_directory_exists() {
+        assert!(
+            RELEASED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION),
+            "current protocol v{PROTOCOL_VERSION} must be listed as released"
+        );
+        let root = fixture_root_for(PROTOCOL_VERSION);
+        assert!(
+            root.is_dir(),
+            "current protocol fixture directory must exist: {}",
+            root.display()
+        );
+    }
+
     fn assert_enum_fixture<T>(tag: &str, file_name: &str, expected_kinds: Vec<String>)
     where
         T: DeserializeOwned + Serialize,
@@ -1682,6 +1735,19 @@ mod proto_fixture_tests {
         }
     }
 
+    fn assert_frozen_fixture_deserializes<T>(version: u32, file_name: &str)
+    where
+        T: DeserializeOwned,
+    {
+        for (kind, value) in read_fixture_for(version, file_name) {
+            let _: T = serde_json::from_value(value).unwrap_or_else(|error| {
+                panic!(
+                    "frozen fixture v{version}/{file_name}:{kind} no longer deserializes — this is a breaking wire change; bump MIN_SUPPORTED_PROTOCOL_VERSION deliberately or restore compatibility: {error}"
+                )
+            });
+        }
+    }
+
     fn assert_fixture_wire_tags<T>(
         tag: &str,
         file_name: &str,
@@ -1706,7 +1772,11 @@ mod proto_fixture_tests {
     }
 
     fn read_fixture(file_name: &str) -> Map<String, Value> {
-        let path = fixture_root().join(file_name);
+        read_fixture_for(PROTOCOL_VERSION, file_name)
+    }
+
+    fn read_fixture_for(version: u32, file_name: &str) -> Map<String, Value> {
+        let path = fixture_root_for(version).join(file_name);
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
         serde_json::from_str(&raw)
@@ -1752,11 +1822,81 @@ mod proto_fixture_tests {
         crate::event_variants!(collect_tags)
     }
 
-    fn fixture_root() -> PathBuf {
+    fn fixture_root_for(version: u32) -> PathBuf {
+        let path = daemon_proto_fixture_root().join(format!("v{version}"));
+        if !path.is_dir() {
+            panic!(
+                "missing daemon proto fixture directory for protocol v{version}: {}",
+                path.display()
+            );
+        }
+        path
+    }
+
+    fn daemon_proto_fixture_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
             .join("daemon_proto")
+    }
+
+    fn released_fixture_directories() -> BTreeSet<u32> {
+        let root = daemon_proto_fixture_root();
+        let entries = std::fs::read_dir(&root)
+            .unwrap_or_else(|error| panic!("read {}: {error}", root.display()));
+        let mut versions = BTreeSet::new();
+        for entry in entries {
+            let entry =
+                entry.unwrap_or_else(|error| panic!("read {} entry: {error}", root.display()));
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                path.is_dir(),
+                "unexpected file directly under daemon_proto fixtures: {}",
+                path.display()
+            );
+            let Some(raw) = name.strip_prefix('v') else {
+                panic!(
+                    "unexpected non-version directory under daemon_proto fixtures: {}",
+                    path.display()
+                );
+            };
+            let version = raw.parse::<u32>().unwrap_or_else(|error| {
+                panic!(
+                    "unexpected non-numeric daemon_proto fixture directory {}: {error}",
+                    path.display()
+                )
+            });
+            versions.insert(version);
+        }
+        versions
+    }
+
+    fn assert_fixture_directory_files(version: u32) {
+        let root = fixture_root_for(version);
+        let entries = std::fs::read_dir(&root)
+            .unwrap_or_else(|error| panic!("read {}: {error}", root.display()));
+        let mut actual = BTreeSet::new();
+        for entry in entries {
+            let entry =
+                entry.unwrap_or_else(|error| panic!("read {} entry: {error}", root.display()));
+            let path = entry.path();
+            assert!(
+                path.is_file(),
+                "unexpected non-file under frozen daemon_proto v{version}: {}",
+                path.display()
+            );
+            actual.insert(entry.file_name().to_string_lossy().to_string());
+        }
+        let expected = DAEMON_PROTO_FIXTURE_FILES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "frozen daemon_proto v{version} must contain exactly the known fixture files"
+        );
     }
 
     fn canonical(value: Value) -> Value {

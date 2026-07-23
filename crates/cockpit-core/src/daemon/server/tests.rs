@@ -2746,13 +2746,13 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
     ]
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AuthzExpectation {
     Allow(AuthzAllowedOutcome),
     Deny(ErrorCode),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AuthzAllowedOutcome {
     Response,
     Error(ErrorCode),
@@ -2779,7 +2779,7 @@ impl AuthzLevel {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AuthzDispatchCase {
     kind: &'static str,
     owner: AuthzExpectation,
@@ -2789,7 +2789,7 @@ struct AuthzDispatchCase {
     known_holes: &'static [AuthzKnownHole],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AuthzKnownHole {
     marker: &'static str,
     level: AuthzLevel,
@@ -2798,12 +2798,12 @@ struct AuthzKnownHole {
 }
 
 impl AuthzDispatchCase {
-    fn expectation(self, level: AuthzLevel) -> AuthzExpectation {
+    fn expectation(&self, level: AuthzLevel) -> AuthzExpectation {
         match level {
-            AuthzLevel::Owner => self.owner,
-            AuthzLevel::Writer => self.writer,
-            AuthzLevel::Readonly => self.readonly,
-            AuthzLevel::NoAccess => self.no_access,
+            AuthzLevel::Owner => self.owner.clone(),
+            AuthzLevel::Writer => self.writer.clone(),
+            AuthzLevel::Readonly => self.readonly.clone(),
+            AuthzLevel::NoAccess => self.no_access.clone(),
         }
     }
 }
@@ -3437,10 +3437,10 @@ async fn authz_dispatch_matrix_covers_every_controlled_kind() {
                 scenario.request,
             )
             .await;
-            assert_authz_matrix_result(case, level, result);
+            assert_authz_matrix_result(&case, level, result);
         }
         for known_hole in case.known_holes {
-            assert_authz_known_hole_socket_case(case.kind, *known_hole).await;
+            assert_authz_known_hole_socket_case(case.kind, known_hole.clone()).await;
         }
     }
 }
@@ -3459,7 +3459,7 @@ struct AuthzSocketScenario {
 
 #[cfg(unix)]
 fn assert_authz_matrix_result(
-    case: AuthzDispatchCase,
+    case: &AuthzDispatchCase,
     level: AuthzLevel,
     result: std::result::Result<Response, ErrorPayload>,
 ) {

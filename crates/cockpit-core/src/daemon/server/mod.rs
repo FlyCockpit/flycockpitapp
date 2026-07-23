@@ -1419,7 +1419,8 @@ fn scrub_auth_failure(auth: &mut proto::AuthFailureKind, _redact: &RedactionTabl
         proto::AuthFailureKind::CredentialsRejected { status: _ }
         | proto::AuthFailureKind::MissingEntitlement { feature: _ }
         | proto::AuthFailureKind::OAuthExpired { provider: _ }
-        | proto::AuthFailureKind::ProviderNotConfigured => {}
+        | proto::AuthFailureKind::ProviderNotConfigured
+        | proto::AuthFailureKind::Other(_) => {}
     }
 }
 

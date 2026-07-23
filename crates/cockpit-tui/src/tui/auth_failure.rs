@@ -24,6 +24,7 @@ pub fn failure_label(kind: &AuthFailureKind) -> String {
         AuthFailureKind::MissingEntitlement { feature } => format!("missing {feature}"),
         AuthFailureKind::OAuthExpired { .. } => "OAuth expired".to_string(),
         AuthFailureKind::ProviderNotConfigured => "provider not configured".to_string(),
+        AuthFailureKind::Other(kind) => kind.clone(),
     }
 }
 

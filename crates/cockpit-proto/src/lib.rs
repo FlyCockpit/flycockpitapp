@@ -813,8 +813,7 @@ pub struct ErrorPayload {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorCode {
     /// Request payload didn't parse / failed validation.
     BadRequest,
@@ -846,8 +845,44 @@ pub enum ErrorCode {
     WorkspaceTrust,
     /// Anything else.
     Internal,
-    #[serde(other)]
-    Unknown,
+    /// Error code from a future peer that this binary does not know yet.
+    Other(String),
+}
+
+impl Serialize for ErrorCode {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ErrorCode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "bad_request" => Self::BadRequest,
+            "protocol_version" => Self::ProtocolVersion,
+            "unsupported_request" => Self::UnsupportedRequest,
+            "not_attached" => Self::NotAttached,
+            "unknown_session" => Self::UnknownSession,
+            "unknown_interrupt" => Self::UnknownInterrupt,
+            "shutdown" => Self::Shutdown,
+            "authorization" => Self::Authorization,
+            "read_only" => Self::ReadOnly,
+            "root_missing" => Self::RootMissing,
+            "path_outside_root" => Self::PathOutsideRoot,
+            "hash_mismatch" => Self::HashMismatch,
+            "lock_conflict" => Self::LockConflict,
+            "workspace_trust" => Self::WorkspaceTrust,
+            "internal" => Self::Internal,
+            _ => Self::Other(raw),
+        })
+    }
 }
 
 impl std::fmt::Display for ErrorCode {
@@ -868,7 +903,7 @@ impl std::fmt::Display for ErrorCode {
             Self::LockConflict => "lock_conflict",
             Self::WorkspaceTrust => "workspace_trust",
             Self::Internal => "internal",
-            Self::Unknown => "unknown",
+            Self::Other(raw) => raw,
         };
         f.write_str(s)
     }
@@ -1505,7 +1540,7 @@ fn payload_tag_is_unknown(kind: &str, tag: Option<&str>) -> bool {
         "evt" => serde_json::from_value::<Event>(json!({ "event": tag }))
             .is_ok_and(|event| matches!(event, Event::Unknown)),
         "err" => serde_json::from_value::<ErrorCode>(json!(tag))
-            .is_ok_and(|code| matches!(code, ErrorCode::Unknown)),
+            .is_ok_and(|code| matches!(code, ErrorCode::Other(_))),
         _ => false,
     }
 }
@@ -1515,7 +1550,7 @@ fn envelope_contains_unknown(env: &Envelope) -> bool {
         Body::Request { request, .. } => matches!(request, Request::Unknown),
         Body::Response { response, .. } => matches!(**response, Response::Unknown),
         Body::Event { event } => matches!(event, Event::Unknown),
-        Body::Error { error, .. } => matches!(error.code, ErrorCode::Unknown),
+        Body::Error { error, .. } => matches!(error.code, ErrorCode::Other(_)),
         Body::Unknown => true,
     }
 }
@@ -1772,6 +1807,33 @@ mod forward_open_guard_tests {
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
         serde_json::from_str(&raw)
             .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod errorcode_forward_tests {
+    use super::*;
+
+    #[test]
+    fn errorcode_forward_unknown_string_deserializes_to_catch_all() {
+        let code: ErrorCode = serde_json::from_str("\"future_code\"").unwrap();
+        assert_eq!(code, ErrorCode::Other("future_code".to_string()));
+        assert_eq!(code.to_string(), "future_code");
+    }
+
+    #[test]
+    fn errorcode_forward_known_string_still_deserializes_to_specific_variant() {
+        let code: ErrorCode = serde_json::from_str("\"protocol_version\"").unwrap();
+        assert_eq!(code, ErrorCode::ProtocolVersion);
+    }
+
+    #[test]
+    fn errorcode_forward_catch_all_round_trips() {
+        let original = ErrorCode::Other("future_code".to_string());
+        let serialized = serde_json::to_string(&original).unwrap();
+        assert_eq!(serialized, "\"future_code\"");
+        let parsed: ErrorCode = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed, original);
     }
 }
 

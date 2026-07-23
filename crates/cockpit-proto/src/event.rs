@@ -1,17 +1,185 @@
 use super::*;
+use serde::ser::SerializeMap;
 
 // ---- Events ----------------------------------------------------------------
 
 /// Structured recovery classification for send-time credential and entitlement
 /// failures. Rate limits, timeouts, and transport failures are intentionally
 /// absent from this narrower taxonomy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthFailureKind {
     CredentialsRejected { status: u16 },
     MissingEntitlement { feature: String },
     OAuthExpired { provider: String },
     ProviderNotConfigured,
+    Other(String),
+}
+
+#[cfg(test)]
+mod auth_failure_kind_forward_tests {
+    use super::*;
+
+    #[test]
+    fn auth_failure_kind_forward_unknown_kind_deserializes_to_catch_all() {
+        let kind: AuthFailureKind = serde_json::from_value(serde_json::json!({
+            "kind": "future_auth_failure",
+            "future": true
+        }))
+        .unwrap();
+        assert_eq!(
+            kind,
+            AuthFailureKind::Other("future_auth_failure".to_string())
+        );
+
+        let serialized = serde_json::to_value(&kind).unwrap();
+        assert_eq!(
+            serialized,
+            serde_json::json!({ "kind": "future_auth_failure" })
+        );
+        let parsed: AuthFailureKind = serde_json::from_value(serialized).unwrap();
+        assert_eq!(parsed, kind);
+    }
+
+    #[test]
+    fn auth_failure_kind_forward_inference_failed_parses_with_unknown_auth_failure() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "event": "inference_failed",
+            "data": {
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "agent": "Build",
+                "provider": "future-provider",
+                "model": "future-model",
+                "error_class": "future_error",
+                "detail": "details",
+                "auth_failure": {
+                    "kind": "future_auth_failure",
+                    "future": true
+                }
+            }
+        }))
+        .unwrap();
+
+        match event {
+            Event::InferenceFailed { auth_failure, .. } => {
+                assert_eq!(
+                    auth_failure,
+                    Some(AuthFailureKind::Other("future_auth_failure".to_string()))
+                );
+            }
+            other => panic!("expected inference_failed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_failure_kind_forward_malformed_known_kind_still_errors() {
+        let error = serde_json::from_value::<AuthFailureKind>(serde_json::json!({
+            "kind": "credentials_rejected",
+            "status": "bad"
+        }))
+        .expect_err("malformed known auth failure must remain an error");
+        assert!(
+            error.to_string().contains("invalid type"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn auth_failure_kind_forward_known_kind_still_deserializes_with_fields() {
+        let kind: AuthFailureKind = serde_json::from_value(serde_json::json!({
+            "kind": "credentials_rejected",
+            "status": 403
+        }))
+        .unwrap();
+        assert_eq!(kind, AuthFailureKind::CredentialsRejected { status: 403 });
+    }
+}
+
+impl Serialize for AuthFailureKind {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::CredentialsRejected { status } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("kind", "credentials_rejected")?;
+                map.serialize_entry("status", status)?;
+                map.end()
+            }
+            Self::MissingEntitlement { feature } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("kind", "missing_entitlement")?;
+                map.serialize_entry("feature", feature)?;
+                map.end()
+            }
+            Self::OAuthExpired { provider } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("kind", "oauth_expired")?;
+                map.serialize_entry("provider", provider)?;
+                map.end()
+            }
+            Self::ProviderNotConfigured => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("kind", "provider_not_configured")?;
+                map.end()
+            }
+            Self::Other(kind) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("kind", kind)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthFailureKind {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let kind = value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::missing_field("kind"))?;
+        match kind {
+            "credentials_rejected" => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    status: u16,
+                }
+                serde_json::from_value::<Wire>(value)
+                    .map(|wire| Self::CredentialsRejected {
+                        status: wire.status,
+                    })
+                    .map_err(serde::de::Error::custom)
+            }
+            "missing_entitlement" => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    feature: String,
+                }
+                serde_json::from_value::<Wire>(value)
+                    .map(|wire| Self::MissingEntitlement {
+                        feature: wire.feature,
+                    })
+                    .map_err(serde::de::Error::custom)
+            }
+            "oauth_expired" => {
+                #[derive(Deserialize)]
+                struct Wire {
+                    provider: String,
+                }
+                serde_json::from_value::<Wire>(value)
+                    .map(|wire| Self::OAuthExpired {
+                        provider: wire.provider,
+                    })
+                    .map_err(serde::de::Error::custom)
+            }
+            "provider_not_configured" => Ok(Self::ProviderNotConfigured),
+            _ => Ok(Self::Other(kind.to_string())),
+        }
+    }
 }
 
 /// Unsolicited daemon → client notifications. The event stream is

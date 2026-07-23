@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{Notify, RwLock, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::{Notify, RwLock, mpsc, oneshot, watch};
+use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
 
 use cockpit_core::daemon::client::{DaemonClient, LifecycleMode, probe_or_spawn};
@@ -293,6 +293,27 @@ struct IncomingEventContext<'a> {
     last_applied_seq: &'a Arc<Mutex<Option<i64>>>,
 }
 
+struct ClientEventState {
+    events: Arc<Mutex<Vec<TurnEvent>>>,
+    event_notify: Arc<Notify>,
+    active_agent: Arc<Mutex<String>>,
+    active_agent_path: Arc<Mutex<Vec<String>>>,
+    primary_agent: Arc<Mutex<String>>,
+    last_applied_seq: Arc<Mutex<Option<i64>>>,
+    attach_context: Arc<RwLock<AttachRequestContext>>,
+    session_id_state: Arc<Mutex<Uuid>>,
+    skill_refresh_tx: watch::Sender<u64>,
+    skill_refresh_generation: u64,
+}
+
+struct AbortOnDrop(AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 struct ReconnectBackoff<J = SystemJitter> {
     base: Duration,
     cap: Duration,
@@ -302,6 +323,12 @@ struct ReconnectBackoff<J = SystemJitter> {
 
 struct ReconnectAttach {
     client: DaemonClient,
+    history: Vec<proto::HistoryEntry>,
+    paused_work: Vec<proto::PausedWorkSummary>,
+    repair_required: Option<proto::ResumeRepairState>,
+}
+
+struct AttachedPayload {
     history: Vec<proto::HistoryEntry>,
     paused_work: Vec<proto::PausedWorkSummary>,
     repair_required: Option<proto::ResumeRepairState>,
@@ -376,6 +403,189 @@ fn current_last_applied_seq(last_applied_seq: &Arc<Mutex<Option<i64>>>) -> Optio
     *last_applied_seq
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+async fn run_skill_inventory_refresh(
+    current_client: Arc<RwLock<DaemonClient>>,
+    attach_context: Arc<RwLock<AttachRequestContext>>,
+    skill_inventory_names: Arc<Mutex<Option<std::collections::HashSet<String>>>>,
+    refresh_rx: watch::Receiver<u64>,
+) {
+    run_skill_inventory_refresh_with_request(
+        attach_context,
+        skill_inventory_names,
+        refresh_rx,
+        move |project_root| {
+            let current_client = current_client.clone();
+            async move {
+                let client = current_client.read().await.clone();
+                client
+                    .request_ok(Request::ListSkills { project_root })
+                    .await
+            }
+        },
+    )
+    .await;
+}
+
+async fn run_skill_inventory_refresh_with_request<F, Fut>(
+    attach_context: Arc<RwLock<AttachRequestContext>>,
+    skill_inventory_names: Arc<Mutex<Option<std::collections::HashSet<String>>>>,
+    mut refresh_rx: watch::Receiver<u64>,
+    mut request_skills: F,
+) where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Response>>,
+{
+    while refresh_rx.changed().await.is_ok() {
+        let project_root = attach_context.read().await.project_root.clone();
+        match request_skills(project_root).await {
+            Ok(Response::Skills { skills }) => {
+                let names = skills
+                    .into_iter()
+                    .map(|skill| skill.name)
+                    .collect::<std::collections::HashSet<_>>();
+                *skill_inventory_names
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(names);
+            }
+            Ok(other) => {
+                tracing::debug!(?other, "list_skills returned unexpected response");
+            }
+            Err(error) => {
+                tracing::debug!(error = ?error, "skill inventory refresh failed");
+            }
+        }
+    }
+}
+
+fn spawn_skill_inventory_refresh_task(
+    client_tasks: &mut ClientTasks,
+    current_client: Arc<RwLock<DaemonClient>>,
+    attach_context: Arc<RwLock<AttachRequestContext>>,
+    skill_inventory_names: Arc<Mutex<Option<std::collections::HashSet<String>>>>,
+) -> (watch::Sender<u64>, AbortHandle) {
+    let (refresh_tx, refresh_rx) = watch::channel(0);
+    let handle = tokio::spawn(run_skill_inventory_refresh(
+        current_client,
+        attach_context,
+        skill_inventory_names,
+        refresh_rx,
+    ));
+    let abort_handle = handle.abort_handle();
+    client_tasks.push(handle);
+    (refresh_tx, abort_handle)
+}
+
+impl ClientEventState {
+    fn session_id(&self) -> Uuid {
+        *self
+            .session_id_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn incoming_context(&self, session_id: Uuid) -> IncomingEventContext<'_> {
+        IncomingEventContext {
+            session_id,
+            events: &self.events,
+            event_notify: &self.event_notify,
+            active_agent: &self.active_agent,
+            active_agent_path: &self.active_agent_path,
+            primary_agent: &self.primary_agent,
+            last_applied_seq: &self.last_applied_seq,
+        }
+    }
+
+    fn trigger_skill_refresh(&mut self) {
+        self.skill_refresh_generation = self.skill_refresh_generation.wrapping_add(1);
+        self.skill_refresh_tx
+            .send_replace(self.skill_refresh_generation);
+    }
+
+    fn handle_regular_event(&mut self, event: proto::Event) {
+        if should_refresh_skill_inventory(&event) {
+            self.trigger_skill_refresh();
+        }
+        let session_id = self.session_id();
+        let incoming = self.incoming_context(session_id);
+        apply_incoming_event(event, &incoming);
+    }
+
+    async fn handle_event(&mut self, client: &DaemonClient, event: proto::Event) -> bool {
+        let client = client.clone();
+        self.handle_event_with_resync(event, move |session_id, attach_snapshot, last| {
+            let client = client.clone();
+            async move { resync_attach_payload(&client, session_id, &attach_snapshot, &last).await }
+        })
+        .await
+    }
+
+    async fn handle_event_with_resync<F, Fut>(&mut self, event: proto::Event, resync: F) -> bool
+    where
+        F: FnOnce(Uuid, AttachRequestContext, Arc<Mutex<Option<i64>>>) -> Fut,
+        Fut: std::future::Future<Output = Result<AttachedPayload, ReconnectAttachError>>,
+    {
+        if let proto::Event::EventStreamLagged {
+            session_id: lag_session_id,
+            dropped,
+        } = event
+        {
+            return self.handle_lag_event(lag_session_id, dropped, resync).await;
+        }
+
+        self.handle_regular_event(event);
+        true
+    }
+
+    async fn handle_lag_event<F, Fut>(
+        &mut self,
+        lag_session_id: Option<Uuid>,
+        dropped: u64,
+        resync: F,
+    ) -> bool
+    where
+        F: FnOnce(Uuid, AttachRequestContext, Arc<Mutex<Option<i64>>>) -> Fut,
+        Fut: std::future::Future<Output = Result<AttachedPayload, ReconnectAttachError>>,
+    {
+        let session_id = self.session_id();
+        if lag_session_id.is_some_and(|lag_session_id| lag_session_id != session_id) {
+            return true;
+        }
+        let attach_snapshot = self.attach_context.read().await.clone();
+        match resync(session_id, attach_snapshot, self.last_applied_seq.clone()).await {
+            Ok(attached) => {
+                let incoming = self.incoming_context(session_id);
+                apply_attached_payload(attached, &incoming);
+            }
+            Err(ReconnectAttachError::Retriable(error)) => {
+                tracing::debug!(
+                    error = ?error,
+                    dropped,
+                    "daemon event stream lag resync failed"
+                );
+            }
+            Err(ReconnectAttachError::Terminal(error)) => {
+                tracing::warn!(%error, "daemon event stream lag resync stopped");
+                push_turn_event(
+                    &self.events,
+                    &self.event_notify,
+                    TurnEvent::DaemonLinkTerminal { error },
+                );
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn should_refresh_skill_inventory(event: &proto::Event) -> bool {
+    matches!(
+        event,
+        proto::Event::PrimarySwapped { .. }
+            | proto::Event::ForegroundInputTarget { .. }
+            | proto::Event::AgentIdle { .. }
+    )
 }
 
 async fn switch_session_inner(
@@ -895,6 +1105,13 @@ fn try_spawn_inner(
         }));
     }
 
+    let (skill_refresh_tx, skill_refresh_abort) = spawn_skill_inventory_refresh_task(
+        &mut client_tasks,
+        current_client.clone(),
+        attach_context.clone(),
+        skill_inventory_names.clone(),
+    );
+
     // Inbound: daemon events → translate → push into the shared
     // buffer and update active-agent tracker.
     {
@@ -902,11 +1119,11 @@ fn try_spawn_inner(
         let event_notify = event_notify.clone();
         let active_agent = active_agent.clone();
         let active_agent_path = active_agent_path.clone();
-        let skill_inventory_names = skill_inventory_names.clone();
         let current_client = current_client.clone();
         let last_applied_seq = last_applied_seq.clone();
         let attach_context = attach_context.clone();
         let session_id_state = session_id_state.clone();
+        let skill_refresh_tx = skill_refresh_tx.clone();
         let driver = LocalReconnectDriver {
             socket: socket.clone(),
         };
@@ -923,47 +1140,31 @@ fn try_spawn_inner(
                 .unwrap_or_else(|| active_agent.lock().unwrap().clone()),
         ));
         client_tasks.push(tokio::spawn(async move {
+            let _skill_refresh_abort = AbortOnDrop(skill_refresh_abort);
+            let mut event_state = ClientEventState {
+                events: events.clone(),
+                event_notify: event_notify.clone(),
+                active_agent: active_agent.clone(),
+                active_agent_path: active_agent_path.clone(),
+                primary_agent: primary_agent.clone(),
+                last_applied_seq: last_applied_seq.clone(),
+                attach_context: attach_context.clone(),
+                session_id_state: session_id_state.clone(),
+                skill_refresh_tx,
+                skill_refresh_generation: 0,
+            };
             let mut saw_draining = false;
             loop {
                 let client = current_client.read().await.clone();
                 while let Some(event) = client.next_event().await {
-                    let refresh_skill_inventory = matches!(
-                        &event,
-                        proto::Event::PrimarySwapped { .. }
-                            | proto::Event::ForegroundInputTarget { .. }
-                            | proto::Event::AgentIdle { .. }
-                    );
                     if matches!(event, proto::Event::DaemonDraining { .. }) {
                         saw_draining = true;
                     } else if saw_draining {
                         saw_draining = false;
                     }
-                    let session_id = *session_id_state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let incoming = IncomingEventContext {
-                        session_id,
-                        events: &events,
-                        event_notify: &event_notify,
-                        active_agent: &active_agent,
-                        active_agent_path: &active_agent_path,
-                        primary_agent: &primary_agent,
-                        last_applied_seq: &last_applied_seq,
-                    };
-                    let project_root = attach_context.read().await.project_root.clone();
-                    if refresh_skill_inventory
-                        && let Ok(Response::Skills { skills }) = client
-                            .request_ok(Request::ListSkills { project_root })
-                            .await
-                    {
-                        *skill_inventory_names.lock().unwrap() = Some(
-                            skills
-                                .into_iter()
-                                .map(|skill| skill.name)
-                                .collect::<std::collections::HashSet<_>>(),
-                        );
+                    if !event_state.handle_event(&client, event).await {
+                        return;
                     }
-                    apply_incoming_event(event, &incoming);
                 }
                 if !client.is_socket_backed() {
                     return;
@@ -1627,28 +1828,65 @@ async fn reconnect_and_attach(
         .connect()
         .await
         .map_err(ReconnectAttachError::Retriable)?;
-    let response = client
-        .request(Request::Attach {
-            session_id: Some(session_id),
-            since_seq: current_last_applied_seq(last_applied_seq),
-            project_root: Some(attach_context.project_root.clone()),
-            no_sandbox: attach_context.no_sandbox,
-            interactive: true,
-            model_override: None,
-            client_protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
-            env_snapshot: Some(attach_context.env_snapshot.clone()),
-            env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
-        })
-        .await
-        .map_err(ReconnectAttachError::Retriable)?;
+    let payload =
+        resync_attach_payload(&client, session_id, attach_context, last_applied_seq).await?;
+    Ok(ReconnectAttach {
+        client,
+        history: payload.history,
+        paused_work: payload.paused_work,
+        repair_required: payload.repair_required,
+    })
+}
+
+async fn resync_attach_payload(
+    client: &DaemonClient,
+    session_id: Uuid,
+    attach_context: &AttachRequestContext,
+    last_applied_seq: &Arc<Mutex<Option<i64>>>,
+) -> Result<AttachedPayload, ReconnectAttachError> {
+    request_attach_payload(session_id, attach_context, last_applied_seq, |request| {
+        let client = client.clone();
+        async move { client.request(request).await }
+    })
+    .await
+}
+
+async fn request_attach_payload<F, Fut>(
+    session_id: Uuid,
+    attach_context: &AttachRequestContext,
+    last_applied_seq: &Arc<Mutex<Option<i64>>>,
+    send_request: F,
+) -> Result<AttachedPayload, ReconnectAttachError>
+where
+    F: FnOnce(Request) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<std::result::Result<Response, ErrorPayload>>>,
+{
+    let response = send_request(Request::Attach {
+        session_id: Some(session_id),
+        since_seq: current_last_applied_seq(last_applied_seq),
+        project_root: Some(attach_context.project_root.clone()),
+        no_sandbox: attach_context.no_sandbox,
+        interactive: true,
+        model_override: None,
+        client_protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
+        env_snapshot: Some(attach_context.env_snapshot.clone()),
+        env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+    })
+    .await
+    .map_err(ReconnectAttachError::Retriable)?;
+    attach_payload_from_response(response)
+}
+
+fn attach_payload_from_response(
+    response: std::result::Result<Response, ErrorPayload>,
+) -> Result<AttachedPayload, ReconnectAttachError> {
     match response {
         Ok(Response::Attached {
             history,
             paused_work,
             repair_required,
             ..
-        }) => Ok(ReconnectAttach {
-            client,
+        }) => Ok(AttachedPayload {
             history,
             paused_work,
             repair_required: repair_required.map(|repair| *repair),
@@ -1671,6 +1909,19 @@ fn apply_reconnect_attached(
     attached: ReconnectAttach,
     ctx: &IncomingEventContext<'_>,
 ) -> DaemonClient {
+    let client = attached.client;
+    apply_attached_payload(
+        AttachedPayload {
+            history: attached.history,
+            paused_work: attached.paused_work,
+            repair_required: attached.repair_required,
+        },
+        ctx,
+    );
+    client
+}
+
+fn apply_attached_payload(attached: AttachedPayload, ctx: &IncomingEventContext<'_>) {
     if let Some(repair) = attached.repair_required {
         push_turn_event(
             ctx.events,
@@ -1709,7 +1960,6 @@ fn apply_reconnect_attached(
             );
         }
     }
-    attached.client
 }
 
 fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
@@ -2487,6 +2737,341 @@ mod tests {
         assert!(err.contains("unexpected read_history_page response"));
         assert!(err.contains("SessionMessages"));
         server.await.unwrap();
+    }
+
+    fn test_attach_context(project_root: &str) -> Arc<RwLock<AttachRequestContext>> {
+        Arc::new(RwLock::new(AttachRequestContext {
+            project_root: project_root.to_string(),
+            no_sandbox: true,
+            env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire {
+                source: cockpit_core::env_snapshot::EnvSnapshotSource::TuiShell,
+                digest: String::new(),
+                vars: std::collections::HashMap::new(),
+            },
+        }))
+    }
+
+    fn test_skill(name: &str) -> proto::SkillSummary {
+        proto::SkillSummary {
+            name: name.to_string(),
+            description: String::new(),
+            source: "test".to_string(),
+            user_invocable: true,
+        }
+    }
+
+    fn attached_response(session_id: Uuid, history: Vec<proto::HistoryEntry>) -> Response {
+        Response::Attached {
+            session_id,
+            short_id: "test01".to_string(),
+            project_root: "/tmp/project".to_string(),
+            project_id: "project".to_string(),
+            active_agent: "Build".to_string(),
+            active_agent_path: vec!["Build".to_string()],
+            foreground_target: None,
+            active_subagent: None,
+            active_model_state: None,
+            history,
+            paused_work: Vec::new(),
+            repair_required: None,
+            daemon_version: "test".to_string(),
+            compatible: true,
+            env_baseline: None,
+            env_session: None,
+            env_drift: None,
+            env_policy_applied: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+            btw_fork: None,
+        }
+    }
+
+    fn test_event_state(
+        session_id: Uuid,
+        attach_context: Arc<RwLock<AttachRequestContext>>,
+        last_applied_seq: Arc<Mutex<Option<i64>>>,
+        skill_refresh_tx: watch::Sender<u64>,
+    ) -> (ClientEventState, Arc<Mutex<Vec<TurnEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let active_agent = Arc::new(Mutex::new("Build".to_string()));
+        let active_agent_path = Arc::new(Mutex::new(vec!["Build".to_string()]));
+        (
+            ClientEventState {
+                events: events.clone(),
+                event_notify: Arc::new(Notify::new()),
+                active_agent: active_agent.clone(),
+                active_agent_path,
+                primary_agent: active_agent,
+                last_applied_seq,
+                attach_context,
+                session_id_state: Arc::new(Mutex::new(session_id)),
+                skill_refresh_tx,
+                skill_refresh_generation: 0,
+            },
+            events,
+        )
+    }
+
+    fn foreground_target_event(session_id: Uuid) -> proto::Event {
+        proto::Event::ForegroundInputTarget {
+            session_id,
+            target: proto::QueueTarget {
+                id: "root".to_string(),
+                agent: "Build".to_string(),
+                depth: 0,
+                task_call_id: None,
+            },
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn skill_inventory_refresh_does_not_block_event_drain() {
+        let attach_context = test_attach_context("/tmp/project");
+        let skill_inventory_names = Arc::new(Mutex::new(None));
+        let (refresh_tx, refresh_rx) = watch::channel(0);
+        let (list_seen_tx, list_seen_rx) = oneshot::channel();
+        let list_seen_tx = Arc::new(Mutex::new(Some(list_seen_tx)));
+        let refresh_task = tokio::spawn(run_skill_inventory_refresh_with_request(
+            attach_context.clone(),
+            skill_inventory_names,
+            refresh_rx,
+            move |project_root| {
+                let list_seen_tx = list_seen_tx.clone();
+                async move {
+                    assert_eq!(project_root, "/tmp/project");
+                    if let Some(tx) = list_seen_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    std::future::pending::<anyhow::Result<Response>>().await
+                }
+            },
+        ));
+        let session_id = Uuid::new_v4();
+        let last_applied_seq = Arc::new(Mutex::new(None));
+        let (mut state, events) =
+            test_event_state(session_id, attach_context, last_applied_seq, refresh_tx);
+
+        state.handle_regular_event(foreground_target_event(session_id));
+        tokio::time::timeout(Duration::from_secs(1), list_seen_rx)
+            .await
+            .expect("list_skills should be requested")
+            .expect("list_skills observer should stay alive");
+
+        state.handle_regular_event(proto::Event::AssistantText {
+            session_id,
+            agent: "Build".to_string(),
+            text: "still draining".to_string(),
+            reasoning: String::new(),
+            seq: Some(1),
+        });
+        let drained = drain_turn_events(&events);
+        assert!(matches!(
+            drained.as_slice(),
+            [TurnEvent::ForegroundInputTarget { .. }, TurnEvent::AssistantText { text, .. }]
+                if text == "still draining"
+        ));
+
+        refresh_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn skill_inventory_refresh_coalesces_bursts() {
+        let attach_context = test_attach_context("/tmp/project");
+        let skill_inventory_names = Arc::new(Mutex::new(None));
+        let (refresh_tx, refresh_rx) = watch::channel(0);
+        let (first_seen_tx, first_seen_rx) = oneshot::channel();
+        let (release_first_tx, release_first_rx) = oneshot::channel();
+        let (count_tx, count_rx) = oneshot::channel();
+        let request_count = Arc::new(Mutex::new(0usize));
+        let first_seen_tx = Arc::new(Mutex::new(Some(first_seen_tx)));
+        let release_first_rx = Arc::new(tokio::sync::Mutex::new(Some(release_first_rx)));
+        let refresh_task = tokio::spawn(run_skill_inventory_refresh_with_request(
+            attach_context.clone(),
+            skill_inventory_names.clone(),
+            refresh_rx,
+            {
+                let request_count = request_count.clone();
+                let first_seen_tx = first_seen_tx.clone();
+                let release_first_rx = release_first_rx.clone();
+                move |project_root| {
+                    let request_count = request_count.clone();
+                    let first_seen_tx = first_seen_tx.clone();
+                    let release_first_rx = release_first_rx.clone();
+                    async move {
+                        assert_eq!(project_root, "/tmp/project");
+                        let count = {
+                            let mut guard = request_count.lock().unwrap();
+                            *guard += 1;
+                            *guard
+                        };
+                        if count == 1 {
+                            if let Some(tx) = first_seen_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                            let rx = release_first_rx.lock().await.take();
+                            if let Some(rx) = rx {
+                                let _ = rx.await;
+                            }
+                        }
+                        Ok(Response::Skills {
+                            skills: vec![test_skill("refreshed")],
+                        })
+                    }
+                }
+            },
+        ));
+        let session_id = Uuid::new_v4();
+        let last_applied_seq = Arc::new(Mutex::new(None));
+        let (mut state, _events) =
+            test_event_state(session_id, attach_context, last_applied_seq, refresh_tx);
+
+        for _ in 0..5 {
+            state.handle_regular_event(foreground_target_event(session_id));
+        }
+        tokio::time::timeout(Duration::from_secs(1), first_seen_rx)
+            .await
+            .expect("first list_skills should be requested")
+            .expect("first list_skills observer should stay alive");
+        let _ = release_first_tx.send(());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let count = *request_count.lock().unwrap();
+                if count >= 1 && skill_inventory_names.lock().unwrap().is_some() {
+                    let _ = count_tx.send(count);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("coalesced refresh should complete");
+        let request_count = count_rx
+            .await
+            .expect("request count sender should stay alive");
+        assert!(request_count >= 1);
+        assert!(
+            request_count < 5,
+            "watch refresh should coalesce burst, saw {request_count} requests"
+        );
+
+        refresh_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lag_marker_triggers_since_seq_reattach() {
+        let session_id = Uuid::new_v4();
+        let attach_context = test_attach_context("/tmp/project");
+        let (skill_refresh_tx, _rx) = watch::channel(0);
+        let last_applied_seq = Arc::new(Mutex::new(Some(4)));
+        let (mut state, events) = test_event_state(
+            session_id,
+            attach_context,
+            last_applied_seq.clone(),
+            skill_refresh_tx,
+        );
+
+        assert!(
+            state
+                .handle_event_with_resync(
+                    proto::Event::EventStreamLagged {
+                        session_id: Some(session_id),
+                        dropped: 5,
+                    },
+                    move |session_id, attach_context, last| {
+                        async move {
+                            request_attach_payload(
+                                session_id,
+                                &attach_context,
+                                &last,
+                                |request| async move {
+                                    match request {
+                                        Request::Attach {
+                                            session_id: got_session_id,
+                                            since_seq,
+                                            project_root,
+                                            ..
+                                        } => {
+                                            assert_eq!(got_session_id, Some(session_id));
+                                            assert_eq!(since_seq, Some(4));
+                                            assert_eq!(
+                                                project_root.as_deref(),
+                                                Some("/tmp/project")
+                                            );
+                                        }
+                                        other => panic!("expected attach request, got {other:?}"),
+                                    }
+                                    Ok(Ok(attached_response(
+                                        session_id,
+                                        vec![proto::HistoryEntry::Assistant {
+                                            agent: "Build".to_string(),
+                                            text: "replayed".to_string(),
+                                            reasoning: String::new(),
+                                            ts_ms: 0,
+                                            seq: 5,
+                                        }],
+                                    )))
+                                },
+                            )
+                            .await
+                        }
+                    }
+                )
+                .await
+        );
+        assert_eq!(current_last_applied_seq(&last_applied_seq), Some(5));
+        let drained = drain_turn_events(&events);
+        assert!(matches!(
+            drained.as_slice(),
+            [TurnEvent::HistoryReplay { entries }]
+                if matches!(entries.as_slice(), [proto::HistoryEntry::Assistant { text, seq: 5, .. }] if text == "replayed")
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lag_marker_resync_emits_no_reconnect_chrome() {
+        let session_id = Uuid::new_v4();
+        let attach_context = test_attach_context("/tmp/project");
+        let (skill_refresh_tx, _rx) = watch::channel(0);
+        let last_applied_seq = Arc::new(Mutex::new(Some(1)));
+        let (mut state, events) = test_event_state(
+            session_id,
+            attach_context,
+            last_applied_seq,
+            skill_refresh_tx,
+        );
+
+        assert!(
+            state
+                .handle_event_with_resync(
+                    proto::Event::EventStreamLagged {
+                        session_id: None,
+                        dropped: 1,
+                    },
+                    move |session_id, _attach_context, _last| {
+                        async move {
+                            attach_payload_from_response(Ok(attached_response(
+                                session_id,
+                                vec![proto::HistoryEntry::Assistant {
+                                    agent: "Build".to_string(),
+                                    text: "replayed".to_string(),
+                                    reasoning: String::new(),
+                                    ts_ms: 0,
+                                    seq: 2,
+                                }],
+                            )))
+                        }
+                    }
+                )
+                .await
+        );
+        let drained = drain_turn_events(&events);
+        assert!(!drained.iter().any(|event| matches!(
+            event,
+            TurnEvent::DaemonLinkReconnecting { .. } | TurnEvent::DaemonLinkReconnected
+        )));
+        assert!(
+            drained
+                .iter()
+                .any(|event| matches!(event, TurnEvent::HistoryReplay { .. }))
+        );
     }
 
     fn runner_with_client_task(handle: JoinHandle<()>) -> AgentRunner {

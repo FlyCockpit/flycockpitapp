@@ -49,6 +49,7 @@ use zip::write::{SimpleFileOptions, ZipWriter};
 
 use crate::approval::store::{ManagedGrants, global_approvals_dir, list_managed_grants};
 use crate::config::dirs::{ConfigDir, ConfigDirKind, discover_config_dirs};
+use crate::daemon::proto;
 use crate::db::Db;
 use crate::db::session_log::SessionEventRow;
 use crate::db::sessions::SessionRow;
@@ -70,6 +71,262 @@ const TOOL_OUTPUT_DIR: &str = "tool_outputs";
 const COMPRESSED_TOOL_RESULTS_DIR: &str = "compressed_tool_results";
 const DELEGATION_PAYLOADS_DIR: &str = "delegation_payloads";
 const DELEGATION_STEERS_DIR: &str = "delegation_steers";
+
+/// Build the user-facing `/export` transcript from durable session history.
+///
+/// The transcript reflects the session rows persisted at the instant the DB
+/// snapshot is read; it does not impose an extra daemon flush barrier. It is
+/// scoped to the current root session's display history. Fork trees and
+/// compaction predecessors remain part of `/export debug`, and rows that never
+/// persist to the DB (local command errors, local commands, warning notices,
+/// maintenance lines, skill auto-injection notices) cannot appear here.
+pub fn transcript_json(db: &Db, session_id: Uuid, root_agent: &str) -> Result<Value> {
+    let history = crate::engine::rehydrate::history_snapshot(db, session_id, root_agent)?;
+    Ok(transcript_json_from_history(&history))
+}
+
+fn transcript_json_from_history(history: &[proto::HistoryEntry]) -> Value {
+    let mut turns = Vec::new();
+    let mut pending_tool_calls = Vec::new();
+
+    for entry in history {
+        match entry {
+            proto::HistoryEntry::ToolCall {
+                call_id,
+                parent_call_id,
+                parent_child_index,
+                tool,
+                mcp_server,
+                mcp_builtin,
+                mcp_kind,
+                original_input,
+                output,
+                hard_fail,
+                ..
+            } => {
+                if is_edit_tool(tool)
+                    && let Some((path, old, new)) = extract_edit_args(original_input)
+                {
+                    flush_tool_calls(&mut turns, &mut pending_tool_calls);
+                    turns.push(json!({
+                        "type": "diff",
+                        "tool": tool,
+                        "path": path,
+                        "old": old,
+                        "new": new,
+                    }));
+                    continue;
+                }
+                let presentation =
+                    crate::engine::tool::known_tool_presentation(tool, original_input);
+                if is_write_tool(tool) {
+                    flush_tool_calls(&mut turns, &mut pending_tool_calls);
+                    turns.push(json!({
+                        "type": "tool_call",
+                        "call_id": call_id,
+                        "tool": tool,
+                        "summary": presentation.summary,
+                        "state": tool_state_str(*hard_fail),
+                    }));
+                    continue;
+                }
+
+                let mut value = json!({
+                    "call_id": call_id,
+                    "tool": tool,
+                    "summary": presentation.summary,
+                    "input": presentation.full_input,
+                    "output": output,
+                    "state": tool_state_str(*hard_fail),
+                });
+                if let (Some(parent_call_id), Some(parent_child_index)) =
+                    (parent_call_id, parent_child_index)
+                {
+                    value["mcp_child"] = json!({
+                        "parent_call_id": parent_call_id,
+                        "parent_child_index": parent_child_index,
+                        "server": mcp_server,
+                        "builtin": mcp_builtin,
+                        "kind": mcp_kind,
+                    });
+                }
+                pending_tool_calls.push(value);
+            }
+            proto::HistoryEntry::InterruptDecision { decision, .. } => {
+                flush_tool_calls(&mut turns, &mut pending_tool_calls);
+                turns.push(json!({
+                    "type": "interrupt_decision",
+                    "permission": decision.permission,
+                    "cancelled": decision.cancelled,
+                    "lines": decision.lines,
+                }));
+            }
+            proto::HistoryEntry::User {
+                text,
+                display_text,
+                tag_expansions,
+                ts_ms,
+                origin_principal,
+                ..
+            } => {
+                flush_tool_calls(&mut turns, &mut pending_tool_calls);
+                let display = display_text
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(text);
+                if let Some(origin) = origin_principal
+                    .as_deref()
+                    .filter(|origin| !origin.trim().is_empty())
+                {
+                    turns.push(json!({
+                        "type": "note",
+                        "text": format!("steer from {origin}: {display}"),
+                    }));
+                } else {
+                    turns.push(json!({
+                        "type": "user",
+                        "text": display,
+                        "timestamp": timestamp_json(*ts_ms),
+                    }));
+                }
+                for expansion in tag_expansions {
+                    let mark = if expansion.ok { '✓' } else { '✗' };
+                    turns.push(json!({
+                        "type": "note",
+                        "text": format!(
+                            "  → {}({}) {mark} {}",
+                            expansion.tool, expansion.path, expansion.detail
+                        ),
+                    }));
+                }
+            }
+            proto::HistoryEntry::UserNote { text, ts_ms, .. } => {
+                flush_tool_calls(&mut turns, &mut pending_tool_calls);
+                turns.push(json!({
+                    "type": "user_note",
+                    "text": text,
+                    "timestamp": timestamp_json(*ts_ms),
+                }));
+            }
+            proto::HistoryEntry::Assistant {
+                agent,
+                text,
+                reasoning,
+                ts_ms,
+                ..
+            } => {
+                flush_tool_calls(&mut turns, &mut pending_tool_calls);
+                turns.push(json!({
+                    "type": "assistant",
+                    "agent": agent,
+                    "text": text,
+                    "reasoning": reasoning,
+                    "timestamp": timestamp_json(*ts_ms),
+                    "think_ms": Option::<u64>::None,
+                }));
+            }
+            proto::HistoryEntry::InferenceError {
+                summary, detail, ..
+            } => {
+                flush_tool_calls(&mut turns, &mut pending_tool_calls);
+                turns.push(json!({
+                    "type": "inference_error",
+                    "text": summary,
+                    "summary": summary,
+                    "detail": detail,
+                }));
+            }
+            proto::HistoryEntry::CompactBoundary {
+                predecessor_short_id,
+                seed_tool_count,
+                seed_tool_tokens,
+                source,
+                trigger_ctx_pct,
+                tokens_before,
+                tokens_after,
+                turns_summarized,
+                tail_kept,
+                tail_trimmed,
+                brief,
+                handoff,
+                ..
+            } => {
+                flush_tool_calls(&mut turns, &mut pending_tool_calls);
+                turns.push(json!({
+                    "type": "compact_boundary",
+                    "predecessor_short_id": predecessor_short_id,
+                    "seed_tool_count": seed_tool_count,
+                    "seed_tool_tokens": seed_tool_tokens,
+                    "source": source,
+                    "trigger_ctx_pct": trigger_ctx_pct,
+                    "tokens_before": tokens_before,
+                    "tokens_after": tokens_after,
+                    "turns_summarized": turns_summarized,
+                    "tail_kept": tail_kept,
+                    "tail_trimmed": tail_trimmed,
+                    "handoff": handoff.as_ref().or(brief.as_ref()),
+                }));
+            }
+            proto::HistoryEntry::Subagent { parent, child, .. } => {
+                flush_tool_calls(&mut turns, &mut pending_tool_calls);
+                turns.push(json!({
+                    "type": "subagent",
+                    "parent": parent,
+                    "child": child,
+                    "trusted_only": false,
+                    "model_trusted": false,
+                    "routing": {
+                        "model": Option::<String>::None,
+                        "location": Option::<String>::None,
+                        "fallback": Option::<String>::None,
+                    },
+                    "report": Option::<String>::None,
+                    "failed": Option::<bool>::None,
+                    "duration_ms": Option::<u64>::None,
+                }));
+            }
+        }
+    }
+    flush_tool_calls(&mut turns, &mut pending_tool_calls);
+    Value::Array(turns)
+}
+
+fn flush_tool_calls(turns: &mut Vec<Value>, pending_tool_calls: &mut Vec<Value>) {
+    if pending_tool_calls.is_empty() {
+        return;
+    }
+    turns.push(json!({
+        "type": "tool_calls",
+        "calls": std::mem::take(pending_tool_calls),
+    }));
+}
+
+fn timestamp_json(ts_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms)
+        .map(|dt| dt.with_timezone(&chrono::Local))
+        .unwrap_or_else(chrono::Local::now)
+        .to_rfc3339()
+}
+
+fn tool_state_str(hard_fail: bool) -> &'static str {
+    if hard_fail { "bad_call" } else { "success" }
+}
+
+fn is_edit_tool(tool: &str) -> bool {
+    matches!(tool, "edit" | "editunlock")
+}
+
+fn is_write_tool(tool: &str) -> bool {
+    matches!(tool, "write" | "writeunlock")
+}
+
+fn extract_edit_args(args: &Value) -> Option<(&str, &str, &str)> {
+    Some((
+        args.get("path")?.as_str()?,
+        args.get("old_string")?.as_str()?,
+        args.get("new_string")?.as_str()?,
+    ))
+}
 
 /// Sanitize a `provider`/`model` id for use in a tandem export filename:
 /// replace any character that isn't alphanumeric / `-` / `_` / `.` with `_`,

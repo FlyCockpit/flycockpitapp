@@ -80,132 +80,6 @@ fn link_reference_definition_start_shape_is_position_aware() {
     assert!(!is_link_reference_definition_start("[ref] : target"));
 }
 
-/// `/export` serializes the live transcript as an ordered turns
-/// array; tool calls carry the user-facing input (`full_input`) +
-/// recovery `state`, never the wire form (GOALS §14).
-#[test]
-fn export_transcript_is_ordered_user_facing_turns() {
-    let ts = chrono::Local::now();
-    let history = vec![
-        HistoryEntry::User {
-            text: "do a thing".to_string(),
-            cleaned: None,
-            expanded: false,
-            timestamp: ts,
-            seq: Some(1),
-            preflight_pending: false,
-            persist_failed: false,
-        },
-        HistoryEntry::Agent {
-            name: "builder".to_string(),
-            text: "on it".to_string(),
-            reasoning: "thinking".to_string(),
-            timestamp: ts,
-            expanded: false,
-            reasoning_offset: 0,
-            think_duration: Some(Duration::from_millis(1200)),
-            seq: Some(2),
-        },
-        HistoryEntry::ToolBox {
-            calls: vec![ToolCall {
-                call_id: "tc-1".to_string(),
-                tool: "read".to_string(),
-                // User-facing summary/input — NOT the wire path.
-                summary: "a.rs".to_string(),
-                full_input: "a.rs".to_string(),
-                output: "fn main() {}".to_string(),
-                expanded: false,
-                result_offset: 0,
-                state: ToolCallState::Success,
-                hint: None,
-                mcp_child: None,
-            }],
-            view_offset: 0,
-            follow: true,
-        },
-    ];
-
-    let v = export_transcript(&history);
-    let arr = v.as_array().expect("turns array");
-    assert_eq!(arr.len(), 3, "one turn per history entry, in order");
-    assert_eq!(arr[0]["type"], "user");
-    assert_eq!(arr[0]["text"], "do a thing");
-    assert_eq!(arr[1]["type"], "assistant");
-    assert_eq!(arr[1]["agent"], "builder");
-    assert_eq!(arr[2]["type"], "tool_calls");
-    let call = &arr[2]["calls"][0];
-    assert_eq!(call["tool"], "read");
-    // User-facing input + recovery state, never the wire form.
-    assert_eq!(call["input"], "a.rs");
-    assert_eq!(call["state"], "success");
-    assert!(
-        call.get("wire_input").is_none(),
-        "the JSON export must never carry the wire form"
-    );
-}
-
-/// A `/note` entry exports as a clearly-labeled `user_note` turn in its
-/// chronological position (implementation note), distinct
-/// from a normal `user` turn so `analyze-session-prompts` can pick it out.
-#[test]
-fn export_transcript_includes_user_note_in_order() {
-    let ts = chrono::Local::now();
-    let history = vec![
-        HistoryEntry::User {
-            text: "go".to_string(),
-            cleaned: None,
-            expanded: false,
-            timestamp: ts,
-            seq: Some(1),
-            preflight_pending: false,
-            persist_failed: false,
-        },
-        HistoryEntry::UserNote {
-            text: "remember the retry change broke it".to_string(),
-            timestamp: ts,
-        },
-        HistoryEntry::Agent {
-            name: "Build".to_string(),
-            text: "ok".to_string(),
-            reasoning: String::new(),
-            timestamp: ts,
-            expanded: false,
-            reasoning_offset: 0,
-            think_duration: None,
-            seq: Some(2),
-        },
-    ];
-    let v = export_transcript(&history);
-    let arr = v.as_array().expect("turns array");
-    assert_eq!(arr.len(), 3);
-    assert_eq!(arr[0]["type"], "user");
-    // The note keeps its own distinct type + verbatim text, in place.
-    assert_eq!(arr[1]["type"], "user_note");
-    assert_eq!(arr[1]["text"], "remember the retry change broke it");
-    assert!(arr[1].get("timestamp").is_some());
-    assert_eq!(arr[2]["type"], "assistant");
-}
-
-#[test]
-fn export_transcript_includes_interrupt_decision_rows() {
-    let history = vec![HistoryEntry::InterruptDecision {
-        decision: cockpit_core::daemon::proto::InterruptDecision {
-            permission: false,
-            cancelled: true,
-            lines: vec![cockpit_core::daemon::proto::InterruptDecisionLine {
-                prompt: "Proceed?".to_string(),
-                answer: "No".to_string(),
-            }],
-        },
-    }];
-
-    let v = export_transcript(&history);
-    let arr = v.as_array().expect("turns array");
-    assert_eq!(arr[0]["type"], "interrupt_decision");
-    assert_eq!(arr[0]["cancelled"], true);
-    assert_eq!(arr[0]["lines"][0]["prompt"], "Proceed?");
-}
-
 #[test]
 fn interrupt_decision_renders_as_dedicated_styled_dismissed_row() {
     let entry = HistoryEntry::InterruptDecision {
@@ -241,44 +115,6 @@ fn interrupt_decision_renders_as_dedicated_styled_dismissed_row() {
     assert_eq!(spans[5].content.as_ref(), "dismissed");
     assert_eq!(spans[5].style.fg, Some(WARNING_TEXT));
     assert_eq!(spans[5].style.add_modifier, Modifier::BOLD);
-}
-
-#[test]
-fn export_transcript_distinguishes_inference_warning_from_backup_warning() {
-    let history = vec![
-        HistoryEntry::InferenceWarning {
-            line: "local/slow has not produced another token after 1s. Press Ctrl+C to cancel."
-                .to_string(),
-        },
-        HistoryEntry::BackupWarning {
-            line: "primary `q` failed (timeout) — answered with backup `c`.".to_string(),
-        },
-    ];
-    let v = export_transcript(&history);
-    let arr = v.as_array().expect("turns array");
-    assert_eq!(arr[0]["type"], "inference_warning");
-    assert_eq!(arr[1]["type"], "backup_warning");
-}
-
-#[test]
-fn export_transcript_includes_inference_error_summary_and_detail() {
-    let history = vec![HistoryEntry::InferenceError {
-        summary: "Inference failed (p/m): network: first line".to_string(),
-        detail: "first line\nrequest id: abc".to_string(),
-        expanded: false,
-    }];
-    let v = export_transcript(&history);
-    let arr = v.as_array().expect("turns array");
-    assert_eq!(arr[0]["type"], "inference_error");
-    assert_eq!(
-        arr[0]["text"],
-        "Inference failed (p/m): network: first line"
-    );
-    assert_eq!(
-        arr[0]["summary"],
-        "Inference failed (p/m): network: first line"
-    );
-    assert_eq!(arr[0]["detail"], "first line\nrequest id: abc");
 }
 
 #[test]
@@ -354,20 +190,6 @@ fn inference_error_without_detail_expands_to_safe_placeholder() {
     );
     let text = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
     assert!(text.contains("No additional inference detail was recorded."));
-}
-
-#[test]
-fn export_transcript_keeps_command_error_distinct() {
-    let history = vec![HistoryEntry::CommandError {
-        line: "/resume: could not attach to session: missing".to_string(),
-    }];
-    let v = export_transcript(&history);
-    let arr = v.as_array().expect("turns array");
-    assert_eq!(arr[0]["type"], "command_error");
-    assert_eq!(
-        arr[0]["text"],
-        "/resume: could not attach to session: missing"
-    );
 }
 
 /// The user-note row renders as a distinct "note to self" block — not a

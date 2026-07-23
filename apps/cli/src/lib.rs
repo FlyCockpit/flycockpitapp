@@ -548,6 +548,7 @@ pub mod integration {
         match entry {
             crate::daemon::proto::HistoryEntry::InterruptDecision { seq, .. }
             | crate::daemon::proto::HistoryEntry::User { seq, .. }
+            | crate::daemon::proto::HistoryEntry::UserNote { seq, .. }
             | crate::daemon::proto::HistoryEntry::Assistant { seq, .. }
             | crate::daemon::proto::HistoryEntry::ToolCall { seq, .. }
             | crate::daemon::proto::HistoryEntry::InferenceError { seq, .. }
@@ -560,6 +561,7 @@ pub mod integration {
         match entry {
             crate::daemon::proto::HistoryEntry::InterruptDecision { .. } => "interrupt_decision",
             crate::daemon::proto::HistoryEntry::User { .. } => "user",
+            crate::daemon::proto::HistoryEntry::UserNote { .. } => "user_note",
             crate::daemon::proto::HistoryEntry::Assistant { .. } => "assistant",
             crate::daemon::proto::HistoryEntry::ToolCall { .. } => "tool_call",
             crate::daemon::proto::HistoryEntry::InferenceError { .. } => "inference_error",

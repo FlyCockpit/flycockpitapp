@@ -899,6 +899,13 @@ fn scrub_history_entry_free_text(entry: &mut proto::HistoryEntry, redact: &Redac
             scrub_option_string(display_text, redact);
             scrub_tag_expansions(tag_expansions, redact);
         }
+        proto::HistoryEntry::UserNote {
+            text,
+            ts_ms: _,
+            seq: _,
+        } => {
+            scrub_string(text, redact);
+        }
         proto::HistoryEntry::Assistant {
             agent: _,
             text,

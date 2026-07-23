@@ -341,6 +341,7 @@ fn history_entry_seq(entry: &proto::HistoryEntry) -> Option<i64> {
     match entry {
         proto::HistoryEntry::InterruptDecision { seq, .. }
         | proto::HistoryEntry::User { seq, .. }
+        | proto::HistoryEntry::UserNote { seq, .. }
         | proto::HistoryEntry::Assistant { seq, .. }
         | proto::HistoryEntry::ToolCall { seq, .. }
         | proto::HistoryEntry::InferenceError { seq, .. }

@@ -1853,6 +1853,12 @@ pub(super) fn wire_history_to_entries(
                     });
                 }
             }
+            Wire::UserNote { text, ts_ms, .. } => {
+                out.push(HistoryEntry::UserNote {
+                    text,
+                    timestamp: local_from_ts_ms(ts_ms),
+                });
+            }
             Wire::Assistant {
                 agent,
                 text,

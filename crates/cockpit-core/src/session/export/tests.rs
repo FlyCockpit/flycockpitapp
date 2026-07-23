@@ -70,6 +70,308 @@ fn responses_session_with_intro() -> Session {
     session
 }
 
+fn transcript_session() -> Session {
+    let db = Db::open_in_memory().unwrap();
+    Session::create(db, PathBuf::from("/proj"), "Build").unwrap()
+}
+
+#[expect(
+    deprecated,
+    reason = "export transcript tests pin deterministic session_events timestamps"
+)]
+fn set_event_ts(db: &Db, seq: i64, ts_ms: i64) {
+    db.write_blocking(move |conn| {
+        conn.execute(
+            "UPDATE session_events SET ts_ms = ?1 WHERE seq = ?2",
+            [ts_ms, seq],
+        )
+        .context("setting deterministic event timestamp")?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn ts(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .to_rfc3339()
+}
+
+fn record_transcript_event(
+    session: &Session,
+    kind: SessionEventKind,
+    agent: Option<&str>,
+    call_id: Option<&str>,
+    data: Value,
+    ts_ms: i64,
+) {
+    let seq = session.record_event(kind, agent, call_id, &data).unwrap();
+    set_event_ts(&session.db, seq, ts_ms);
+}
+
+struct TranscriptTool<'a> {
+    call_id: &'a str,
+    tool: &'a str,
+    original_input: Value,
+    wire_input: Value,
+    output: &'a str,
+    hard_fail: bool,
+    ts_ms: i64,
+}
+
+fn record_transcript_tool(session: &Session, row: TranscriptTool<'_>) {
+    session
+        .record_tool_call(ToolCallRow {
+            event_id: Uuid::new_v4(),
+            timestamp: chrono::Utc::now(),
+            agent: "Build".into(),
+            call_id: row.call_id.into(),
+            parent_call_id: None,
+            parent_child_index: None,
+            identity: ToolCallProviderIdentity::synthetic_cockpit_call(row.call_id, None),
+            tool: row.tool.into(),
+            mcp_server: None,
+            path: None,
+            original_input_json: row.original_input.clone(),
+            wire_input_json: row.wire_input.clone(),
+            recovery: Recovery::Clean,
+            hard_fail: row.hard_fail,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
+            output: row.output.into(),
+            truncated: false,
+            duration_ms: 1,
+            llm_mode: crate::config::extended::LlmMode::default(),
+            shape_fingerprint: None,
+            hint: None,
+        })
+        .unwrap();
+    record_transcript_event(
+        session,
+        SessionEventKind::ToolCall,
+        Some("Build"),
+        Some(row.call_id),
+        json!({
+            "tool": row.tool,
+            "original_input": row.original_input,
+            "wire_input": row.wire_input,
+            "output": row.output,
+        }),
+        row.ts_ms,
+    );
+}
+
+#[test]
+fn transcript_json_is_ordered_user_facing_turns() {
+    let session = transcript_session();
+    record_transcript_event(
+        &session,
+        SessionEventKind::UserMessage,
+        Some("Build"),
+        None,
+        json!({ "text": "do a thing" }),
+        1_000,
+    );
+    record_transcript_event(
+        &session,
+        SessionEventKind::AssistantMessage,
+        Some("Build"),
+        Some("infer-1"),
+        json!({ "text": "on it", "reasoning": "thinking" }),
+        2_000,
+    );
+    record_transcript_tool(
+        &session,
+        TranscriptTool {
+            call_id: "tc-1",
+            tool: "read",
+            original_input: json!({ "path": "a.rs", "wire_only_must_not_win": true }),
+            wire_input: json!({ "path": "/proj/a.rs" }),
+            output: "fn main() {}",
+            hard_fail: false,
+            ts_ms: 3_000,
+        },
+    );
+
+    let exported = transcript_json(&session.db, session.id, "Build").unwrap();
+
+    assert_eq!(
+        exported,
+        json!([
+            {
+                "type": "user",
+                "text": "do a thing",
+                "timestamp": ts(1_000),
+            },
+            {
+                "type": "assistant",
+                "agent": "Build",
+                "text": "on it",
+                "reasoning": "thinking",
+                "timestamp": ts(2_000),
+                "think_ms": null,
+            },
+            {
+                "type": "tool_calls",
+                "calls": [{
+                    "call_id": "tc-1",
+                    "tool": "read",
+                    "summary": "a.rs",
+                    "input": "a.rs",
+                    "output": "fn main() {}",
+                    "state": "success",
+                }],
+            },
+        ])
+    );
+    assert!(
+        exported[2]["calls"][0].get("wire_input").is_none()
+            && !exported.to_string().contains("/proj/a.rs"),
+        "export must use original/user-facing input, never repaired wire input: {exported}"
+    );
+}
+
+#[test]
+fn transcript_json_includes_user_note_in_order() {
+    let session = transcript_session();
+    record_transcript_event(
+        &session,
+        SessionEventKind::UserMessage,
+        Some("Build"),
+        None,
+        json!({ "text": "go" }),
+        1_000,
+    );
+    record_transcript_event(
+        &session,
+        SessionEventKind::UserNote,
+        Some("Build"),
+        None,
+        json!({ "text": "remember the retry change broke it" }),
+        1_500,
+    );
+    record_transcript_event(
+        &session,
+        SessionEventKind::AssistantMessage,
+        Some("Build"),
+        Some("infer-1"),
+        json!({ "text": "ok" }),
+        2_000,
+    );
+
+    assert_eq!(
+        transcript_json(&session.db, session.id, "Build").unwrap(),
+        json!([
+            {
+                "type": "user",
+                "text": "go",
+                "timestamp": ts(1_000),
+            },
+            {
+                "type": "user_note",
+                "text": "remember the retry change broke it",
+                "timestamp": ts(1_500),
+            },
+            {
+                "type": "assistant",
+                "agent": "Build",
+                "text": "ok",
+                "reasoning": "",
+                "timestamp": ts(2_000),
+                "think_ms": null,
+            },
+        ])
+    );
+}
+
+#[test]
+fn transcript_json_includes_interrupt_decision_rows() {
+    let session = transcript_session();
+    record_transcript_event(
+        &session,
+        SessionEventKind::InterruptDecision,
+        Some("Build"),
+        None,
+        json!({
+            "decision": {
+                "permission": false,
+                "cancelled": true,
+                "lines": [{
+                    "prompt": "Proceed?",
+                    "answer": "No",
+                }],
+            },
+        }),
+        1_000,
+    );
+
+    assert_eq!(
+        transcript_json(&session.db, session.id, "Build").unwrap(),
+        json!([{
+            "type": "interrupt_decision",
+            "permission": false,
+            "cancelled": true,
+            "lines": [{
+                "prompt": "Proceed?",
+                "answer": "No",
+            }],
+        }])
+    );
+}
+
+#[test]
+fn transcript_json_includes_inference_error_summary_and_detail() {
+    let session = transcript_session();
+    record_transcript_event(
+        &session,
+        SessionEventKind::InferenceFailure,
+        Some("Build"),
+        None,
+        json!({
+            "provider": "p",
+            "model": "m",
+            "error_class": "network",
+            "detail": "first line\nrequest id: abc",
+        }),
+        1_000,
+    );
+
+    assert_eq!(
+        transcript_json(&session.db, session.id, "Build").unwrap(),
+        json!([{
+            "type": "inference_error",
+            "text": "Inference failed (p/m): network: first line",
+            "summary": "Inference failed (p/m): network: first line",
+            "detail": "first line\nrequest id: abc",
+        }])
+    );
+}
+
+#[test]
+fn transcript_json_db_snapshot_exports_all_persisted_turns() {
+    let session = transcript_session();
+    for idx in 0..25 {
+        record_transcript_event(
+            &session,
+            SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            json!({ "text": format!("turn {idx}") }),
+            1_000 + idx,
+        );
+    }
+
+    let exported = transcript_json(&session.db, session.id, "Build").unwrap();
+    let turns = exported.as_array().unwrap();
+
+    assert_eq!(turns.len(), 25);
+    assert_eq!(turns[0]["text"], "turn 0");
+    assert_eq!(turns[24]["text"], "turn 24");
+}
+
 fn record_responses_task_pair(
     session: &Session,
     task_call_id: &str,

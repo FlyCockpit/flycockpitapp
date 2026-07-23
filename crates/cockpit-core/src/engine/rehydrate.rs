@@ -422,6 +422,19 @@ fn history_snapshot_from_events_conn(
                     origin_principal: ev.origin_principal.clone(),
                 });
             }
+            "user_note" if visible_lineage(ev) => {
+                let text = ev
+                    .data
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                snapshot.push(proto::HistoryEntry::UserNote {
+                    text,
+                    ts_ms: ev.ts_ms,
+                    seq: ev.seq,
+                });
+            }
             "assistant_message" if visible_agent(ev.agent.as_deref()) && visible_lineage(ev) => {
                 let agent = ev.agent.as_deref().unwrap_or(root_agent).to_string();
                 let text = ev
@@ -4970,6 +4983,7 @@ mod tests {
             }
             proto::HistoryEntry::ToolCall { .. }
             | proto::HistoryEntry::InterruptDecision { .. }
+            | proto::HistoryEntry::UserNote { .. }
             | proto::HistoryEntry::CompactBoundary { .. }
             | proto::HistoryEntry::Subagent { .. }
             | proto::HistoryEntry::InferenceError { .. } => panic!("not a message entry"),

@@ -951,6 +951,15 @@ pub enum HistoryEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_principal: Option<String>,
     },
+    /// Display-only `/note` transcript annotation restored into attach/export
+    /// history. It never enters model-bound rehydration context.
+    UserNote {
+        text: String,
+        #[serde(default)]
+        ts_ms: i64,
+        #[serde(default)]
+        seq: i64,
+    },
     Assistant {
         agent: String,
         /// Body text with inline `<think>` blocks stripped (the clean,

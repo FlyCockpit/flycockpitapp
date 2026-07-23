@@ -239,30 +239,3 @@ fn no_reason_renders_a_single_unchanged_line() {
     let line = line_text(&r.lines[0]);
     assert_eq!(line, "/firecrawl · injected by agent");
 }
-
-/// The JSON export round-trips the `reason` field.
-#[test]
-fn json_export_round_trips_reason() {
-    let history = vec![
-        HistoryEntry::SkillAutoInjected {
-            name: "firecrawl".to_string(),
-            reason: Some("matches: scrape, content".to_string()),
-        },
-        HistoryEntry::SkillAutoInjected {
-            name: "deploy".to_string(),
-            reason: None,
-        },
-    ];
-    let exported = crate::tui::history::export_transcript(&history);
-    let turns = exported.as_array().expect("an array of turns");
-
-    assert_eq!(turns[0]["type"], "skill_auto_injected");
-    assert_eq!(turns[0]["name"], "firecrawl");
-    assert_eq!(turns[0]["reason"], "matches: scrape, content");
-
-    // No reason → the field is present and null.
-    assert!(
-        turns[1]["reason"].is_null(),
-        "absent reason exports as null"
-    );
-}

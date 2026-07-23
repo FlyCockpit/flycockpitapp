@@ -1,9 +1,21 @@
 use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+/// Current relay envelope version.
+///
+/// Additive changes such as new frame variants or new optional fields with
+/// `#[serde(default)]` bump only this value; peers in the supported version
+/// window must keep parsing known data and ignoring unknown additive fields.
+/// Breaking changes such as removals, renames, or type changes bump
+/// `RELAY_MIN_SUPPORTED_ENVELOPE_VERSION`.
 pub const RELAY_ENVELOPE_VERSION: u32 = 1;
+pub const RELAY_MIN_SUPPORTED_ENVELOPE_VERSION: u32 = 1;
+
+pub fn is_relay_envelope_version_supported(version: u32) -> bool {
+    (RELAY_MIN_SUPPORTED_ENVELOPE_VERSION..=RELAY_ENVELOPE_VERSION).contains(&version)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,14 +27,14 @@ pub enum RelayGrantScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RelayGrant {
     pub scope: RelayGrantScope,
     pub project_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RelayPrincipal {
     #[serde(deserialize_with = "non_empty_string")]
     pub user_id: String,
@@ -41,18 +53,56 @@ pub enum DaemonControlTarget {
     Control,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttentionEventType {
-    #[serde(rename = "QUESTION_RAISED")]
     QuestionRaised,
-    #[serde(rename = "APPROVAL_NEEDED")]
     ApprovalNeeded,
-    #[serde(rename = "TURN_DONE")]
     TurnDone,
-    #[serde(rename = "TURN_ERROR")]
     TurnError,
-    #[serde(rename = "SCHEDULE_DONE")]
     ScheduleDone,
+    Unknown(String),
+}
+
+impl AttentionEventType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::QuestionRaised => "QUESTION_RAISED",
+            Self::ApprovalNeeded => "APPROVAL_NEEDED",
+            Self::TurnDone => "TURN_DONE",
+            Self::TurnError => "TURN_ERROR",
+            Self::ScheduleDone => "SCHEDULE_DONE",
+            Self::Unknown(raw) => raw.as_str(),
+        }
+    }
+}
+
+impl Serialize for AttentionEventType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AttentionEventType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "QUESTION_RAISED" => Ok(Self::QuestionRaised),
+            "APPROVAL_NEEDED" => Ok(Self::ApprovalNeeded),
+            "TURN_DONE" => Ok(Self::TurnDone),
+            "TURN_ERROR" => Ok(Self::TurnError),
+            "SCHEDULE_DONE" => Ok(Self::ScheduleDone),
+            "" => Err(serde::de::Error::custom(
+                "expected non-empty attention event type",
+            )),
+            _ => Ok(Self::Unknown(value)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,7 +148,7 @@ impl PartialEq<SystemCode> for &str {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientRelayFrame {
     #[serde(deserialize_with = "relay_envelope_version")]
     pub v: u32,
@@ -108,7 +158,7 @@ pub struct ClientRelayFrame {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct StampedClientRelayFrame {
     #[serde(deserialize_with = "relay_envelope_version")]
     pub v: u32,
@@ -120,7 +170,7 @@ pub struct StampedClientRelayFrame {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct DaemonClientRelayFrame {
     #[serde(deserialize_with = "relay_envelope_version")]
     pub v: u32,
@@ -130,7 +180,7 @@ pub struct DaemonClientRelayFrame {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct DaemonControlRelayFrame {
     #[serde(deserialize_with = "relay_envelope_version")]
     pub v: u32,
@@ -140,15 +190,38 @@ pub struct DaemonControlRelayFrame {
     pub payload: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum DaemonRelayFrame {
     Client(DaemonClientRelayFrame),
     Control(DaemonControlRelayFrame),
 }
 
+impl<'de> Deserialize<'de> for DaemonRelayFrame {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("expected relay frame object"))?;
+        if object.contains_key("to") {
+            return serde_json::from_value::<DaemonControlRelayFrame>(value)
+                .map(Self::Control)
+                .map_err(serde::de::Error::custom);
+        }
+        if object.contains_key("channelId") {
+            return serde_json::from_value::<DaemonClientRelayFrame>(value)
+                .map(Self::Client)
+                .map_err(serde::de::Error::custom);
+        }
+        Err(serde::de::Error::custom("unknown daemon relay frame shape"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct AttentionNotificationPayload {
     #[serde(deserialize_with = "non_empty_string")]
     pub event_id: String,
@@ -168,14 +241,14 @@ pub struct AttentionNotificationPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct AttentionTargetPrincipal {
     #[serde(deserialize_with = "non_empty_string")]
     pub user_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct UserPresenceRelayFrame {
     #[serde(deserialize_with = "relay_envelope_version")]
     pub v: u32,
@@ -197,7 +270,7 @@ pub enum UserPresenceFrameType {
 pub type UserRelayFrame = UserPresenceRelayFrame;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct UserNotificationRelayFrame {
     #[serde(deserialize_with = "relay_envelope_version")]
     pub v: u32,
@@ -213,7 +286,7 @@ pub enum UserNotificationFrameType {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RelayNotification {
     #[serde(deserialize_with = "non_empty_string")]
     pub id: String,
@@ -260,8 +333,7 @@ pub enum IncomingRelayFrame {
 #[serde(
     tag = "type",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
+    rename_all_fields = "camelCase"
 )]
 pub enum RelayControlMessage {
     DisconnectInstance {
@@ -286,10 +358,14 @@ pub enum RelayControlMessage {
 }
 
 pub fn parse_incoming(value: &str) -> serde_json::Result<IncomingRelayFrame> {
-    if let Ok(system) = serde_json::from_str::<SystemRelayFrame>(value) {
-        return Ok(IncomingRelayFrame::System(system));
+    let parsed = serde_json::from_str::<Value>(value)?;
+    if parsed
+        .as_object()
+        .is_some_and(|object| object.contains_key("type"))
+    {
+        return serde_json::from_value::<SystemRelayFrame>(parsed).map(IncomingRelayFrame::System);
     }
-    serde_json::from_str::<StampedClientRelayFrame>(value).map(IncomingRelayFrame::Client)
+    serde_json::from_value::<StampedClientRelayFrame>(parsed).map(IncomingRelayFrame::Client)
 }
 
 pub fn daemon_client_frame(channel_id: String, payload: Value) -> DaemonClientRelayFrame {
@@ -326,7 +402,7 @@ where
     D: Deserializer<'de>,
 {
     let value = u32::deserialize(deserializer)?;
-    if value == RELAY_ENVELOPE_VERSION {
+    if is_relay_envelope_version_supported(value) {
         Ok(value)
     } else {
         Err(serde::de::Error::custom(
@@ -427,6 +503,99 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn forward_compat_frame_accepts_unknown_additive_field() {
+        let raw = fs::read_to_string(
+            fixture_root()
+                .join("forward-compat")
+                .join("client-relay-frame-additive-field.json"),
+        )
+        .unwrap();
+
+        let frame = serde_json::from_str::<ClientRelayFrame>(&raw).unwrap();
+
+        assert_eq!(frame.v, RELAY_ENVELOPE_VERSION);
+        assert_eq!(frame.channel_id, "ch-forward");
+        assert_eq!(frame.payload, json!({"kind": "req"}));
+    }
+
+    #[test]
+    fn forward_compat_daemon_control_with_additive_channel_id_routes_to_control() {
+        let raw = json!({
+            "v": RELAY_ENVELOPE_VERSION,
+            "to": "control",
+            "channelId": "additive-channel",
+            "event": "attention",
+            "payload": { "kind": "notice" }
+        });
+
+        let frame = serde_json::from_value::<DaemonRelayFrame>(raw).unwrap();
+
+        match frame {
+            DaemonRelayFrame::Control(frame) => {
+                assert_eq!(frame.event.as_deref(), Some("attention"));
+                assert_eq!(frame.payload, json!({"kind": "notice"}));
+            }
+            DaemonRelayFrame::Client(_) => panic!("control frame routed as client frame"),
+        }
+    }
+
+    #[test]
+    fn forward_compat_unknown_incoming_frame_kind_is_not_ignored() {
+        let raw = r#"{
+          "v": 1,
+          "type": "mystery",
+          "channelId": "ch-1",
+          "from": "client",
+          "principal": {
+            "userId": "user-1",
+            "grants": [{ "scope": "terminal", "projectRoot": null }]
+          },
+          "payload": { "kind": "req" }
+        }"#;
+
+        assert!(parse_incoming(raw).is_err());
+    }
+
+    #[test]
+    fn forward_compat_version_within_window_is_accepted() {
+        let raw = json!({
+            "v": RELAY_MIN_SUPPORTED_ENVELOPE_VERSION,
+            "channelId": "ch-1",
+            "payload": { "kind": "req" }
+        });
+
+        let frame = serde_json::from_value::<ClientRelayFrame>(raw).unwrap();
+
+        assert_eq!(frame.v, RELAY_MIN_SUPPORTED_ENVELOPE_VERSION);
+    }
+
+    #[test]
+    fn forward_compat_version_outside_window_is_rejected() {
+        let raw = json!({
+            "v": RELAY_ENVELOPE_VERSION + 1,
+            "channelId": "ch-1",
+            "payload": { "kind": "req" }
+        });
+
+        assert!(serde_json::from_value::<ClientRelayFrame>(raw).is_err());
+    }
+
+    #[test]
+    fn attention_event_type_unknown_preserves_tag() {
+        let event_type =
+            serde_json::from_str::<AttentionEventType>(r#""NEW_ATTENTION_TYPE""#).unwrap();
+
+        assert_eq!(
+            event_type,
+            AttentionEventType::Unknown("NEW_ATTENTION_TYPE".to_string())
+        );
+        assert_eq!(
+            serde_json::to_string(&event_type).unwrap(),
+            r#""NEW_ATTENTION_TYPE""#
+        );
     }
 
     fn fixture_root() -> &'static Path {

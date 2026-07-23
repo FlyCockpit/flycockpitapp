@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "channelId": "ch-forward",
+  "payload": {
+    "kind": "req"
+  },
+  "futureField": {
+    "ignored": true
+  }
+}

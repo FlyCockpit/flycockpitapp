@@ -18,7 +18,9 @@ use axum::{Router, serve};
 use base64::Engine as _;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use flycockpit_relay_protocol::{RelayControlMessage, RelayGrant, RelayPrincipal};
+use flycockpit_relay_protocol::{
+    RelayControlMessage, RelayGrant, RelayPrincipal, is_relay_envelope_version_supported,
+};
 use futures::{SinkExt, StreamExt};
 use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation, decode, decode_header};
 use redis::AsyncCommands;
@@ -1002,23 +1004,27 @@ impl RelayState {
     }
 
     async fn handle_daemon_frame(&self, daemon: &DaemonConnection, data: Vec<u8>) -> Result<()> {
-        if let Ok(frame) = serde_json::from_slice::<RawDaemonClientRelayFrame>(&data) {
-            let client = {
-                let inner = self.inner.lock().await;
-                inner
-                    .channel_owners
-                    .get(&channel_key(&daemon.instance_id, &frame.channel_id))
-                    .and_then(|id| inner.clients.get(id))
-                    .cloned()
-            };
-            if let Some(client) = client {
-                client.tx.send_bytes_deferred(data);
+        match daemon_frame_route(&data)? {
+            DaemonFrameRoute::Control => {
+                let frame = serde_json::from_slice::<RawDaemonControlRelayFrame>(&data)?;
+                self.ingest_daemon_control(daemon, frame.event, frame.payload)
+                    .await;
             }
-            return Ok(());
+            DaemonFrameRoute::Client => {
+                let frame = serde_json::from_slice::<RawDaemonClientRelayFrame>(&data)?;
+                let client = {
+                    let inner = self.inner.lock().await;
+                    inner
+                        .channel_owners
+                        .get(&channel_key(&daemon.instance_id, &frame.channel_id))
+                        .and_then(|id| inner.clients.get(id))
+                        .cloned()
+                };
+                if let Some(client) = client {
+                    client.tx.send_bytes_deferred(data);
+                }
+            }
         }
-        let frame = serde_json::from_slice::<RawDaemonControlRelayFrame>(&data)?;
-        self.ingest_daemon_control(daemon, frame.event, frame.payload)
-            .await;
         Ok(())
     }
 
@@ -1893,9 +1899,9 @@ struct RelayTokenClaims {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct RawClientRelayFrame {
-    #[serde(deserialize_with = "version_one")]
+    #[serde(deserialize_with = "relay_envelope_version")]
     #[serde(rename = "v")]
     _v: u32,
     #[serde(deserialize_with = "channel_id")]
@@ -1914,9 +1920,9 @@ struct StampedRawClientRelayFrame<'a> {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct RawDaemonClientRelayFrame {
-    #[serde(deserialize_with = "version_one")]
+    #[serde(deserialize_with = "relay_envelope_version")]
     #[serde(rename = "v")]
     _v: u32,
     #[serde(deserialize_with = "channel_id")]
@@ -1926,9 +1932,9 @@ struct RawDaemonClientRelayFrame {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct RawDaemonControlRelayFrame {
-    #[serde(deserialize_with = "version_one")]
+    #[serde(deserialize_with = "relay_envelope_version")]
     #[serde(rename = "v")]
     _v: u32,
     #[serde(rename = "to")]
@@ -1945,9 +1951,9 @@ enum ControlTarget {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct UserPresenceFrame {
-    #[serde(deserialize_with = "version_one")]
+    #[serde(deserialize_with = "relay_envelope_version")]
     #[serde(rename = "v")]
     _v: u32,
     #[serde(rename = "type")]
@@ -1964,12 +1970,73 @@ enum PresenceType {
     Presence,
 }
 
-fn version_one<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+struct RawDaemonFrameRouteProbe {
+    to: bool,
+    channel_id: bool,
+}
+
+impl<'de> Deserialize<'de> for RawDaemonFrameRouteProbe {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ProbeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ProbeVisitor {
+            type Value = RawDaemonFrameRouteProbe;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("daemon relay frame object")
+            }
+
+            fn visit_map<A>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<RawDaemonFrameRouteProbe, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut to = false;
+                let mut channel_id = false;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "to" => to = true,
+                        "channelId" => channel_id = true,
+                        _ => {}
+                    }
+                    let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                }
+                Ok(RawDaemonFrameRouteProbe { to, channel_id })
+            }
+        }
+
+        deserializer.deserialize_map(ProbeVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonFrameRoute {
+    Client,
+    Control,
+}
+
+fn daemon_frame_route(data: &[u8]) -> Result<DaemonFrameRoute> {
+    let probe = serde_json::from_slice::<RawDaemonFrameRouteProbe>(data)?;
+    if probe.to {
+        return Ok(DaemonFrameRoute::Control);
+    }
+    if probe.channel_id {
+        return Ok(DaemonFrameRoute::Client);
+    }
+    Err(anyhow!("unknown daemon relay frame shape"))
+}
+
+fn relay_envelope_version<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = u32::deserialize(deserializer)?;
-    if value == 1 {
+    if is_relay_envelope_version_supported(value) {
         Ok(value)
     } else {
         Err(serde::de::Error::custom(
@@ -2473,6 +2540,134 @@ mod tests {
         }
     }
 
+    #[test]
+    fn relay_binary_frame_accepts_unknown_additive_field() {
+        let client = serde_json::from_value::<RawClientRelayFrame>(serde_json::json!({
+            "v": flycockpit_relay_protocol::RELAY_ENVELOPE_VERSION,
+            "channelId": "ch-client",
+            "payload": { "kind": "req" },
+            "futureField": true
+        }))
+        .unwrap();
+        assert_eq!(client.channel_id, "ch-client");
+
+        let daemon_client =
+            serde_json::from_value::<RawDaemonClientRelayFrame>(serde_json::json!({
+                "v": flycockpit_relay_protocol::RELAY_ENVELOPE_VERSION,
+                "channelId": "ch-daemon",
+                "payload": { "kind": "res" },
+                "futureField": true
+            }))
+            .unwrap();
+        assert_eq!(daemon_client.channel_id, "ch-daemon");
+
+        let daemon_control =
+            serde_json::from_value::<RawDaemonControlRelayFrame>(serde_json::json!({
+                "v": flycockpit_relay_protocol::RELAY_ENVELOPE_VERSION,
+                "to": "control",
+                "event": "attention",
+                "payload": { "kind": "notice" },
+                "futureField": true
+            }))
+            .unwrap();
+        assert_eq!(daemon_control.event.as_deref(), Some("attention"));
+
+        let presence = serde_json::from_value::<UserPresenceFrame>(serde_json::json!({
+            "v": flycockpit_relay_protocol::RELAY_ENVELOPE_VERSION,
+            "type": "presence",
+            "clientId": "user-client",
+            "visible": true,
+            "futureField": true
+        }))
+        .unwrap();
+        assert_eq!(presence.client_id, "user-client");
+    }
+
+    #[test]
+    fn relay_binary_control_frame_with_additive_channel_id_routes_to_control() {
+        let raw = serde_json::json!({
+            "v": flycockpit_relay_protocol::RELAY_ENVELOPE_VERSION,
+            "to": "control",
+            "channelId": "additive-channel",
+            "event": "attention",
+            "payload": { "kind": "notice" }
+        });
+        let raw = serde_json::to_vec(&raw).unwrap();
+
+        assert_eq!(daemon_frame_route(&raw).unwrap(), DaemonFrameRoute::Control);
+    }
+
+    #[test]
+    fn relay_binary_null_to_still_routes_to_control() {
+        let raw = serde_json::json!({
+            "v": flycockpit_relay_protocol::RELAY_ENVELOPE_VERSION,
+            "to": null,
+            "channelId": "client-looking",
+            "payload": {}
+        });
+        let raw = serde_json::to_vec(&raw).unwrap();
+
+        assert_eq!(daemon_frame_route(&raw).unwrap(), DaemonFrameRoute::Control);
+    }
+
+    #[test]
+    fn relay_binary_frame_rejects_out_of_window_version() {
+        let raw = serde_json::json!({
+            "v": flycockpit_relay_protocol::RELAY_ENVELOPE_VERSION + 1,
+            "channelId": "ch-client",
+            "payload": { "kind": "req" }
+        });
+
+        assert!(serde_json::from_value::<RawClientRelayFrame>(raw).is_err());
+    }
+
+    #[tokio::test]
+    async fn notify_user_with_unknown_attention_type_is_forwarded_not_dropped() {
+        let raw = serde_json::json!({
+            "type": "notify_user",
+            "userId": "user-1",
+            "notification": {
+                "id": "notification-1",
+                "type": "NEW_ATTENTION_TYPE",
+                "title": "Future event",
+                "body": "A newer server emitted this.",
+                "url": "https://example.test/sessions/session-1",
+                "instanceId": "instance-1",
+                "sessionRef": "session-1",
+                "createdAt": "2026-07-22T00:00:00.000Z"
+            }
+        });
+        let message = serde_json::from_value::<RelayControlMessage>(raw).unwrap();
+        let state = RelayState::new(
+            test_config(),
+            PresenceStore::Memory(MemoryPresenceStore::default()),
+            JwtVerifier::new(
+                "https://example.test/jwks.json".to_string(),
+                "https://example.test".to_string(),
+                "flycockpit-relay".to_string(),
+            ),
+        );
+        let (tx, mut rx) = test_connection_tx();
+        state.inner.lock().await.users.insert(
+            "connection-1".to_string(),
+            UserConnection {
+                tx,
+                connection_id: "connection-1".to_string(),
+                user_id: "user-1".to_string(),
+            },
+        );
+
+        state.handle_control(message).await;
+
+        let outbound = rx.recv().await.unwrap();
+        let Outbound::Text(text) = outbound else {
+            panic!("expected forwarded notification text frame");
+        };
+        let forwarded = serde_json::from_str::<serde_json::Value>(&text).unwrap();
+        assert_eq!(forwarded["type"], "notification");
+        assert_eq!(forwarded["notification"]["type"], "NEW_ATTENTION_TYPE");
+    }
+
     #[tokio::test]
     async fn fleet_client_registers_and_heartbeats_with_session_token() {
         let signing_key = test_signing_key();
@@ -2594,6 +2789,44 @@ mod tests {
             *state.heartbeat_tokens.lock().await,
             vec!["Bearer session-1".to_string()]
         );
+    }
+
+    fn test_config() -> Arc<Config> {
+        Arc::new(Config {
+            relay_id: "relay-test".to_string(),
+            token_issuer: "https://example.test".to_string(),
+            jwks_url: "https://example.test/jwks.json".to_string(),
+            control_ingest_url: None,
+            control_secret: None,
+            redis_url: None,
+            heartbeat_ms: 30_000,
+            lease_ttl_ms: 60_000,
+            max_frame_bytes: 64 * 1024,
+            max_channels_per_client: 8,
+            max_connections_per_instance: 8,
+            client_rate_limit_per_second: 60,
+            shutdown_grace_ms: 100,
+            mode: RelayMode::Embedded,
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            fleet: None,
+        })
+    }
+
+    fn test_connection_tx() -> (ConnectionTx, mpsc::Receiver<Outbound>) {
+        let (tx, rx) = mpsc::channel::<Outbound>(8);
+        (
+            ConnectionTx {
+                tx,
+                queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                notify: Arc::new(Notify::new()),
+                burst: Arc::new(std::sync::Mutex::new(OutboundBurst {
+                    window_started: Instant::now(),
+                    count: 0,
+                })),
+            },
+            rx,
+        )
     }
 
     fn test_signing_key() -> SigningKey {

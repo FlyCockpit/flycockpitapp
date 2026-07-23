@@ -1,20 +1,24 @@
 import {
   type DaemonClientRelayFrame,
   daemonClientRelayFrameSchema,
+  RELAY_ENVELOPE_VERSION,
 } from "@flycockpit/relay-protocol/envelopes";
 import {
-  type AttachResult,
   type ClientRequest,
   createEnvelope,
   parseAckResult,
   parseAttachResult,
   parseFsListResult,
   parseFsReadResult,
+  parseFsStatResult,
   parseFsWriteResult,
   parseGitDiffFileResult,
   parseGitStatusResult,
-  parseListProjectsResult,
+  parseHistoryPageResult,
   parseListSessionsResult,
+  parseSessionLiveStatusResult,
+  parseSessionMessagesResult,
+  type ResolveResponse,
   serverMessageSchema,
 } from ".";
 
@@ -36,7 +40,6 @@ export type RemoteSessionClientOptions = {
   instanceId: string;
   relayUrl: string;
   token: string;
-  idPrefix: string;
   baseUrl?: string;
   WebSocketImpl?: RemoteSessionWebSocketConstructor;
   onStatus?: (status: RemoteSessionStatus, detail?: string) => void;
@@ -47,6 +50,11 @@ type Pending = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
 };
+
+type ParamsOf<Name extends ClientRequest["request"]> = Extract<
+  ClientRequest,
+  { request: Name }
+>["params"];
 
 export class RemoteSessionError extends Error {
   readonly code: string;
@@ -78,10 +86,17 @@ function messageData(event: Listener) {
   return event;
 }
 
+function nextRequestId() {
+  return globalThis.crypto.randomUUID();
+}
+
+function warn(message: string, detail?: unknown) {
+  console.warn(`[cockpit-protocol] ${message}`, detail);
+}
+
 export class RemoteSessionClient {
   private ws: RemoteSessionWebSocket | null = null;
   private readonly pending = new Map<string, Pending>();
-  private requestSeq = 0;
   private readonly channelId: string;
 
   constructor(private readonly options: RemoteSessionClientOptions) {
@@ -120,95 +135,158 @@ export class RemoteSessionClient {
     this.ws = null;
   }
 
-  async listProjects() {
-    return parseListProjectsResult(await this.send({ type: "list_projects" }));
+  async attach(params: ParamsOf<"attach"> = {}) {
+    return parseAttachResult(await this.send({ request: "attach", params }));
   }
 
-  async listSessions(projectRoot: string) {
-    return parseListSessionsResult(await this.send({ type: "list_sessions", projectRoot }));
+  async sendUserMessage(params: ParamsOf<"send_user_message"> | string) {
+    const requestParams = typeof params === "string" ? { text: params } : params;
+    return parseAckResult(await this.send({ request: "send_user_message", params: requestParams }));
   }
 
-  async attach(sessionId: string, sinceSeq?: number): Promise<AttachResult> {
-    return parseAttachResult(await this.send({ type: "attach", sessionId, sinceSeq }));
-  }
-
-  async createSession(input: {
-    projectRoot: string;
-    title?: string;
-    agent?: string;
-    model?: string;
-  }) {
-    return parseAttachResult(await this.send({ type: "create_session", ...input }));
-  }
-
-  async sendUserMessage(sessionId: string, text: string, clientMessageId: string) {
-    return this.send({ type: "send_user_message", sessionId, text, clientMessageId });
-  }
-
-  async resolveInterrupt(input: {
-    sessionId: string;
-    interruptId: string;
-    resolution: "approve" | "deny" | "answer";
-    answer?: string;
-  }) {
-    return this.send({ type: "resolve_interrupt", ...input });
-  }
-
-  async renameSession(sessionId: string, title: string) {
-    return this.send({ type: "rename_session", sessionId, title });
-  }
-
-  async archiveSession(sessionId: string, archived: boolean) {
-    return this.send({ type: "archive_session", sessionId, archived });
-  }
-
-  async shareSession(sessionId: string, shared: boolean) {
-    return parseAckResult(await this.send({ type: "share_session", sessionId, shared }));
-  }
-
-  async listFiles(projectRoot: string, path: string, showHidden: boolean) {
-    return parseFsListResult(await this.send({ type: "fs_list", projectRoot, path, showHidden }));
-  }
-
-  async readFile(projectRoot: string, path: string) {
-    return parseFsReadResult(await this.send({ type: "fs_read", projectRoot, path }));
-  }
-
-  async writeFile(projectRoot: string, path: string, content: string, baseHash?: string) {
-    return parseFsWriteResult(
-      await this.send({ type: "fs_write", projectRoot, path, content, baseHash }),
+  async resolveInterrupt(interrupt_id: string, response: ResolveResponse) {
+    return parseAckResult(
+      await this.send({ request: "resolve_interrupt", params: { interrupt_id, response } }),
     );
   }
 
-  async createDirectory(projectRoot: string, path: string) {
-    return parseAckResult(await this.send({ type: "fs_create_dir", projectRoot, path }));
+  async listSessions(params: ParamsOf<"list_sessions"> = {}) {
+    return parseListSessionsResult(await this.send({ request: "list_sessions", params }));
   }
 
-  async renamePath(projectRoot: string, fromPath: string, toPath: string) {
-    return parseAckResult(await this.send({ type: "fs_rename", projectRoot, fromPath, toPath }));
+  async readSessionMessages(params: ParamsOf<"read_session_messages">) {
+    return parseSessionMessagesResult(
+      await this.send({ request: "read_session_messages", params }),
+    );
   }
 
-  async deletePath(projectRoot: string, path: string) {
-    return parseAckResult(await this.send({ type: "fs_delete", projectRoot, path }));
+  async readHistoryPage(params: ParamsOf<"read_history_page">) {
+    return parseHistoryPageResult(await this.send({ request: "read_history_page", params }));
   }
 
-  async gitStatus(projectRoot: string) {
-    return parseGitStatusResult(await this.send({ type: "git_status", projectRoot }));
+  async sessionLiveStatus(session_ids: string[]) {
+    return parseSessionLiveStatusResult(
+      await this.send({ request: "session_live_status", params: { session_ids } }),
+    );
   }
 
-  async gitDiffFile(projectRoot: string, path: string) {
-    return parseGitDiffFileResult(await this.send({ type: "git_diff_file", projectRoot, path }));
+  async archiveSession(session_id: string, cascade = false) {
+    return parseAckResult(
+      await this.send({ request: "archive_session", params: { session_id, cascade } }),
+    );
   }
 
-  async forkSession(sessionId: string) {
-    return this.send({ type: "fork_session", sessionId });
+  async unarchiveSession(session_id: string) {
+    return parseAckResult(
+      await this.send({ request: "unarchive_session", params: { session_id } }),
+    );
+  }
+
+  async forkSession(params: ParamsOf<"fork_session">) {
+    return this.send({ request: "fork_session", params });
+  }
+
+  async renameSession(session_id: string, title: string) {
+    return parseAckResult(
+      await this.send({ request: "rename_session", params: { session_id, title } }),
+    );
+  }
+
+  async shareSession(session_id: string, shared: boolean) {
+    return parseAckResult(
+      await this.send({ request: "share_session", params: { session_id, shared } }),
+    );
+  }
+
+  async deleteSession(session_id: string, cascade = false) {
+    return parseAckResult(
+      await this.send({ request: "delete_session", params: { session_id, cascade } }),
+    );
+  }
+
+  async setActiveModel(params: ParamsOf<"set_active_model">) {
+    return parseAckResult(await this.send({ request: "set_active_model", params }));
+  }
+
+  async setAgent(name: string) {
+    return parseAckResult(await this.send({ request: "set_agent", params: { name } }));
+  }
+
+  async statsRollup(params: ParamsOf<"stats_rollup">) {
+    return this.send({ request: "stats_rollup", params });
+  }
+
+  async resumePausedWork(session_id: string) {
+    return parseAckResult(
+      await this.send({ request: "resume_paused_work", params: { session_id } }),
+    );
+  }
+
+  async cancelPausedWork(session_id: string) {
+    return parseAckResult(
+      await this.send({ request: "cancel_paused_work", params: { session_id } }),
+    );
+  }
+
+  async listFiles(project_root: string, path: string, show_hidden = false) {
+    return parseFsListResult(
+      await this.send({ request: "fs_list", params: { project_root, path, show_hidden } }),
+    );
+  }
+
+  async statFile(project_root: string, path: string) {
+    return parseFsStatResult(
+      await this.send({ request: "fs_stat", params: { project_root, path } }),
+    );
+  }
+
+  async readFile(project_root: string, path: string, base64 = false) {
+    return parseFsReadResult(
+      await this.send({ request: "fs_read", params: { project_root, path, base64 } }),
+    );
+  }
+
+  async writeFile(project_root: string, path: string, content: string, base_hash?: string) {
+    return parseFsWriteResult(
+      await this.send({ request: "fs_write", params: { project_root, path, content, base_hash } }),
+    );
+  }
+
+  async createDirectory(project_root: string, path: string) {
+    return parseAckResult(
+      await this.send({ request: "fs_create_dir", params: { project_root, path } }),
+    );
+  }
+
+  async renamePath(project_root: string, from_path: string, to_path: string) {
+    return parseAckResult(
+      await this.send({ request: "fs_rename", params: { project_root, from_path, to_path } }),
+    );
+  }
+
+  async deletePath(project_root: string, path: string) {
+    return parseAckResult(
+      await this.send({ request: "fs_delete", params: { project_root, path } }),
+    );
+  }
+
+  async gitStatus(project_root: string) {
+    return parseGitStatusResult(
+      await this.send({ request: "git_status", params: { project_root } }),
+    );
+  }
+
+  async gitDiffFile(project_root: string, path: string) {
+    return parseGitDiffFileResult(
+      await this.send({ request: "git_diff_file", params: { project_root, path } }),
+    );
   }
 
   private send(request: ClientRequest) {
     if (this.ws?.readyState !== 1) {
       return Promise.reject(new Error("Instance connection is not open."));
     }
-    const id = this.options.idPrefix + "-" + ++this.requestSeq;
+    const id = nextRequestId();
     const envelope = createEnvelope(id, request);
     const promise = new Promise<unknown>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
@@ -217,7 +295,13 @@ export class RemoteSessionClient {
         reject(new Error("Request timed out."));
       }, 30_000);
     });
-    this.ws.send(JSON.stringify({ v: 1, channelId: this.channelId, payload: envelope }));
+    this.ws.send(
+      JSON.stringify({
+        v: RELAY_ENVELOPE_VERSION,
+        channelId: this.channelId,
+        payload: envelope,
+      }),
+    );
     return promise;
   }
 
@@ -229,23 +313,37 @@ export class RemoteSessionClient {
       return;
     }
     const message = serverMessageSchema.safeParse(frame.payload);
-    if (!message.success) return;
-    if (message.data.type === "event") {
-      this.options.onEvent?.(message.data.event);
+    if (!message.success) {
+      warn("failed to parse daemon payload", message.error);
+      return;
+    }
+    if (message.data.kind === "evt") {
+      if ("__unknown" in message.data && message.data.__unknown) {
+        warn(`unknown daemon event kind: ${message.data.event}`, message.data);
+      }
+      this.options.onEvent?.(message.data);
+      return;
+    }
+    if (message.data.kind === "res") {
+      const pending = this.pending.get(message.data.id);
+      if (!pending) return;
+      this.pending.delete(message.data.id);
+      pending.resolve(message.data.data);
+      return;
+    }
+
+    if (!message.data.id) {
+      warn(`out-of-band daemon error: ${message.data.error.code}`, message.data.error);
       return;
     }
     const pending = this.pending.get(message.data.id);
     if (!pending) return;
     this.pending.delete(message.data.id);
-    if (message.data.ok) {
-      pending.resolve(message.data.result);
-      return;
-    }
     pending.reject(
       new RemoteSessionError(
         message.data.error.message,
         message.data.error.code,
-        "data" in message.data.error ? message.data.error.data : undefined,
+        message.data.error,
       ),
     );
   }

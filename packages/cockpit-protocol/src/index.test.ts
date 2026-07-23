@@ -1,73 +1,198 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
+import errorsFixture from "../fixtures/daemon-wire/errors.json" with { type: "json" };
+import eventsFixture from "../fixtures/daemon-wire/events.json" with { type: "json" };
+import interruptsFixture from "../fixtures/daemon-wire/interrupts.json" with { type: "json" };
+import requestsFixture from "../fixtures/daemon-wire/requests.json" with { type: "json" };
+import responsesFixture from "../fixtures/daemon-wire/responses.json" with { type: "json" };
 import {
-  attachResultSchema,
-  createEnvelope,
-  liveEventSchema,
+  clientEnvelopeSchema,
+  commandDetailSchema,
+  errorEnvelopeSchema,
+  eventEnvelopeSchema,
+  grantKindSchema,
+  interruptQuestionSchema,
+  knownEventEnvelopeSchema,
+  PROTOCOL_VERSION,
+  resolveResponseSchema,
+  responseEnvelopeSchema,
+  sandboxEscalationSchema,
   serverMessageSchema,
-  sessionSummarySchema,
 } from ".";
-import attachFixture from "./fixtures/attach.json" with { type: "json" };
-import eventsFixture from "./fixtures/events.json" with { type: "json" };
 
-describe("cockpit protocol codecs", () => {
-  it("parses attach history fixtures from the daemon JSON shape", () => {
-    const parsed = attachResultSchema.parse(attachFixture);
-    expect(parsed.session.sessionId).toBe("s1");
-    expect(parsed.history.map((entry) => entry.kind)).toEqual([
-      "user_message",
-      "assistant_text",
-      "tool_call",
-      "interrupt",
-    ]);
-    expect(attachResultSchema.parse(JSON.parse(JSON.stringify(parsed)))).toEqual(parsed);
+const goldenFiles = [
+  requestsFixture,
+  responsesFixture,
+  eventsFixture,
+  errorsFixture,
+  interruptsFixture,
+] as const;
+const interruptRaisedDataSchema = z.object({ question: interruptQuestionSchema });
+
+describe("cockpit-proto daemon wire schemas", () => {
+  it("parses every golden request envelope", () => {
+    for (const [name, frame] of Object.entries(requestsFixture)) {
+      const parsed = clientEnvelopeSchema.safeParse(frame);
+      expect(parsed.success, name).toBe(true);
+      if (parsed.success) expect(parsed.data.request).toBe(name);
+    }
   });
 
-  it("parses live event fixtures and server message envelopes", () => {
-    const events = eventsFixture.map((event) => liveEventSchema.parse(event));
-    expect(events.map((event) => event.type)).toEqual([
-      "history_entry",
-      "assistant_delta",
-      "usage",
-      "interrupt_resolved",
-      "idle",
-    ]);
-    const message = serverMessageSchema.parse({ type: "event", event: events[0] });
-    expect(message.type).toBe("event");
-  });
-
-  it("normalizes daemon session visibility and principal attribution fields", () => {
-    const parsed = sessionSummarySchema.parse({
-      sessionId: "s1",
-      projectRoot: "/work/app",
-      title: "Fix checkout",
-      updatedAt: 1783296000,
-      created_by_principal: "flycockpit:user-1",
-      shared_with_collaborators: true,
-    });
-    expect(parsed.createdBy?.userId).toBe("user-1");
-    expect(parsed.sharedWithCollaborators).toBe(true);
-
-    const local = sessionSummarySchema.parse({
-      sessionId: "s2",
-      projectRoot: "/work/app",
-      title: "Local session",
-      updatedAt: 1783296001,
-      created_by_principal: null,
-    });
-    expect(local.createdBy).toBeNull();
-    expect(local.sharedWithCollaborators).toBe(false);
-  });
-
-  it("round-trips outbound client envelopes", () => {
-    const envelope = createEnvelope("req-1", {
-      type: "send_user_message",
-      sessionId: "s1",
-      text: "hello",
-      clientMessageId: "client-1",
-    });
-    expect(createEnvelope(envelope.id, envelope.request)).toEqual(envelope);
+  it("parses every golden response envelope", () => {
+    for (const [name, frame] of Object.entries(responsesFixture)) {
+      const parsed = responseEnvelopeSchema.safeParse(frame);
+      expect(parsed.success, name).toBe(true);
+      if (parsed.success) expect(parsed.data.response).toBe(name);
+    }
     expect(
-      createEnvelope("req-2", { type: "share_session", sessionId: "s1", shared: true }).request,
-    ).toEqual({ type: "share_session", sessionId: "s1", shared: true });
+      responseEnvelopeSchema.safeParse({
+        v: PROTOCOL_VERSION,
+        kind: "res",
+        id: "11111111-1111-4111-8111-111111111111",
+        response: "session_messages",
+        data: { messages: [] },
+      }).success,
+    ).toBe(false);
+    expect(
+      responseEnvelopeSchema.safeParse({
+        v: PROTOCOL_VERSION,
+        kind: "res",
+        id: "11111111-1111-4111-8111-111111111111",
+        response: "stats_rollup",
+        data: { rollup: {} },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("parses every golden event envelope and maps every known kind", () => {
+    for (const [name, frame] of Object.entries(eventsFixture)) {
+      const known = knownEventEnvelopeSchema.safeParse(frame);
+      expect(known.success, name).toBe(true);
+      if (known.success) expect(known.data.event).toBe(name);
+
+      const parsed = eventEnvelopeSchema.parse(frame);
+      expect("__unknown" in parsed, name).toBe(false);
+    }
+  });
+
+  it("tolerates and flags an unknown event kind", () => {
+    const parsed = eventEnvelopeSchema.parse({
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "future_daemon_event",
+      data: { payload: true },
+    });
+    expect(parsed).toMatchObject({
+      event: "future_daemon_event",
+      __unknown: true,
+    });
+  });
+
+  it("rejects malformed known event payloads", () => {
+    expect(
+      eventEnvelopeSchema.safeParse({
+        v: PROTOCOL_VERSION,
+        kind: "evt",
+        event: "interrupt_resolved",
+        data: {
+          session_id: "11111111-1111-4111-8111-111111111111",
+          interrupt_id: "22222222-2222-4222-8222-222222222222",
+        },
+      }).success,
+    ).toBe(true);
+    expect(
+      eventEnvelopeSchema.safeParse({
+        v: PROTOCOL_VERSION,
+        kind: "evt",
+        event: "interrupt_raised",
+        data: {
+          session_id: "11111111-1111-4111-8111-111111111111",
+          interrupt_id: "22222222-2222-4222-8222-222222222222",
+          agent: "builder",
+          description: "bad interrupt",
+          question: { kind: "single", data: { prompt: "Missing options" } },
+        },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("parses every golden err frame into code and message", () => {
+    for (const [name, frame] of Object.entries(errorsFixture)) {
+      const parsed = errorEnvelopeSchema.safeParse(frame);
+      expect(parsed.success, name).toBe(true);
+      if (parsed.success) {
+        expect(parsed.data.error.code).toEqual(expect.any(String));
+        expect(parsed.data.error.message).toEqual(expect.any(String));
+      }
+    }
+    expect(errorEnvelopeSchema.parse(errorsFixture.bad_request_out_of_band).id).toBeUndefined();
+  });
+
+  it("parses every interrupt-question and resolve-response variant from the golden", () => {
+    const questionKinds = new Set<string>();
+    const maskedValues = new Set<boolean>();
+    const responseKinds = new Set<string>();
+
+    for (const frame of Object.values(interruptsFixture)) {
+      const eventFrame = eventEnvelopeSchema.safeParse(frame);
+      const requestFrame = clientEnvelopeSchema.safeParse(frame);
+      expect(eventFrame.success || requestFrame.success).toBe(true);
+      if (eventFrame.success && eventFrame.data.event === "interrupt_raised") {
+        const question = interruptRaisedDataSchema.parse(eventFrame.data.data).question;
+        questionKinds.add(question.kind);
+        if (question.kind === "freetext") {
+          maskedValues.add(question.data.masked ?? false);
+        }
+      }
+      if (requestFrame.success && requestFrame.data.request === "resolve_interrupt") {
+        const response = resolveResponseSchema.parse(requestFrame.data.params.response);
+        responseKinds.add(response.kind);
+        if (response.kind === "batch") {
+          expect(response.data.responses.some((child) => child.kind !== "batch")).toBe(true);
+        }
+      }
+    }
+
+    expect(questionKinds).toEqual(new Set(["single", "multi", "freetext"]));
+    expect(maskedValues).toEqual(new Set([true, false]));
+    expect(responseKinds).toEqual(new Set(["single", "multi", "freetext", "batch", "cancel"]));
+  });
+
+  it("parses command_detail present and absent, sandbox_escalation, and all grant kinds", () => {
+    const present = interruptsFixture.event_single_command_detail_present.data.question.data;
+    expect(commandDetailSchema.safeParse(present.command_detail).success).toBe(true);
+    expect(
+      "command_detail" in interruptsFixture.event_single_command_detail_absent.data.question.data,
+    ).toBe(false);
+
+    expect(sandboxEscalationSchema.safeParse(present.sandbox_escalation).success).toBe(true);
+    expect(
+      sandboxEscalationSchema.parse(
+        interruptsFixture.event_single_sandbox_denial_absent.data.question.data.sandbox_escalation,
+      ).denial,
+    ).toBeUndefined();
+
+    const grantKinds = new Set(
+      [
+        interruptsFixture.event_single_grant_command,
+        interruptsFixture.event_single_grant_path,
+        interruptsFixture.event_single_grant_mcp_tool,
+      ].map((frame) => grantKindSchema.parse(frame.data.question.data.approval_class)),
+    );
+    expect(grantKinds).toEqual(new Set(["command", "path", "mcp_tool"]));
+  });
+
+  it("asserts every golden envelope v equals PROTOCOL_VERSION", () => {
+    for (const file of goldenFiles) {
+      for (const [name, frame] of Object.entries(file)) {
+        expect(frame.v, name).toBe(PROTOCOL_VERSION);
+      }
+    }
+  });
+
+  it("rejects the legacy type/ok/result server shape", () => {
+    expect(serverMessageSchema.safeParse({ type: "response", id: "req-1", ok: true }).success).toBe(
+      false,
+    );
   });
 });

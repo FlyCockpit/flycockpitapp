@@ -7,5 +7,5 @@
     "outDir": "dist",
     "composite": true
   },
-  "include": ["src/**/*.ts", "src/**/*.json"]
+  "include": ["src/**/*.ts", "src/**/*.json", "fixtures/**/*.json"]
 }

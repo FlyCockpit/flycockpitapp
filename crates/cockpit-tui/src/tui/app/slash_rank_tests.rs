@@ -1,8 +1,7 @@
 use super::{
-    AgentCommandOutcome, App, SLASH_COMMANDS, SLASH_MENU_COUNTER_TEST_LOCK,
-    SWARM_TOKEN_BURN_WARNING, agent_command_outcome, mcp_load_call_count, primary_swap_warning,
-    program_on_path_call_count, reset_mcp_load_call_count, reset_program_on_path_call_count,
-    slash_matches,
+    AgentCommandOutcome, App, SLASH_COMMANDS, SLASH_MENU_COUNTER_TEST_LOCK, agent_command_outcome,
+    mcp_load_call_count, primary_swap_warning, program_on_path_call_count,
+    reset_mcp_load_call_count, reset_program_on_path_call_count, slash_matches,
 };
 use std::collections::HashMap;
 
@@ -293,34 +292,16 @@ fn plan_and_build_commands_are_registered() {
 }
 
 #[test]
-fn swarm_command_is_registered_with_token_warning() {
-    // `/swarm` swaps the primary to `Swarm` via the same
-    // `swap_primary_agent` path `/plan`/`/build` use (GOALS §24); its
-    // registry description carries the token-burn caution.
-    let swarm = SLASH_COMMANDS
-        .iter()
-        .find(|c| c.name == "swarm")
-        .expect("/swarm must be a registered slash command");
+fn roster_trim_swarm_command_is_not_registered() {
     assert!(
-        swarm.description.to_lowercase().contains("token"),
-        "the /swarm entry must caution about token burn: {}",
-        swarm.description
+        !SLASH_COMMANDS.iter().any(|c| c.name == "swarm"),
+        "/swarm is removed with the Swarm primary"
     );
 }
 
 #[test]
-fn primary_swap_warning_fires_only_for_swarm() {
-    // The token-burn caution rides the shared `swap_primary_agent` path
-    // (implementation note), so every route onto
-    // `Swarm` — `/swarm`, `/agent Swarm`, the `Shift+Tab` cycle —
-    // surfaces the *same* text exactly once, and no other primary spams a
-    // warning.
-    assert_eq!(
-        primary_swap_warning("Swarm"),
-        Some(SWARM_TOKEN_BURN_WARNING),
-        "landing on Swarm must fire the token-burn warning"
-    );
-    for quiet in ["Auto", "Plan", "Build", "builder", "explore"] {
+fn roster_trim_primary_swap_warning_is_removed() {
+    for quiet in ["Auto", "Swarm", "Plan", "Build", "builder", "explore"] {
         assert_eq!(
             primary_swap_warning(quiet),
             None,
@@ -330,20 +311,14 @@ fn primary_swap_warning_fires_only_for_swarm() {
 }
 
 #[test]
-fn agent_command_outcome_switches_to_swarm() {
-    // `Swarm` is a bundled chat-ownable primary, so `/agent Swarm`
-    // (and the `Shift+Tab` cycle) route to a swap (GOALS §24). Build the
-    // experimental-on order explicitly (the gate itself is covered in
-    // `agents::tests`) so this routing test is config-independent.
-    let order: Vec<String> = ["Auto", "Plan", "Build", "Swarm", "Build"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    assert!(order.iter().any(|n| n == "Swarm"), "{order:?}");
-    assert_eq!(
-        agent_command_outcome("Swarm", "Auto", &order),
-        AgentCommandOutcome::Switch("Swarm".into())
-    );
+fn roster_trim_agent_command_rejects_swarm() {
+    let order: Vec<String> = vec!["Plan".into(), "Build".into()];
+    let out = agent_command_outcome("Swarm", "Build", &order);
+    assert!(matches!(
+        out,
+        AgentCommandOutcome::Message(ref line)
+            if line.contains("`Swarm`") && line.contains("Plan, Build")
+    ));
 }
 
 #[test]
@@ -360,34 +335,31 @@ fn agent_command_is_registered_and_takes_args() {
 
 #[test]
 fn agent_command_outcome_switches_on_valid_name() {
-    let order: Vec<String> = vec!["Auto".into(), "Plan".into(), "Build".into()];
+    let order: Vec<String> = vec!["Plan".into(), "Build".into()];
     // A valid chat-ownable name routes to a switch (which the caller
     // sends through `swap_primary_agent`).
     assert_eq!(
-        agent_command_outcome("Auto", "Plan", &order),
-        AgentCommandOutcome::Switch("Auto".into())
+        agent_command_outcome("Plan", "Build", &order),
+        AgentCommandOutcome::Switch("Plan".into())
     );
     // Surrounding whitespace is trimmed before matching.
     assert_eq!(
-        agent_command_outcome("  Build  ", "Auto", &order),
+        agent_command_outcome("  Build  ", "Plan", &order),
         AgentCommandOutcome::Switch("Build".into())
     );
 }
 
 #[test]
 fn agent_command_outcome_errors_on_bogus_name_without_switching() {
-    let order: Vec<String> = vec!["Auto".into(), "Plan".into(), "Build".into()];
-    let out = agent_command_outcome("bogus", "Auto", &order);
+    let order: Vec<String> = vec!["Plan".into(), "Build".into()];
+    let out = agent_command_outcome("bogus", "Build", &order);
     match out {
         AgentCommandOutcome::Message(line) => {
             assert!(
                 line.contains("`bogus`"),
                 "names the bad value in backticks: {line}"
             );
-            assert!(
-                line.contains("Auto, Plan, Build"),
-                "lists valid choices: {line}"
-            );
+            assert!(line.contains("Plan, Build"), "lists valid choices: {line}");
         }
         other => panic!("a bogus name must not switch: {other:?}"),
     }
@@ -397,18 +369,18 @@ fn agent_command_outcome_errors_on_bogus_name_without_switching() {
 fn agent_command_outcome_rejects_subagent_names() {
     // A subagent is never in `order`, so `/agent builder` errors and does
     // not switch.
-    let order: Vec<String> = vec!["Auto".into(), "Plan".into(), "Build".into()];
-    let out = agent_command_outcome("builder", "Auto", &order);
+    let order: Vec<String> = vec!["Plan".into(), "Build".into()];
+    let out = agent_command_outcome("builder", "Build", &order);
     assert!(matches!(out, AgentCommandOutcome::Message(ref l) if l.contains("`builder`")));
 }
 
 #[test]
 fn agent_command_outcome_lists_and_marks_active_on_no_arg() {
-    let order: Vec<String> = vec!["Auto".into(), "Plan".into(), "Build".into()];
+    let order: Vec<String> = vec!["Plan".into(), "Build".into()];
     let out = agent_command_outcome("", "Plan", &order);
     match out {
         AgentCommandOutcome::Message(line) => {
-            assert_eq!(line, "Available primary agents: Auto, Plan (active), Build");
+            assert_eq!(line, "Available primary agents: Plan (active), Build");
         }
         other => panic!("bare /agent lists, does not switch: {other:?}"),
     }

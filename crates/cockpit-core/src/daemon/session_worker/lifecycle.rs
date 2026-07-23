@@ -246,22 +246,10 @@ pub(super) fn update_live_foreground(
 }
 
 /// The primary agent a new session starts on: the user's configured
-/// `defaultPrimaryAgent`, falling back to `Auto` (the conversational
-/// front-door router) when unset. The registry uses this when it
-/// constructs a fresh session row; the worker uses it for the approver's
-/// prompt-attribution agent. Lives here so the constants and
+/// `defaultPrimaryAgent`, defaulting to `Build` when unset. The registry uses
+/// this when it constructs a fresh session row; the worker uses it for the
+/// approver's prompt-attribution agent. Lives here so the constants and
 /// event-translation helpers stay in one module.
 pub(crate) fn initial_active_agent(cfg: &crate::config::extended::ExtendedConfig) -> &'static str {
-    let configured = cfg.default_primary_agent.agent_name();
-    // Experimental-mode gate (implementation note): with
-    // the flag off, a configured default that points at a gated builtin
-    // (`Auto`/`Swarm`/…) silently falls back to `Build`. Returning `&'static
-    // str` keeps the existing signature: both the configured names and the
-    // fallback are statics, so resolve to the canonical static rather than a
-    // heap string.
-    if !cfg.experimental_mode && crate::agents::is_experimental_primary(configured) {
-        crate::agents::FALLBACK_PRIMARY
-    } else {
-        configured
-    }
+    cfg.default_primary_agent.agent_name()
 }

@@ -73,7 +73,7 @@ impl WritePolicy {
     /// Direct harness writes are reserved for agents that already have a
     /// write-capable surface. Other agents must stay isolated.
     pub fn direct_allowed_for_agent(agent: &str) -> bool {
-        matches!(agent, "Build" | "Swarm" | "builder" | "bee")
+        matches!(agent, "Build" | "builder" | "bee")
     }
 
     /// Parse an explicit per-call override (`direct`/`isolated`), or
@@ -496,12 +496,12 @@ mod tests {
     #[test]
     fn write_policy_defaults_by_primary() {
         assert_eq!(WritePolicy::for_primary("Build"), WritePolicy::Direct);
-        assert_eq!(WritePolicy::for_primary("Swarm"), WritePolicy::Direct);
         assert_eq!(WritePolicy::for_primary("builder"), WritePolicy::Direct);
         assert_eq!(WritePolicy::for_primary("bee"), WritePolicy::Direct);
         assert_eq!(WritePolicy::for_primary("Plan"), WritePolicy::Isolated);
-        // Auto / custom → safer isolated default.
+        // Removed primaries / custom → safer isolated default.
         assert_eq!(WritePolicy::for_primary("Auto"), WritePolicy::Isolated);
+        assert_eq!(WritePolicy::for_primary("Swarm"), WritePolicy::Isolated);
         assert_eq!(WritePolicy::for_primary("Custom"), WritePolicy::Isolated);
     }
 

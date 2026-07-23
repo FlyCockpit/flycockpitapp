@@ -1,10 +1,10 @@
 use super::*;
 
 #[tokio::test]
-async fn auto_hands_off_to_build_on_clear_build_intent() {
-    let (mut driver, _t) = auto_rooted_driver();
+async fn plan_hands_off_to_build_on_clear_build_intent() {
+    let (mut driver, _t) = plan_rooted_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
-    assert_eq!(driver.active_agent(), "Auto", "starts on the front door");
+    assert_eq!(driver.active_agent(), "Plan", "starts on Plan");
 
     let next = driver
         .apply_handoff("Build", "call-1".to_string(), Some("fc-1".to_string()), &tx)
@@ -23,7 +23,7 @@ async fn auto_hands_off_to_build_on_clear_build_intent() {
 
 #[tokio::test]
 async fn failed_handoff_does_not_persist_target_agent() {
-    let (mut driver, _t) = auto_rooted_driver();
+    let (mut driver, _t) = plan_rooted_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
 
     driver
@@ -35,8 +35,8 @@ async fn failed_handoff_does_not_persist_target_agent() {
         )
         .await;
 
-    assert_eq!(driver.active_agent(), "Auto");
-    assert_eq!(persisted_active_agent(&driver), "Auto");
+    assert_eq!(driver.active_agent(), "Plan");
+    assert_eq!(persisted_active_agent(&driver), "Plan");
 }
 
 /// Part 1 (implementation note): the swapped-in
@@ -46,7 +46,7 @@ async fn failed_handoff_does_not_persist_target_agent() {
 /// narrate.
 #[tokio::test]
 async fn handoff_kickoff_restates_user_request_and_commands_action() {
-    let (mut driver, _t) = auto_rooted_driver();
+    let (mut driver, _t) = plan_rooted_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     // The originating user request that triggered the handoff.
     let request = "Add a confirm-on-quit toggle to /settings";
@@ -76,7 +76,7 @@ async fn handoff_kickoff_restates_user_request_and_commands_action() {
 /// preceded the handoff — not the whole transcript.
 #[tokio::test]
 async fn handoff_kickoff_restates_only_the_salient_request() {
-    let (mut driver, _t) = auto_rooted_driver();
+    let (mut driver, _t) = plan_rooted_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     push_user_turn(&mut driver, "What does the config loader do?");
     // An intervening agent reply closes that turn so the next user message
@@ -104,8 +104,8 @@ async fn handoff_kickoff_restates_only_the_salient_request() {
 
 /// Companion to the above: a clear planning request routes to `Plan`.
 #[tokio::test]
-async fn auto_hands_off_to_plan_on_clear_plan_intent() {
-    let (mut driver, _t) = auto_rooted_driver();
+async fn build_hands_off_to_plan_on_clear_plan_intent() {
+    let (mut driver, _t) = test_driver(1);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
 
     driver
@@ -132,10 +132,10 @@ async fn swap_command_injects_one_marker_at_boundary_on_next_message() {
         .push(Message::assistant("It arbitrates writers."));
     assert_eq!(driver.active_agent(), "Build");
 
-    // Swap to `Swarm` (B) via the slash-command path. No marker yet —
+    // Swap to `Plan` (B) via the slash-command path. No marker yet —
     // injection is deferred to the next message.
-    driver.swap_primary("Swarm", &tx).await;
-    assert_eq!(driver.active_agent(), "Swarm");
+    driver.swap_primary("Plan", &tx).await;
+    assert_eq!(driver.active_agent(), "Plan");
     assert!(
         swap_markers(&driver).is_empty(),
         "marker is deferred, not written at swap time"
@@ -149,7 +149,7 @@ async fn swap_command_injects_one_marker_at_boundary_on_next_message() {
     let markers = swap_markers(&driver);
     assert_eq!(markers.len(), 1, "exactly one marker: {markers:?}");
     assert!(
-        markers[0].contains("`Build` → `Swarm`") && markers[0].contains("You are now `Swarm`"),
+        markers[0].contains("`Build` → `Plan`") && markers[0].contains("You are now `Plan`"),
         "marker names A→B and the new identity: {:?}",
         markers[0]
     );
@@ -175,7 +175,7 @@ async fn swap_command_injects_one_marker_at_boundary_on_next_message() {
 }
 
 /// Coalesce (implementation note): several swaps before
-/// a message (`Build`→`Swarm`→`Plan`→`Build` … then `Plan`) emit exactly
+/// a message (`Build`→`Plan`→`Build` … then `Plan`) emit exactly
 /// ONE marker naming previously-effective → final. The intermediate hops
 /// produce nothing; `from` stays the agent whose turns are in history.
 #[tokio::test]
@@ -187,8 +187,8 @@ async fn multiple_swaps_before_message_coalesce_to_one_marker() {
         .history
         .push(Message::assistant("here is an outline"));
 
-    // Build → Swarm → Plan, all before a message.
-    driver.swap_primary("Swarm", &tx).await;
+    // Build → Plan → Build → Plan, all before a message.
+    driver.swap_primary("Plan", &tx).await;
     driver.swap_primary("Build", &tx).await;
     driver.swap_primary("Plan", &tx).await;
     assert_eq!(driver.active_agent(), "Plan");
@@ -205,7 +205,7 @@ async fn multiple_swaps_before_message_coalesce_to_one_marker() {
 }
 
 /// Net no-op (implementation note): when the final
-/// agent equals the previously-effective one (`Build`→`Swarm`→`Build`
+/// agent equals the previously-effective one (`Build`→`Plan`→`Build`
 /// while history was already `Build`), nothing is injected — and the
 /// pending state is still cleared.
 #[tokio::test]
@@ -215,7 +215,7 @@ async fn swap_back_to_original_agent_injects_no_marker() {
     push_user_turn(&mut driver, "think about it");
     driver.stack[0].history.push(Message::assistant("thinking"));
 
-    driver.swap_primary("Swarm", &tx).await;
+    driver.swap_primary("Plan", &tx).await;
     driver.swap_primary("Build", &tx).await; // back to the original
     assert_eq!(driver.active_agent(), "Build");
 
@@ -243,7 +243,7 @@ async fn swap_marker_does_not_leak_into_user_transcript() {
     push_user_turn(&mut driver, "do the thing");
     driver.stack[0].history.push(Message::assistant("ok"));
 
-    driver.swap_primary("Swarm", &tx).await;
+    driver.swap_primary("Plan", &tx).await;
     driver.inject_pending_swap_marker();
 
     // The marker is on the wire.
@@ -269,7 +269,7 @@ async fn swap_marker_does_not_leak_into_user_transcript() {
     let mut saw_swapped = false;
     while let Ok(ev) = rx.try_recv() {
         if let TurnEvent::PrimarySwapped { name } = &ev {
-            assert_eq!(name, "Swarm");
+            assert_eq!(name, "Plan");
             saw_swapped = true;
         }
         // No event should ever carry the marker text.
@@ -330,12 +330,12 @@ fn stale_skill_pairs_drop_when_call_and_result_leave_root_history() {
         ));
     driver.skill_pairs.push(SkillPair {
         call_id: "skill-live".to_string(),
-        owner: "Auto".to_string(),
+        owner: "Build".to_string(),
         intentional_steer: false,
     });
     driver.skill_pairs.push(SkillPair {
         call_id: "skill-stale".to_string(),
-        owner: "Auto".to_string(),
+        owner: "Build".to_string(),
         intentional_steer: false,
     });
 
@@ -469,7 +469,7 @@ fn stale_owner_cleanup_bounds_repeated_removed_calls() {
             .insert(format!("gone-{i}"), "Build".to_string());
         driver.skill_pairs.push(SkillPair {
             call_id: format!("skill-gone-{i}"),
-            owner: "Auto".to_string(),
+            owner: "Build".to_string(),
             intentional_steer: false,
         });
     }
@@ -566,12 +566,10 @@ async fn absent_tool_calls_annotated_naming_the_maker_present_tools_untouched() 
     assert_eq!(w2, w, "re-evaluation does not double-annotate");
 }
 
-/// Per-call ownership across several swaps
-/// (implementation note): a write call made under
-/// `Build`, then a swap to `Swarm` (also write-capable) that makes its own
-/// write call, then a swap to `Plan` (read-only). On the next message each
-/// write call is attributed to the agent that ACTUALLY made it — "the
-/// previous agent" is not enough.
+/// Per-call ownership across a swap (implementation note): write calls made
+/// under `Build`, then a swap to `Plan` (read-only). On the next message each
+/// write call is attributed to the agent that ACTUALLY made it — "the previous
+/// agent" is not enough.
 #[tokio::test]
 async fn annotation_attributes_each_call_to_its_actual_maker() {
     let (mut driver, _t) = test_driver(1);
@@ -590,8 +588,7 @@ async fn annotation_attributes_each_call_to_its_actual_maker() {
             "build-write",
         ));
 
-    // Swap to `Swarm` (still write-capable) which makes its own write call.
-    driver.swap_primary("Swarm", &tx).await;
+    // A second write call is still attributed to Build before the read-only swap.
     driver.stack[0]
         .history
         .push(tool_call_turn("s1", "writeunlock"));
@@ -600,7 +597,7 @@ async fn annotation_attributes_each_call_to_its_actual_maker() {
         .push(Message::tool_result_with_call_id(
             "s1".to_string(),
             None,
-            "swarm-write",
+            "build-write-2",
         ));
 
     // Swap to `Plan` (read-only) and annotate at the next message.
@@ -614,13 +611,13 @@ async fn annotation_attributes_each_call_to_its_actual_maker() {
     );
     let s = tool_result_text_for(&driver, "s1");
     assert!(
-        s.contains("[Called by `Swarm`, which had the `writeunlock` tool."),
-        "the second write call is attributed to `Swarm`, not `Build`: {s:?}"
+        s.contains("[Called by `Build`, which had the `writeunlock` tool."),
+        "the second write call is attributed to `Build`: {s:?}"
     );
 }
 
 #[tokio::test]
-async fn primary_swap_transfers_locks_between_write_capable_agents() {
+async fn roster_trim_swap_to_removed_swarm_keeps_locks_with_build() {
     let (mut driver, _t) = test_driver(1);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     reroot_real(&mut driver, "Build");
@@ -633,16 +630,16 @@ async fn primary_swap_transfers_locks_between_write_capable_agents() {
 
     driver.swap_primary("Swarm", &tx).await;
 
-    assert_eq!(driver.active_agent(), "Swarm");
+    assert_eq!(driver.active_agent(), "Build");
     assert_eq!(
         driver.locks.holder(&path).map(|(_, a)| a).as_deref(),
-        Some("Swarm")
+        Some("Build")
     );
     driver
         .locks
-        .check_write_permitted(&path, "Swarm", driver.session.id)
+        .check_write_permitted(&path, "Build", driver.session.id)
         .unwrap();
-    assert!(!driver.locks.has_read(&path, "Build", driver.session.id));
+    assert!(driver.locks.has_read(&path, "Build", driver.session.id));
 }
 
 #[tokio::test]
@@ -698,7 +695,7 @@ async fn read_only_agent_cannot_reissue_annotated_write_tool() {
 /// Part 2 (implementation note, the `myj42m`
 /// shape): an abandoned skill pair injected under the outgoing primary
 /// must not remain as authoritative instructions for the new primary after
-/// a swap. After `Auto` seeds a user-invoked skill and then hands off, the
+/// a swap. After `Plan` seeds a user-invoked skill and then hands off, the
 /// skill's call + result are stripped from the root history (both halves,
 /// together) so `Build` follows its own role.
 #[tokio::test]
@@ -706,7 +703,7 @@ async fn abandoned_skill_pair_is_stripped_on_handoff_swap() {
     use crate::engine::message::AssistantContent;
     use rig::message::UserContent;
 
-    let (mut driver, _t) = auto_rooted_driver();
+    let (mut driver, _t) = plan_rooted_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     // The user invoked a skill then described a change. The skill
     // name need not exist on disk — the seam still folds a real pair into
@@ -716,7 +713,7 @@ async fn abandoned_skill_pair_is_stripped_on_handoff_swap() {
         .await;
     push_user_turn(&mut driver, "Add a confirm-on-quit toggle to /settings");
 
-    // The pair is present and owned by the outgoing primary (`Auto`).
+    // The pair is present and owned by the outgoing primary (`Plan`).
     let skill_call_present = |d: &Driver| {
         d.stack[0].history.iter().any(|m| {
             matches!(m,
@@ -771,7 +768,7 @@ async fn abandoned_skill_pair_is_stripped_on_handoff_swap() {
 /// today; this guards the seam.)
 #[tokio::test]
 async fn intentional_steer_skill_pair_survives_swap() {
-    let (mut driver, _t) = auto_rooted_driver();
+    let (mut driver, _t) = plan_rooted_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     driver
         .seed_forced_skill("definitely-not-a-real-skill-xyz", &tx)
@@ -821,15 +818,15 @@ fn delegated_subagent_first_turn_is_the_actionable_brief() {
 }
 
 #[tokio::test]
-async fn ambiguous_turn_keeps_auto_active() {
-    let (driver, _t) = auto_rooted_driver();
+async fn ambiguous_turn_keeps_plan_active() {
+    let (driver, _t) = plan_rooted_driver();
     // No `apply_handoff` call (the model emitted no `handoff` tool call).
     assert_eq!(
         driver.active_agent(),
-        "Auto",
-        "ambiguous intent keeps the front door — no unsolicited swap"
+        "Plan",
+        "ambiguous intent keeps the active primary — no unsolicited swap"
     );
-    assert_eq!(persisted_active_agent(&driver), "Auto");
+    assert_eq!(persisted_active_agent(&driver), "Plan");
 }
 
 /// Resume rehydration is automatic but applies ONLY when the root frame

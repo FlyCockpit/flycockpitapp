@@ -21,8 +21,7 @@
 //! Validation lives with the mutation: numeric/text edits parse + clamp (or
 //! reject with an inline reason) before anything is persisted. Enum cycles
 //! drive their option set from the config enum's own `cycled()`, never a
-//! hardcoded list, so a grown cast (e.g. a `Swarm` primary) is reflected
-//! automatically.
+//! hardcoded list, so roster changes are reflected automatically.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -128,9 +127,6 @@ fn concurrency_label(c: Concurrency) -> &'static str {
 
 fn default_primary_agent_label(a: DefaultPrimaryAgent) -> &'static str {
     match a {
-        DefaultPrimaryAgent::Auto => {
-            "auto (default — front-door router; converses, hands off to Plan/Build)"
-        }
         DefaultPrimaryAgent::Build => "build (start on the coding agent — make the change now)",
         DefaultPrimaryAgent::Plan => "plan (start on the planning agent — author a plan)",
     }
@@ -359,7 +355,6 @@ pub(super) enum SettingId {
     ExitTailLines,
 
     // ── Behavior ─────────────────────────────────────────────────────
-    ExperimentalMode,
     DefaultPrimaryAgent,
     LlmMode,
     ApprovalMode,
@@ -455,7 +450,6 @@ const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::AttentionBell,
     SettingId::AttentionDesktop,
     SettingId::ExitTailLines,
-    SettingId::ExperimentalMode,
     SettingId::DefaultPrimaryAgent,
     SettingId::LlmMode,
     SettingId::ApprovalMode,
@@ -553,7 +547,6 @@ impl SettingId {
             SettingId::AttentionBell => "attention bell",
             SettingId::AttentionDesktop => "attention desktop",
             SettingId::ExitTailLines => "exit tail lines",
-            SettingId::ExperimentalMode => "experimental mode",
             SettingId::DefaultPrimaryAgent => "default agent",
             SettingId::LlmMode => "llm mode",
             SettingId::ApprovalMode => "approval mode",
@@ -727,18 +720,10 @@ impl SettingId {
                  visible. Default 100; `0` dumps nothing; `-1` dumps the whole \
                  session."
             }
-            SettingId::ExperimentalMode => {
-                "Enable not-yet-stable features and agents (Auto, Swarm). \
-                 Off by default. While off, those agents are hidden \
-                 from the cycle, /agent list, and slash swaps, and a new session \
-                 starts on Build."
-            }
             SettingId::DefaultPrimaryAgent => {
-                "Which agent a brand-new session starts on. `auto` (default) is the \
-                 conversational front door that answers questions directly and \
-                 hands off to Plan/Build once your intent is clear; pick `build` to \
-                 start straight on the coding agent or `plan` to start authoring a \
-                 plan. You can still switch any time with /build, /plan, /swarm."
+                "Which agent a brand-new session starts on. `build` starts on the \
+                 coding agent; `plan` starts on the planning agent. You can still \
+                 switch any time with /build or /plan."
             }
             SettingId::LlmMode => {
                 "How hard tools and prompts steer the model. `defensive` (default) \
@@ -854,7 +839,7 @@ impl SettingId {
                  honored; when off (default), role defaults apply."
             }
             SettingId::DeepthinkEnabled => {
-                "When on, Build/Swarm may delegate to `deepthink`, a tool-free \
+                "When on, Build may delegate to `deepthink`, a tool-free \
                  reasoning leaf that receives only its brief and explicit seeds. \
                  It is off by default because it is meant for strong reasoning \
                  models and may route prompts to remote providers."
@@ -929,13 +914,13 @@ impl SettingId {
                  be at least 1."
             }
             SettingId::SwarmMaxDepth => {
-                "Hard ceiling on how deep the Swarm agent may recursively \
-                 self-delegate (Swarm spawning Swarm; the root is depth 0). \
+                "Hard ceiling on recursive `spawn` fan-out depth (the root is \
+                 depth 0). \
                  A spawn past the ceiling is refused and that branch does the work \
                  itself. Default 3."
             }
             SettingId::SwarmMaxConcurrency => {
-                "Global cap on Swarm subagents running at once across the whole \
+                "Global cap on recursive `spawn` subagents running at once across the whole \
                  tree (not per level). Spawns beyond it queue and start as slots \
                  free. `0` means unlimited. Default 8."
             }
@@ -1550,7 +1535,6 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::ExitTailLines),
         ],
         Category::Behavior => vec![
-            Setting(S::ExperimentalMode),
             Setting(S::DefaultPrimaryAgent),
             Setting(S::LlmMode),
             Setting(S::ApprovalMode),
@@ -1723,11 +1707,6 @@ impl SettingsCx {
                 "{} (lines of tail dumped to scrollback on exit; 0 none, -1 all)",
                 e.tui.exit_tail_lines
             ),
-            S::ExperimentalMode => on_off(
-                e.experimental_mode,
-                "on (Auto and Swarm available)",
-                "off (default — Auto and Swarm hidden)",
-            ),
             S::DefaultPrimaryAgent => {
                 default_primary_agent_label(e.default_primary_agent).to_string()
             }
@@ -1836,10 +1815,13 @@ impl SettingsCx {
                 e.delegation.max_parallel
             ),
             S::SwarmMaxDepth => {
-                format!("{} (Swarm recursion ceiling; default 3)", e.swarm.max_depth)
+                format!(
+                    "{} (recursive spawn depth ceiling; default 3)",
+                    e.swarm.max_depth
+                )
             }
             S::SwarmMaxConcurrency => format!(
-                "{} (global Swarm subagent cap; 0 = unlimited)",
+                "{} (global recursive spawn cap; 0 = unlimited)",
                 e.swarm.max_concurrency
             ),
             S::DialogLockoutMs => format!(
@@ -2427,30 +2409,8 @@ impl SettingsCx {
             S::AttentionTitle => e.tui.attention.title = !e.tui.attention.title,
             S::AttentionBell => e.tui.attention.bell = !e.tui.attention.bell,
             S::AttentionDesktop => e.tui.attention.desktop = !e.tui.attention.desktop,
-            S::ExperimentalMode => {
-                e.experimental_mode = !e.experimental_mode;
-                // Turning experimental off rewrites only values that are still
-                // gated, so `Plan` remains a valid default while `Auto` falls
-                // back to `Build`.
-                if !e.experimental_mode
-                    && cockpit_core::agents::is_experimental_primary(
-                        e.default_primary_agent.agent_name(),
-                    )
-                {
-                    e.default_primary_agent = DefaultPrimaryAgent::Build;
-                }
-            }
             S::DefaultPrimaryAgent => {
-                // Cycle only among ENABLED values. With experimental off the
-                // `Auto→Build→Plan` enum cycle skips any value still gated
-                // (`Auto` today); with it on, all enum values are reachable.
-                let mut next = e.default_primary_agent.cycled();
-                if !e.experimental_mode {
-                    while cockpit_core::agents::is_experimental_primary(next.agent_name()) {
-                        next = next.cycled();
-                    }
-                }
-                e.default_primary_agent = next;
+                e.default_primary_agent = e.default_primary_agent.cycled();
             }
             S::LlmMode => e.llm_mode = e.llm_mode.cycled(),
             S::ApprovalMode => e.default_approval_mode = e.default_approval_mode.cycled(),
@@ -3029,7 +2989,6 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::SandboxEscalationEnabled => &["sandbox_escalation_enabled"],
         S::SandboxDefaultMode => &["sandbox", "defaultMode"],
         S::SandboxDockerfile => &["sandbox", "dockerfile"],
-        S::ExperimentalMode => &["experimentalMode"],
         S::DefaultPrimaryAgent => &["defaultPrimaryAgent"],
         S::PredictNextMessage => &["predictNextMessage"],
         S::ShellCompression => &["shellCompression"],

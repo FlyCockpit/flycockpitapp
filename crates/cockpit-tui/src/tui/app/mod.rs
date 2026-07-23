@@ -1080,13 +1080,6 @@ const REDACT_OPT_ENV: &str = "redact_env";
 const REDACT_OPT_FILE: &str = "redact_file";
 const REDACT_OPT_SSH: &str = "redact_ssh";
 
-/// Token-burn caution shown on every entry into the `Swarm` primary
-/// (GOALS §24 / §26). Warning only — no budget cap, no spend meter; the user
-/// interrupts. Lives on the shared [`App::swap_primary_agent`] path so every
-/// route onto `Swarm` (`/swarm`, `/agent Swarm`, the `Shift+Tab`
-/// cycle) fires the identical text exactly once.
-const SWARM_TOKEN_BURN_WARNING: &str = "Heads up: Swarm mode can spawn parallel recursive subagents and burn a LOT of tokens. \
-     There is no budget cap — interrupt (esc) if a fan-out runs away.";
 const MULTIREVIEW_TOKEN_BURN_WARNING: &str = "Heads up: `/multireview` can run many models and harnesses at once and burn a LOT of tokens. \
      There is no budget cap — interrupt (esc) if review fan-out runs away.";
 
@@ -1151,14 +1144,9 @@ fn failed_dispatch_line(prefix: &str, outcome: DispatchOutcome) -> String {
     }
 }
 
-/// The caution line (if any) that heads the confirmation when swapping the
-/// primary to `name`. Returns the [`SWARM_TOKEN_BURN_WARNING`] for
-/// `Swarm` and nothing for every other primary — so the warning fires on
-/// every route onto `Swarm` (`/swarm`, `/agent Swarm`, the
-/// `Shift+Tab` cycle) and never spams the others. Pure so the keying is
-/// unit-testable without an `App`.
 fn primary_swap_warning(name: &str) -> Option<&'static str> {
-    (name == "Swarm").then_some(SWARM_TOKEN_BURN_WARNING)
+    let _ = name;
+    None
 }
 
 /// Compose the persistent sandbox-down notice (`implementation notes` §6.5) from

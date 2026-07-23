@@ -209,9 +209,8 @@ async fn control_request_ack_reports_applied() {
 }
 
 #[tokio::test]
-async fn plan_default_available_everywhere_when_experimental_off_tui_plan_swap() {
+async fn plan_default_available_everywhere_tui_plan_swap() {
     let mut app = app();
-    assert!(!app.config_snapshot.extended.experimental_mode);
     let (record_tx, _record_rx) = mpsc::channel(1);
     let (control_tx, mut control_rx) = mpsc::channel(1);
     install_runner(&mut app, record_tx, control_tx);
@@ -230,20 +229,23 @@ async fn plan_default_available_everywhere_when_experimental_off_tui_plan_swap()
 }
 
 #[tokio::test]
-async fn plan_default_swarm_swap_still_requires_experimental_mode() {
+async fn roster_trim_swarm_swap_is_sent_to_daemon_validation() {
     let mut app = app();
-    assert!(!app.config_snapshot.extended.experimental_mode);
     let (record_tx, _record_rx) = mpsc::channel(1);
     let (control_tx, mut control_rx) = mpsc::channel(1);
     install_runner(&mut app, record_tx, control_tx);
 
     app.swap_primary_agent("Swarm");
 
-    assert!(control_rx.try_recv().is_err());
-    assert_eq!(
-        history_lines(&app),
-        vec!["`Swarm` requires experimental mode — enable it in `/settings`."]
-    );
+    let control = control_rx
+        .recv()
+        .await
+        .expect("Swarm is no longer blocked by a local experimental gate");
+    match control.request {
+        Request::SetAgent { name } => assert_eq!(name, "Swarm"),
+        other => panic!("expected SetAgent request, got {other:?}"),
+    }
+    assert!(history_lines(&app).is_empty());
 }
 
 #[tokio::test]

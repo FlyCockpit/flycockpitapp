@@ -25,7 +25,7 @@ fn write_fixture_tree(root: &Path) {
     std::fs::create_dir_all(&cockpit).unwrap();
     std::fs::write(
         cockpit.join("config.json"),
-        r#"{"llm_mode":"normal","experimentalMode":true,"dialog":{"lockout_ms":2500},"tui":{"use_emojis":false}}"#,
+        r#"{"llm_mode":"normal","dialog":{"lockout_ms":2500},"tui":{"use_emojis":false}}"#,
     )
     .unwrap();
     let provider_path =
@@ -45,8 +45,6 @@ const FIXTURE_GLOBAL_LLM_MODE: LlmMode = LlmMode::Normal;
 const FIXTURE_DIALOG_LOCKOUT_MS: u64 = 2500;
 /// `load_for_cwd(cwd).tui.use_emojis`
 const FIXTURE_USE_EMOJIS: bool = false;
-/// `load_for_cwd(cwd).experimental_mode`
-const FIXTURE_EXPERIMENTAL_MODE: bool = true;
 /// `ordered_model_choices(cwd, &counts)` → `(provider_id, model_id, is_favorite, mode)`
 fn fixture_model_ordering() -> Vec<(String, String, bool, LlmMode)> {
     vec![
@@ -152,11 +150,6 @@ fn config_snapshot_values_match_previous_resolution() {
         app.config_snapshot.extended.tui.use_emojis,
         FIXTURE_USE_EMOJIS
     );
-    assert_eq!(
-        app.config_snapshot.extended.experimental_mode,
-        FIXTURE_EXPERIMENTAL_MODE
-    );
-
     // Model-picker ordering: the global LLM mode is now threaded from the held
     // snapshot (the provider list read is owned by `tui-inventory-from-daemon`).
     let choices = crate::tui::model_picker::ordered_model_choices(

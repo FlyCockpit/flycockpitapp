@@ -170,10 +170,7 @@ fn build_launch_info(
         .filter(|name| !name.is_empty())
         .map(ToString::to_string);
     let banner_enabled = extended.tui.banner.enabled;
-    let agent_name = crate::agents::resolve_primary_for_flag(
-        extended.default_primary_agent.agent_name(),
-        extended.experimental_mode,
-    );
+    let agent_name = extended.default_primary_agent.agent_name().to_string();
 
     LaunchInfo {
         version: env!("CARGO_PKG_VERSION"),

@@ -82,8 +82,6 @@ pub fn configured_recursion_context(
 // [`builtin_prompt_for`] selects between them; an agent lacking the frontier
 // file falls back to normal, and one lacking normal falls back to the flat
 // body, so the flat-fallback contract holds belt-and-suspenders.
-pub(crate) const AUTO_PROMPT: &str = include_str!("auto.md");
-pub(crate) const AUTO_PROMPT_NORMAL: &str = include_str!("auto.normal.md");
 pub(crate) const BUILD_PROMPT: &str = include_str!("build.md");
 pub(crate) const BUILD_PROMPT_NORMAL: &str = include_str!("build.normal.md");
 pub(crate) const BUILD_PROMPT_FRONTIER: &str = include_str!("build.frontier.md");
@@ -98,9 +96,6 @@ pub(crate) const SCOUT_PROMPT: &str = include_str!("scout.md");
 pub(crate) const SCOUT_PROMPT_NORMAL: &str = include_str!("scout.normal.md");
 pub(crate) const PLAN_PROMPT: &str = include_str!("plan.md");
 pub(crate) const PLAN_PROMPT_NORMAL: &str = include_str!("plan.normal.md");
-pub(crate) const SWARM_PROMPT: &str = include_str!("swarm.md");
-pub(crate) const SWARM_PROMPT_NORMAL: &str = include_str!("swarm.normal.md");
-pub(crate) const SWARM_PROMPT_FRONTIER: &str = include_str!("swarm.frontier.md");
 pub(crate) const MULTIREVIEW_PROMPT: &str = include_str!("multireview.md");
 pub(crate) const MULTIREVIEW_PROMPT_NORMAL: &str = include_str!("multireview.normal.md");
 // `bee` — `Swarm`'s recursive parallel worker (GOALS §24/§26).
@@ -1262,7 +1257,7 @@ fn disabled_tier_names(def: &crate::agents::AgentDef) -> std::collections::BTree
 
 pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static str] {
     match name {
-        "Build" | "builder" | "Plan" | "Swarm" => &[
+        "Build" | "builder" | "Plan" => &[
             "word",
             "hot",
             "circular",
@@ -1275,7 +1270,7 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "goal",
             "lsp",
         ],
-        "Auto" | "Multireview" => &[
+        "Multireview" => &[
             "harness_list",
             "harness_invoke",
             "session_search",
@@ -1289,8 +1284,9 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
 
 fn default_disabled_tools_for(name: &str) -> &'static [&'static str] {
     match name {
-        "Build" | "builder" | "Plan" | "Swarm" | "bee" | "scout" | "explore" | "Auto"
-        | "Multireview" => &["skill_manage"],
+        "Build" | "builder" | "Plan" | "bee" | "scout" | "explore" | "Multireview" => {
+            &["skill_manage"]
+        }
         _ => &[],
     }
 }
@@ -1541,7 +1537,7 @@ fn with_return_tool(tb: ToolBox, name: &str) -> ToolBox {
 /// to exclude primaries from the delegated-subagent `return` tool: a primary is
 /// never delegated to and finishes via `Done`/`handoff`.
 fn is_primary(name: &str) -> bool {
-    matches!(name, "Auto" | "Build" | "Plan" | "Swarm" | "Multireview")
+    matches!(name, "Build" | "Plan" | "Multireview")
 }
 
 /// Register the `seed` tool (GOALS §3c) on `tb` when this is a read-only
@@ -1927,52 +1923,6 @@ fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Resul
     }
 }
 
-/// `Auto` — the default front-door primary. Converses, answers plain
-/// questions directly, and hands off to `Plan`/`Build` via the structural
-/// `handoff` tool once the user's intent is clear (the spec's router).
-/// Holds no write/lock or delegation tools — the chosen primary owns the
-/// work after the swap.
-pub fn auto(args: &SpawnArgs) -> Agent {
-    let tools = with_recall_tools(
-        with_custom_tools(
-            ToolBox::new()
-                .with(Arc::new(crate::tools::read::ReadTool))
-                .with(Arc::new(crate::tools::bash::BashTool::new()))
-                // `search` (GOALS §21): a light, budgeted structured search so
-                // the router can answer a quick "where is X" without delegating.
-                .with(Arc::new(crate::tools::intel::SearchTool))
-                // `question` (GOALS §3b): blocks the turn until the user
-                // disambiguates — the router's clarifying-exchange path.
-                .with(Arc::new(crate::tools::skill::SkillTool))
-                .with(Arc::new(crate::tools::question::QuestionTool))
-                // `handoff` (structural): the engine routes the chosen
-                // target to the driver's single primary-swap authority.
-                .with(Arc::new(crate::tools::handoff::HandoffTool))
-                // MCP (GOALS §18a): `mcp` runs the Monty Python sandbox.
-                .with(Arc::new(crate::tools::mcp_tool::McpTool)),
-            &args.config,
-            &args.cwd,
-            &std::collections::BTreeSet::new(),
-        ),
-        args,
-    );
-
-    let role = builtin_prompt_for(AUTO_PROMPT, Some(AUTO_PROMPT_NORMAL), None, args.llm_mode);
-    Agent {
-        name: "Auto".to_string(),
-        system: compose_system_prompt_for_effective_model(role, args),
-        role_prompt: role.to_string(),
-        tools,
-        model: args.effective_model(),
-        params: args.params.clone(),
-        scan_tool_results: true,
-        llm_mode: args.llm_mode,
-        delegated: args.delegated,
-        delegation_recursion: args.delegation_recursion.clone(),
-        env_overlay: args.env_overlay.clone(),
-    }
-}
-
 /// `Build` — the user-facing, **write-capable** primary agent. Owns the chat
 /// when the focus is *making the change* (GOALS §3a). It can write directly
 /// (it holds the lock/write tools, arbitrated by the single lock authority),
@@ -2254,77 +2204,6 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         tools,
         model: args.effective_model(),
         params: args.params.clone(),
-        scan_tool_results: true,
-        llm_mode: args.llm_mode,
-        delegated: args.delegated,
-        delegation_recursion: args.delegation_recursion.clone(),
-        env_overlay: args.env_overlay.clone(),
-    }
-}
-
-/// `Swarm` — the interactive, **write-capable** recursive fan-out primary
-/// (GOALS §24/§26). Its surface is `Build`'s entire surface (read/bash/full
-/// intel/schedule/question/skill/task/MCP/web + the lock/write tools) plus
-/// the extra `spawn` tool, which recursively fans out parallel background
-/// `bee` workers. This is the **sole** documented exception to leaf-
-/// termination: `Swarm`/`bee` may fan out `bee`, but still not
-/// `Plan`/`Build`/etc. The recursive-spawn description carries the per-task
-/// effective depth (`args.swarm_depth`) and the ceiling so the model can
-/// self-limit. A spawn over the ceiling is refused by the driver and the
-/// branch does the work itself (clamp, don't crash). Intent: general parallel
-/// fan-out for any wide task, not just research.
-pub fn swarm(args: &SpawnArgs) -> Agent {
-    let subs = build_subagents(&args.config, &args.cwd);
-    let sub_refs: Vec<&str> = subs.iter().map(String::as_str).collect();
-    let base_tools = with_write_tools(with_full_intel(
-        ToolBox::new()
-            .with(Arc::new(crate::tools::read::ReadTool))
-            .with(Arc::new(crate::tools::bash::BashTool::new())),
-    ))
-    .with(Arc::new(crate::tools::schedule::ScheduleTool))
-    .with(Arc::new(crate::tools::question::QuestionTool))
-    .with(Arc::new(crate::tools::skill::SkillTool))
-    // Swarm is itself write-capable, so `/learn` can persist through the
-    // same guarded skill mutation service without an impossible handoff.
-    .with(Arc::new(crate::tools::skill_manage::SkillManageTool))
-    .with(Arc::new(crate::tools::harness::HarnessListTool))
-    .with(Arc::new(crate::tools::harness::HarnessInvokeTool))
-    // MCP (GOALS §18a): Monty Python sandbox.
-    .with(Arc::new(crate::tools::mcp_tool::McpTool));
-    let tools = with_recall_tools(
-        with_custom_tools(
-            with_task_for_targets(base_tools, args, &sub_refs)
-                // The recursive fan-out tool (GOALS §24). Structural:
-                // intercepted by the engine and routed to the driver's single
-                // async-job authority, which enforces depth + global
-                // concurrency. The description bakes in the per-task depth so
-                // the model self-limits. Only `Swarm`/`bee` hold it.
-                .with(Arc::new(crate::tools::spawn::SpawnTool::for_depth(
-                    args.swarm_depth,
-                    args.swarm_max_depth,
-                ))),
-            &args.config,
-            &args.cwd,
-            &std::collections::BTreeSet::new(),
-        ),
-        args,
-    );
-
-    let role = builtin_prompt_for(
-        SWARM_PROMPT,
-        Some(SWARM_PROMPT_NORMAL),
-        Some(SWARM_PROMPT_FRONTIER),
-        args.llm_mode,
-    );
-    let model = args.effective_model();
-    let params = params_with_direct_computer(args, &model);
-    Agent {
-        name: "Swarm".to_string(),
-        system: compose_system_prompt_for_effective_model(role, args),
-        role_prompt: role.to_string(),
-        tools,
-        model,
-        params,
         scan_tool_results: true,
         llm_mode: args.llm_mode,
         delegated: args.delegated,
@@ -2643,7 +2522,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
 
-        for name in ["bee", "scout", "deepthink", "Auto", "Build", "Plan"] {
+        for name in ["bee", "scout", "deepthink", "Build", "Plan"] {
             let agent = load(name, &args).unwrap();
             assert!(
                 !agent.tools.names().contains(&"defer_to_orchestrator"),
@@ -2829,7 +2708,7 @@ mod tests {
     #[test]
     fn tool_tier_structural_tools_including_defer_to_orchestrator_are_absent_from_monty_registry() {
         let tmp = tempfile::tempdir().unwrap();
-        let agent = swarm(&test_spawn_args(tmp.path()));
+        let agent = build(&test_spawn_args(tmp.path()));
         let host = host_for_agent(&agent, tmp.path());
         for tool in [
             "question",
@@ -3911,39 +3790,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_factory_routes_no_writes_no_delegation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let agent = auto(&test_spawn_args(tmp.path()));
-        assert_eq!(agent.name, "Auto");
-        let names = agent.tools.names();
-        // The front-door router converses + hands off.
-        for t in ["handoff", "question", "read", "bash"] {
-            assert!(names.contains(&t), "Auto missing `{t}`: {names:?}");
-        }
-        // It owns no write/lock and no code-writing delegation — the
-        // swapped-in primary does the work.
-        for t in ["readlock", "writeunlock", "editunlock", "unlock", "task"] {
-            assert!(!names.contains(&t), "Auto must not hold `{t}`");
-        }
-    }
-
-    #[test]
-    fn load_dispatches_auto() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(
-            load("Auto", &test_spawn_args(tmp.path())).unwrap().name,
-            "Auto"
-        );
-    }
-
-    #[test]
-    fn auto_is_noninteractive_default() {
-        // `Auto` is a primary, never delegated to via `task`; it isn't in
-        // the interactive-handoff set, so it defaults to noninteractive.
-        assert!(is_noninteractive("Auto"));
-    }
-
-    #[test]
     fn explore_is_read_only_noninteractive_others_are_not() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
@@ -4001,45 +3847,50 @@ mod tests {
         // A single-mode agent resolves to the flat defensive body in every
         // mode — the belt-and-suspenders fallback.
         assert_eq!(
-            builtin_prompt_for(AUTO_PROMPT, None, None, LlmMode::Normal),
-            AUTO_PROMPT
+            builtin_prompt_for(DEEPTHINK_PROMPT, None, None, LlmMode::Normal),
+            DEEPTHINK_PROMPT
         );
         assert_eq!(
-            builtin_prompt_for(AUTO_PROMPT, None, None, LlmMode::Frontier),
-            AUTO_PROMPT
+            builtin_prompt_for(DEEPTHINK_PROMPT, None, None, LlmMode::Frontier),
+            DEEPTHINK_PROMPT
         );
         assert_eq!(
-            builtin_prompt_for(AUTO_PROMPT, None, None, LlmMode::Defensive),
-            AUTO_PROMPT
+            builtin_prompt_for(DEEPTHINK_PROMPT, None, None, LlmMode::Defensive),
+            DEEPTHINK_PROMPT
         );
         // With a normal variant present, Normal selects it, Frontier falls
         // back to it, and Defensive keeps the flat body.
         assert_eq!(
-            builtin_prompt_for(AUTO_PROMPT, Some(AUTO_PROMPT_NORMAL), None, LlmMode::Normal),
-            AUTO_PROMPT_NORMAL
+            builtin_prompt_for(
+                BUILD_PROMPT,
+                Some(BUILD_PROMPT_NORMAL),
+                None,
+                LlmMode::Normal
+            ),
+            BUILD_PROMPT_NORMAL
         );
         assert_eq!(
             builtin_prompt_for(
-                AUTO_PROMPT,
-                Some(AUTO_PROMPT_NORMAL),
+                BUILD_PROMPT,
+                Some(BUILD_PROMPT_NORMAL),
                 None,
                 LlmMode::Frontier
             ),
-            AUTO_PROMPT_NORMAL
+            BUILD_PROMPT_NORMAL
         );
         assert_eq!(
             builtin_prompt_for(
-                AUTO_PROMPT,
-                Some(AUTO_PROMPT_NORMAL),
+                BUILD_PROMPT,
+                Some(BUILD_PROMPT_NORMAL),
                 None,
                 LlmMode::Defensive
             ),
-            AUTO_PROMPT
+            BUILD_PROMPT
         );
         assert_eq!(
             builtin_prompt_for(
-                AUTO_PROMPT,
-                Some(AUTO_PROMPT_NORMAL),
+                BUILD_PROMPT,
+                Some(BUILD_PROMPT_NORMAL),
                 Some("FRONTIER BODY"),
                 LlmMode::Frontier
             ),
@@ -4048,10 +3899,10 @@ mod tests {
     }
 
     #[test]
-    fn learn_is_reachable_from_write_capable_swarm() {
+    fn learn_is_reachable_from_write_capable_build() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
-        let agent = swarm(&args);
+        let agent = build(&args);
         assert!(agent.tools.names().contains(&"skill_manage"));
     }
 
@@ -4060,7 +3911,6 @@ mod tests {
         for (name, body) in [
             ("build", BUILD_PROMPT),
             ("builder", BUILDER_PROMPT),
-            ("swarm", SWARM_PROMPT),
             ("bee", BEE_PROMPT),
         ] {
             let low = body.to_lowercase();
@@ -4084,7 +3934,6 @@ mod tests {
         for (name, body) in [
             ("build.normal", BUILD_PROMPT_NORMAL),
             ("builder.normal", BUILDER_PROMPT_NORMAL),
-            ("swarm.normal", SWARM_PROMPT_NORMAL),
             ("bee.normal", BEE_PROMPT_NORMAL),
         ] {
             let low = body.to_lowercase();
@@ -4105,7 +3954,6 @@ mod tests {
         for (name, body) in [
             ("build.frontier", BUILD_PROMPT_FRONTIER),
             ("builder.frontier", BUILDER_PROMPT_FRONTIER),
-            ("swarm.frontier", SWARM_PROMPT_FRONTIER),
             ("bee.frontier", BEE_PROMPT_FRONTIER),
         ] {
             let low = body.to_lowercase();
@@ -4870,35 +4718,14 @@ mod tests {
     }
 
     #[test]
-    fn swarm_factory_has_build_surface_plus_recursive_spawn() {
-        // `Swarm` (GOALS §24) mirrors `Build`'s surface and adds the
-        // recursive `spawn` fan-out tool — the sole leaf-termination
-        // exception. It can delegate to `builder` (writes flow through the
-        // single writer) and to itself via `spawn`.
-        let tmp = tempfile::tempdir().unwrap();
-        let agent = swarm(&test_spawn_args(tmp.path()));
-        assert_eq!(agent.name, "Swarm");
-        let names = agent.tools.names();
-        // Build's surface.
-        for t in ["read", "bash", "tree", "hot", "schedule", "task", "skill"] {
-            assert!(names.contains(&t), "Swarm missing `{t}`: {names:?}");
-        }
-        // The recursive fan-out tool.
-        assert!(
-            names.contains(&"spawn"),
-            "Swarm must hold `spawn`: {names:?}"
-        );
-    }
-
-    #[test]
     fn can_delegate_false_hides_delegation_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args_with_provider_can_delegate(tmp.path(), Some(false));
-        let agent = swarm(&args);
+        let agent = build(&args);
         let session = crate::session::Session::create(
             crate::db::Db::open_in_memory().unwrap(),
             tmp.path().to_path_buf(),
-            "Swarm",
+            "Build",
         )
         .unwrap();
 
@@ -4918,11 +4745,11 @@ mod tests {
     fn can_delegate_unset_keeps_delegation_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args_with_provider_can_delegate(tmp.path(), None);
-        let agent = swarm(&args);
+        let agent = build(&args);
         let session = crate::session::Session::create(
             crate::db::Db::open_in_memory().unwrap(),
             tmp.path().to_path_buf(),
-            "Swarm",
+            "Build",
         )
         .unwrap();
 
@@ -4935,7 +4762,7 @@ mod tests {
         let names = toolbox.names();
 
         assert!(names.contains(&"task"), "{names:?}");
-        assert!(names.contains(&"spawn"), "{names:?}");
+        assert!(!names.contains(&"spawn"), "{names:?}");
     }
 
     #[test]
@@ -5010,13 +4837,11 @@ mod tests {
     }
 
     #[test]
-    fn swarm_task_targets_exclude_primaries_recursion_is_spawn_only() {
-        // Swarm→Swarm is the ONLY new edge, and it goes through
-        // `spawn`, not `task`. The `task` enum must still offer only
-        // the normal subagents (builder/explore/docs) — never `Plan`/`Build`/
-        // `Swarm` — so leaf-termination otherwise holds (GOALS §24).
+    fn build_task_targets_exclude_primaries() {
+        // The `task` enum must offer only normal subagents
+        // (builder/explore/docs) — never primaries.
         let tmp = tempfile::tempdir().unwrap();
-        let agent = swarm(&test_spawn_args(tmp.path()));
+        let agent = build(&test_spawn_args(tmp.path()));
         let def = agent
             .tools
             .definitions(crate::config::extended::LlmMode::Defensive)
@@ -5047,7 +4872,7 @@ mod tests {
         let mut args = test_spawn_args(tmp.path());
         args.swarm_depth = 1;
         args.swarm_max_depth = 4;
-        let agent = swarm(&args);
+        let agent = bee(&args);
         let def = agent
             .tools
             .definitions(args.llm_mode)

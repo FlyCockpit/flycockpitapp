@@ -934,51 +934,29 @@ fn behavior_default_agent_row_cycles_and_persists() {
     use cockpit_config::extended::{DefaultPrimaryAgent, ExtendedConfigDoc};
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
-    assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Auto);
+    assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Build);
     open_category_on(&mut d, Category::Behavior, SettingId::DefaultPrimaryAgent);
-    // Experimental on so the full Auto→Build→Plan cycle is reachable. Set
-    // after entering the category, since `enter_category` reloads `extended`
-    // from disk.
-    d.extended.experimental_mode = true;
+    d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Plan);
+    let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+    assert_eq!(reloaded.default_primary_agent, DefaultPrimaryAgent::Plan);
     d.handle_key(press(KeyCode::Enter));
     assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Build);
-    let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
-    assert_eq!(reloaded.default_primary_agent, DefaultPrimaryAgent::Build);
-    d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Plan);
-    d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Auto);
 }
 
-/// Experimental-mode gate (implementation note): the
-/// `ExperimentalMode` toggle flips + persists, and while it is off the
-/// `DefaultPrimaryAgent` cycle skips Auto but still reaches Plan.
 #[test]
-fn plan_default_settings_cycle_includes_plan() {
-    use cockpit_config::extended::{DefaultPrimaryAgent, ExtendedConfigDoc};
+fn roster_trim_behavior_settings_has_no_experimental_row_and_cycles_build_plan() {
+    use cockpit_config::extended::DefaultPrimaryAgent;
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
-    // Fresh dialog: experimental off by default.
-    assert!(!d.extended.experimental_mode);
 
-    // Toggle on → flips + persists.
-    open_category_on(&mut d, Category::Behavior, SettingId::ExperimentalMode);
-    d.handle_key(press(KeyCode::Enter));
-    assert!(d.extended.experimental_mode);
-    let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
-    assert!(reloaded.experimental_mode);
-
-    // While on, pin the default to Plan, then toggle experimental back off:
-    // Plan stays valid because it is no longer experimental.
-    d.extended.default_primary_agent = DefaultPrimaryAgent::Plan;
-    d.handle_key(press(KeyCode::Enter)); // experimental → off
-    assert!(!d.extended.experimental_mode);
-    assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Plan);
-
-    // With experimental off, cycling skips Auto and alternates between Build
-    // and Plan.
     open_category_on(&mut d, Category::Behavior, SettingId::DefaultPrimaryAgent);
-    d.extended.default_primary_agent = DefaultPrimaryAgent::Auto;
+    let rendered = render_settings_rows(&d, 100, 30).join("\n");
+    assert!(
+        !rendered.contains("experimental mode"),
+        "experimental mode row must be removed"
+    );
+    d.extended.default_primary_agent = DefaultPrimaryAgent::Plan;
     d.handle_key(press(KeyCode::Enter));
     assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Build);
     d.handle_key(press(KeyCode::Enter));

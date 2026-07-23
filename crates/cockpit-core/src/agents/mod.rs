@@ -40,8 +40,8 @@ pub(crate) mod invariants;
 
 pub(crate) use builtin_defs::embedded_internal_default;
 pub use builtin_defs::{
-    BUILTIN_AGENT_NAMES, FALLBACK_PRIMARY, embedded_default, is_builtin_agent,
-    is_experimental_primary, is_hidden_primary, resolve_primary_for_flag,
+    BUILTIN_AGENT_NAMES, FALLBACK_PRIMARY, embedded_default, is_builtin_agent, is_hidden_primary,
+    is_removed_primary,
 };
 pub use invariants::validate_invariants;
 
@@ -419,34 +419,23 @@ impl AgentMode {
 }
 
 /// The chat-owning (primary) agents in their canonical cycle / listing
-/// order: the four builtins first (`Auto`, `Plan`, `Build`, `Swarm`), then every
+/// order: the two public builtins first (`Plan`, `Build`), then every
 /// user-defined chat-ownable agent (mode `primary` or `all`, excluding the
 /// builtins) in alphabetical order by name. Drives both the `/agent` valid-
 /// choices list and the `Shift+Tab` cycle (`agent-switch-command-
 /// and-cycle.md`). Custom agents whose file failed to parse are skipped —
 /// they cannot be resolved as a switch target. Subagents are never included.
 pub fn chat_ownable_primaries(cwd: &Path) -> Vec<String> {
-    // Experimental-mode gate (implementation note): read the
-    // flag from the layered config, then delegate. Split so the flag-driven
-    // filtering is unit-testable without a config layer winning the
-    // discovery walk.
-    let experimental = crate::config::extended::load_for_cwd(cwd).experimental_mode;
-    chat_ownable_primaries_with(cwd, experimental)
+    chat_ownable_primaries_with(cwd)
 }
 
-/// [`chat_ownable_primaries`] with the experimental flag supplied directly
-/// (the production entry reads it via `load_for_cwd`). With `experimental`
-/// off the gated builtins (`Auto`/`Swarm`) are fully
-/// hidden — only `Plan`, `Build`, and user customs remain; this one filter
-/// cascades to every consumer of the chat-ownable list.
-fn chat_ownable_primaries_with(cwd: &Path, experimental: bool) -> Vec<String> {
+fn chat_ownable_primaries_with(cwd: &Path) -> Vec<String> {
     // Builtins first, in the prompt-specified cycle order — note this is
     // intentionally *not* `BUILTIN_AGENT_NAMES` order (which interleaves the
     // subagents) nor the settings toggle's order.
-    let mut out: Vec<String> = ["Auto", "Plan", "Build", "Swarm"]
+    let mut out: Vec<String> = ["Plan", "Build"]
         .into_iter()
         .filter(|name| !is_hidden_primary(name))
-        .filter(|name| experimental || !is_experimental_primary(name))
         .map(str::to_string)
         .collect();
 
@@ -913,6 +902,15 @@ fn resolve_inner(
     name: &str,
     resolve_assistant: impl FnOnce(&str) -> Result<Option<AgentDef>>,
 ) -> Result<Option<AgentDef>> {
+    if is_removed_primary(name) {
+        if find_override(cwd, name).is_some() {
+            tracing::warn!(
+                agent = name,
+                "ignoring override for removed builtin primary"
+            );
+        }
+        return Ok(None);
+    }
     for dir in agent_search_dirs(cwd) {
         let candidate = agent_path_in(&dir, name);
         if candidate.is_dir() {
@@ -981,6 +979,15 @@ pub fn list_all(cwd: &Path) -> Vec<AgentListing> {
                 continue;
             };
             if seen.contains(&name) {
+                continue;
+            }
+            if is_removed_primary(&name) {
+                tracing::warn!(
+                    agent = name,
+                    path = %path.display(),
+                    "ignoring override for removed builtin primary"
+                );
+                seen.insert(name);
                 continue;
             }
             if agent_markdown_oversized(&path, &dir, &name) {

@@ -8643,7 +8643,7 @@ fn insert_hung_worker(ctx: &Arc<DaemonContext>, session_id: Uuid) {
 }
 
 #[tokio::test]
-async fn set_agent_rejects_experimental_primary_when_mode_off() {
+async fn roster_trim_set_agent_rejects_removed_primary() {
     let ctx = test_ctx();
     let tmp = tempfile::TempDir::new().unwrap();
     let (mut state, session_id) = attached_state(&ctx, tmp.path());
@@ -8656,11 +8656,11 @@ async fn set_agent_rejects_experimental_primary_when_mode_off() {
         &ctx,
     )
     .await
-    .expect_err("Swarm is gated when experimental mode is off");
+    .expect_err("Swarm primary has been removed");
 
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("agent `Swarm`"));
-    assert!(err.message.contains("requires experimental mode"));
+    assert!(err.message.contains("not a chat-ownable primary"));
     let got = ctx.db.get_session(session_id).unwrap().unwrap();
     assert_eq!(got.active_agent, "Build");
 }
@@ -8767,39 +8767,22 @@ async fn set_agent_rejects_non_ownable_subagent_name() {
 }
 
 #[test]
-fn set_agent_allows_swarm_when_experimental_mode_on() {
-    let ownable = vec![
-        "Auto".to_string(),
-        "Plan".to_string(),
-        "Build".to_string(),
-        "Swarm".to_string(),
-        "Build".to_string(),
-    ];
-
-    validate_set_agent_name("Swarm", true, &ownable)
-        .expect("Swarm is allowed when experimental mode is enabled");
-}
-
-#[test]
-fn plan_default_available_everywhere_when_experimental_off_daemon_set_agent() {
+fn roster_trim_set_agent_allows_plan_and_rejects_removed_primaries() {
     let ownable = vec!["Plan".to_string(), "Build".to_string()];
 
-    validate_set_agent_name("Plan", false, &ownable)
-        .expect("Plan is allowed when experimental mode is disabled");
-    let err = validate_set_agent_name("Auto", false, &ownable)
-        .expect_err("Auto remains gated when experimental mode is disabled");
-    assert!(err.message.contains("requires experimental mode"));
-    let err = validate_set_agent_name("Swarm", false, &ownable)
-        .expect_err("Swarm remains gated when experimental mode is disabled");
-    assert!(err.message.contains("requires experimental mode"));
+    validate_set_agent_name("Plan", &ownable).expect("Plan is a chat-ownable primary");
+    for removed in ["Auto", "Swarm"] {
+        let err = validate_set_agent_name(removed, &ownable)
+            .expect_err("removed primaries are no longer chat-ownable");
+        assert!(err.message.contains("not a chat-ownable primary"));
+    }
 }
 
 #[test]
-fn set_agent_allows_build_when_experimental_mode_off() {
+fn set_agent_allows_build() {
     let ownable = vec!["Build".to_string()];
 
-    validate_set_agent_name("Build", false, &ownable)
-        .expect("Build remains a chat-ownable primary without experimental mode");
+    validate_set_agent_name("Build", &ownable).expect("Build is a chat-ownable primary");
 }
 
 #[tokio::test]
@@ -8830,10 +8813,7 @@ async fn list_agents_returns_chat_ownable_primaries() {
 
 #[tokio::test]
 async fn list_agents_agrees_with_validate_set_agent() {
-    let extended = crate::config::extended::ExtendedConfig {
-        experimental_mode: true,
-        ..Default::default()
-    };
+    let extended = crate::config::extended::ExtendedConfig::default();
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         crate::config::providers::ProvidersConfig::default(),
         extended,

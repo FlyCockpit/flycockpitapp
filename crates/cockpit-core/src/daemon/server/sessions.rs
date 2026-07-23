@@ -484,7 +484,7 @@ pub(super) fn validate_set_agent(
     att: &AttachedSession,
     name: &str,
 ) -> std::result::Result<(), ErrorPayload> {
-    let (_, cfg) = ctx
+    let _ = ctx
         .config_source()
         .load_with_trust(&att.handle.project_root, &att.handle.trust_policy)
         .map_err(internal)?;
@@ -492,21 +492,13 @@ pub(super) fn validate_set_agent(
         crate::config::trust::with_workspace_trust_policy(att.handle.trust_policy.clone(), || {
             crate::agents::chat_ownable_primaries(&att.handle.project_root)
         });
-    validate_set_agent_name(name, cfg.experimental_mode, &ownable)
+    validate_set_agent_name(name, &ownable)
 }
 
 pub(super) fn validate_set_agent_name(
     name: &str,
-    experimental_mode: bool,
     ownable: &[String],
 ) -> std::result::Result<(), ErrorPayload> {
-    if crate::agents::is_experimental_primary(name) && !experimental_mode {
-        return Err(ErrorPayload {
-            code: ErrorCode::BadRequest,
-            message: format!("agent `{name}` requires experimental mode"),
-        });
-    }
-
     if !ownable.iter().any(|agent| agent == name) {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,

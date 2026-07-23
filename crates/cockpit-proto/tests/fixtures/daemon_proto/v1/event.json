@@ -97,7 +97,7 @@
             "enabled": false
           },
           "defaultApprovalMode": "manual",
-          "defaultPrimaryAgent": "auto",
+          "defaultPrimaryAgent": "build",
           "delegation": {
             "defaultRecursionDepth": 0,
             "maxParallel": 4,
@@ -106,7 +106,6 @@
           "dialog": {
             "lockout_ms": 1500
           },
-          "experimentalMode": false,
           "gitignore_allow": [],
           "harnesses": {},
           "hintToolCallCorrections": false,

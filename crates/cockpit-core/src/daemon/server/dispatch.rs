@@ -1472,7 +1472,7 @@ pub(super) fn list_agents(
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_attached(state)?;
     let trust_policy = attached_trust_policy(ctx, att)?;
-    let (_, cfg) = ctx
+    let _ = ctx
         .config_source()
         .load_with_trust(&att.handle.project_root, &trust_policy)
         .map_err(internal)?;
@@ -1481,7 +1481,7 @@ pub(super) fn list_agents(
     });
     let mut agents = Vec::with_capacity(ownable.len());
     for name in &ownable {
-        validate_set_agent_name(name, cfg.experimental_mode, &ownable)?;
+        validate_set_agent_name(name, &ownable)?;
         let def = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             crate::agents::resolve(&att.handle.project_root, name)
         })
@@ -1592,7 +1592,7 @@ pub(super) fn list_agents_shared(
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_shared_attached(shared)?;
     let trust_policy = attached_trust_policy_shared(ctx, att)?;
-    let (_, cfg) = ctx
+    let _ = ctx
         .config_source()
         .load_with_trust(&att.project_root, &trust_policy)
         .map_err(internal)?;
@@ -1601,7 +1601,7 @@ pub(super) fn list_agents_shared(
     });
     let mut agents = Vec::with_capacity(ownable.len());
     for name in &ownable {
-        validate_set_agent_name(name, cfg.experimental_mode, &ownable)?;
+        validate_set_agent_name(name, &ownable)?;
         let def = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             crate::agents::resolve(&att.project_root, name)
         })

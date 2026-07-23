@@ -324,16 +324,21 @@ pub struct ExtendedConfig {
     #[serde(default, deserialize_with = "deserialize_llm_mode")]
     pub llm_mode: LlmMode,
 
-    /// Which primary agent a new session starts on (the auto-router
-    /// feature). `auto` (the default) is the conversational front door that
-    /// hands off to `Plan`/`Build`; the user may pin `build` or `plan` to
-    /// skip it. `/settings` exposes the cycle; [`initial_active_agent`]
-    /// reads this. Distinct from [`crate::agents::AgentMode`] and
-    /// [`LlmMode`].
+    /// Which primary agent a new session starts on. `build` (the default)
+    /// starts on the coding agent; the user may pin `plan` for plan-mode
+    /// deliberation. `/settings` exposes the cycle; [`initial_active_agent`]
+    /// reads this. Distinct from [`crate::agents::AgentMode`] and [`LlmMode`].
     ///
     /// [`initial_active_agent`]: crate::daemon::session_worker
     #[serde(rename = "defaultPrimaryAgent", default)]
     pub default_primary_agent: DefaultPrimaryAgent,
+
+    /// Raw removed/unknown `defaultPrimaryAgent` value that degraded to
+    /// [`DefaultPrimaryAgent::Build`]. This is runtime-only notice state:
+    /// it is derived from config input, cloned through daemon snapshots, and
+    /// intentionally omitted from serialized config/protocol output.
+    #[serde(skip)]
+    pub removed_default_primary_agent: Option<String>,
 
     /// Round-trip utility-model translation (implementation note).
     /// The user's language and the model's language; when both are set and
@@ -357,9 +362,8 @@ pub struct ExtendedConfig {
     /// (implementation note). `manual` (the default)
     /// asks the user for every gated call; `auto` runs each gated call past
     /// the utility-model safety gate (safe → run, unsafe → ask); `yolo` runs
-    /// everything unprompted. Distinct from the `auto` *router agent*
-    /// ([`DefaultPrimaryAgent::Auto`]) and from [`LlmMode`]. `/settings`
-    /// exposes the cycle; the session reads this at spawn.
+    /// everything unprompted. Distinct from [`LlmMode`]. `/settings` exposes
+    /// the cycle; the session reads this at spawn.
     #[serde(rename = "defaultApprovalMode", default)]
     pub default_approval_mode: ApprovalMode,
 
@@ -455,16 +459,6 @@ pub struct ExtendedConfig {
     /// order. Resolved by [`resolve_centrality_ranking`].
     #[serde(rename = "intelCentralityRanking", default = "default_true")]
     pub intel_centrality_ranking: bool,
-
-    /// Experimental-mode gate (implementation note). A
-    /// single reusable flag segmenting not-yet-stable features. Off by
-    /// default. Its first use gates the `Auto`/`Swarm`
-    /// builtin primaries (see [`crate::agents::is_experimental_primary`]):
-    /// with this off they are fully hidden from the cycle / `/agent` list /
-    /// slash swaps and the active primary falls back to `Build`. `/settings`
-    /// exposes the toggle.
-    #[serde(rename = "experimentalMode", default)]
-    pub experimental_mode: bool,
 }
 
 /// Whether call-graph centrality ranking is enabled for `cwd` (the
@@ -785,20 +779,32 @@ impl TranslationConfig {
     }
 }
 
-/// Which primary agent a new session starts on (the auto-router feature).
-/// The serde spelling is lowercase (`auto`/`build`/`plan`); the resolved
+/// Which primary agent a new session starts on.
+/// The serde spelling is lowercase (`build`/`plan`); the resolved
 /// agent name [`Self::agent_name`] keeps the in-binary casing convention
-/// (capitalized primaries — `Auto`/`Build`/`Plan`).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+/// (capitalized primaries — `Build`/`Plan`).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultPrimaryAgent {
-    /// The conversational front door (default): routes to `Plan`/`Build`.
-    #[default]
-    Auto,
     /// Start directly on `Build` (make-the-change-now).
+    #[default]
     Build,
     /// Start directly on `Plan` for plan-mode deliberation.
     Plan,
+}
+
+impl<'de> Deserialize<'de> for DefaultPrimaryAgent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "plan" => DefaultPrimaryAgent::Plan,
+            "build" | "auto" | "swarm" => DefaultPrimaryAgent::Build,
+            _ => DefaultPrimaryAgent::Build,
+        })
+    }
 }
 
 impl DefaultPrimaryAgent {
@@ -806,7 +812,6 @@ impl DefaultPrimaryAgent {
     /// agent factory + `swap_primary` match on).
     pub fn agent_name(self) -> &'static str {
         match self {
-            DefaultPrimaryAgent::Auto => "Auto",
             DefaultPrimaryAgent::Build => "Build",
             DefaultPrimaryAgent::Plan => "Plan",
         }
@@ -815,9 +820,8 @@ impl DefaultPrimaryAgent {
     /// Cycle to the next choice — the `/settings` row's toggle action.
     pub fn cycled(self) -> Self {
         match self {
-            DefaultPrimaryAgent::Auto => DefaultPrimaryAgent::Build,
             DefaultPrimaryAgent::Build => DefaultPrimaryAgent::Plan,
-            DefaultPrimaryAgent::Plan => DefaultPrimaryAgent::Auto,
+            DefaultPrimaryAgent::Plan => DefaultPrimaryAgent::Build,
         }
     }
 }
@@ -826,10 +830,8 @@ impl DefaultPrimaryAgent {
 /// Governs whether — and how — a gated tool call (`bash`, `mcp`)
 /// prompts the user before it runs.
 ///
-/// Deliberately distinct from the `auto`/`Auto` *router agent*
-/// ([`DefaultPrimaryAgent::Auto`]) and from [`LlmMode`]: this is the
-/// *approval* `auto`, the safety-gate engine. UI labels disambiguate it as
-/// "auto (safety-gated)" so the two are never conflated.
+/// Deliberately distinct from [`LlmMode`]: this is the *approval* `auto`, the
+/// safety-gate engine.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMode {
@@ -1399,6 +1401,10 @@ impl ExtendedConfig {
             .map(str::trim)
             .filter(|s| !s.is_empty())
     }
+
+    pub fn removed_default_primary_agent(&self) -> Option<&str> {
+        self.removed_default_primary_agent.as_deref()
+    }
 }
 
 impl Default for ExtendedConfig {
@@ -1454,6 +1460,7 @@ impl Default for ExtendedConfig {
             skills: SkillsConfig::default(),
             llm_mode: LlmMode::default(),
             default_primary_agent: DefaultPrimaryAgent::default(),
+            removed_default_primary_agent: None,
             translation: TranslationConfig::default(),
             sandbox_escalation_enabled: true,
             default_approval_mode: ApprovalMode::default(),
@@ -1465,7 +1472,6 @@ impl Default for ExtendedConfig {
             hint_tool_call_corrections: false,
             text_embedded_recovery: TextEmbeddedRecovery::default(),
             intel_centrality_ranking: default_true(),
-            experimental_mode: false,
         }
     }
 }
@@ -1733,7 +1739,32 @@ impl ExtendedConfigDoc {
         parse_field!("dialog", dialog);
         parse_field!("skills", skills);
         parse_field!("llm_mode", llm_mode);
-        parse_field!("defaultPrimaryAgent", default_primary_agent);
+        if let Some(value) = raw.get("defaultPrimaryAgent") {
+            match value.as_str() {
+                Some("build") => cfg.default_primary_agent = DefaultPrimaryAgent::Build,
+                Some("plan") => cfg.default_primary_agent = DefaultPrimaryAgent::Plan,
+                Some(other) => {
+                    cfg.default_primary_agent = DefaultPrimaryAgent::Build;
+                    cfg.removed_default_primary_agent = Some(other.to_string());
+                }
+                None => match serde_json::from_value::<DefaultPrimaryAgent>(value.clone()) {
+                    Ok(parsed) => cfg.default_primary_agent = parsed,
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %self.path.display(),
+                            key = "defaultPrimaryAgent",
+                            %error,
+                            "skipping malformed extended config field"
+                        );
+                        warnings.push(format!(
+                            "ignored malformed `{}` in {}",
+                            "defaultPrimaryAgent",
+                            self.path.display()
+                        ));
+                    }
+                },
+            }
+        }
         parse_field!("translation", translation);
         parse_field!("sandboxEscalationEnabled", sandbox_escalation_enabled);
         parse_field!("sandbox_escalation_enabled", sandbox_escalation_enabled);
@@ -1746,7 +1777,6 @@ impl ExtendedConfigDoc {
         parse_field!("hintToolCallCorrections", hint_tool_call_corrections);
         parse_field!("textEmbeddedRecovery", text_embedded_recovery);
         parse_field!("intelCentralityRanking", intel_centrality_ranking);
-        parse_field!("experimentalMode", experimental_mode);
 
         migrate_legacy_web_tool_templates(&mut cfg);
 

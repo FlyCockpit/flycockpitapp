@@ -255,13 +255,24 @@ pub(super) async fn run_worker(
     let llm_mode =
         resolve_effective_llm_mode(&session, &start_config.providers, extended_cfg.llm_mode);
     // Root primary: the session's stored active agent (so a resume restarts
-    // on `Plan` after a `/plan` swap or whichever primary `Auto` handed off
-    // to, `plan.md §4.6.d`), falling back to the configured default
-    // (`Auto` unless the user pinned another) when it's unset/unknown.
+    // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
+    // configured default when it's unset/unknown. Removed stored primaries
+    // force the release default (`Build`).
     let root_agent_name = session
         .assistant_name
         .clone()
         .unwrap_or_else(|| resolve_root_agent(session_id, &session.db, &extended_cfg));
+    if session.assistant_name.is_none()
+        && let Some(text) = super::removed_primary_notice(session_id, &session.db, &extended_cfg)
+    {
+        send_current_session_event(
+            &session,
+            &event_tx,
+            &redaction,
+            proto::Event::Notice { session_id, text },
+            NoticeSource::DaemonDirect,
+        );
+    }
     let assistant_identity_prefix =
         match session.assistant_name.as_deref().and_then(|name| match session.db.get_assistant(name)
         {
@@ -1765,7 +1776,7 @@ pub(super) async fn run_worker(
                         .map(crate::engine::schedule::TandemTarget::label)
                         .collect();
                     // Token-burn warning on a non-empty set (warning only — no cap,
-                    // no meter), in the spirit of the `/swarm` entry warning.
+                    // no meter) for tandem model-comparison fan-out.
                     let warning = (!labels.is_empty()).then(|| {
                     format!(
                         "model-comparison ON: every substantive request is ALSO sent to {} tandem model(s) ({}). This multiplies token spend — it is off by default and reverts on restart.",

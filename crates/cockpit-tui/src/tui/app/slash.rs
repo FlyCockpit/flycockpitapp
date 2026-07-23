@@ -611,14 +611,6 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
-        name: "swarm",
-        description: "Switch the primary agent to Swarm (recursive parallel fan-out; burns lots of tokens)",
-        takes_args: false,
-        run: run_swarm,
-        available: available_always,
-        describe: describe_static,
-    },
-    SlashCommand {
         name: "resume",
         description: "Browse and resume previous sessions (alias of /sessions)",
         takes_args: false,
@@ -1094,11 +1086,6 @@ fn run_plan(app: &mut App, _: &str) -> bool {
 
 fn run_build(app: &mut App, _: &str) -> bool {
     app.swap_primary_agent("Build");
-    false
-}
-
-fn run_swarm(app: &mut App, _: &str) -> bool {
-    app.swap_primary_agent("Swarm");
     false
 }
 
@@ -1594,8 +1581,7 @@ impl App {
     /// `/agent [name]` — switch the active primary (chat-owning) agent, or
     /// list the available primaries (`agent-switch-command-and-
     /// cycle.md`). With a `name`, validate it against the chat-ownable set
-    /// (builtins `Auto`/`Plan`/`Build`/`Swarm` + user-defined
-    /// `primary`/`all`) and
+    /// (builtins `Plan`/`Build` + user-defined `primary`/`all`) and
     /// route a valid one through [`Self::swap_primary_agent`] (same
     /// confirmation line + start-a-session-first guard `/plan`/`/build`
     /// have); an unknown or subagent-only name prints an error naming the

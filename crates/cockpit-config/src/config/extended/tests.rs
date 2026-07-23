@@ -186,7 +186,6 @@ fn fully_populated_config_json_round_trips_byte_identically() {
     cfg.hint_tool_call_corrections = true;
     cfg.text_embedded_recovery = TextEmbeddedRecovery::Strict;
     cfg.intel_centrality_ranking = false;
-    cfg.experimental_mode = true;
 
     let mut doc = ExtendedConfigDoc::load(&path).unwrap();
     doc.write(&cfg).unwrap();
@@ -1032,24 +1031,21 @@ fn caffeinate_display_awake_round_trips_and_maps_to_full_scope() {
 }
 
 #[test]
-fn default_primary_agent_defaults_to_auto() {
-    // A new session starts on the front-door router unless pinned.
+fn roster_trim_default_primary_is_build() {
     let cfg = ExtendedConfig::default();
-    assert_eq!(cfg.default_primary_agent, DefaultPrimaryAgent::Auto);
-    assert_eq!(cfg.default_primary_agent.agent_name(), "Auto");
+    assert_eq!(cfg.default_primary_agent, DefaultPrimaryAgent::Build);
+    assert_eq!(cfg.default_primary_agent.agent_name(), "Build");
     let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
-    assert_eq!(parsed.default_primary_agent, DefaultPrimaryAgent::Auto);
-}
-
-#[test]
-fn plan_default_config_defaults_stay_unchanged() {
-    let cfg = ExtendedConfig::default();
-    assert!(!cfg.experimental_mode);
-    assert_eq!(cfg.default_primary_agent, DefaultPrimaryAgent::Auto);
-
-    let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
-    assert!(!parsed.experimental_mode);
-    assert_eq!(parsed.default_primary_agent, DefaultPrimaryAgent::Auto);
+    assert_eq!(parsed.default_primary_agent, DefaultPrimaryAgent::Build);
+    assert_eq!(
+        DefaultPrimaryAgent::Build.cycled(),
+        DefaultPrimaryAgent::Plan
+    );
+    assert_eq!(
+        DefaultPrimaryAgent::Plan.cycled(),
+        DefaultPrimaryAgent::Build
+    );
+    assert_eq!(DefaultPrimaryAgent::Plan.agent_name(), "Plan");
 }
 
 #[test]
@@ -1072,21 +1068,23 @@ fn default_primary_agent_round_trips() {
 }
 
 #[test]
-fn default_primary_agent_cycles_auto_build_plan() {
-    assert_eq!(
-        DefaultPrimaryAgent::Auto.cycled(),
-        DefaultPrimaryAgent::Build
-    );
-    assert_eq!(
-        DefaultPrimaryAgent::Build.cycled(),
-        DefaultPrimaryAgent::Plan
-    );
-    assert_eq!(
-        DefaultPrimaryAgent::Plan.cycled(),
-        DefaultPrimaryAgent::Auto
-    );
-    assert_eq!(DefaultPrimaryAgent::Build.agent_name(), "Build");
-    assert_eq!(DefaultPrimaryAgent::Plan.agent_name(), "Plan");
+fn roster_trim_removed_default_primary_degrades_to_build() {
+    for value in ["auto", "swarm", "unknown"] {
+        let parsed: ExtendedConfig =
+            serde_json::from_str(&format!(r#"{{"defaultPrimaryAgent":"{value}"}}"#)).unwrap();
+        assert_eq!(
+            parsed.default_primary_agent,
+            DefaultPrimaryAgent::Build,
+            "{value}"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, format!(r#"{{"defaultPrimaryAgent":"{value}"}}"#)).unwrap();
+        let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
+        assert_eq!(cfg.default_primary_agent, DefaultPrimaryAgent::Build);
+        assert_eq!(cfg.removed_default_primary_agent(), Some(value));
+    }
 }
 
 #[test]

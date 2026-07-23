@@ -308,17 +308,17 @@ fn record_goal_tool_event(driver: &Driver, tool: &str, wire_input: serde_json::V
         .unwrap();
 }
 
-/// Build a driver rooted on the real `Auto` front-door agent — the
-/// handoff scenario. The model is keyless localhost and never called:
+/// Build a driver rooted on the real `Plan` primary. The model is keyless
+/// localhost and never called:
 /// these tests drive [`Driver::apply_handoff`] (the engine side of a
 /// model-issued `handoff` call) directly, so no inference round-trips.
-fn auto_rooted_driver() -> (Driver, tempfile::TempDir) {
+fn plan_rooted_driver() -> (Driver, tempfile::TempDir) {
     let (mut driver, tmp) = test_driver(1);
-    // Re-root on a genuine `Auto`, built through the same factory the
+    // Re-root on a genuine `Plan`, built through the same factory the
     // session worker uses, so its tool surface + name match production.
-    let auto = crate::engine::builtin::load("Auto", &driver.spawn_args(true)).unwrap();
-    driver.stack[0].agent = Arc::new(auto);
-    driver.session.set_active_agent("Auto").unwrap();
+    let plan = crate::engine::builtin::load("Plan", &driver.spawn_args(true)).unwrap();
+    driver.stack[0].agent = Arc::new(plan);
+    driver.session.set_active_agent("Plan").unwrap();
     (driver, tmp)
 }
 

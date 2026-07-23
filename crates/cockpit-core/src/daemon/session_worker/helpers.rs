@@ -169,19 +169,44 @@ pub(crate) fn resolve_root_agent_conn(
         }
         return default_primary();
     }
-    Some(row.active_agent)
-        .filter(|name| {
-            matches!(
-                name.as_str(),
-                "Auto" | "Plan" | "Build" | "Swarm" | "Multireview"
-            )
-        })
-        // Experimental-mode gate (implementation note): a
-        // session persisted on a now-gated primary (e.g. last on `Swarm`,
-        // experimental since turned off) silently loads on `Build` instead —
-        // no notice. With the flag on, the stored value is honored.
-        .map(|name| crate::agents::resolve_primary_for_flag(&name, cfg.experimental_mode))
+    let active = row.active_agent;
+    if crate::agents::is_removed_primary(&active) {
+        return crate::agents::FALLBACK_PRIMARY.to_string();
+    }
+    Some(active)
+        .filter(|name| matches!(name.as_str(), "Plan" | "Build" | "Multireview"))
         .unwrap_or_else(default_primary)
+}
+
+pub(crate) fn removed_primary_notice(
+    session_id: Uuid,
+    db: &crate::db::Db,
+    cfg: &crate::config::extended::ExtendedConfig,
+) -> Option<String> {
+    let row = db.get_session(session_id).ok().flatten()?;
+    let text = if crate::agents::is_removed_primary(&row.active_agent) {
+        format!(
+            "Primary agent `{}` was removed; continuing with `{}`.",
+            row.active_agent,
+            crate::agents::FALLBACK_PRIMARY
+        )
+    } else if let Some(default_primary) = cfg.removed_default_primary_agent() {
+        format!(
+            "Default primary agent `{default_primary}` was removed; continuing with `{}`.",
+            crate::agents::FALLBACK_PRIMARY
+        )
+    } else {
+        return None;
+    };
+    let already_recorded = db
+        .list_session_events(session_id)
+        .ok()?
+        .into_iter()
+        .any(|event| {
+            event.kind == "notice"
+                && event.data.get("text").and_then(|v| v.as_str()) == Some(text.as_str())
+        });
+    (!already_recorded).then_some(text)
 }
 
 /// Resolve the effective LLM mode for the session's active (provider, model)

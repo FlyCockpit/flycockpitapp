@@ -701,15 +701,12 @@ async fn absent_scheduler_is_not_an_error() {
         .expect("worker task does not panic");
 }
 
-/// An [`ExtendedConfig`] pinning `defaultPrimaryAgent` + the
-/// experimental flag, for the gate tests.
+/// An [`ExtendedConfig`] pinning `defaultPrimaryAgent` for fallback tests.
 fn cfg_with(
     default_primary: crate::config::extended::DefaultPrimaryAgent,
-    experimental: bool,
 ) -> crate::config::extended::ExtendedConfig {
     crate::config::extended::ExtendedConfig {
         default_primary_agent: default_primary,
-        experimental_mode: experimental,
         ..Default::default()
     }
 }
@@ -815,18 +812,11 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
 }
 
 #[test]
-fn initial_active_agent_gates_default_to_build_when_off() {
+fn roster_trim_initial_active_agent_uses_build_or_plan() {
     use crate::config::extended::DefaultPrimaryAgent as D;
-    // Off: a gated configured default (Auto) resolves to Build, while Plan
-    // is available by default.
-    assert_eq!(initial_active_agent(&cfg_with(D::Auto, false)), "Build");
-    assert_eq!(initial_active_agent(&cfg_with(D::Plan, false)), "Plan");
-    // Off: Build is honored (not gated). Since the enum default is Auto, this
-    // keeps new sessions on Build while experimental mode is off.
-    assert_eq!(initial_active_agent(&cfg_with(D::Build, false)), "Build");
-    // On: the configured default is honored.
-    assert_eq!(initial_active_agent(&cfg_with(D::Auto, true)), "Auto");
-    assert_eq!(initial_active_agent(&cfg_with(D::Plan, true)), "Plan");
+
+    assert_eq!(initial_active_agent(&cfg_with(D::Build)), "Build");
+    assert_eq!(initial_active_agent(&cfg_with(D::Plan)), "Plan");
 }
 
 #[test]
@@ -848,22 +838,89 @@ fn seed_tool_drain_failure_warns_with_session_id_without_payload() {
 fn plan_default_stale_session_keeps_plan() {
     use crate::config::extended::DefaultPrimaryAgent as D;
     let db = crate::db::Db::open_in_memory().unwrap();
-    // A session persisted on Plan loads on Plan with experimental off. Swarm is
-    // still gated, so it continues to fall back through the shared predicate.
+    // A session persisted on Plan loads on Plan. Removed primaries fall back to
+    // Build through the shared predicate.
     let row = db.create_session("proj", "/proj", "Plan").unwrap();
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Auto, false)),
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)),
         "Plan"
     );
     let swarm = db.create_session("proj", "/proj", "Swarm").unwrap();
     assert_eq!(
-        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Auto, false)),
+        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Build)),
         "Build"
     );
-    // Same persisted Plan session, experimental on → the stored value stands.
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Auto, true)),
-        "Plan"
+        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Plan)),
+        "Build",
+        "removed stored primaries force Build, not the configured default"
+    );
+}
+
+#[test]
+fn roster_trim_removed_primary_notice_is_one_time() {
+    use crate::config::extended::DefaultPrimaryAgent as D;
+
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let row = db.create_session("proj", "/proj", "Swarm").unwrap();
+
+    assert_eq!(
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)),
+        "Build"
+    );
+    let notice =
+        removed_primary_notice(row.session_id, &db, &cfg_with(D::Plan)).expect("first notice");
+    assert_eq!(
+        notice,
+        "Primary agent `Swarm` was removed; continuing with `Build`."
+    );
+
+    db.insert_session_event(
+        row.session_id,
+        crate::db::session_log::SessionEventKind::Notice,
+        None,
+        None,
+        &serde_json::json!({
+            "text": notice,
+            "severity": "info",
+            "source": NoticeSource::DaemonDirect.as_str(),
+        }),
+    )
+    .unwrap();
+    assert!(
+        removed_primary_notice(row.session_id, &db, &cfg_with(D::Plan)).is_none(),
+        "notice is de-duped once recorded"
+    );
+}
+
+#[test]
+fn roster_trim_removed_default_primary_notice_is_one_time() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let row = db.create_session("proj", "/proj", "Build").unwrap();
+    let mut cfg = cfg_with(crate::config::extended::DefaultPrimaryAgent::Build);
+    cfg.removed_default_primary_agent = Some("auto".to_string());
+
+    let notice = removed_primary_notice(row.session_id, &db, &cfg).expect("first notice");
+    assert_eq!(
+        notice,
+        "Default primary agent `auto` was removed; continuing with `Build`."
+    );
+
+    db.insert_session_event(
+        row.session_id,
+        crate::db::session_log::SessionEventKind::Notice,
+        None,
+        None,
+        &serde_json::json!({
+            "text": notice,
+            "severity": "info",
+            "source": NoticeSource::DaemonDirect.as_str(),
+        }),
+    )
+    .unwrap();
+    assert!(
+        removed_primary_notice(row.session_id, &db, &cfg).is_none(),
+        "config-default notice is de-duped once recorded"
     );
 }
 
@@ -878,7 +935,7 @@ fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
         .unwrap();
 
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Auto, false)),
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)),
         "helper-bot"
     );
 }
@@ -892,7 +949,7 @@ fn resolve_root_agent_deleted_assistant_falls_back_to_default_primary() {
         .unwrap();
 
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build, true)),
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)),
         "Build"
     );
 }
@@ -927,7 +984,7 @@ fn assistant_session_root_agent_loads_assistant_definition() {
         .create_assistant_session("proj", cwd.to_str().unwrap(), "helper-bot", "helper-bot")
         .unwrap();
 
-    let root_agent_name = resolve_root_agent(row.session_id, &db, &cfg_with(D::Auto, false));
+    let root_agent_name = resolve_root_agent(row.session_id, &db, &cfg_with(D::Build));
     let root = crate::engine::builtin::load(&root_agent_name, &test_spawn_args(&cwd)).unwrap();
 
     assert_eq!(root.name, "helper-bot");

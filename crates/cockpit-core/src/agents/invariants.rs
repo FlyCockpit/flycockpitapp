@@ -50,16 +50,16 @@ pub const LOCK_WRITE_TOOLS: &[&str] = &["readlock", "writeunlock", "editunlock",
 pub const SANDBOX_ONLY_TOOLS: &[&str] = &["grep", "glob"];
 
 /// The recursive fan-out tool (GOALS §24/§26a). Grantable only to the write
-/// branch (`Swarm`/`bee`) and read-only review branch (`Multireview`/`scout`).
+/// branch (`bee`) and read-only review branch (`Multireview`/`scout`).
 pub const SPAWN_TOOL: &str = "spawn";
 
-const SPAWN_AGENTS: &[&str] = &["Swarm", "bee", "Multireview", "scout"];
+const SPAWN_AGENTS: &[&str] = &["bee", "Multireview", "scout"];
 
 /// The structural delegation/handoff tools. Never grantable to a delegation
 /// child (prompt `parent-granted-tools.md`): a delegated child is a leaf and
 /// must report a single result up, so it may not gain the power to spawn its
 /// own subagents (`task`) or hand off the conversation (`handoff`). The
-/// recursive-`Swarm` exception is [`SPAWN_TOOL`], gated separately.
+/// recursive fan-out exception is [`SPAWN_TOOL`], gated separately.
 pub const DELEGATION_TOOLS: &[&str] = &["task", "handoff", "start_build"];
 
 pub const STRUCTURAL_TOOLS: &[&str] = &[
@@ -115,7 +115,7 @@ pub fn known_tool_names() -> &'static [&'static str] {
 /// `target_name`/`target_mode` are the delegation target's own identity (its
 /// resolved [`AgentDef`]), so the spawn-only / primary-only rules are
 /// evaluated for *that* agent — e.g. the recursive fan-out tool to a
-/// non-`Swarm` agent is rejected, and the external-harness tools to a
+/// non-fan-out agent is rejected, and the external-harness tools to a
 /// subagent are rejected. Write/lock tools are **not** grantable per
 /// delegation at all: write-capability is a property of an agent's *base
 /// definition* (governed by [`validate_invariants`] and arbitrated at runtime
@@ -135,7 +135,7 @@ pub fn validate_grant(
         // Delegation/handoff tools are never grantable: handing a child the
         // power to spawn or hand off would break leaf-termination — the child
         // is a leaf and must report one result up. (`spawn` is the
-        // documented exception, gated to `Swarm` below.)
+        // documented exception, gated to recursive fan-out agents below.)
         if DELEGATION_TOOLS.contains(&tool.as_str()) {
             bail!(
                 "delegation to `{target_name}` may not be granted the delegation tool `{tool}` — a delegated child is a leaf and may not spawn or hand off (leaf-termination rule)"
@@ -148,7 +148,7 @@ pub fn validate_grant(
         }
         if tool == SPAWN_TOOL && !SPAWN_AGENTS.contains(&target_name) {
             bail!(
-                "delegation to `{target_name}` may not be granted the recursive fan-out tool `{tool}` — only `Swarm`/`bee` fan out (leaf-termination exception, GOALS §24)"
+                "delegation to `{target_name}` may not be granted the recursive fan-out tool `{tool}` — only `bee` and multireview/scout fan out (leaf-termination exception, GOALS §24)"
             );
         }
         // Write/lock tools are not grantable per delegation: write-capability
@@ -257,11 +257,11 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
                 def.name
             );
         }
-        // Recursive fan-out: grantable only to the write branch
-        // (`Swarm`/`bee`) and read-only review branch (`Multireview`/`scout`).
+        // Recursive fan-out: grantable only to the write branch (`bee`) and
+        // read-only review branch (`Multireview`/`scout`).
         if tool == SPAWN_TOOL && !SPAWN_AGENTS.contains(&def.name.as_str()) {
             bail!(
-                "agent `{}` may not hold the recursive fan-out tool `{tool}` — only `Swarm`/`bee` and `Multireview`/`scout` fan out (leaf-termination exception, GOALS §24/§26a)",
+                "agent `{}` may not hold the recursive fan-out tool `{tool}` — only `bee` and `Multireview`/`scout` fan out (leaf-termination exception, GOALS §24/§26a)",
                 def.name
             );
         }
@@ -403,8 +403,7 @@ mod grant_tests {
         );
     }
 
-    /// The recursive fan-out tool may not be granted to a non-`Swarm` agent
-    /// (leaf-termination exception is Swarm-only).
+    /// The recursive fan-out tool may not be granted to a non-fan-out agent.
     #[test]
     fn rejects_spawn_to_non_swarm() {
         let err = validate_grant("explore", AgentMode::Subagent, &g(&["spawn"]))

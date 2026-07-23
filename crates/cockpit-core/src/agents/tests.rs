@@ -225,21 +225,27 @@ fn write_tools_are_role_driven_not_name_bound() {
 }
 
 #[test]
-fn spawn_tool_is_swarm_and_bee_only() {
-    // A non-`Swarm`/`bee` agent naming the recursive fan-out tool is rejected
-    // — it is the sole leaf-termination exception, held only by `Swarm` and
-    // its `bee` worker (GOALS §24/§26).
+fn roster_trim_spawn_agents_drop_swarm_keep_bee() {
+    // A non-`bee` agent naming the recursive fan-out tool is rejected on the
+    // write branch; read-only Multireview/scout are the review exceptions.
     let def = def_with_tools("Build", &["read", "spawn"]);
     let err = validate_invariants(&def).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("`spawn`"), "{msg}");
     assert!(msg.contains("leaf-termination"), "{msg}");
-    // `Swarm` (primary) and `bee` (worker) may both hold it.
     let mut ok = def_with_tools("Swarm", &["read", "spawn"]);
     ok.mode = AgentMode::Primary;
-    assert!(validate_invariants(&ok).is_ok());
+    assert!(validate_invariants(&ok).is_err());
     let bee = def_with_tools("bee", &["read", "spawn"]);
     assert!(validate_invariants(&bee).is_ok());
+    assert!(
+        embedded_default("bee")
+            .unwrap()
+            .tools
+            .unwrap()
+            .iter()
+            .any(|tool| tool == "spawn")
+    );
 }
 
 #[test]
@@ -806,7 +812,7 @@ fn is_chat_ownable_classifies_modes() {
 fn multireview_is_hidden_from_chat_ownable_cycle() {
     let tmp = tempfile::tempdir().unwrap();
     project_agents_dir(tmp.path());
-    let order = chat_ownable_primaries_with(tmp.path(), true);
+    let order = chat_ownable_primaries_with(tmp.path());
     assert!(
         !order.iter().any(|n| n == "Multireview"),
         "hidden primary must not be listed or cycled: {order:?}"
@@ -835,70 +841,78 @@ fn scout_and_multireview_builtin_surfaces_are_read_only() {
 }
 
 #[test]
-fn plan_default_not_experimental() {
-    assert!(!is_experimental_primary("Plan"));
-    assert!(is_experimental_primary("Auto"));
-    assert!(is_experimental_primary("Swarm"));
-}
-
-#[test]
-fn plan_default_available_everywhere_when_experimental_off_agents() {
+fn roster_trim_chat_ownable_is_plan_build_only() {
     let tmp = tempfile::tempdir().unwrap();
     project_agents_dir(tmp.path());
 
-    let order = chat_ownable_primaries_with(tmp.path(), false);
+    let order = chat_ownable_primaries_with(tmp.path());
     assert_eq!(order, vec!["Plan", "Build"]);
-    assert_eq!(resolve_primary_for_flag("Plan", false), "Plan");
-    assert_eq!(resolve_primary_for_flag("Build", false), "Build");
-    assert_eq!(resolve_primary_for_flag("Auto", false), "Build");
-    assert_eq!(resolve_primary_for_flag("Swarm", false), "Build");
+}
+
+#[test]
+fn roster_trim_auto_and_swarm_removed() {
+    assert!(!BUILTIN_AGENT_NAMES.contains(&"Auto"));
+    assert!(!BUILTIN_AGENT_NAMES.contains(&"Swarm"));
+    assert!(!is_builtin_agent("Auto"));
+    assert!(!is_builtin_agent("Swarm"));
+    assert!(embedded_default("Auto").is_none());
+    assert!(embedded_default("Swarm").is_none());
+    assert!(is_removed_primary("Auto"));
+    assert!(is_removed_primary("Swarm"));
+}
+
+#[test]
+fn roster_trim_removed_builtin_override_file_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = project_agents_dir(tmp.path());
+    for name in ["Auto", "Swarm"] {
+        fs::write(
+            dir.join(format!("{name}.md")),
+            "---\ndescription: removed primary override\nmode: primary\n---\nbody\n",
+        )
+        .unwrap();
+
+        assert!(
+            resolve(tmp.path(), name).unwrap().is_none(),
+            "removed builtin {name} override must not resolve"
+        );
+    }
+
+    let listed: Vec<String> = list_all(tmp.path()).into_iter().map(|a| a.name).collect();
+    assert!(
+        !listed.iter().any(|name| name == "Auto" || name == "Swarm"),
+        "removed builtin overrides must not appear in list_all: {listed:?}"
+    );
 }
 
 #[test]
 fn next_primary_in_cycle_wraps_builtins_only() {
-    let order: Vec<String> = vec!["Auto".into(), "Plan".into(), "Build".into()];
-    assert_eq!(next_primary_in_cycle("Auto", &order), "Plan");
+    let order: Vec<String> = vec!["Plan".into(), "Build".into()];
     assert_eq!(next_primary_in_cycle("Plan", &order), "Build");
-    // Build wraps back to Auto when there are no user-defined primaries.
-    assert_eq!(next_primary_in_cycle("Build", &order), "Auto");
+    assert_eq!(next_primary_in_cycle("Build", &order), "Plan");
 }
 
 #[test]
 fn next_primary_in_cycle_wraps_through_user_primaries() {
-    let order: Vec<String> = vec![
-        "Auto".into(),
-        "Plan".into(),
-        "Build".into(),
-        "alpha".into(),
-        "zeta".into(),
-    ];
+    let order: Vec<String> = vec!["Plan".into(), "Build".into(), "alpha".into(), "zeta".into()];
     assert_eq!(next_primary_in_cycle("Build", &order), "alpha");
     assert_eq!(next_primary_in_cycle("alpha", &order), "zeta");
     // The last user primary wraps back to the front of the cycle.
-    assert_eq!(next_primary_in_cycle("zeta", &order), "Auto");
+    assert_eq!(next_primary_in_cycle("zeta", &order), "Plan");
 }
 
 #[test]
-fn shift_tab_cycle_wraps_through_swarm_back_to_auto() {
-    // Regression for the `Shift+Tab` cycle getting stuck on `Swarm`
-    // (implementation note): driving the cycle from
-    // `Auto` must visit every builtin primary, advance *past* `Swarm`, and
-    // wrap back to `Auto` — indefinitely, with no stuck state in either
-    // direction of travel.
-    let order: Vec<String> = vec!["Auto".into(), "Plan".into(), "Build".into(), "Swarm".into()];
-    // One full lap from `Auto`.
-    let mut cur = "Auto".to_string();
+fn shift_tab_cycle_wraps_plan_build_only() {
+    let order: Vec<String> = vec!["Plan".into(), "Build".into()];
+    let mut cur = "Plan".to_string();
     let mut visited = Vec::new();
     for _ in 0..order.len() {
         cur = next_primary_in_cycle(&cur, &order);
         visited.push(cur.clone());
     }
-    assert_eq!(visited, vec!["Plan", "Build", "Swarm", "Auto"]);
-    // The single step the bug broke: leaving `Swarm` advances to the front.
-    assert_eq!(next_primary_in_cycle("Swarm", &order), "Auto");
-    // And it keeps looping (a second lap is identical — no stuck state).
-    let mut cur = "Auto".to_string();
-    for expected in ["Plan", "Build", "Swarm", "Auto", "Plan"] {
+    assert_eq!(visited, vec!["Build", "Plan"]);
+    let mut cur = "Plan".to_string();
+    for expected in ["Build", "Plan", "Build"] {
         cur = next_primary_in_cycle(&cur, &order);
         assert_eq!(cur, expected, "cycle stalled after {cur}");
     }
@@ -906,11 +920,11 @@ fn shift_tab_cycle_wraps_through_swarm_back_to_auto() {
 
 #[test]
 fn next_primary_in_cycle_off_cycle_starts_at_front() {
-    let order: Vec<String> = vec!["Auto".into(), "Plan".into(), "Build".into()];
+    let order: Vec<String> = vec!["Plan".into(), "Build".into()];
     // A subagent / stale name isn't in the cycle — start at the front.
-    assert_eq!(next_primary_in_cycle("builder", &order), "Auto");
+    assert_eq!(next_primary_in_cycle("builder", &order), "Plan");
     // An empty cycle is a no-op (returns the current name unchanged).
-    assert_eq!(next_primary_in_cycle("Auto", &[]), "Auto");
+    assert_eq!(next_primary_in_cycle("Build", &[]), "Build");
 }
 
 // ── Per-agent tool-description overrides ────────────────────────────────────

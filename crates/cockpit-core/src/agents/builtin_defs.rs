@@ -24,14 +24,12 @@ use super::{AgentDef, AgentMode, ToolDescriptionSpec, ToolTier};
 /// listing order. Drives the override-resolution, listing, and reset
 /// paths. Driven off the code (the factory functions).
 pub const BUILTIN_AGENT_NAMES: &[&str] = &[
-    "Auto",
     "Build",
     "builder",
     "explore",
     "deepthink",
     "scout",
     "Plan",
-    "Swarm",
     "bee",
     "Multireview",
 ];
@@ -41,19 +39,13 @@ pub fn is_builtin_agent(name: &str) -> bool {
     BUILTIN_AGENT_NAMES.contains(&name)
 }
 
-/// The builtin primaries gated behind experimental mode
-/// (implementation note): `Auto` and `Swarm`. The single source of truth for the gated-name set — every
-/// gate decision (`chat_ownable_primaries` filtering, the front-door /
-/// stale-session fallback in [`resolve_primary_for_flag`], the `/settings`
-/// `defaultPrimaryAgent` cycle, the slash-swap rejection) derives from this
-/// list, so the names are never duplicated across call sites.
-pub const EXPERIMENTAL_PRIMARY_NAMES: &[&str] = &["Auto", "Swarm"];
+/// Builtin primaries removed before release. These names stay reserved so
+/// stale sessions/configs degrade to `Build` and old ejected overrides do not
+/// resurrect them as custom agents.
+pub const REMOVED_PRIMARY_NAMES: &[&str] = &["Auto", "Swarm"];
 
-/// True when `name` is a builtin primary gated behind experimental mode.
-/// `Build` (and every user-defined custom primary) is never gated. This is
-/// the single predicate the rest of the gate routes through.
-pub fn is_experimental_primary(name: &str) -> bool {
-    EXPERIMENTAL_PRIMARY_NAMES.contains(&name)
+pub fn is_removed_primary(name: &str) -> bool {
+    REMOVED_PRIMARY_NAMES.contains(&name)
 }
 
 /// Built-in primaries that are real primary agents but never appear in the
@@ -65,38 +57,21 @@ pub fn is_hidden_primary(name: &str) -> bool {
     HIDDEN_PRIMARY_NAMES.contains(&name)
 }
 
-/// The non-experimental builtin primary the gate falls back to when
-/// experimental mode is off (implementation note).
+/// The builtin primary used when a stored or configured primary is no longer
+/// available.
 pub const FALLBACK_PRIMARY: &str = "Build";
-
-/// Resolve a candidate primary-agent `name` against the experimental flag:
-/// when `experimental_mode` is off and `name` is an
-/// [`is_experimental_primary`] builtin, silently fall back to
-/// [`FALLBACK_PRIMARY`] (`Build`); otherwise return `name` unchanged. Used
-/// by the default front-door resolution and the stale-session resume path
-/// so that, with experimental off, the active primary is never a gated
-/// agent.
-pub fn resolve_primary_for_flag(name: &str, experimental_mode: bool) -> String {
-    if !experimental_mode && is_experimental_primary(name) {
-        FALLBACK_PRIMARY.to_string()
-    } else {
-        name.to_string()
-    }
-}
 
 /// The embedded default [`AgentDef`] for a built-in `name`, or `None`
 /// when `name` is not a built-in. The `prompt` is the same body the
 /// factory functions compose into the system prompt.
 pub fn embedded_default(name: &str) -> Option<AgentDef> {
     match name {
-        "Auto" => Some(auto_def()),
         "Build" => Some(build_def()),
         "builder" => Some(builder_def()),
         "explore" => Some(explore_def()),
         "deepthink" => Some(deepthink_def()),
         "scout" => Some(scout_def()),
         "Plan" => Some(plan_def()),
-        "Swarm" => Some(swarm_def()),
         "bee" => Some(bee_def()),
         "Multireview" => Some(multireview_def()),
         _ => None,
@@ -159,22 +134,6 @@ fn def_with_normal(
         // Embedded defaults have no on-disk source.
         source: PathBuf::new(),
     }
-}
-
-/// `Auto` — the default front-door primary. Converses, answers plain
-/// questions directly, and routes to `Plan`/`Build` via the `handoff`
-/// tool. Tool surface mirrors [`crate::engine::builtin::auto`].
-fn auto_def() -> AgentDef {
-    def_with_normal(
-        "Auto",
-        "Default front-door agent; converses and hands off to `Plan` or `Build` once intent is clear.",
-        AgentMode::Primary,
-        &[
-            "read", "bash", "search", "lsp", "skill", "question", "handoff", "mcp",
-        ],
-        crate::engine::builtin::AUTO_PROMPT,
-        Some(crate::engine::builtin::AUTO_PROMPT_NORMAL),
-    )
 }
 
 /// `Build` — the user-facing, write-capable primary agent (GOALS §3a).
@@ -436,52 +395,7 @@ fn plan_def() -> AgentDef {
     )
 }
 
-/// `Swarm` — the interactive, write-capable recursive fan-out primary
-/// (GOALS §24/§26). `Build`'s full surface plus the `spawn` tool for
-/// recursive, parallel, background `bee` fan-out — the sole leaf-termination
-/// exception. Tool surface mirrors [`crate::engine::builtin::swarm`].
-fn swarm_def() -> AgentDef {
-    def_with_normal(
-        "Swarm",
-        "Recursive fan-out primary; write-capable, partitions a wide task into parallel background `bee` workers.",
-        AgentMode::Primary,
-        &[
-            "read",
-            "bash",
-            // full intel (GOALS §21)
-            "context_pack",
-            "tree",
-            "outline",
-            "symbol_find",
-            "word",
-            "deps",
-            "hot",
-            "circular",
-            "search",
-            "impact",
-            "change_impact",
-            "lsp",
-            // write/lock set (arbitrated by the lock authority)
-            "readlock",
-            "writeunlock",
-            "editunlock",
-            "unlock",
-            "schedule",
-            "question",
-            "skill",
-            "skill_manage",
-            "harness_list",
-            "harness_invoke",
-            "task",
-            "spawn",
-            "mcp",
-        ],
-        crate::engine::builtin::SWARM_PROMPT,
-        Some(crate::engine::builtin::SWARM_PROMPT_NORMAL),
-    )
-}
-
-/// `bee` — `Swarm`'s recursive, noninteractive, write-capable worker
+/// `bee` — recursive, noninteractive, write-capable fan-out worker
 /// (GOALS §24/§26). `builder`'s write+intel surface plus `spawn` for deeper
 /// fan-out; no base MCP (parent-grantable). Tool surface mirrors
 /// [`crate::engine::builtin::bee`].

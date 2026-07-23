@@ -450,7 +450,7 @@ fn agent_switch_success_lines_coalesce_until_locked() {
 }
 
 #[test]
-fn swarm_warning_is_inserted_only_when_switch_line_locks() {
+fn roster_trim_primary_switch_confirmation_has_no_swarm_warning() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app(&tmp);
 
@@ -458,11 +458,5 @@ fn swarm_warning_is_inserted_only_when_switch_line_locks() {
     assert_eq!(plain_lines(&app), vec!["Switched primary agent to `Swarm`"]);
 
     app.lock_pending_agent_switch_log();
-    assert_eq!(
-        plain_lines(&app),
-        vec![
-            super::SWARM_TOKEN_BURN_WARNING,
-            "Switched primary agent to `Swarm`"
-        ]
-    );
+    assert_eq!(plain_lines(&app), vec!["Switched primary agent to `Swarm`"]);
 }

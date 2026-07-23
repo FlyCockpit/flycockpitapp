@@ -768,7 +768,7 @@ mod tests {
         db.insert_session_event(
             sid,
             SessionEventKind::UserMessage,
-            Some("Auto"),
+            Some("Build"),
             None,
             &json!({ "text": text }),
         )
@@ -789,7 +789,7 @@ mod tests {
 
     fn agent(seq: Option<i64>) -> HistoryEntry {
         HistoryEntry::Agent {
-            name: "Auto".into(),
+            name: "Build".into(),
             text: "ok".into(),
             reasoning: String::new(),
             timestamp: chrono::Local::now(),
@@ -1014,7 +1014,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = test_app(tmp.path());
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "Auto").unwrap();
+        let session = db.create_session("p", "/x", "Build").unwrap();
         let sid = session.session_id;
         app.launch.session_id = Some(sid);
         let seq = record_msg(&db, sid, "pin me");
@@ -1168,7 +1168,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = test_app(tmp.path());
         app.history = vec![HistoryEntry::Agent {
-            name: "Auto".into(),
+            name: "Build".into(),
             text: "before\n```rust\nlet x=1;\n```\nafter".into(),
             reasoning: String::new(),
             timestamp: chrono::Local::now(),
@@ -1183,7 +1183,7 @@ mod tests {
 
         let (label, text, shape) = app.copy_target_text().unwrap();
 
-        assert_eq!(label, "Auto message code block 1");
+        assert_eq!(label, "Build message code block 1");
         assert_eq!(text, "let x=1;\n");
         assert_eq!(shape, CopyShape::CodeBlock);
     }

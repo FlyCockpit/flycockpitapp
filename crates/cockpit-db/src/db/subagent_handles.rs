@@ -109,11 +109,11 @@ impl Db {
 mod tests {
     use super::*;
 
-    #[test]
-    fn save_load_round_trip_and_scopes_to_session() {
+    #[tokio::test]
+    async fn save_load_round_trip_and_scopes_to_session() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "explore").unwrap();
-        let other = db.create_session("p", "/x", "explore").unwrap();
+        let s = db.create_session("p", "/x", "explore").await.unwrap();
+        let other = db.create_session("p", "/x", "explore").await.unwrap();
         db.save_subagent_handle("h1", s.session_id, "explore", Some("/repo/a"), "[1,2,3]")
             .unwrap();
 
@@ -139,10 +139,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn save_upserts_transcript() {
+    #[tokio::test]
+    async fn save_upserts_transcript() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "explore").unwrap();
+        let s = db.create_session("p", "/x", "explore").await.unwrap();
         db.save_subagent_handle("h1", s.session_id, "explore", Some("/repo/a"), "[1]")
             .unwrap();
         db.save_subagent_handle("h1", s.session_id, "explore", Some("/repo/b"), "[1,2]")

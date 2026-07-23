@@ -18,6 +18,8 @@
 //! is shared across agents in the same conversation; agent
 //! transcripts are private.
 
+#![allow(deprecated)]
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -386,8 +388,16 @@ impl Session {
             row.created_by_principal = principal;
             return Ok(());
         }
+        let session_id = self.id;
         self.db
-            .set_session_created_by_principal(self.id, principal.as_deref())
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
+                    params![principal, session_id.to_string()],
+                )
+                .context("setting session created_by_principal")?;
+                Ok(())
+            })
             .context("setting session creator principal")
     }
 
@@ -768,7 +778,7 @@ fn scheduled_title_slot(user_turns: usize, last_slot: u8) -> Option<u8> {
 }
 
 fn count_user_turns_for_title(db: &Db, session_id: Uuid) -> usize {
-    match db.thread_turns(session_id) {
+    match db.write_blocking(move |conn| crate::db::Db::thread_turns_conn(conn, session_id)) {
         Ok(turns) => turns.iter().filter(|t| t.role == "user").count(),
         Err(e) => {
             tracing::debug!(error = %e, "auto_title: reading user turn count failed");
@@ -1600,8 +1610,8 @@ mod tests {
         assert_eq!(s.repeated_recoverable_tool_call_message("sig-a"), None);
     }
 
-    #[test]
-    fn deferred_session_is_not_written_until_first_message() {
+    #[tokio::test]
+    async fn deferred_session_is_not_written_until_first_message() {
         // session-id-display-and-lazy-persist: a deferred session has an id
         // and short_id in memory but no `sessions` row, and never appears in
         // listings until persisted.
@@ -1611,8 +1621,8 @@ mod tests {
         assert!(!s.short_id.is_empty());
         assert!(!s.is_persisted());
         // No DB row yet: not fetchable, not listed.
-        assert!(db.get_session(s.id).unwrap().is_none());
-        assert!(db.list_sessions(true, 100).unwrap().is_empty());
+        assert!(db.get_session(s.id).await.unwrap().is_none());
+        assert!(db.list_sessions(true, 100).await.unwrap().is_empty());
 
         // First user message → persist. The flush returns `true` once.
         assert!(
@@ -1620,17 +1630,17 @@ mod tests {
             "first persist writes the row"
         );
         assert!(s.is_persisted());
-        let row = db.get_session(s.id).unwrap().expect("row now exists");
+        let row = db.get_session(s.id).await.unwrap().expect("row now exists");
         assert_eq!(row.short_id.as_deref(), Some(s.short_id.as_str()));
-        assert_eq!(db.list_sessions(true, 100).unwrap().len(), 1);
+        assert_eq!(db.list_sessions(true, 100).await.unwrap().len(), 1);
 
         // Idempotent: a second flush is a no-op (returns `false`).
         assert!(!s.persist_if_needed().unwrap());
-        assert_eq!(db.list_sessions(true, 100).unwrap().len(), 1);
+        assert_eq!(db.list_sessions(true, 100).await.unwrap().len(), 1);
     }
 
-    #[test]
-    fn deferred_persist_carries_provider_and_model() {
+    #[tokio::test]
+    async fn deferred_persist_carries_provider_and_model() {
         // A model picked before the first message survives the deferred
         // write (session-id-display-and-lazy-persist).
         let db = Db::open_in_memory().unwrap();
@@ -1638,15 +1648,15 @@ mod tests {
         // set_active_model's DB UPDATE is a no-op while un-persisted; the
         // value lives in memory and must land in the deferred INSERT.
         s.set_active_model("anthropic", "claude-opus-4-7").unwrap();
-        assert!(db.get_session(s.id).unwrap().is_none());
+        assert!(db.get_session(s.id).await.unwrap().is_none());
         s.persist_if_needed().unwrap();
-        let row = db.get_session(s.id).unwrap().unwrap();
+        let row = db.get_session(s.id).await.unwrap().unwrap();
         assert_eq!(row.provider.as_deref(), Some("anthropic"));
         assert_eq!(row.model.as_deref(), Some("claude-opus-4-7"));
     }
 
-    #[test]
-    fn deferred_persist_carries_agent_touch_and_viewed() {
+    #[tokio::test]
+    async fn deferred_persist_carries_agent_touch_and_viewed() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "Build").unwrap();
         let original_last_active = {
@@ -1657,24 +1667,24 @@ mod tests {
         s.set_active_agent("Plan").unwrap();
         s.touch().unwrap();
         s.mark_viewed().unwrap();
-        assert!(db.get_session(s.id).unwrap().is_none());
+        assert!(db.get_session(s.id).await.unwrap().is_none());
 
         s.persist_if_needed().unwrap();
-        let row = db.get_session(s.id).unwrap().unwrap();
+        let row = db.get_session(s.id).await.unwrap().unwrap();
         assert_eq!(row.active_agent, "Plan");
         assert!(row.last_active_at >= original_last_active);
         assert!(row.last_viewed_at.is_some());
     }
 
-    #[test]
-    fn create_is_persisted_immediately() {
+    #[tokio::test]
+    async fn create_is_persisted_immediately() {
         // The non-deferred constructor writes the row up front, so
         // persist_if_needed is a no-op and is_persisted is true.
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db.clone(), PathBuf::from("/x"), "builder").unwrap();
         assert!(s.is_persisted());
         assert!(!s.persist_if_needed().unwrap());
-        assert!(db.get_session(s.id).unwrap().is_some());
+        assert!(db.get_session(s.id).await.unwrap().is_some());
     }
 
     #[test]
@@ -1798,8 +1808,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deferred_snapshot_baseline_survives_first_persist() {
+    #[tokio::test]
+    async fn deferred_snapshot_baseline_survives_first_persist() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("AGENTS.md");
         std::fs::write(&path, "RULE A\nRULE B\n").unwrap();
@@ -1807,7 +1817,7 @@ mod tests {
         let s = Session::create_deferred(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
 
         s.snapshot_guidance_baseline(tmp.path());
-        assert!(db.get_session(s.id).unwrap().is_none());
+        assert!(db.get_session(s.id).await.unwrap().is_none());
 
         s.persist_if_needed().unwrap();
         let baseline = s.db.guidance_baseline(s.id).unwrap().expect("baseline set");

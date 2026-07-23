@@ -1516,15 +1516,15 @@ mod tests {
         assert_eq!(out, body);
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(not(windows))]
-    fn bang_command_shell_uses_sh_on_unix_like_platforms() {
+    async fn bang_command_shell_uses_sh_on_unix_like_platforms() {
         assert_eq!(bang_command_shell(), ("sh", "-c"));
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(windows)]
-    fn bang_command_shell_uses_cmd_on_windows() {
+    async fn bang_command_shell_uses_cmd_on_windows() {
         assert_eq!(bang_command_shell(), ("cmd", "/C"));
     }
 

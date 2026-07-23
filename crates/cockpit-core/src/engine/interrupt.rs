@@ -686,14 +686,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn resolve_unknown_id_returns_false() {
+    #[test]
+    fn resolve_unknown_id_returns_false() {
         let hub = InterruptHub::detached();
         assert!(!hub.resolve(Uuid::new_v4(), ResolveResponse::Cancel));
     }
 
-    #[tokio::test]
-    async fn dropping_pending_clears_the_registry() {
+    #[test]
+    fn dropping_pending_clears_the_registry() {
         let hub = InterruptHub::detached();
         let id = Uuid::new_v4();
         let pending = hub.register(id);
@@ -733,7 +733,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_park_wakes_waiter_as_parked() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "builder").unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, _events) = attached_hub(db.clone(), session.session_id);
         let set = question_set();
         let id = db
@@ -752,7 +752,7 @@ mod tests {
     #[tokio::test]
     async fn interrupt_replay_answer_requires_matching_id() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "builder").unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, _events) = attached_hub(db.clone(), session.session_id);
         let hub = Arc::new(hub);
         let resolver_db = db.clone();
@@ -848,7 +848,7 @@ mod tests {
     #[tokio::test]
     async fn interrupt_replay_multiple_parked_answers_keyed_by_id() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "builder").unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, _events) = attached_hub(db.clone(), session.session_id);
         let hub = Arc::new(hub);
         let first_id = Uuid::new_v4();
@@ -922,7 +922,7 @@ mod tests {
     #[tokio::test]
     async fn interrupt_replay_duplicate_prompt_shape_uses_persisted_occurrence() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "builder").unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, _events) = attached_hub(db.clone(), session.session_id);
         let hub = Arc::new(hub);
         let resolver_db = db.clone();
@@ -1002,7 +1002,7 @@ mod tests {
     #[tokio::test]
     async fn interrupt_replay_unconsumed_answer_discarded() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "builder").unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, _events) = attached_hub(db.clone(), session.session_id);
         let hub = Arc::new(hub);
         let resolver_db = db.clone();
@@ -1067,7 +1067,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_raises_keep_fifo_active_and_rehydrate_with_counter() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "builder").unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, mut events) = attached_hub(db.clone(), session.session_id);
         let set = question_set();
         let first = db
@@ -1138,7 +1138,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_active_waiter_leaves_row_open_without_advancing() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "builder").unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, mut events) = attached_hub(db.clone(), session.session_id);
         let set = question_set();
         let first = db
@@ -1165,7 +1165,7 @@ mod tests {
     #[tokio::test]
     async fn park_all_registered_delegates_to_park_marks_row_and_wakes_waiter() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "builder").unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, _events) = attached_hub(db.clone(), session.session_id);
         let interrupt_id = db
             .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
@@ -1187,7 +1187,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_queued_waiter_leaves_fifo_unchanged() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "builder").unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, mut events) = attached_hub(db.clone(), session.session_id);
         let set = question_set();
         let first = db

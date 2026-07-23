@@ -492,6 +492,10 @@ fn daemon_autostart_notice(
 }
 
 impl App {
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; TUI trust persistence remains sync until db-async-workspace-trust"
+    )]
     pub(super) fn apply_workspace_trust_choice(
         &mut self,
         root: cockpit_config::trust::TrustRoot,
@@ -501,7 +505,16 @@ impl App {
             self.show_toast("workspace trust could not be saved", ToastKind::Error);
             return false;
         };
-        if let Err(error) = db.set_workspace_trust(&root.root, mode) {
+        let normalized_root = root.root.to_string_lossy().into_owned();
+        if let Err(error) = db.write_blocking(move |conn| {
+            cockpit_db::Db::set_workspace_trust_conn(
+                conn,
+                &normalized_root,
+                mode,
+                chrono::Utc::now().timestamp(),
+            )
+            .map(|_| ())
+        }) {
             self.show_toast(
                 format!("workspace trust could not be saved: {error}"),
                 ToastKind::Error,

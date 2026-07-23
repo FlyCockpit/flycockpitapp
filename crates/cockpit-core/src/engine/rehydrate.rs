@@ -4263,13 +4263,14 @@ mod tests {
         assert!(u < a, "user precedes assistant in seq order: {u} < {a}");
     }
 
-    #[test]
-    fn btw_events_absent_from_parent_history() {
+    #[tokio::test]
+    async fn btw_events_absent_from_parent_history() {
         let parent = root_session();
         record_user(&parent, "parent before btw");
         let btw = parent
             .db
             .create_btw_fork(parent.id, true)
+            .await
             .expect("btw fork");
         let btw_session = Session::resume(parent.db.clone(), btw.info.session_id)
             .unwrap()
@@ -4292,12 +4293,12 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-session-log"
     )]
-    fn history_snapshot_conn_matches_db_wrapper_byte_for_byte() {
+    async fn history_snapshot_conn_matches_db_wrapper_byte_for_byte() {
         let s = root_session();
         record_user(&s, "read the file");
         record_assistant(&s, "infer-1", "let me read it");
@@ -4321,12 +4322,12 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-session-log"
     )]
-    fn history_snapshot_since_replays_only_rows_after_cursor() {
+    async fn history_snapshot_since_replays_only_rows_after_cursor() {
         let s = root_session();
         record_user(&s, "already rendered");
         record_assistant(&s, "infer-1", "also rendered");
@@ -4363,12 +4364,12 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-session-log"
     )]
-    fn history_page_before_returns_newest_entries_oldest_first() {
+    async fn history_page_before_returns_newest_entries_oldest_first() {
         let s = root_session();
         record_user(&s, "one");
         record_user(&s, "two");
@@ -4389,12 +4390,12 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-session-log"
     )]
-    fn history_page_before_walk_reconstructs_full_snapshot() {
+    async fn history_page_before_walk_reconstructs_full_snapshot() {
         let s = root_session();
         record_user(&s, "one");
         record_assistant(&s, "infer-1", "two");
@@ -4427,12 +4428,12 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-session-log"
     )]
-    fn history_page_before_reports_has_more_until_first_entry() {
+    async fn history_page_before_reports_has_more_until_first_entry() {
         let s = root_session();
         record_user(&s, "one");
         record_user(&s, "two");
@@ -4462,12 +4463,12 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-session-log"
     )]
-    fn history_page_before_empty_session_returns_empty_page() {
+    async fn history_page_before_empty_session_returns_empty_page() {
         let s = root_session();
 
         let page =
@@ -4479,12 +4480,12 @@ mod tests {
         assert_eq!(page.oldest_seq, None);
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-session-log"
     )]
-    fn history_page_before_carries_compact_boundary_brief() {
+    async fn history_page_before_carries_compact_boundary_brief() {
         let s = root_session();
         let handoff_id = Uuid::new_v4();
         s.db.store_compaction_payload(
@@ -4603,12 +4604,12 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-session-log"
     )]
-    fn session_compacted_persists_handoff() {
+    async fn session_compacted_persists_handoff() {
         let s = root_session();
         let handoff = format!("## Decisions\n{}", "durable ".repeat(3_000));
         let tail = vec![
@@ -4710,12 +4711,12 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-session-log"
     )]
-    fn compaction_entries_survive_replay() {
+    async fn compaction_entries_survive_replay() {
         let s = root_session();
         let seq = s
             .record_session_compacted_with_source(
@@ -4899,12 +4900,12 @@ mod tests {
         assert!(matches!(snap[1], proto::HistoryEntry::Assistant { .. }));
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-session-log"
     )]
-    fn history_snapshot_active_subagent_includes_running_row_and_child_turns() {
+    async fn history_snapshot_active_subagent_includes_running_row_and_child_turns() {
         let s = root_session();
         record_user(&s, "build it");
         record_assistant(&s, "infer-1", "delegating");
@@ -4997,15 +4998,16 @@ mod subagent_observe_tests {
     use crate::db::session_log::SessionEventKind;
     use serde_json::json;
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-session-log"
     )]
-    fn subagent_snapshot_isolates_interleaved_runs_with_same_agent() {
+    async fn subagent_snapshot_isolates_interleaved_runs_with_same_agent() {
         let db = Db::open_in_memory().unwrap();
         let session = db
             .create_session("project", "/tmp/project", "Build")
+            .await
             .unwrap();
         let sid = session.session_id;
 
@@ -5081,15 +5083,16 @@ mod subagent_observe_tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-session-log"
     )]
-    fn root_snapshot_hides_finished_child_rows() {
+    async fn root_snapshot_hides_finished_child_rows() {
         let db = Db::open_in_memory().unwrap();
         let session = db
             .create_session("project", "/tmp/project", "Build")
+            .await
             .unwrap();
         let sid = session.session_id;
         db.insert_session_event(

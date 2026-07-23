@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use super::*;
 
 impl Session {
@@ -222,8 +224,18 @@ impl Session {
         }) {
             return Ok(());
         }
+        let session_id = self.id;
+        let provider = provider.to_string();
+        let model = model.to_string();
         self.db
-            .set_session_model(self.id, provider, model)
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET provider = ?1, model = ?2 WHERE session_id = ?3",
+                    params![provider, model, session_id.to_string()],
+                )
+                .context("setting session model")?;
+                Ok(())
+            })
             .context("persisting active model")?;
         Ok(())
     }
@@ -243,8 +255,17 @@ impl Session {
         }) {
             return Ok(());
         }
+        let session_id = self.id;
+        let active_agent = agent.to_string();
         self.db
-            .set_session_agent(self.id, agent)
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
+                    params![active_agent, session_id.to_string()],
+                )
+                .context("setting session agent")?;
+                Ok(())
+            })
             .context("persisting active agent")
     }
 }

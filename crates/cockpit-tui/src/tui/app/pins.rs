@@ -1009,12 +1009,12 @@ mod tests {
         assert_eq!(App::entry_pin_seq(&toolbox()), None);
     }
 
-    #[test]
-    fn pin_cache_refreshes_after_pin_and_unpin() {
+    #[tokio::test]
+    async fn pin_cache_refreshes_after_pin_and_unpin() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = test_app(tmp.path());
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "Build").unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
         let sid = session.session_id;
         app.launch.session_id = Some(sid);
         let seq = record_msg(&db, sid, "pin me");

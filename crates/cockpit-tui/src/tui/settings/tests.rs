@@ -1659,8 +1659,8 @@ fn on_fetch_all_page(d: &SettingsDialog) -> bool {
     )
 }
 
-#[tokio::test]
-async fn providers_list_initial_enter_edits_first_provider() {
+#[test]
+fn providers_list_initial_enter_edits_first_provider() {
     // Providers configured: initial focus is the first provider row,
     // not the `[refetch provider models]` button.
     let tmp = TempDir::new().unwrap();

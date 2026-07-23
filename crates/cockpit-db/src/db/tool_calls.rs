@@ -676,8 +676,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn fixture(db: &Db) -> Uuid {
-        let s = db.create_session("p", "/x", "a").unwrap();
+    async fn fixture(db: &Db) -> Uuid {
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         s.session_id
     }
 
@@ -720,10 +720,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn insert_and_list_round_trip() {
+    #[tokio::test]
+    async fn insert_and_list_round_trip() {
         let db = Db::open_in_memory().unwrap();
-        let sid = fixture(&db);
+        let sid = fixture(&db).await;
         let ev = ToolCallEvent {
             event_id: Uuid::new_v4(),
             session_id: sid,
@@ -770,10 +770,10 @@ mod tests {
         assert_eq!(rows[0].llm_mode, Some("defensive".to_string()));
     }
 
-    #[test]
-    fn child_rows_round_trip_with_parent_linkage() {
+    #[tokio::test]
+    async fn child_rows_round_trip_with_parent_linkage() {
         let db = Db::open_in_memory().unwrap();
-        let sid = fixture(&db);
+        let sid = fixture(&db).await;
         let parent = tool_call_fixture(sid, "outer", "mcp", 100);
         let mut child_a = tool_call_fixture(sid, "outer:mcp:0", "test_count", 101);
         child_a.parent_call_id = Some("outer".into());
@@ -807,10 +807,10 @@ mod tests {
         assert_eq!(rows[2].mcp_server.as_deref(), Some("external"));
     }
 
-    #[test]
-    fn existing_call_sites_unchanged() {
+    #[tokio::test]
+    async fn existing_call_sites_unchanged() {
         let db = Db::open_in_memory().unwrap();
-        let sid = fixture(&db);
+        let sid = fixture(&db).await;
         let ev = tool_call_fixture(sid, "top-level", "read", 100);
 
         db.insert_tool_call(&ev).unwrap();
@@ -825,10 +825,10 @@ mod tests {
         assert_eq!(rows[0].output, ev.output);
     }
 
-    #[test]
-    fn list_failed_tool_calls_filters_correctly() {
+    #[tokio::test]
+    async fn list_failed_tool_calls_filters_correctly() {
         let db = Db::open_in_memory().unwrap();
-        let sid = fixture(&db);
+        let sid = fixture(&db).await;
         let mk = |tool: &str, ts: i64, hard_fail: bool, recovery: Recovery| ToolCallEvent {
             event_id: Uuid::new_v4(),
             session_id: sid,
@@ -939,14 +939,14 @@ mod tests {
         assert_eq!(rows.len(), 2);
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn language_populated_from_extension() {
+    async fn language_populated_from_extension() {
         let db = Db::open_in_memory().unwrap();
-        let sid = fixture(&db);
+        let sid = fixture(&db).await;
         let ev = ToolCallEvent {
             event_id: Uuid::new_v4(),
             session_id: sid,
@@ -996,14 +996,14 @@ mod tests {
         assert_eq!(language.as_deref(), Some("Python"));
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn shape_fingerprint_persists_and_groups_by_model_and_fingerprint() {
+    async fn shape_fingerprint_persists_and_groups_by_model_and_fingerprint() {
         let db = Db::open_in_memory().unwrap();
-        let sid = fixture(&db);
+        let sid = fixture(&db).await;
         let mk = |model: &str, fp: Option<&str>, ts: i64| ToolCallEvent {
             event_id: Uuid::new_v4(),
             session_id: sid,
@@ -1086,8 +1086,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decode_recovery_unknown_kind_preserves_raw_fields() {
+    #[tokio::test]
+    async fn decode_recovery_unknown_kind_preserves_raw_fields() {
         let raw = ToolCallEventRaw {
             event_id: Uuid::new_v4().to_string(),
             session_id: Uuid::new_v4().to_string(),
@@ -1135,8 +1135,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decode_recovery_known_kind_unknown_stage_preserves_raw_fields() {
+    #[tokio::test]
+    async fn decode_recovery_known_kind_unknown_stage_preserves_raw_fields() {
         assert_eq!(
             decode_recovery(&Some("name_repair".into()), &Some("future".into())),
             Recovery::Unknown {
@@ -1153,8 +1153,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decode_recovery_name_repair_stages_round_trip() {
+    #[tokio::test]
+    async fn decode_recovery_name_repair_stages_round_trip() {
         for stage in ["rebind", "sanitize"] {
             let decoded =
                 decode_recovery(&Some("name_repair".to_string()), &Some(stage.to_string()));
@@ -1170,8 +1170,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn decode_recovery_text_embedded_stages_round_trip() {
+    #[tokio::test]
+    async fn decode_recovery_text_embedded_stages_round_trip() {
         for stage in ["openai", "agent_keyed"] {
             let decoded =
                 decode_recovery(&Some("text_embedded".to_string()), &Some(stage.to_string()));

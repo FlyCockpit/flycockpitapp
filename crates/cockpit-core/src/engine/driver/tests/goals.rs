@@ -637,8 +637,8 @@ async fn goal_continue_only_maintenance_events_emits_diagnostic_and_keeps_latch(
     assert_eq!(diagnostic.data["anchor_seq"], serde_json::json!(anchor));
 }
 
-#[tokio::test]
-async fn goal_continue_progress_accepts_goal_status_update() {
+#[test]
+fn goal_continue_progress_accepts_goal_status_update() {
     let (driver, _tmp) = test_driver(1);
     driver
         .session

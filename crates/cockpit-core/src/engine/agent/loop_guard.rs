@@ -355,8 +355,8 @@ mod loop_collapse_tests {
         );
     }
 
-    #[tokio::test]
-    async fn repeated_recoverable_tree_call_is_short_circuited_before_dispatch() {
+    #[test]
+    fn repeated_recoverable_tree_call_is_short_circuited_before_dispatch() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
         let session =

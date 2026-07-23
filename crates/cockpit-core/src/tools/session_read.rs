@@ -81,6 +81,7 @@ impl Tool for SessionReadTool {
         ctx.session
             .db
             .fts5_available()
+            .await
             .map_err(|e| invalid_input(format!("{e:#}")))?;
 
         let id_arg = args
@@ -90,12 +91,13 @@ impl Tool for SessionReadTool {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| invalid_input("`short_id` is required"))?;
 
-        let session_id = resolve_session(ctx, id_arg)?;
+        let session_id = resolve_session(ctx, id_arg).await?;
 
         let turns = ctx
             .session
             .db
             .thread_turns(session_id)
+            .await
             .map_err(|e| anyhow::anyhow!("session_read: {e:#}"))?;
         if turns.is_empty() {
             return Ok(ToolOutput::text(format!(
@@ -121,7 +123,7 @@ impl Tool for SessionReadTool {
         let start_seq = if let Some(o) = offset {
             o
         } else if let Some(q) = query {
-            match_window_start(ctx, session_id, q, &turns)?
+            match_window_start(ctx, session_id, q, &turns).await?
         } else {
             turns[0].seq
         };
@@ -136,12 +138,13 @@ impl Tool for SessionReadTool {
 /// look globally and report an ambiguous match by id rather than
 /// guessing. An archived thread is readable by explicit id (the
 /// archive exclusion only applies to search).
-fn resolve_session(ctx: &ToolCtx, id_arg: &str) -> Result<Uuid> {
+async fn resolve_session(ctx: &ToolCtx, id_arg: &str) -> Result<Uuid> {
     if let Ok(uuid) = Uuid::parse_str(id_arg) {
         if ctx
             .session
             .db
             .get_session(uuid)
+            .await
             .map_err(|e| anyhow::anyhow!("session_read: {e:#}"))?
             .is_some()
         {
@@ -155,6 +158,7 @@ fn resolve_session(ctx: &ToolCtx, id_arg: &str) -> Result<Uuid> {
         .session
         .db
         .get_session_by_short_id(&ctx.session.project_id, id_arg)
+        .await
         .map_err(|e| anyhow::anyhow!("session_read: {e:#}"))?
     {
         return Ok(row.session_id);
@@ -166,6 +170,7 @@ fn resolve_session(ctx: &ToolCtx, id_arg: &str) -> Result<Uuid> {
         .session
         .db
         .find_sessions_by_short_id_global(id_arg)
+        .await
         .map_err(|e| anyhow::anyhow!("session_read: {e:#}"))?;
     match global.len() {
         0 => Err(invalid_input(format!(
@@ -183,7 +188,7 @@ fn resolve_session(ctx: &ToolCtx, id_arg: &str) -> Result<Uuid> {
 /// whose text matches, backed up by [`CONTEXT_TURNS`] turns of context.
 /// No textual match → start from the first turn (so the read still
 /// returns something useful rather than nothing).
-fn match_window_start(
+async fn match_window_start(
     ctx: &ToolCtx,
     session_id: Uuid,
     query: &str,
@@ -193,6 +198,7 @@ fn match_window_start(
         .session
         .db
         .thread_match_seqs(session_id, query)
+        .await
         .map_err(|e| anyhow::anyhow!("session_read: {e:#}"))?;
     let Some(&first_match) = seqs.first() else {
         return Ok(turns[0].seq);
@@ -243,6 +249,8 @@ fn render_window(turns: &[ThreadTurn], start_seq: i64, id_arg: &str) -> ToolOutp
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
     use crate::db::session_log::SessionEventKind;
     use crate::tools::common::test_ctx;
@@ -253,7 +261,20 @@ mod tests {
         let s = ctx
             .session
             .db
-            .create_session(&ctx.session.project_id, "/x", "Build")
+            .write_blocking({
+                let project_id = ctx.session.project_id.clone();
+                move |conn| {
+                    crate::db::Db::insert_session_row_conn(
+                        conn,
+                        &crate::db::Db::build_new_session_row_conn(
+                            conn,
+                            &project_id,
+                            "/x",
+                            "Build",
+                        )?,
+                    )
+                }
+            })
             .unwrap();
         for (text, is_assistant) in texts {
             let kind = if *is_assistant {

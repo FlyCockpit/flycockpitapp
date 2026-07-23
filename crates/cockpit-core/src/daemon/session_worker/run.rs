@@ -263,7 +263,8 @@ pub(super) async fn run_worker(
         .clone()
         .unwrap_or_else(|| resolve_root_agent(session_id, &session.db, &extended_cfg));
     if session.assistant_name.is_none()
-        && let Some(text) = super::removed_primary_notice(session_id, &session.db, &extended_cfg)
+        && let Some(text) =
+            super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
     {
         send_current_session_event(
             &session,

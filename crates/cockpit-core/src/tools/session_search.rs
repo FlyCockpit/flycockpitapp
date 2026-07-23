@@ -82,6 +82,7 @@ impl Tool for SessionSearchTool {
         ctx.session
             .db
             .fts5_available()
+            .await
             .map_err(|e| crate::engine::tool::invalid_input(format!("{e:#}")))?;
 
         let query = args
@@ -120,6 +121,7 @@ impl Tool for SessionSearchTool {
             .session
             .db
             .search_candidates(query, project_id, Some(ctx.session.id), since, pool)
+            .await
             .map_err(|e| anyhow::anyhow!("session_search: {e:#}"))?;
 
         if hits.is_empty() {
@@ -196,6 +198,7 @@ mod tests {
             .session
             .db
             .create_session(&ctx.session.project_id, "/x", "Build")
+            .await
             .unwrap();
         ctx.session
             .db

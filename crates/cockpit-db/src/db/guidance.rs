@@ -141,10 +141,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn baseline_round_trips_and_defaults_null() {
+    #[tokio::test]
+    async fn baseline_round_trips_and_defaults_null() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         // Fresh session: no baseline yet.
         assert_eq!(db.guidance_baseline(s.session_id).unwrap(), None);
         db.set_guidance_baseline(s.session_id, Some(&baseline("/x/AGENTS.md", "deadbeef")))
@@ -165,8 +165,8 @@ mod tests {
         assert_eq!(db.guidance_baseline(s.session_id).unwrap(), None);
     }
 
-    #[test]
-    fn guidance_contents_insert_is_idempotent() {
+    #[tokio::test]
+    async fn guidance_contents_insert_is_idempotent() {
         let db = Db::open_in_memory().unwrap();
         db.put_guidance_contents("h1", "first body").unwrap();
         // Re-inserting the same hash with different contents must NOT
@@ -186,8 +186,8 @@ mod tests {
         assert_eq!(db.guidance_contents("missing").unwrap(), None);
     }
 
-    #[test]
-    fn baseline_none_for_missing_session() {
+    #[tokio::test]
+    async fn baseline_none_for_missing_session() {
         let db = Db::open_in_memory().unwrap();
         assert_eq!(db.guidance_baseline(Uuid::new_v4()).unwrap(), None);
     }

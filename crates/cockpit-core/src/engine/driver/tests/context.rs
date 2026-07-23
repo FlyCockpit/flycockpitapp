@@ -577,8 +577,8 @@ async fn consumed_brief_is_deleted() {
     );
 }
 
-#[tokio::test]
-async fn load_without_row_clears_memory_view() {
+#[test]
+fn load_without_row_clears_memory_view() {
     let (mut driver, _tmp) = test_driver_without_network(8);
     driver.shadow_brief_generation = 2;
     driver.shadow_brief = Some(ShadowBriefState::Ready(ShadowBriefReady {
@@ -597,8 +597,8 @@ async fn load_without_row_clears_memory_view() {
     );
 }
 
-#[tokio::test]
-async fn loaded_brief_generation_is_persisted_and_compared() {
+#[test]
+fn loaded_brief_generation_is_persisted_and_compared() {
     let (driver, _tmp) = test_driver_without_network(8);
     let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief {
         generation: 7,
@@ -654,8 +654,8 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
     );
 }
 
-#[tokio::test]
-async fn stale_loaded_brief_is_discarded() {
+#[test]
+fn stale_loaded_brief_is_discarded() {
     let (mut driver, _tmp) = test_driver_without_network(8);
     let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief {
         generation: 3,
@@ -733,6 +733,7 @@ async fn ephemeral_session_writes_no_rows() {
         .session
         .db
         .create_ephemeral_fork(parent.session.id, None)
+        .await
         .unwrap();
     let session = Arc::new(
         Session::resume(parent.session.db.clone(), row.session_id)
@@ -2069,8 +2070,8 @@ async fn request_compact_coalesces() {
 
 /// `classify_prune_reason` reports the telemetry reason from a plan's
 /// targets (Part D).
-#[test]
-fn classify_prune_reason_buckets() {
+#[tokio::test]
+async fn classify_prune_reason_buckets() {
     use crate::engine::prune::{DedupPlan, Elision, ElisionTarget, OVERLAP_REASON};
     let mk = |reason: &'static str| ElisionTarget {
         history_index: 0,

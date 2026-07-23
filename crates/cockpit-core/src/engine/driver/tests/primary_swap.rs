@@ -817,8 +817,8 @@ fn delegated_subagent_first_turn_is_the_actionable_brief() {
     assert!(with_why.contains("the API changed"), "motivation prefixed");
 }
 
-#[tokio::test]
-async fn ambiguous_turn_keeps_plan_active() {
+#[test]
+fn ambiguous_turn_keeps_plan_active() {
     let (driver, _t) = plan_rooted_driver();
     // No `apply_handoff` call (the model emitted no `handoff` tool call).
     assert_eq!(

@@ -127,10 +127,10 @@ impl Db {
 mod tests {
     use super::*;
 
-    #[test]
-    fn save_list_delete_round_trip() {
+    #[tokio::test]
+    async fn save_list_delete_round_trip() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         db.save_skill_pair(s.session_id, "skillslash-1", "Build", false)
             .unwrap();
         db.save_skill_pair(s.session_id, "skillslash-2", "Plan", true)

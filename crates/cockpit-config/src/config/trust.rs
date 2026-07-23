@@ -199,21 +199,21 @@ pub fn project_config_write_allowed(cockpit_dir: &Path) -> bool {
     project_config_allowed(cockpit_dir)
 }
 
-pub fn enforce_noninteractive_workspace_trust(
+pub async fn enforce_noninteractive_workspace_trust(
     db: &crate::db::Db,
     path: &Path,
 ) -> Result<WorkspaceTrustPolicy> {
-    let policy = resolve_workspace_trust_policy_from_db(db, path)?;
+    let policy = resolve_workspace_trust_policy_from_db(db, path).await?;
     set_runtime_policy(policy.root.clone(), policy.mode);
     Ok(policy)
 }
 
-pub fn resolve_workspace_trust_policy_from_db(
+pub async fn resolve_workspace_trust_policy_from_db(
     db: &crate::db::Db,
     path: &Path,
 ) -> Result<WorkspaceTrustPolicy> {
     let root = resolve_trust_root(path)?;
-    let Some(decision) = db.workspace_trust_by_root(&root.root)? else {
+    let Some(decision) = db.workspace_trust_by_root(&root.root).await? else {
         return Err(WorkspaceTrustError::Unset {
             root: root.root.clone(),
         }
@@ -372,41 +372,49 @@ mod tests {
         assert_eq!(direct.root, variant.root);
     }
 
-    #[test]
-    fn noninteractive_trust_enforcement_fails_without_decision() {
-        let _env = crate::test_env::lock();
+    #[tokio::test]
+    async fn noninteractive_trust_enforcement_fails_without_decision() {
+        let _env = crate::test_env::lock_async().await;
         clear_runtime_policy_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
-        let err = enforce_noninteractive_workspace_trust(&db, tmp.path()).unwrap_err();
+        let err = enforce_noninteractive_workspace_trust(&db, tmp.path())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("workspace trust is not set"));
         clear_runtime_policy_for_tests();
     }
 
-    #[test]
-    fn noninteractive_trust_enforcement_rejects_untrusted() {
-        let _env = crate::test_env::lock();
+    #[tokio::test]
+    async fn noninteractive_trust_enforcement_rejects_untrusted() {
+        let _env = crate::test_env::lock_async().await;
         clear_runtime_policy_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
         let root = resolve_trust_root(tmp.path()).unwrap();
         db.set_workspace_trust(&root.root, WorkspaceTrustMode::Untrusted)
+            .await
             .unwrap();
-        let err = enforce_noninteractive_workspace_trust(&db, tmp.path()).unwrap_err();
+        let err = enforce_noninteractive_workspace_trust(&db, tmp.path())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("is untrusted"));
         clear_runtime_policy_for_tests();
     }
 
-    #[test]
-    fn noninteractive_trust_enforcement_accepts_ignore_config() {
-        let _env = crate::test_env::lock();
+    #[tokio::test]
+    async fn noninteractive_trust_enforcement_accepts_ignore_config() {
+        let _env = crate::test_env::lock_async().await;
         clear_runtime_policy_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
         let root = resolve_trust_root(tmp.path()).unwrap();
         db.set_workspace_trust(&root.root, WorkspaceTrustMode::IgnoreConfig)
+            .await
             .unwrap();
-        let policy = enforce_noninteractive_workspace_trust(&db, tmp.path()).unwrap();
+        let policy = enforce_noninteractive_workspace_trust(&db, tmp.path())
+            .await
+            .unwrap();
         assert_eq!(policy.mode, WorkspaceTrustMode::IgnoreConfig);
         assert_eq!(
             runtime_policy().map(|policy| policy.mode),

@@ -222,10 +222,10 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn pin_unpin_list_and_count() {
+    #[tokio::test]
+    async fn pin_unpin_list_and_count() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Auto").unwrap();
+        let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
         let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello");
         let a = record_msg(&db, sid, SessionEventKind::AssistantMessage, "hi there");
@@ -245,10 +245,10 @@ mod tests {
         assert_eq!(db.list_pin_seqs(sid).unwrap(), vec![a]);
     }
 
-    #[test]
-    fn pinning_is_idempotent() {
+    #[tokio::test]
+    async fn pinning_is_idempotent() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Auto").unwrap();
+        let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
         let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello");
 
@@ -260,10 +260,10 @@ mod tests {
         assert_eq!(db.count_pins(sid).unwrap(), 1, "still exactly one pin");
     }
 
-    #[test]
-    fn toggle_flips_state() {
+    #[tokio::test]
+    async fn toggle_flips_state() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Auto").unwrap();
+        let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
         let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello");
 
@@ -273,10 +273,10 @@ mod tests {
         assert!(!db.is_pinned(sid, u).unwrap());
     }
 
-    #[test]
-    fn list_pins_resolves_role_and_text_in_order() {
+    #[tokio::test]
+    async fn list_pins_resolves_role_and_text_in_order() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Auto").unwrap();
+        let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
         let u = record_msg(&db, sid, SessionEventKind::UserMessage, "the question");
         let a = record_msg(&db, sid, SessionEventKind::AssistantMessage, "the answer");
@@ -301,10 +301,10 @@ mod tests {
     /// `session_events` rows. We simulate that by leaving `session_events`
     /// untouched (the real prune/compact code path) and confirming the pin
     /// still resolves the full original text.
-    #[test]
-    fn pinned_text_survives_prune_and_compact() {
+    #[tokio::test]
+    async fn pinned_text_survives_prune_and_compact() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Auto").unwrap();
+        let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
         let original = "FULL ORIGINAL MESSAGE BODY with lots of content here";
         let a = record_msg(&db, sid, SessionEventKind::AssistantMessage, original);
@@ -340,11 +340,11 @@ mod tests {
         assert_eq!(listed[0].text, original);
     }
 
-    #[test]
-    fn pins_are_scoped_per_session() {
+    #[tokio::test]
+    async fn pins_are_scoped_per_session() {
         let db = Db::open_in_memory().unwrap();
-        let a = db.create_session("p", "/x", "Auto").unwrap();
-        let b = db.create_session("p", "/y", "Auto").unwrap();
+        let a = db.create_session("p", "/x", "Auto").await.unwrap();
+        let b = db.create_session("p", "/y", "Auto").await.unwrap();
         let ua = record_msg(&db, a.session_id, SessionEventKind::UserMessage, "in a");
         let ub = record_msg(&db, b.session_id, SessionEventKind::UserMessage, "in b");
         db.pin_message(a.session_id, ua).unwrap();
@@ -356,14 +356,14 @@ mod tests {
         assert_eq!(db.list_pin_seqs(b.session_id).unwrap(), vec![ub]);
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn pin_cascades_when_session_deleted() {
+    async fn pin_cascades_when_session_deleted() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Auto").unwrap();
+        let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
         let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello");
         db.pin_message(sid, u).unwrap();

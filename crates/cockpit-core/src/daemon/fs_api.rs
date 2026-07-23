@@ -544,12 +544,32 @@ fn secret_blocked_for_sharee(
     Ok(crate::gitignore::is_gitignored(path) || dotenv_pattern_matches(ctx, root, path)?)
 }
 
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; filesystem sync helpers migrate in a later prompt"
+)]
 fn dotenv_pattern_matches(
     ctx: &DaemonContext,
     root: &Path,
     path: &Path,
 ) -> Result<bool, ErrorPayload> {
-    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, root)
+    let trust_root = crate::config::trust::resolve_trust_root(root).map_err(internal)?;
+    let root_for_db = trust_root.root.clone();
+    let trust_policy = ctx
+        .db
+        .write_blocking(move |conn| {
+            let decision = crate::db::Db::workspace_trust_by_root_conn(conn, &root_for_db)?;
+            let Some(decision) = decision else {
+                anyhow::bail!("workspace trust is unset for {}", root_for_db.display());
+            };
+            if decision.mode == crate::db::workspace_trust::WorkspaceTrustMode::Untrusted {
+                anyhow::bail!("workspace {} is untrusted", root_for_db.display());
+            }
+            Ok(crate::config::trust::WorkspaceTrustPolicy {
+                root: trust_root,
+                mode: decision.mode,
+            })
+        })
         .map_err(internal)?;
     let cfg = ctx
         .config_source()
@@ -690,6 +710,8 @@ fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
     use crate::daemon::principal::{
         ClientPrincipal, PrincipalGrant, PrincipalScope, RemotePrincipal,
@@ -697,8 +719,17 @@ mod tests {
 
     fn test_ctx(root: &Path) -> crate::daemon::server::DaemonContext {
         let db = crate::db::Db::open_in_memory().expect("in-memory db");
-        db.set_workspace_trust(root, crate::db::workspace_trust::WorkspaceTrustMode::Trust)
-            .expect("trust root");
+        let normalized_root = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        db.write_blocking(move |conn| {
+            crate::db::Db::set_workspace_trust_conn(
+                conn,
+                &normalized_root,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                1,
+            )
+            .map(|_| ())
+        })
+        .expect("trust root");
         let locks = std::sync::Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap());
         crate::daemon::server::DaemonContext::new(
             db,

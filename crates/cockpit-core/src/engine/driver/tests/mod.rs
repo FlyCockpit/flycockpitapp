@@ -382,11 +382,13 @@ fn bash_turn(call_id: &str, command: &str) -> Message {
 
 /// The active-agent name persisted in the session row — what a resume
 /// restarts on.
+#[allow(deprecated)]
 fn persisted_active_agent(driver: &Driver) -> String {
+    let session_id = driver.session.id;
     driver
         .session
         .db
-        .get_session(driver.session.id)
+        .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
         .unwrap()
         .unwrap()
         .active_agent

@@ -85,8 +85,10 @@ impl Db {
         let roots = self.read_blocking(|conn| old_session_roots(conn, session_cutoff_secs))?;
         let mut removed = 0;
         for root in roots {
-            self.delete_session(root, true)
-                .with_context(|| format!("expiring old session {root}"))?;
+            self.write_blocking(move |conn| {
+                crate::db::sessions::delete_session_conn(conn, root, true)
+            })
+            .with_context(|| format!("expiring old session {root}"))?;
             removed += 1;
         }
         Ok(removed)
@@ -343,11 +345,11 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn payload_age_out_keeps_open_session_rows() {
+    #[tokio::test]
+    async fn payload_age_out_keeps_open_session_rows() {
         let db = Db::open_in_memory().unwrap();
-        let closed = db.create_session("p", "/x", "Build").unwrap();
-        let open = db.create_session("p", "/x", "Build").unwrap();
+        let closed = db.create_session("p", "/x", "Build").await.unwrap();
+        let open = db.create_session("p", "/x", "Build").await.unwrap();
         close_session(&db, closed.session_id, 10);
         insert_payload_rows(&db, closed.session_id, "closed", 10);
         insert_payload_rows(&db, open.session_id, "open", 10);
@@ -365,14 +367,14 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn payload_prune_failure_rolls_back_prior_table_deletes() {
+    async fn payload_prune_failure_rolls_back_prior_table_deletes() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         close_session(&db, s.session_id, 10);
         insert_payload_rows(&db, s.session_id, "closed", 10);
         db.write_blocking(move |conn| {
@@ -403,11 +405,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn payload_age_out_respects_half_open_boundary() {
+    #[tokio::test]
+    async fn payload_age_out_respects_half_open_boundary() {
         let db = Db::open_in_memory().unwrap();
-        let at = db.create_session("p", "/x", "Build").unwrap();
-        let old = db.create_session("p", "/x", "Build").unwrap();
+        let at = db.create_session("p", "/x", "Build").await.unwrap();
+        let old = db.create_session("p", "/x", "Build").await.unwrap();
         close_session(&db, at.session_id, 100);
         close_session(&db, old.session_id, 99);
         insert_payload_rows(&db, at.session_id, "at", 100);
@@ -426,37 +428,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn payload_age_out_preserves_session_metadata_row() {
+    #[tokio::test]
+    async fn payload_age_out_preserves_session_metadata_row() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         close_session(&db, s.session_id, 10);
         insert_payload_rows(&db, s.session_id, "closed", 10);
 
         db.prune_session_payloads(20).unwrap();
 
-        assert!(db.get_session(s.session_id).unwrap().is_some());
+        assert!(db.get_session(s.session_id).await.unwrap().is_some());
     }
 
-    #[test]
-    fn session_age_out_skips_open_subtree() {
+    #[tokio::test]
+    async fn session_age_out_skips_open_subtree() {
         let db = Db::open_in_memory().unwrap();
-        let root = db.create_session("p", "/x", "Build").unwrap();
-        let _child = db.create_fork(root.session_id, None).unwrap();
+        let root = db.create_session("p", "/x", "Build").await.unwrap();
+        let _child = db.create_fork(root.session_id, None).await.unwrap();
         close_session(&db, root.session_id, 10);
 
         assert_eq!(db.expire_old_sessions(20).unwrap(), 0);
-        assert!(db.get_session(root.session_id).unwrap().is_some());
+        assert!(db.get_session(root.session_id).await.unwrap().is_some());
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn session_age_out_skips_ephemeral() {
+    async fn session_age_out_skips_ephemeral() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         close_session(&db, s.session_id, 10);
         db.write_blocking(move |conn| {
             conn.execute(
@@ -468,28 +470,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(db.expire_old_sessions(20).unwrap(), 0);
-        assert!(db.get_session(s.session_id).unwrap().is_some());
+        assert!(db.get_session(s.session_id).await.unwrap().is_some());
     }
 
-    #[test]
-    fn session_age_out_zero_window_is_noop() {
+    #[tokio::test]
+    async fn session_age_out_zero_window_is_noop() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         close_session(&db, s.session_id, 10);
 
         assert_eq!(db.expire_old_sessions(0).unwrap(), 0);
-        assert!(db.get_session(s.session_id).unwrap().is_some());
+        assert!(db.get_session(s.session_id).await.unwrap().is_some());
     }
 
-    #[test]
-    fn vacuum_triggers_on_deletion_threshold() {
+    #[tokio::test]
+    async fn vacuum_triggers_on_deletion_threshold() {
         let db = Db::open_in_memory().unwrap();
         let cfg = RetentionConfig::default();
         assert!(db.should_vacuum(cfg.vacuum_min_deletions, 100, &cfg));
     }
 
-    #[test]
-    fn vacuum_triggers_on_interval() {
+    #[tokio::test]
+    async fn vacuum_triggers_on_interval() {
         let db = Db::open_in_memory().unwrap();
         let cfg = RetentionConfig::default();
         db.record_vacuum(100).unwrap();
@@ -497,20 +499,20 @@ mod tests {
         assert!(db.should_vacuum(0, 100 + 7 * 86_400, &cfg));
     }
 
-    #[test]
-    fn record_vacuum_round_trips() {
+    #[tokio::test]
+    async fn record_vacuum_round_trips() {
         let db = Db::open_in_memory().unwrap();
         let cfg = RetentionConfig::default();
         db.record_vacuum(100).unwrap();
         assert!(!db.should_vacuum(0, 100, &cfg));
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn vacuum_uses_dedicated_connection_without_shared_mutex() {
+    async fn vacuum_uses_dedicated_connection_without_shared_mutex() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = Db::open(&tmp.path().join("retention.db")).unwrap();
         let db_for_vacuum = db.clone();
@@ -529,8 +531,8 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn disabled_windows_delete_nothing() {
+    #[tokio::test]
+    async fn disabled_windows_delete_nothing() {
         let db = Db::open_in_memory().unwrap();
         let cfg = RetentionConfig {
             payload_window_days: 0,
@@ -545,10 +547,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retention_pass_is_idempotent() {
+    #[tokio::test]
+    async fn retention_pass_is_idempotent() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         close_session(&db, s.session_id, 10);
         insert_payload_rows(&db, s.session_id, "closed", 10);
         let cfg = RetentionConfig {

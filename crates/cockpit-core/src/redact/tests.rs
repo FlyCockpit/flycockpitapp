@@ -783,8 +783,8 @@ OTHER='unterminated-secret-value-002
     assert!(table.unsupported_files().is_empty());
 }
 
-#[test]
-fn dotenv_hash_inside_quoted_value_is_not_a_comment() {
+#[tokio::test]
+async fn dotenv_hash_inside_quoted_value_is_not_a_comment() {
     let dir = TempDir::new().unwrap();
     let p = dir.path().join(".env");
     std::fs::write(&p, "TOKEN=\"value#with#hashes-long\"\n").unwrap();
@@ -794,8 +794,8 @@ fn dotenv_hash_inside_quoted_value_is_not_a_comment() {
     assert_eq!(t.scrub("value#with#hashes-long"), "***REDACT***");
 }
 
-#[test]
-fn structured_disable_marker_is_scoped_to_one_duplicate_value_occurrence() {
+#[tokio::test]
+async fn structured_disable_marker_is_scoped_to_one_duplicate_value_occurrence() {
     let dir = TempDir::new().unwrap();
     let p = dir.path().join(".env");
     std::fs::write(
@@ -812,8 +812,8 @@ kept = "shared-structured-secret"
     assert_eq!(table.scrub("shared-structured-secret"), cfg.placeholder);
 }
 
-#[test]
-fn toml_marker_excludes_long_value() {
+#[tokio::test]
+async fn toml_marker_excludes_long_value() {
     let dir = TempDir::new().unwrap();
     let p = dir.path().join(".env");
     std::fs::write(
@@ -831,8 +831,8 @@ fn toml_marker_excludes_long_value() {
     assert_eq!(t.scrub("toml-kept-long-secret"), "***REDACT***");
 }
 
-#[test]
-fn yaml_marker_excludes_long_value() {
+#[tokio::test]
+async fn yaml_marker_excludes_long_value() {
     let dir = TempDir::new().unwrap();
     let p = dir.path().join(".env");
     std::fs::write(
@@ -850,8 +850,8 @@ fn yaml_marker_excludes_long_value() {
     assert_eq!(t.scrub("yaml-kept-long-secret"), "***REDACT***");
 }
 
-#[test]
-fn json_has_no_comment_marker() {
+#[tokio::test]
+async fn json_has_no_comment_marker() {
     // JSON is exempt from the marker: a `# COCKPIT_DISABLE_REDACT`
     // would make the doc invalid JSON, so it parses as JSON only
     // without one and every leaf string stays a candidate.
@@ -867,8 +867,8 @@ fn json_has_no_comment_marker() {
 
 // ── gitignore-pattern matching, cwd-downward (§3) ────────────────────
 
-#[test]
-fn patterns_match_cwd_downward_across_subdirs() {
+#[tokio::test]
+async fn patterns_match_cwd_downward_across_subdirs() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("a/b")).unwrap();

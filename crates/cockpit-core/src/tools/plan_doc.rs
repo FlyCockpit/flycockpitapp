@@ -225,11 +225,15 @@ impl Tool for StartBuildTool {
             )));
         }
 
-        let row = ctx.session.db.create_session(
-            &ctx.session.project_id,
-            &ctx.session.project_root.to_string_lossy(),
-            "Build",
-        )?;
+        let row = ctx
+            .session
+            .db
+            .create_session(
+                &ctx.session.project_id,
+                &ctx.session.project_root.to_string_lossy(),
+                "Build",
+            )
+            .await?;
         insert_user_message(&ctx.session.db, row.session_id, &doc.content)
             .context("recording Build kickoff message")?;
         let build_ref = row.short_id.as_deref().unwrap_or("unknown");
@@ -310,6 +314,10 @@ fn parse_start_build_force(args: &Value) -> Result<bool> {
     }
 }
 
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; plan-doc tool remains sync until db-async-session-log"
+)]
 fn find_existing_build_handoff(
     db: &crate::db::Db,
     plan_session_id: Uuid,
@@ -325,7 +333,8 @@ fn find_existing_build_handoff(
         let Ok(build_session_id) = Uuid::parse_str(raw_id) else {
             return Ok(None);
         };
-        if let Some(row) = db.get_session(build_session_id)?
+        if let Some(row) =
+            db.write_blocking(move |conn| crate::db::Db::get_session_conn(conn, build_session_id))?
             && row.active_agent == "Build"
         {
             return Ok(Some(row));
@@ -893,6 +902,7 @@ mod tests {
             .expect("build_session_id uuid");
         assert_eq!(
             db.get_session(build_session_id)
+                .await
                 .unwrap()
                 .unwrap()
                 .short_id
@@ -939,7 +949,9 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        db.delete_session(deleted_build_session_id, true).unwrap();
+        db.delete_session(deleted_build_session_id, true)
+            .await
+            .unwrap();
 
         let fresh = StartBuildTool
             .call(Value::Null, &ctx)

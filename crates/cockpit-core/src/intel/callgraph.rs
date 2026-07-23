@@ -28,7 +28,7 @@
 //!
 //! The spec asks test symbols to be excluded as resolution targets.
 //! `intel_symbols` carries no test-ness marker (no `#[cfg(test)]` /
-//! `#[test]` flag column, and the extractor never records one), so
+//! `#[tokio::test]` flag column, and the extractor never records one), so
 //! test-ness is **not derivable here**. Per the spec we therefore resolve
 //! against *all* definitions and document this as a known precision gap —
 //! we do NOT invent a name/path heuristic that guesses test-ness, because
@@ -307,8 +307,8 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn denylist_filters_ubiquitous_names_before_resolving() {
+    #[tokio::test]
+    async fn denylist_filters_ubiquitous_names_before_resolving() {
         let conn = db();
         add_sym(&conn, "a.rs", "get", "function", 1);
         // Even with a real def, a denylisted name resolves to nothing.

@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use super::attachments::*;
 use super::authz::*;
 use super::dispatch::*;
@@ -87,7 +89,7 @@ async fn detached_client_cannot_remove_editable_queued_messages() {
 #[tokio::test]
 async fn read_session_messages_requires_read_access_returns_page_and_does_not_spawn_worker() {
     let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     let seq = ctx
         .db
         .insert_session_event(
@@ -145,7 +147,7 @@ async fn read_session_messages_requires_read_access_returns_page_and_does_not_sp
 #[tokio::test]
 async fn read_history_page_requires_read_access_returns_page_and_does_not_spawn_worker() {
     let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     let seq = ctx
         .db
         .insert_session_event(
@@ -206,7 +208,7 @@ async fn read_history_page_requires_read_access_returns_page_and_does_not_spawn_
 #[tokio::test]
 async fn read_history_page_denied_without_session_read_access() {
     let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     let request = Request::ReadHistoryPage {
         session_id: session.session_id,
         before_seq: None,
@@ -229,7 +231,7 @@ async fn read_history_page_denied_without_session_read_access() {
 #[tokio::test]
 async fn goal_rpc_reads_sets_and_clears() {
     let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     ctx.db
         .create_session_goal(
             session.session_id,
@@ -315,7 +317,7 @@ async fn goal_change_is_visible_to_live_worker() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, session_id, _work_rx) = attached_state_with_worker_receiver(&ctx, tmp.path());
-    let session = ctx.db.get_session(session_id).unwrap().unwrap();
+    let session = ctx.db.get_session(session_id).await.unwrap().unwrap();
     ctx.db
         .create_session_goal(
             session_id,
@@ -375,7 +377,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (state, session_id, mut work_rx) = attached_state_with_worker_receiver(&ctx, tmp.path());
-    let session = ctx.db.get_session(session_id).unwrap().unwrap();
+    let session = ctx.db.get_session(session_id).await.unwrap().unwrap();
     ctx.db
         .create_session_goal(
             session_id,
@@ -613,10 +615,10 @@ fn new_session_state_requests_are_classified() {
     }
 }
 
-#[test]
-fn new_session_state_requests_enforce_authorization() {
+#[tokio::test]
+async fn new_session_state_requests_enforce_authorization() {
     let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     let session_id = session.session_id;
     let state = remote_state_with_grants(Vec::new());
     let requests = [
@@ -654,6 +656,7 @@ fn new_session_state_requests_enforce_authorization() {
     for request in requests {
         let kind = principal::request_kind(&request);
         let err = authorize_request(&request, &state, &ctx)
+            .await
             .err()
             .unwrap_or_else(|| panic!("{kind} unexpectedly authorized"));
         assert_eq!(err.code, ErrorCode::Authorization, "{kind}");
@@ -692,6 +695,7 @@ async fn stats_rollup_runs_off_request_loop() {
     let session = ctx
         .db
         .create_session("project-1", "/repo", "Build")
+        .await
         .unwrap();
     ctx.db
         .insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
@@ -746,6 +750,7 @@ async fn assistant_rpc_creates_session_via_registry() {
             project.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     create_test_assistant(&ctx, &assistant_home, "helper-bot");
     let mut state = owner_state();
@@ -783,7 +788,11 @@ async fn assistant_rpc_creates_session_via_registry() {
         "created assistant session is live in the registry"
     );
     assert!(
-        ctx.db.get_session(session.session_id).unwrap().is_none(),
+        ctx.db
+            .get_session(session.session_id)
+            .await
+            .unwrap()
+            .is_none(),
         "created assistant session is deferred until first user message"
     );
 }
@@ -815,7 +824,7 @@ async fn assistant_session_creation_is_atomic() {
         "failed assistant session creation must not register a live worker"
     );
     assert!(
-        ctx.db.list_sessions(false, 100).unwrap().is_empty(),
+        ctx.db.list_sessions(false, 100).await.unwrap().is_empty(),
         "failed assistant session creation must not persist a session row"
     );
 }
@@ -830,10 +839,12 @@ async fn auto_title_rpc_generates_title() {
             project.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let session = ctx
         .db
         .create_session("p", project.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     ctx.db
         .insert_session_event(
@@ -861,7 +872,12 @@ async fn auto_title_rpc_generates_title() {
     };
     assert_eq!(session_id, session.session_id);
     assert_eq!(title, "codex-model-fetch");
-    let row = ctx.db.get_session(session.session_id).unwrap().unwrap();
+    let row = ctx
+        .db
+        .get_session(session.session_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.title.as_deref(), Some("codex-model-fetch"));
     assert!(!row.user_renamed);
 }
@@ -878,10 +894,12 @@ async fn auto_title_failure_leaves_session_unrenamed() {
             project.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let session = ctx
         .db
         .create_session("p", project.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     let mut state = owner_state();
 
@@ -896,7 +914,12 @@ async fn auto_title_failure_leaves_session_unrenamed() {
     .expect_err("missing utility model rejects");
 
     assert_eq!(err.code, ErrorCode::BadRequest);
-    let row = ctx.db.get_session(session.session_id).unwrap().unwrap();
+    let row = ctx
+        .db
+        .get_session(session.session_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(row.title.is_none());
     assert!(!row.user_renamed);
 }
@@ -911,10 +934,12 @@ async fn concurrent_auto_title_second_attempt_is_rejected() {
             project.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let session = ctx
         .db
         .create_session("p", project.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     let mut first_state = owner_state();
     let mut second_state = owner_state();
@@ -947,7 +972,12 @@ async fn concurrent_auto_title_second_attempt_is_rejected() {
     }
     assert_eq!(successes, 1);
     assert_eq!(rejections, 1);
-    let row = ctx.db.get_session(session.session_id).unwrap().unwrap();
+    let row = ctx
+        .db
+        .get_session(session.session_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.title.as_deref(), Some("concurrent-title"));
     assert!(!row.user_renamed);
 }
@@ -955,7 +985,7 @@ async fn concurrent_auto_title_second_attempt_is_rejected() {
 #[tokio::test]
 async fn export_rpc_returns_redacted_data() {
     let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     let call_id = Uuid::new_v4().to_string();
     ctx.db
         .insert_session_event(
@@ -1055,6 +1085,7 @@ async fn curator_rpc_performs_curation() {
             project.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let mut state = owner_state();
 
@@ -1131,6 +1162,7 @@ async fn curator_rpc_failure_leaves_skills_unchanged() {
             project.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let mut state = owner_state();
 
@@ -1754,12 +1786,14 @@ async fn fs_requests_require_project_files_scope_for_matching_root() {
             &root_a,
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     ctx.db
         .set_workspace_trust(
             &root_b,
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     std::fs::write(root_a.join("readme.md"), "ok").unwrap();
     std::fs::write(root_b.join("readme.md"), "no").unwrap();
@@ -1890,6 +1924,7 @@ async fn remote_fs_write_hash_mismatch_and_lock_conflict_are_typed() {
     let session = ctx
         .db
         .create_session("proj", &root.to_string_lossy(), "Build")
+        .await
         .unwrap();
     ctx.registry
         .locks()
@@ -2062,6 +2097,56 @@ fn boot_housekeeping_succeeds_with_empty_task_delegation_tables() {
     assert_eq!(db.reconcile_orphaned_task_delegations().unwrap(), 0);
 }
 
+#[test]
+#[allow(deprecated)]
+fn boot_ephemeral_sweep_continues_after_delete_failure() {
+    let db = Db::open_in_memory().expect("in-memory db");
+    let (blocked, removed) = db
+        .write_blocking(|conn| {
+            let mut blocked =
+                crate::db::Db::build_new_session_row_conn(conn, "p", "/blocked", "Build")?;
+            blocked.ephemeral = true;
+            let blocked = crate::db::Db::insert_session_row_conn(conn, &blocked)?;
+
+            let mut removed =
+                crate::db::Db::build_new_session_row_conn(conn, "p", "/removed", "Build")?;
+            removed.ephemeral = true;
+            let removed = crate::db::Db::insert_session_row_conn(conn, &removed)?;
+            conn.execute(
+                "UPDATE sessions SET ephemeral = 1 WHERE session_id IN (?1, ?2)",
+                [
+                    blocked.session_id.to_string(),
+                    removed.session_id.to_string(),
+                ],
+            )?;
+
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER block_boot_ephemeral_delete
+                 BEFORE DELETE ON sessions
+                 WHEN OLD.session_id = '{}'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'blocked delete');
+                 END",
+                blocked.session_id
+            ))?;
+            Ok((blocked, removed))
+        })
+        .unwrap();
+
+    assert_eq!(sweep_ephemeral_sessions_blocking(&db).unwrap(), 1);
+
+    assert!(
+        db.write_blocking(move |conn| crate::db::Db::get_session_conn(conn, blocked.session_id))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.write_blocking(move |conn| crate::db::Db::get_session_conn(conn, removed.session_id))
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[tokio::test]
 #[expect(
     deprecated,
@@ -2069,7 +2154,7 @@ fn boot_housekeeping_succeeds_with_empty_task_delegation_tables() {
 )]
 async fn retention_tick_runs_one_pass_without_sleep() {
     let db = Db::open_in_memory().expect("in-memory db");
-    let session = db.create_session("p", "/x", "Build").unwrap();
+    let session = db.create_session("p", "/x", "Build").await.unwrap();
     db.write_blocking(move |conn| {
         conn.execute(
             "UPDATE sessions SET ended_at = 10, last_active_at = 10 WHERE session_id = ?1",
@@ -2120,15 +2205,24 @@ fn attached_state_with_worker_receiver(
     Uuid,
     tokio::sync::mpsc::Receiver<SessionWork>,
 ) {
-    ctx.db
-        .set_workspace_trust(
-            project_root,
-            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
-        )
-        .unwrap();
+    let normalized_root = project_root
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let project_root = project_root.to_str().unwrap().to_string();
     let session_row = ctx
         .db
-        .create_session("p", project_root.to_str().unwrap(), "Build")
+        .write_blocking(move |conn| {
+            crate::db::Db::set_workspace_trust_conn(
+                conn,
+                &normalized_root,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                chrono::Utc::now().timestamp(),
+            )?;
+            let row = crate::db::Db::build_new_session_row_conn(conn, "p", &project_root, "Build")?;
+            crate::db::Db::insert_session_row_conn(conn, &row)
+        })
         .unwrap();
     let session = Arc::new(
         Session::resume(ctx.db.clone(), session_row.session_id)
@@ -3629,9 +3723,18 @@ fn authz_cross_session_paused_work_scenario(
     ctx.db
         .set_session_shared_with_collaborators(attached_session_id, true)
         .unwrap();
+    let target_root_str = target_root.to_str().unwrap().to_string();
     let target_session = ctx
         .db
-        .create_session("target", target_root.to_str().unwrap(), "Build")
+        .write_blocking(move |conn| {
+            let row = crate::db::Db::build_new_session_row_conn(
+                conn,
+                "target",
+                &target_root_str,
+                "Build",
+            )?;
+            crate::db::Db::insert_session_row_conn(conn, &row)
+        })
         .unwrap();
     ctx.db
         .upsert_paused_session_work(
@@ -4159,7 +4262,7 @@ impl ReadonlyDispatchCaseKind {
             }
             Self::ListSessions => {
                 let ctx = test_ctx();
-                let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
                 let response = dispatch_matrix_request(
                     &ctx,
                     Request::ListSessions {
@@ -4180,7 +4283,7 @@ impl ReadonlyDispatchCaseKind {
             }
             Self::ReadSessionMessages => {
                 let ctx = test_ctx();
-                let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
                 let seq = ctx
                     .db
                     .insert_session_event(
@@ -4209,7 +4312,7 @@ impl ReadonlyDispatchCaseKind {
             }
             Self::ReadHistoryPage => {
                 let ctx = test_ctx();
-                let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
                 let seq = ctx
                     .db
                     .insert_session_event(
@@ -4240,7 +4343,7 @@ impl ReadonlyDispatchCaseKind {
             }
             Self::SessionLiveStatus => {
                 let ctx = test_ctx();
-                let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
                 insert_hung_worker(&ctx, session.session_id);
                 let response = dispatch_matrix_request(
                     &ctx,
@@ -4258,7 +4361,7 @@ impl ReadonlyDispatchCaseKind {
             }
             Self::GoalStatus => {
                 let ctx = test_ctx();
-                let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
                 ctx.db
                     .create_session_goal(
                         session.session_id,
@@ -4291,6 +4394,7 @@ impl ReadonlyDispatchCaseKind {
                         tmp.path(),
                         crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                     )
+                    .await
                     .unwrap();
                 let response = dispatch_matrix_request_after(
                     &ctx,
@@ -4427,7 +4531,10 @@ impl ReadonlyDispatchCaseKind {
             }
             Self::ListSessions => {
                 let ctx = test_ctx();
-                ctx.db.create_session("visible", "/repo", "Build").unwrap();
+                ctx.db
+                    .create_session("visible", "/repo", "Build")
+                    .await
+                    .unwrap();
                 let response = dispatch_matrix_request(
                     &ctx,
                     Request::ListSessions {
@@ -4511,7 +4618,7 @@ impl ReadonlyDispatchCaseKind {
             }
             Self::GoalStatus => {
                 let ctx = test_ctx();
-                let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+                let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
                 let response = dispatch_matrix_request(
                     &ctx,
                     Request::GoalStatus {
@@ -4593,6 +4700,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
                     tmp.path(),
                     crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                 )
+                .await
                 .unwrap();
             let response = dispatch_matrix_request(
                 &ctx,
@@ -4972,15 +5080,24 @@ fn live_worker_with_receiver(
     ctx: &Arc<DaemonContext>,
     project_root: &Path,
 ) -> (Uuid, tokio::sync::mpsc::Receiver<SessionWork>) {
-    ctx.db
-        .set_workspace_trust(
-            project_root,
-            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
-        )
-        .unwrap();
+    let normalized_root = project_root
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let project_root = project_root.to_str().unwrap().to_string();
     let row = ctx
         .db
-        .create_session("p", project_root.to_str().unwrap(), "Build")
+        .write_blocking(move |conn| {
+            crate::db::Db::set_workspace_trust_conn(
+                conn,
+                &normalized_root,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                chrono::Utc::now().timestamp(),
+            )?;
+            let row = crate::db::Db::build_new_session_row_conn(conn, "p", &project_root, "Build")?;
+            crate::db::Db::insert_session_row_conn(conn, &row)
+        })
         .unwrap();
     let session = Arc::new(
         Session::resume(ctx.db.clone(), row.session_id)
@@ -5776,7 +5893,7 @@ async fn assert_terminal_mutating_malformed(kind: &str) {
 #[cfg(unix)]
 async fn assert_paused_work_mutating_happy(kind: &str) {
     let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     ctx.db
         .upsert_paused_session_work(
             session.session_id,
@@ -5814,7 +5931,7 @@ async fn assert_paused_work_mutating_happy(kind: &str) {
 #[cfg(unix)]
 async fn assert_goal_mutating_happy(kind: &str) {
     let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     ctx.db
         .create_session_goal(
             session.session_id,
@@ -5860,7 +5977,7 @@ async fn assert_goal_mutating_happy(kind: &str) {
 #[cfg(unix)]
 async fn assert_goal_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     match kind {
         "set_goal_status" => {
             let err = dispatch_matrix_request(
@@ -5920,6 +6037,7 @@ async fn assert_create_assistant_session_happy() {
             project.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     create_test_assistant(&ctx, &tmp, "helper-bot");
     let response = dispatch_matrix_request(
@@ -5945,7 +6063,11 @@ async fn assert_create_assistant_session_happy() {
         "assistant session is started through the registry"
     );
     assert!(
-        ctx.db.get_session(session.session_id).unwrap().is_none(),
+        ctx.db
+            .get_session(session.session_id)
+            .await
+            .unwrap()
+            .is_none(),
         "assistant session remains deferred until first user message"
     );
 }
@@ -5960,10 +6082,12 @@ async fn assert_auto_title_mutating_happy() {
             project.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let session = ctx
         .db
         .create_session("p", project.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     let response = dispatch_matrix_request(
         &ctx,
@@ -5980,6 +6104,7 @@ async fn assert_auto_title_mutating_happy() {
     assert_eq!(
         ctx.db
             .get_session(session.session_id)
+            .await
             .unwrap()
             .unwrap()
             .title
@@ -6000,10 +6125,12 @@ async fn assert_auto_title_mutating_malformed() {
             project.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let session = ctx
         .db
         .create_session("p", project.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     let err = dispatch_matrix_request(
         &ctx,
@@ -6014,7 +6141,12 @@ async fn assert_auto_title_mutating_malformed() {
     .await
     .expect_err("auto-title missing utility model rejects");
     assert_eq!(err.code, ErrorCode::BadRequest);
-    let row = ctx.db.get_session(session.session_id).unwrap().unwrap();
+    let row = ctx
+        .db
+        .get_session(session.session_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(row.title.is_none());
     assert!(!row.user_renamed);
 }
@@ -6030,6 +6162,7 @@ async fn assert_curator_mutating_happy() {
             project.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let response = dispatch_matrix_request(
         &ctx,
@@ -6064,6 +6197,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
     let session = ctx
         .db
         .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     match kind {
         "archive_session" => {
@@ -6080,6 +6214,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
             assert!(
                 ctx.db
                     .get_session(session.session_id)
+                    .await
                     .unwrap()
                     .unwrap()
                     .archived_at
@@ -6087,7 +6222,10 @@ async fn assert_session_db_mutating_happy(kind: &str) {
             );
         }
         "unarchive_session" => {
-            ctx.db.archive_session(session.session_id, false).unwrap();
+            ctx.db
+                .archive_session(session.session_id, false)
+                .await
+                .unwrap();
             let response = dispatch_matrix_request(
                 &ctx,
                 Request::UnarchiveSession {
@@ -6100,6 +6238,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
             assert!(
                 ctx.db
                     .get_session(session.session_id)
+                    .await
                     .unwrap()
                     .unwrap()
                     .archived_at
@@ -6129,6 +6268,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
             assert_eq!(
                 ctx.db
                     .get_session(fork_id)
+                    .await
                     .unwrap()
                     .unwrap()
                     .parent_session_id,
@@ -6139,6 +6279,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
             let fork = ctx
                 .db
                 .create_ephemeral_fork(session.session_id, None)
+                .await
                 .unwrap();
             let response = dispatch_matrix_request(
                 &ctx,
@@ -6149,7 +6290,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
             .await
             .expect("discard ephemeral session");
             assert!(matches!(response, Response::Ack));
-            assert!(ctx.db.get_session(fork.session_id).unwrap().is_none());
+            assert!(ctx.db.get_session(fork.session_id).await.unwrap().is_none());
         }
         "btw_create" => {
             let response = dispatch_matrix_request(
@@ -6166,10 +6307,14 @@ async fn assert_session_db_mutating_happy(kind: &str) {
             };
             assert!(created);
             assert_eq!(info.parent_session_id, session.session_id);
-            assert!(ctx.db.get_session(info.session_id).unwrap().is_some());
+            assert!(ctx.db.get_session(info.session_id).await.unwrap().is_some());
         }
         "btw_end" => {
-            let fork = ctx.db.create_btw_fork(session.session_id, false).unwrap();
+            let fork = ctx
+                .db
+                .create_btw_fork(session.session_id, false)
+                .await
+                .unwrap();
             let response = dispatch_matrix_request(
                 &ctx,
                 Request::EndBtwFork {
@@ -6179,7 +6324,13 @@ async fn assert_session_db_mutating_happy(kind: &str) {
             .await
             .expect("end btw fork");
             assert!(matches!(response, Response::Ack));
-            assert!(ctx.db.get_session(fork.info.session_id).unwrap().is_none());
+            assert!(
+                ctx.db
+                    .get_session(fork.info.session_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
         "rename_session" => {
             let response = dispatch_matrix_request(
@@ -6195,6 +6346,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
             assert_eq!(
                 ctx.db
                     .get_session(session.session_id)
+                    .await
                     .unwrap()
                     .unwrap()
                     .title,
@@ -6215,6 +6367,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
             assert!(
                 ctx.db
                     .get_session(session.session_id)
+                    .await
                     .unwrap()
                     .unwrap()
                     .shared_with_collaborators
@@ -6251,7 +6404,13 @@ async fn assert_session_db_mutating_happy(kind: &str) {
             .await
             .expect("delete session");
             assert!(matches!(response, Response::Ack));
-            assert!(ctx.db.get_session(session.session_id).unwrap().is_none());
+            assert!(
+                ctx.db
+                    .get_session(session.session_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
         _ => unreachable!(),
     }
@@ -6260,7 +6419,7 @@ async fn assert_session_db_mutating_happy(kind: &str) {
 #[cfg(unix)]
 async fn assert_session_db_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").unwrap();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     let missing = Uuid::new_v4();
     let request = match kind {
         "archive_session" => Request::ArchiveSession {
@@ -6321,7 +6480,13 @@ async fn assert_session_db_mutating_malformed(kind: &str) {
             ));
         }
     }
-    assert!(ctx.db.get_session(session.session_id).unwrap().is_some());
+    assert!(
+        ctx.db
+            .get_session(session.session_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[cfg(unix)]
@@ -6681,10 +6846,12 @@ async fn dispatch_attach_delivers_config_snapshot_event() {
             project.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let session = ctx
         .db
         .create_session("p", project.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     let (result, events) = dispatch_matrix_request_after_collect_events(
         &ctx,
@@ -6750,10 +6917,12 @@ async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
             project.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let session = ctx
         .db
         .create_session("p", project.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     let (result, events) = dispatch_matrix_request_after_collect_events(
         &ctx,
@@ -6897,8 +7066,8 @@ fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_reads() 
     }
 }
 
-#[test]
-fn command_table_metadata_is_exhaustive_and_stable() {
+#[tokio::test]
+async fn command_table_metadata_is_exhaustive_and_stable() {
     struct CommandMetadataCase {
         request: Request,
         kind: &'static str,
@@ -7987,34 +8156,36 @@ fn begin_upload_for(state: &mut MutableClientState, png: &[u8]) -> Uuid {
     }
 }
 
-fn finish_attachment_upload_for_test(
+async fn finish_attachment_upload_for_test(
     state: &mut MutableClientState,
     upload_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(finish_attachment_upload(state, upload_id))
+    finish_attachment_upload(state, upload_id).await
 }
 
-fn finish_upload_for(state: &mut MutableClientState, png: &[u8]) -> proto::ImageAttachmentRef {
+async fn finish_upload_for(
+    state: &mut MutableClientState,
+    png: &[u8],
+) -> proto::ImageAttachmentRef {
     let upload_id = begin_upload_for(state, png);
     let data_base64 = base64::engine::general_purpose::STANDARD.encode(png);
     upload_attachment_chunk(state, upload_id, 0, data_base64).unwrap();
-    match finish_attachment_upload_for_test(state, upload_id).unwrap() {
+    match finish_attachment_upload_for_test(state, upload_id)
+        .await
+        .unwrap()
+    {
         Response::AttachmentUploaded { image_ref } => image_ref,
         other => panic!("unexpected response: {other:?}"),
     }
 }
 
-#[test]
-fn attachment_upload_consumes_image_refs_exactly_once() {
+#[tokio::test]
+async fn attachment_upload_consumes_image_refs_exactly_once() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, session_id) = attached_state(&ctx, tmp.path());
     let png = sample_png();
-    let image_ref = finish_upload_for(&mut state, &png);
+    let image_ref = finish_upload_for(&mut state, &png).await;
 
     let images = consume_image_refs(&mut state, session_id, std::slice::from_ref(&image_ref))
         .expect("first consume");
@@ -8026,13 +8197,13 @@ fn attachment_upload_consumes_image_refs_exactly_once() {
     assert!(err.message.contains("already consumed"));
 }
 
-#[test]
-fn duplicate_image_refs_are_rejected_without_consuming() {
+#[tokio::test]
+async fn duplicate_image_refs_are_rejected_without_consuming() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, session_id) = attached_state(&ctx, tmp.path());
     let png = sample_png();
-    let image_ref = finish_upload_for(&mut state, &png);
+    let image_ref = finish_upload_for(&mut state, &png).await;
 
     let err = consume_image_refs(
         &mut state,
@@ -8047,14 +8218,14 @@ fn duplicate_image_refs_are_rejected_without_consuming() {
     assert_eq!(images, vec![png]);
 }
 
-#[test]
-fn attachment_ref_is_scoped_to_attached_session() {
+#[tokio::test]
+async fn attachment_ref_is_scoped_to_attached_session() {
     let ctx = test_ctx();
     let tmp_a = tempfile::tempdir().unwrap();
     let tmp_b = tempfile::tempdir().unwrap();
     let (mut state, session_a) = attached_state(&ctx, tmp_a.path());
     let (_, session_b) = attached_state(&ctx, tmp_b.path());
-    let image_ref = finish_upload_for(&mut state, &sample_png());
+    let image_ref = finish_upload_for(&mut state, &sample_png()).await;
 
     let err = consume_image_refs(&mut state, session_b, std::slice::from_ref(&image_ref))
         .expect_err("wrong session must fail");
@@ -8066,8 +8237,8 @@ fn attachment_ref_is_scoped_to_attached_session() {
     assert_ne!(session_a, session_b);
 }
 
-#[test]
-fn attachment_upload_rejects_bad_chunk_shapes() {
+#[tokio::test]
+async fn attachment_upload_rejects_bad_chunk_shapes() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path());
@@ -8085,8 +8256,8 @@ fn attachment_upload_rejects_bad_chunk_shapes() {
     assert!(err.message.contains("valid base64"));
 }
 
-#[test]
-fn attachment_finish_rejects_sha_mismatch_and_invalid_png() {
+#[tokio::test]
+async fn attachment_finish_rejects_sha_mismatch_and_invalid_png() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path());
@@ -8110,7 +8281,9 @@ fn attachment_finish_rejects_sha_mismatch_and_invalid_png() {
         base64::engine::general_purpose::STANDARD.encode(&png),
     )
     .unwrap();
-    let err = finish_attachment_upload_for_test(&mut state, upload_id).expect_err("hash mismatch");
+    let err = finish_attachment_upload_for_test(&mut state, upload_id)
+        .await
+        .expect_err("hash mismatch");
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("SHA-256 mismatch"));
 
@@ -8123,13 +8296,15 @@ fn attachment_finish_rejects_sha_mismatch_and_invalid_png() {
         base64::engine::general_purpose::STANDARD.encode(&bad_png),
     )
     .unwrap();
-    let err = finish_attachment_upload_for_test(&mut state, upload_id).expect_err("invalid png");
+    let err = finish_attachment_upload_for_test(&mut state, upload_id)
+        .await
+        .expect_err("invalid png");
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("valid PNG"));
 }
 
-#[test]
-fn png_validation_uses_strict_limits() {
+#[tokio::test]
+async fn png_validation_uses_strict_limits() {
     let large = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
         proto::MAX_IMAGE_DIMENSION_PIXELS + 1,
         1,
@@ -8145,8 +8320,8 @@ fn png_validation_uses_strict_limits() {
     assert!(err.message.contains("decode limit"));
 }
 
-#[test]
-fn attachment_upload_default_limits_match_config_defaults() {
+#[tokio::test]
+async fn attachment_upload_default_limits_match_config_defaults() {
     let limits = AttachmentUploadLimits::default();
     assert_eq!(limits.per_client_uploads, 4);
     assert_eq!(limits.global_uploads, 32);
@@ -8160,8 +8335,8 @@ fn attachment_upload_default_limits_match_config_defaults() {
     assert_eq!(cfg_limits.global_bytes, limits.global_bytes);
 }
 
-#[test]
-fn attachment_upload_config_clamps_to_protocol_cap_and_warns() {
+#[tokio::test]
+async fn attachment_upload_config_clamps_to_protocol_cap_and_warns() {
     let (limits, warning) =
         AttachmentUploadLimits::from_config_with_warning(DaemonUploadLimitsConfig {
             per_upload_bytes: 64 * 1024 * 1024,
@@ -8194,8 +8369,8 @@ fn attachment_upload_config_clamps_to_protocol_cap_and_warns() {
     );
 }
 
-#[test]
-fn attachment_upload_config_below_protocol_cap_binds() {
+#[tokio::test]
+async fn attachment_upload_config_below_protocol_cap_binds() {
     let configured = MIN_ATTACHMENT_UPLOAD_BYTES + 1;
     let (limits, warning) =
         AttachmentUploadLimits::from_config_with_warning(DaemonUploadLimitsConfig {
@@ -8225,8 +8400,8 @@ fn attachment_upload_config_below_protocol_cap_binds() {
     );
 }
 
-#[test]
-fn attachment_upload_config_degenerate_per_upload_bytes_clamps_to_floor() {
+#[tokio::test]
+async fn attachment_upload_config_degenerate_per_upload_bytes_clamps_to_floor() {
     let (limits, warning) =
         AttachmentUploadLimits::from_config_with_warning(DaemonUploadLimitsConfig {
             per_upload_bytes: 0,
@@ -8239,8 +8414,8 @@ fn attachment_upload_config_degenerate_per_upload_bytes_clamps_to_floor() {
     );
 }
 
-#[test]
-fn attachment_upload_default_limits_enforce_per_client_count() {
+#[tokio::test]
+async fn attachment_upload_default_limits_enforce_per_client_count() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path());
@@ -8269,8 +8444,8 @@ fn attachment_upload_default_limits_enforce_per_client_count() {
     assert!(err.message.contains("limit 4"), "{}", err.message);
 }
 
-#[test]
-fn attachment_upload_default_limits_enforce_global_count() {
+#[tokio::test]
+async fn attachment_upload_default_limits_enforce_global_count() {
     let ctx = test_ctx();
     let accounting = Arc::new(StdMutex::new(UploadAccounting::default()));
     let png = sample_png();
@@ -8309,8 +8484,8 @@ fn attachment_upload_default_limits_enforce_global_count() {
     drop((states, tempdirs, tmp));
 }
 
-#[test]
-fn attachment_upload_limits_enforce_per_client_count_and_per_upload_bytes() {
+#[tokio::test]
+async fn attachment_upload_limits_enforce_per_client_count_and_per_upload_bytes() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path());
@@ -8373,8 +8548,8 @@ fn attachment_upload_limits_enforce_per_client_count_and_per_upload_bytes() {
     );
 }
 
-#[test]
-fn attachment_upload_limits_enforce_global_count_and_bytes() {
+#[tokio::test]
+async fn attachment_upload_limits_enforce_global_count_and_bytes() {
     let ctx = test_ctx();
     let tmp_a = tempfile::tempdir().unwrap();
     let tmp_b = tempfile::tempdir().unwrap();
@@ -8431,8 +8606,8 @@ fn attachment_upload_limits_enforce_global_count_and_bytes() {
     assert!(err.message.contains("byte limit"), "{}", err.message);
 }
 
-#[test]
-fn expired_pending_upload_prune_releases_global_accounting() {
+#[tokio::test]
+async fn expired_pending_upload_prune_releases_global_accounting() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path());
@@ -8529,8 +8704,8 @@ async fn refresh_env_is_scoped_to_attached_session_overlay() {
     );
 }
 
-#[test]
-fn env_policy_daemon_keeps_baseline_and_reports_safe_drift() {
+#[tokio::test]
+async fn env_policy_daemon_keeps_baseline_and_reports_safe_drift() {
     let ctx = test_ctx();
     let baseline = EnvSnapshot::new(
         EnvSnapshotSource::DaemonStart,
@@ -8565,8 +8740,8 @@ fn env_policy_daemon_keeps_baseline_and_reports_safe_drift() {
     assert!(!serialized.contains("daemon-secret"));
 }
 
-#[test]
-fn env_policy_update_daemon_replaces_future_baseline() {
+#[tokio::test]
+async fn env_policy_update_daemon_replaces_future_baseline() {
     let ctx = test_ctx();
     *ctx.env_baseline.write().unwrap() = EnvSnapshot::new(
         EnvSnapshotSource::DaemonStart,
@@ -8587,8 +8762,8 @@ fn env_policy_update_daemon_replaces_future_baseline() {
     assert_eq!(ctx.env_baseline.read().unwrap().digest(), client.digest());
 }
 
-#[test]
-fn env_policy_error_on_drift_rejects() {
+#[tokio::test]
+async fn env_policy_error_on_drift_rejects() {
     let ctx = test_ctx();
     *ctx.env_baseline.write().unwrap() = EnvSnapshot::new(
         EnvSnapshotSource::DaemonStart,
@@ -8616,8 +8791,8 @@ async fn peer_uid_accepts_same_uid_socket_pair() {
 }
 
 #[cfg(unix)]
-#[test]
-fn peer_uid_rejects_mismatched_uid() {
+#[tokio::test]
+async fn peer_uid_rejects_mismatched_uid() {
     let daemon_uid = current_uid();
     let peer_uid = daemon_uid.saturating_add(1);
 
@@ -8661,7 +8836,7 @@ async fn roster_trim_set_agent_rejects_removed_primary() {
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("agent `Swarm`"));
     assert!(err.message.contains("not a chat-ownable primary"));
-    let got = ctx.db.get_session(session_id).unwrap().unwrap();
+    let got = ctx.db.get_session(session_id).await.unwrap().unwrap();
     assert_eq!(got.active_agent, "Build");
 }
 
@@ -8762,12 +8937,12 @@ async fn set_agent_rejects_non_ownable_subagent_name() {
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("agent `bee`"));
     assert!(err.message.contains("not a chat-ownable primary"));
-    let got = ctx.db.get_session(session_id).unwrap().unwrap();
+    let got = ctx.db.get_session(session_id).await.unwrap().unwrap();
     assert_eq!(got.active_agent, "Build");
 }
 
-#[test]
-fn roster_trim_set_agent_allows_plan_and_rejects_removed_primaries() {
+#[tokio::test]
+async fn roster_trim_set_agent_allows_plan_and_rejects_removed_primaries() {
     let ownable = vec!["Plan".to_string(), "Build".to_string()];
 
     validate_set_agent_name("Plan", &ownable).expect("Plan is a chat-ownable primary");
@@ -8778,8 +8953,8 @@ fn roster_trim_set_agent_allows_plan_and_rejects_removed_primaries() {
     }
 }
 
-#[test]
-fn set_agent_allows_build() {
+#[tokio::test]
+async fn set_agent_allows_build() {
     let ownable = vec!["Build".to_string()];
 
     validate_set_agent_name("Build", &ownable).expect("Build is a chat-ownable primary");
@@ -8863,6 +9038,7 @@ async fn list_agents_respects_workspace_trust() {
             tmp.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
         )
+        .await
         .unwrap();
     state
         .attached
@@ -9051,6 +9227,7 @@ async fn list_models_respects_workspace_trust() {
             tmp.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
         )
+        .await
         .unwrap();
     state
         .attached
@@ -9175,8 +9352,8 @@ async fn inventory_ordering_is_stable() {
     );
 }
 
-#[test]
-fn response_send_failure_warns_with_request_id_and_no_payload() {
+#[tokio::test]
+async fn response_send_failure_warns_with_request_id_and_no_payload() {
     let request_id = Uuid::new_v4();
     let log = capture_warn_log(|| {
         let error = anyhow::anyhow!("broken pipe while writing envelope");
@@ -9245,10 +9422,12 @@ async fn serialized_requests_apply_in_receipt_order() {
             tmp.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let session = ctx
         .db
         .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     let live_session = Arc::new(
         Session::resume(ctx.db.clone(), session.session_id)
@@ -9712,8 +9891,8 @@ async fn client_io_split_slow_request_does_not_block_event_forwarding() {
     event_task.abort();
 }
 
-#[test]
-fn client_io_split_writer_is_sole_socket_writer() {
+#[tokio::test]
+async fn client_io_split_writer_is_sole_socket_writer() {
     let source = include_str!("mod.rs");
     let transport_start = source
         .find("async fn handle_client_transport_as")
@@ -9754,10 +9933,12 @@ async fn attach_replay_precedes_live_events_under_task_split() {
             tmp.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let session = ctx
         .db
         .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     let live_session = Arc::new(
         Session::resume(ctx.db.clone(), session.session_id)
@@ -9839,10 +10020,12 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
             tmp.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let session = ctx
         .db
         .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     let live_session = Arc::new(
         Session::resume(ctx.db.clone(), session.session_id)
@@ -10054,7 +10237,7 @@ async fn client_io_split_global_lag_still_emits_resync_error() {
 async fn delete_live_session_timeout_leaves_row_intact() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let session = ctx.db.create_session("p", "/x", "Build").unwrap();
+    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
     insert_hung_worker(&ctx, session.session_id);
 
     let err = handle_request(
@@ -10073,7 +10256,13 @@ async fn delete_live_session_timeout_leaves_row_intact() {
         err.message
             .contains("refusing destructive session mutation")
     );
-    assert!(ctx.db.get_session(session.session_id).unwrap().is_some());
+    assert!(
+        ctx.db
+            .get_session(session.session_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert!(
         ctx.registry
             .active_session_ids()
@@ -10085,7 +10274,7 @@ async fn delete_live_session_timeout_leaves_row_intact() {
 async fn archive_live_session_timeout_leaves_row_unarchived() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let session = ctx.db.create_session("p", "/x", "Build").unwrap();
+    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
     insert_hung_worker(&ctx, session.session_id);
 
     let err = handle_request(
@@ -10107,6 +10296,7 @@ async fn archive_live_session_timeout_leaves_row_unarchived() {
     let row = ctx
         .db
         .get_session(session.session_id)
+        .await
         .unwrap()
         .expect("row remains");
     assert!(row.archived_at.is_none());
@@ -10116,10 +10306,11 @@ async fn archive_live_session_timeout_leaves_row_unarchived() {
 async fn discard_live_ephemeral_session_timeout_leaves_row_intact() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let parent = ctx.db.create_session("p", "/x", "Build").unwrap();
+    let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
     let side = ctx
         .db
         .create_ephemeral_fork(parent.session_id, None)
+        .await
         .unwrap();
     insert_hung_worker(&ctx, side.session_id);
 
@@ -10138,14 +10329,14 @@ async fn discard_live_ephemeral_session_timeout_leaves_row_intact() {
         err.message
             .contains("refusing destructive session mutation")
     );
-    assert!(ctx.db.get_session(side.session_id).unwrap().is_some());
+    assert!(ctx.db.get_session(side.session_id).await.unwrap().is_some());
 }
 
 #[tokio::test]
 async fn btw_create_rpc_returns_existing_fork_atomically() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let parent = ctx.db.create_session("p", "/x", "Build").unwrap();
+    let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
 
     let first = handle_request(
         Request::CreateBtwFork {
@@ -10195,6 +10386,7 @@ async fn btw_concurrent_with_parent_turn() {
     let parent_row = ctx
         .db
         .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     let parent_session = Arc::new(
         Session::resume(ctx.db.clone(), parent_row.session_id)
@@ -10241,7 +10433,11 @@ async fn btw_concurrent_with_parent_turn() {
     };
     assert_eq!(parent_submission.text, "parent work");
 
-    let created = ctx.db.create_btw_fork(parent_row.session_id, true).unwrap();
+    let created = ctx
+        .db
+        .create_btw_fork(parent_row.session_id, true)
+        .await
+        .unwrap();
     let btw_session = Arc::new(
         Session::resume(ctx.db.clone(), created.info.session_id)
             .unwrap()
@@ -10320,8 +10516,12 @@ async fn btw_concurrent_with_parent_turn() {
 async fn btw_end_rpc_discards_fork() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let parent = ctx.db.create_session("p", "/x", "Build").unwrap();
-    let created = ctx.db.create_btw_fork(parent.session_id, false).unwrap();
+    let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let created = ctx
+        .db
+        .create_btw_fork(parent.session_id, false)
+        .await
+        .unwrap();
 
     let response = handle_request(
         Request::EndBtwFork {
@@ -10337,6 +10537,7 @@ async fn btw_end_rpc_discards_fork() {
     assert!(
         ctx.db
             .get_session(created.info.session_id)
+            .await
             .unwrap()
             .is_none()
     );
@@ -10351,12 +10552,18 @@ async fn btw_rehydrate_reports_live_fork() {
             tmp.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let parent = ctx
         .db
         .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
-    let created = ctx.db.create_btw_fork(parent.session_id, true).unwrap();
+    let created = ctx
+        .db
+        .create_btw_fork(parent.session_id, true)
+        .await
+        .unwrap();
     let live_session = Arc::new(
         Session::resume(ctx.db.clone(), parent.session_id)
             .unwrap()
@@ -10402,8 +10609,8 @@ async fn btw_rehydrate_reports_live_fork() {
 async fn cascaded_delete_timeout_stops_before_any_db_mutation() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let root = ctx.db.create_session("p", "/x", "Build").unwrap();
-    let child = ctx.db.create_fork(root.session_id, None).unwrap();
+    let root = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let child = ctx.db.create_fork(root.session_id, None).await.unwrap();
     insert_hung_worker(&ctx, child.session_id);
 
     let err = handle_request(
@@ -10422,8 +10629,14 @@ async fn cascaded_delete_timeout_stops_before_any_db_mutation() {
         err.message
             .contains("refusing destructive session mutation")
     );
-    assert!(ctx.db.get_session(root.session_id).unwrap().is_some());
-    assert!(ctx.db.get_session(child.session_id).unwrap().is_some());
+    assert!(ctx.db.get_session(root.session_id).await.unwrap().is_some());
+    assert!(
+        ctx.db
+            .get_session(child.session_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// The single graceful-shutdown path
@@ -10488,7 +10701,7 @@ async fn stop_daemon_grace_override_reaches_shutdown_context() {
 async fn record_session_note_persists_event_without_inference() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
-    let s = ctx.db.create_session("p", "/x", "Build").unwrap();
+    let s = ctx.db.create_session("p", "/x", "Build").await.unwrap();
 
     let resp = handle_request(
         Request::RecordSessionNote {
@@ -10620,10 +10833,12 @@ async fn attach_replays_drain_state_after_attached_response() {
             tmp.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let session = ctx
         .db
         .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     let live_session = Arc::new(
         Session::resume(ctx.db.clone(), session.session_id)
@@ -10705,10 +10920,12 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
             tmp.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
     let session = ctx
         .db
         .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .await
         .unwrap();
     let seq1 = ctx
         .db
@@ -10802,6 +11019,7 @@ async fn attach_compatible_reflects_client_protocol_version() {
             tmp.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
 
     let mut state = MutableClientState::detached_for_test();
@@ -10894,6 +11112,7 @@ async fn attach_resolves_model_from_injected_config_source() {
             tmp.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
 
     let mut state = MutableClientState::detached_for_test();
@@ -11118,9 +11337,9 @@ async fn attach_requires_db_workspace_trust_row() {
     assert!(state.attached.is_none());
 }
 
-#[test]
-fn daemon_load_configs_uses_session_policy_over_global_policy() {
-    let _env = crate::test_env::lock();
+#[tokio::test]
+async fn daemon_load_configs_uses_session_policy_over_global_policy() {
+    let _env = crate::test_env::lock_async().await;
     let trusted = tempfile::tempdir().unwrap();
     let ignored = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(trusted.path().join(".cockpit")).unwrap();
@@ -11150,8 +11369,8 @@ fn daemon_load_configs_uses_session_policy_over_global_policy() {
     crate::config::trust::clear_runtime_policy_for_tests();
 }
 
-#[test]
-fn response_redaction_scrubs_queue_display_metadata() {
+#[tokio::test]
+async fn response_redaction_scrubs_queue_display_metadata() {
     crate::auth::flycockpit::with_redaction_token_override("fci_response_secret_12345", || {
         let tmp = tempfile::tempdir().unwrap();
         let table = crate::redact::RedactionTable::build(
@@ -11180,8 +11399,8 @@ fn response_redaction_scrubs_queue_display_metadata() {
     });
 }
 
-#[test]
-fn redaction_preserves_uuid_when_secret_overlaps() {
+#[tokio::test]
+async fn redaction_preserves_uuid_when_secret_overlaps() {
     crate::auth::flycockpit::with_redaction_token_override("88c0e13f", || {
         let tmp = tempfile::tempdir().unwrap();
         let table = crate::redact::RedactionTable::build(
@@ -11227,8 +11446,8 @@ fn redaction_preserves_uuid_when_secret_overlaps() {
     });
 }
 
-#[test]
-fn event_redaction_preserves_typed_fields() {
+#[tokio::test]
+async fn event_redaction_preserves_typed_fields() {
     crate::auth::flycockpit::with_redaction_token_override("88c0e13f", || {
         let tmp = tempfile::tempdir().unwrap();
         let table = crate::redact::RedactionTable::build(
@@ -11271,8 +11490,8 @@ fn event_redaction_preserves_typed_fields() {
     });
 }
 
-#[test]
-fn redaction_preserves_structural_string_fields() {
+#[tokio::test]
+async fn redaction_preserves_structural_string_fields() {
     crate::auth::flycockpit::with_redaction_token_override("secret-struct", || {
         let tmp = tempfile::tempdir().unwrap();
         let table = crate::redact::RedactionTable::build(
@@ -11353,8 +11572,8 @@ fn redaction_preserves_structural_string_fields() {
     });
 }
 
-#[test]
-fn history_redaction_preserves_typed_fields() {
+#[tokio::test]
+async fn history_redaction_preserves_typed_fields() {
     crate::auth::flycockpit::with_redaction_token_override("call-secret-123", || {
         let tmp = tempfile::tempdir().unwrap();
         let table = crate::redact::RedactionTable::build(
@@ -11403,8 +11622,8 @@ fn history_redaction_preserves_typed_fields() {
     });
 }
 
-#[test]
-fn history_redaction_scrubs_display_text_and_tag_expansions() {
+#[tokio::test]
+async fn history_redaction_scrubs_display_text_and_tag_expansions() {
     crate::auth::flycockpit::with_redaction_token_override("fci_history_secret_12345", || {
         let tmp = tempfile::tempdir().unwrap();
         let table = crate::redact::RedactionTable::build(

@@ -405,6 +405,8 @@ fn response_hint(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
     use crate::auth::flycockpit::AccountInfo;
     use std::collections::VecDeque;
@@ -459,7 +461,17 @@ mod tests {
 
     fn insert_remote(db: &Db, kind: &str, path: Option<&str>) -> i64 {
         let session = db
-            .create_session("project", "/tmp/project", "Build")
+            .write_blocking(|conn| {
+                crate::db::Db::insert_session_row_conn(
+                    conn,
+                    &crate::db::Db::build_new_session_row_conn(
+                        conn,
+                        "project",
+                        "/tmp/project",
+                        "Build",
+                    )?,
+                )
+            })
             .unwrap();
         db.insert_remote_audit_with_path(
             "flycockpit:user-1",

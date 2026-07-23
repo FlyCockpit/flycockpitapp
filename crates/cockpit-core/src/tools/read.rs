@@ -448,8 +448,8 @@ mod tests {
     }
 
     /// Steering variant (a): an agent holding `tree` is pointed at `tree`.
-    #[tokio::test]
-    async fn directory_message_suggests_tree_when_available() {
+    #[test]
+    fn directory_message_suggests_tree_when_available() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("d");
         std::fs::create_dir(&dir).unwrap();
@@ -463,8 +463,8 @@ mod tests {
     }
 
     /// Steering variant (b): no `tree` but `bash` → suggest `bash`.
-    #[tokio::test]
-    async fn directory_message_suggests_bash_when_no_tree() {
+    #[test]
+    fn directory_message_suggests_bash_when_no_tree() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("d");
         std::fs::create_dir(&dir).unwrap();
@@ -479,8 +479,8 @@ mod tests {
 
     /// Steering variant (c): neither `tree` nor `bash` (e.g. the `docs`
     /// answerer) → no alternative tool is named.
-    #[tokio::test]
-    async fn directory_message_suggests_nothing_without_tree_or_bash() {
+    #[test]
+    fn directory_message_suggests_nothing_without_tree_or_bash() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("d");
         std::fs::create_dir(&dir).unwrap();
@@ -500,8 +500,8 @@ mod tests {
 
     /// A nonexistent path (the weak-model path-hallucination case) returns a
     /// non-`Err` recovery message that steers to `tree`, never a raw OS error.
-    #[tokio::test]
-    async fn nonexistent_path_steers_to_tree_when_available() {
+    #[test]
+    fn nonexistent_path_steers_to_tree_when_available() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(tmp.path());
         ctx.has_tree = true;
@@ -523,8 +523,8 @@ mod tests {
     }
 
     /// No `tree` but `bash` present → steer to `bash` instead.
-    #[tokio::test]
-    async fn nonexistent_path_steers_to_bash_when_no_tree() {
+    #[test]
+    fn nonexistent_path_steers_to_bash_when_no_tree() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(tmp.path());
         ctx.has_tree = false;
@@ -541,8 +541,8 @@ mod tests {
         assert!(!out.content.contains("`tree`"), "got: {}", out.content);
     }
 
-    #[tokio::test]
-    async fn read_deleted_after_preflight_uses_missing_path_recovery() {
+    #[test]
+    fn read_deleted_after_preflight_uses_missing_path_recovery() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("gone.txt");
         std::fs::write(&file, "content").unwrap();
@@ -575,8 +575,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn read_replaced_by_directory_after_preflight_uses_directory_recovery() {
+    #[test]
+    fn read_replaced_by_directory_after_preflight_uses_directory_recovery() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("now-dir");
         std::fs::write(&file, "content").unwrap();
@@ -609,8 +609,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn read_unclassified_error_stays_hard_error() {
+    #[test]
+    fn read_unclassified_error_stays_hard_error() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("f.txt");
         std::fs::write(&file, "content").unwrap();
@@ -627,8 +627,8 @@ mod tests {
         assert!(msg.contains("blocked"), "got: {msg}");
     }
 
-    #[tokio::test]
-    async fn binary_file_hint_backticks_commands() {
+    #[test]
+    fn binary_file_hint_backticks_commands() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("blob.bin");
         std::fs::write(&file, b"\0binary").unwrap();

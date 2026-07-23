@@ -797,8 +797,8 @@ fn decode_child_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<DelegationCh
 mod tests {
     use super::*;
 
-    fn seed_job(db: &Db, task_call_id: &str, children: &[&str]) -> Uuid {
-        let session = db.create_session("p", "/tmp/p", "Build").unwrap();
+    async fn seed_job(db: &Db, task_call_id: &str, children: &[&str]) -> Uuid {
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
         let inits = children
             .iter()
             .map(|label| DelegationChildInit {
@@ -823,10 +823,10 @@ mod tests {
         session.session_id
     }
 
-    #[test]
-    fn completed_child_allows_error_prefixed_report_text() {
+    #[tokio::test]
+    async fn completed_child_allows_error_prefixed_report_text() {
         let db = Db::open_in_memory().unwrap();
-        let session_id = seed_job(&db, "task-1", &["default"]);
+        let session_id = seed_job(&db, "task-1", &["default"]).await;
 
         db.complete_task_delegation_child(
             "task-1",
@@ -842,10 +842,10 @@ mod tests {
         assert_eq!(job_status(&db, "task-1"), DelegationStatus::Completed);
     }
 
-    #[test]
-    fn failed_child_uses_explicit_flag_not_report_text() {
+    #[tokio::test]
+    async fn failed_child_uses_explicit_flag_not_report_text() {
         let db = Db::open_in_memory().unwrap();
-        let session_id = seed_job(&db, "task-1", &["default"]);
+        let session_id = seed_job(&db, "task-1", &["default"]).await;
 
         db.complete_task_delegation_child("task-1", "default", "ordinary report", true, None)
             .unwrap();
@@ -855,10 +855,10 @@ mod tests {
         assert_eq!(job_status(&db, "task-1"), DelegationStatus::Failed);
     }
 
-    #[test]
-    fn error_prefixed_success_child_does_not_taint_job_rollup() {
+    #[tokio::test]
+    async fn error_prefixed_success_child_does_not_taint_job_rollup() {
         let db = Db::open_in_memory().unwrap();
-        let session_id = seed_job(&db, "task-1", &["a", "b"]);
+        let session_id = seed_job(&db, "task-1", &["a", "b"]).await;
 
         db.complete_task_delegation_child("task-1", "a", "Error: quoted and fixed", false, None)
             .unwrap();
@@ -873,10 +873,10 @@ mod tests {
         assert_eq!(job_status(&db, "task-1"), DelegationStatus::Completed);
     }
 
-    #[test]
-    fn explicit_failed_child_taints_job_rollup() {
+    #[tokio::test]
+    async fn explicit_failed_child_taints_job_rollup() {
         let db = Db::open_in_memory().unwrap();
-        seed_job(&db, "task-1", &["a", "b"]);
+        seed_job(&db, "task-1", &["a", "b"]).await;
 
         db.complete_task_delegation_child("task-1", "a", "plain report", false, None)
             .unwrap();
@@ -886,10 +886,10 @@ mod tests {
         assert_eq!(job_status(&db, "task-1"), DelegationStatus::Failed);
     }
 
-    #[test]
-    fn child_delivery_is_durable_and_idempotent() {
+    #[tokio::test]
+    async fn child_delivery_is_durable_and_idempotent() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/tmp/p", "Build").unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
         db.upsert_task_delegation_job(
             session.session_id,
             "task-1",
@@ -935,10 +935,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cancellation_is_terminal_and_steers_are_counted_fifo_pending() {
+    #[tokio::test]
+    async fn cancellation_is_terminal_and_steers_are_counted_fifo_pending() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/tmp/p", "Build").unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
         db.upsert_task_delegation_job(
             session.session_id,
             "task-1",
@@ -1003,10 +1003,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reconcile_orphaned_task_delegations_marks_active_children_lost_once() {
+    #[tokio::test]
+    async fn reconcile_orphaned_task_delegations_marks_active_children_lost_once() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/tmp/p", "Build").unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
         db.upsert_task_delegation_job(
             session.session_id,
             "task-1",
@@ -1037,14 +1037,14 @@ mod tests {
         assert_eq!(job_status(&db, "task-1"), DelegationStatus::Lost);
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn mark_task_delegation_child_lost_preserves_completed_jobs() {
+    async fn mark_task_delegation_child_lost_preserves_completed_jobs() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/tmp/p", "Build").unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
         db.upsert_task_delegation_job(
             session.session_id,
             "task-1",
@@ -1091,10 +1091,10 @@ mod tests {
         assert_eq!(job_status(&db, "task-1"), DelegationStatus::Completed);
     }
 
-    #[test]
-    fn lost_reconciled_child_delivers_report_once() {
+    #[tokio::test]
+    async fn lost_reconciled_child_delivers_report_once() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/tmp/p", "Build").unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
         db.upsert_task_delegation_job(
             session.session_id,
             "task-1",
@@ -1130,14 +1130,14 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn complete_child_rolls_back_when_job_update_fails() {
+    async fn complete_child_rolls_back_when_job_update_fails() {
         let db = Db::open_in_memory().unwrap();
-        let session_id = seed_job(&db, "task-rollback", &["default"]);
+        let session_id = seed_job(&db, "task-rollback", &["default"]).await;
         db.write_blocking(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_task_job_update

@@ -656,6 +656,10 @@ impl SessionsPane {
     /// ordering / scoping / fork-grouping match. `Err` only when the DB
     /// couldn't be opened (handle is `None`) or the query itself failed —
     /// both surface as the pane's inline error, never a crash.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; daemonless sessions pane remains sync until db-async-session-log"
+    )]
     fn list_sessions_daemonless(
         &self,
         project_id: Option<&str>,
@@ -664,8 +668,16 @@ impl SessionsPane {
         let Some(db) = self.db.as_ref() else {
             return Err("could not open the session database".to_string());
         };
-        db.list_session_summaries(project_id, parent, DAEMONLESS_LIST_LIMIT)
-            .map_err(|e| e.to_string())
+        let project_id = project_id.map(str::to_string);
+        db.write_blocking(move |conn| {
+            cockpit_db::Db::list_session_summaries_conn(
+                conn,
+                project_id.as_deref(),
+                parent,
+                DAEMONLESS_LIST_LIMIT,
+            )
+        })
+        .map_err(|e| e.to_string())
     }
 
     /// Reload the current level in place, preserving scope/breadcrumb and
@@ -2706,10 +2718,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn daemonless_split_first_render_populates_preview() {
+    #[tokio::test]
+    async fn daemonless_split_first_render_populates_preview() {
         let db = Db::open_in_memory().unwrap();
-        let root = db.create_session("pid", "/proj", "builder").unwrap();
+        let root = db.create_session("pid", "/proj", "builder").await.unwrap();
         db.insert_session_event(
             root.session_id,
             cockpit_db::session_log::SessionEventKind::UserMessage,
@@ -3189,13 +3201,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn daemonless_lists_from_the_db() {
+    #[tokio::test]
+    async fn daemonless_lists_from_the_db() {
         // The factored `Db::list_session_summaries` populates the daemonless
         // list: open an in-memory DB, seed a root session, and confirm the
         // pane's daemonless fetch returns it tier-classified.
         let db = Db::open_in_memory().unwrap();
-        let root = db.create_session("pid", "/proj", "builder").unwrap();
+        let root = db.create_session("pid", "/proj", "builder").await.unwrap();
         let mut pane = test_pane_mode(vec![], false);
         pane.db = Some(db);
         let cards = pane.fetch_level(Some("pid".into()), None);

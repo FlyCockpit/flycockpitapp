@@ -757,9 +757,9 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "spawned by security_wizard_write_target_falls_back_to_cwd_config"]
-    fn security_wizard_write_target_falls_back_to_cwd_config_child() {
+    async fn security_wizard_write_target_falls_back_to_cwd_config_child() {
         let cwd = std::path::PathBuf::from(
             std::env::var_os("COCKPIT_SECURITY_FALLBACK_CWD").expect("fallback cwd env var"),
         );

@@ -227,10 +227,10 @@ fn decode_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CompressedToolResul
 mod tests {
     use super::*;
 
-    #[test]
-    fn stores_retrieves_and_rejects_collision() {
+    #[tokio::test]
+    async fn stores_retrieves_and_rejects_collision() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "Build").unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
         let hash = "0123456789abcdefabcdef12";
         db.insert_compressed_tool_result(
             hash,

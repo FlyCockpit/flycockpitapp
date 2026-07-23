@@ -589,10 +589,10 @@ fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
 mod tests {
     use super::*;
 
-    #[test]
-    fn assignment_preserves_parallel_notes_append_only() {
+    #[tokio::test]
+    async fn assignment_preserves_parallel_notes_append_only() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         let todo = db
             .create_task_todo(s.session_id, "implement thing", 5)
             .unwrap();
@@ -628,10 +628,10 @@ mod tests {
         assert!(matches!(detail.todo.status, TodoStatus::InProgress));
     }
 
-    #[test]
-    fn assign_task_todos_failure_rolls_back_prior_assignments() {
+    #[tokio::test]
+    async fn assign_task_todos_failure_rolls_back_prior_assignments() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         let todo = db.create_task_todo(s.session_id, "auth", 5).unwrap();
         let missing = Uuid::new_v4();
 
@@ -658,10 +658,10 @@ mod tests {
         assert_eq!(detail.todo.version, 0);
     }
 
-    #[test]
-    fn assignments_scope_finish_by_task_call_and_label() {
+    #[tokio::test]
+    async fn assignments_scope_finish_by_task_call_and_label() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         let a = db.create_task_todo(s.session_id, "auth", 5).unwrap();
         let b = db.create_task_todo(s.session_id, "db", 5).unwrap();
         db.assign_task_todos(s.session_id, &[a.id], "call-1", "auth", "explore")
@@ -685,10 +685,10 @@ mod tests {
         assert_eq!(db_todo.assignments[0].state, "running");
     }
 
-    #[test]
-    fn retrieves_completed_details_with_summary_artifacts_and_blockers() {
+    #[tokio::test]
+    async fn retrieves_completed_details_with_summary_artifacts_and_blockers() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         let todo = db
             .create_task_todo(s.session_id, "ship compact overview", 9)
             .unwrap();

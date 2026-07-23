@@ -1932,12 +1932,12 @@ mod tests {
         assert!(store.is_path_granted(&file));
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
     )]
-    fn path_grant_modes_round_trip_at_each_scope() {
+    async fn path_grant_modes_round_trip_at_each_scope() {
         for scope in [Scope::Session, Scope::Project, Scope::Global] {
             let tmp = tempfile::tempdir().unwrap();
             let global = tempfile::tempdir().unwrap();
@@ -1985,12 +1985,12 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
     )]
-    fn mcp_tool_grant_round_trips_through_session_and_file_scopes() {
+    async fn mcp_tool_grant_round_trips_through_session_and_file_scopes() {
         for scope in [Scope::Session, Scope::Project, Scope::Global] {
             let tmp = tempfile::tempdir().unwrap();
             let global = tempfile::tempdir().unwrap();
@@ -2101,12 +2101,12 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
     )]
-    fn approval_timestamp_columns_are_integer() {
+    async fn approval_timestamp_columns_are_integer() {
         let db = Db::open_in_memory().unwrap();
         db.read_blocking(|conn| {
             assert_eq!(
@@ -2122,12 +2122,12 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
     )]
-    fn session_approval_records_epoch_integer_timestamp() {
+    async fn session_approval_records_epoch_integer_timestamp() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
@@ -2159,12 +2159,12 @@ mod tests {
         assert!((before..=after).contains(&value));
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
     )]
-    fn loop_rule_records_epoch_integer_timestamp() {
+    async fn loop_rule_records_epoch_integer_timestamp() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
@@ -2425,12 +2425,12 @@ mod tests {
         assert!(!store.is_path_rejected(&p));
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
     )]
-    fn tierless_command_allow_rows_are_rejected() {
+    async fn tierless_command_allow_rows_are_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());

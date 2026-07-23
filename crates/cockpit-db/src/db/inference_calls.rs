@@ -118,14 +118,14 @@ impl Db {
 mod tests {
     use super::*;
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn insert_round_trip() {
+    async fn insert_round_trip() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         let row = InferenceCallRow {
             call_id: Uuid::new_v4(),
             session_id: s.session_id,
@@ -165,10 +165,10 @@ mod tests {
     /// The `is_utility` flag round-trips on `inference_calls`, and
     /// `utility_call_ids` returns exactly the utility-flagged calls — the join
     /// the `/export debug` bundle uses to split the request folders.
-    #[test]
-    fn is_utility_flag_round_trips_and_filters() {
+    #[tokio::test]
+    async fn is_utility_flag_round_trips_and_filters() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         let regular = Uuid::new_v4();
         let utility = Uuid::new_v4();
         let base = |call_id: Uuid, is_utility: bool| InferenceCallRow {

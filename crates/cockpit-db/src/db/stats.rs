@@ -854,8 +854,11 @@ mod tests {
 
     /// Seed a session and return its id; the project_id is the literal
     /// passed (tests pass `p1`/`p2` directly rather than hashing a path).
-    fn seed_session(db: &Db, project_id: &str) -> Uuid {
-        let s = db.create_session(project_id, "/root", "builder").unwrap();
+    async fn seed_session(db: &Db, project_id: &str) -> Uuid {
+        let s = db
+            .create_session(project_id, "/root", "builder")
+            .await
+            .unwrap();
         s.session_id
     }
 
@@ -994,10 +997,10 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn token_rollup_without_pricing() {
+    #[tokio::test]
+    async fn token_rollup_without_pricing() {
         let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1");
+        let sid = seed_session(&db, "p1").await;
         ic_with_cache_creation(&db, sid, "p1", "opus", "anthropic", 1000, 100, 50, 10, 20);
         ic(&db, sid, "p1", "opus", "anthropic", 2000, 200, 60, 0);
         ic(&db, sid, "p1", "gpt-5", "openai", 3000, 5, 5, 0);
@@ -1021,10 +1024,10 @@ mod tests {
         assert!(opus.cost_usd.is_none(), "no prices => None");
     }
 
-    #[test]
-    fn token_rollup_with_pricing() {
+    #[tokio::test]
+    async fn token_rollup_with_pricing() {
         let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1");
+        let sid = seed_session(&db, "p1").await;
         ic_with_cache_creation(
             &db,
             sid,
@@ -1063,10 +1066,10 @@ mod tests {
         assert!((cost - 22.05).abs() < 1e-9, "cost was {cost}");
     }
 
-    #[test]
-    fn recovery_percentages() {
+    #[tokio::test]
+    async fn recovery_percentages() {
         let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1");
+        let sid = seed_session(&db, "p1").await;
         let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
         // 10 calls: 6 clean, 2 recovered (shape_repair), 1 relational
         // (not malformed), 1 hard-fail.
@@ -1169,10 +1172,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recovery_by_llm_mode_groups_and_percentages() {
+    #[tokio::test]
+    async fn recovery_by_llm_mode_groups_and_percentages() {
         let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1");
+        let sid = seed_session(&db, "p1").await;
         let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
 
         tce_with_dims(
@@ -1255,10 +1258,10 @@ mod tests {
         assert_eq!(defensive.hard_fail, 0);
     }
 
-    #[test]
-    fn recovery_by_llm_mode_buckets_blank_mode_as_unknown() {
+    #[tokio::test]
+    async fn recovery_by_llm_mode_buckets_blank_mode_as_unknown() {
         let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1");
+        let sid = seed_session(&db, "p1").await;
         let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
 
         tce_with_dims(
@@ -1292,10 +1295,10 @@ mod tests {
         assert_eq!(unknown.calls, 1);
     }
 
-    #[test]
-    fn recovery_hard_fail_shapes_group_by_mode_tool_fingerprint() {
+    #[tokio::test]
+    async fn recovery_hard_fail_shapes_group_by_mode_tool_fingerprint() {
         let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1");
+        let sid = seed_session(&db, "p1").await;
         let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
 
         for _ in 0..2 {
@@ -1376,10 +1379,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recovery_hard_fail_shapes_bucket_null_fingerprint() {
+    #[tokio::test]
+    async fn recovery_hard_fail_shapes_bucket_null_fingerprint() {
         let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1");
+        let sid = seed_session(&db, "p1").await;
         let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
 
         tce_with_dims(
@@ -1412,10 +1415,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recovery_hard_fail_shapes_limited_to_twenty() {
+    #[tokio::test]
+    async fn recovery_hard_fail_shapes_limited_to_twenty() {
         let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1");
+        let sid = seed_session(&db, "p1").await;
         let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
 
         for idx in 0..25 {
@@ -1445,10 +1448,10 @@ mod tests {
         assert_eq!(r.recovery.hard_fail_shapes.len(), 20);
     }
 
-    #[test]
-    fn recovery_existing_sections_unchanged_by_new_dimensions() {
+    #[tokio::test]
+    async fn recovery_existing_sections_unchanged_by_new_dimensions() {
         let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1");
+        let sid = seed_session(&db, "p1").await;
         let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
 
         tce_with_dims(
@@ -1531,10 +1534,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn language_top8_and_other_folding() {
+    #[tokio::test]
+    async fn language_top8_and_other_folding() {
         let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1");
+        let sid = seed_session(&db, "p1").await;
         let cid = ic(&db, sid, "p1", "m", "p", 1000, 1, 1, 0);
         // 9 distinct languages so one folds into Other. Use descending
         // counts so the fold target is deterministic.
@@ -1621,11 +1624,11 @@ mod tests {
         assert_eq!(lang.non_file[0].calls, 4);
     }
 
-    #[test]
-    fn scope_and_range_filtering() {
+    #[tokio::test]
+    async fn scope_and_range_filtering() {
         let db = Db::open_in_memory().unwrap();
-        let s1 = seed_session(&db, "p1");
-        let s2 = seed_session(&db, "p2");
+        let s1 = seed_session(&db, "p1").await;
+        let s2 = seed_session(&db, "p2").await;
         // p1: recent + old; p2: recent only.
         ic(&db, s1, "p1", "m", "p", 1_000_000 - 100, 10, 0, 0); // in 7d
         ic(&db, s1, "p1", "m", "p", 1_000, 99, 0, 0); // old (outside 7d)
@@ -1668,8 +1671,8 @@ mod tests {
         assert_eq!(r.tokens.by_model[0].input_tokens, 15);
     }
 
-    #[test]
-    fn empty_db_renders_clean() {
+    #[tokio::test]
+    async fn empty_db_renders_clean() {
         let db = Db::open_in_memory().unwrap();
         let r = run(
             &db,
@@ -1684,14 +1687,14 @@ mod tests {
         assert!(r.language.non_file.is_empty());
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn by_role_breakdown() {
+    async fn by_role_breakdown() {
         let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1");
+        let sid = seed_session(&db, "p1").await;
         let cid_builder = ic(&db, sid, "p1", "m", "p", 1000, 100, 0, 0);
         let cid_docs = ic(&db, sid, "p1", "m", "p", 1000, 30, 0, 0);
         tce(
@@ -1741,14 +1744,14 @@ mod tests {
         assert_eq!(docs.input_tokens, 30);
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn by_role_same_agent_multiple_tool_rows_count_once() {
+    async fn by_role_same_agent_multiple_tool_rows_count_once() {
         let db = Db::open_in_memory().unwrap();
-        let sid = seed_session(&db, "p1");
+        let sid = seed_session(&db, "p1").await;
         let cid = ic_with_cache_creation(&db, sid, "p1", "m", "p", 1000, 100, 20, 5, 7);
         for tool in ["read", "grep"] {
             tce(
@@ -1791,8 +1794,8 @@ mod tests {
         assert_eq!(builder.calls, 1);
     }
 
-    #[test]
-    fn malformed_prices_json_yields_empty_table() {
+    #[tokio::test]
+    async fn malformed_prices_json_yields_empty_table() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prices.json");
         std::fs::write(&path, b"{ this is not json").unwrap();
@@ -1801,16 +1804,16 @@ mod tests {
         assert!(table.cost_for("opus", 1000, 1000, 0, 0).is_none());
     }
 
-    #[test]
-    fn missing_prices_json_yields_empty_table() {
+    #[tokio::test]
+    async fn missing_prices_json_yields_empty_table() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.json");
         let table = PriceTable::load_from(&path);
         assert!(table.cost_for("opus", 1000, 1000, 0, 0).is_none());
     }
 
-    #[test]
-    fn old_prices_json_defaults_cache_creation_rate_to_zero() {
+    #[tokio::test]
+    async fn old_prices_json_defaults_cache_creation_rate_to_zero() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prices.json");
         std::fs::write(

@@ -1606,6 +1606,10 @@ impl App {
     /// creating one when none exists. Uses the same resume path as the
     /// sessions browser so daemon attach, transcript rebuild, and workspace
     /// trust behavior stay centralized.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; TUI assistant slash path remains sync until db-async-session-log"
+    )]
     pub(super) fn handle_assistant_command(&mut self, arg: &str) {
         let name = arg.trim();
         if name.is_empty() {
@@ -1621,12 +1625,25 @@ impl App {
                 .get_assistant(name)?
                 .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
             cockpit_core::assistants::load_from_row(&row)?;
-            if let Some(session) = db.most_recent_session_for_assistant(name)? {
+            let name_for_lookup = name.to_string();
+            if let Some(session) = db.write_blocking(move |conn| {
+                cockpit_db::Db::most_recent_session_for_assistant_conn(conn, &name_for_lookup)
+            })? {
                 return Ok(session);
             }
             let project_id = cockpit_core::session::project_id_for(&self.launch.cwd);
             let project_root = self.launch.cwd.to_string_lossy().into_owned();
-            db.create_assistant_session(&project_id, &project_root, name, name)
+            let name_for_create = name.to_string();
+            db.write_blocking(move |conn| {
+                let row = cockpit_db::Db::build_new_assistant_session_row_conn(
+                    conn,
+                    &project_id,
+                    &project_root,
+                    &name_for_create,
+                    &name_for_create,
+                )?;
+                cockpit_db::Db::insert_session_row_conn(conn, &row)
+            })
         }) {
             Ok(session) => session,
             Err(error) => {

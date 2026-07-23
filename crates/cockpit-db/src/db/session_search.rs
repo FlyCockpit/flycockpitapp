@@ -46,12 +46,8 @@ impl Db {
     /// it. Returns `Ok(())` when FTS5 is usable; an explanatory error
     /// otherwise. The feature must never silently degrade to LIKE
     /// (prompt decision), so callers surface this and stop.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn fts5_available(&self) -> Result<()> {
-        self.write_blocking(move |conn| {
+    pub async fn fts5_available(&self) -> Result<()> {
+        self.write(move |conn| {
             conn.execute_batch(
                 "CREATE VIRTUAL TABLE temp.__cockpit_fts5_probe USING fts5(x);
                  INSERT INTO temp.__cockpit_fts5_probe (x) VALUES ('cockpit');
@@ -63,6 +59,7 @@ impl Db {
             )?;
             Ok(())
         })
+        .await
     }
 
     /// Rank FTS5 candidates for `query`, one row per matching thread
@@ -79,11 +76,7 @@ impl Db {
     ///   * archived threads (`archived_at IS NOT NULL`) are always
     ///     excluded — search never surfaces a soft-deleted thread.
     ///   * `since` (epoch seconds) keeps only threads active at/after it.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn search_candidates(
+    pub async fn search_candidates(
         &self,
         query: &str,
         project_id: Option<&str>,
@@ -91,64 +84,70 @@ impl Db {
         since: Option<i64>,
         pool: u32,
     ) -> Result<Vec<SearchHit>> {
-        self.read_blocking(|conn| {
-            search_candidates_inner(conn, query, project_id, exclude_session, since, pool)
+        let query = query.to_string();
+        let project_id = project_id.map(str::to_string);
+        self.read(move |conn| {
+            search_candidates_inner(
+                conn,
+                &query,
+                project_id.as_deref(),
+                exclude_session,
+                since,
+                pool,
+            )
         })
+        .await
     }
 
     /// All `user_message` / `assistant_message` turns of a thread,
     /// ordered by `seq` (oldest first). Powers `session_read`'s
     /// windowing — the tool slices this in Rust per the `read`-tool
     /// pagination conventions. Non-message events are skipped.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn thread_turns(&self, session_id: Uuid) -> Result<Vec<ThreadTurn>> {
-        self.read_blocking(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT seq, type, json_extract(data_json, '$.text') AS text
-                       FROM session_events
-                      WHERE session_id = ?1
-                        AND type IN ('user_message', 'assistant_message')
-                      ORDER BY seq ASC",
-                )
-                .context("preparing thread_turns")?;
-            let rows = stmt
-                .query_map([session_id.to_string()], |row| {
-                    let kind: String = row.get("type")?;
-                    let role = match kind.as_str() {
-                        "assistant_message" => "assistant",
-                        _ => "user",
-                    }
-                    .to_string();
-                    let text: Option<String> = row.get("text")?;
-                    Ok(ThreadTurn {
-                        seq: row.get("seq")?,
-                        role,
-                        text: text.unwrap_or_default(),
-                    })
+    pub async fn thread_turns(&self, session_id: Uuid) -> Result<Vec<ThreadTurn>> {
+        self.read(move |conn| Self::thread_turns_conn(conn, session_id))
+            .await
+    }
+
+    pub fn thread_turns_conn(conn: &Connection, session_id: Uuid) -> Result<Vec<ThreadTurn>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, type, json_extract(data_json, '$.text') AS text
+                   FROM session_events
+                  WHERE session_id = ?1
+                    AND type IN ('user_message', 'assistant_message')
+                  ORDER BY seq ASC",
+            )
+            .context("preparing thread_turns")?;
+        let rows = stmt
+            .query_map([session_id.to_string()], |row| {
+                let kind: String = row.get("type")?;
+                let role = match kind.as_str() {
+                    "assistant_message" => "assistant",
+                    _ => "user",
+                }
+                .to_string();
+                let text: Option<String> = row.get("text")?;
+                Ok(ThreadTurn {
+                    seq: row.get("seq")?,
+                    role,
+                    text: text.unwrap_or_default(),
                 })
-                .context("querying thread_turns")?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r.context("decoding thread turn")?);
-            }
-            Ok(out)
-        })
+            })
+            .context("querying thread_turns")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("decoding thread turn")?);
+        }
+        Ok(out)
     }
 
     /// `seq`s within a thread whose message text matches `query` (FTS5),
     /// oldest first. `session_read` centers its window on these. Empty
     /// when the thread has no textual match.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn thread_match_seqs(&self, session_id: Uuid, query: &str) -> Result<Vec<i64>> {
-        self.read_blocking(|conn| {
-            let Some(match_query) = literal_fts_match_query(query) else {
+    pub async fn thread_match_seqs(&self, session_id: Uuid, query: &str) -> Result<Vec<i64>> {
+        let query = query.to_string();
+        self.read(move |conn| {
+            let Some(match_query) = literal_fts_match_query(&query) else {
                 return Ok(Vec::new());
             };
             let mut stmt = conn
@@ -173,6 +172,7 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 }
 
@@ -409,18 +409,19 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn fts5_is_available_in_bundled_build() {
+    #[tokio::test]
+    async fn fts5_is_available_in_bundled_build() {
         let db = Db::open_in_memory().unwrap();
         db.fts5_available()
+            .await
             .expect("bundled rusqlite must ship FTS5");
     }
 
-    #[test]
-    fn search_ranks_and_scopes_by_project() {
+    #[tokio::test]
+    async fn search_ranks_and_scopes_by_project() {
         let db = Db::open_in_memory().unwrap();
-        let a = db.create_session("projA", "/a", "Build").unwrap();
-        let b = db.create_session("projB", "/b", "Build").unwrap();
+        let a = db.create_session("projA", "/a", "Build").await.unwrap();
+        let b = db.create_session("projB", "/b", "Build").await.unwrap();
         msg(
             &db,
             a.session_id,
@@ -437,6 +438,7 @@ mod tests {
         // Default scope = projA only.
         let hits = db
             .search_candidates("widget", Some("projA"), None, None, 10)
+            .await
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, a.session_id);
@@ -449,22 +451,24 @@ mod tests {
         // projB has no widget match.
         let none = db
             .search_candidates("widget", Some("projB"), None, None, 10)
+            .await
             .unwrap();
         assert!(none.is_empty());
 
         // Global recall still finds it.
         let global = db
             .search_candidates("widget", None, None, None, 10)
+            .await
             .unwrap();
         assert_eq!(global.len(), 1);
     }
 
-    #[test]
-    fn search_excludes_archived_and_current_session() {
+    #[tokio::test]
+    async fn search_excludes_archived_and_current_session() {
         let db = Db::open_in_memory().unwrap();
-        let live = db.create_session("p", "/x", "Build").unwrap();
-        let archived = db.create_session("p", "/x", "Build").unwrap();
-        let current = db.create_session("p", "/x", "Build").unwrap();
+        let live = db.create_session("p", "/x", "Build").await.unwrap();
+        let archived = db.create_session("p", "/x", "Build").await.unwrap();
+        let current = db.create_session("p", "/x", "Build").await.unwrap();
         for s in [&live, &archived, &current] {
             msg(
                 &db,
@@ -473,10 +477,13 @@ mod tests {
                 "shared keyword apricot",
             );
         }
-        db.archive_session(archived.session_id, false).unwrap();
+        db.archive_session(archived.session_id, false)
+            .await
+            .unwrap();
 
         let hits = db
             .search_candidates("apricot", Some("p"), Some(current.session_id), None, 10)
+            .await
             .unwrap();
         let ids: Vec<Uuid> = hits.iter().map(|h| h.session_id).collect();
         assert!(ids.contains(&live.session_id));
@@ -490,23 +497,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn search_indexes_titles() {
+    #[tokio::test]
+    async fn search_indexes_titles() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         db.set_auto_title(s.session_id, "refactor the lock manager")
+            .await
             .unwrap();
         let hits = db
             .search_candidates("refactor", Some("p"), None, None, 10)
+            .await
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, s.session_id);
     }
 
-    #[test]
-    fn search_honors_since_filter() {
+    #[tokio::test]
+    async fn search_honors_since_filter() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         msg(
             &db,
             s.session_id,
@@ -515,25 +524,28 @@ mod tests {
         );
         let active = db
             .get_session(s.session_id)
+            .await
             .unwrap()
             .unwrap()
             .last_active_at;
         // since in the future → filtered out.
         let later = db
             .search_candidates("banana", Some("p"), None, Some(active + 10_000), 10)
+            .await
             .unwrap();
         assert!(later.is_empty());
         // since in the past → included.
         let earlier = db
             .search_candidates("banana", Some("p"), None, Some(active - 10_000), 10)
+            .await
             .unwrap();
         assert_eq!(earlier.len(), 1);
     }
 
-    #[test]
-    fn no_match_is_empty_not_error() {
+    #[tokio::test]
+    async fn no_match_is_empty_not_error() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         msg(
             &db,
             s.session_id,
@@ -542,12 +554,13 @@ mod tests {
         );
         let hits = db
             .search_candidates("nonexistentterm", Some("p"), None, None, 10)
+            .await
             .unwrap();
         assert!(hits.is_empty());
     }
 
-    #[test]
-    fn literal_fts_query_tokenizes_malformed_syntax_safely() {
+    #[tokio::test]
+    async fn literal_fts_query_tokenizes_malformed_syntax_safely() {
         assert_eq!(
             literal_fts_match_query(r#"foo "bar baz" ("#).as_deref(),
             Some(r#""foo" OR "bar" OR "baz""#)
@@ -560,10 +573,10 @@ mod tests {
         assert_eq!(literal_fts_match_query("").as_deref(), None);
     }
 
-    #[test]
-    fn malformed_search_candidates_queries_never_surface_fts_syntax_errors() {
+    #[tokio::test]
+    async fn malformed_search_candidates_queries_never_surface_fts_syntax_errors() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         msg(
             &db,
             s.session_id,
@@ -574,6 +587,7 @@ mod tests {
         for query in [r#""foo"#, "foo)", "(bar", "foo OR bar"] {
             let hits = db
                 .search_candidates(query, Some("p"), None, None, 10)
+                .await
                 .unwrap();
             assert_eq!(hits.len(), 1, "query {query:?}");
             assert_eq!(hits[0].session_id, s.session_id);
@@ -582,15 +596,16 @@ mod tests {
         for query in ["", "   ", "?!()"] {
             let hits = db
                 .search_candidates(query, Some("p"), None, None, 10)
+                .await
                 .unwrap();
             assert!(hits.is_empty(), "query {query:?}");
         }
     }
 
-    #[test]
-    fn malformed_thread_match_queries_never_surface_fts_syntax_errors() {
+    #[tokio::test]
+    async fn malformed_thread_match_queries_never_surface_fts_syntax_errors() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         let seq = msg(
             &db,
             s.session_id,
@@ -599,13 +614,14 @@ mod tests {
         );
 
         for query in [r#""falcon"#, "falcon)", "(syntax", "falcon OR syntax"] {
-            let seqs = db.thread_match_seqs(s.session_id, query).unwrap();
+            let seqs = db.thread_match_seqs(s.session_id, query).await.unwrap();
             assert!(seqs.contains(&seq), "query {query:?}: {seqs:?}");
         }
 
         for query in ["", "   ", "?!()"] {
             assert!(
                 db.thread_match_seqs(s.session_id, query)
+                    .await
                     .unwrap()
                     .is_empty(),
                 "query {query:?}"
@@ -613,10 +629,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ordinary_multi_word_search_still_finds_and_highlights() {
+    #[tokio::test]
+    async fn ordinary_multi_word_search_still_finds_and_highlights() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         msg(
             &db,
             s.session_id,
@@ -625,6 +641,7 @@ mod tests {
         );
         let hits = db
             .search_candidates("alpha beta", Some("p"), None, None, 10)
+            .await
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, s.session_id);
@@ -635,18 +652,14 @@ mod tests {
         );
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn session_fts_is_contentless_and_does_not_expose_body_text() {
+    #[tokio::test]
+    async fn session_fts_is_contentless_and_does_not_expose_body_text() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         let secret = "secret_like_indexed_value_123";
         msg(&db, s.session_id, SessionEventKind::UserMessage, secret);
 
-        db.read_blocking(|conn| {
+        db.read(move |conn| {
             let ddl: String = conn.query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_fts'",
                 [],
@@ -671,11 +684,12 @@ mod tests {
             assert_eq!(canonical, secret);
             Ok(())
         })
+        .await
         .unwrap();
     }
 
-    #[test]
-    fn canonical_snippet_highlights_terms_and_handles_utf8_boundaries() {
+    #[tokio::test]
+    async fn canonical_snippet_highlights_terms_and_handles_utf8_boundaries() {
         let terms = literal_fts_terms("beta!");
         assert_eq!(
             canonical_snippet("alpha beta gamma", &terms),
@@ -693,15 +707,12 @@ mod tests {
         assert_eq!(snippet, "😀é中abc");
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn title_update_event_update_and_deletes_keep_fts_in_sync() {
+    #[tokio::test]
+    async fn title_update_event_update_and_deletes_keep_fts_in_sync() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         db.set_auto_title(s.session_id, "original dashboard")
+            .await
             .unwrap();
         let seq = msg(
             &db,
@@ -711,9 +722,11 @@ mod tests {
         );
 
         db.set_auto_title(s.session_id, "renamed dashboard")
+            .await
             .unwrap();
         assert!(
             db.search_candidates("original", Some("p"), None, None, 10)
+                .await
                 .unwrap()
                 .iter()
                 .any(|hit| hit.session_id == s.session_id),
@@ -721,12 +734,13 @@ mod tests {
         );
         assert_eq!(
             db.search_candidates("renamed", Some("p"), None, None, 10)
+                .await
                 .unwrap()
                 .len(),
             1
         );
 
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute(
                 "UPDATE session_events
                     SET data_json = json_object('text', 'updated body keyword')
@@ -735,51 +749,54 @@ mod tests {
             )?;
             Ok(())
         })
+        .await
         .unwrap();
         assert!(
             db.search_candidates("original", Some("p"), None, None, 10)
+                .await
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
             db.search_candidates("updated", Some("p"), None, None, 10)
+                .await
                 .unwrap()
                 .len(),
             1
         );
 
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute("DELETE FROM session_events WHERE seq = ?1", [seq])?;
             Ok(())
         })
+        .await
         .unwrap();
         assert!(
             db.search_candidates("updated", Some("p"), None, None, 10)
+                .await
                 .unwrap()
                 .is_empty()
         );
 
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute(
                 "DELETE FROM sessions WHERE session_id = ?1",
                 [s.session_id.to_string()],
             )?;
             Ok(())
         })
+        .await
         .unwrap();
         assert!(
             db.search_candidates("renamed", Some("p"), None, None, 10)
+                .await
                 .unwrap()
                 .is_empty()
         );
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn backfill_indexes_preexisting_rows() {
+    #[tokio::test]
+    async fn backfill_indexes_preexisting_rows() {
         // Simulate pre-migration data: insert events with the FTS triggers
         // dropped, then re-run the backfill statements and confirm the
         // rows become searchable. We mimic this by inserting directly with
@@ -791,7 +808,7 @@ mod tests {
         // event row by hand bypassing nothing (triggers fire) — then drop
         // and rebuild the FTS table from the backfill statements.
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         msg(
             &db,
             s.session_id,
@@ -801,7 +818,7 @@ mod tests {
 
         // Drop the FTS contents and re-run the backfill to prove the
         // backfill SQL (not just the triggers) reconstructs the index.
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute_batch(
                 "INSERT INTO session_fts(session_fts) VALUES('delete-all');
                  DELETE FROM session_fts_docs;",
@@ -820,19 +837,21 @@ mod tests {
             )?;
             Ok(())
         })
+        .await
         .unwrap();
 
         let hits = db
             .search_candidates("quokka", Some("p"), None, None, 10)
+            .await
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, s.session_id);
     }
 
-    #[test]
-    fn thread_turns_and_match_seqs() {
+    #[tokio::test]
+    async fn thread_turns_and_match_seqs() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         let s1 = msg(
             &db,
             s.session_id,
@@ -852,12 +871,12 @@ mod tests {
             "and the kestrel diet",
         );
 
-        let turns = db.thread_turns(s.session_id).unwrap();
+        let turns = db.thread_turns(s.session_id).await.unwrap();
         assert_eq!(turns.len(), 3);
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[1].role, "assistant");
 
-        let seqs = db.thread_match_seqs(s.session_id, "kestrel").unwrap();
+        let seqs = db.thread_match_seqs(s.session_id, "kestrel").await.unwrap();
         assert_eq!(seqs, vec![s1, s3]);
     }
 }

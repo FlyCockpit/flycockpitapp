@@ -292,7 +292,7 @@ async fn generate_slug_inner(
     let content = match action {
         TitleAction::Eager => content_prefix,
         TitleAction::None | TitleAction::Refine | TitleAction::Explicit => {
-            accumulated_user_content(session, &content_prefix)
+            accumulated_user_content(session, &content_prefix).await
         }
     };
     let prompt = build_title_prompt(&content);
@@ -319,8 +319,8 @@ async fn generate_slug_inner(
 /// [`REFINE_CONTEXT_TOKEN_BUDGET`]. Falls back to `content_prefix` when
 /// the recorded turns can't be read or are empty, so a refresh pass is
 /// never worse than the eager one.
-fn accumulated_user_content(session: &Session, content_prefix: &str) -> String {
-    let turns = match session.db.thread_turns(session.id) {
+async fn accumulated_user_content(session: &Session, content_prefix: &str) -> String {
+    let turns = match session.db.thread_turns(session.id).await {
         Ok(turns) => turns,
         Err(e) => {
             tracing::debug!(error = %e, "auto_title: reading user turns failed; using prefix");

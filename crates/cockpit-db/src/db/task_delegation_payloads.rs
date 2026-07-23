@@ -386,10 +386,10 @@ fn decode_payload_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskDelegatio
 mod tests {
     use super::*;
 
-    #[test]
-    fn in_memory_store_load_and_mark_delivered() {
+    #[tokio::test]
+    async fn in_memory_store_load_and_mark_delivered() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/proj", "Build").unwrap();
+        let session = db.create_session("p", "/proj", "Build").await.unwrap();
         db.upsert_task_delegation_job(
             session.session_id,
             "task-1",
@@ -438,11 +438,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn file_backed_store_uses_hash_sidecar_and_detects_missing_body() {
+    #[tokio::test]
+    async fn file_backed_store_uses_hash_sidecar_and_detects_missing_body() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
-        let session = db.create_session("p", "/proj", "Build").unwrap();
+        let session = db.create_session("p", "/proj", "Build").await.unwrap();
         db.upsert_task_delegation_job(
             session.session_id,
             "task-2",

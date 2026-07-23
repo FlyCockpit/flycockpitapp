@@ -786,10 +786,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn inference_request_round_trip() {
+    #[tokio::test]
+    async fn inference_request_round_trip() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let call_id = Uuid::new_v4().to_string();
         let payload = json!({
             "model": "claude-opus-4-7",
@@ -812,19 +812,19 @@ mod tests {
         assert!(db.get_inference_request("missing").unwrap().is_none());
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn inference_request_dispatch_then_terminal_update_supersedes() {
+    async fn inference_request_dispatch_then_terminal_update_supersedes() {
         // The dispatch-time write (status `pending`) and the terminal update
         // (status `timed_out`) for one call_id collapse onto a single row,
         // with the terminal status + payload winning — the
         // dispatch-time-recording lifecycle
         // (implementation note).
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let call_id = Uuid::new_v4().to_string();
         let pending_payload = json!({ "model": "m", "status_hint": "pre-dispatch" });
         db.insert_inference_request(
@@ -864,12 +864,12 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    #[test]
-    fn permission_decision_event_round_trips() {
+    #[tokio::test]
+    async fn permission_decision_event_round_trips() {
         // The `permission_decision` variant persists with its stable
         // discriminant string and its data payload flows back verbatim.
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let data = json!({
             "tool": "bash",
             "tool_call_id": null,
@@ -893,17 +893,17 @@ mod tests {
         assert_eq!(events[0].data, data);
     }
 
-    #[test]
-    fn notice_event_kind_wire_string_is_notice() {
+    #[tokio::test]
+    async fn notice_event_kind_wire_string_is_notice() {
         assert_eq!(SessionEventKind::Notice.as_str(), "notice");
     }
 
-    #[test]
-    fn session_event_kind_export_audit_events_round_trip() {
+    #[tokio::test]
+    async fn session_event_kind_export_audit_events_round_trip() {
         // The export-audit-fidelity event kinds persist with their stable
         // discriminant strings and flow their data payloads back verbatim.
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         let sid = s.session_id;
 
         let rejected = json!({"tool": "handoff", "reason": "not_in_advertised_set"});
@@ -959,8 +959,8 @@ mod tests {
         assert_eq!(events[2].data, model_switch);
     }
 
-    #[test]
-    fn user_note_event_persists_with_stable_discriminant() {
+    #[tokio::test]
+    async fn user_note_event_persists_with_stable_discriminant() {
         // `/note` records a `user_note` session event that persists durably
         // (survives a fresh Db handle to the same file) with its stable
         // discriminant string and verbatim text payload — the basis for both
@@ -972,7 +972,7 @@ mod tests {
         let seq;
         {
             let db = Db::open(&path).unwrap();
-            let s = db.create_session("p", "/x", "Build").unwrap();
+            let s = db.create_session("p", "/x", "Build").await.unwrap();
             sid = s.session_id;
             assert_eq!(SessionEventKind::UserNote.as_str(), "user_note");
             seq = db
@@ -1001,11 +1001,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn session_events_seq_is_monotonic_across_sessions() {
+    #[tokio::test]
+    async fn session_events_seq_is_monotonic_across_sessions() {
         let db = Db::open_in_memory().unwrap();
-        let a = db.create_session("p", "/x", "builder").unwrap();
-        let b = db.create_fork(a.session_id, None).unwrap();
+        let a = db.create_session("p", "/x", "builder").await.unwrap();
+        let b = db.create_fork(a.session_id, None).await.unwrap();
         // Interleave inserts across two sessions; seq must be globally
         // monotonic so the export's unified timeline orders correctly.
         let s1 = db
@@ -1049,12 +1049,12 @@ mod tests {
         assert_eq!(b_events[0].data, json!({"text": "second"}));
     }
 
-    #[test]
-    fn concurrent_session_event_writers_assign_unique_monotonic_seq() {
+    #[tokio::test]
+    async fn concurrent_session_event_writers_assign_unique_monotonic_seq() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cockpit.db");
         let db = Db::open(&path).unwrap();
-        let session = db.create_session("p", "/x", "builder").unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
 
         let mut threads = Vec::new();
         for worker in 0..8 {
@@ -1095,12 +1095,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn crash_mid_append_rolls_back_uncommitted_tail() {
+    #[tokio::test]
+    async fn crash_mid_append_rolls_back_uncommitted_tail() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cockpit.db");
         let db = Db::open(&path).unwrap();
-        let session = db.create_session("p", "/x", "builder").unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
         let committed = db
             .insert_session_event(
                 session.session_id,
@@ -1138,12 +1138,12 @@ mod tests {
         assert_eq!(events[0].data, json!({"text": "committed"}));
     }
 
-    #[test]
-    fn truncated_tail_is_ignored_when_rehydrating_committed_prefix() {
+    #[tokio::test]
+    async fn truncated_tail_is_ignored_when_rehydrating_committed_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cockpit.db");
         let db = Db::open(&path).unwrap();
-        let session = db.create_session("p", "/x", "builder").unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
         let user_seq = db
             .insert_session_event(
                 session.session_id,
@@ -1213,14 +1213,14 @@ mod tests {
         assert_eq!(events[1].data["text"], "still committed");
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn list_session_events_since_filters_strictly_after_seq() {
+    async fn list_session_events_since_filters_strictly_after_seq() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let seq1 = db
             .insert_session_event(
                 s.session_id,
@@ -1261,10 +1261,10 @@ mod tests {
         assert!(rows.is_empty());
     }
 
-    #[test]
-    fn list_session_events_before_returns_newest_page_oldest_first() {
+    #[tokio::test]
+    async fn list_session_events_before_returns_newest_page_oldest_first() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let seqs = insert_numbered_events(&db, s.session_id, 5);
 
         let page = db
@@ -1293,10 +1293,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_session_events_before_walk_reconstructs_full_event_list() {
+    #[tokio::test]
+    async fn list_session_events_before_walk_reconstructs_full_event_list() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         insert_numbered_events(&db, s.session_id, 7);
         let full = db.list_session_events(s.session_id).unwrap();
 
@@ -1321,10 +1321,10 @@ mod tests {
         assert_session_event_rows_eq(&reconstructed, &full);
     }
 
-    #[test]
-    fn list_session_events_before_reports_has_more_until_oldest_event() {
+    #[tokio::test]
+    async fn list_session_events_before_reports_has_more_until_oldest_event() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let seqs = insert_numbered_events(&db, s.session_id, 5);
 
         let first = db
@@ -1377,10 +1377,10 @@ mod tests {
         assert_eq!(before_oldest.oldest_seq, None);
     }
 
-    #[test]
-    fn list_session_events_before_clamps_limit() {
+    #[tokio::test]
+    async fn list_session_events_before_clamps_limit() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let seqs = insert_numbered_events(&db, s.session_id, 501);
 
         let minimum = db
@@ -1405,10 +1405,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_session_events_before_hydrates_compaction_payload() {
+    #[tokio::test]
+    async fn list_session_events_before_hydrates_compaction_payload() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let handoff_id = Uuid::new_v4();
         let payload = json!({
             "handoff_text": "resume from stored handoff",
@@ -1436,10 +1436,10 @@ mod tests {
         assert_session_event_rows_eq(&page.events, &full);
     }
 
-    #[test]
-    fn list_session_events_before_empty_session_returns_empty_page() {
+    #[tokio::test]
+    async fn list_session_events_before_empty_session_returns_empty_page() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
 
         let page = db
             .list_session_events_before(s.session_id, None, 10)
@@ -1456,11 +1456,11 @@ mod tests {
         assert_eq!(unknown.oldest_seq, None);
     }
 
-    #[test]
-    fn list_session_events_before_does_not_leak_across_sessions() {
+    #[tokio::test]
+    async fn list_session_events_before_does_not_leak_across_sessions() {
         let db = Db::open_in_memory().unwrap();
-        let a = db.create_session("p", "/x", "builder").unwrap();
-        let b = db.create_fork(a.session_id, None).unwrap();
+        let a = db.create_session("p", "/x", "builder").await.unwrap();
+        let b = db.create_fork(a.session_id, None).await.unwrap();
 
         let a1 = db
             .insert_session_event(
@@ -1530,10 +1530,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_session_messages_pages_message_rows_only() {
+    #[tokio::test]
+    async fn read_session_messages_pages_message_rows_only() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let user_one = db
             .insert_session_event(
                 s.session_id,
@@ -1572,6 +1572,7 @@ mod tests {
 
         let before = db
             .list_session_summaries(Some("p"), None, 10)
+            .await
             .unwrap()
             .remove(0);
         let (page, has_more) = db
@@ -1596,6 +1597,7 @@ mod tests {
 
         let after = db
             .list_session_summaries(Some("p"), None, 10)
+            .await
             .unwrap()
             .remove(0);
         assert_eq!(after.last_viewed_at, before.last_viewed_at);

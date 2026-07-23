@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::path::Path;
 
 use super::*;
@@ -13,13 +15,22 @@ impl Session {
     pub fn create(db: Db, project_root: PathBuf, active_agent: &str) -> Result<Self> {
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
-        let mut row = db
-            .new_session_row(&project_id, &project_root_str, active_agent)
-            .context("building session row")?;
+        let project_id_for_db = project_id.clone();
+        let project_root_for_db = project_root_str.clone();
+        let active_agent_for_db = active_agent.to_string();
+        let mut row = db.write_blocking(move |conn| {
+            crate::db::Db::build_new_session_row_conn(
+                conn,
+                &project_id_for_db,
+                &project_root_for_db,
+                &active_agent_for_db,
+            )
+        })?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
+        let row_for_db = row.clone();
         let row = db
-            .insert_session_row(&row)
+            .write_blocking(move |conn| crate::db::Db::insert_session_row_conn(conn, &row_for_db))
             .context("creating session row")?;
         Self::from_row(db, project_root, row)
     }
@@ -33,8 +44,18 @@ impl Session {
     pub fn create_deferred(db: Db, project_root: PathBuf, active_agent: &str) -> Result<Self> {
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
+        let project_id_for_db = project_id.clone();
+        let project_root_for_db = project_root_str.clone();
+        let active_agent_for_db = active_agent.to_string();
         let mut row = db
-            .new_session_row(&project_id, &project_root_str, active_agent)
+            .write_blocking(move |conn| {
+                crate::db::Db::build_new_session_row_conn(
+                    conn,
+                    &project_id_for_db,
+                    &project_root_for_db,
+                    &active_agent_for_db,
+                )
+            })
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
@@ -55,8 +76,20 @@ impl Session {
     ) -> Result<Self> {
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
+        let project_id_for_db = project_id.clone();
+        let project_root_for_db = project_root_str.clone();
+        let active_agent_for_db = active_agent.to_string();
+        let assistant_name_for_db = assistant_name.to_string();
         let mut row = db
-            .new_assistant_session_row(&project_id, &project_root_str, active_agent, assistant_name)
+            .write_blocking(move |conn| {
+                crate::db::Db::build_new_assistant_session_row_conn(
+                    conn,
+                    &project_id_for_db,
+                    &project_root_for_db,
+                    &active_agent_for_db,
+                    &assistant_name_for_db,
+                )
+            })
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
@@ -91,7 +124,11 @@ impl Session {
                 None => return Ok(false),
             }
         };
-        match self.db.insert_session_row(&row) {
+        let row_for_db = row.clone();
+        match self
+            .db
+            .write_blocking(move |conn| crate::db::Db::insert_session_row_conn(conn, &row_for_db))
+        {
             Ok(_) => {}
             Err(e) => {
                 // Restore the pending row so a transient failure can retry on
@@ -100,8 +137,16 @@ impl Session {
                 return Err(e).context("persisting deferred session row");
             }
         }
+        let session_id = self.id;
         if row.last_viewed_at.is_some()
-            && let Err(e) = self.db.mark_session_viewed(self.id)
+            && let Err(e) = self.db.write_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET last_viewed_at = ?1 WHERE session_id = ?2",
+                    params![Utc::now().timestamp(), session_id.to_string()],
+                )
+                .context("marking session viewed")?;
+                Ok(())
+            })
         {
             tracing::warn!(error = %e, "persisting deferred session viewed marker failed");
         }
@@ -139,7 +184,16 @@ impl Session {
         fork_point_turn_id: Option<String>,
     ) -> Result<Self> {
         let row = db
-            .create_fork(parent_session_id, fork_point_turn_id)
+            .write_blocking(move |conn| {
+                crate::db::Db::create_fork_conn(
+                    conn,
+                    parent_session_id,
+                    fork_point_turn_id,
+                    false,
+                    Uuid::new_v4(),
+                    Utc::now().timestamp(),
+                )
+            })
             .context("creating fork session row")?;
         let project_root = PathBuf::from(&row.project_root);
         Self::from_row(db, project_root, row)
@@ -148,7 +202,10 @@ impl Session {
     /// Resume an existing session. Returns `None` if the id is unknown.
     /// Backfills `short_id` if missing (lazy migration from pre-§17 rows).
     pub fn resume(db: Db, session_id: Uuid) -> Result<Option<Self>> {
-        let Some(row) = db.get_session(session_id).context("fetching session")? else {
+        let Some(row) = db
+            .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+            .context("fetching session")?
+        else {
             return Ok(None);
         };
         let project_root = PathBuf::from(&row.project_root);
@@ -162,11 +219,13 @@ impl Session {
         let model_system_prompt_snapshot = Arc::new(ModelSystemPromptSnapshot::from_json_str(
             &row.model_system_prompt_snapshot_json,
         ));
-        let short_id = match row.short_id {
+        let short_id = match row.short_id.clone() {
             Some(s) => s,
-            None => db
-                .ensure_short_id(row.session_id)
-                .context("backfilling short_id")?,
+            None => {
+                let session_id = row.session_id;
+                db.write_blocking(move |conn| crate::db::Db::ensure_short_id_conn(conn, session_id))
+                    .context("backfilling short_id")?
+            }
         };
         Ok(Self {
             id: row.session_id,
@@ -287,8 +346,17 @@ impl Session {
     // `/rename` affordance.
     #[allow(dead_code)]
     pub fn rename(&self, new_title: &str) -> Result<()> {
+        let title = new_title.to_string();
+        let session_id = self.id;
         self.db
-            .rename_session(self.id, new_title)
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET title = ?1, user_renamed = 1 WHERE session_id = ?2",
+                    params![title, session_id.to_string()],
+                )
+                .context("renaming session")?;
+                Ok(())
+            })
             .context("renaming session")?;
         *self.title.lock().unwrap() = Some(new_title.to_string());
         *self.user_renamed.lock().unwrap() = true;
@@ -305,8 +373,16 @@ impl Session {
         }) {
             return Ok(());
         }
+        let session_id = self.id;
         self.db
-            .set_session_redaction_table_json(self.id, Some(json))
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET redaction_table_json = ?1 WHERE session_id = ?2",
+                    params![Some(json), session_id.to_string()],
+                )
+                .context("setting session redaction table")?;
+                Ok(())
+            })
             .context("persisting session redaction table")
     }
 
@@ -327,7 +403,17 @@ impl Session {
         }) {
             return Ok(());
         }
-        self.db.touch_session(self.id).context("touching session")
+        let session_id = self.id;
+        self.db
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET last_active_at = ?1 WHERE session_id = ?2",
+                    params![Utc::now().timestamp(), session_id.to_string()],
+                )
+                .context("touching session")?;
+                Ok(())
+            })
+            .context("touching session")
     }
 
     /// Mark this session viewed by a client. For an unpersisted deferred
@@ -339,8 +425,16 @@ impl Session {
         }) {
             return Ok(());
         }
+        let session_id = self.id;
         self.db
-            .mark_session_viewed(self.id)
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET last_viewed_at = ?1 WHERE session_id = ?2",
+                    params![Utc::now().timestamp(), session_id.to_string()],
+                )
+                .context("marking session viewed")?;
+                Ok(())
+            })
             .context("marking session viewed")
     }
 
@@ -350,7 +444,17 @@ impl Session {
     /// scratch space doesn't outlive it.
     pub fn end(&self) -> Result<()> {
         self.remove_tmp_dir();
-        self.db.end_session(self.id).context("ending session")
+        let session_id = self.id;
+        self.db
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2",
+                    params![Utc::now().timestamp(), session_id.to_string()],
+                )
+                .context("ending session")?;
+                Ok(())
+            })
+            .context("ending session")
     }
 
     /// Remove the per-session tmp dir if one was created. Idempotent.

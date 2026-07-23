@@ -124,12 +124,13 @@ async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Re
         .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
     crate::assistants::load_from_row(&row)
         .with_context(|| format!("validating assistant `{name}` before chat"))?;
-    let session = match db.most_recent_session_for_assistant(name)? {
+    let session = match db.most_recent_session_for_assistant(name).await? {
         Some(session) => session,
         None => {
             let project_id = project_id_for(&project_root);
             let project_root_str = project_root.to_string_lossy().into_owned();
             db.create_assistant_session(&project_id, &project_root_str, name, name)
+                .await
                 .context("creating assistant session")?
         }
     };
@@ -249,8 +250,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn assistant_sessions_owned() {
+    #[tokio::test]
+    async fn assistant_sessions_owned() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let project_root = temp.path().to_path_buf();
@@ -259,15 +260,18 @@ mod tests {
 
         let session = db
             .create_assistant_session(&project_id, &project_root_str, "helper-bot", "helper-bot")
+            .await
             .unwrap();
         db.create_session(&project_id, &project_root_str, "Build")
+            .await
             .unwrap();
 
-        let fetched = db.get_session(session.session_id).unwrap().unwrap();
+        let fetched = db.get_session(session.session_id).await.unwrap().unwrap();
         assert_eq!(fetched.assistant_name.as_deref(), Some("helper-bot"));
 
         let filtered = db
             .list_sessions_for_assistant("helper-bot", false, 100)
+            .await
             .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].session_id, session.session_id);

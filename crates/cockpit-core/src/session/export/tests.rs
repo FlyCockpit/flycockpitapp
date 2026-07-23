@@ -1,10 +1,55 @@
 use super::*;
 use crate::db::session_log::SessionEventKind;
+use crate::db::sessions::SessionRow;
 use crate::db::tool_calls::Recovery;
 use crate::db::tool_calls::ToolCallEvent;
 use crate::engine::tool::Tool;
 use crate::session::{Session, ToolCallProviderIdentity, ToolCallRow};
 use std::io::Read;
+
+#[allow(deprecated)]
+fn create_test_session(
+    db: &crate::db::Db,
+    project_id: &str,
+    project_root: &str,
+    active_agent: &str,
+) -> SessionRow {
+    let project_id = project_id.to_string();
+    let project_root = project_root.to_string();
+    let active_agent = active_agent.to_string();
+    db.write_blocking(move |conn| {
+        let row = crate::db::Db::build_new_session_row_conn(
+            conn,
+            &project_id,
+            &project_root,
+            &active_agent,
+        )?;
+        crate::db::Db::insert_session_row_conn(conn, &row)
+    })
+    .unwrap()
+}
+
+#[allow(deprecated)]
+fn create_test_fork(db: &crate::db::Db, parent_session_id: Uuid) -> SessionRow {
+    db.write_blocking(move |conn| {
+        crate::db::Db::create_fork_conn(
+            conn,
+            parent_session_id,
+            None,
+            false,
+            Uuid::new_v4(),
+            chrono::Utc::now().timestamp(),
+        )
+    })
+    .unwrap()
+}
+
+#[allow(deprecated)]
+fn get_test_session(db: &crate::db::Db, session_id: Uuid) -> SessionRow {
+    db.write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+        .unwrap()
+        .unwrap()
+}
 
 /// Read a named file out of a zip byte buffer.
 fn read_zip_entry(bytes: &[u8], name: &str) -> Option<String> {
@@ -420,7 +465,12 @@ fn record_responses_task_pair(
 }
 
 fn build_session_zip(session: &Session) -> Vec<u8> {
-    let target = session.db.get_session(session.id).unwrap().unwrap();
+    let session_id = session.id;
+    let target = session
+        .db
+        .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+        .unwrap()
+        .unwrap();
     let bundle = collect_bundle(&session.db, session.id).unwrap();
     build_zip(&session.db, &target, &bundle).unwrap()
 }
@@ -515,9 +565,7 @@ fn export_bundles_main_and_subagent_requests() {
         )
         .unwrap();
     let db = Db::open_in_memory().unwrap();
-    let s = db
-        .create_session("p", tmp.path().to_string_lossy().as_ref(), "Build")
-        .unwrap();
+    let s = create_test_session(&db, "p", tmp.path().to_string_lossy().as_ref(), "Build");
     let sid = s.session_id;
 
     // Main agent inference call + captured request.
@@ -580,7 +628,7 @@ fn export_bundles_main_and_subagent_requests() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
 
@@ -649,9 +697,7 @@ fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preserves() 
     .unwrap();
 
     let db = Db::open_in_memory().unwrap();
-    let s = db
-        .create_session("p", tmp.path().to_str().unwrap(), "Build")
-        .unwrap();
+    let s = create_test_session(&db, "p", tmp.path().to_str().unwrap(), "Build");
     let call = Uuid::new_v4();
     db.insert_inference_request(
         &call.to_string(),
@@ -674,7 +720,7 @@ fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preserves() 
     )
     .unwrap();
 
-    let target = db.get_session(s.session_id).unwrap().unwrap();
+    let target = get_test_session(&db, s.session_id);
     let bundle = collect_bundle(&db, s.session_id).unwrap();
     let safe = build_zip_with_options_and_env(
         &db,
@@ -723,7 +769,7 @@ fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preserves() 
 #[test]
 fn export_tool_call_event_includes_provider_identity_provenance() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
 
     db.insert_tool_call(&ToolCallEvent {
@@ -776,7 +822,7 @@ fn export_tool_call_event_includes_provider_identity_provenance() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let events: Vec<Value> =
@@ -802,7 +848,7 @@ fn export_tool_call_event_includes_provider_identity_provenance() {
 #[test]
 fn export_completions_wire_tool_call_event_includes_provider_identity() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     let providers = crate::config::providers::ProvidersConfig {
         providers: [(
@@ -877,7 +923,7 @@ fn export_completions_wire_tool_call_event_includes_provider_identity() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let events: Vec<Value> =
@@ -903,7 +949,7 @@ fn export_completions_wire_tool_call_event_includes_provider_identity() {
 #[test]
 fn export_synthetic_seed_tool_call_event_includes_provider_identity() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     let identity = ToolCallProviderIdentity::synthetic_cockpit_call(
         "seed-export",
@@ -961,7 +1007,7 @@ fn export_synthetic_seed_tool_call_event_includes_provider_identity() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let events = zip_events(&zip);
@@ -1159,7 +1205,7 @@ fn export_rejects_invalid_responses_provider_identity() {
         )
         .unwrap();
 
-    let target = session.db.get_session(session.id).unwrap().unwrap();
+    let target = get_test_session(&session.db, session.id);
     let bundle = collect_bundle(&session.db, session.id).unwrap();
     let err = build_zip(&session.db, &target, &bundle).unwrap_err();
     let msg = err.to_string();
@@ -1170,7 +1216,7 @@ fn export_rejects_invalid_responses_provider_identity() {
 #[test]
 fn export_sanitizes_inference_request_call_id_filename_segment() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     let call_id = "call/../evil:id?";
 
@@ -1190,7 +1236,7 @@ fn export_sanitizes_inference_request_call_id_filename_segment() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let names = entry_names(&zip);
@@ -1257,7 +1303,7 @@ fn export_includes_context_pruned_before_next_inference_request() {
         )
         .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
 
@@ -1300,7 +1346,7 @@ fn export_includes_goal_progress_diagnostic() {
         )
         .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let events: Vec<Value> =
@@ -1338,7 +1384,7 @@ fn export_includes_queued_user_fold_metadata() {
         )
         .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let events: Vec<Value> =
@@ -1389,7 +1435,7 @@ fn export_of_hung_turn_has_inference_record_and_failure_event() {
         )
         .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
 
@@ -1443,7 +1489,7 @@ fn export_follows_session_compacted_successor() {
         .unwrap();
     }
 
-    let target = db.get_session(pred.id).unwrap().unwrap();
+    let target = get_test_session(&db, pred.id);
     let bundle = collect_bundle(&db, pred.id).unwrap();
     // Both predecessor and successor are in the bundle.
     assert_eq!(bundle.len(), 2);
@@ -1475,7 +1521,7 @@ fn export_follows_session_compacted_successor() {
 #[test]
 fn export_includes_permission_decision_event() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "builder").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "builder");
     let sid = s.session_id;
     db.insert_session_event(
         sid,
@@ -1494,7 +1540,7 @@ fn export_includes_permission_decision_event() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
 
@@ -1520,7 +1566,7 @@ fn export_includes_permission_decision_event() {
 )]
 fn export_includes_persisted_approval_grants_snapshot() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "builder").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "builder");
     let sid = s.session_id;
     db.write_blocking(move |conn| {
         conn.execute(
@@ -1548,7 +1594,7 @@ fn export_includes_persisted_approval_grants_snapshot() {
     })
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
 
@@ -1597,7 +1643,7 @@ fn export_includes_tool_rejected_event() {
         )
         .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
 
@@ -1659,7 +1705,7 @@ fn export_includes_primary_swap_event_both_halves() {
         .record_primary_swap("Build", "Plan", "swap_command", None, None)
         .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
 
@@ -1698,6 +1744,7 @@ fn export_includes_primary_swap_event_both_halves() {
     assert!(cmd["data"]["display"].is_null());
 }
 
+#[allow(deprecated)]
 fn build_model_switch_zip(
     trigger: crate::session::ModelSwitchTrigger,
     outcome: crate::session::ModelSwitchOutcome,
@@ -1717,7 +1764,11 @@ fn build_model_switch_zip(
             error,
         })
         .unwrap();
-    let target = db.get_session(session.id).unwrap().unwrap();
+    let session_id = session.id;
+    let target = db
+        .write_blocking(move |conn| Db::get_session_conn(conn, session_id))
+        .unwrap()
+        .unwrap();
     let bundle = collect_bundle(&db, session.id).unwrap();
     build_zip(&db, &target, &bundle).unwrap()
 }
@@ -1834,7 +1885,7 @@ fn export_model_switch_event_records_all_triggers() {
             })
             .unwrap();
     }
-    let target = db.get_session(session.id).unwrap().unwrap();
+    let target = get_test_session(&db, session.id);
     let bundle = collect_bundle(&db, session.id).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let triggers = zip_events(&zip)
@@ -1853,7 +1904,7 @@ fn export_model_switch_event_records_all_triggers() {
 #[test]
 fn export_bash_tool_call_carries_exit_code_field() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     // A failing bash call: the event data the dispatcher writes today plus
     // the new authoritative `exit_code` field.
@@ -1893,7 +1944,7 @@ fn export_bash_tool_call_carries_exit_code_field() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
 
@@ -1918,7 +1969,7 @@ fn export_bash_tool_call_carries_exit_code_field() {
 #[test]
 fn export_tool_lifecycle_events_distinguish_start_and_completion() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     db.insert_session_event(
         sid,
@@ -1952,7 +2003,7 @@ fn export_tool_lifecycle_events_distinguish_start_and_completion() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let events: Vec<Value> =
@@ -1999,7 +2050,7 @@ fn export_includes_notice_events() {
         )
         .unwrap();
 
-    let target = db.get_session(session.id).unwrap().unwrap();
+    let target = get_test_session(&db, session.id);
     let bundle = collect_bundle(&db, session.id).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let events = zip_events(&zip);
@@ -2020,7 +2071,7 @@ fn export_includes_notice_events() {
 #[test]
 fn export_labels_orphaned_tool_call_started() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     db.insert_session_event(
         sid,
@@ -2037,7 +2088,7 @@ fn export_labels_orphaned_tool_call_started() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let events = zip_events(&zip);
@@ -2051,7 +2102,7 @@ fn export_labels_orphaned_tool_call_started() {
 #[test]
 fn export_does_not_label_completed_tool_call_started() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     db.insert_session_event(
         sid,
@@ -2084,7 +2135,7 @@ fn export_does_not_label_completed_tool_call_started() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let events = zip_events(&zip);
@@ -2098,8 +2149,8 @@ fn export_does_not_label_completed_tool_call_started() {
 #[test]
 fn export_orphan_detection_is_bundle_scoped() {
     let db = Db::open_in_memory().unwrap();
-    let parent = db.create_session("p", "/proj", "Build").unwrap();
-    let child = db.create_fork(parent.session_id, None).unwrap();
+    let parent = create_test_session(&db, "p", "/proj", "Build");
+    let child = create_test_fork(&db, parent.session_id);
     db.insert_session_event(
         parent.session_id,
         SessionEventKind::ToolCallStarted,
@@ -2131,7 +2182,7 @@ fn export_orphan_detection_is_bundle_scoped() {
     )
     .unwrap();
 
-    let target = db.get_session(parent.session_id).unwrap().unwrap();
+    let target = get_test_session(&db, parent.session_id);
     let bundle = collect_bundle(&db, parent.session_id).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let events = zip_events(&zip);
@@ -2145,7 +2196,7 @@ fn export_orphan_detection_is_bundle_scoped() {
 #[test]
 fn export_tool_lifecycle_blocked_completion_is_not_dispatched() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     db.insert_session_event(
         sid,
@@ -2178,7 +2229,7 @@ fn export_tool_lifecycle_blocked_completion_is_not_dispatched() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let events: Vec<Value> =
@@ -2196,7 +2247,7 @@ fn export_tool_lifecycle_blocked_completion_is_not_dispatched() {
 #[test]
 fn export_tool_output_sidecar_writes_file_and_keeps_event_bounded() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     let full_stdout = "line\n".repeat(3000);
     db.insert_session_event(
@@ -2235,7 +2286,7 @@ fn export_tool_output_sidecar_writes_file_and_keeps_event_bounded() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let events: Vec<Value> =
@@ -2265,7 +2316,7 @@ fn export_tool_output_sidecar_writes_file_and_keeps_event_bounded() {
 #[test]
 fn export_compressed_tool_results_writes_index_and_payload() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     db.insert_compressed_tool_result(
         "0123456789abcdefabcdef12",
@@ -2283,7 +2334,7 @@ fn export_compressed_tool_results_writes_index_and_payload() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let names = entry_names(&zip);
@@ -2310,7 +2361,7 @@ fn export_compressed_tool_results_writes_index_and_payload() {
 #[test]
 fn export_truncate_only_result_omits_compressed_byte_len() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     db.insert_compressed_tool_result(
         "fedcba987654321001234567",
@@ -2328,7 +2379,7 @@ fn export_truncate_only_result_omits_compressed_byte_len() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let index: Vec<Value> =
@@ -2348,7 +2399,7 @@ fn export_truncate_only_result_omits_compressed_byte_len() {
 #[test]
 fn export_task_delegation_payloads_writes_bounded_index_and_payload() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     db.upsert_task_delegation_job(
         sid,
@@ -2383,7 +2434,7 @@ fn export_task_delegation_payloads_writes_bounded_index_and_payload() {
     db.mark_task_delegation_payload_delivered("task-long", "alpha")
         .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let names = entry_names(&zip);
@@ -2411,9 +2462,7 @@ fn export_task_delegation_steers_includes_origin_and_redacted_body() {
         )
         .unwrap();
     let db = Db::open_in_memory().unwrap();
-    let s = db
-        .create_session("p", tmp.path().to_string_lossy().as_ref(), "Build")
-        .unwrap();
+    let s = create_test_session(&db, "p", tmp.path().to_string_lossy().as_ref(), "Build");
     let sid = s.session_id;
     db.upsert_task_delegation_job(
         sid,
@@ -2440,7 +2489,7 @@ fn export_task_delegation_steers_includes_origin_and_redacted_body() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let names = entry_names(&zip);
@@ -2465,7 +2514,7 @@ fn export_task_delegation_steers_includes_origin_and_redacted_body() {
 #[test]
 fn export_older_events_without_new_fields_still_parse() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     // A pre-feature bash tool_call: no `exit_code` key at all.
     db.insert_session_event(
@@ -2487,7 +2536,7 @@ fn export_older_events_without_new_fields_still_parse() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
 
@@ -2523,7 +2572,7 @@ fn resolve_unknown_short_id_is_usage_error() {
 #[test]
 fn resolve_accepts_uuid_and_short_id() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/x", "builder").unwrap();
+    let s = create_test_session(&db, "p", "/x", "builder");
     let short = s.short_id.clone().unwrap();
     // By short id.
     assert_eq!(
@@ -2551,7 +2600,7 @@ fn resolve_accepts_uuid_and_short_id() {
 #[test]
 fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "builder").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "builder");
     let call = Uuid::new_v4();
     db.insert_inference_request(
         &call.to_string(),
@@ -2569,7 +2618,7 @@ fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
     )
     .unwrap();
 
-    let target = db.get_session(s.session_id).unwrap().unwrap();
+    let target = get_test_session(&db, s.session_id);
     let bundle = collect_bundle(&db, s.session_id).unwrap();
     let bytes = build_zip(&db, &target, &bundle).unwrap();
 
@@ -2599,7 +2648,7 @@ fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
 #[test]
 fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "builder").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "builder");
     let call = Uuid::new_v4();
     db.insert_inference_request(
         &call.to_string(),
@@ -2616,7 +2665,7 @@ fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
         &json!({}),
     )
     .unwrap();
-    let target = db.get_session(s.session_id).unwrap().unwrap();
+    let target = get_test_session(&db, s.session_id);
 
     let tmp = tempfile::tempdir().unwrap();
     // A nested dir that does not exist yet — the writer must create it.
@@ -2684,13 +2733,13 @@ fn add_inference_call(db: &Db, sid: Uuid, agent: &str, is_utility: bool) -> Uuid
 #[test]
 fn export_splits_utility_and_regular_inference_requests() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
 
     let regular = add_inference_call(&db, sid, "Build", false);
     let utility = add_inference_call(&db, sid, "Build", true);
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
 
@@ -2744,7 +2793,7 @@ fn export_splits_utility_and_regular_inference_requests() {
 #[test]
 fn export_includes_tandem_sibling_dir_and_events() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
 
     // One main call, shadowed by two tandem models — one settled, one
@@ -2779,7 +2828,7 @@ fn export_includes_tandem_sibling_dir_and_events() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
 
@@ -2838,7 +2887,7 @@ fn export_includes_tandem_sibling_dir_and_events() {
 #[test]
 fn export_sanitizes_tandem_parent_call_id_filename_segment() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     let parent_call_id = "main/../../call:id?";
 
@@ -2865,7 +2914,7 @@ fn export_sanitizes_tandem_parent_call_id_filename_segment() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let names = entry_names(&zip);
@@ -2998,7 +3047,7 @@ fn tandem_validation_classifies_write_and_lock_capable_tools() {
 #[test]
 fn export_includes_tandem_tool_call_validation_in_file_and_event() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "Build").unwrap();
+    let s = create_test_session(&db, "p", "/proj", "Build");
     let sid = s.session_id;
     let main = add_inference_call(&db, sid, "Build", false);
 
@@ -3022,7 +3071,7 @@ fn export_includes_tandem_tool_call_validation_in_file_and_event() {
     )
     .unwrap();
 
-    let target = db.get_session(sid).unwrap().unwrap();
+    let target = get_test_session(&db, sid);
     let bundle = collect_bundle(&db, sid).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
     let file = entry_names(&zip)
@@ -3048,8 +3097,8 @@ fn export_includes_tandem_tool_call_validation_in_file_and_event() {
 #[test]
 fn manifest_has_version_and_session_date() {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/proj", "builder").unwrap();
-    let target = db.get_session(s.session_id).unwrap().unwrap();
+    let s = create_test_session(&db, "p", "/proj", "builder");
+    let target = get_test_session(&db, s.session_id);
     let bundle = collect_bundle(&db, s.session_id).unwrap();
     let zip = build_zip(&db, &target, &bundle).unwrap();
 
@@ -3126,7 +3175,7 @@ fn export_manifest_includes_session_and_config_active_model() {
     let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
     session.set_active_model("provider-a", "model-a").unwrap();
 
-    let target = db.get_session(session.id).unwrap().unwrap();
+    let target = get_test_session(&db, session.id);
     let bundle = collect_bundle(&db, session.id).unwrap();
     let zip = build_zip_with_config_override(
         &db,
@@ -3156,7 +3205,7 @@ fn export_manifest_flags_active_model_divergence() {
     let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
     session.set_active_model("provider-a", "model-a").unwrap();
 
-    let target = db.get_session(session.id).unwrap().unwrap();
+    let target = get_test_session(&db, session.id);
     let bundle = collect_bundle(&db, session.id).unwrap();
     let zip = build_zip_with_config_override(
         &db,
@@ -3185,7 +3234,7 @@ fn export_manifest_active_model_without_config_is_null() {
     let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
     session.set_active_model("provider-a", "model-a").unwrap();
 
-    let target = db.get_session(session.id).unwrap().unwrap();
+    let target = get_test_session(&db, session.id);
     let bundle = collect_bundle(&db, session.id).unwrap();
     let zip = build_zip_with_config_override(
         &db,

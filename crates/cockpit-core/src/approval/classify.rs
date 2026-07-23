@@ -1554,8 +1554,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn unbalanced_quote_is_unparseable() {
+    #[tokio::test]
+    async fn unbalanced_quote_is_unparseable() {
         // An unterminated quote can't parse as a complete program.
         match classify(r#"echo "unterminated"#) {
             Classification::Unparseable(_) | Classification::Empty => {}

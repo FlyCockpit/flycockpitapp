@@ -495,10 +495,10 @@ fn guarded_lock_acquire(
 mod tests {
     use super::*;
 
-    #[test]
-    fn acquire_release_round_trip() {
+    #[tokio::test]
+    async fn acquire_release_round_trip() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         let p = std::path::PathBuf::from("/x/main.rs");
         db.lock_acquire(&p, "builder", s.session_id).unwrap();
         let held = db.list_held_locks().unwrap();
@@ -508,10 +508,10 @@ mod tests {
         assert!(db.list_held_locks().unwrap().is_empty());
     }
 
-    #[test]
-    fn acquire_same_owner_refreshes_without_changing_owner() {
+    #[tokio::test]
+    async fn acquire_same_owner_refreshes_without_changing_owner() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         let p = std::path::PathBuf::from("/x/main.rs");
         db.lock_acquire(&p, "builder", s.session_id).unwrap();
         db.lock_touch(&p, "builder", s.session_id, 1).unwrap();
@@ -528,10 +528,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn acquire_different_agent_errors_and_keeps_original_owner() {
+    #[tokio::test]
+    async fn acquire_different_agent_errors_and_keeps_original_owner() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         let p = std::path::PathBuf::from("/x/main.rs");
         db.lock_acquire(&p, "builder", s.session_id).unwrap();
         db.lock_touch(&p, "builder", s.session_id, 123).unwrap();
@@ -551,11 +551,11 @@ mod tests {
         assert_eq!(held[0].acquired_at, 123);
     }
 
-    #[test]
-    fn acquire_different_session_errors_and_keeps_original_owner() {
+    #[tokio::test]
+    async fn acquire_different_session_errors_and_keeps_original_owner() {
         let db = Db::open_in_memory().unwrap();
-        let s1 = db.create_session("p", "/x", "a").unwrap();
-        let s2 = db.create_session("p", "/y", "a").unwrap();
+        let s1 = db.create_session("p", "/x", "a").await.unwrap();
+        let s2 = db.create_session("p", "/y", "a").await.unwrap();
         let p = std::path::PathBuf::from("/x/main.rs");
         db.lock_acquire(&p, "builder", s1.session_id).unwrap();
         db.lock_touch(&p, "builder", s1.session_id, 456).unwrap();
@@ -575,10 +575,10 @@ mod tests {
         assert_eq!(held[0].acquired_at, 456);
     }
 
-    #[test]
-    fn lock_touch_refreshes_acquired_at() {
+    #[tokio::test]
+    async fn lock_touch_refreshes_acquired_at() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         let p = std::path::PathBuf::from("/x/main.rs");
         db.lock_acquire(&p, "builder", s.session_id).unwrap();
         // Refresh forward to a known timestamp; the row reflects it.
@@ -592,16 +592,16 @@ mod tests {
         let held = db.list_held_locks().unwrap();
         assert_eq!(held[0].acquired_at, 9_999_999_999);
         // Same agent in a different session is also a no-op.
-        let s2 = db.create_session("p", "/y", "a").unwrap();
+        let s2 = db.create_session("p", "/y", "a").await.unwrap();
         db.lock_touch(&p, "builder", s2.session_id, 1).unwrap();
         let held = db.list_held_locks().unwrap();
         assert_eq!(held[0].acquired_at, 9_999_999_999);
     }
 
-    #[test]
-    fn note_read_idempotent() {
+    #[tokio::test]
+    async fn note_read_idempotent() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         let p = std::path::PathBuf::from("/x/a.rs");
         db.lock_note_read(&p, "builder", s.session_id, Some(7))
             .unwrap();
@@ -612,10 +612,10 @@ mod tests {
         assert_eq!(reads[0].0, "builder");
     }
 
-    #[test]
-    fn lock_reads_read_hash_column_round_trips() {
+    #[tokio::test]
+    async fn lock_reads_read_hash_column_round_trips() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         let with_hash = std::path::PathBuf::from("/x/with.rs");
         let without_hash = std::path::PathBuf::from("/x/without.rs");
 
@@ -645,14 +645,14 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn acquire_with_read_failure_rolls_back_lock_and_closes_transaction() {
+    async fn acquire_with_read_failure_rolls_back_lock_and_closes_transaction() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         let p = std::path::PathBuf::from("/x/fail.rs");
         db.write_blocking(move |conn| {
             conn.execute_batch(
@@ -680,14 +680,14 @@ mod tests {
         assert_transaction_closed(&db);
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn transfer_agent_failure_rolls_back_memory_mirror_rows() {
+    async fn transfer_agent_failure_rolls_back_memory_mirror_rows() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         let p = std::path::PathBuf::from("/x/main.rs");
         db.lock_acquire_with_read(&p, "builder", s.session_id, Some(11))
             .unwrap();
@@ -722,11 +722,11 @@ mod tests {
         assert_transaction_closed(&db);
     }
 
-    #[test]
-    fn list_and_delete_lock_reads() {
+    #[tokio::test]
+    async fn list_and_delete_lock_reads() {
         let db = Db::open_in_memory().unwrap();
-        let s1 = db.create_session("p", "/x", "a").unwrap();
-        let s2 = db.create_session("p", "/y", "a").unwrap();
+        let s1 = db.create_session("p", "/x", "a").await.unwrap();
+        let s2 = db.create_session("p", "/y", "a").await.unwrap();
         let p1 = std::path::PathBuf::from("/x/a.rs");
         let p2 = std::path::PathBuf::from("/y/b.rs");
         db.lock_note_read(&p1, "builder", s1.session_id, Some(1))

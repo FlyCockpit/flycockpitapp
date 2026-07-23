@@ -716,10 +716,10 @@ mod tests {
         InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
     };
 
-    #[test]
-    fn raise_and_resolve_round_trip() {
+    #[tokio::test]
+    async fn raise_and_resolve_round_trip() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let q = InterruptQuestion::Single {
             prompt: "yes or no".into(),
             options: vec![
@@ -761,8 +761,8 @@ mod tests {
         assert_eq!(open.len(), 0);
     }
 
-    #[test]
-    fn decision_summary_uses_labels_and_never_exposes_masked_text() {
+    #[tokio::test]
+    async fn decision_summary_uses_labels_and_never_exposes_masked_text() {
         let row = NeedsAttentionRow {
             interrupt_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
@@ -817,10 +817,10 @@ mod tests {
         assert!(json.contains("••••••••"));
     }
 
-    #[test]
-    fn raise_questions_batch_round_trip() {
+    #[tokio::test]
+    async fn raise_questions_batch_round_trip() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let set = InterruptQuestionSet {
             questions: vec![
                 InterruptQuestion::Single {
@@ -868,10 +868,10 @@ mod tests {
         assert_eq!(db.list_open_interrupts(s.session_id).unwrap().len(), 0);
     }
 
-    #[test]
-    fn parked_payload_round_trips_and_executes_once() {
+    #[tokio::test]
+    async fn parked_payload_round_trips_and_executes_once() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let set = InterruptQuestionSet {
             questions: vec![InterruptQuestion::Freetext {
                 prompt: "why?".into(),
@@ -944,10 +944,10 @@ mod tests {
         assert!(resolved.resolved_at.is_some());
     }
 
-    #[test]
-    fn executing_interrupt_can_be_marked_interrupted_and_reconciled() {
+    #[tokio::test]
+    async fn executing_interrupt_can_be_marked_interrupted_and_reconciled() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let set = InterruptQuestionSet {
             questions: vec![InterruptQuestion::Freetext {
                 prompt: "why?".into(),
@@ -995,10 +995,10 @@ mod tests {
         assert!(!db.complete_executing_interrupt(iid).unwrap());
     }
 
-    #[test]
-    fn interrupted_markers_are_acknowledged_after_forward_progress() {
+    #[tokio::test]
+    async fn interrupted_markers_are_acknowledged_after_forward_progress() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let iid = db
             .raise_interrupted_turn(s.session_id, "builder", "forced drain")
             .unwrap();
@@ -1010,10 +1010,10 @@ mod tests {
         assert_eq!(db.acknowledge_interrupted_turns(s.session_id).unwrap(), 0);
     }
 
-    #[test]
-    fn double_resolve_errors() {
+    #[tokio::test]
+    async fn double_resolve_errors() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let iid = db
             .raise_interrupt(s.session_id, "builder", "x", None)
             .unwrap();

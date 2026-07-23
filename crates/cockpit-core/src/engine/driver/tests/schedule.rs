@@ -622,8 +622,8 @@ fn write_capable_followup_forces_reread_on_drift() {
 /// surfaced (the builder simply doesn't hold it) and the follow-up does NOT
 /// force-write — single-writer is preserved, the other writer keeps the
 /// lock.
-#[test]
-fn write_capable_followup_defers_to_other_lock_holder() {
+#[tokio::test]
+async fn write_capable_followup_defers_to_other_lock_holder() {
     let (driver, tmp) = test_driver(8);
     let p = tmp.path().join("a.rs");
     std::fs::write(&p, "v1").unwrap();
@@ -633,6 +633,7 @@ fn write_capable_followup_defers_to_other_lock_holder() {
         .session
         .db
         .create_session("p", "/x", "builder")
+        .await
         .unwrap();
     driver.locks.acquire(&p, "builder", sid).unwrap();
     driver.locks.suspend_agent("builder", sid).unwrap();

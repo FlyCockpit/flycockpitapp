@@ -455,8 +455,8 @@ async fn noninteractive_single_spawn_amends_with_child_routing() {
     }
 }
 
-#[test]
-fn delegated_child_succeeds_via_fallback_chain_and_export_records_it() {
+#[tokio::test]
+async fn delegated_child_succeeds_via_fallback_chain_and_export_records_it() {
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {
@@ -1729,12 +1729,12 @@ fn task_control_live_registry_entry_keeps_happy_path() {
     );
 }
 
-#[test]
+#[tokio::test]
 #[expect(
     deprecated,
     reason = "db-async-foundation bridge; migrated later in db-async-delegation-and-scheduler"
 )]
-fn task_query_reports_db_and_none_sources() {
+async fn task_query_reports_db_and_none_sources() {
     let (mut driver, _tmp) = test_driver(8);
     seed_task_delegation(&driver, "task-db", "default");
     driver

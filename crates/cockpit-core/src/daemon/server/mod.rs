@@ -1939,7 +1939,7 @@ fn run_boot_housekeeping(db: &Db) {
     // SIGKILL backstop for `/side`: a side conversation whose owning process
     // died uncatchably can orphan an ephemeral session row. Sweep them on
     // boot so ephemeral sessions never accumulate. Best-effort.
-    match db.sweep_ephemeral_sessions() {
+    match sweep_ephemeral_sessions_blocking(db) {
         Ok(n) if n > 0 => tracing::info!(count = n, "swept orphaned ephemeral sessions on boot"),
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "sweeping ephemeral sessions on boot failed"),
@@ -1958,6 +1958,46 @@ fn run_boot_housekeeping(db: &Db) {
             tracing::warn!(error = %e, "reconciling orphaned task delegations on boot failed")
         }
     }
+}
+
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; daemon boot remains sync until boot path is async"
+)]
+fn sweep_ephemeral_sessions_blocking(db: &Db) -> Result<usize> {
+    db.write_blocking(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id
+                   FROM sessions
+                  WHERE ephemeral = 1
+                    AND btw_parent_session_id IS NULL",
+            )
+            .context("preparing ephemeral sweep")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("querying ephemeral sweep")?;
+        let mut roots = Vec::new();
+        for row in rows {
+            let id = row.context("decoding ephemeral row")?;
+            roots.push(uuid::Uuid::parse_str(&id).context("parsing ephemeral session id")?);
+        }
+        drop(stmt);
+        let mut removed = 0;
+        for id in roots {
+            match crate::db::sessions::delete_session_conn(conn, id, true)
+                .with_context(|| format!("sweeping ephemeral session {id}"))
+            {
+                Ok(_) => removed += 1,
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    session_id = %id,
+                    "ephemeral session sweep delete failed"
+                ),
+            }
+        }
+        Ok(removed)
+    })
 }
 
 /// Bind the Unix socket and run the accept loop until the daemon's

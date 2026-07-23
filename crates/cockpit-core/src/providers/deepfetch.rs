@@ -1169,8 +1169,8 @@ mod tests {
         assert_eq!(model.wire_api, WireApi::Responses);
     }
 
-    #[tokio::test]
-    async fn deepfetch_never_overwrites_explicit_pin() {
+    #[test]
+    fn deepfetch_never_overwrites_explicit_pin() {
         let mut model = ModelEntry {
             id: "m".into(),
             wire_api: WireApi::Completions,

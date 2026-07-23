@@ -1,10 +1,19 @@
+#![allow(deprecated)]
+
 use super::*;
 use std::fs;
 use tempfile::TempDir;
 
 fn setup() -> (Db, Uuid) {
     let db = Db::open_in_memory().unwrap();
-    let s = db.create_session("p", "/x", "builder").unwrap();
+    let s = db
+        .write_blocking(|conn| {
+            crate::db::Db::insert_session_row_conn(
+                conn,
+                &crate::db::Db::build_new_session_row_conn(conn, "p", "/x", "builder")?,
+            )
+        })
+        .unwrap();
     (db, s.session_id)
 }
 
@@ -146,12 +155,12 @@ fn swarm_disjoint_scopes_coexist_same_path_serializes() {
     assert!(lm.check_write_permitted(&a, "swarm-branch-3", sid).is_err());
 }
 
-#[test]
-fn different_session_cannot_acquire_held_lock() {
+#[tokio::test]
+async fn different_session_cannot_acquire_held_lock() {
     let tmp = TempDir::new().unwrap();
     let p = touch(tmp.path(), "a.rs");
     let (db, sid_a) = setup();
-    let s_b = db.create_session("p", "/x", "explore").unwrap();
+    let s_b = db.create_session("p", "/x", "explore").await.unwrap();
     let lm = LockManager::in_memory(db);
     lm.acquire(&p, "builder", sid_a).unwrap();
     assert!(lm.acquire(&p, "builder", s_b.session_id).is_err());
@@ -277,12 +286,12 @@ fn release_by_wrong_agent_errors() {
     assert!(lm.release(&p, "explore", sid).is_err());
 }
 
-#[test]
-fn same_agent_in_different_session_cannot_release_lock() {
+#[tokio::test]
+async fn same_agent_in_different_session_cannot_release_lock() {
     let tmp = TempDir::new().unwrap();
     let p = touch(tmp.path(), "a.rs");
     let (db, sid_a) = setup();
-    let s_b = db.create_session("p", "/x", "explore").unwrap();
+    let s_b = db.create_session("p", "/x", "explore").await.unwrap();
     let lm = LockManager::in_memory(db.clone());
 
     lm.acquire(&p, "builder", sid_a).unwrap();
@@ -398,13 +407,13 @@ fn resume_skips_when_file_changed() {
     assert!(db.list_reads_for_session(sid).unwrap().is_empty());
 }
 
-#[test]
-fn resume_skips_when_another_agent_grabbed_lock() {
+#[tokio::test]
+async fn resume_skips_when_another_agent_grabbed_lock() {
     let tmp = TempDir::new().unwrap();
     let p = tmp.path().join("a.rs");
     fs::write(&p, "hello").unwrap();
     let (db, sid) = setup();
-    let s_b = db.create_session("p", "/x", "builder").unwrap();
+    let s_b = db.create_session("p", "/x", "builder").await.unwrap();
     let lm = LockManager::in_memory(db);
     lm.acquire(&p, "builder", sid).unwrap();
     lm.suspend_agent("builder", sid).unwrap();
@@ -573,12 +582,16 @@ fn from_db_restores_read_without_held_lock() {
     restored.check_write_permitted(&p, "builder", sid).unwrap();
 }
 
-#[test]
-fn write_guard_serializes_two_read_but_unlocked_writers() {
+#[tokio::test]
+async fn write_guard_serializes_two_read_but_unlocked_writers() {
     let tmp = TempDir::new().unwrap();
     let p = touch(tmp.path(), "shared.rs");
     let (db, sid_a) = setup();
-    let sid_b = db.create_session("p", "/b", "builder").unwrap().session_id;
+    let sid_b = db
+        .create_session("p", "/b", "builder")
+        .await
+        .unwrap()
+        .session_id;
     let lm = LockManager::in_memory(db);
     lm.note_read(&p, "writer-a", sid_a);
     lm.note_read(&p, "writer-b", sid_b);
@@ -599,13 +612,17 @@ fn write_guard_serializes_two_read_but_unlocked_writers() {
     assert!(lm.holder(&p).is_none());
 }
 
-#[test]
-fn sequential_read_record_writers_second_write_rejected_as_stale() {
+#[tokio::test]
+async fn sequential_read_record_writers_second_write_rejected_as_stale() {
     let tmp = TempDir::new().unwrap();
     let p = tmp.path().join("shared.rs");
     fs::write(&p, "base").unwrap();
     let (db, sid_a) = setup();
-    let sid_b = db.create_session("p", "/b", "builder").unwrap().session_id;
+    let sid_b = db
+        .create_session("p", "/b", "builder")
+        .await
+        .unwrap()
+        .session_id;
     let lm = LockManager::in_memory(db);
     lm.note_read(&p, "writer-a", sid_a);
     lm.note_read(&p, "writer-b", sid_b);
@@ -858,7 +875,7 @@ async fn acquire_wait_blocks_until_holder_releases() {
     let tmp = TempDir::new().unwrap();
     let p = touch(tmp.path(), "a.rs");
     let (db, sid_a) = setup();
-    let s_b = db.create_session("p", "/x", "explore").unwrap();
+    let s_b = db.create_session("p", "/x", "explore").await.unwrap();
     let lm = Arc::new(LockManager::in_memory(db));
 
     // A holds the lock.
@@ -912,7 +929,7 @@ async fn acquire_wait_cancelled_leaves_no_waiter() {
     let tmp = TempDir::new().unwrap();
     let p = touch(tmp.path(), "a.rs");
     let (db, sid_a) = setup();
-    let s_b = db.create_session("p", "/x", "explore").unwrap();
+    let s_b = db.create_session("p", "/x", "explore").await.unwrap();
     let lm = Arc::new(LockManager::in_memory(db));
     lm.acquire(&p, "builder", sid_a).unwrap();
 
@@ -999,14 +1016,15 @@ fn sweep_expired_rolls_back_when_read_delete_fails() {
     assert_eq!(db.list_reads_for_session(sid).unwrap().len(), 1);
 }
 
-#[test]
-fn sweep_skips_path_reacquired_by_other_holder_between_phases() {
+#[tokio::test]
+async fn sweep_skips_path_reacquired_by_other_holder_between_phases() {
     let tmp = TempDir::new().unwrap();
     let p = touch(tmp.path(), "a.rs");
     let canon = std::fs::canonicalize(&p).unwrap();
     let (db, sid) = setup();
     let other = db
         .create_session("p", "/other", "builder")
+        .await
         .unwrap()
         .session_id;
     let lm = LockManager::in_memory(db.clone());
@@ -1088,9 +1106,10 @@ async fn sweep_returns_only_actually_evicted_count() {
     let (db, sid) = setup();
     let other = db
         .create_session("p", "/other", "builder")
+        .await
         .unwrap()
         .session_id;
-    let waiter_session = db.create_session("p", "/waiter", "builder").unwrap();
+    let waiter_session = db.create_session("p", "/waiter", "builder").await.unwrap();
     let lm = Arc::new(LockManager::in_memory(db.clone()));
     lm.acquire(&evicted, "builder", sid).unwrap();
     lm.acquire(&survived, "builder", sid).unwrap();
@@ -1175,8 +1194,8 @@ async fn sweep_returns_only_actually_evicted_count() {
     assert_eq!(lm.holder(&survived), Some((other, "builder".to_string())));
 }
 
-#[test]
-fn permanent_session_end_purges_session_state_only() {
+#[tokio::test]
+async fn permanent_session_end_purges_session_state_only() {
     let tmp = TempDir::new().unwrap();
     let p1 = touch(tmp.path(), "a.rs");
     let p2 = touch(tmp.path(), "b.rs");
@@ -1184,6 +1203,7 @@ fn permanent_session_end_purges_session_state_only() {
     let (db, sid) = setup();
     let other = db
         .create_session("p", "/other", "builder")
+        .await
         .unwrap()
         .session_id;
     let lm = LockManager::in_memory(db.clone());
@@ -1265,7 +1285,7 @@ async fn waiter_woken_when_holder_lock_expires() {
     let p = touch(tmp.path(), "a.rs");
     let canon = std::fs::canonicalize(&p).unwrap();
     let (db, sid_a) = setup();
-    let s_b = db.create_session("p", "/x", "explore").unwrap();
+    let s_b = db.create_session("p", "/x", "explore").await.unwrap();
     let lm = Arc::new(LockManager::in_memory(db));
     lm.acquire(&p, "builder", sid_a).unwrap();
 
@@ -1305,7 +1325,11 @@ async fn wait_timeout_message_is_guidance_shaped() {
     let tmp = TempDir::new().unwrap();
     let p = touch(tmp.path(), "held.rs");
     let (db, sid_a) = setup();
-    let sid_b = db.create_session("p", "/b", "builder").unwrap().session_id;
+    let sid_b = db
+        .create_session("p", "/b", "builder")
+        .await
+        .unwrap()
+        .session_id;
     let lm = Arc::new(LockManager::in_memory(db));
     lm.acquire(&p, "holder", sid_a).unwrap();
 
@@ -1336,7 +1360,11 @@ async fn wait_cycle_message_directs_unlock_and_reacquire_in_order() {
     let a = touch(tmp.path(), "a.rs");
     let b = touch(tmp.path(), "b.rs");
     let (db, sid_a) = setup();
-    let sid_b = db.create_session("p", "/b", "builder").unwrap().session_id;
+    let sid_b = db
+        .create_session("p", "/b", "builder")
+        .await
+        .unwrap()
+        .session_id;
     let lm = Arc::new(LockManager::in_memory(db));
     lm.acquire(&a, "agent-a", sid_a).unwrap();
     lm.acquire(&b, "agent-b", sid_b).unwrap();
@@ -1380,7 +1408,11 @@ async fn ordered_multi_lock_acquire_avoids_reversed_path_deadlock() {
     let a = touch(tmp.path(), "a.rs");
     let b = touch(tmp.path(), "b.rs");
     let (db, sid_a) = setup();
-    let sid_b = db.create_session("p", "/b", "builder").unwrap().session_id;
+    let sid_b = db
+        .create_session("p", "/b", "builder")
+        .await
+        .unwrap()
+        .session_id;
     let lm = Arc::new(LockManager::in_memory(db));
 
     let cancel_a = CancellationToken::new();
@@ -1468,7 +1500,7 @@ async fn suspend_session_wakes_cross_session_waiter() {
     let tmp = TempDir::new().unwrap();
     let p = touch(tmp.path(), "a.rs");
     let (db, sid_a) = setup();
-    let s_b = db.create_session("p", "/x", "explore").unwrap();
+    let s_b = db.create_session("p", "/x", "explore").await.unwrap();
     let lm = Arc::new(LockManager::in_memory(db));
     lm.acquire(&p, "builder", sid_a).unwrap();
 
@@ -1539,13 +1571,13 @@ fn resume_session_skips_changed_file_and_invalidates_read() {
 /// A path taken by another `(session, agent)` while detached is NOT
 /// reacquired on resume, and the detached session's read-record for it is
 /// dropped so its later write must `readlock` again.
-#[test]
-fn resume_session_skips_taken_file_and_invalidates_read() {
+#[tokio::test]
+async fn resume_session_skips_taken_file_and_invalidates_read() {
     let tmp = TempDir::new().unwrap();
     let p = tmp.path().join("a.rs");
     fs::write(&p, "hello").unwrap();
     let (db, sid) = setup();
-    let s_b = db.create_session("p", "/x", "builder").unwrap();
+    let s_b = db.create_session("p", "/x", "builder").await.unwrap();
     let lm = LockManager::in_memory(db.clone());
     lm.acquire(&p, "builder", sid).unwrap();
     lm.suspend_session(sid).unwrap();

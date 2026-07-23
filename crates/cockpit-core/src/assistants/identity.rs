@@ -375,6 +375,8 @@ fn normalize(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
     use std::sync::Arc;
 
@@ -403,13 +405,20 @@ mod tests {
             )
             .unwrap();
         let project_id = crate::session::project_id_for(&project.to_path_buf());
+        let project_root = project.display().to_string();
         let session_row = db
-            .create_assistant_session(
-                &project_id,
-                &project.display().to_string(),
-                "helper",
-                "helper",
-            )
+            .write_blocking(move |conn| {
+                crate::db::Db::insert_session_row_conn(
+                    conn,
+                    &crate::db::Db::build_new_assistant_session_row_conn(
+                        conn,
+                        &project_id,
+                        &project_root,
+                        "helper",
+                        "helper",
+                    )?,
+                )
+            })
             .unwrap();
         let session = crate::session::Session::resume(db.clone(), session_row.session_id)
             .unwrap()

@@ -448,15 +448,18 @@ fn decode_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> rusqlite::E
 mod tests {
     use super::*;
 
-    #[test]
-    fn goal_status_parse_rejects_draft() {
+    #[tokio::test]
+    async fn goal_status_parse_rejects_draft() {
         assert!(GoalStatus::parse("draft").is_err());
     }
 
-    #[test]
-    fn complete_requires_goal_get_after_latest_update() {
+    #[tokio::test]
+    async fn complete_requires_goal_get_after_latest_update() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/tmp/goal-test", "Build").unwrap();
+        let session = db
+            .create_session("p", "/tmp/goal-test", "Build")
+            .await
+            .unwrap();
         db.create_session_goal(
             session.session_id,
             &session.project_id,
@@ -489,10 +492,13 @@ mod tests {
         assert!(matches!(out, GoalUpdateOutcome::Updated(g) if g.status == GoalStatus::Complete));
     }
 
-    #[test]
-    fn blocked_requires_three_attempts() {
+    #[tokio::test]
+    async fn blocked_requires_three_attempts() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/tmp/goal-test", "Build").unwrap();
+        let session = db
+            .create_session("p", "/tmp/goal-test", "Build")
+            .await
+            .unwrap();
         db.create_session_goal(
             session.session_id,
             &session.project_id,
@@ -527,10 +533,13 @@ mod tests {
         assert!(matches!(out, GoalUpdateOutcome::Updated(g) if g.status == GoalStatus::Blocked));
     }
 
-    #[test]
-    fn current_session_goal_ignores_terminal_goals() {
+    #[tokio::test]
+    async fn current_session_goal_ignores_terminal_goals() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/tmp/goal-test", "Build").unwrap();
+        let session = db
+            .create_session("p", "/tmp/goal-test", "Build")
+            .await
+            .unwrap();
         db.create_session_goal(
             session.session_id,
             &session.project_id,
@@ -556,10 +565,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn new_goal_can_be_created_after_completion() {
+    #[tokio::test]
+    async fn new_goal_can_be_created_after_completion() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/tmp/goal-test", "Build").unwrap();
+        let session = db
+            .create_session("p", "/tmp/goal-test", "Build")
+            .await
+            .unwrap();
         db.create_session_goal(
             session.session_id,
             &session.project_id,
@@ -591,10 +603,13 @@ mod tests {
         assert_eq!(next.status, GoalStatus::Active);
     }
 
-    #[test]
-    fn second_open_goal_is_rejected() {
+    #[tokio::test]
+    async fn second_open_goal_is_rejected() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/tmp/goal-test", "Build").unwrap();
+        let session = db
+            .create_session("p", "/tmp/goal-test", "Build")
+            .await
+            .unwrap();
         db.create_session_goal(
             session.session_id,
             &session.project_id,

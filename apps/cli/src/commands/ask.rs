@@ -32,7 +32,7 @@ pub async fn run(args: AskArgs) -> Result<()> {
 async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let db = crate::db::Db::open_default().context("opening cockpit DB")?;
-    crate::config::trust::enforce_noninteractive_workspace_trust(&db, &cwd)?;
+    crate::config::trust::enforce_noninteractive_workspace_trust(&db, &cwd).await?;
 
     let (extended, providers) = crate::auto_title::load_configs_for(&cwd);
     let env = EnvSnapshot::from_process(EnvSnapshotSource::ExplicitCli);

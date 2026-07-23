@@ -425,8 +425,9 @@ impl SessionRegistry {
                 }
                 AttachClaim::Start(ticket) => {
                     let generation = ticket.generation();
-                    let result =
-                        self.start_resumed_worker(id, client_no_sandbox, env_snapshot, generation);
+                    let result = self
+                        .start_resumed_worker(id, client_no_sandbox, env_snapshot, generation)
+                        .await;
                     self.finish_attach_start(ticket, &result);
                     let handle = result?;
                     self.resume_session_locks(id);
@@ -439,7 +440,8 @@ impl SessionRegistry {
         let Some(project_root) = project_root else {
             bail!("attach requires either session_id or project_root");
         };
-        let trust_policy = resolve_workspace_trust_policy_from_db(&self.inner.db, &project_root)?;
+        let trust_policy =
+            resolve_workspace_trust_policy_from_db(&self.inner.db, &project_root).await?;
         let (providers_cfg, extended_cfg) = self
             .inner
             .config_source
@@ -492,7 +494,8 @@ impl SessionRegistry {
             .ok_or_else(|| anyhow::anyhow!("assistant `{assistant_name}` not found"))?;
         crate::assistants::load_from_row(&row)?;
 
-        let trust_policy = resolve_workspace_trust_policy_from_db(&self.inner.db, &project_root)?;
+        let trust_policy =
+            resolve_workspace_trust_policy_from_db(&self.inner.db, &project_root).await?;
         let (providers_cfg, extended_cfg) = self
             .inner
             .config_source
@@ -526,7 +529,7 @@ impl SessionRegistry {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_resumed_worker(
+    async fn start_resumed_worker(
         &self,
         id: Uuid,
         client_no_sandbox: bool,
@@ -537,7 +540,7 @@ impl SessionRegistry {
             .context("resuming session")?
             .ok_or_else(|| anyhow::anyhow!("unknown session {id}"))?;
         let trust_policy =
-            resolve_workspace_trust_policy_from_db(&self.inner.db, &session.project_root)?;
+            resolve_workspace_trust_policy_from_db(&self.inner.db, &session.project_root).await?;
         let (providers_cfg, extended_cfg) = self
             .inner
             .config_source
@@ -1415,6 +1418,7 @@ mod tests {
                 tmp.path(),
                 crate::db::workspace_trust::WorkspaceTrustMode::Trust,
             )
+            .await
             .unwrap();
 
         let handle = reg
@@ -1465,8 +1469,8 @@ mod tests {
         panic!("forget should abort config watcher task");
     }
 
-    #[test]
-    fn btw_model_knob_resolution() {
+    #[tokio::test]
+    async fn btw_model_knob_resolution() {
         let reg = test_registry();
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent =
@@ -1476,6 +1480,7 @@ mod tests {
             .inner
             .db
             .create_btw_fork(parent.id, false)
+            .await
             .expect("btw fork")
             .info;
         let fork_session = Session::resume(reg.inner.db.clone(), fork.session_id)
@@ -1785,12 +1790,14 @@ mod tests {
                 reg.inner
                     .db
                     .get_session(id)
+                    .await
                     .unwrap()
                     .expect("persisted session")
                     .project_root
                     .as_ref(),
                 crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
             )
+            .await
             .unwrap();
 
         let result = reg
@@ -1829,6 +1836,7 @@ mod tests {
                 &session.project_root,
                 crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
             )
+            .await
             .unwrap();
 
         let ticket = match reg.claim_attach(id) {
@@ -1839,15 +1847,17 @@ mod tests {
             AttachClaim::Starting(slot) => slot,
             _ => panic!("second concurrent resume must wait on the shared start"),
         };
-        let result = reg.start_resumed_worker(
-            id,
-            false,
-            EnvSnapshot::new(
-                crate::env_snapshot::EnvSnapshotSource::DaemonStart,
-                Default::default(),
-            ),
-            ticket.generation(),
-        );
+        let result = reg
+            .start_resumed_worker(
+                id,
+                false,
+                EnvSnapshot::new(
+                    crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                    Default::default(),
+                ),
+                ticket.generation(),
+            )
+            .await;
         match &result {
             Ok(_) => panic!("winner must observe revoked trust"),
             Err(error) => assert!(error.downcast_ref::<WorkspaceTrustError>().is_some()),
@@ -2027,6 +2037,7 @@ mod tests {
             .inner
             .db
             .list_session_summaries(None, None, 100)
+            .await
             .unwrap();
         let summary = summaries
             .iter()
@@ -2121,6 +2132,7 @@ mod tests {
             .inner
             .db
             .list_session_summaries(None, None, 100)
+            .await
             .unwrap();
         let summary = summaries
             .iter()
@@ -2295,6 +2307,7 @@ mod tests {
         let db = Db::open_in_memory().expect("db");
         let sid = db
             .create_session("p", "/x", "builder")
+            .await
             .expect("session")
             .session_id;
         let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));

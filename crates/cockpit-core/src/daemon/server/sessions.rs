@@ -185,7 +185,7 @@ pub(super) fn record_resource_promotion(
     );
 }
 
-pub(super) fn fork_session(
+pub(super) async fn fork_session(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
     parent_session_id: Uuid,
@@ -195,7 +195,7 @@ pub(super) fn fork_session(
     // Guard rail: refuse forks of unknown parents with the typed
     // `UnknownSession` code so the TUI can surface a friendlier error
     // than a generic internal failure.
-    match ctx.db.get_session(parent_session_id) {
+    match ctx.db.get_session(parent_session_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
             return Err(ErrorPayload {
@@ -210,14 +210,17 @@ pub(super) fn fork_session(
     let row = if ephemeral {
         ctx.db
             .create_ephemeral_fork(parent_session_id, fork_point_turn_id.clone())
+            .await
     } else {
         ctx.db
             .create_fork(parent_session_id, fork_point_turn_id.clone())
+            .await
     }
     .map_err(internal)?;
     if let Some(tag) = principal.tag() {
         ctx.db
             .set_session_created_by_principal(row.session_id, Some(&tag))
+            .await
             .map_err(internal)?;
     }
     Ok(Response::Forked {
@@ -239,13 +242,13 @@ pub(super) fn btw_info_to_proto(info: crate::db::sessions::BtwForkInfo) -> proto
     }
 }
 
-pub(super) fn create_btw_fork(
+pub(super) async fn create_btw_fork(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
     parent_session_id: Uuid,
     tangent: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
-    match ctx.db.get_session(parent_session_id) {
+    match ctx.db.get_session(parent_session_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
             return Err(ErrorPayload {
@@ -258,12 +261,14 @@ pub(super) fn create_btw_fork(
     let result = ctx
         .db
         .create_btw_fork(parent_session_id, tangent)
+        .await
         .map_err(internal)?;
     if result.created
         && let Some(tag) = principal.tag()
     {
         ctx.db
             .set_session_created_by_principal(result.info.session_id, Some(&tag))
+            .await
             .map_err(internal)?;
     }
     Ok(Response::BtwFork {
@@ -279,6 +284,7 @@ pub(super) async fn end_btw_fork(
     if let Some(info) = ctx
         .db
         .live_btw_fork_info(parent_session_id)
+        .await
         .map_err(internal)?
     {
         ctx.registry
@@ -286,7 +292,10 @@ pub(super) async fn end_btw_fork(
             .await
             .map_err(internal)?;
     }
-    ctx.db.end_btw_fork(parent_session_id).map_err(internal)?;
+    ctx.db
+        .end_btw_fork(parent_session_id)
+        .await
+        .map_err(internal)?;
     Ok(Response::Ack)
 }
 
@@ -315,16 +324,17 @@ pub(super) async fn discard_session(
         .map_err(internal)?;
     ctx.db
         .discard_ephemeral_session(session_id)
+        .await
         .map_err(internal)?;
     Ok(Response::Ack)
 }
 
-pub(super) fn rename_session(
+pub(super) async fn rename_session(
     ctx: &DaemonContext,
     session_id: Uuid,
     title: &str,
 ) -> std::result::Result<Response, ErrorPayload> {
-    match ctx.db.get_session(session_id) {
+    match ctx.db.get_session(session_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
             return Err(ErrorPayload {
@@ -334,7 +344,10 @@ pub(super) fn rename_session(
         }
         Err(e) => return Err(internal(e)),
     }
-    ctx.db.rename_session(session_id, title).map_err(internal)?;
+    ctx.db
+        .rename_session(session_id, title)
+        .await
+        .map_err(internal)?;
     Ok(Response::Ack)
 }
 
@@ -343,12 +356,12 @@ pub(super) fn rename_session(
 /// the target session and returns its assigned `seq`. The note never enters
 /// model-bound history (rehydration skips `user_note`) and triggers no
 /// inference — it is purely a durable, exportable transcript annotation.
-pub(super) fn record_session_note(
+pub(super) async fn record_session_note(
     ctx: &DaemonContext,
     session_id: Uuid,
     text: &str,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let agent = match ctx.db.get_session(session_id) {
+    let agent = match ctx.db.get_session(session_id).await {
         Ok(Some(s)) => s.active_agent,
         Ok(None) => {
             return Err(ErrorPayload {
@@ -376,7 +389,7 @@ pub(super) async fn delete_session(
     session_id: Uuid,
     cascade: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
-    match ctx.db.get_session(session_id) {
+    match ctx.db.get_session(session_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
             return Err(ErrorPayload {
@@ -392,6 +405,7 @@ pub(super) async fn delete_session(
     stop_subtree(ctx, session_id, cascade).await?;
     ctx.db
         .delete_session(session_id, cascade)
+        .await
         .map_err(internal)?;
     Ok(Response::Ack)
 }
@@ -401,7 +415,7 @@ pub(super) async fn archive_session(
     session_id: Uuid,
     cascade: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
-    match ctx.db.get_session(session_id) {
+    match ctx.db.get_session(session_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
             return Err(ErrorPayload {
@@ -416,6 +430,7 @@ pub(super) async fn archive_session(
     stop_subtree(ctx, session_id, cascade).await?;
     ctx.db
         .archive_session(session_id, cascade)
+        .await
         .map_err(internal)?;
     Ok(Response::Ack)
 }
@@ -442,7 +457,7 @@ pub(super) async fn stop_subtree(
     // with the DB subtree so we only walk what's actually running.
     let active = ctx.registry.active_session_ids();
     for id in active {
-        if ctx.db.is_in_subtree(root, id).unwrap_or(false) {
+        if ctx.db.is_in_subtree(root, id).await.unwrap_or(false) {
             ctx.registry
                 .interrupt_and_stop(id)
                 .await
@@ -452,11 +467,11 @@ pub(super) async fn stop_subtree(
     Ok(())
 }
 
-pub(super) fn unarchive_session(
+pub(super) async fn unarchive_session(
     ctx: &DaemonContext,
     session_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
-    match ctx.db.get_session(session_id) {
+    match ctx.db.get_session(session_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
             return Err(ErrorPayload {
@@ -466,7 +481,10 @@ pub(super) fn unarchive_session(
         }
         Err(e) => return Err(internal(e)),
     }
-    ctx.db.unarchive_session(session_id).map_err(internal)?;
+    ctx.db
+        .unarchive_session(session_id)
+        .await
+        .map_err(internal)?;
     Ok(Response::Ack)
 }
 

@@ -320,9 +320,9 @@ fn semantic_warning_and_error_colors_are_not_muted() {
     }
 }
 
-#[test]
+#[tokio::test]
 #[rustfmt::skip]
-fn timestamp_helpers_keep_right_margin() {
+async fn timestamp_helpers_keep_right_margin() {
     let width: u16 = 40;
     let line =
         render_first_line_timestamped(vec![Span::raw("  body")], fixed_ts(), width, true);
@@ -731,9 +731,9 @@ fn expanded_long_wrapped_reasoning_windows_by_display_rows() {
     assert_eq!(region.row_end - region.row_start + 1, THINKING_VISIBLE + 1);
 }
 
-#[test]
+#[tokio::test]
 #[rustfmt::skip]
-fn agent_markdown_first_line_has_no_timestamp_orphan() {
+async fn agent_markdown_first_line_has_no_timestamp_orphan() {
     // Regression: the no-reasoning + markdown path used to wrap the
     // body to the full content width, then slice the first row for
     // the timestamp *after* — pushing the trailing word(s) onto row
@@ -1819,9 +1819,9 @@ fn toolbox_result_window_caps_and_records_scroll_region() {
     assert!(joined.contains("2 more below"));
 }
 
-#[test]
+#[tokio::test]
 #[rustfmt::skip]
-fn toolbox_renders_readable_websearch_and_custom_args() {
+async fn toolbox_renders_readable_websearch_and_custom_args() {
     let websearch = mk_call(
         "websearch",
         "OpenAI model release news",
@@ -1881,9 +1881,9 @@ fn toolbox_renders_readable_websearch_and_custom_args() {
     assert!(!expanded_text.contains("<52c>"));
 }
 
-#[test]
+#[tokio::test]
 #[rustfmt::skip]
-fn toolbox_honors_emoji_setting() {
+async fn toolbox_honors_emoji_setting() {
     let calls = vec![mk_call("read", "f.txt", ToolCallState::Success)];
     assert!(
         !line_text(&render_toolbox(&calls, 0, true, 80, false, &no_elided()).lines[0])
@@ -2080,9 +2080,9 @@ fn command_error_renders_red() {
     );
 }
 
-#[test]
+#[tokio::test]
 #[rustfmt::skip]
-fn inference_warning_renders_yellow() {
+async fn inference_warning_renders_yellow() {
     let entry = HistoryEntry::InferenceWarning {
         line: "local/slow has not produced another token after 1s. Press Ctrl+C to cancel."
             .into(),
@@ -2160,9 +2160,9 @@ fn render_sub(
     )
 }
 
-#[test]
+#[tokio::test]
 #[rustfmt::skip]
-fn subagent_routing_chips_condense_model_and_trust() {
+async fn subagent_routing_chips_condense_model_and_trust() {
     fn chip_text(
         trusted_only: bool,
         model_trusted: bool,

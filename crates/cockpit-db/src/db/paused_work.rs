@@ -209,10 +209,10 @@ fn decode_paused_work(row: &rusqlite::Row<'_>) -> rusqlite::Result<PausedWorkRow
 mod tests {
     use super::*;
 
-    #[test]
-    fn paused_work_round_trips_and_resolves_once() {
+    #[tokio::test]
+    async fn paused_work_round_trips_and_resolves_once() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/tmp/p", "Build").unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
 
         db.upsert_paused_session_work(
             session.session_id,

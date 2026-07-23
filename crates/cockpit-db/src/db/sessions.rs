@@ -162,11 +162,6 @@ fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
 /// Generate a random 6-char Crockford base32 string. Not collision-safe
 /// on its own — use [`generate_unique_short_id`] for DB inserts.
 fn random_short_id() -> String {
-    #[cfg(test)]
-    if let Some(id) = pop_test_short_id() {
-        return id;
-    }
-
     use rand::RngExt;
     let mut rng = rand::rng();
     (0..SHORT_ID_LEN)
@@ -178,23 +173,44 @@ fn random_short_id() -> String {
 }
 
 #[cfg(test)]
-thread_local! {
-    static TEST_SHORT_IDS: std::cell::RefCell<std::collections::VecDeque<String>> =
-        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+fn test_short_ids()
+-> &'static std::sync::Mutex<std::collections::HashMap<usize, std::collections::VecDeque<String>>> {
+    static TEST_SHORT_IDS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, std::collections::VecDeque<String>>>,
+    > = std::sync::OnceLock::new();
+    TEST_SHORT_IDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 #[cfg(test)]
-fn set_test_short_ids(ids: &[&str]) {
-    TEST_SHORT_IDS.with(|queue| {
-        let mut queue = queue.borrow_mut();
-        queue.clear();
-        queue.extend(ids.iter().map(|id| (*id).to_string()));
-    });
+fn set_test_short_ids_conn(conn: &Connection, ids: Vec<String>) {
+    let mut queues = test_short_ids().lock().unwrap();
+    queues.insert(
+        conn as *const Connection as usize,
+        ids.into_iter().collect(),
+    );
 }
 
 #[cfg(test)]
-fn pop_test_short_id() -> Option<String> {
-    TEST_SHORT_IDS.with(|queue| queue.borrow_mut().pop_front())
+fn pop_test_short_id(conn: &Connection) -> Option<String> {
+    let mut queues = test_short_ids().lock().unwrap();
+    let key = conn as *const Connection as usize;
+    let queue = queues.get_mut(&key)?;
+    let id = queue.pop_front();
+    if queue.is_empty() {
+        queues.remove(&key);
+    }
+    id
+}
+
+#[cfg(test)]
+async fn set_test_short_ids(db: &Db, ids: &[&str]) {
+    let ids = ids.iter().map(|id| (*id).to_string()).collect::<Vec<_>>();
+    db.write(move |conn| {
+        set_test_short_ids_conn(conn, ids);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 /// Generate a 6-char short id that doesn't collide within `project_id`.
@@ -203,7 +219,7 @@ fn pop_test_short_id() -> Option<String> {
 /// belt-and-braces guard.
 fn generate_unique_short_id(conn: &Connection, project_id: &str) -> rusqlite::Result<String> {
     for _ in 0..16 {
-        let candidate = random_short_id();
+        let candidate = short_id_candidate(conn);
         let exists: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sessions WHERE project_id = ?1 AND short_id = ?2",
             params![project_id, candidate],
@@ -214,6 +230,18 @@ fn generate_unique_short_id(conn: &Connection, project_id: &str) -> rusqlite::Re
         }
     }
     Err(short_id_exhausted())
+}
+
+fn short_id_candidate(conn: &Connection) -> String {
+    #[cfg(test)]
+    {
+        pop_test_short_id(conn).unwrap_or_else(random_short_id)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = conn;
+        random_short_id()
+    }
 }
 
 fn short_id_exhausted() -> rusqlite::Error {
@@ -532,7 +560,7 @@ fn backfill_short_id_with_retry(
 ) -> rusqlite::Result<String> {
     for attempt in 0..16 {
         let short_id = if attempt == 0 {
-            random_short_id()
+            short_id_candidate(conn)
         } else {
             generate_unique_short_id(conn, project_id)?
         };
@@ -799,21 +827,49 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
     })
 }
 
+pub fn delete_session_conn(conn: &Connection, session_id: Uuid, cascade: bool) -> Result<()> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin delete_session tx")?;
+    if cascade {
+        let mut to_delete = collect_subtree(&tx, session_id)?;
+        // Descendants first, so a successful cascade never depends on
+        // deleting a parent before its app-level child pointers.
+        to_delete.reverse();
+        for id in to_delete {
+            tx.execute(
+                "DELETE FROM sessions WHERE session_id = ?1",
+                [id.to_string()],
+            )
+            .context("deleting session in cascade")?;
+        }
+    } else {
+        tx.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            [session_id.to_string()],
+        )
+        .context("deleting session")?;
+    }
+    tx.commit().context("commit delete_session tx")?;
+    Ok(())
+}
+
 impl Db {
-    pub fn create_session(
+    pub async fn create_session(
         &self,
         project_id: &str,
         project_root: &str,
         active_agent: &str,
     ) -> Result<SessionRow> {
-        let row = build_session_row(
-            project_id,
-            project_root,
-            active_agent,
-            Some(random_short_id()),
-            None,
-        );
-        self.insert_session_row(&row)
+        let project_id = project_id.to_string();
+        let project_root = project_root.to_string();
+        let active_agent = active_agent.to_string();
+        self.write(move |conn| {
+            let row =
+                Self::build_new_session_row_conn(conn, &project_id, &project_root, &active_agent)?;
+            Self::insert_session_row_conn(conn, &row)
+        })
+        .await
     }
 
     /// Build a brand-new session row — fresh UUID + project-unique
@@ -824,94 +880,148 @@ impl Db {
     /// no DB trace. The short_id is checked against the live table at build
     /// time for a useful display value; the eventual INSERT is the reservation
     /// point and may retry with a different final short_id.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn new_session_row(
+    pub async fn new_session_row(
         &self,
         project_id: &str,
         project_root: &str,
         active_agent: &str,
     ) -> Result<SessionRow> {
-        let short_id = self.read_blocking(|conn| {
-            generate_unique_short_id(conn, project_id).context("generating session short_id")
-        })?;
-        Ok(build_session_row(
+        let project_id = project_id.to_string();
+        let project_root = project_root.to_string();
+        let active_agent = active_agent.to_string();
+        self.read(move |conn| {
+            Self::build_new_session_row_conn(conn, &project_id, &project_root, &active_agent)
+        })
+        .await
+    }
+
+    pub fn build_new_session_row_conn(
+        conn: &Connection,
+        project_id: &str,
+        project_root: &str,
+        active_agent: &str,
+    ) -> Result<SessionRow> {
+        let short_id =
+            generate_unique_short_id(conn, project_id).context("generating session short_id")?;
+        Ok(Self::new_session_row_conn(
             project_id,
             project_root,
             active_agent,
-            Some(short_id),
-            None,
+            short_id,
         ))
     }
 
-    pub fn create_assistant_session(
+    fn new_session_row_conn(
+        project_id: &str,
+        project_root: &str,
+        active_agent: &str,
+        short_id: String,
+    ) -> SessionRow {
+        build_session_row(project_id, project_root, active_agent, Some(short_id), None)
+    }
+
+    pub async fn create_assistant_session(
         &self,
         project_id: &str,
         project_root: &str,
         active_agent: &str,
         assistant_name: &str,
     ) -> Result<SessionRow> {
-        let row = build_session_row(
-            project_id,
-            project_root,
-            active_agent,
-            Some(random_short_id()),
-            Some(assistant_name.to_string()),
-        );
-        self.insert_session_row(&row)
+        let project_id = project_id.to_string();
+        let project_root = project_root.to_string();
+        let active_agent = active_agent.to_string();
+        let assistant_name = assistant_name.to_string();
+        self.write(move |conn| {
+            let row = Self::build_new_assistant_session_row_conn(
+                conn,
+                &project_id,
+                &project_root,
+                &active_agent,
+                &assistant_name,
+            )?;
+            Self::insert_session_row_conn(conn, &row)
+        })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn new_assistant_session_row(
+    pub async fn new_assistant_session_row(
         &self,
         project_id: &str,
         project_root: &str,
         active_agent: &str,
         assistant_name: &str,
     ) -> Result<SessionRow> {
-        let short_id = self.read_blocking(|conn| {
-            generate_unique_short_id(conn, project_id).context("generating session short_id")
-        })?;
-        Ok(build_session_row(
+        let project_id = project_id.to_string();
+        let project_root = project_root.to_string();
+        let active_agent = active_agent.to_string();
+        let assistant_name = assistant_name.to_string();
+        self.read(move |conn| {
+            Self::build_new_assistant_session_row_conn(
+                conn,
+                &project_id,
+                &project_root,
+                &active_agent,
+                &assistant_name,
+            )
+        })
+        .await
+    }
+
+    pub fn build_new_assistant_session_row_conn(
+        conn: &Connection,
+        project_id: &str,
+        project_root: &str,
+        active_agent: &str,
+        assistant_name: &str,
+    ) -> Result<SessionRow> {
+        let short_id =
+            generate_unique_short_id(conn, project_id).context("generating session short_id")?;
+        Ok(Self::new_assistant_session_row_conn(
+            project_id,
+            project_root,
+            active_agent,
+            assistant_name,
+            short_id,
+        ))
+    }
+
+    fn new_assistant_session_row_conn(
+        project_id: &str,
+        project_root: &str,
+        active_agent: &str,
+        assistant_name: &str,
+        short_id: String,
+    ) -> SessionRow {
+        build_session_row(
             project_id,
             project_root,
             active_agent,
             Some(short_id),
             Some(assistant_name.to_string()),
-        ))
+        )
     }
 
     /// Insert a pre-built root session row. Pairs with
     /// [`Self::new_session_row`] for the deferred-persistence path; also the
     /// second half of [`Self::create_session`]. Idempotent at the
     /// application layer is **not** assumed — callers persist exactly once.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn insert_session_row(&self, row: &SessionRow) -> Result<SessionRow> {
+    pub async fn insert_session_row(&self, row: &SessionRow) -> Result<SessionRow> {
         let row = row.clone();
-        self.write_blocking(move |conn| {
-            insert_session_row_with_short_id_retry(conn, row.clone()).context("inserting session")
-        })
+        self.write(move |conn| Self::insert_session_row_conn(conn, &row))
+            .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_session_created_by_principal(
+    pub fn insert_session_row_conn(conn: &Connection, row: &SessionRow) -> Result<SessionRow> {
+        insert_session_row_with_short_id_retry(conn, row.clone()).context("inserting session")
+    }
+
+    pub async fn set_session_created_by_principal(
         &self,
         session_id: Uuid,
         principal: Option<&str>,
     ) -> Result<()> {
         let principal = principal.map(str::to_owned);
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
                 params![principal, session_id.to_string()],
@@ -919,48 +1029,47 @@ impl Db {
             .context("setting session created_by_principal")?;
             Ok(())
         })
+        .await
     }
 
     /// Create a fork session branching from `parent_session_id` at
     /// `fork_point_turn_id` (None = tail). Inherits the parent's
     /// project_id, project_root, active_agent, provider, model.
     /// Returns the new session row (with a fresh UUID + short_id).
-    pub fn create_fork(
+    pub async fn create_fork(
         &self,
         parent_session_id: Uuid,
         fork_point_turn_id: Option<String>,
     ) -> Result<SessionRow> {
         self.create_fork_inner(parent_session_id, fork_point_turn_id, false)
+            .await
     }
 
     /// Create an **ephemeral** side-conversation fork (`/side`). Identical
     /// to [`Self::create_fork`] but marks the row `ephemeral = 1`, so it is
     /// excluded from every list query, never auto-titled, never resumable,
     /// and discarded when the side conversation ends / its process exits.
-    pub fn create_ephemeral_fork(
+    pub async fn create_ephemeral_fork(
         &self,
         parent_session_id: Uuid,
         fork_point_turn_id: Option<String>,
     ) -> Result<SessionRow> {
         self.create_fork_inner(parent_session_id, fork_point_turn_id, true)
+            .await
     }
 
     /// Create or return the one live persistent `/btw` fork for
     /// `parent_session_id`. The fork is hidden from session lists like an
     /// ephemeral `/side` fork, but it is not swept on boot because it carries
     /// typed BTW linkage.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn create_btw_fork(
+    pub async fn create_btw_fork(
         &self,
         parent_session_id: Uuid,
         tangent: bool,
     ) -> Result<BtwForkCreateResult> {
         let session_id = Uuid::new_v4();
         let now = Utc::now().timestamp();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin create_btw_fork tx")?;
@@ -973,6 +1082,8 @@ impl Db {
             }
             let parent = get_session_inner(&tx, parent_session_id)?
                 .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
+            let short_id = generate_unique_short_id(&tx, &parent.project_id)
+                .context("generating btw fork short_id")?;
             let row = SessionRow {
                 session_id,
                 project_id: parent.project_id,
@@ -984,7 +1095,7 @@ impl Db {
                 model: parent.model,
                 active_agent: parent.active_agent,
                 assistant_name: parent.assistant_name,
-                short_id: Some(random_short_id()),
+                short_id: Some(short_id),
                 parent_session_id: Some(parent_session_id),
                 fork_point_turn_id: None,
                 title: None,
@@ -1020,30 +1131,26 @@ impl Db {
                 created: true,
             })
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn live_btw_fork_info(&self, parent_session_id: Uuid) -> Result<Option<BtwForkInfo>> {
-        self.read_blocking(|conn| live_btw_fork_info_conn(conn, parent_session_id))
+    pub async fn live_btw_fork_info(&self, parent_session_id: Uuid) -> Result<Option<BtwForkInfo>> {
+        self.read(move |conn| live_btw_fork_info_conn(conn, parent_session_id))
+            .await
     }
 
-    pub fn end_btw_fork(&self, parent_session_id: Uuid) -> Result<bool> {
-        let fork = self.live_btw_fork_info(parent_session_id)?;
-        let Some(info) = fork else {
-            return Ok(false);
-        };
-        self.delete_session(info.session_id, true)?;
-        Ok(true)
+    pub async fn end_btw_fork(&self, parent_session_id: Uuid) -> Result<bool> {
+        self.write(move |conn| {
+            let Some(info) = live_btw_fork_info_conn(conn, parent_session_id)? else {
+                return Ok(false);
+            };
+            delete_session_conn(conn, info.session_id, true)?;
+            Ok(true)
+        })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn create_fork_inner(
+    async fn create_fork_inner(
         &self,
         parent_session_id: Uuid,
         fork_point_turn_id: Option<String>,
@@ -1051,63 +1158,80 @@ impl Db {
     ) -> Result<SessionRow> {
         let session_id = Uuid::new_v4();
         let now = Utc::now().timestamp();
-        self.write_blocking(move |conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .context("begin create_fork tx")?;
-            let parent = get_session_inner(&tx, parent_session_id)?
-                .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
-            let short_id = random_short_id();
-            let row = SessionRow {
-                session_id,
-                project_id: parent.project_id,
-                project_root: parent.project_root,
-                started_at: now,
-                last_active_at: now,
-                ended_at: None,
-                provider: parent.provider,
-                model: parent.model,
-                active_agent: parent.active_agent,
-                assistant_name: parent.assistant_name,
-                short_id: Some(short_id),
-                parent_session_id: Some(parent_session_id),
-                fork_point_turn_id: fork_point_turn_id.clone(),
-                title: None,
-                user_renamed: false,
-                last_viewed_at: None,
-                archived_at: None,
-                ephemeral,
-                btw_parent_session_id: None,
-                btw_tangent: false,
-                user_content_tokens: parent.user_content_tokens,
-                title_stage: parent.title_stage,
-                guidance_baseline_path: parent.guidance_baseline_path,
-                guidance_baseline_hash: parent.guidance_baseline_hash,
-                redaction_table_json: parent.redaction_table_json,
-                model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
-                created_by_principal: parent.created_by_principal,
-                shared_with_collaborators: false,
-            };
-            let row = insert_fork_row_with_short_id_retry(&tx, row, &fork_point_turn_id)
-                .context("inserting fork session")?;
-            copy_fork_transcript(
-                &tx,
+        self.write(move |conn| {
+            Self::create_fork_conn(
+                conn,
                 parent_session_id,
+                fork_point_turn_id,
+                ephemeral,
                 session_id,
-                fork_point_turn_id.as_deref(),
+                now,
             )
-            .context("copying fork transcript")?;
-            tx.commit().context("commit create_fork tx")?;
-            Ok(row)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn get_session(&self, session_id: Uuid) -> Result<Option<SessionRow>> {
-        self.read_blocking(|conn| Self::get_session_conn(conn, session_id))
+    pub fn create_fork_conn(
+        conn: &Connection,
+        parent_session_id: Uuid,
+        fork_point_turn_id: Option<String>,
+        ephemeral: bool,
+        session_id: Uuid,
+        now: i64,
+    ) -> Result<SessionRow> {
+        let tx = conn
+            .unchecked_transaction()
+            .context("begin create_fork tx")?;
+        let parent = get_session_inner(&tx, parent_session_id)?
+            .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
+        let short_id = generate_unique_short_id(&tx, &parent.project_id)
+            .context("generating fork short_id")?;
+        let row = SessionRow {
+            session_id,
+            project_id: parent.project_id,
+            project_root: parent.project_root,
+            started_at: now,
+            last_active_at: now,
+            ended_at: None,
+            provider: parent.provider,
+            model: parent.model,
+            active_agent: parent.active_agent,
+            assistant_name: parent.assistant_name,
+            short_id: Some(short_id),
+            parent_session_id: Some(parent_session_id),
+            fork_point_turn_id: fork_point_turn_id.clone(),
+            title: None,
+            user_renamed: false,
+            last_viewed_at: None,
+            archived_at: None,
+            ephemeral,
+            btw_parent_session_id: None,
+            btw_tangent: false,
+            user_content_tokens: parent.user_content_tokens,
+            title_stage: parent.title_stage,
+            guidance_baseline_path: parent.guidance_baseline_path,
+            guidance_baseline_hash: parent.guidance_baseline_hash,
+            redaction_table_json: parent.redaction_table_json,
+            model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
+            created_by_principal: parent.created_by_principal,
+            shared_with_collaborators: false,
+        };
+        let row = insert_fork_row_with_short_id_retry(&tx, row, &fork_point_turn_id)
+            .context("inserting fork session")?;
+        copy_fork_transcript(
+            &tx,
+            parent_session_id,
+            session_id,
+            fork_point_turn_id.as_deref(),
+        )
+        .context("copying fork transcript")?;
+        tx.commit().context("commit create_fork tx")?;
+        Ok(row)
+    }
+
+    pub async fn get_session(&self, session_id: Uuid) -> Result<Option<SessionRow>> {
+        self.read(move |conn| Self::get_session_conn(conn, session_id))
+            .await
     }
 
     pub fn get_session_conn(conn: &Connection, session_id: Uuid) -> Result<Option<SessionRow>> {
@@ -1116,16 +1240,14 @@ impl Db {
 
     /// Lookup by short id within a project. Used by CLI/RPC paths where
     /// the user types the 6-char display id rather than the full UUID.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn get_session_by_short_id(
+    pub async fn get_session_by_short_id(
         &self,
         project_id: &str,
         short_id: &str,
     ) -> Result<Option<SessionRow>> {
-        self.read_blocking(|conn| {
+        let project_id = project_id.to_string();
+        let short_id = short_id.to_string();
+        self.read(move |conn| {
             let result = conn.query_row(
                 "SELECT * FROM sessions
                  WHERE project_id = ?1 AND short_id = ?2",
@@ -1138,60 +1260,62 @@ impl Db {
                 Err(e) => Err(e).context("query get_session_by_short_id"),
             }
         })
+        .await
     }
 
     /// Look up sessions by `short_id` across **every** project. Used by
     /// `cockpit export <session>`, which accepts a bare short_id without a
     /// project context. Returns all matches so the caller can report an
     /// ambiguous identifier (a short_id is unique only within a project).
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn find_sessions_by_short_id_global(&self, short_id: &str) -> Result<Vec<SessionRow>> {
-        self.read_blocking(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT * FROM sessions WHERE short_id = ?1")
-                .context("preparing find_sessions_by_short_id_global")?;
-            let rows = stmt
-                .query_map([short_id], SessionRow::from_row)
-                .context("querying sessions by short_id")?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.context("decoding session row")?);
-            }
-            Ok(out)
-        })
+    pub async fn find_sessions_by_short_id_global(
+        &self,
+        short_id: &str,
+    ) -> Result<Vec<SessionRow>> {
+        let short_id = short_id.to_string();
+        self.read(move |conn| Self::find_sessions_by_short_id_global_conn(conn, &short_id))
+            .await
+    }
+
+    pub fn find_sessions_by_short_id_global_conn(
+        conn: &Connection,
+        short_id: &str,
+    ) -> Result<Vec<SessionRow>> {
+        let mut stmt = conn
+            .prepare("SELECT * FROM sessions WHERE short_id = ?1")
+            .context("preparing find_sessions_by_short_id_global")?;
+        let rows = stmt
+            .query_map([short_id], SessionRow::from_row)
+            .context("querying sessions by short_id")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding session row")?);
+        }
+        Ok(out)
     }
 
     /// Ensure the session has a short_id (lazy backfill for rows
     /// migrated from pre-§17 schemas). Returns the resolved short_id.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn ensure_short_id(&self, session_id: Uuid) -> Result<String> {
-        self.write_blocking(move |conn| {
-            let row = get_session_inner(conn, session_id)?
-                .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
-            if let Some(existing) = row.short_id {
-                return Ok(existing);
-            }
-            let short_id = backfill_short_id_with_retry(conn, session_id, &row.project_id)
-                .context("backfilling short_id")?;
-            Ok(short_id)
-        })
+    pub async fn ensure_short_id(&self, session_id: Uuid) -> Result<String> {
+        self.write(move |conn| Self::ensure_short_id_conn(conn, session_id))
+            .await
+    }
+
+    pub fn ensure_short_id_conn(conn: &Connection, session_id: Uuid) -> Result<String> {
+        let row = get_session_inner(conn, session_id)?
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+        if let Some(existing) = row.short_id {
+            return Ok(existing);
+        }
+        let short_id = backfill_short_id_with_retry(conn, session_id, &row.project_id)
+            .context("backfilling short_id")?;
+        Ok(short_id)
     }
 
     /// Set or replace the session's title. `user_renamed` flips to true
     /// to lock out the auto-titling pass (GOALS §17d).
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn rename_session(&self, session_id: Uuid, title: &str) -> Result<()> {
+    pub async fn rename_session(&self, session_id: Uuid, title: &str) -> Result<()> {
         let title = title.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET title = ?1, user_renamed = 1 WHERE session_id = ?2",
                 params![title, session_id.to_string()],
@@ -1199,17 +1323,14 @@ impl Db {
             .context("renaming session")?;
             Ok(())
         })
+        .await
     }
 
     /// Set the title from the auto-titling pass. Refuses to overwrite a
     /// user-set title — auto-titling never clobbers manual labels.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_auto_title(&self, session_id: Uuid, title: &str) -> Result<bool> {
+    pub async fn set_auto_title(&self, session_id: Uuid, title: &str) -> Result<bool> {
         let title = title.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE sessions SET title = ?1
@@ -1219,19 +1340,16 @@ impl Db {
                 .context("setting auto title")?;
             Ok(affected > 0)
         })
+        .await
     }
 
     /// Set a title generated by an explicit user request (`/rename` with no
     /// title). This is still an auto-generated title, so it clears
     /// `user_renamed`; future scheduled auto-refreshes may replace it until the
     /// user manually names the session again.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_explicit_auto_title(&self, session_id: Uuid, title: &str) -> Result<bool> {
+    pub async fn set_explicit_auto_title(&self, session_id: Uuid, title: &str) -> Result<bool> {
         let title = title.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE sessions SET title = ?1, user_renamed = 0
@@ -1241,22 +1359,19 @@ impl Db {
                 .context("setting explicit auto title")?;
             Ok(affected > 0)
         })
+        .await
     }
 
     /// Set a generated title only if the session is still unnamed. This is
     /// used by daemon RPCs where competing callers may generate concurrently;
     /// the storage layer decides the single winner.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_explicit_auto_title_if_untitled(
+    pub async fn set_explicit_auto_title_if_untitled(
         &self,
         session_id: Uuid,
         title: &str,
     ) -> Result<bool> {
         let title = title.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE sessions SET title = ?1, user_renamed = 0
@@ -1266,6 +1381,7 @@ impl Db {
                 .context("setting explicit auto title if untitled")?;
             Ok(affected > 0)
         })
+        .await
     }
 
     /// Persist auto-title progress (migration 0037): the running raw-user
@@ -1273,17 +1389,13 @@ impl Db {
     /// [`crate::session::Session::note_user_content`] so automatic refresh
     /// progress survives resume / daemon restart. Best-effort at the call
     /// site; an erroring write never blocks a turn.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_title_progress(
+    pub async fn set_title_progress(
         &self,
         session_id: Uuid,
         user_content_tokens: i64,
         title_stage: i64,
     ) -> Result<()> {
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sessions
                  SET user_content_tokens = ?1, title_stage = ?2
@@ -1293,15 +1405,13 @@ impl Db {
             .context("persisting title progress")?;
             Ok(())
         })
+        .await
     }
 
     /// Direct children of a session in the fork tree. Most-recent-first.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_forks(&self, parent_session_id: Uuid) -> Result<Vec<SessionRow>> {
-        self.read_blocking(|conn| Self::list_forks_conn(conn, parent_session_id))
+    pub async fn list_forks(&self, parent_session_id: Uuid) -> Result<Vec<SessionRow>> {
+        self.read(move |conn| Self::list_forks_conn(conn, parent_session_id))
+            .await
     }
 
     pub fn list_forks_conn(conn: &Connection, parent_session_id: Uuid) -> Result<Vec<SessionRow>> {
@@ -1324,12 +1434,9 @@ impl Db {
     /// Cheap fork count for the `[N forks]` chip in the `/sessions`
     /// browser. Counts immediate children only (depth-1).
     #[allow(dead_code)]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn count_forks_for(&self, parent_session_id: Uuid) -> Result<u32> {
-        self.read_blocking(|conn| Self::count_forks_for_conn(conn, parent_session_id))
+    pub async fn count_forks_for(&self, parent_session_id: Uuid) -> Result<u32> {
+        self.read(move |conn| Self::count_forks_for_conn(conn, parent_session_id))
+            .await
     }
 
     fn count_forks_for_conn(conn: &Connection, parent_session_id: Uuid) -> Result<u32> {
@@ -1347,15 +1454,17 @@ impl Db {
     /// This is what the top-level `/sessions` view shows; forks descend
     /// via [`Self::list_forks`].
     #[allow(dead_code)]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_root_sessions(&self, project_id: &str, limit: u32) -> Result<Vec<SessionRow>> {
-        self.read_blocking(|conn| Self::list_root_sessions_conn(conn, project_id, limit))
+    pub async fn list_root_sessions(
+        &self,
+        project_id: &str,
+        limit: u32,
+    ) -> Result<Vec<SessionRow>> {
+        let project_id = project_id.to_string();
+        self.read(move |conn| Self::list_root_sessions_conn(conn, &project_id, limit))
+            .await
     }
 
-    pub fn list_root_sessions_conn(
+    pub(crate) fn list_root_sessions_conn(
         conn: &Connection,
         project_id: &str,
         limit: u32,
@@ -1380,37 +1489,9 @@ impl Db {
     /// Delete a session. With `cascade = true`, also deletes every
     /// descendant fork (depth-unbounded). FK CASCADE on tool_call_events
     /// / inference_calls / lock state takes care of dependent rows.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn delete_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
-        self.write_blocking(move |conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .context("begin delete_session tx")?;
-            if cascade {
-                let mut to_delete = collect_subtree(&tx, session_id)?;
-                // Descendants first, so a successful cascade never depends on
-                // deleting a parent before its app-level child pointers.
-                to_delete.reverse();
-                for id in to_delete {
-                    tx.execute(
-                        "DELETE FROM sessions WHERE session_id = ?1",
-                        [id.to_string()],
-                    )
-                    .context("deleting session in cascade")?;
-                }
-            } else {
-                tx.execute(
-                    "DELETE FROM sessions WHERE session_id = ?1",
-                    [session_id.to_string()],
-                )
-                .context("deleting session")?;
-            }
-            tx.commit().context("commit delete_session tx")?;
-            Ok(())
-        })
+    pub async fn delete_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
+        self.write(move |conn| delete_session_conn(conn, session_id, cascade))
+            .await
     }
 
     /// Discard a single ephemeral side-conversation session (`/side`),
@@ -1418,15 +1499,18 @@ impl Db {
     /// the id is unknown or the row is **not** ephemeral — a guard so a
     /// stray discard can never delete a persisted session. Returns `true`
     /// when an ephemeral row was deleted.
-    pub fn discard_ephemeral_session(&self, session_id: Uuid) -> Result<bool> {
-        // Guard on the typed row flag — only an ephemeral session is ever
-        // discarded this way, so a stray call can't drop a persisted one.
-        match self.get_session(session_id)? {
-            Some(row) if row.ephemeral => {}
-            _ => return Ok(false),
-        }
-        self.delete_session(session_id, true)?;
-        Ok(true)
+    pub async fn discard_ephemeral_session(&self, session_id: Uuid) -> Result<bool> {
+        self.write(move |conn| {
+            // Guard on the typed row flag — only an ephemeral session is ever
+            // discarded this way, so a stray call can't drop a persisted one.
+            match get_session_inner(conn, session_id)? {
+                Some(row) if row.ephemeral => {}
+                _ => return Ok(false),
+            }
+            delete_session_conn(conn, session_id, true)?;
+            Ok(true)
+        })
+        .await
     }
 
     /// Sweep every ephemeral session row (and descendant forks) from the DB.
@@ -1434,36 +1518,34 @@ impl Db {
     /// whose owning process died uncatchably can leave an orphaned ephemeral
     /// row behind, and this clears it so ephemeral sessions never accumulate.
     /// Returns the number of root ephemeral sessions removed.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn sweep_ephemeral_sessions(&self) -> Result<usize> {
-        let roots = self.read_blocking(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT session_id
+    pub async fn sweep_ephemeral_sessions(&self) -> Result<usize> {
+        let roots = self
+            .read(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT session_id
                        FROM sessions
                       WHERE ephemeral = 1
                         AND btw_parent_session_id IS NULL",
-                )
-                .context("preparing ephemeral sweep")?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let s: String = row.get(0)?;
-                    parse_uuid(&s)
-                })
-                .context("querying ephemeral sweep")?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.context("decoding ephemeral row")?);
-            }
-            Ok(out)
-        })?;
+                    )
+                    .context("preparing ephemeral sweep")?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let s: String = row.get(0)?;
+                        parse_uuid(&s)
+                    })
+                    .context("querying ephemeral sweep")?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row.context("decoding ephemeral row")?);
+                }
+                Ok(out)
+            })
+            .await?;
         let mut removed = 0;
         for id in roots {
             // Cascade in case a side conversation itself spawned forks.
-            match self.delete_session(id, true) {
+            match self.delete_session(id, true).await {
                 Ok(()) => removed += 1,
                 Err(error) => {
                     tracing::warn!(
@@ -1481,13 +1563,9 @@ impl Db {
     /// client opens/resumes the session — everything the agent produced
     /// up to this instant counts as seen; later agent output reads as
     /// unread.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn mark_session_viewed(&self, session_id: Uuid) -> Result<()> {
+    pub async fn mark_session_viewed(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET last_viewed_at = ?1 WHERE session_id = ?2",
                 params![now, session_id.to_string()],
@@ -1495,6 +1573,7 @@ impl Db {
             .context("marking session viewed")?;
             Ok(())
         })
+        .await
     }
 
     /// Timestamp (epoch seconds) of the most recent agent-produced event
@@ -1504,12 +1583,9 @@ impl Db {
     /// session is unread when this is newer than `last_viewed_at` (or it
     /// has activity and was never viewed).
     #[allow(dead_code)]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn latest_agent_activity_at(&self, session_id: Uuid) -> Result<Option<i64>> {
-        self.read_blocking(|conn| Self::latest_agent_activity_at_conn(conn, session_id))
+    pub async fn latest_agent_activity_at(&self, session_id: Uuid) -> Result<Option<i64>> {
+        self.read(move |conn| Self::latest_agent_activity_at_conn(conn, session_id))
+            .await
     }
 
     fn latest_agent_activity_at_conn(conn: &Connection, session_id: Uuid) -> Result<Option<i64>> {
@@ -1532,13 +1608,9 @@ impl Db {
     /// via the same recursive walk `delete_session` uses, so the whole
     /// fork subtree disappears from the browser together. Idempotent —
     /// re-archiving an already-archived row just re-stamps `archived_at`.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn archive_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
+    pub async fn archive_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin archive_session tx")?;
@@ -1557,16 +1629,13 @@ impl Db {
             tx.commit().context("commit archive_session tx")?;
             Ok(())
         })
+        .await
     }
 
     /// Clear a session's archive flag (recover). Single row only — the
     /// browser unarchives one session at a time from the archived view.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn unarchive_session(&self, session_id: Uuid) -> Result<()> {
-        self.write_blocking(move |conn| {
+    pub async fn unarchive_session(&self, session_id: Uuid) -> Result<()> {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET archived_at = NULL WHERE session_id = ?1",
                 [session_id.to_string()],
@@ -1574,18 +1643,16 @@ impl Db {
             .context("unarchiving session")?;
             Ok(())
         })
+        .await
     }
 
     /// Count the descendant forks of a session (depth-unbounded, not
     /// counting the session itself). Used by the archive/delete confirm
     /// dialog to state how many sessions the cascade will affect.
     #[allow(dead_code)]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn count_descendants(&self, session_id: Uuid) -> Result<u32> {
-        self.read_blocking(|conn| Self::count_descendants_conn(conn, session_id))
+    pub async fn count_descendants(&self, session_id: Uuid) -> Result<u32> {
+        self.read(move |conn| Self::count_descendants_conn(conn, session_id))
+            .await
     }
 
     fn count_descendants_conn(conn: &Connection, session_id: Uuid) -> Result<u32> {
@@ -1599,15 +1666,11 @@ impl Db {
     /// cheap for the shallow trees forks produce, and bounded by a guard
     /// against cyclic/dangling parents. Used by the daemon to decide
     /// which live workers to interrupt before a cascading archive/delete.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn is_in_subtree(&self, root: Uuid, node: Uuid) -> Result<bool> {
+    pub async fn is_in_subtree(&self, root: Uuid, node: Uuid) -> Result<bool> {
         if root == node {
             return Ok(true);
         }
-        self.read_blocking(|conn| {
+        self.read(move |conn| {
             let mut cur = node;
             // Bound the walk so a corrupted parent cycle can't spin.
             for _ in 0..10_000 {
@@ -1632,17 +1695,14 @@ impl Db {
             }
             Ok(false)
         })
+        .await
     }
 
     /// Move `last_active_at` to now. Called by the daemon on every
     /// interaction so `cockpit -c` resumes the actually-recent one.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn touch_session(&self, session_id: Uuid) -> Result<()> {
+    pub async fn touch_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET last_active_at = ?1 WHERE session_id = ?2",
                 params![now, session_id.to_string()],
@@ -1650,18 +1710,15 @@ impl Db {
             .context("touching session")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_session_redaction_table_json(
+    pub async fn set_session_redaction_table_json(
         &self,
         session_id: Uuid,
         redaction_table_json: Option<String>,
     ) -> Result<()> {
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET redaction_table_json = ?1 WHERE session_id = ?2",
                 params![redaction_table_json, session_id.to_string()],
@@ -1669,16 +1726,18 @@ impl Db {
             .context("setting session redaction table")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_session_model(&self, session_id: Uuid, provider: &str, model: &str) -> Result<()> {
+    pub async fn set_session_model(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        model: &str,
+    ) -> Result<()> {
         let provider = provider.to_owned();
         let model = model.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET provider = ?1, model = ?2 WHERE session_id = ?3",
                 params![provider, model, session_id.to_string()],
@@ -1686,15 +1745,12 @@ impl Db {
             .context("setting session model")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_session_agent(&self, session_id: Uuid, active_agent: &str) -> Result<()> {
+    pub async fn set_session_agent(&self, session_id: Uuid, active_agent: &str) -> Result<()> {
         let active_agent = active_agent.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
                 params![active_agent, session_id.to_string()],
@@ -1702,15 +1758,12 @@ impl Db {
             .context("setting session agent")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn end_session(&self, session_id: Uuid) -> Result<()> {
+    pub async fn end_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2",
                 params![now, session_id.to_string()],
@@ -1718,16 +1771,14 @@ impl Db {
             .context("ending session")?;
             Ok(())
         })
+        .await
     }
 
     /// Sessions newest-first. `only_open = true` filters out ended ones.
     #[allow(dead_code)]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_sessions(&self, only_open: bool, limit: u32) -> Result<Vec<SessionRow>> {
-        self.read_blocking(|conn| Self::list_sessions_conn(conn, only_open, limit))
+    pub async fn list_sessions(&self, only_open: bool, limit: u32) -> Result<Vec<SessionRow>> {
+        self.read(move |conn| Self::list_sessions_conn(conn, only_open, limit))
+            .await
     }
 
     pub fn list_sessions_conn(
@@ -1753,76 +1804,81 @@ impl Db {
         Ok(out)
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_sessions_for_assistant(
+    pub async fn list_sessions_for_assistant(
         &self,
         assistant_name: &str,
         only_open: bool,
         limit: u32,
     ) -> Result<Vec<SessionRow>> {
         let assistant_name = assistant_name.to_string();
-        self.read_blocking(move |conn| {
-            let sql = if only_open {
-                "SELECT * FROM sessions
-                  WHERE assistant_name = ?1 AND ended_at IS NULL AND ephemeral = 0
-                  ORDER BY last_active_at DESC LIMIT ?2"
-            } else {
-                "SELECT * FROM sessions
-                  WHERE assistant_name = ?1 AND ephemeral = 0
-                  ORDER BY last_active_at DESC LIMIT ?2"
-            };
-            let mut stmt = conn
-                .prepare(sql)
-                .context("preparing list_sessions_for_assistant")?;
-            let rows = stmt
-                .query_map(params![assistant_name, limit], SessionRow::from_row)
-                .context("querying assistant sessions")?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.context("decoding assistant session row")?);
-            }
-            Ok(out)
+        self.read(move |conn| {
+            Self::list_sessions_for_assistant_conn(conn, &assistant_name, only_open, limit)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn most_recent_session_for_assistant(
+    pub fn list_sessions_for_assistant_conn(
+        conn: &Connection,
+        assistant_name: &str,
+        only_open: bool,
+        limit: u32,
+    ) -> Result<Vec<SessionRow>> {
+        let sql = if only_open {
+            "SELECT * FROM sessions
+              WHERE assistant_name = ?1 AND ended_at IS NULL AND ephemeral = 0
+              ORDER BY last_active_at DESC LIMIT ?2"
+        } else {
+            "SELECT * FROM sessions
+              WHERE assistant_name = ?1 AND ephemeral = 0
+              ORDER BY last_active_at DESC LIMIT ?2"
+        };
+        let mut stmt = conn
+            .prepare(sql)
+            .context("preparing list_sessions_for_assistant")?;
+        let rows = stmt
+            .query_map(params![assistant_name, limit], SessionRow::from_row)
+            .context("querying assistant sessions")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding assistant session row")?);
+        }
+        Ok(out)
+    }
+
+    pub async fn most_recent_session_for_assistant(
         &self,
         assistant_name: &str,
     ) -> Result<Option<SessionRow>> {
         let assistant_name = assistant_name.to_string();
-        self.read_blocking(move |conn| {
-            conn.query_row(
-                "SELECT * FROM sessions
-                  WHERE assistant_name = ?1 AND ephemeral = 0
-                  ORDER BY last_active_at DESC, started_at DESC
-                  LIMIT 1",
-                params![assistant_name],
-                SessionRow::from_row,
-            )
-            .optional()
-            .context("loading most recent assistant session")
-        })
+        self.read(move |conn| Self::most_recent_session_for_assistant_conn(conn, &assistant_name))
+            .await
+    }
+
+    pub fn most_recent_session_for_assistant_conn(
+        conn: &Connection,
+        assistant_name: &str,
+    ) -> Result<Option<SessionRow>> {
+        conn.query_row(
+            "SELECT * FROM sessions
+              WHERE assistant_name = ?1 AND ephemeral = 0
+              ORDER BY last_active_at DESC, started_at DESC
+              LIMIT 1",
+            params![assistant_name],
+            SessionRow::from_row,
+        )
+        .optional()
+        .context("loading most recent assistant session")
     }
 
     /// The most recent durable session for a canonical workspace root,
     /// ordered by its latest user/assistant message rather than incidental
     /// metadata activity. Used by noninteractive `run --continue`.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn most_recent_session_for_root_by_message(
+    pub async fn most_recent_session_for_root_by_message(
         &self,
         project_root: &str,
     ) -> Result<Option<SessionRow>> {
-        self.read_blocking(|conn| {
+        let project_root = project_root.to_string();
+        self.read(move |conn| {
             let result = conn.query_row(
                 "SELECT s.*
                    FROM sessions AS s
@@ -1837,7 +1893,7 @@ impl Db {
                            s.last_active_at DESC,
                            s.session_id DESC
                   LIMIT 1",
-                [project_root],
+                [&project_root],
                 SessionRow::from_row,
             );
             match result {
@@ -1846,6 +1902,7 @@ impl Db {
                 Err(error) => Err(error).context("querying latest session by message time"),
             }
         })
+        .await
     }
 
     /// Assemble the `/sessions` browser rows for one level, the single
@@ -1865,19 +1922,17 @@ impl Db {
     /// daemonless path not at all). A per-row auxiliary-query miss
     /// degrades that field to its empty default rather than failing the
     /// whole list, matching the daemon handler's best-effort behavior.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_session_summaries(
+    pub async fn list_session_summaries(
         &self,
         project_id: Option<&str>,
         parent_session_id: Option<Uuid>,
         limit: u32,
     ) -> Result<Vec<crate::db::wire::SessionSummary>> {
-        self.read_blocking(|conn| {
-            Self::list_session_summaries_conn(conn, project_id, parent_session_id, limit)
+        let project_id = project_id.map(str::to_string);
+        self.read(move |conn| {
+            Self::list_session_summaries_conn(conn, project_id.as_deref(), parent_session_id, limit)
         })
+        .await
     }
 
     pub fn list_session_summaries_conn(
@@ -2015,17 +2070,17 @@ impl Db {
     /// project.
     // Retained for the not-yet-wired `cockpit -c` continue flow.
     #[allow(dead_code)]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn most_recent_open_session_for(&self, project_id: &str) -> Result<Option<SessionRow>> {
-        self.read_blocking(|conn| {
+    pub async fn most_recent_open_session_for(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<SessionRow>> {
+        let project_id = project_id.to_string();
+        self.read(move |conn| {
             let result = conn.query_row(
                 "SELECT * FROM sessions
                  WHERE project_id = ?1 AND ended_at IS NULL AND ephemeral = 0
                  ORDER BY last_active_at DESC LIMIT 1",
-                [project_id],
+                [&project_id],
                 SessionRow::from_row,
             );
             match result {
@@ -2034,6 +2089,7 @@ impl Db {
                 Err(e) => Err(e).context("query most_recent_open_session_for"),
             }
         })
+        .await
     }
 }
 
@@ -2222,6 +2278,22 @@ mod tests {
         String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
     }
 
+    async fn capture_warn_log_async<Fut>(f: impl FnOnce() -> Fut) -> String
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        let bytes = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::WARN)
+            .with_ansi(false)
+            .with_writer(CaptureWriter(bytes.clone()))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        f().await;
+        drop(guard);
+        String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+    }
+
     fn record_message(db: &Db, session_id: Uuid, text: &str, assistant: bool) -> i64 {
         db.insert_session_event(
             session_id,
@@ -2288,12 +2360,8 @@ mod tests {
         .unwrap();
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn fork_tool_call_ids(db: &Db, session_id: Uuid) -> Vec<String> {
-        db.read_blocking(|conn| {
+    async fn fork_tool_call_ids(db: &Db, session_id: Uuid) -> Vec<String> {
+        db.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT call_id FROM tool_call_events WHERE session_id = ?1 ORDER BY call_id",
@@ -2304,19 +2372,16 @@ mod tests {
                 .unwrap();
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>().unwrap())
         })
+        .await
         .unwrap()
     }
 
-    fn session_exists(db: &Db, session_id: Uuid) -> bool {
-        db.get_session(session_id).unwrap().is_some()
+    async fn session_exists(db: &Db, session_id: Uuid) -> bool {
+        db.get_session(session_id).await.unwrap().is_some()
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn fork_rows_for_parent(db: &Db, parent_session_id: Uuid) -> Vec<Uuid> {
-        db.read_blocking(|conn| {
+    async fn fork_rows_for_parent(db: &Db, parent_session_id: Uuid) -> Vec<Uuid> {
+        db.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT session_id FROM sessions WHERE parent_session_id = ?1 ORDER BY started_at",
@@ -2330,49 +2395,209 @@ mod tests {
                 .unwrap();
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>().unwrap())
         })
+        .await
         .unwrap()
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn install_trigger(db: &Db, sql: &str) {
+    async fn install_trigger(db: &Db, sql: &str) {
         let db = db.clone();
         let sql = sql.to_owned();
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute_batch(&sql)?;
             Ok(())
         })
+        .await
         .unwrap();
     }
 
-    #[test]
-    fn create_and_get() {
+    #[tokio::test]
+    async fn create_and_get() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p1", "/x/y", "Build").unwrap();
-        let g = db.get_session(s.session_id).unwrap().unwrap();
+        let s = db.create_session("p1", "/x/y", "Build").await.unwrap();
+        let g = db.get_session(s.session_id).await.unwrap().unwrap();
         assert_eq!(g.project_id, "p1");
         assert_eq!(g.project_root, "/x/y");
         assert_eq!(g.active_agent, "Build");
         assert!(g.ended_at.is_none());
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn latest_session_for_root_orders_by_last_message() {
+    #[tokio::test]
+    async fn db_async_sessions_roundtrip_through_async_api() {
         let db = Db::open_in_memory().unwrap();
-        let first = db.create_session("p", "/proj", "Build").unwrap();
-        let second = db.create_session("p", "/proj", "Build").unwrap();
-        let other = db.create_session("q", "/other", "Build").unwrap();
+        let session = db
+            .create_session("project-a", "/workspace/a", "Build")
+            .await
+            .unwrap();
+
+        db.set_session_model(session.session_id, "openai", "gpt-5")
+            .await
+            .unwrap();
+        db.set_session_agent(session.session_id, "Review")
+            .await
+            .unwrap();
+        db.rename_session(session.session_id, "Reviewed title")
+            .await
+            .unwrap();
+
+        let stored = db.get_session(session.session_id).await.unwrap().unwrap();
+        assert_eq!(stored.provider.as_deref(), Some("openai"));
+        assert_eq!(stored.model.as_deref(), Some("gpt-5"));
+        assert_eq!(stored.active_agent, "Review");
+        assert_eq!(stored.title.as_deref(), Some("Reviewed title"));
+        assert!(stored.user_renamed);
+    }
+
+    #[tokio::test]
+    async fn db_async_sessions_write_then_read_sees_committed_value() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+
+        db.end_session(session.session_id).await.unwrap();
+
+        let stored = db.get_session(session.session_id).await.unwrap().unwrap();
+        assert!(stored.ended_at.is_some());
+        assert!(
+            db.list_sessions(true, 100)
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.session_id != session.session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn db_async_sessions_concurrent_read_finishes_during_queued_slow_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("db.sqlite3")).unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let (write_started_tx, write_started_rx) = tokio::sync::oneshot::channel();
+        let (release_write_tx, release_write_rx) = std::sync::mpsc::channel();
+        let db_for_write = db.clone();
+
+        let writer = tokio::spawn(async move {
+            db_for_write
+                .write(move |_conn| {
+                    write_started_tx.send(()).ok();
+                    release_write_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        });
+
+        write_started_rx.await.unwrap();
+        let read = db.get_session(session.session_id).await.unwrap().unwrap();
+        assert_eq!(read.session_id, session.session_id);
+
+        release_write_tx.send(()).unwrap();
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn db_async_sessions_atomic_delete_rolls_back_on_cascade_failure() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "Build").await.unwrap();
+        let child = db.create_fork(parent.session_id, None).await.unwrap();
+        let grandchild = db.create_fork(child.session_id, None).await.unwrap();
+
+        install_trigger(
+            &db,
+            &format!(
+                "CREATE TEMP TRIGGER db_async_sessions_fail_child_delete
+                 BEFORE DELETE ON sessions
+                 WHEN OLD.session_id = '{}'
+                 BEGIN
+                     SELECT RAISE(FAIL, 'db async sessions injected delete failure');
+                 END;",
+                child.session_id
+            ),
+        )
+        .await;
+
+        let error = db
+            .delete_session(parent.session_id, true)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("db async sessions injected delete failure"),
+            "unexpected error: {error:#}"
+        );
+        for id in [parent.session_id, child.session_id, grandchild.session_id] {
+            assert!(db.get_session(id).await.unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn db_async_sessions_search_returns_expected_rows_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let target = db
+            .create_session("project-a", "/workspace/a", "Build")
+            .await
+            .unwrap();
+        let other = db
+            .create_session("project-b", "/workspace/b", "Build")
+            .await
+            .unwrap();
+        record_message(
+            &db,
+            target.session_id,
+            "needle phrase belongs to project a",
+            false,
+        );
+        record_message(
+            &db,
+            other.session_id,
+            "needle phrase belongs to project b",
+            false,
+        );
+
+        let hits = db
+            .search_candidates("needle", Some("project-a"), None, None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, target.session_id);
+    }
+
+    #[tokio::test]
+    async fn db_async_sessions_workspace_trust_roundtrip_through_async_api() {
+        use crate::db::workspace_trust::WorkspaceTrustMode;
+
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        assert!(
+            db.workspace_trust_by_root(tmp.path())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let decision = db
+            .set_workspace_trust(tmp.path(), WorkspaceTrustMode::Trust)
+            .await
+            .unwrap();
+
+        let stored = db
+            .workspace_trust_by_root(tmp.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.mode, WorkspaceTrustMode::Trust);
+        assert_eq!(stored.root_path, decision.root_path);
+    }
+
+    #[tokio::test]
+    async fn latest_session_for_root_orders_by_last_message() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db.create_session("p", "/proj", "Build").await.unwrap();
+        let second = db.create_session("p", "/proj", "Build").await.unwrap();
+        let other = db.create_session("q", "/other", "Build").await.unwrap();
         let first_seq = record_message(&db, first.session_id, "newest message", false);
         let second_seq = record_message(&db, second.session_id, "older message", true);
         let other_seq = record_message(&db, other.session_id, "newest elsewhere", false);
 
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute(
                 "UPDATE session_events SET ts_ms = 3000 WHERE seq = ?1",
                 [first_seq],
@@ -2391,73 +2616,76 @@ mod tests {
             )?;
             Ok(())
         })
+        .await
         .unwrap();
 
         let selected = db
             .most_recent_session_for_root_by_message("/proj")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(selected.session_id, first.session_id);
         assert!(
             db.most_recent_session_for_root_by_message("/missing")
+                .await
                 .unwrap()
                 .is_none()
         );
     }
 
-    #[test]
-    fn new_session_row_defers_the_write() {
+    #[tokio::test]
+    async fn new_session_row_defers_the_write() {
         // session-id-display-and-lazy-persist: building a row reserves an id
         // + short_id but writes nothing; inserting it makes it queryable.
         let db = Db::open_in_memory().unwrap();
-        let row = db.new_session_row("p", "/x", "builder").unwrap();
+        let row = db.new_session_row("p", "/x", "builder").await.unwrap();
         assert!(row.short_id.is_some());
-        assert!(db.get_session(row.session_id).unwrap().is_none());
-        assert!(db.list_sessions(false, 100).unwrap().is_empty());
-        db.insert_session_row(&row).unwrap();
-        let got = db.get_session(row.session_id).unwrap().unwrap();
+        assert!(db.get_session(row.session_id).await.unwrap().is_none());
+        assert!(db.list_sessions(false, 100).await.unwrap().is_empty());
+        db.insert_session_row(&row).await.unwrap();
+        let got = db.get_session(row.session_id).await.unwrap().unwrap();
         assert_eq!(got.project_id, "p");
         assert_eq!(got.short_id, row.short_id);
-        assert_eq!(db.list_sessions(false, 100).unwrap().len(), 1);
+        assert_eq!(db.list_sessions(false, 100).await.unwrap().len(), 1);
     }
 
-    #[test]
-    fn insert_session_row_round_trips_provider_model() {
+    #[tokio::test]
+    async fn insert_session_row_round_trips_provider_model() {
         let db = Db::open_in_memory().unwrap();
-        let mut row = db.new_session_row("p", "/x", "builder").unwrap();
+        let mut row = db.new_session_row("p", "/x", "builder").await.unwrap();
         row.provider = Some("anthropic".into());
         row.model = Some("opus".into());
-        db.insert_session_row(&row).unwrap();
-        let got = db.get_session(row.session_id).unwrap().unwrap();
+        db.insert_session_row(&row).await.unwrap();
+        let got = db.get_session(row.session_id).await.unwrap().unwrap();
         assert_eq!(got.provider.as_deref(), Some("anthropic"));
         assert_eq!(got.model.as_deref(), Some("opus"));
     }
 
-    #[test]
-    fn insert_session_row_round_trips_model_system_prompt_snapshot_json() {
+    #[tokio::test]
+    async fn insert_session_row_round_trips_model_system_prompt_snapshot_json() {
         let db = Db::open_in_memory().unwrap();
-        let mut row = db.new_session_row("p", "/x", "builder").unwrap();
+        let mut row = db.new_session_row("p", "/x", "builder").await.unwrap();
         row.model_system_prompt_snapshot_json =
             r#"{"prompts":{"p":{"m":"model instructions"}}}"#.to_string();
 
-        db.insert_session_row(&row).unwrap();
+        db.insert_session_row(&row).await.unwrap();
 
-        let got = db.get_session(row.session_id).unwrap().unwrap();
+        let got = db.get_session(row.session_id).await.unwrap().unwrap();
         assert_eq!(
             got.model_system_prompt_snapshot_json,
             r#"{"prompts":{"p":{"m":"model instructions"}}}"#
         );
     }
 
-    #[test]
-    fn insert_session_row_round_trips_redaction_table_json() {
+    #[tokio::test]
+    async fn insert_session_row_round_trips_redaction_table_json() {
         let db = Db::open_in_memory().unwrap();
-        let mut row = db.new_session_row("p", "/x", "builder").unwrap();
+        let mut row = db.new_session_row("p", "/x", "builder").await.unwrap();
         row.redaction_table_json =
             Some(r#"{"rules":[{"kind":"literal","value":"persisted-secret-value"}]}"#.to_string());
-        db.insert_session_row(&row).unwrap();
+        db.insert_session_row(&row).await.unwrap();
 
-        let got = db.get_session(row.session_id).unwrap().unwrap();
+        let got = db.get_session(row.session_id).await.unwrap().unwrap();
         assert_eq!(
             got.redaction_table_json.as_deref(),
             Some(r#"{"rules":[{"kind":"literal","value":"persisted-secret-value"}]}"#)
@@ -2466,12 +2694,8 @@ mod tests {
 
     /// Push a session's `last_active_at` into the past so recency ordering is
     /// deterministic without sleeping across a whole-second timestamp boundary.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn backdate_session(db: &Db, session_id: Uuid, seconds: i64) {
-        db.write_blocking(move |conn| {
+    async fn backdate_session(db: &Db, session_id: Uuid, seconds: i64) {
+        db.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET last_active_at = last_active_at - ?1 WHERE session_id = ?2",
                 params![seconds, session_id.to_string()],
@@ -2479,61 +2703,67 @@ mod tests {
             .context("backdating session")?;
             Ok(())
         })
+        .await
         .unwrap();
     }
 
-    #[test]
-    fn touch_updates_last_active() {
+    #[tokio::test]
+    async fn touch_updates_last_active() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
-        db.touch_session(s.session_id).unwrap();
-        let g = db.get_session(s.session_id).unwrap().unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
+        db.touch_session(s.session_id).await.unwrap();
+        let g = db.get_session(s.session_id).await.unwrap().unwrap();
         assert!(g.last_active_at >= s.last_active_at);
     }
 
-    #[test]
-    fn most_recent_open() {
+    #[tokio::test]
+    async fn most_recent_open() {
         let db = Db::open_in_memory().unwrap();
-        let _ = db.create_session("p", "/x", "a").unwrap();
-        let s2 = db.create_session("p", "/x", "a").unwrap();
-        db.end_session(s2.session_id).unwrap();
-        let recent = db.most_recent_open_session_for("p").unwrap().unwrap();
+        let _ = db.create_session("p", "/x", "a").await.unwrap();
+        let s2 = db.create_session("p", "/x", "a").await.unwrap();
+        db.end_session(s2.session_id).await.unwrap();
+        let recent = db.most_recent_open_session_for("p").await.unwrap().unwrap();
         assert_ne!(recent.session_id, s2.session_id);
     }
 
-    #[test]
-    fn create_session_populates_short_id() {
+    #[tokio::test]
+    async fn create_session_populates_short_id() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         let sid = s.short_id.expect("short_id missing");
         assert_eq!(sid.len(), SHORT_ID_LEN);
         assert!(sid.chars().all(|c| CROCKFORD_BASE32.contains(&(c as u8))));
-        let by_short = db.get_session_by_short_id("p", &sid).unwrap().unwrap();
+        let by_short = db
+            .get_session_by_short_id("p", &sid)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(by_short.session_id, s.session_id);
     }
 
-    #[test]
-    fn short_ids_unique_within_project() {
+    #[tokio::test]
+    async fn short_ids_unique_within_project() {
         let db = Db::open_in_memory().unwrap();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
-            let s = db.create_session("p", "/x", "a").unwrap();
+            let s = db.create_session("p", "/x", "a").await.unwrap();
             assert!(seen.insert(s.short_id.unwrap()));
         }
     }
 
-    #[test]
-    fn create_session_retries_short_id_collision_at_insert() {
+    #[tokio::test]
+    async fn create_session_retries_short_id_collision_at_insert() {
         let db = Db::open_in_memory().unwrap();
-        set_test_short_ids(&["aaaaaa"]);
-        let first = db.create_session("p", "/x", "a").unwrap();
+        set_test_short_ids(&db, &["aaaaaa"]).await;
+        let first = db.create_session("p", "/x", "a").await.unwrap();
         assert_eq!(first.short_id.as_deref(), Some("aaaaaa"));
 
-        set_test_short_ids(&["aaaaaa", "bbbbbb"]);
-        let second = db.create_session("p", "/x", "a").unwrap();
+        set_test_short_ids(&db, &["aaaaaa", "bbbbbb"]).await;
+        let second = db.create_session("p", "/x", "a").await.unwrap();
         assert_eq!(second.short_id.as_deref(), Some("bbbbbb"));
         assert_eq!(
             db.get_session(second.session_id)
+                .await
                 .unwrap()
                 .unwrap()
                 .short_id
@@ -2542,35 +2772,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deferred_insert_retries_and_returns_final_short_id() {
+    #[tokio::test]
+    async fn deferred_insert_retries_and_returns_final_short_id() {
         let db = Db::open_in_memory().unwrap();
-        set_test_short_ids(&["aaaaaa"]);
-        let row = db.new_session_row("p", "/x", "a").unwrap();
+        set_test_short_ids(&db, &["aaaaaa"]).await;
+        let row = db.new_session_row("p", "/x", "a").await.unwrap();
         assert_eq!(row.short_id.as_deref(), Some("aaaaaa"));
 
-        set_test_short_ids(&["aaaaaa"]);
-        let competing = db.create_session("p", "/x", "a").unwrap();
+        set_test_short_ids(&db, &["aaaaaa"]).await;
+        let competing = db.create_session("p", "/x", "a").await.unwrap();
         assert_eq!(competing.short_id.as_deref(), Some("aaaaaa"));
 
-        set_test_short_ids(&["bbbbbb"]);
-        let inserted = db.insert_session_row(&row).unwrap();
+        set_test_short_ids(&db, &["bbbbbb"]).await;
+        let inserted = db.insert_session_row(&row).await.unwrap();
         assert_eq!(inserted.short_id.as_deref(), Some("bbbbbb"));
-        let got = db.get_session(row.session_id).unwrap().unwrap();
+        let got = db.get_session(row.session_id).await.unwrap().unwrap();
         assert_eq!(got.short_id.as_deref(), Some("bbbbbb"));
     }
 
-    #[test]
-    fn create_fork_retries_short_id_collision_at_insert() {
+    #[tokio::test]
+    async fn create_fork_retries_short_id_collision_at_insert() {
         let db = Db::open_in_memory().unwrap();
-        set_test_short_ids(&["aaaaaa"]);
-        let parent = db.create_session("p", "/x", "a").unwrap();
+        set_test_short_ids(&db, &["aaaaaa"]).await;
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
 
-        set_test_short_ids(&["aaaaaa", "bbbbbb"]);
-        let fork = db.create_fork(parent.session_id, None).unwrap();
+        set_test_short_ids(&db, &["aaaaaa", "bbbbbb"]).await;
+        let fork = db.create_fork(parent.session_id, None).await.unwrap();
         assert_eq!(fork.short_id.as_deref(), Some("bbbbbb"));
         assert_eq!(
             db.get_session(fork.session_id)
+                .await
                 .unwrap()
                 .unwrap()
                 .short_id
@@ -2579,45 +2810,46 @@ mod tests {
         );
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn ensure_short_id_retries_backfill_collision() {
+    #[tokio::test]
+    async fn ensure_short_id_retries_backfill_collision() {
         let db = Db::open_in_memory().unwrap();
-        set_test_short_ids(&["aaaaaa"]);
-        let existing = db.create_session("p", "/x", "a").unwrap();
+        set_test_short_ids(&db, &["aaaaaa"]).await;
+        let existing = db.create_session("p", "/x", "a").await.unwrap();
         assert_eq!(existing.short_id.as_deref(), Some("aaaaaa"));
 
-        set_test_short_ids(&["bbbbbb"]);
-        let target = db.create_session("p", "/x", "a").unwrap();
-        db.write_blocking(move |conn| {
+        set_test_short_ids(&db, &["bbbbbb"]).await;
+        let target = db.create_session("p", "/x", "a").await.unwrap();
+        db.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET short_id = NULL WHERE session_id = ?1",
                 [target.session_id.to_string()],
             )?;
             Ok(())
         })
+        .await
         .unwrap();
 
-        set_test_short_ids(&["aaaaaa", "cccccc"]);
-        let backfilled = db.ensure_short_id(target.session_id).unwrap();
+        set_test_short_ids(&db, &["aaaaaa", "cccccc"]).await;
+        let backfilled = db.ensure_short_id(target.session_id).await.unwrap();
         assert_eq!(backfilled, "cccccc");
     }
 
-    #[test]
-    fn short_id_retry_exhaustion_names_the_condition() {
+    #[tokio::test]
+    async fn short_id_retry_exhaustion_names_the_condition() {
         let db = Db::open_in_memory().unwrap();
-        set_test_short_ids(&["aaaaaa"]);
-        db.create_session("p", "/x", "a").unwrap();
+        set_test_short_ids(&db, &["aaaaaa"]).await;
+        db.create_session("p", "/x", "a").await.unwrap();
 
-        set_test_short_ids(&[
-            "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa",
-            "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa",
-            "aaaaaa", "aaaaaa",
-        ]);
-        let err = db.create_session("p", "/x", "a").unwrap_err();
+        set_test_short_ids(
+            &db,
+            &[
+                "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa",
+                "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa", "aaaaaa",
+                "aaaaaa", "aaaaaa",
+            ],
+        )
+        .await;
+        let err = db.create_session("p", "/x", "a").await.unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.contains("session short-id generation exhausted"),
@@ -2625,10 +2857,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn create_fork_inherits_parent_metadata() {
+    #[tokio::test]
+    async fn create_fork_inherits_parent_metadata() {
         let db = Db::open_in_memory().unwrap();
-        let mut parent = db.new_session_row("p", "/proj", "Build").unwrap();
+        let mut parent = db.new_session_row("p", "/proj", "Build").await.unwrap();
         parent.provider = Some("anthropic".to_string());
         parent.model = Some("opus-4-7".to_string());
         parent.redaction_table_json = Some(
@@ -2637,11 +2869,12 @@ mod tests {
         );
         parent.model_system_prompt_snapshot_json =
             r#"{"prompts":{"anthropic":{"opus-4-7":"fork prompt"}}}"#.to_string();
-        let parent = db.insert_session_row(&parent).unwrap();
+        let parent = db.insert_session_row(&parent).await.unwrap();
         let fork_point = record_message(&db, parent.session_id, "fork here", false).to_string();
-        let parent = db.get_session(parent.session_id).unwrap().unwrap();
+        let parent = db.get_session(parent.session_id).await.unwrap().unwrap();
         let fork = db
             .create_fork(parent.session_id, Some(fork_point.clone()))
+            .await
             .unwrap();
 
         assert_eq!(fork.project_id, "p");
@@ -2663,10 +2896,10 @@ mod tests {
         assert_ne!(fork.short_id, parent.short_id);
     }
 
-    #[test]
-    fn create_fork_copies_transcript_and_then_diverges() {
+    #[tokio::test]
+    async fn create_fork_copies_transcript_and_then_diverges() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         let first = db
             .insert_session_event(
                 parent.session_id,
@@ -2678,7 +2911,7 @@ mod tests {
             .unwrap();
         db.pin_message(parent.session_id, first).unwrap();
 
-        let fork = db.create_fork(parent.session_id, None).unwrap();
+        let fork = db.create_fork(parent.session_id, None).await.unwrap();
         let fork_events = db.list_session_events(fork.session_id).unwrap();
         assert_eq!(fork_events.len(), 1);
         assert_eq!(fork_events[0].data["text"], "parent before fork");
@@ -2710,10 +2943,10 @@ mod tests {
         assert_eq!(fork_events[1].data["text"], "child after fork");
     }
 
-    #[test]
-    fn copy_fork_transcript_truncates_at_seq() {
+    #[tokio::test]
+    async fn copy_fork_transcript_truncates_at_seq() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         record_message(&db, parent.session_id, "s1", false);
         let fork_point = record_message(&db, parent.session_id, "s2", true);
         record_message(&db, parent.session_id, "s3", false);
@@ -2721,6 +2954,7 @@ mod tests {
 
         let fork = db
             .create_fork(parent.session_id, Some(fork_point.to_string()))
+            .await
             .unwrap();
         let fork_events = db.list_session_events(fork.session_id).unwrap();
         let texts: Vec<_> = fork_events
@@ -2731,10 +2965,10 @@ mod tests {
         assert_eq!(texts, vec!["s1", "s2"]);
     }
 
-    #[test]
-    fn fork_event_copy_failure_rolls_back_child_session() {
+    #[tokio::test]
+    async fn fork_event_copy_failure_rolls_back_child_session() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         record_message(&db, parent.session_id, "fail-event-copy", false);
         install_trigger(
             &db,
@@ -2745,21 +2979,26 @@ mod tests {
              BEGIN
                  SELECT RAISE(FAIL, 'injected fork event copy failure');
              END;",
-        );
+        )
+        .await;
 
-        let err = db.create_fork(parent.session_id, None).unwrap_err();
+        let err = db.create_fork(parent.session_id, None).await.unwrap_err();
 
         assert!(
             format!("{err:#}").contains("injected fork event copy failure"),
             "unexpected error: {err:#}"
         );
-        assert!(fork_rows_for_parent(&db, parent.session_id).is_empty());
+        assert!(
+            fork_rows_for_parent(&db, parent.session_id)
+                .await
+                .is_empty()
+        );
     }
 
-    #[test]
-    fn fork_tool_call_copy_failure_rolls_back_child_session() {
+    #[tokio::test]
+    async fn fork_tool_call_copy_failure_rolls_back_child_session() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         record_tool_timeline(&db, parent.session_id, "fail-tool-copy");
         record_tool_call_event(&db, parent.session_id, "fail-tool-copy", 100);
         install_trigger(
@@ -2771,21 +3010,26 @@ mod tests {
              BEGIN
                  SELECT RAISE(FAIL, 'injected fork tool copy failure');
              END;",
-        );
+        )
+        .await;
 
-        let err = db.create_fork(parent.session_id, None).unwrap_err();
+        let err = db.create_fork(parent.session_id, None).await.unwrap_err();
 
         assert!(
             format!("{err:#}").contains("injected fork tool copy failure"),
             "unexpected error: {err:#}"
         );
-        assert!(fork_rows_for_parent(&db, parent.session_id).is_empty());
+        assert!(
+            fork_rows_for_parent(&db, parent.session_id)
+                .await
+                .is_empty()
+        );
     }
 
-    #[test]
-    fn fork_pin_copy_failure_rolls_back_child_session() {
+    #[tokio::test]
+    async fn fork_pin_copy_failure_rolls_back_child_session() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         let seq = record_message(&db, parent.session_id, "pinned", false);
         db.pin_message(parent.session_id, seq).unwrap();
         install_trigger(
@@ -2796,28 +3040,34 @@ mod tests {
              BEGIN
                  SELECT RAISE(FAIL, 'injected fork pin copy failure');
              END;",
-        );
+        )
+        .await;
 
-        let err = db.create_fork(parent.session_id, None).unwrap_err();
+        let err = db.create_fork(parent.session_id, None).await.unwrap_err();
 
         assert!(
             format!("{err:#}").contains("injected fork pin copy failure"),
             "unexpected error: {err:#}"
         );
-        assert!(fork_rows_for_parent(&db, parent.session_id).is_empty());
+        assert!(
+            fork_rows_for_parent(&db, parent.session_id)
+                .await
+                .is_empty()
+        );
     }
 
-    #[test]
-    fn fork_at_tail_seq_equals_fork_none() {
+    #[tokio::test]
+    async fn fork_at_tail_seq_equals_fork_none() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         record_message(&db, parent.session_id, "s1", false);
         let tail = record_message(&db, parent.session_id, "s2", true);
 
         let fork_at_tail = db
             .create_fork(parent.session_id, Some(tail.to_string()))
+            .await
             .unwrap();
-        let fork_at_none = db.create_fork(parent.session_id, None).unwrap();
+        let fork_at_none = db.create_fork(parent.session_id, None).await.unwrap();
         let tail_payloads: Vec<_> = db
             .list_session_events(fork_at_tail.session_id)
             .unwrap()
@@ -2834,10 +3084,10 @@ mod tests {
         assert_eq!(tail_payloads, none_payloads);
     }
 
-    #[test]
-    fn fork_truncates_pins() {
+    #[tokio::test]
+    async fn fork_truncates_pins() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         let s1 = record_message(&db, parent.session_id, "s1", false);
         let fork_point = record_message(&db, parent.session_id, "s2", true);
         let s3 = record_message(&db, parent.session_id, "s3", false);
@@ -2846,6 +3096,7 @@ mod tests {
 
         let fork = db
             .create_fork(parent.session_id, Some(fork_point.to_string()))
+            .await
             .unwrap();
         let fork_events = db.list_session_events(fork.session_id).unwrap();
         let fork_pins = db.list_pin_seqs(fork.session_id).unwrap();
@@ -2853,10 +3104,10 @@ mod tests {
         assert_eq!(fork_pins, vec![fork_events[0].seq]);
     }
 
-    #[test]
-    fn fork_truncates_tool_calls() {
+    #[tokio::test]
+    async fn fork_truncates_tool_calls() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         record_message(&db, parent.session_id, "s1", false);
         record_tool_timeline(&db, parent.session_id, "keep");
         let fork_point = record_message(&db, parent.session_id, "s2", true);
@@ -2866,135 +3117,150 @@ mod tests {
 
         let fork = db
             .create_fork(parent.session_id, Some(fork_point.to_string()))
+            .await
             .unwrap();
 
-        assert_eq!(fork_tool_call_ids(&db, fork.session_id), vec!["keep"]);
+        assert_eq!(fork_tool_call_ids(&db, fork.session_id).await, vec!["keep"]);
     }
 
-    #[test]
-    fn fork_unparsable_turn_id_errors() {
+    #[tokio::test]
+    async fn fork_unparsable_turn_id_errors() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         record_message(&db, parent.session_id, "s1", false);
 
         let err = db
             .create_fork(parent.session_id, Some("turn-x".to_string()))
+            .await
             .unwrap_err();
 
         assert!(format!("{err:#}").contains("invalid fork point turn id"));
     }
 
-    #[test]
-    fn fork_missing_seq_errors() {
+    #[tokio::test]
+    async fn fork_missing_seq_errors() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         let only = record_message(&db, parent.session_id, "s1", false);
 
         let err = db
             .create_fork(parent.session_id, Some((only + 100).to_string()))
+            .await
             .unwrap_err();
 
         assert!(format!("{err:#}").contains("was not found in parent session"));
     }
 
-    #[test]
-    fn list_forks_returns_children_most_recent_first() {
+    #[tokio::test]
+    async fn list_forks_returns_children_most_recent_first() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/x", "a").unwrap();
-        let f1 = db.create_fork(parent.session_id, None).unwrap();
-        let f2 = db.create_fork(parent.session_id, None).unwrap();
-        backdate_session(&db, f1.session_id, 10);
-        let forks = db.list_forks(parent.session_id).unwrap();
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let f1 = db.create_fork(parent.session_id, None).await.unwrap();
+        let f2 = db.create_fork(parent.session_id, None).await.unwrap();
+        backdate_session(&db, f1.session_id, 10).await;
+        let forks = db.list_forks(parent.session_id).await.unwrap();
         assert_eq!(forks.len(), 2);
         assert_eq!(forks[0].session_id, f2.session_id);
-        assert_eq!(db.count_forks_for(parent.session_id).unwrap(), 2);
+        assert_eq!(db.count_forks_for(parent.session_id).await.unwrap(), 2);
     }
 
-    #[test]
-    fn rename_sets_user_renamed_and_blocks_auto_title() {
+    #[tokio::test]
+    async fn rename_sets_user_renamed_and_blocks_auto_title() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
-        db.rename_session(s.session_id, "my-custom-title").unwrap();
-        let row = db.get_session(s.session_id).unwrap().unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
+        db.rename_session(s.session_id, "my-custom-title")
+            .await
+            .unwrap();
+        let row = db.get_session(s.session_id).await.unwrap().unwrap();
         assert!(row.user_renamed);
         assert_eq!(row.title.as_deref(), Some("my-custom-title"));
-        let updated = db.set_auto_title(s.session_id, "robot-name").unwrap();
+        let updated = db.set_auto_title(s.session_id, "robot-name").await.unwrap();
         assert!(!updated, "auto-title should refuse a user-renamed row");
-        let row2 = db.get_session(s.session_id).unwrap().unwrap();
+        let row2 = db.get_session(s.session_id).await.unwrap().unwrap();
         assert_eq!(row2.title.as_deref(), Some("my-custom-title"));
     }
 
-    #[test]
-    fn set_auto_title_populates_unset_title() {
+    #[tokio::test]
+    async fn set_auto_title_populates_unset_title() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
-        let updated = db.set_auto_title(s.session_id, "auto-name").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
+        let updated = db.set_auto_title(s.session_id, "auto-name").await.unwrap();
         assert!(updated);
-        let row = db.get_session(s.session_id).unwrap().unwrap();
+        let row = db.get_session(s.session_id).await.unwrap().unwrap();
         assert!(!row.user_renamed);
         assert_eq!(row.title.as_deref(), Some("auto-name"));
     }
 
-    #[test]
-    fn explicit_auto_title_clears_user_renamed() {
+    #[tokio::test]
+    async fn explicit_auto_title_clears_user_renamed() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
-        db.rename_session(s.session_id, "manual-name").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
+        db.rename_session(s.session_id, "manual-name")
+            .await
+            .unwrap();
         let updated = db
             .set_explicit_auto_title(s.session_id, "generated-name")
+            .await
             .unwrap();
         assert!(updated);
-        let row = db.get_session(s.session_id).unwrap().unwrap();
+        let row = db.get_session(s.session_id).await.unwrap().unwrap();
         assert!(!row.user_renamed);
         assert_eq!(row.title.as_deref(), Some("generated-name"));
     }
 
-    #[test]
-    fn explicit_auto_title_if_untitled_has_single_winner() {
+    #[tokio::test]
+    async fn explicit_auto_title_if_untitled_has_single_winner() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         let first = db
             .set_explicit_auto_title_if_untitled(s.session_id, "first-name")
+            .await
             .unwrap();
         let second = db
             .set_explicit_auto_title_if_untitled(s.session_id, "second-name")
+            .await
             .unwrap();
         assert!(first);
         assert!(!second);
-        let row = db.get_session(s.session_id).unwrap().unwrap();
+        let row = db.get_session(s.session_id).await.unwrap().unwrap();
         assert!(!row.user_renamed);
         assert_eq!(row.title.as_deref(), Some("first-name"));
     }
 
-    #[test]
-    fn list_root_sessions_excludes_forks() {
+    #[tokio::test]
+    async fn list_root_sessions_excludes_forks() {
         let db = Db::open_in_memory().unwrap();
-        let root_a = db.create_session("p", "/x", "a").unwrap();
-        let _fork_a = db.create_fork(root_a.session_id, None).unwrap();
-        let _root_b = db.create_session("p", "/x", "a").unwrap();
-        let roots = db.list_root_sessions("p", 100).unwrap();
+        let root_a = db.create_session("p", "/x", "a").await.unwrap();
+        let _fork_a = db.create_fork(root_a.session_id, None).await.unwrap();
+        let _root_b = db.create_session("p", "/x", "a").await.unwrap();
+        let roots = db.list_root_sessions("p", 100).await.unwrap();
         assert_eq!(roots.len(), 2);
         assert!(roots.iter().all(|r| r.parent_session_id.is_none()));
     }
 
-    #[test]
-    fn delete_session_cascade_drops_forks() {
+    #[tokio::test]
+    async fn delete_session_cascade_drops_forks() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/x", "a").unwrap();
-        let child = db.create_fork(parent.session_id, None).unwrap();
-        let grandchild = db.create_fork(child.session_id, None).unwrap();
-        db.delete_session(parent.session_id, true).unwrap();
-        assert!(db.get_session(parent.session_id).unwrap().is_none());
-        assert!(db.get_session(child.session_id).unwrap().is_none());
-        assert!(db.get_session(grandchild.session_id).unwrap().is_none());
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let child = db.create_fork(parent.session_id, None).await.unwrap();
+        let grandchild = db.create_fork(child.session_id, None).await.unwrap();
+        db.delete_session(parent.session_id, true).await.unwrap();
+        assert!(db.get_session(parent.session_id).await.unwrap().is_none());
+        assert!(db.get_session(child.session_id).await.unwrap().is_none());
+        assert!(
+            db.get_session(grandchild.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
-    #[test]
-    fn delete_session_cascade_failure_rolls_back_deleted_descendants() {
+    #[tokio::test]
+    async fn delete_session_cascade_failure_rolls_back_deleted_descendants() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/x", "a").unwrap();
-        let child = db.create_fork(parent.session_id, None).unwrap();
-        let grandchild = db.create_fork(child.session_id, None).unwrap();
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let child = db.create_fork(parent.session_id, None).await.unwrap();
+        let grandchild = db.create_fork(child.session_id, None).await.unwrap();
         install_trigger(
             &db,
             &format!(
@@ -3006,45 +3272,54 @@ mod tests {
                  END;",
                 child.session_id
             ),
-        );
+        )
+        .await;
 
-        let err = db.delete_session(parent.session_id, true).unwrap_err();
+        let err = db
+            .delete_session(parent.session_id, true)
+            .await
+            .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("injected cascade delete failure"),
             "unexpected error: {err:#}"
         );
         for id in [parent.session_id, child.session_id, grandchild.session_id] {
-            assert!(session_exists(&db, id), "{id} should have rolled back");
+            assert!(
+                session_exists(&db, id).await,
+                "{id} should have rolled back"
+            );
         }
     }
 
-    #[test]
-    fn delete_session_no_cascade_leaves_forks() {
+    #[tokio::test]
+    async fn delete_session_no_cascade_leaves_forks() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/x", "a").unwrap();
-        let child = db.create_fork(parent.session_id, None).unwrap();
-        db.delete_session(parent.session_id, false).unwrap();
-        assert!(db.get_session(parent.session_id).unwrap().is_none());
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let child = db.create_fork(parent.session_id, None).await.unwrap();
+        db.delete_session(parent.session_id, false).await.unwrap();
+        assert!(db.get_session(parent.session_id).await.unwrap().is_none());
         // The child is still there — its parent_session_id now points at a
         // dangling id, which the application layer is expected to handle.
-        assert!(db.get_session(child.session_id).unwrap().is_some());
+        assert!(db.get_session(child.session_id).await.unwrap().is_some());
     }
 
-    #[test]
-    fn mark_viewed_sets_marker() {
+    #[tokio::test]
+    async fn mark_viewed_sets_marker() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         assert!(
             db.get_session(s.session_id)
+                .await
                 .unwrap()
                 .unwrap()
                 .last_viewed_at
                 .is_none()
         );
-        db.mark_session_viewed(s.session_id).unwrap();
+        db.mark_session_viewed(s.session_id).await.unwrap();
         assert!(
             db.get_session(s.session_id)
+                .await
                 .unwrap()
                 .unwrap()
                 .last_viewed_at
@@ -3052,27 +3327,33 @@ mod tests {
         );
     }
 
-    #[test]
-    fn archive_cascades_subtree_and_unarchive_recovers() {
+    #[tokio::test]
+    async fn archive_cascades_subtree_and_unarchive_recovers() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/x", "a").unwrap();
-        let child = db.create_fork(parent.session_id, None).unwrap();
-        let grandchild = db.create_fork(child.session_id, None).unwrap();
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let child = db.create_fork(parent.session_id, None).await.unwrap();
+        let grandchild = db.create_fork(child.session_id, None).await.unwrap();
         // Descendant count excludes the root itself.
-        assert_eq!(db.count_descendants(parent.session_id).unwrap(), 2);
+        assert_eq!(db.count_descendants(parent.session_id).await.unwrap(), 2);
 
-        db.archive_session(parent.session_id, true).unwrap();
+        db.archive_session(parent.session_id, true).await.unwrap();
         for id in [parent.session_id, child.session_id, grandchild.session_id] {
             assert!(
-                db.get_session(id).unwrap().unwrap().archived_at.is_some(),
+                db.get_session(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .archived_at
+                    .is_some(),
                 "archive should cascade the whole subtree"
             );
         }
 
         // Unarchive recovers a single row (the rest stay archived).
-        db.unarchive_session(parent.session_id).unwrap();
+        db.unarchive_session(parent.session_id).await.unwrap();
         assert!(
             db.get_session(parent.session_id)
+                .await
                 .unwrap()
                 .unwrap()
                 .archived_at
@@ -3080,6 +3361,7 @@ mod tests {
         );
         assert!(
             db.get_session(child.session_id)
+                .await
                 .unwrap()
                 .unwrap()
                 .archived_at
@@ -3087,12 +3369,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn archive_session_cascade_failure_rolls_back_updated_ancestors() {
+    #[tokio::test]
+    async fn archive_session_cascade_failure_rolls_back_updated_ancestors() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/x", "a").unwrap();
-        let child = db.create_fork(parent.session_id, None).unwrap();
-        let grandchild = db.create_fork(child.session_id, None).unwrap();
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let child = db.create_fork(parent.session_id, None).await.unwrap();
+        let grandchild = db.create_fork(child.session_id, None).await.unwrap();
         install_trigger(
             &db,
             &format!(
@@ -3105,9 +3387,13 @@ mod tests {
                  END;",
                 child.session_id
             ),
-        );
+        )
+        .await;
 
-        let err = db.archive_session(parent.session_id, true).unwrap_err();
+        let err = db
+            .archive_session(parent.session_id, true)
+            .await
+            .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("injected cascade archive failure"),
@@ -3115,40 +3401,61 @@ mod tests {
         );
         for id in [parent.session_id, child.session_id, grandchild.session_id] {
             assert!(
-                db.get_session(id).unwrap().unwrap().archived_at.is_none(),
+                db.get_session(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .archived_at
+                    .is_none(),
                 "{id} should not be archived after rollback"
             );
         }
     }
 
-    #[test]
-    fn is_in_subtree_walks_ancestors() {
+    #[tokio::test]
+    async fn is_in_subtree_walks_ancestors() {
         let db = Db::open_in_memory().unwrap();
-        let root = db.create_session("p", "/x", "a").unwrap();
-        let child = db.create_fork(root.session_id, None).unwrap();
-        let grandchild = db.create_fork(child.session_id, None).unwrap();
-        let other = db.create_session("p", "/x", "a").unwrap();
-        assert!(db.is_in_subtree(root.session_id, root.session_id).unwrap());
-        assert!(db.is_in_subtree(root.session_id, child.session_id).unwrap());
+        let root = db.create_session("p", "/x", "a").await.unwrap();
+        let child = db.create_fork(root.session_id, None).await.unwrap();
+        let grandchild = db.create_fork(child.session_id, None).await.unwrap();
+        let other = db.create_session("p", "/x", "a").await.unwrap();
         assert!(
-            db.is_in_subtree(root.session_id, grandchild.session_id)
+            db.is_in_subtree(root.session_id, root.session_id)
+                .await
                 .unwrap()
         );
-        assert!(!db.is_in_subtree(root.session_id, other.session_id).unwrap());
         assert!(
-            !db.is_in_subtree(child.session_id, root.session_id).unwrap(),
+            db.is_in_subtree(root.session_id, child.session_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.is_in_subtree(root.session_id, grandchild.session_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.is_in_subtree(root.session_id, other.session_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.is_in_subtree(child.session_id, root.session_id)
+                .await
+                .unwrap(),
             "the parent is not in the child's subtree"
         );
     }
 
-    #[test]
-    fn archive_no_cascade_leaves_forks_live() {
+    #[tokio::test]
+    async fn archive_no_cascade_leaves_forks_live() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/x", "a").unwrap();
-        let child = db.create_fork(parent.session_id, None).unwrap();
-        db.archive_session(parent.session_id, false).unwrap();
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let child = db.create_fork(parent.session_id, None).await.unwrap();
+        db.archive_session(parent.session_id, false).await.unwrap();
         assert!(
             db.get_session(parent.session_id)
+                .await
                 .unwrap()
                 .unwrap()
                 .archived_at
@@ -3156,6 +3463,7 @@ mod tests {
         );
         assert!(
             db.get_session(child.session_id)
+                .await
                 .unwrap()
                 .unwrap()
                 .archived_at
@@ -3163,25 +3471,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_session_summaries_scopes_orders_and_groups_forks() {
+    #[tokio::test]
+    async fn list_session_summaries_scopes_orders_and_groups_forks() {
         // The factored query is the single source of truth for the
         // `/sessions` browser (daemon RPC + TUI daemonless). Assert the
         // three level selections produce the same shape the daemon handler
         // used: project-scoped roots newest-first, forks grouped under a
         // parent, fork/descendant counts, and the all-projects fallback.
         let db = Db::open_in_memory().unwrap();
-        let root_a = db.create_session("pid", "/proj", "builder").unwrap();
-        let root_b = db.create_session("pid", "/proj", "builder").unwrap();
-        backdate_session(&db, root_a.session_id, 10);
+        let root_a = db.create_session("pid", "/proj", "builder").await.unwrap();
+        let root_b = db.create_session("pid", "/proj", "builder").await.unwrap();
+        backdate_session(&db, root_a.session_id, 10).await;
         // A session in a different project must not leak into `pid` scope.
-        let _other = db.create_session("pid2", "/other", "builder").unwrap();
+        let _other = db
+            .create_session("pid2", "/other", "builder")
+            .await
+            .unwrap();
         // Two forks under root_a (one of them with its own descendant).
-        let fork_1 = db.create_fork(root_a.session_id, None).unwrap();
-        let _grandchild = db.create_fork(fork_1.session_id, None).unwrap();
+        let fork_1 = db.create_fork(root_a.session_id, None).await.unwrap();
+        let _grandchild = db.create_fork(fork_1.session_id, None).await.unwrap();
 
         // Project-scoped roots: only `pid` roots, newest (`root_b`) first.
-        let roots = db.list_session_summaries(Some("pid"), None, 100).unwrap();
+        let roots = db
+            .list_session_summaries(Some("pid"), None, 100)
+            .await
+            .unwrap();
         let root_ids: Vec<_> = roots.iter().map(|s| s.session_id).collect();
         assert_eq!(root_ids, vec![root_b.session_id, root_a.session_id]);
         // root_a has 2 direct forks and 3 descendants (2 forks + 1 grand).
@@ -3196,32 +3510,33 @@ mod tests {
         // Fork grouping: parent = root_a → its direct forks only.
         let forks = db
             .list_session_summaries(None, Some(root_a.session_id), 100)
+            .await
             .unwrap();
         assert_eq!(forks.len(), 1);
         assert_eq!(forks[0].session_id, fork_1.session_id);
         assert_eq!(forks[0].parent_session_id, Some(root_a.session_id));
 
         // All-projects fallback (both args None) spans every project.
-        let all = db.list_session_summaries(None, None, 100).unwrap();
+        let all = db.list_session_summaries(None, None, 100).await.unwrap();
         let project_ids: std::collections::HashSet<_> =
             all.iter().map(|s| s.project_id.as_str()).collect();
         assert!(project_ids.contains("pid"));
         assert!(project_ids.contains("pid2"));
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn list_session_summaries_conn_matches_db_wrapper() {
+    #[tokio::test]
+    async fn list_session_summaries_conn_matches_db_wrapper() {
         let db = Db::open_in_memory().unwrap();
-        let root = db.create_session("pid", "/proj", "builder").unwrap();
-        let _fork = db.create_fork(root.session_id, None).unwrap();
+        let root = db.create_session("pid", "/proj", "builder").await.unwrap();
+        let _fork = db.create_fork(root.session_id, None).await.unwrap();
 
-        let wrapped = db.list_session_summaries(Some("pid"), None, 100).unwrap();
+        let wrapped = db
+            .list_session_summaries(Some("pid"), None, 100)
+            .await
+            .unwrap();
         let direct = db
-            .read_blocking(|conn| Db::list_session_summaries_conn(conn, Some("pid"), None, 100))
+            .read(|conn| Db::list_session_summaries_conn(conn, Some("pid"), None, 100))
+            .await
             .unwrap();
 
         assert_eq!(
@@ -3230,14 +3545,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_session_summaries_populates_interrupt_activity_state() {
+    #[tokio::test]
+    async fn list_session_summaries_populates_interrupt_activity_state() {
         use crate::db::wire::{InterruptQuestion, InterruptQuestionSet, SessionActivityState};
 
         let db = Db::open_in_memory().unwrap();
-        let pending = db.create_session("pid", "/proj", "builder").unwrap();
-        let parked = db.create_session("pid", "/proj", "builder").unwrap();
-        let interrupted = db.create_session("pid", "/proj", "builder").unwrap();
+        let pending = db.create_session("pid", "/proj", "builder").await.unwrap();
+        let parked = db.create_session("pid", "/proj", "builder").await.unwrap();
+        let interrupted = db.create_session("pid", "/proj", "builder").await.unwrap();
         db.raise_interrupt_questions(
             pending.session_id,
             "builder",
@@ -3282,7 +3597,10 @@ mod tests {
             .unwrap();
         db.mark_interrupt_interrupted(interrupted_id).unwrap();
 
-        let summaries = db.list_session_summaries(Some("pid"), None, 100).unwrap();
+        let summaries = db
+            .list_session_summaries(Some("pid"), None, 100)
+            .await
+            .unwrap();
         let pending_summary = summaries
             .iter()
             .find(|summary| summary.session_id == pending.session_id)
@@ -3309,12 +3627,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_session_summaries_prefers_actionable_interrupt_over_stale_interrupted_marker() {
+    #[tokio::test]
+    async fn list_session_summaries_prefers_actionable_interrupt_over_stale_interrupted_marker() {
         use crate::db::wire::{InterruptQuestion, InterruptQuestionSet, SessionActivityState};
 
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("pid", "/proj", "builder").unwrap();
+        let session = db.create_session("pid", "/proj", "builder").await.unwrap();
         db.raise_interrupted_turn(session.session_id, "builder", "forced drain")
             .unwrap();
         db.raise_interrupt_questions(
@@ -3330,7 +3648,10 @@ mod tests {
         )
         .unwrap();
 
-        let summaries = db.list_session_summaries(Some("pid"), None, 100).unwrap();
+        let summaries = db
+            .list_session_summaries(Some("pid"), None, 100)
+            .await
+            .unwrap();
         let summary = summaries
             .iter()
             .find(|summary| summary.session_id == session.session_id)
@@ -3341,8 +3662,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_summary_fallbacks_warn_and_keep_defaults() {
+    #[tokio::test]
+    async fn session_summary_fallbacks_warn_and_keep_defaults() {
         let session_id = Uuid::new_v4();
         let log = capture_warn_log(|| {
             assert_eq!(
@@ -3373,137 +3694,160 @@ mod tests {
         assert!(log.contains("pin_count"));
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn ensure_short_id_backfills_null() {
+    #[tokio::test]
+    async fn ensure_short_id_backfills_null() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
         // Simulate a pre-0002 row by clearing the short_id.
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET short_id = NULL WHERE session_id = ?1",
                 [s.session_id.to_string()],
             )?;
             Ok(())
         })
+        .await
         .unwrap();
-        let backfilled = db.ensure_short_id(s.session_id).unwrap();
+        let backfilled = db.ensure_short_id(s.session_id).await.unwrap();
         assert_eq!(backfilled.len(), SHORT_ID_LEN);
         // Idempotent: a second call returns the same id, doesn't churn.
-        let again = db.ensure_short_id(s.session_id).unwrap();
+        let again = db.ensure_short_id(s.session_id).await.unwrap();
         assert_eq!(again, backfilled);
     }
 
     // ---- `/side` ephemeral side-conversation forks (migration 0017) -------
 
-    #[test]
-    fn create_ephemeral_fork_marks_row_ephemeral() {
+    #[tokio::test]
+    async fn create_ephemeral_fork_marks_row_ephemeral() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/x", "a").unwrap();
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
         let fork_point = record_message(&db, parent.session_id, "fork here", false);
         let side = db
             .create_ephemeral_fork(parent.session_id, Some(fork_point.to_string()))
+            .await
             .unwrap();
         assert!(side.ephemeral, "side fork row should be ephemeral");
         assert_eq!(side.parent_session_id, Some(parent.session_id));
-        let stored = db.get_session(side.session_id).unwrap().unwrap();
+        let stored = db.get_session(side.session_id).await.unwrap().unwrap();
         assert!(stored.ephemeral);
         // A plain fork is NOT ephemeral.
-        let plain = db.create_fork(parent.session_id, None).unwrap();
+        let plain = db.create_fork(parent.session_id, None).await.unwrap();
         assert!(!plain.ephemeral);
     }
 
-    #[test]
-    fn ephemeral_sessions_excluded_from_all_list_queries() {
+    #[tokio::test]
+    async fn ephemeral_sessions_excluded_from_all_list_queries() {
         let db = Db::open_in_memory().unwrap();
-        let root = db.create_session("p", "/x", "a").unwrap();
-        let _side = db.create_ephemeral_fork(root.session_id, None).unwrap();
+        let root = db.create_session("p", "/x", "a").await.unwrap();
+        let _side = db
+            .create_ephemeral_fork(root.session_id, None)
+            .await
+            .unwrap();
 
         // Root listing: only the persisted root, no ephemeral fork.
-        let roots = db.list_root_sessions("p", 100).unwrap();
+        let roots = db.list_root_sessions("p", 100).await.unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].session_id, root.session_id);
 
         // Direct-forks listing of the parent: the ephemeral fork is hidden.
-        let forks = db.list_forks(root.session_id).unwrap();
+        let forks = db.list_forks(root.session_id).await.unwrap();
         assert!(
             forks.is_empty(),
             "ephemeral fork must not appear in list_forks"
         );
-        assert_eq!(db.count_forks_for(root.session_id).unwrap(), 0);
+        assert_eq!(db.count_forks_for(root.session_id).await.unwrap(), 0);
 
         // Flat open-session list (`cockpit session list`).
-        let open = db.list_sessions(true, 100).unwrap();
+        let open = db.list_sessions(true, 100).await.unwrap();
         assert!(open.iter().all(|s| !s.ephemeral));
         assert_eq!(open.len(), 1);
 
         // `cockpit -c` continue: never resumes the ephemeral fork.
-        let recent = db.most_recent_open_session_for("p").unwrap().unwrap();
+        let recent = db.most_recent_open_session_for("p").await.unwrap().unwrap();
         assert_eq!(recent.session_id, root.session_id);
 
         // Browser summaries (the daemon + daemonless shared path).
-        let summaries = db.list_session_summaries(Some("p"), None, 100).unwrap();
+        let summaries = db
+            .list_session_summaries(Some("p"), None, 100)
+            .await
+            .unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].fork_count, 0);
     }
 
-    #[test]
-    fn ephemeral_sessions_are_never_auto_titled() {
+    #[tokio::test]
+    async fn ephemeral_sessions_are_never_auto_titled() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/x", "a").unwrap();
-        let side = db.create_ephemeral_fork(parent.session_id, None).unwrap();
-        let updated = db.set_auto_title(side.session_id, "auto-name").unwrap();
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let side = db
+            .create_ephemeral_fork(parent.session_id, None)
+            .await
+            .unwrap();
+        let updated = db
+            .set_auto_title(side.session_id, "auto-name")
+            .await
+            .unwrap();
         assert!(!updated, "auto-title must refuse an ephemeral row");
-        let row = db.get_session(side.session_id).unwrap().unwrap();
+        let row = db.get_session(side.session_id).await.unwrap().unwrap();
         assert!(row.title.is_none());
     }
 
-    #[test]
-    fn discard_ephemeral_session_removes_row_and_guards_persisted() {
+    #[tokio::test]
+    async fn discard_ephemeral_session_removes_row_and_guards_persisted() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/x", "a").unwrap();
-        let side = db.create_ephemeral_fork(parent.session_id, None).unwrap();
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let side = db
+            .create_ephemeral_fork(parent.session_id, None)
+            .await
+            .unwrap();
 
         // Discarding the ephemeral fork drops its row.
-        assert!(db.discard_ephemeral_session(side.session_id).unwrap());
-        assert!(db.get_session(side.session_id).unwrap().is_none());
+        assert!(db.discard_ephemeral_session(side.session_id).await.unwrap());
+        assert!(db.get_session(side.session_id).await.unwrap().is_none());
 
         // Guard: discarding a *persisted* session is a no-op, leaves it intact.
-        assert!(!db.discard_ephemeral_session(parent.session_id).unwrap());
-        assert!(db.get_session(parent.session_id).unwrap().is_some());
+        assert!(
+            !db.discard_ephemeral_session(parent.session_id)
+                .await
+                .unwrap()
+        );
+        assert!(db.get_session(parent.session_id).await.unwrap().is_some());
 
         // Unknown id is a no-op, not an error.
-        assert!(!db.discard_ephemeral_session(Uuid::new_v4()).unwrap());
+        assert!(!db.discard_ephemeral_session(Uuid::new_v4()).await.unwrap());
     }
 
-    #[test]
-    fn sweep_ephemeral_sessions_clears_orphans_only() {
+    #[tokio::test]
+    async fn sweep_ephemeral_sessions_clears_orphans_only() {
         let db = Db::open_in_memory().unwrap();
-        let root = db.create_session("p", "/x", "a").unwrap();
-        let _plain_fork = db.create_fork(root.session_id, None).unwrap();
-        let side_a = db.create_ephemeral_fork(root.session_id, None).unwrap();
-        let side_b = db.create_ephemeral_fork(root.session_id, None).unwrap();
+        let root = db.create_session("p", "/x", "a").await.unwrap();
+        let _plain_fork = db.create_fork(root.session_id, None).await.unwrap();
+        let side_a = db
+            .create_ephemeral_fork(root.session_id, None)
+            .await
+            .unwrap();
+        let side_b = db
+            .create_ephemeral_fork(root.session_id, None)
+            .await
+            .unwrap();
 
-        let removed = db.sweep_ephemeral_sessions().unwrap();
+        let removed = db.sweep_ephemeral_sessions().await.unwrap();
         assert_eq!(removed, 2);
-        assert!(db.get_session(side_a.session_id).unwrap().is_none());
-        assert!(db.get_session(side_b.session_id).unwrap().is_none());
+        assert!(db.get_session(side_a.session_id).await.unwrap().is_none());
+        assert!(db.get_session(side_b.session_id).await.unwrap().is_none());
         // The persisted root + its plain fork survive the sweep.
-        assert!(db.get_session(root.session_id).unwrap().is_some());
-        assert_eq!(db.count_forks_for(root.session_id).unwrap(), 1);
+        assert!(db.get_session(root.session_id).await.unwrap().is_some());
+        assert_eq!(db.count_forks_for(root.session_id).await.unwrap(), 1);
     }
 
-    #[test]
-    fn btw_fork_seeded_to_ceiling() {
+    #[tokio::test]
+    async fn btw_fork_seeded_to_ceiling() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         record_message(&db, parent.session_id, "first", false);
         record_message(&db, parent.session_id, "second", true);
 
-        let result = db.create_btw_fork(parent.session_id, false).unwrap();
+        let result = db.create_btw_fork(parent.session_id, false).await.unwrap();
 
         assert!(result.created);
         assert_eq!(result.info.parent_session_id, parent.session_id);
@@ -3517,13 +3861,13 @@ mod tests {
         assert_eq!(texts, vec!["first", "second"]);
     }
 
-    #[test]
-    fn btw_tangent_fork_empty() {
+    #[tokio::test]
+    async fn btw_tangent_fork_empty() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         record_message(&db, parent.session_id, "parent context", false);
 
-        let result = db.create_btw_fork(parent.session_id, true).unwrap();
+        let result = db.create_btw_fork(parent.session_id, true).await.unwrap();
 
         assert!(result.created);
         assert!(result.info.tangent);
@@ -3535,17 +3879,13 @@ mod tests {
         );
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn btw_schema_enforces_one_live_fork() {
+    #[tokio::test]
+    async fn btw_schema_enforces_one_live_fork() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
 
-        let first = db.create_btw_fork(parent.session_id, false).unwrap();
-        let second = db.create_btw_fork(parent.session_id, true).unwrap();
+        let first = db.create_btw_fork(parent.session_id, false).await.unwrap();
+        let second = db.create_btw_fork(parent.session_id, true).await.unwrap();
 
         assert!(first.created);
         assert!(!second.created);
@@ -3553,12 +3893,13 @@ mod tests {
         assert!(!second.info.tangent, "existing fork identity wins");
         assert!(
             db.list_sessions(false, 100)
+                .await
                 .unwrap()
                 .iter()
                 .all(|row| row.session_id != first.info.session_id)
         );
         let direct_count: i64 = db
-            .read_blocking(|conn| {
+            .read(move |conn| {
                 conn.query_row(
                     "SELECT COUNT(*) FROM sessions WHERE btw_parent_session_id = ?1",
                     [parent.session_id.to_string()],
@@ -3566,37 +3907,34 @@ mod tests {
                 )
                 .map_err(anyhow::Error::from)
             })
+            .await
             .unwrap();
         assert_eq!(direct_count, 1);
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn btw_create_is_atomic_and_unique() {
+    #[tokio::test]
+    async fn btw_create_is_atomic_and_unique() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
 
         let mut joins = Vec::new();
         for tangent in [false, true] {
             let db = db.clone();
             let barrier = barrier.clone();
             let parent_id = parent.session_id;
-            joins.push(std::thread::spawn(move || {
-                barrier.wait();
-                db.create_btw_fork(parent_id, tangent).unwrap()
+            joins.push(tokio::spawn(async move {
+                barrier.wait().await;
+                db.create_btw_fork(parent_id, tangent).await.unwrap()
             }));
         }
 
-        let first = joins.remove(0).join().unwrap();
-        let second = joins.remove(0).join().unwrap();
+        let first = joins.remove(0).await.unwrap();
+        let second = joins.remove(0).await.unwrap();
         assert_eq!(first.info.session_id, second.info.session_id);
         assert_ne!(first.created, second.created);
         let direct_count: i64 = db
-            .read_blocking(|conn| {
+            .read(move |conn| {
                 conn.query_row(
                     "SELECT COUNT(*) FROM sessions WHERE btw_parent_session_id = ?1",
                     [parent.session_id.to_string()],
@@ -3604,58 +3942,64 @@ mod tests {
                 )
                 .map_err(anyhow::Error::from)
             })
+            .await
             .unwrap();
         assert_eq!(direct_count, 1);
     }
 
-    #[test]
-    fn btw_orphan_sweep_spares_live_fork() {
+    #[tokio::test]
+    async fn btw_orphan_sweep_spares_live_fork() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
-        let side = db.create_ephemeral_fork(parent.session_id, None).unwrap();
-        let btw = db.create_btw_fork(parent.session_id, false).unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
+        let side = db
+            .create_ephemeral_fork(parent.session_id, None)
+            .await
+            .unwrap();
+        let btw = db.create_btw_fork(parent.session_id, false).await.unwrap();
 
-        let removed = db.sweep_ephemeral_sessions().unwrap();
+        let removed = db.sweep_ephemeral_sessions().await.unwrap();
 
         assert_eq!(removed, 1);
-        assert!(db.get_session(side.session_id).unwrap().is_none());
-        assert!(db.get_session(btw.info.session_id).unwrap().is_some());
+        assert!(db.get_session(side.session_id).await.unwrap().is_none());
+        assert!(db.get_session(btw.info.session_id).await.unwrap().is_some());
     }
 
-    #[test]
-    fn btw_end_discards_fork() {
+    #[tokio::test]
+    async fn btw_end_discards_fork() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
-        let btw = db.create_btw_fork(parent.session_id, false).unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
+        let btw = db.create_btw_fork(parent.session_id, false).await.unwrap();
 
-        assert!(db.end_btw_fork(parent.session_id).unwrap());
-        assert!(db.get_session(btw.info.session_id).unwrap().is_none());
-        assert!(!db.end_btw_fork(parent.session_id).unwrap());
+        assert!(db.end_btw_fork(parent.session_id).await.unwrap());
+        assert!(db.get_session(btw.info.session_id).await.unwrap().is_none());
+        assert!(!db.end_btw_fork(parent.session_id).await.unwrap());
     }
 
-    #[test]
-    fn btw_parent_delete_cascades() {
+    #[tokio::test]
+    async fn btw_parent_delete_cascades() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "Build").unwrap();
-        let btw = db.create_btw_fork(parent.session_id, false).unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
+        let btw = db.create_btw_fork(parent.session_id, false).await.unwrap();
 
-        db.delete_session(parent.session_id, true).unwrap();
+        db.delete_session(parent.session_id, true).await.unwrap();
 
-        assert!(db.get_session(parent.session_id).unwrap().is_none());
-        assert!(db.get_session(btw.info.session_id).unwrap().is_none());
+        assert!(db.get_session(parent.session_id).await.unwrap().is_none());
+        assert!(db.get_session(btw.info.session_id).await.unwrap().is_none());
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn sweep_ephemeral_sessions_warns_on_delete_failure_and_continues() {
+    #[tokio::test]
+    async fn sweep_ephemeral_sessions_warns_on_delete_failure_and_continues() {
         let db = Db::open_in_memory().unwrap();
-        let root = db.create_session("p", "/x", "a").unwrap();
-        let blocked = db.create_ephemeral_fork(root.session_id, None).unwrap();
-        let removed = db.create_ephemeral_fork(root.session_id, None).unwrap();
-        db.write_blocking(move |conn| {
+        let root = db.create_session("p", "/x", "a").await.unwrap();
+        let blocked = db
+            .create_ephemeral_fork(root.session_id, None)
+            .await
+            .unwrap();
+        let removed = db
+            .create_ephemeral_fork(root.session_id, None)
+            .await
+            .unwrap();
+        db.write(move |conn| {
             conn.execute_batch(&format!(
                 "CREATE TRIGGER block_ephemeral_delete
                  BEFORE DELETE ON sessions
@@ -3667,15 +4011,17 @@ mod tests {
             ))?;
             Ok(())
         })
+        .await
         .unwrap();
 
-        let log = capture_warn_log(|| {
-            assert_eq!(db.sweep_ephemeral_sessions().unwrap(), 1);
-        });
+        let log = capture_warn_log_async(|| async {
+            assert_eq!(db.sweep_ephemeral_sessions().await.unwrap(), 1);
+        })
+        .await;
 
         assert!(log.contains("ephemeral session sweep delete failed"));
         assert!(log.contains(&blocked.session_id.to_string()));
-        assert!(db.get_session(blocked.session_id).unwrap().is_some());
-        assert!(db.get_session(removed.session_id).unwrap().is_none());
+        assert!(db.get_session(blocked.session_id).await.unwrap().is_some());
+        assert!(db.get_session(removed.session_id).await.unwrap().is_none());
     }
 }

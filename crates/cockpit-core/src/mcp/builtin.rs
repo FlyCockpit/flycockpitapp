@@ -1059,6 +1059,7 @@ fn rename_session<'a>(
         let row = session
             .db
             .get_session(session.id)
+            .await
             .context("loading session before rename")?
             .context("session row is missing")?;
         if row.user_renamed {
@@ -2260,8 +2261,8 @@ mod tests {
         assert_eq!(out["title"], "A title");
     }
 
-    #[tokio::test]
-    async fn rename_session_unavailable_when_titled() {
+    #[test]
+    fn rename_session_unavailable_when_titled() {
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
         let host = host(tmp.path());
@@ -2302,7 +2303,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(out["title"], "agent race title");
-        let row = session.db.get_session(session.id).unwrap().unwrap();
+        let row = session.db.get_session(session.id).await.unwrap().unwrap();
         assert_eq!(row.title.as_deref(), Some("agent race title"));
         assert!(!row.user_renamed);
     }
@@ -2314,7 +2315,11 @@ mod tests {
         let host = host(tmp.path());
         let session = host.session.as_ref().unwrap();
         advance_title_turns(session, 8);
-        session.db.rename_session(session.id, "manual").unwrap();
+        session
+            .db
+            .rename_session(session.id, "manual")
+            .await
+            .unwrap();
         let err = rename_session(&host, serde_json::json!({ "name": "agent" }))
             .await
             .unwrap_err();
@@ -2323,7 +2328,7 @@ mod tests {
         let db = crate::db::Db::open_in_memory().unwrap();
         let parent =
             crate::session::Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
-        let side = db.create_ephemeral_fork(parent.id, None).unwrap();
+        let side = db.create_ephemeral_fork(parent.id, None).await.unwrap();
         let session = Arc::new(
             crate::session::Session::resume(db, side.session_id)
                 .unwrap()
@@ -2372,15 +2377,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out["title"], "agent title");
-        let row = session.db.get_session(session.id).unwrap().unwrap();
+        let row = session.db.get_session(session.id).await.unwrap().unwrap();
         assert_eq!(row.title.as_deref(), Some("agent title"));
         assert!(!row.user_renamed);
 
         session
             .db
             .rename_session(session.id, "manual title")
+            .await
             .unwrap();
-        let row = session.db.get_session(session.id).unwrap().unwrap();
+        let row = session.db.get_session(session.id).await.unwrap().unwrap();
         assert_eq!(row.title.as_deref(), Some("manual title"));
         assert!(row.user_renamed);
     }
@@ -2392,7 +2398,11 @@ mod tests {
         let host = host(tmp.path());
         let session = host.session.as_ref().unwrap();
         advance_title_turns(session, 8);
-        session.db.rename_session(session.id, "manual").unwrap();
+        session
+            .db
+            .rename_session(session.id, "manual")
+            .await
+            .unwrap();
 
         let err = rename_session(&host, serde_json::json!({ "name": "agent" }))
             .await
@@ -2407,7 +2417,7 @@ mod tests {
         let db = crate::db::Db::open_in_memory().unwrap();
         let parent =
             crate::session::Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
-        let side = db.create_ephemeral_fork(parent.id, None).unwrap();
+        let side = db.create_ephemeral_fork(parent.id, None).await.unwrap();
         let session = Arc::new(
             crate::session::Session::resume(db, side.session_id)
                 .unwrap()

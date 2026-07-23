@@ -7,6 +7,10 @@ impl App {
         self.export_transcript_json_with_db(file_stem, exports_dir, cockpit_db::Db::open_default);
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; TUI export action remains sync until db-async-session-log"
+    )]
     fn export_transcript_json_with_db(
         &mut self,
         file_stem: &str,
@@ -21,7 +25,7 @@ impl App {
         let result = (|| -> anyhow::Result<()> {
             let db = open_db()?;
             let target = db
-                .get_session(session_id)?
+                .write_blocking(move |conn| cockpit_db::Db::get_session_conn(conn, session_id))?
                 .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found in the DB"))?;
             std::fs::create_dir_all(exports_dir).with_context(|| {
                 format!("creating export directory `{}`", exports_dir.display())
@@ -49,6 +53,10 @@ impl App {
     /// reusing [`cockpit_core::session::export::write_bundle_zip`] —
     /// the single shared zip-assembly implementation, called in-process
     /// with this handle.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; TUI export action remains sync until db-async-session-log"
+    )]
     pub(super) fn export_debug_bundle(
         &mut self,
         session_id: uuid::Uuid,
@@ -59,7 +67,7 @@ impl App {
         let result = (|| -> anyhow::Result<cockpit_core::session::export::BundleSummary> {
             let db = cockpit_db::Db::open_default()?;
             let target = db
-                .get_session(session_id)?
+                .write_blocking(move |conn| cockpit_db::Db::get_session_conn(conn, session_id))?
                 .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found in the DB"))?;
             // Unconditional overwrite (the TUI has no `--force`); this
             // does not weaken the CLI's no-clobber-without-`--force`

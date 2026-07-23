@@ -429,14 +429,23 @@ pub fn write_bundle_zip(
 /// success; `Ok(Err(message))` for a usage error (not found / ambiguous)
 /// the caller surfaces with exit 64. A full UUID resolves directly; any
 /// other string is treated as a `short_id` and matched globally.
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; export command remains sync until db-async-session-log"
+)]
 pub fn resolve_session(db: &Db, ident: &str) -> Result<std::result::Result<SessionRow, String>> {
     if let Ok(uuid) = Uuid::parse_str(ident) {
-        return Ok(match db.get_session(uuid)? {
-            Some(row) => Ok(row),
-            None => Err(format!("no session with id `{ident}`")),
-        });
+        return Ok(
+            match db.write_blocking(move |conn| crate::db::Db::get_session_conn(conn, uuid))? {
+                Some(row) => Ok(row),
+                None => Err(format!("no session with id `{ident}`")),
+            },
+        );
     }
-    let matches = db.find_sessions_by_short_id_global(ident)?;
+    let ident_for_db = ident.to_string();
+    let matches = db.write_blocking(move |conn| {
+        crate::db::Db::find_sessions_by_short_id_global_conn(conn, &ident_for_db)
+    })?;
     match matches.len() {
         0 => Ok(Err(format!("no session with short id `{ident}`"))),
         1 => Ok(Ok(matches.into_iter().next().unwrap())),
@@ -450,6 +459,10 @@ pub fn resolve_session(db: &Db, ident: &str) -> Result<std::result::Result<Sessi
 /// Walk the fork tree (descendant `parent_session_id`) and follow every
 /// `/compact` successor link, breadth-first, deduping. Returns the
 /// session rows in discovery order with the target first.
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; export command remains sync until db-async-session-log"
+)]
 fn collect_bundle(db: &Db, target_id: Uuid) -> Result<Vec<SessionRow>> {
     let mut seen: HashSet<Uuid> = HashSet::new();
     let mut order: Vec<SessionRow> = Vec::new();
@@ -460,13 +473,14 @@ fn collect_bundle(db: &Db, target_id: Uuid) -> Result<Vec<SessionRow>> {
         if !seen.insert(id) {
             continue;
         }
-        let Some(row) = db.get_session(id)? else {
+        let Some(row) = db.write_blocking(move |conn| crate::db::Db::get_session_conn(conn, id))?
+        else {
             continue;
         };
         order.push(row);
 
         // Descendant forks.
-        for child in db.list_forks(id)? {
+        for child in db.write_blocking(move |conn| crate::db::Db::list_forks_conn(conn, id))? {
             frontier.push_back(child.session_id);
         }
         // `/compact` successor sessions (a session boundary, not a fork —
@@ -1399,7 +1413,7 @@ fn session_approval_snapshot(db: &Db, bundle: &[SessionRow]) -> Result<Vec<Value
             Vec<Value>,
             Vec<String>,
             Vec<String>,
-        ) = db.read_blocking(|conn| {
+        ) = db.write_blocking(move |conn| {
             let read_keys = |sql: &str| -> Result<Vec<String>> {
                 let mut stmt = conn.prepare(sql)?;
                 let rows = stmt.query_map([session_id.as_str()], |row| row.get::<_, String>(0))?;

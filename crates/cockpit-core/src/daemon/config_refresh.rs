@@ -33,7 +33,8 @@ pub(crate) async fn refresh_session_config(
     mut failure_deduper: Option<&mut ConfigRefreshFailureDeduper>,
 ) -> Result<Option<u64>> {
     let trust_policy =
-        crate::config::trust::resolve_workspace_trust_policy_from_db(db, &handle.project_root)?;
+        crate::config::trust::resolve_workspace_trust_policy_from_db(db, &handle.project_root)
+            .await?;
     let (providers, extended) =
         match config_source.load_with_trust(&handle.project_root, &trust_policy) {
             Ok(configs) => configs,
@@ -92,6 +93,7 @@ mod tests {
             tmp.path(),
             crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         )
+        .await
         .unwrap();
         let session =
             Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());

@@ -1,12 +1,25 @@
+#![allow(deprecated)]
+
 use super::*;
 
 impl Session {
     /// Apply an auto-generated title. No-ops (and returns false) if the
     /// user has manually renamed this session.
     pub fn set_auto_title(&self, title: &str) -> Result<bool> {
+        let session_id = self.id;
+        let title_for_db = title.to_string();
         let updated = self
             .db
-            .set_auto_title(self.id, title)
+            .write_blocking(move |conn| {
+                let affected = conn
+                    .execute(
+                        "UPDATE sessions SET title = ?1
+                 WHERE session_id = ?2 AND user_renamed = 0 AND ephemeral = 0",
+                        params![title_for_db, session_id.to_string()],
+                    )
+                    .context("setting auto title")?;
+                Ok(affected > 0)
+            })
             .context("setting auto title")?;
         if updated {
             *self.title.lock().unwrap() = Some(title.to_string());
@@ -19,9 +32,20 @@ impl Session {
     /// guard because the user asked the utility model to replace the current
     /// title.
     pub fn set_explicit_auto_title(&self, title: &str) -> Result<bool> {
+        let session_id = self.id;
+        let title_for_db = title.to_string();
         let updated = self
             .db
-            .set_explicit_auto_title(self.id, title)
+            .write_blocking(move |conn| {
+                let affected = conn
+                    .execute(
+                        "UPDATE sessions SET title = ?1, user_renamed = 0
+                 WHERE session_id = ?2 AND ephemeral = 0",
+                        params![title_for_db, session_id.to_string()],
+                    )
+                    .context("setting explicit auto title")?;
+                Ok(affected > 0)
+            })
             .context("setting explicit auto title")?;
         if updated {
             *self.title.lock().unwrap() = Some(title.to_string());
@@ -34,9 +58,20 @@ impl Session {
     /// still untitled. The DB update is atomic so competing daemon requests
     /// produce exactly one winner.
     pub fn set_explicit_auto_title_if_untitled(&self, title: &str) -> Result<bool> {
+        let session_id = self.id;
+        let title_for_db = title.to_string();
         let updated = self
             .db
-            .set_explicit_auto_title_if_untitled(self.id, title)
+            .write_blocking(move |conn| {
+                let affected = conn
+                    .execute(
+                        "UPDATE sessions SET title = ?1, user_renamed = 0
+                 WHERE session_id = ?2 AND ephemeral = 0 AND title IS NULL",
+                        params![title_for_db, session_id.to_string()],
+                    )
+                    .context("setting explicit auto title if untitled")?;
+                Ok(affected > 0)
+            })
             .context("setting explicit auto title if untitled")?;
         if updated {
             *self.title.lock().unwrap() = Some(title.to_string());
@@ -54,7 +89,11 @@ impl Session {
     }
 
     pub(crate) fn agent_rename_session_available(&self, auto_title_configured: bool) -> bool {
-        let Ok(Some(row)) = self.db.get_session(self.id) else {
+        let session_id = self.id;
+        let Ok(Some(row)) = self
+            .db
+            .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+        else {
             return false;
         };
         if row.user_renamed || row.ephemeral {
@@ -67,7 +106,11 @@ impl Session {
     }
 
     pub(crate) fn agent_rename_session_invoke_allowed(&self, auto_title_configured: bool) -> bool {
-        let Ok(Some(row)) = self.db.get_session(self.id) else {
+        let session_id = self.id;
+        let Ok(Some(row)) = self
+            .db
+            .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+        else {
             return false;
         };
         if row.user_renamed || row.ephemeral {
@@ -88,7 +131,12 @@ impl Session {
         if !mcp_present {
             return None;
         }
-        let row = self.db.get_session(self.id).ok().flatten()?;
+        let session_id = self.id;
+        let row = self
+            .db
+            .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+            .ok()
+            .flatten()?;
         if row.user_renamed || row.ephemeral || row.title.is_some() {
             return None;
         }
@@ -218,7 +266,17 @@ impl Session {
     fn persist_title_progress(&self) {
         let tokens = self.user_content_tokens.load(Ordering::Relaxed) as i64;
         let stage = self.title_stage.load(Ordering::Relaxed) as i64;
-        if let Err(e) = self.db.set_title_progress(self.id, tokens, stage) {
+        let session_id = self.id;
+        if let Err(e) = self.db.write_blocking(move |conn| {
+            conn.execute(
+                "UPDATE sessions
+                 SET user_content_tokens = ?1, title_stage = ?2
+                 WHERE session_id = ?3",
+                params![tokens, stage, session_id.to_string()],
+            )
+            .context("persisting title progress")?;
+            Ok(())
+        }) {
             tracing::warn!(error = %e, "auto_title: persisting title progress failed");
         }
     }

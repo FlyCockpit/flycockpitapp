@@ -1578,10 +1578,14 @@ mod tests {
         Arc::new(Session::create(db, root.to_path_buf(), "Build").unwrap())
     }
 
-    fn test_btw_session(root: &std::path::Path) -> Arc<Session> {
+    async fn test_btw_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
         let parent = Session::create(db.clone(), root.to_path_buf(), "Build").unwrap();
-        let fork = db.create_btw_fork(parent.id, false).expect("btw fork").info;
+        let fork = db
+            .create_btw_fork(parent.id, false)
+            .await
+            .expect("btw fork")
+            .info;
         Arc::new(
             Session::resume(db, fork.session_id)
                 .expect("resume btw fork")
@@ -1816,7 +1820,7 @@ mod tests {
             called: called.clone(),
         }));
         let agent = test_agent(tools.clone());
-        let session = test_btw_session(tmp.path());
+        let session = test_btw_session(tmp.path()).await;
         session.set_approval_mode(ApprovalMode::Yolo);
         let model = test_model();
         let (tx, _rx) = mpsc::channel(8);
@@ -1868,7 +1872,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tools = ToolBox::new().with(Arc::new(ReadOnlyEchoTool));
         let agent = test_agent(tools.clone());
-        let session = test_btw_session(tmp.path());
+        let session = test_btw_session(tmp.path()).await;
         session.set_approval_mode(ApprovalMode::Yolo);
         let model = test_model();
         let (tx, _rx) = mpsc::channel(8);
@@ -1910,7 +1914,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let read_only_tools = ToolBox::new().with(Arc::new(crate::tools::intel::HotTool));
         let agent = test_agent(read_only_tools.clone());
-        let session = test_btw_session(tmp.path());
+        let session = test_btw_session(tmp.path()).await;
         session.set_approval_mode(ApprovalMode::Yolo);
         let model = test_model();
         let (tx, _rx) = mpsc::channel(8);
@@ -1950,7 +1954,7 @@ mod tests {
             called: called.clone(),
         }));
         let agent = test_agent(dynamic_tools.clone());
-        let session = test_btw_session(tmp.path());
+        let session = test_btw_session(tmp.path()).await;
         session.set_approval_mode(ApprovalMode::Yolo);
         let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
         let env = DispatchEnv {

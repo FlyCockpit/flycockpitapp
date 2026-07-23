@@ -388,8 +388,8 @@ mod tests {
     /// the timer) and prove that touching the SHARED session's send timer
     /// afterwards does not change the parent's verdict — because the
     /// tracker measures elapsed-since-delegation, never the session timer.
-    #[tokio::test]
-    async fn child_note_send_does_not_mask_parent_cold() {
+    #[test]
+    fn child_note_send_does_not_mask_parent_cold() {
         use crate::session::Session;
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Session::create(db, std::path::PathBuf::from("/tmp"), "builder").unwrap();

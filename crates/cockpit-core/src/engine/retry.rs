@@ -805,8 +805,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unrecognized_transport_box_is_conservatively_retried() {
+    #[tokio::test]
+    async fn unrecognized_transport_box_is_conservatively_retried() {
         // An inner error that is NOT a reqwest::Error but arrives on the
         // transport path: conservative retry (documented).
         #[derive(Debug)]
@@ -823,14 +823,14 @@ mod tests {
 
     // --- Retry-After parsing ---------------------------------------
 
-    #[test]
-    fn retry_after_delta_seconds() {
+    #[tokio::test]
+    async fn retry_after_delta_seconds() {
         assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(120)));
         assert_eq!(parse_retry_after("  0 "), Some(Duration::from_secs(0)));
     }
 
-    #[test]
-    fn retry_after_http_date() {
+    #[tokio::test]
+    async fn retry_after_http_date() {
         // A date far in the future parses to a positive delay.
         let future = (chrono::Utc::now() + chrono::Duration::seconds(300)).to_rfc2822();
         let parsed = parse_retry_after(&future).expect("future date parses");
@@ -838,22 +838,22 @@ mod tests {
         assert!(parsed <= Duration::from_secs(301) && parsed >= Duration::from_secs(290));
     }
 
-    #[test]
-    fn retry_after_past_date_is_none() {
+    #[tokio::test]
+    async fn retry_after_past_date_is_none() {
         let past = (chrono::Utc::now() - chrono::Duration::seconds(300)).to_rfc2822();
         // A past date yields a negative delta → no usable delay.
         assert_eq!(parse_retry_after(&past), None);
     }
 
-    #[test]
-    fn retry_after_garbage_is_none() {
+    #[tokio::test]
+    async fn retry_after_garbage_is_none() {
         assert_eq!(parse_retry_after("not-a-date"), None);
     }
 
     // --- backoff sequence ------------------------------------------
 
-    #[test]
-    fn backoff_is_exponential_and_capped() {
+    #[tokio::test]
+    async fn backoff_is_exponential_and_capped() {
         // With jitter = 1.0 (no reduction) we see the raw exponential
         // ladder, capped at BACKOFF_CAP.
         assert_eq!(backoff_for(0, 1.0), Duration::from_millis(500));
@@ -865,8 +865,8 @@ mod tests {
         assert_eq!(backoff_for(u32::MAX, 1.0), BACKOFF_CAP);
     }
 
-    #[test]
-    fn backoff_jitter_stays_within_bounds() {
+    #[tokio::test]
+    async fn backoff_jitter_stays_within_bounds() {
         // Jitter only ever reduces the wait (full-jitter lower half), so
         // the effective interval is in (0.5 * raw, raw] and never exceeds
         // the cap.
@@ -1051,8 +1051,8 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), DEFAULT_MAX_ATTEMPTS);
     }
 
-    #[test]
-    fn retry_after_wait_is_capped_at_thirty_seconds() {
+    #[tokio::test]
+    async fn retry_after_wait_is_capped_at_thirty_seconds() {
         assert_eq!(
             wait_for_decision(RetryDecision::RetryAfter(Some(Duration::from_secs(120))), 0,),
             Some(BACKOFF_CAP)

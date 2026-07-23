@@ -780,7 +780,7 @@ mod tests {
         .unwrap();
 
         assert!(out.contains("\"title\":\"agent race title\""), "{out}");
-        let row = session.db.get_session(session.id).unwrap().unwrap();
+        let row = session.db.get_session(session.id).await.unwrap().unwrap();
         assert_eq!(row.title.as_deref(), Some("agent race title"));
         assert!(!row.user_renamed);
     }
@@ -1357,8 +1357,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn json_round_trips_through_monty() {
+    #[test]
+    fn json_round_trips_through_monty() {
         let v = serde_json::json!({"a": [1, 2, {"b": true}], "c": "s", "d": null});
         let obj = json_to_monty(&v);
         let back = monty_to_json(&obj);

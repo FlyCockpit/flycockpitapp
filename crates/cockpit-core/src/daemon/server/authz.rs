@@ -50,7 +50,7 @@ pub(super) fn session_access_for_summary(
     }
 }
 
-pub(super) fn attached_session_access(
+pub(super) async fn attached_session_access(
     principal: &ClientPrincipal,
     state: &MutableClientState,
     ctx: &DaemonContext,
@@ -59,7 +59,7 @@ pub(super) fn attached_session_access(
         return Ok(SessionAccess::Owner);
     }
     let att = require_attached(state)?;
-    match ctx.db.get_session(att.handle.session_id) {
+    match ctx.db.get_session(att.handle.session_id).await {
         Ok(Some(row)) => Ok(session_access_for_row(principal, &row)),
         Ok(None) => {
             let project_root = att.handle.project_root.to_string_lossy();
@@ -75,12 +75,12 @@ pub(super) fn attached_session_access(
     }
 }
 
-pub(super) fn require_remote_session_writer(
+pub(super) async fn require_remote_session_writer(
     principal: &ClientPrincipal,
     state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
-    match attached_session_access(principal, state, ctx)? {
+    match attached_session_access(principal, state, ctx).await? {
         SessionAccess::Owner | SessionAccess::Writer => Ok(()),
         SessionAccess::Readonly => Err(read_only_error(
             "remote principal has read-only access to this session",
@@ -91,7 +91,7 @@ pub(super) fn require_remote_session_writer(
     }
 }
 
-pub(super) fn require_remote_shared_session_writer(
+pub(super) async fn require_remote_shared_session_writer(
     principal: &ClientPrincipal,
     shared: &SharedClientState,
     ctx: &DaemonContext,
@@ -105,7 +105,7 @@ pub(super) fn require_remote_shared_session_writer(
             message: "client has not attached to a session".into(),
         });
     };
-    match ctx.db.get_session(att.session_id()) {
+    match ctx.db.get_session(att.session_id()).await {
         Ok(Some(row)) => match session_access_for_row(principal, &row) {
             SessionAccess::Owner | SessionAccess::Writer => Ok(()),
             SessionAccess::Readonly => Err(read_only_error(
@@ -133,12 +133,12 @@ pub(super) fn require_remote_shared_session_writer(
     }
 }
 
-pub(super) fn require_remote_target_session_writer(
+pub(super) async fn require_remote_target_session_writer(
     principal: &ClientPrincipal,
     ctx: &DaemonContext,
     session_id: Uuid,
 ) -> std::result::Result<(), ErrorPayload> {
-    match ctx.db.get_session(session_id) {
+    match ctx.db.get_session(session_id).await {
         Ok(Some(row)) => match session_access_for_row(principal, &row) {
             SessionAccess::Owner | SessionAccess::Writer => Ok(()),
             SessionAccess::Readonly => Err(read_only_error(
@@ -245,7 +245,7 @@ pub(super) fn audit_remote_request(
     }
 }
 
-pub(super) fn authorize_attach(
+pub(super) async fn authorize_attach(
     request: &Request,
     state: &MutableClientState,
     ctx: &DaemonContext,
@@ -261,7 +261,7 @@ pub(super) fn authorize_attach(
     };
 
     if let Some(session_id) = session_id {
-        match ctx.db.get_session(*session_id) {
+        match ctx.db.get_session(*session_id).await {
             Ok(Some(row)) => match session_access_for_row(principal, &row) {
                 SessionAccess::Writer | SessionAccess::Readonly => Ok(()),
                 SessionAccess::Owner => Ok(()),
@@ -288,7 +288,7 @@ pub(super) fn authorize_attach(
     }
 }
 
-pub(super) fn authorize_subagent_transcript(
+pub(super) async fn authorize_subagent_transcript(
     request: &Request,
     state: &MutableClientState,
     ctx: &DaemonContext,
@@ -298,7 +298,7 @@ pub(super) fn authorize_subagent_transcript(
         unreachable!("authorize_subagent_transcript called for non-SubagentTranscript request");
     };
 
-    match ctx.db.get_session(*session_id) {
+    match ctx.db.get_session(*session_id).await {
         Ok(Some(row)) => match session_access_for_row(principal, &row) {
             SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => Ok(()),
             SessionAccess::None => Err(authorization_error(
@@ -313,7 +313,7 @@ pub(super) fn authorize_subagent_transcript(
     }
 }
 
-pub(super) fn authorize_read_session_messages(
+pub(super) async fn authorize_read_session_messages(
     request: &Request,
     state: &MutableClientState,
     ctx: &DaemonContext,
@@ -322,10 +322,10 @@ pub(super) fn authorize_read_session_messages(
         unreachable!("authorize_read_session_messages called for non-ReadSessionMessages request");
     };
 
-    authorize_session_reader_by_id(&state.principal, ctx, *session_id)
+    authorize_session_reader_by_id(&state.principal, ctx, *session_id).await
 }
 
-pub(super) fn authorize_read_history_page(
+pub(super) async fn authorize_read_history_page(
     request: &Request,
     state: &MutableClientState,
     ctx: &DaemonContext,
@@ -334,15 +334,15 @@ pub(super) fn authorize_read_history_page(
         unreachable!("authorize_read_history_page called for non-ReadHistoryPage request");
     };
 
-    authorize_session_reader_by_id(&state.principal, ctx, *session_id)
+    authorize_session_reader_by_id(&state.principal, ctx, *session_id).await
 }
 
-fn authorize_session_reader_by_id(
+async fn authorize_session_reader_by_id(
     principal: &ClientPrincipal,
     ctx: &DaemonContext,
     session_id: Uuid,
 ) -> std::result::Result<(), ErrorPayload> {
-    match ctx.db.get_session(session_id) {
+    match ctx.db.get_session(session_id).await {
         Ok(Some(row)) => match session_access_for_row(principal, &row) {
             SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => Ok(()),
             SessionAccess::None => Err(authorization_error(
@@ -357,7 +357,7 @@ fn authorize_session_reader_by_id(
     }
 }
 
-pub(super) fn authorize_begin_attachment_upload(
+pub(super) async fn authorize_begin_attachment_upload(
     request: &Request,
     state: &MutableClientState,
     ctx: &DaemonContext,
@@ -378,11 +378,11 @@ pub(super) fn authorize_begin_attachment_upload(
             ))
         }
     } else {
-        require_remote_session_writer(principal, state, ctx)
+        require_remote_session_writer(principal, state, ctx).await
     }
 }
 
-pub(super) fn authorize_attachment_upload_step(
+pub(super) async fn authorize_attachment_upload_step(
     request: &Request,
     state: &MutableClientState,
     ctx: &DaemonContext,
@@ -409,11 +409,11 @@ pub(super) fn authorize_attachment_upload_step(
             ))
         }
     } else {
-        require_remote_session_writer(principal, state, ctx)
+        require_remote_session_writer(principal, state, ctx).await
     }
 }
 
-pub(super) fn authorize_steer_delegation(
+pub(super) async fn authorize_steer_delegation(
     request: &Request,
     state: &MutableClientState,
     ctx: &DaemonContext,
@@ -421,10 +421,10 @@ pub(super) fn authorize_steer_delegation(
     let Request::SteerDelegation { session_id, .. } = request else {
         unreachable!("authorize_steer_delegation called for non-SteerDelegation request");
     };
-    require_remote_target_session_writer(&state.principal, ctx, *session_id)
+    require_remote_target_session_writer(&state.principal, ctx, *session_id).await
 }
 
-pub(super) fn authorize_lsp_control(
+pub(super) async fn authorize_lsp_control(
     request: &Request,
     state: &MutableClientState,
     _ctx: &DaemonContext,
@@ -442,7 +442,7 @@ pub(super) fn authorize_lsp_control(
     }
 }
 
-pub(super) fn authorize_shared_custom(
+pub(super) async fn authorize_shared_custom(
     request: &Request,
     shared: &SharedClientState,
     ctx: &DaemonContext,
@@ -455,7 +455,7 @@ pub(super) fn authorize_shared_custom(
             ..
         } => {
             if let Some(session_id) = session_id {
-                match ctx.db.get_session(*session_id) {
+                match ctx.db.get_session(*session_id).await {
                     Ok(Some(row)) => match session_access_for_row(principal, &row) {
                         SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => {
                             Ok(())
@@ -484,19 +484,23 @@ pub(super) fn authorize_shared_custom(
         }
         Request::SubagentTranscript { session_id, .. }
         | Request::ReadSessionMessages { session_id, .. }
-        | Request::ReadHistoryPage { session_id, .. } => match ctx.db.get_session(*session_id) {
-            Ok(Some(row)) => match session_access_for_row(principal, &row) {
-                SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => Ok(()),
-                SessionAccess::None => Err(authorization_error(
-                    "remote principal cannot access this session",
-                )),
-            },
-            Ok(None) => Err(ErrorPayload {
-                code: ErrorCode::UnknownSession,
-                message: format!("unknown session {session_id}"),
-            }),
-            Err(e) => Err(internal(e)),
-        },
+        | Request::ReadHistoryPage { session_id, .. } => {
+            match ctx.db.get_session(*session_id).await {
+                Ok(Some(row)) => match session_access_for_row(principal, &row) {
+                    SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => {
+                        Ok(())
+                    }
+                    SessionAccess::None => Err(authorization_error(
+                        "remote principal cannot access this session",
+                    )),
+                },
+                Ok(None) => Err(ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: format!("unknown session {session_id}"),
+                }),
+                Err(e) => Err(internal(e)),
+            }
+        }
         Request::BeginAttachmentUpload { purpose, .. } => {
             if matches!(purpose, proto::AttachmentPurpose::TerminalPasteImage { .. }) {
                 if principal.has_terminal() {
@@ -507,16 +511,16 @@ pub(super) fn authorize_shared_custom(
                     ))
                 }
             } else {
-                require_remote_shared_session_writer(principal, shared, ctx)
+                require_remote_shared_session_writer(principal, shared, ctx).await
             }
         }
         Request::UploadAttachmentChunk { .. }
         | Request::FinishAttachmentUpload { .. }
         | Request::CancelAttachmentUpload { .. } => {
-            require_remote_shared_session_writer(principal, shared, ctx)
+            require_remote_shared_session_writer(principal, shared, ctx).await
         }
         Request::SteerDelegation { session_id, .. } => {
-            require_remote_target_session_writer(principal, ctx, *session_id)
+            require_remote_target_session_writer(principal, ctx, *session_id).await
         }
         Request::LspControl { project_root, .. } => {
             if principal.has_terminal() && principal.can_agent_read_project(project_root) {
@@ -531,12 +535,12 @@ pub(super) fn authorize_shared_custom(
     }
 }
 
-pub(super) fn authorize_session_row_writer(
+pub(super) async fn authorize_session_row_writer(
     principal: &ClientPrincipal,
     ctx: &DaemonContext,
     session_id: Uuid,
 ) -> std::result::Result<(), ErrorPayload> {
-    match ctx.db.get_session(session_id) {
+    match ctx.db.get_session(session_id).await {
         Ok(Some(row)) => match session_access_for_row(principal, &row) {
             SessionAccess::Writer | SessionAccess::Owner => Ok(()),
             SessionAccess::Readonly => Err(read_only_error(
@@ -554,12 +558,12 @@ pub(super) fn authorize_session_row_writer(
     }
 }
 
-pub(super) fn authorize_session_row_reader(
+pub(super) async fn authorize_session_row_reader(
     principal: &ClientPrincipal,
     ctx: &DaemonContext,
     session_id: Uuid,
 ) -> std::result::Result<(), ErrorPayload> {
-    match ctx.db.get_session(session_id) {
+    match ctx.db.get_session(session_id).await {
         Ok(Some(row)) => match session_access_for_row(principal, &row) {
             SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => Ok(()),
             SessionAccess::None => Err(authorization_error(
@@ -582,7 +586,7 @@ macro_rules! command_authorize_value {
         Ok(())
     };
     ($principal:expr, $state:expr, $ctx:expr, $request:expr, session_writer) => {
-        require_remote_session_writer($principal, $state, $ctx)
+        require_remote_session_writer($principal, $state, $ctx).await
     };
     ($principal:expr, $state:expr, $ctx:expr, $request:expr, terminal) => {{
         if $principal.has_terminal() {
@@ -614,13 +618,13 @@ macro_rules! command_authorize_value {
         }
     }};
     ($principal:expr, $state:expr, $ctx:expr, $request:expr, session_row_writer($session_id:ident)) => {
-        authorize_session_row_writer($principal, $ctx, *$session_id)
+        authorize_session_row_writer($principal, $ctx, *$session_id).await
     };
     ($principal:expr, $state:expr, $ctx:expr, $request:expr, session_row_reader($session_id:ident)) => {
-        authorize_session_row_reader($principal, $ctx, *$session_id)
+        authorize_session_row_reader($principal, $ctx, *$session_id).await
     };
     ($principal:expr, $state:expr, $ctx:expr, $request:expr, custom($handler:ident)) => {
-        $handler($request, $state, $ctx)
+        $handler($request, $state, $ctx).await
     };
 }
 
@@ -633,7 +637,7 @@ macro_rules! command_authorize_request_match {
 }
 
 #[allow(unused_variables)]
-pub(super) fn authorize_request(
+pub(super) async fn authorize_request(
     request: &Request,
     state: &MutableClientState,
     ctx: &DaemonContext,
@@ -660,7 +664,7 @@ macro_rules! command_authorize_shared_value {
         Ok(())
     };
     ($principal:expr, $shared:expr, $ctx:expr, $request:expr, session_writer) => {
-        require_remote_shared_session_writer($principal, $shared, $ctx)
+        require_remote_shared_session_writer($principal, $shared, $ctx).await
     };
     ($principal:expr, $shared:expr, $ctx:expr, $request:expr, terminal) => {{
         if $principal.has_terminal() {
@@ -692,13 +696,13 @@ macro_rules! command_authorize_shared_value {
         }
     }};
     ($principal:expr, $shared:expr, $ctx:expr, $request:expr, session_row_writer($session_id:ident)) => {
-        authorize_session_row_writer($principal, $ctx, *$session_id)
+        authorize_session_row_writer($principal, $ctx, *$session_id).await
     };
     ($principal:expr, $shared:expr, $ctx:expr, $request:expr, session_row_reader($session_id:ident)) => {
-        authorize_session_row_reader($principal, $ctx, *$session_id)
+        authorize_session_row_reader($principal, $ctx, *$session_id).await
     };
     ($principal:expr, $shared:expr, $ctx:expr, $request:expr, custom($handler:ident)) => {
-        authorize_shared_custom($request, $shared, $ctx)
+        authorize_shared_custom($request, $shared, $ctx).await
     };
 }
 
@@ -711,7 +715,7 @@ macro_rules! command_authorize_shared_request_match {
 }
 
 #[allow(unused_variables)]
-pub(super) fn authorize_request_shared(
+pub(super) async fn authorize_request_shared(
     request: &Request,
     shared: &SharedClientState,
     ctx: &DaemonContext,

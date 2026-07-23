@@ -126,9 +126,15 @@ mod tests {
     )]
     fn export_ambiguous_identifier_returns_typed_usage_error() {
         let db = Db::open_in_memory().unwrap();
-        let a = db.create_session("p1", "/x", "builder").unwrap();
-        let b = db.create_session("p2", "/y", "builder").unwrap();
         db.write_blocking(move |conn| {
+            let a = crate::db::Db::insert_session_row_conn(
+                conn,
+                &crate::db::Db::build_new_session_row_conn(conn, "p1", "/x", "builder")?,
+            )?;
+            let b = crate::db::Db::insert_session_row_conn(
+                conn,
+                &crate::db::Db::build_new_session_row_conn(conn, "p2", "/y", "builder")?,
+            )?;
             conn.execute(
                 "UPDATE sessions SET short_id = 'same42' WHERE session_id IN (?1, ?2)",
                 rusqlite::params![a.session_id.to_string(), b.session_id.to_string()],

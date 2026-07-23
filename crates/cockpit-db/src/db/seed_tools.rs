@@ -184,10 +184,10 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn set_take_round_trip_and_clears() {
+    #[tokio::test]
+    async fn set_take_round_trip_and_clears() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let seeds = vec![seed("read", "/a.rs"), seed("outline", "/b.rs")];
         db.set_seed_tools(s.session_id, &seeds).unwrap();
 
@@ -201,10 +201,10 @@ mod tests {
         assert!(again.is_empty());
     }
 
-    #[test]
-    fn failed_replacement_rolls_back_prior_plan() {
+    #[tokio::test]
+    async fn failed_replacement_rolls_back_prior_plan() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let original = vec![seed("read", "/a.rs"), seed("outline", "/b.rs")];
         db.set_seed_tools(s.session_id, &original).unwrap();
 
@@ -221,10 +221,10 @@ mod tests {
         assert_eq!(stored_seed_tools(&db, s.session_id), original);
     }
 
-    #[test]
-    fn empty_seed_list_clears_prior_rows_atomically() {
+    #[tokio::test]
+    async fn empty_seed_list_clears_prior_rows_atomically() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         db.set_seed_tools(s.session_id, &[seed("read", "/a.rs")])
             .unwrap();
 
@@ -232,10 +232,10 @@ mod tests {
         assert!(stored_seed_tools(&db, s.session_id).is_empty());
     }
 
-    #[test]
-    fn failed_drain_rolls_back_delete_for_retry() {
+    #[tokio::test]
+    async fn failed_drain_rolls_back_delete_for_retry() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let seeds = vec![seed("read", "/a.rs"), seed("outline", "/b.rs")];
         db.set_seed_tools(s.session_id, &seeds).unwrap();
 
@@ -253,14 +253,14 @@ mod tests {
         assert!(db.take_seed_tools(s.session_id).unwrap().is_empty());
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
-    fn malformed_args_json_still_drains_as_null_compatibly() {
+    async fn malformed_args_json_still_drains_as_null_compatibly() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         db.write_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO seed_tools (session_id, seq, tool, args_json)

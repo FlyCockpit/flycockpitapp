@@ -20,13 +20,22 @@ pub async fn run(cmd: SessionCommand) -> Result<()> {
     }
 }
 
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; CLI session command remains sync until db-async-session-log"
+)]
 fn list(args: SessionListArgs) -> Result<()> {
     let db = Db::open_default().context("opening cockpit DB")?;
     let sessions = if let Some(assistant) = args.assistant.as_deref() {
-        db.list_sessions_for_assistant(assistant, false, 100)
-            .with_context(|| format!("listing sessions for assistant `{assistant}`"))?
+        let assistant = assistant.to_string();
+        let assistant_label = assistant.clone();
+        db.write_blocking(move |conn| {
+            Db::list_sessions_for_assistant_conn(conn, &assistant, false, 100)
+        })
+        .with_context(|| format!("listing sessions for assistant `{assistant_label}`"))?
     } else {
-        db.list_sessions(false, 100).context("listing sessions")?
+        db.write_blocking(move |conn| Db::list_sessions_conn(conn, false, 100))
+            .context("listing sessions")?
     };
     if sessions.is_empty() {
         println!("no sessions");
@@ -47,10 +56,14 @@ fn list(args: SessionListArgs) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; CLI session command remains sync until db-async-session-log"
+)]
 fn show(session: &str, json_mode: bool) -> Result<()> {
     let session_id = Uuid::parse_str(session).context("parsing session id")?;
     let db = Db::open_default().context("opening cockpit DB")?;
-    db.get_session(session_id)
+    db.write_blocking(move |conn| Db::get_session_conn(conn, session_id))
         .context("loading session")?
         .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
     let compactions = db

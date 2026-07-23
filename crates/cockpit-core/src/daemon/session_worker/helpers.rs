@@ -178,12 +178,12 @@ pub(crate) fn resolve_root_agent_conn(
         .unwrap_or_else(default_primary)
 }
 
-pub(crate) fn removed_primary_notice(
+pub(crate) async fn removed_primary_notice(
     session_id: Uuid,
     db: &crate::db::Db,
     cfg: &crate::config::extended::ExtendedConfig,
 ) -> Option<String> {
-    let row = db.get_session(session_id).ok().flatten()?;
+    let row = db.get_session(session_id).await.ok().flatten()?;
     let text = if crate::agents::is_removed_primary(&row.active_agent) {
         format!(
             "Primary agent `{}` was removed; continuing with `{}`.",

@@ -93,10 +93,10 @@ impl Db {
 mod tests {
     use super::*;
 
-    #[test]
-    fn save_load_round_trip() {
+    #[tokio::test]
+    async fn save_load_round_trip() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         let ledger = PruneLedger {
             elided: vec![
                 LedgerEntry {
@@ -117,10 +117,10 @@ mod tests {
         assert_eq!(got, ledger);
     }
 
-    #[test]
-    fn save_upserts() {
+    #[tokio::test]
+    async fn save_upserts() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "Build").unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
         let l1 = PruneLedger {
             elided: vec![LedgerEntry {
                 original_event_id: "c1".into(),
@@ -150,8 +150,8 @@ mod tests {
         assert_eq!(got, l2);
     }
 
-    #[test]
-    fn unknown_session_is_none() {
+    #[tokio::test]
+    async fn unknown_session_is_none() {
         let db = Db::open_in_memory().unwrap();
         assert!(db.load_prune_ledger(Uuid::new_v4()).unwrap().is_none());
     }

@@ -55,43 +55,52 @@ pub struct WorkspaceTrustDecision {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_workspace_trust(
+    pub async fn set_workspace_trust(
         &self,
         root_path: &Path,
         mode: WorkspaceTrustMode,
     ) -> Result<WorkspaceTrustDecision> {
         let root = normalize_trust_root(root_path)?;
         let now = now_epoch_seconds();
-        self.write_blocking(move |conn| {
-            conn.execute(
-                "INSERT INTO workspace_trust (root_path, mode, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?3)
-                 ON CONFLICT(root_path) DO UPDATE SET
-                    mode = excluded.mode,
-                    updated_at = excluded.updated_at",
-                params![root, mode.as_str(), now],
-            )
-            .context("upserting workspace_trust decision")?;
-
-            query_decision_by_root(conn, &root)?
-                .context("workspace_trust decision missing after upsert")
-        })
+        self.write(move |conn| Self::set_workspace_trust_conn(conn, &root, mode, now))
+            .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn workspace_trust_by_root(
+    pub fn set_workspace_trust_conn(
+        conn: &Connection,
+        normalized_root: &str,
+        mode: WorkspaceTrustMode,
+        now: i64,
+    ) -> Result<WorkspaceTrustDecision> {
+        conn.execute(
+            "INSERT INTO workspace_trust (root_path, mode, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(root_path) DO UPDATE SET
+                mode = excluded.mode,
+                updated_at = excluded.updated_at",
+            params![normalized_root, mode.as_str(), now],
+        )
+        .context("upserting workspace_trust decision")?;
+
+        query_decision_by_root(conn, normalized_root)?
+            .context("workspace_trust decision missing after upsert")
+    }
+
+    pub async fn workspace_trust_by_root(
         &self,
         root_path: &Path,
     ) -> Result<Option<WorkspaceTrustDecision>> {
         let root = normalize_trust_root(root_path)?;
-        self.read_blocking(|conn| query_decision_by_root(conn, &root))
+        self.read(move |conn| query_decision_by_root(conn, &root))
+            .await
+    }
+
+    pub fn workspace_trust_by_root_conn(
+        conn: &Connection,
+        root_path: &Path,
+    ) -> Result<Option<WorkspaceTrustDecision>> {
+        let root = normalize_trust_root(root_path)?;
+        query_decision_by_root(conn, &root)
     }
 }
 
@@ -154,17 +163,18 @@ fn now_epoch_seconds() -> i64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn set_update_and_read_workspace_trust_decision() {
+    #[tokio::test]
+    async fn set_update_and_read_workspace_trust_decision() {
         let db = Db::open_in_memory().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let canonical_root = root.canonicalize().unwrap().display().to_string();
 
-        assert!(db.workspace_trust_by_root(root).unwrap().is_none());
+        assert!(db.workspace_trust_by_root(root).await.unwrap().is_none());
 
         let first = db
             .set_workspace_trust(root, WorkspaceTrustMode::Trust)
+            .await
             .unwrap();
         assert_eq!(first.mode, WorkspaceTrustMode::Trust);
         assert_eq!(first.root_path, canonical_root);
@@ -172,18 +182,23 @@ mod tests {
 
         let second = db
             .set_workspace_trust(root, WorkspaceTrustMode::IgnoreConfig)
+            .await
             .unwrap();
         assert_eq!(second.mode, WorkspaceTrustMode::IgnoreConfig);
         assert_eq!(second.root_path, first.root_path);
         assert_eq!(second.created_at, first.created_at);
         assert!(second.updated_at >= first.updated_at);
 
-        let loaded = db.workspace_trust_by_root(root).unwrap().expect("stored");
+        let loaded = db
+            .workspace_trust_by_root(root)
+            .await
+            .unwrap()
+            .expect("stored");
         assert_eq!(loaded, second);
     }
 
-    #[test]
-    fn set_workspace_trust_stores_canonical_root_identity() {
+    #[tokio::test]
+    async fn set_workspace_trust_stores_canonical_root_identity() {
         let tmp = tempfile::tempdir().unwrap();
         let subdir = tmp.path().join("subdir");
         std::fs::create_dir(&subdir).unwrap();
@@ -193,11 +208,13 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let stored = db
             .set_workspace_trust(&lexical_variant, WorkspaceTrustMode::Trust)
+            .await
             .unwrap();
 
         assert_eq!(stored.root_path, canonical_root);
         assert_eq!(
             db.workspace_trust_by_root(tmp.path())
+                .await
                 .unwrap()
                 .expect("stored")
                 .root_path,
@@ -205,18 +222,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lookup_by_root_uses_canonical_identity() {
+    #[tokio::test]
+    async fn lookup_by_root_uses_canonical_identity() {
         let tmp = tempfile::tempdir().unwrap();
         let subdir = tmp.path().join("subdir");
         std::fs::create_dir(&subdir).unwrap();
 
         let db = Db::open_in_memory().unwrap();
         db.set_workspace_trust(tmp.path(), WorkspaceTrustMode::Untrusted)
+            .await
             .unwrap();
 
         let loaded = db
             .workspace_trust_by_root(&subdir.join(".."))
+            .await
             .unwrap()
             .expect("stored");
         assert_eq!(

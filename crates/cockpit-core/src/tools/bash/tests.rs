@@ -191,8 +191,8 @@ fn jq_shim_is_skipped_only_for_actual_container_runs() {
     assert!(should_prepare_jq_shim(false, SandboxMode::Off));
 }
 
-#[test]
-fn resources_schema_is_closed_and_matches_scheduler_permits() {
+#[tokio::test]
+async fn resources_schema_is_closed_and_matches_scheduler_permits() {
     let expected: Vec<String> = crate::config::extended::ResourceSchedulerPoolsConfig::default()
         .as_map()
         .into_keys()
@@ -675,8 +675,8 @@ fn ctx_with_scheduler(
     ctx
 }
 
-#[test]
-fn resource_policy_matches_and_merges_by_max() {
+#[tokio::test]
+async fn resource_policy_matches_and_merges_by_max() {
     let mut cfg = crate::config::extended::ResourceSchedulerConfig::default();
     cfg.rules
         .push(crate::config::extended::ResourceSchedulerRuleConfig {
@@ -703,8 +703,8 @@ fn resource_policy_matches_and_merges_by_max() {
     assert_eq!(plan.queue_timeout_ms, Some(50));
 }
 
-#[test]
-fn resource_policy_structured_fields_are_conjunctive() {
+#[tokio::test]
+async fn resource_policy_structured_fields_are_conjunctive() {
     let mut cfg = crate::config::extended::ResourceSchedulerConfig::default();
     cfg.rules
         .push(crate::config::extended::ResourceSchedulerRuleConfig {

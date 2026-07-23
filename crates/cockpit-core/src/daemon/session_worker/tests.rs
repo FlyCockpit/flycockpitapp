@@ -716,9 +716,9 @@ struct IsolatedCockpitEnv {
 }
 
 impl IsolatedCockpitEnv {
-    fn new(root: &std::path::Path) -> Self {
+    async fn new_async(root: &std::path::Path) -> Self {
         Self {
-            _guard: crate::test_env::TestEnvGuard::isolate_cockpit_home_at(root),
+            _guard: crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(root).await,
         }
     }
 }
@@ -834,18 +834,18 @@ fn seed_tool_drain_failure_warns_with_session_id_without_payload() {
     assert!(!log.contains("tool output"));
 }
 
-#[test]
-fn plan_default_stale_session_keeps_plan() {
+#[tokio::test]
+async fn plan_default_stale_session_keeps_plan() {
     use crate::config::extended::DefaultPrimaryAgent as D;
     let db = crate::db::Db::open_in_memory().unwrap();
     // A session persisted on Plan loads on Plan. Removed primaries fall back to
     // Build through the shared predicate.
-    let row = db.create_session("proj", "/proj", "Plan").unwrap();
+    let row = db.create_session("proj", "/proj", "Plan").await.unwrap();
     assert_eq!(
         resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)),
         "Plan"
     );
-    let swarm = db.create_session("proj", "/proj", "Swarm").unwrap();
+    let swarm = db.create_session("proj", "/proj", "Swarm").await.unwrap();
     assert_eq!(
         resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Build)),
         "Build"
@@ -857,19 +857,20 @@ fn plan_default_stale_session_keeps_plan() {
     );
 }
 
-#[test]
-fn roster_trim_removed_primary_notice_is_one_time() {
+#[tokio::test]
+async fn roster_trim_removed_primary_notice_is_one_time() {
     use crate::config::extended::DefaultPrimaryAgent as D;
 
     let db = crate::db::Db::open_in_memory().unwrap();
-    let row = db.create_session("proj", "/proj", "Swarm").unwrap();
+    let row = db.create_session("proj", "/proj", "Swarm").await.unwrap();
 
     assert_eq!(
         resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)),
         "Build"
     );
-    let notice =
-        removed_primary_notice(row.session_id, &db, &cfg_with(D::Plan)).expect("first notice");
+    let notice = removed_primary_notice(row.session_id, &db, &cfg_with(D::Plan))
+        .await
+        .expect("first notice");
     assert_eq!(
         notice,
         "Primary agent `Swarm` was removed; continuing with `Build`."
@@ -888,19 +889,23 @@ fn roster_trim_removed_primary_notice_is_one_time() {
     )
     .unwrap();
     assert!(
-        removed_primary_notice(row.session_id, &db, &cfg_with(D::Plan)).is_none(),
+        removed_primary_notice(row.session_id, &db, &cfg_with(D::Plan))
+            .await
+            .is_none(),
         "notice is de-duped once recorded"
     );
 }
 
-#[test]
-fn roster_trim_removed_default_primary_notice_is_one_time() {
+#[tokio::test]
+async fn roster_trim_removed_default_primary_notice_is_one_time() {
     let db = crate::db::Db::open_in_memory().unwrap();
-    let row = db.create_session("proj", "/proj", "Build").unwrap();
+    let row = db.create_session("proj", "/proj", "Build").await.unwrap();
     let mut cfg = cfg_with(crate::config::extended::DefaultPrimaryAgent::Build);
     cfg.removed_default_primary_agent = Some("auto".to_string());
 
-    let notice = removed_primary_notice(row.session_id, &db, &cfg).expect("first notice");
+    let notice = removed_primary_notice(row.session_id, &db, &cfg)
+        .await
+        .expect("first notice");
     assert_eq!(
         notice,
         "Default primary agent `auto` was removed; continuing with `Build`."
@@ -919,19 +924,22 @@ fn roster_trim_removed_default_primary_notice_is_one_time() {
     )
     .unwrap();
     assert!(
-        removed_primary_notice(row.session_id, &db, &cfg).is_none(),
+        removed_primary_notice(row.session_id, &db, &cfg)
+            .await
+            .is_none(),
         "config-default notice is de-duped once recorded"
     );
 }
 
-#[test]
-fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
+#[tokio::test]
+async fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
     use crate::config::extended::DefaultPrimaryAgent as D;
     let db = crate::db::Db::open_in_memory().unwrap();
     db.upsert_assistant("helper-bot", "/tmp/helper-bot", "{}", "hash")
         .unwrap();
     let row = db
         .create_assistant_session("proj", "/proj", "helper-bot", "helper-bot")
+        .await
         .unwrap();
 
     assert_eq!(
@@ -940,12 +948,13 @@ fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
     );
 }
 
-#[test]
-fn resolve_root_agent_deleted_assistant_falls_back_to_default_primary() {
+#[tokio::test]
+async fn resolve_root_agent_deleted_assistant_falls_back_to_default_primary() {
     use crate::config::extended::DefaultPrimaryAgent as D;
     let db = crate::db::Db::open_in_memory().unwrap();
     let row = db
         .create_assistant_session("proj", "/proj", "missing-bot", "missing-bot")
+        .await
         .unwrap();
 
     assert_eq!(
@@ -954,14 +963,14 @@ fn resolve_root_agent_deleted_assistant_falls_back_to_default_primary() {
     );
 }
 
-#[test]
-fn assistant_session_root_agent_loads_assistant_definition() {
+#[tokio::test]
+async fn assistant_session_root_agent_loads_assistant_definition() {
     use crate::agents::AgentMode;
     use crate::assistants::{CreateAssistantSpec, create_assistant};
     use crate::config::extended::DefaultPrimaryAgent as D;
 
     let tmp = tempfile::tempdir().unwrap();
-    let _env = IsolatedCockpitEnv::new(tmp.path());
+    let _env = IsolatedCockpitEnv::new_async(tmp.path()).await;
     let cwd = tmp.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
     write_model_config(&cwd);
@@ -982,6 +991,7 @@ fn assistant_session_root_agent_loads_assistant_definition() {
     .unwrap();
     let row = db
         .create_assistant_session("proj", cwd.to_str().unwrap(), "helper-bot", "helper-bot")
+        .await
         .unwrap();
 
     let root_agent_name = resolve_root_agent(row.session_id, &db, &cfg_with(D::Build));
@@ -1560,7 +1570,11 @@ async fn last_detach_while_idle_releases_locks() {
     let p = tmp.path().join("a.rs");
     std::fs::write(&p, "x").unwrap();
     let db = Db::open_in_memory().unwrap();
-    let sid = db.create_session("p", "/x", "builder").unwrap().session_id;
+    let sid = db
+        .create_session("p", "/x", "builder")
+        .await
+        .unwrap()
+        .session_id;
     let locks = Arc::new(LockManager::in_memory(db));
     locks.acquire(&p, "builder", sid).unwrap();
 
@@ -1588,7 +1602,11 @@ async fn quick_reattach_skips_scheduled_unattended_release() {
     let p = tmp.path().join("a.rs");
     std::fs::write(&p, "x").unwrap();
     let db = Db::open_in_memory().unwrap();
-    let sid = db.create_session("p", "/x", "builder").unwrap().session_id;
+    let sid = db
+        .create_session("p", "/x", "builder")
+        .await
+        .unwrap()
+        .session_id;
     let locks = Arc::new(LockManager::in_memory(db));
     locks.acquire(&p, "builder", sid).unwrap();
 
@@ -1615,7 +1633,11 @@ async fn mid_turn_detach_keeps_locks_then_idle_releases() {
     let p = tmp.path().join("a.rs");
     std::fs::write(&p, "x").unwrap();
     let db = Db::open_in_memory().unwrap();
-    let sid = db.create_session("p", "/x", "builder").unwrap().session_id;
+    let sid = db
+        .create_session("p", "/x", "builder")
+        .await
+        .unwrap()
+        .session_id;
     let locks = Arc::new(LockManager::in_memory(db));
     locks.acquire(&p, "builder", sid).unwrap();
 
@@ -1658,7 +1680,11 @@ async fn multi_attach_releases_only_on_last_detach() {
     let p = tmp.path().join("a.rs");
     std::fs::write(&p, "x").unwrap();
     let db = Db::open_in_memory().unwrap();
-    let sid = db.create_session("p", "/x", "builder").unwrap().session_id;
+    let sid = db
+        .create_session("p", "/x", "builder")
+        .await
+        .unwrap()
+        .session_id;
     let locks = Arc::new(LockManager::in_memory(db));
     locks.acquire(&p, "builder", sid).unwrap();
 

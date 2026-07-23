@@ -201,11 +201,12 @@ impl Db {
 mod tests {
     use crate::db::Db;
 
-    #[test]
-    fn sharing_flag_and_remote_audit_round_trip() {
+    #[tokio::test]
+    async fn sharing_flag_and_remote_audit_round_trip() {
         let db = Db::open_in_memory().unwrap();
         let session = db
             .create_session("project", "/tmp/project", "Build")
+            .await
             .unwrap();
 
         assert_eq!(

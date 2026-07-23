@@ -31,7 +31,7 @@ pub(super) async fn handle_serialized_request(
     let audit_session_id = request_session_id(&request, state);
     let audit_path = request_audit_path(&request);
     let audit_remote = !state.principal.is_owner() && is_remote_mutating_request(&request);
-    if let Err(error) = authorize_request(&request, state, ctx) {
+    if let Err(error) = authorize_request(&request, state, ctx).await {
         if audit_remote {
             audit_remote_request(
                 ctx,
@@ -573,7 +573,7 @@ pub(super) async fn handle_serialized_request(
         } => {
             let att = require_attached(state)?;
             let cwd = Path::new(&project_root);
-            let trust_policy = attached_trust_policy(ctx, att)?;
+            let trust_policy = attached_trust_policy(ctx, att).await?;
             let (_, config) = ctx
                 .config_source()
                 .load_with_trust(cwd, &trust_policy)
@@ -654,7 +654,7 @@ pub(super) async fn handle_serialized_request(
                     visible_ids.push(id);
                     continue;
                 }
-                match ctx.db.get_session(id) {
+                match ctx.db.get_session(id).await {
                     Ok(Some(row))
                         if session_access_for_row(&state.principal, &row)
                             != SessionAccess::None =>
@@ -685,30 +685,35 @@ pub(super) async fn handle_serialized_request(
             cascade,
         } => archive_session(ctx, session_id, cascade).await,
 
-        Request::UnarchiveSession { session_id } => unarchive_session(ctx, session_id),
+        Request::UnarchiveSession { session_id } => unarchive_session(ctx, session_id).await,
 
         Request::ForkSession {
             parent_session_id,
             fork_point_turn_id,
             ephemeral,
-        } => fork_session(
-            ctx,
-            &state.principal,
-            parent_session_id,
-            fork_point_turn_id,
-            ephemeral,
-        ),
+        } => {
+            fork_session(
+                ctx,
+                &state.principal,
+                parent_session_id,
+                fork_point_turn_id,
+                ephemeral,
+            )
+            .await
+        }
 
         Request::DiscardSession { session_id } => discard_session(state, ctx, session_id).await,
 
         Request::CreateBtwFork {
             parent_session_id,
             tangent,
-        } => create_btw_fork(ctx, &state.principal, parent_session_id, tangent),
+        } => create_btw_fork(ctx, &state.principal, parent_session_id, tangent).await,
 
         Request::EndBtwFork { parent_session_id } => end_btw_fork(ctx, parent_session_id).await,
 
-        Request::RenameSession { session_id, title } => rename_session(ctx, session_id, &title),
+        Request::RenameSession { session_id, title } => {
+            rename_session(ctx, session_id, &title).await
+        }
 
         Request::ShareSession { session_id, shared } => {
             ctx.db
@@ -718,7 +723,7 @@ pub(super) async fn handle_serialized_request(
         }
 
         Request::RecordSessionNote { session_id, text } => {
-            record_session_note(ctx, session_id, &text)
+            record_session_note(ctx, session_id, &text).await
         }
 
         Request::DeleteSession {
@@ -732,7 +737,7 @@ pub(super) async fn handle_serialized_request(
             // discovery used by the `skill` tool and auto-select path.
             let att = require_attached(state)?;
             let cwd = Path::new(&project_root);
-            let trust_policy = attached_trust_policy(ctx, att)?;
+            let trust_policy = attached_trust_policy(ctx, att).await?;
             let (_, extended) = ctx
                 .config_source()
                 .load_with_trust(cwd, &trust_policy)
@@ -794,8 +799,8 @@ pub(super) async fn handle_serialized_request(
             Ok(Response::ScheduledJobRunQueued { id })
         }
 
-        Request::ListAgents => list_agents(ctx, state),
-        Request::ListModels { provider } => list_models(ctx, state, provider.as_deref()),
+        Request::ListAgents => list_agents(ctx, state).await,
+        Request::ListModels { provider } => list_models(ctx, state, provider.as_deref()).await,
 
         Request::SetActiveModel {
             provider,
@@ -1175,7 +1180,7 @@ pub(super) async fn handle_concurrent_request(
     let request_kind = principal::request_kind(&request);
     let audit_path = request_audit_path(&request);
     let audit_remote = !shared.principal.is_owner() && is_remote_mutating_request(&request);
-    if let Err(error) = authorize_request_shared(&request, &shared, &ctx) {
+    if let Err(error) = authorize_request_shared(&request, &shared, &ctx).await {
         if audit_remote {
             audit_remote_request(
                 &ctx,
@@ -1367,7 +1372,7 @@ pub(super) async fn handle_concurrent_request(
                     visible_ids.push(id);
                     continue;
                 }
-                match ctx.db.get_session(id) {
+                match ctx.db.get_session(id).await {
                     Ok(Some(row))
                         if session_access_for_row(&shared.principal, &row)
                             != SessionAccess::None =>
@@ -1392,7 +1397,9 @@ pub(super) async fn handle_concurrent_request(
                 .collect();
             Ok(Response::SessionLiveStatus { statuses })
         }
-        Request::ListSkills { project_root } => list_skills_shared(&ctx, &shared, project_root),
+        Request::ListSkills { project_root } => {
+            list_skills_shared(&ctx, &shared, project_root).await
+        }
         Request::ResourceSnapshot => Ok(Response::ResourceSnapshot {
             snapshot: resource_scheduler_snapshot(&ctx),
         }),
@@ -1401,8 +1408,10 @@ pub(super) async fn handle_concurrent_request(
             let jobs = scheduler.list_jobs(owner.as_deref()).map_err(internal)?;
             Ok(Response::ScheduledJobs { jobs })
         }
-        Request::ListAgents => list_agents_shared(&ctx, &shared),
-        Request::ListModels { provider } => list_models_shared(&ctx, &shared, provider.as_deref()),
+        Request::ListAgents => list_agents_shared(&ctx, &shared).await,
+        Request::ListModels { provider } => {
+            list_models_shared(&ctx, &shared, provider.as_deref()).await
+        }
         Request::DaemonStatus => Ok(Response::DaemonStatus {
             pid: std::process::id(),
             uptime_secs: ctx.started_at.elapsed().as_secs(),
@@ -1458,20 +1467,21 @@ pub(super) async fn handle_concurrent_request(
     }
 }
 
-pub(super) fn attached_trust_policy(
+pub(super) async fn attached_trust_policy(
     ctx: &DaemonContext,
     att: &AttachedSession,
 ) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
     crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &att.handle.project_root)
+        .await
         .map_err(internal)
 }
 
-pub(super) fn list_agents(
+pub(super) async fn list_agents(
     ctx: &DaemonContext,
     state: &MutableClientState,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_attached(state)?;
-    let trust_policy = attached_trust_policy(ctx, att)?;
+    let trust_policy = attached_trust_policy(ctx, att).await?;
     let _ = ctx
         .config_source()
         .load_with_trust(&att.handle.project_root, &trust_policy)
@@ -1501,13 +1511,13 @@ pub(super) fn list_agents(
     Ok(Response::Agents { agents })
 }
 
-pub(super) fn list_models(
+pub(super) async fn list_models(
     ctx: &DaemonContext,
     state: &MutableClientState,
     requested_provider: Option<&str>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_attached(state)?;
-    let trust_policy = attached_trust_policy(ctx, att)?;
+    let trust_policy = attached_trust_policy(ctx, att).await?;
     let (providers, _) = ctx
         .config_source()
         .load_with_trust(&att.handle.project_root, &trust_policy)
@@ -1549,22 +1559,23 @@ pub(super) fn require_shared_attached(
     })
 }
 
-pub(super) fn attached_trust_policy_shared(
+pub(super) async fn attached_trust_policy_shared(
     ctx: &DaemonContext,
     att: &SharedAttachedSession,
 ) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
     crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &att.project_root)
+        .await
         .map_err(internal)
 }
 
-pub(super) fn list_skills_shared(
+pub(super) async fn list_skills_shared(
     ctx: &DaemonContext,
     shared: &SharedClientState,
     project_root: String,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_shared_attached(shared)?;
     let cwd = Path::new(&project_root);
-    let trust_policy = attached_trust_policy_shared(ctx, att)?;
+    let trust_policy = attached_trust_policy_shared(ctx, att).await?;
     let (_, extended) = ctx
         .config_source()
         .load_with_trust(cwd, &trust_policy)
@@ -1586,12 +1597,12 @@ pub(super) fn list_skills_shared(
     Ok(Response::Skills { skills })
 }
 
-pub(super) fn list_agents_shared(
+pub(super) async fn list_agents_shared(
     ctx: &DaemonContext,
     shared: &SharedClientState,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_shared_attached(shared)?;
-    let trust_policy = attached_trust_policy_shared(ctx, att)?;
+    let trust_policy = attached_trust_policy_shared(ctx, att).await?;
     let _ = ctx
         .config_source()
         .load_with_trust(&att.project_root, &trust_policy)
@@ -1621,13 +1632,13 @@ pub(super) fn list_agents_shared(
     Ok(Response::Agents { agents })
 }
 
-pub(super) fn list_models_shared(
+pub(super) async fn list_models_shared(
     ctx: &DaemonContext,
     shared: &SharedClientState,
     requested_provider: Option<&str>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_shared_attached(shared)?;
-    let trust_policy = attached_trust_policy_shared(ctx, att)?;
+    let trust_policy = attached_trust_policy_shared(ctx, att).await?;
     let (providers, _) = ctx
         .config_source()
         .load_with_trust(&att.project_root, &trust_policy)
@@ -1923,7 +1934,7 @@ pub(super) async fn attach(
     let project_root = project_root.map(PathBuf::from);
 
     let cfg_root = match (session_id, &project_root) {
-        (Some(id), _) => match ctx.db.get_session(id) {
+        (Some(id), _) => match ctx.db.get_session(id).await {
             Ok(Some(row)) => Some(PathBuf::from(row.project_root)),
             Ok(None) => {
                 return Err(ErrorPayload {
@@ -2172,6 +2183,7 @@ pub(super) async fn attach(
     let btw_fork = ctx
         .db
         .live_btw_fork_info(session_id)
+        .await
         .map_err(internal)?
         .map(btw_info_to_proto);
 
@@ -2355,10 +2367,15 @@ pub(super) async fn export_session_data(
     include_sensitive: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
     let db = ctx.db.clone();
+    let target = db
+        .get_session(session_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("unknown session {session_id}"),
+        })?;
     let data = tokio::task::spawn_blocking(move || -> Result<proto::ExportSessionData> {
-        let Some(target) = db.get_session(session_id)? else {
-            anyhow::bail!("unknown session {session_id}");
-        };
         match kind {
             proto::ExportSessionKind::TranscriptJson => {
                 let mut messages = Vec::new();
@@ -2453,6 +2470,7 @@ pub(super) async fn auto_title_request(
         &ctx.db,
         &session.project_root,
     )
+    .await
     .map_err(workspace_trust_error)?;
     let (providers, extended) = ctx
         .config_source()
@@ -2507,6 +2525,7 @@ pub(super) async fn curator_request(
 ) -> std::result::Result<Response, ErrorPayload> {
     let trust_policy =
         crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &project_root)
+            .await
             .map_err(workspace_trust_error)?;
     let (_, extended) = ctx
         .config_source()

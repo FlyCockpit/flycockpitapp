@@ -132,17 +132,18 @@ fn decode_shadow_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CompactionShad
 mod tests {
     use super::*;
 
-    fn session(db: &Db, project: &str) -> Uuid {
+    async fn session(db: &Db, project: &str) -> Uuid {
         db.create_session(project, "/tmp/project", "Build")
+            .await
             .unwrap()
             .session_id
     }
 
-    #[test]
-    fn upsert_replaces_row_per_session() {
+    #[tokio::test]
+    async fn upsert_replaces_row_per_session() {
         let db = Db::open_in_memory().unwrap();
-        let one = session(&db, "one");
-        let two = session(&db, "two");
+        let one = session(&db, "one").await;
+        let two = session(&db, "two").await;
 
         assert!(
             db.upsert_compaction_shadow(one, r#"{"brief":"first"}"#)
@@ -167,15 +168,15 @@ mod tests {
             r#"{"brief":"other"}"#
         );
 
-        db.delete_session(one, true).unwrap();
+        db.delete_session(one, true).await.unwrap();
         assert!(db.compaction_shadow(one).unwrap().is_none());
         assert_eq!(db.count_compaction_shadows().unwrap(), 1);
     }
 
-    #[test]
-    fn payload_round_trips_with_full_snapshot() {
+    #[tokio::test]
+    async fn payload_round_trips_with_full_snapshot() {
         let db = Db::open_in_memory().unwrap();
-        let session_id = session(&db, "round-trip");
+        let session_id = session(&db, "round-trip").await;
         let payload = serde_json::json!({
             "kind": "ready_brief",
             "generation": 7,
@@ -200,10 +201,10 @@ mod tests {
         assert_eq!(stored.payload_json, payload_json);
     }
 
-    #[test]
-    fn large_payload_spills() {
+    #[tokio::test]
+    async fn large_payload_spills() {
         let db = Db::open_in_memory().unwrap();
-        let session_id = session(&db, "large");
+        let session_id = session(&db, "large").await;
         let body = "x".repeat(20 * 1024);
         let payload = serde_json::json!({
             "kind": "ready_brief",
@@ -224,11 +225,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ephemeral_session_writes_no_rows() {
+    #[tokio::test]
+    async fn ephemeral_session_writes_no_rows() {
         let db = Db::open_in_memory().unwrap();
-        let parent = session(&db, "ephemeral");
-        let ephemeral = db.create_ephemeral_fork(parent, None).unwrap().session_id;
+        let parent = session(&db, "ephemeral").await;
+        let ephemeral = db
+            .create_ephemeral_fork(parent, None)
+            .await
+            .unwrap()
+            .session_id;
 
         assert!(
             !db.upsert_compaction_shadow(ephemeral, r#"{"brief":"discard"}"#)

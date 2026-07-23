@@ -711,6 +711,7 @@ impl ProductionJobExecutor {
         let session = self
             .db
             .create_assistant_session(&project_id, &root_str, &assistant, &assistant)
+            .await
             .context("creating scheduled assistant session")?;
         self.prompt_runner
             .run_prompt_turn(
@@ -771,7 +772,7 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
         {
             Ok(handle) => handle,
             Err(error) => {
-                if let Err(cleanup_error) = db.delete_session(session_id, true) {
+                if let Err(cleanup_error) = db.delete_session(session_id, true).await {
                     tracing::warn!(
                         error = %cleanup_error,
                         %session_id,
@@ -1428,7 +1429,8 @@ mod tests {
             assert_eq!(job.owner, format!("assistant:{assistant}"));
             assert_eq!(prompt, "summarize the workspace");
             let session = db
-                .get_session(session_id)?
+                .get_session(session_id)
+                .await?
                 .expect("production executor creates session before running turn");
             assert_eq!(session.assistant_name.as_deref(), Some(assistant));
             assert_eq!(session.active_agent, assistant);
@@ -2554,6 +2556,7 @@ mod tests {
         let project_root = tmp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
         db.set_workspace_trust(&project_root, WorkspaceTrustMode::Trust)
+            .await
             .unwrap();
         create_helper_assistant(&db, tmp.path().join("assistants/helper-bot"));
         let runner = Arc::new(FakePromptRunner::default());
@@ -2573,7 +2576,7 @@ mod tests {
         let job = wait_for_job_result(&scheduler, "job-run").await;
         let result = job.last_result.expect("scheduled prompt result");
 
-        let sessions = db.list_sessions(false, 10).unwrap();
+        let sessions = db.list_sessions(false, 10).await.unwrap();
         assert_eq!(sessions.len(), 1);
         let session = &sessions[0];
         assert_eq!(session.assistant_name.as_deref(), Some("helper-bot"));
@@ -2601,6 +2604,7 @@ mod tests {
         let project_root = tmp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
         db.set_workspace_trust(&project_root, WorkspaceTrustMode::Untrusted)
+            .await
             .unwrap();
         create_helper_assistant(&db, tmp.path().join("assistants/helper-bot"));
         let registry = production_registry(db.clone());
@@ -2619,7 +2623,7 @@ mod tests {
 
         assert!(!result.ok);
         assert!(result.summary.contains("untrusted"), "{}", result.summary);
-        let sessions = db.list_sessions(false, 10).unwrap();
+        let sessions = db.list_sessions(false, 10).await.unwrap();
         assert!(
             sessions.is_empty(),
             "trust refusal must not leave an orphan session row"

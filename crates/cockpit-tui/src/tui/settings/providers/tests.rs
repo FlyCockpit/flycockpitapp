@@ -1668,8 +1668,8 @@ async fn oauth_grok_browser_open_failure_still_listens() {
     assert!(status.contains("Waiting for callback"), "{status}");
 }
 
-#[tokio::test]
-async fn oauth_grok_bind_failure_offers_manual_paste() {
+#[test]
+fn oauth_grok_bind_failure_offers_manual_paste() {
     let _guard = OAUTH_EFFECTS_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1700,8 +1700,8 @@ async fn oauth_grok_bind_failure_offers_manual_paste() {
     assert!(state.paste_focused);
 }
 
-#[tokio::test]
-async fn oauth_grok_ssh_begin_binds_no_listener() {
+#[test]
+fn oauth_grok_ssh_begin_binds_no_listener() {
     let _guard = OAUTH_EFFECTS_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2047,8 +2047,8 @@ fn standalone_oauth_enter_on_continue_returns_to_edit() {
     }
 }
 
-#[tokio::test]
-async fn add_wizard_oauth_enter_saves_without_backing_out() {
+#[test]
+fn add_wizard_oauth_enter_saves_without_backing_out() {
     for (template_id, provider) in [
         ("codex-oauth", OAuthProvider::Codex),
         ("grok-oauth", OAuthProvider::Grok),
@@ -2347,8 +2347,8 @@ fn every_visible_oauth_row_acts_on_enter() {
     }
 }
 
-#[tokio::test]
-async fn codex_skip_row_saves_with_device_code_present() {
+#[test]
+fn codex_skip_row_saves_with_device_code_present() {
     let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
     let mut oauth = OAuthFlowState::new(OAuthProvider::Codex);
     oauth.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
@@ -2365,8 +2365,8 @@ async fn codex_skip_row_saves_with_device_code_present() {
     assert!(state.oauth_auth.is_some());
 }
 
-#[tokio::test]
-async fn grok_pending_skip_row_saves_at_rendered_index() {
+#[test]
+fn grok_pending_skip_row_saves_at_rendered_index() {
     let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
     let mut oauth = OAuthFlowState::new(OAuthProvider::Grok);
     oauth.set_browser_session_for_test("https://example.test/oauth");
@@ -2513,8 +2513,8 @@ fn oauth_help_legend_matches_bindings_for_every_host_and_state() {
     }
 }
 
-#[tokio::test]
-async fn logged_in_oauth_enter_advances_add_wizard() {
+#[test]
+fn logged_in_oauth_enter_advances_add_wizard() {
     for template_id in ["codex-oauth", "grok-oauth"] {
         let template = templates::template_by_id(template_id).unwrap();
         let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());

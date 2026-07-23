@@ -81,11 +81,13 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
         Ok(db) => db,
         Err(error) => exit_run_error(format, 2, "configuration", &format!("{error:#}")),
     };
-    if let Err(error) = crate::config::trust::enforce_noninteractive_workspace_trust(&db, &cwd) {
+    if let Err(error) =
+        crate::config::trust::enforce_noninteractive_workspace_trust(&db, &cwd).await
+    {
         exit_run_error(format, 3, "workspace_trust", &error.to_string());
     }
 
-    let requested_session = match resolve_requested_session(&args, &db, &cwd) {
+    let requested_session = match resolve_requested_session(&args, &db, &cwd).await {
         Ok(session) => session,
         Err(error) => exit_run_error(format, 2, "invalid_arguments", &error.to_string()),
     };
@@ -438,7 +440,7 @@ fn resolve_run_cwd(cwd: Option<&Path>, project_alias: Option<&Path>) -> Result<P
         .with_context(|| format!("canonicalizing run cwd {}", selected.display()))
 }
 
-fn resolve_requested_session(
+async fn resolve_requested_session(
     args: &RunArgs,
     db: &crate::db::Db,
     root: &Path,
@@ -447,6 +449,7 @@ fn resolve_requested_session(
         let session_id = Uuid::parse_str(session).context("parsing --session")?;
         let stored = db
             .get_session(session_id)
+            .await
             .context("looking up --session")?
             .ok_or_else(|| anyhow::anyhow!("unknown session {session_id}"))?;
         let stored_root = Path::new(&stored.project_root)
@@ -466,6 +469,7 @@ fn resolve_requested_session(
     }
 
     db.most_recent_session_for_root_by_message(&root.to_string_lossy())
+        .await
         .context("selecting latest session for --continue")?
         .map(|session| Some(session.session_id))
         .ok_or_else(|| anyhow::anyhow!("no previous session for workspace {}", root.display()))

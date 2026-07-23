@@ -193,10 +193,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn tandem_record_round_trips_request_response_usage() {
+    #[tokio::test]
+    async fn tandem_record_round_trips_request_response_usage() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         let parent = Uuid::new_v4().to_string();
 
         // Dispatch-time write: pending, no response yet.
@@ -244,10 +244,10 @@ mod tests {
         assert_eq!(r.usage.as_ref().unwrap()["input_tokens"], 10);
     }
 
-    #[test]
-    fn pending_tandem_record_survives_with_no_response() {
+    #[tokio::test]
+    async fn pending_tandem_record_survives_with_no_response() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "builder").unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
         db.upsert_tandem_inference(
             "tan-pending",
             s.session_id,

@@ -324,8 +324,8 @@ mod tests {
         assert!(!input.is_suspended());
     }
 
-    #[test]
-    fn with_input_suspended_suspends_for_the_closure_and_resumes_after() {
+    #[tokio::test]
+    async fn with_input_suspended_suspends_for_the_closure_and_resumes_after() {
         let mut input = TerminalInput::new_for_test();
 
         let result = with_input_suspended(&mut input, |input| {

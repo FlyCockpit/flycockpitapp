@@ -841,6 +841,10 @@ pub(crate) fn attention_payload_for_event(event: &Event, ctx: &DaemonContext) ->
     serde_json::to_value(payload).ok()
 }
 
+#[expect(
+    deprecated,
+    reason = "db-async-foundation bridge; connector attention path remains sync until db-async-session-log"
+)]
 fn attention_payload_for_event_with_meta(
     event: &Event,
     ctx: &DaemonContext,
@@ -901,7 +905,7 @@ fn attention_payload_for_event_with_meta(
     };
     let project_root = ctx
         .db
-        .get_session(session_id)
+        .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
         .ok()
         .flatten()
         .map(|row| row.project_root);
@@ -1007,6 +1011,8 @@ impl Backoff {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -1059,7 +1065,12 @@ mod tests {
 
     fn test_session_id(ctx: &DaemonContext) -> Uuid {
         ctx.db
-            .create_session("project", "/repo", "Build")
+            .write_blocking(|conn| {
+                crate::db::Db::insert_session_row_conn(
+                    conn,
+                    &crate::db::Db::build_new_session_row_conn(conn, "project", "/repo", "Build")?,
+                )
+            })
             .unwrap()
             .session_id
     }

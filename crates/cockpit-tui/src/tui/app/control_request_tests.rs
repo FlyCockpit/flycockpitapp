@@ -127,8 +127,8 @@ async fn control_request_survives_full_telemetry_channel() {
     assert_eq!(app.pending_control_requests.len(), 1);
 }
 
-#[tokio::test]
-async fn control_request_full_channel_reports_not_delivered() {
+#[test]
+fn control_request_full_channel_reports_not_delivered() {
     let mut app = app();
     let (record_tx, _record_rx) = mpsc::channel(1);
     let (control_tx, _control_rx) = mpsc::channel(1);
@@ -147,8 +147,8 @@ async fn control_request_full_channel_reports_not_delivered() {
     );
 }
 
-#[tokio::test]
-async fn control_request_without_runner_reports_not_delivered() {
+#[test]
+fn control_request_without_runner_reports_not_delivered() {
     let mut app = app();
 
     app.send_daemon_request("/prune", Request::Prune, ControlApplied::None);
@@ -248,8 +248,8 @@ async fn roster_trim_swarm_swap_is_sent_to_daemon_validation() {
     assert!(history_lines(&app).is_empty());
 }
 
-#[tokio::test]
-async fn control_request_stale_ack_is_ignored() {
+#[test]
+fn control_request_stale_ack_is_ignored() {
     let mut app = app();
 
     app.apply_event(TurnEvent::ControlRequestFinished {

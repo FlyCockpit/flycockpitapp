@@ -158,10 +158,10 @@ fn no_model_send_opens_wizard_preserves_input() {
     assert!(app.dialog.test_provider_is_add());
 }
 
-#[test]
-fn trust_dialog_persists_decision() {
+#[tokio::test]
+async fn trust_dialog_persists_decision() {
     let tmp = tempfile::tempdir().unwrap();
-    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let _home = TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
     write_raw_config(tmp.path(), r#"{"daemon":{"autostart":"ask"}}"#);
     let db = cockpit_db::Db::open_in_memory().unwrap();
     let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
@@ -180,6 +180,7 @@ fn trust_dialog_persists_decision() {
 
     let decision = db
         .workspace_trust_by_root(&root.root)
+        .await
         .unwrap()
         .expect("trust decision persisted");
     assert_eq!(

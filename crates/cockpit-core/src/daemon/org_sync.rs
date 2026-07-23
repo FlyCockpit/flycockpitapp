@@ -494,6 +494,8 @@ fn response_hint(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
     use crate::auth::flycockpit::{AccountInfo, with_redaction_token_override};
     use crate::db::session_log::SessionEventKind;
@@ -551,7 +553,19 @@ mod tests {
     }
 
     fn insert_event(db: &Db, kind: SessionEventKind, text: &str) -> i64 {
-        let session = db.create_session("p", "/tmp/project", "builder").unwrap();
+        let session = db
+            .write_blocking(|conn| {
+                crate::db::Db::insert_session_row_conn(
+                    conn,
+                    &crate::db::Db::build_new_session_row_conn(
+                        conn,
+                        "p",
+                        "/tmp/project",
+                        "builder",
+                    )?,
+                )
+            })
+            .unwrap();
         db.insert_session_event(
             session.session_id,
             kind,
@@ -758,7 +772,10 @@ mod tests {
     #[tokio::test]
     async fn redacted_values_never_appear_in_payloads() {
         let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/tmp/project", "builder").unwrap();
+        let session = db
+            .create_session("p", "/tmp/project", "builder")
+            .await
+            .unwrap();
         db.insert_session_event(
             session.session_id,
             SessionEventKind::UserMessage,

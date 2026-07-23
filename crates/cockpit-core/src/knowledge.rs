@@ -1603,12 +1603,12 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         deprecated,
         reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
     )]
-    fn main_db_has_no_vectors() {
+    async fn main_db_has_no_vectors() {
         let tmp = TempDir::new().unwrap();
         let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
         db.read_blocking(|conn| {
@@ -1634,10 +1634,20 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         results.iter().map(|r| r.concept_id.clone()).collect()
     }
 
+    #[allow(deprecated)]
     fn test_session(root: &Path) -> Session {
         let db = crate::db::Db::open(&root.join("cockpit.db")).unwrap();
+        let project_root = root.to_str().unwrap().to_string();
         let row = db
-            .create_session("project", root.to_str().unwrap(), "test")
+            .write_blocking(move |conn| {
+                let row = crate::db::Db::build_new_session_row_conn(
+                    conn,
+                    "project",
+                    &project_root,
+                    "test",
+                )?;
+                crate::db::Db::insert_session_row_conn(conn, &row)
+            })
             .unwrap();
         Session::resume(db, row.session_id).unwrap().unwrap()
     }

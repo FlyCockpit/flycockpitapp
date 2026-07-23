@@ -56,6 +56,7 @@ const TRANSCRIPT_SOURCE: &str =
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
 const MAX_CATALOG_DESCRIPTION_CHARS: usize = 60;
 const SUPPORT_DIRS: [&str; 4] = ["references", "templates", "scripts", "assets"];
+pub const MODEL_SKILL_CATALOG_LABEL: &str = "Available skills";
 static CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DISCOVERY_WALK_CALLS: AtomicU64 = AtomicU64::new(0);
 static CATALOG_CACHE: OnceLock<Mutex<HashMap<Vec<PathBuf>, CatalogCacheEntry>>> = OnceLock::new();
@@ -913,10 +914,20 @@ pub fn find_by_name<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
     skills.iter().find(|s| s.frontmatter.name == name)
 }
 
-/// Build the cheap-model catalog string: one `- name: description` line
-/// per skill. This is the only payload the utility model ever sees for
-/// selection (token economy, GOALS §10) — never a body.
-pub fn catalog_lines(skills: &[Skill]) -> String {
+pub fn is_model_invocable(skill: &Skill) -> bool {
+    !skill.frontmatter.disable_model_invocation
+}
+
+pub fn find_model_invocable_by_name<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
+    skills
+        .iter()
+        .find(|skill| skill.frontmatter.name == name && is_model_invocable(skill))
+}
+
+/// Build the model-facing catalog string: one `- name: description` line per
+/// skill. This is the only payload the utility selector and live agent catalog
+/// ever see before a body is explicitly loaded (token economy, GOALS §10).
+pub fn catalog_lines<'a>(skills: impl IntoIterator<Item = &'a Skill>) -> String {
     let mut out = String::new();
     for s in skills {
         out.push_str("- ");
@@ -1566,6 +1577,51 @@ mod tests {
         ];
         let cat = catalog_lines(&skills);
         assert_eq!(cat, "- a: first\n- b: second\n");
+    }
+
+    #[test]
+    fn model_invocable_lookup_rejects_user_only_skill() {
+        let skills = vec![Skill {
+            frontmatter: SkillFrontmatter {
+                name: "manual".into(),
+                description: "Manual only".into(),
+                disable_model_invocation: true,
+                ..Default::default()
+            },
+            source: PathBuf::from("/x/manual/SKILL.md"),
+        }];
+
+        assert!(find_by_name(&skills, "manual").is_some());
+        assert!(find_model_invocable_by_name(&skills, "manual").is_none());
+    }
+
+    #[test]
+    fn model_invocation_filter_is_shared_by_both_paths() {
+        let model_skill = Skill {
+            frontmatter: SkillFrontmatter {
+                name: "model".into(),
+                description: "Model visible".into(),
+                ..Default::default()
+            },
+            source: PathBuf::from("/x/model/SKILL.md"),
+        };
+        let user_only = Skill {
+            frontmatter: SkillFrontmatter {
+                name: "manual".into(),
+                description: "Manual only".into(),
+                disable_model_invocation: true,
+                ..Default::default()
+            },
+            source: PathBuf::from("/x/manual/SKILL.md"),
+        };
+        let skills = vec![model_skill, user_only];
+
+        let catalog = catalog_lines(skills.iter().filter(|skill| is_model_invocable(skill)));
+
+        assert!(find_model_invocable_by_name(&skills, "model").is_some());
+        assert!(find_model_invocable_by_name(&skills, "manual").is_none());
+        assert!(catalog.contains("- model: Model visible"));
+        assert!(!catalog.contains("manual"));
     }
 
     #[test]

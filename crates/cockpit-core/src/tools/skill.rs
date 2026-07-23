@@ -17,6 +17,8 @@ use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
 
 pub struct SkillTool;
 
+const UNKNOWN_SKILL_AVAILABLE_LIMIT: usize = 20;
+
 #[async_trait]
 impl Tool for SkillTool {
     fn name(&self) -> &str {
@@ -28,15 +30,15 @@ impl Tool for SkillTool {
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some(
+        Some(format!(
             "Pull a named skill's full instructions into your context on demand. Skills are \
-             reusable, task-specific playbooks the user has installed; the system prompt lists \
+             reusable, task-specific playbooks the user has installed; the `{}` message lists \
              each available skill by name and one-line summary, but NOT its body. When a task \
              matches a listed skill, call this with that skill's exact name to load its detailed \
-             steps before you proceed — don't guess the procedure. Only names shown in the \
-             available-skills list will load."
-                .to_string(),
-        )
+             steps before you proceed — don't guess the procedure. Only names shown in that \
+             catalog will load.",
+            crate::skills::MODEL_SKILL_CATALOG_LABEL
+        ))
     }
 
     fn parameters(&self) -> Value {
@@ -51,10 +53,11 @@ impl Tool for SkillTool {
     }
 
     fn defensive_parameters(&self) -> Option<Value> {
+        let label = crate::skills::MODEL_SKILL_CATALOG_LABEL;
         Some(serde_json::json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "The exact name of the skill to load, as shown in the available-skills list in your context; unknown names do not load" },
+                "name": { "type": "string", "description": format!("The exact name of the skill to load, as shown in the `{label}` catalog; unknown names do not load") },
                 "path": { "type": "string", "description": "Optional relative support-file path under references/, templates/, scripts/, or assets/; traversal is rejected" }
             },
             "required": ["name"]
@@ -145,16 +148,13 @@ fn load_skill_for_session(
     let skills =
         crate::skills::discover_for_session(cwd, &extended.skills, activation).unwrap_or_default();
 
-    let Some(skill) = crate::skills::find_by_name(&skills, name) else {
-        let available = if skills.is_empty() {
-            "(none discovered)".to_string()
-        } else {
-            skills
-                .iter()
-                .map(|s| s.frontmatter.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+    let Some(skill) = crate::skills::find_model_invocable_by_name(&skills, name) else {
+        if crate::skills::find_by_name(&skills, name).is_some() {
+            return Err(invalid_input(format!(
+                "skill `{name}` is user-invocable only and cannot be loaded by the model"
+            )));
+        }
+        let available = model_invocable_available_list(&skills);
         return Err(invalid_input(format!(
             "unknown skill `{name}`; available: {available}"
         )));
@@ -187,6 +187,29 @@ fn load_skill_for_session(
     Ok(ToolOutput::text(format!(
         "Skill `{name}`:\n\n{rendered}{setup_note}"
     )))
+}
+
+fn model_invocable_available_list(skills: &[crate::skills::Skill]) -> String {
+    let names: Vec<&str> = skills
+        .iter()
+        .filter(|skill| crate::skills::is_model_invocable(skill))
+        .map(|skill| skill.frontmatter.name.as_str())
+        .collect();
+    if names.is_empty() {
+        return "(none discovered)".to_string();
+    }
+    let shown = names
+        .iter()
+        .take(UNKNOWN_SKILL_AVAILABLE_LIMIT)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = names.len().saturating_sub(UNKNOWN_SKILL_AVAILABLE_LIMIT);
+    if remaining == 0 {
+        shown
+    } else {
+        format!("{shown}, … ({remaining} more)")
+    }
 }
 
 fn record_skill_view(db: Option<&crate::db::Db>, skill: &crate::skills::Skill, name: &str) {
@@ -358,6 +381,88 @@ mod tests {
             crate::engine::tool::classify_failure(&err),
             crate::engine::tool::ToolFailKind::Invocation
         );
+    }
+
+    #[test]
+    fn user_only_skill_is_not_loadable_and_not_advertised() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        write_skill(
+            &scan,
+            "visible",
+            "---\nname: visible\ndescription: visible skill\n---\n",
+            "Visible body.",
+        );
+        write_skill(
+            &scan,
+            "manual",
+            "---\nname: manual\ndescription: manual only\ndisable-model-invocation: true\n---\n",
+            "Manual-only body must not leak.",
+        );
+
+        let err = load_skill_into_output(
+            "manual",
+            tmp.path(),
+            &cfg_for(&scan, false),
+            &no_redact(tmp.path()),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("user-invocable only"), "got {text}");
+        assert!(!text.contains("available:"), "got {text}");
+        assert!(!text.contains("Manual-only body"), "got {text}");
+
+        let err = load_skill_into_output(
+            "missing",
+            tmp.path(),
+            &cfg_for(&scan, false),
+            &no_redact(tmp.path()),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("available: visible"), "got {text}");
+        assert!(!text.contains("manual"), "got {text}");
+    }
+
+    #[test]
+    fn unknown_skill_available_list_is_capped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        for i in 0..25 {
+            let name = format!("s{i:02}");
+            write_skill(
+                &scan,
+                &name,
+                &format!("---\nname: {name}\ndescription: skill {i}\n---\n"),
+                "Body.",
+            );
+        }
+
+        let err = load_skill_into_output(
+            "missing",
+            tmp.path(),
+            &cfg_for(&scan, false),
+            &no_redact(tmp.path()),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("s00"), "got {text}");
+        assert!(text.contains("s19"), "got {text}");
+        assert!(!text.contains("s20"), "got {text}");
+        assert!(text.contains("… (5 more)"), "got {text}");
+    }
+
+    #[test]
+    fn defensive_description_matches_the_injected_label() {
+        let tool = SkillTool;
+        let description = tool.defensive_description().unwrap();
+        assert!(description.contains(crate::skills::MODEL_SKILL_CATALOG_LABEL));
+        assert!(!description.contains("system prompt"));
+        let parameters = tool.defensive_parameters().unwrap().to_string();
+        assert!(parameters.contains(crate::skills::MODEL_SKILL_CATALOG_LABEL));
+        assert!(!parameters.contains("system prompt"));
     }
 
     #[test]

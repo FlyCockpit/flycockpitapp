@@ -209,7 +209,7 @@ async fn select_inner(
     let skills: Vec<crate::skills::Skill> =
         crate::skills::discover_for_session(cwd, &extended.skills, &activation)?
             .into_iter()
-            .filter(|s| !s.frontmatter.disable_model_invocation)
+            .filter(crate::skills::is_model_invocable)
             .filter(|s| !already_injected.contains(&s.frontmatter.name))
             .collect();
     if skills.is_empty() {

@@ -646,7 +646,7 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         BuiltinToolInventoryItem {
             family: "Skills",
             name: "skill",
-            summary: "Run user-invocable skills.",
+            summary: "Load named skill instructions and package support files.",
             condition: None,
         },
         BuiltinToolInventoryItem {
@@ -4321,6 +4321,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn skill_inventory_summary_is_accurate() {
+        let skill = builtin_tool_inventory()
+            .iter()
+            .find(|tool| tool.name == "skill")
+            .expect("skill inventory item");
+
+        assert_eq!(
+            skill.summary,
+            "Load named skill instructions and package support files."
+        );
+        assert!(!skill.summary.contains("Run user-invocable skills"));
+    }
+
     /// The per-agent `task` description override (`Build`/`builder`) follows
     /// the same defensive/normal/frontier docs strength as the prompts.
     #[test]
@@ -5311,6 +5325,16 @@ mod tests {
         let cfg = ExtendedConfig::default();
         let out = compose_system_prompt_with("ROLE PROMPT", "abc123", tmp.path(), &cfg);
         assert!(!out.contains("User:"), "block was: {out}");
+    }
+
+    #[test]
+    fn system_prompt_has_no_skill_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ExtendedConfig::default();
+        let out = compose_system_prompt_with("ROLE PROMPT", "abc123", tmp.path(), &cfg);
+
+        assert!(!out.contains(crate::skills::MODEL_SKILL_CATALOG_LABEL));
+        assert!(!out.contains("- deploy:"));
     }
 
     /// Wiring test: the layered loader actually reads `name` out of a

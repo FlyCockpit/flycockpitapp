@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::db::tool_calls::Recovery;
 use crate::engine::interrupt::{freetext_of, selected_id_of};
 use crate::engine::message::{
-    Message, ToolCall, collect_tool_calls, extract_reasoning, extract_text,
+    Message, ToolCall, collect_tool_calls, extract_reasoning, extract_text, extract_user_text,
     strip_think_from_choice, tool_result_message,
 };
 use crate::engine::model::{Model, ModelParams};
@@ -125,6 +125,93 @@ fn guidance_user_message(body: &str, label: Option<&str>) -> Message {
 
 fn guidance_notice_message(text: &str) -> Message {
     Message::user(format!("[project guidance notice] {text}"))
+}
+
+const SKILL_CATALOG_GENERATION_MARKER: &str = "cockpit-skill-catalog-generation:";
+
+fn latest_injected_skill_catalog_generation(history: &[Message]) -> Option<u64> {
+    history.iter().rev().find_map(|message| {
+        let Message::User { content } = message else {
+            return None;
+        };
+        let text = extract_user_text(content);
+        text.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(SKILL_CATALOG_GENERATION_MARKER)
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+    })
+}
+
+fn has_user_text_history(history: &[Message]) -> bool {
+    history.iter().any(|message| {
+        let Message::User { content } = message else {
+            return false;
+        };
+        !extract_user_text(content).trim().is_empty()
+    })
+}
+
+pub(crate) fn inject_available_skills_catalog(
+    history: &mut Vec<Message>,
+    cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    active_tool_names: &[&str],
+) {
+    let (extended, _) = config.configs();
+    inject_available_skills_catalog_for_config(history, cwd, &extended.skills, active_tool_names);
+}
+
+fn inject_available_skills_catalog_for_config(
+    history: &mut Vec<Message>,
+    cwd: &std::path::Path,
+    skills_cfg: &crate::config::extended::SkillsConfig,
+    active_tool_names: &[&str],
+) {
+    inject_available_skills_catalog_for_config_at_generation(
+        history,
+        cwd,
+        skills_cfg,
+        active_tool_names,
+        crate::skills::catalog_generation(),
+    )
+}
+
+fn inject_available_skills_catalog_for_config_at_generation(
+    history: &mut Vec<Message>,
+    cwd: &std::path::Path,
+    skills_cfg: &crate::config::extended::SkillsConfig,
+    active_tool_names: &[&str],
+    generation: u64,
+) {
+    if !active_tool_names.contains(&"skill") {
+        return;
+    }
+
+    match latest_injected_skill_catalog_generation(history) {
+        Some(previous) if previous == generation => return,
+        None if has_user_text_history(history) => return,
+        _ => {}
+    }
+
+    let activation =
+        crate::skills::ActivationContext::from_tool_names(active_tool_names.iter().copied());
+    let skills =
+        crate::skills::discover_for_session(cwd, skills_cfg, &activation).unwrap_or_default();
+    let catalog = crate::skills::catalog_lines(
+        skills
+            .iter()
+            .filter(|skill| crate::skills::is_model_invocable(skill)),
+    );
+    if catalog.trim().is_empty() {
+        return;
+    }
+
+    let label = crate::skills::MODEL_SKILL_CATALOG_LABEL;
+    let body = format!(
+        "{label}\n{SKILL_CATALOG_GENERATION_MARKER} {generation}\nLoad a skill body only through the `skill` tool.\n\n{catalog}"
+    );
+    history.push(guidance_user_message(&body, Some(label)));
 }
 
 fn guidance_scan_skipped_for_trust(path: &std::path::Path) -> bool {
@@ -1811,6 +1898,180 @@ mod project_guidance_injection_tests {
         let cockpit = root.join(".cockpit");
         std::fs::create_dir_all(&cockpit).unwrap();
         std::fs::write(cockpit.join("config.json"), json).unwrap();
+    }
+
+    fn write_skill(root: &std::path::Path, name: &str, frontmatter: &str, body: &str) {
+        let sub = root.join(name);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("SKILL.md"), format!("{frontmatter}{body}")).unwrap();
+    }
+
+    fn skills_cfg(scan: &std::path::Path) -> crate::config::extended::SkillsConfig {
+        crate::config::extended::SkillsConfig {
+            scan_dirs: vec![scan.to_string_lossy().into_owned()],
+            external_dirs: Vec::new(),
+            auto_bang_commands: false,
+            ancestor_walk: false,
+            write_approval: false,
+            prune_builtins: false,
+            consolidate: false,
+        }
+    }
+
+    #[test]
+    fn catalog_injected_once_on_first_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        write_skill(
+            &scan,
+            "deploy",
+            "---\nname: deploy\ndescription: Deploy safely\n---\n",
+            "Body",
+        );
+        let cfg = skills_cfg(&scan);
+        let mut history = Vec::new();
+
+        inject_available_skills_catalog_for_config_at_generation(
+            &mut history,
+            tmp.path(),
+            &cfg,
+            &["skill"],
+            7,
+        );
+        inject_available_skills_catalog_for_config_at_generation(
+            &mut history,
+            tmp.path(),
+            &cfg,
+            &["skill"],
+            7,
+        );
+
+        let texts = user_texts(&history);
+        assert_eq!(texts.len(), 1, "texts: {texts:?}");
+        assert!(texts[0].contains(crate::skills::MODEL_SKILL_CATALOG_LABEL));
+        assert!(texts[0].contains("- deploy: Deploy safely"));
+    }
+
+    #[test]
+    fn catalog_reinjected_after_generation_bump() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        write_skill(
+            &scan,
+            "deploy",
+            "---\nname: deploy\ndescription: Deploy safely\n---\n",
+            "Body",
+        );
+        let cfg = skills_cfg(&scan);
+        let mut history = Vec::new();
+
+        inject_available_skills_catalog_for_config_at_generation(
+            &mut history,
+            tmp.path(),
+            &cfg,
+            &["skill"],
+            7,
+        );
+        inject_available_skills_catalog_for_config_at_generation(
+            &mut history,
+            tmp.path(),
+            &cfg,
+            &["skill"],
+            8,
+        );
+
+        let texts = user_texts(&history);
+        assert_eq!(texts.len(), 2, "texts: {texts:?}");
+        assert!(
+            texts
+                .iter()
+                .all(|text| text.contains("- deploy: Deploy safely"))
+        );
+    }
+
+    #[test]
+    fn no_catalog_without_skill_tool_or_when_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        write_skill(
+            &scan,
+            "deploy",
+            "---\nname: deploy\ndescription: Deploy safely\n---\n",
+            "Body",
+        );
+        let cfg = skills_cfg(&scan);
+        let mut history = Vec::new();
+
+        inject_available_skills_catalog_for_config_at_generation(
+            &mut history,
+            tmp.path(),
+            &cfg,
+            &["read"],
+            7,
+        );
+        assert!(history.is_empty());
+
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let empty_cfg = skills_cfg(&empty);
+        inject_available_skills_catalog_for_config_at_generation(
+            &mut history,
+            tmp.path(),
+            &empty_cfg,
+            &["skill"],
+            7,
+        );
+        assert!(history.is_empty());
+
+        write_skill(
+            &empty,
+            "manual",
+            "---\nname: manual\ndescription: Manual only\ndisable-model-invocation: true\n---\n",
+            "Body",
+        );
+        crate::skills::invalidate_catalog_cache(tmp.path(), &empty_cfg);
+        inject_available_skills_catalog_for_config_at_generation(
+            &mut history,
+            tmp.path(),
+            &empty_cfg,
+            &["skill"],
+            8,
+        );
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn catalog_body_is_nonce_fenced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        write_skill(
+            &scan,
+            "deploy",
+            "---\nname: deploy\ndescription: Deploy safely\n---\n",
+            "Body",
+        );
+        let cfg = skills_cfg(&scan);
+        let mut history = Vec::new();
+
+        inject_available_skills_catalog_for_config_at_generation(
+            &mut history,
+            tmp.path(),
+            &cfg,
+            &["skill"],
+            7,
+        );
+
+        let texts = user_texts(&history);
+        assert_eq!(texts.len(), 1);
+        let lines = texts[0].lines().collect::<Vec<_>>();
+        assert!(lines[0].contains(crate::skills::MODEL_SKILL_CATALOG_LABEL));
+        assert!(lines[1].chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(Some(lines[1]), lines.last().copied());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with(SKILL_CATALOG_GENERATION_MARKER))
+        );
     }
 
     #[tokio::test]

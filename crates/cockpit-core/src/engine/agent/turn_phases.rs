@@ -651,6 +651,8 @@ pub(crate) async fn run_turn(
     let tools = active_tools.definitions(agent.llm_mode);
 
     inject_turn_start_system_messages(&session, &active_tools, is_root, history);
+    let active_tool_names = active_tools.names();
+    super::inject_available_skills_catalog(history, &cwd, &config, &active_tool_names);
 
     // Tell the TUI we've called the model — `Thinking…` shows until the
     // first AssistantTextDelta arrives.

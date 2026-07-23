@@ -1,4 +1,5 @@
 use super::*;
+use cockpit_test_support::provider::{ScriptedProvider, Turn, Usage, WireDialect};
 
 mod context;
 mod delegation;
@@ -16,69 +17,26 @@ mod schedule;
 mod skills_preflight;
 
 fn test_provider_base_url() -> String {
-    static BASE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    BASE_URL
+    static PROVIDER: std::sync::OnceLock<&'static ScriptedProvider> = std::sync::OnceLock::new();
+    PROVIDER
         .get_or_init(|| {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            std::thread::spawn(move || {
-                for stream in listener.incoming() {
-                    let Ok(mut stream) = stream else {
-                        continue;
-                    };
-                    let mut request = Vec::new();
-                    let mut buf = [0_u8; 512];
-                    while let Ok(n) = std::io::Read::read(&mut stream, &mut buf) {
-                        if n == 0 {
-                            break;
-                        }
-                        request.extend_from_slice(&buf[..n]);
-                        if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let header_end = request
-                        .windows(4)
-                        .position(|w| w == b"\r\n\r\n")
-                        .map(|idx| idx + 4)
-                        .unwrap_or(request.len());
-                    let header =
-                        String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
-                    let content_length = header
-                        .lines()
-                        .find_map(|line| line.strip_prefix("content-length:"))
-                        .and_then(|value| value.trim().parse::<usize>().ok())
-                        .unwrap_or(0);
-                    let mut body_read = request.len().saturating_sub(header_end);
-                    while body_read < content_length {
-                        let Ok(n) = std::io::Read::read(&mut stream, &mut buf) else {
-                            break;
-                        };
-                        if n == 0 {
-                            break;
-                        }
-                        body_read += n;
-                    }
-                    let payload = if header.starts_with("post /v1/responses ") {
-                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"test compact brief\"}\n\n\
-                         data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"local\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":3,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":4},\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"test compact brief\"}]}],\"tools\":[]}}\n\n"
-                    } else {
-                        "data: {\"id\":\"c\",\"model\":\"local\",\"choices\":[{\"delta\":{\"content\":\"test compact brief\"},\"finish_reason\":null}],\"usage\":null}\n\n\
-                         data: {\"id\":\"c\",\"model\":\"local\",\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4}}\n\n\
-                         data: [DONE]\n\n"
-                    };
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        payload.len(),
-                        payload
-                    );
-                    let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
-                    let _ = std::io::Write::flush(&mut stream);
-                }
-            });
-            format!("http://{addr}/v1")
+            // Leak the process-wide fixture provider so its listener outlives
+            // every parallel driver test that reuses this cached base URL.
+            Box::leak(Box::new(
+                ScriptedProvider::builder()
+                    .dialect(WireDialect::ChatCompletions)
+                    .turn(Turn::Text("test compact brief".into()))
+                    .with_usage(Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 3,
+                        total_tokens: 4,
+                        use_alias_names: false,
+                    })
+                    .repeat_last()
+                    .start_blocking(),
+            ))
         })
-        .clone()
+        .base_url()
 }
 
 /// Build a driver rooted on a keyless local fixture provider.
@@ -196,113 +154,6 @@ fn learn_tool_args(name: &str) -> serde_json::Value {
     })
 }
 
-fn scripted_learn_provider(
-    args: serde_json::Value,
-    request_count: usize,
-) -> (String, std::sync::mpsc::Receiver<String>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (request_tx, request_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for request_index in 0..request_count {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut buf = [0_u8; 1024];
-            loop {
-                let n = std::io::Read::read(&mut stream, &mut buf).unwrap();
-                if n == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buf[..n]);
-                let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
-                    continue;
-                };
-                let header_end = header_end + 4;
-                let header = String::from_utf8_lossy(&request[..header_end]);
-                let content_length = header
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|value| value.trim().parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                if request.len() >= header_end + content_length {
-                    break;
-                }
-            }
-            let header_end = request
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|index| index + 4)
-                .unwrap();
-            request_tx
-                .send(String::from_utf8_lossy(&request[header_end..]).to_string())
-                .unwrap();
-
-            let body = if request_index == 0 {
-                let start = serde_json::json!({
-                    "id": "learn-1",
-                    "model": "local",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": "learn-save",
-                                "type": "function",
-                                "function": {
-                                    "name": "skill_manage",
-                                    "arguments": args.to_string()
-                                }
-                            }]
-                        },
-                        "finish_reason": null
-                    }],
-                    "usage": null
-                });
-                let finish = serde_json::json!({
-                    "id": "learn-1",
-                    "model": "local",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"tool_calls": []},
-                        "finish_reason": "tool_calls"
-                    }],
-                    "usage": {
-                        "prompt_tokens": 1,
-                        "completion_tokens": 1,
-                        "total_tokens": 2
-                    }
-                });
-                format!("data: {start}\n\ndata: {finish}\n\ndata: [DONE]\n\n")
-            } else {
-                let text = serde_json::json!({
-                    "id": "learn-2",
-                    "model": "local",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": "Saved the reusable skill."},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {
-                        "prompt_tokens": 1,
-                        "completion_tokens": 1,
-                        "total_tokens": 2
-                    }
-                });
-                format!("data: {text}\n\ndata: [DONE]\n\n")
-            };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
-        }
-    });
-    (format!("http://{addr}/v1"), request_rx)
-}
-
 fn learn_driver(
     approval: bool,
     skill_name: &str,
@@ -311,7 +162,7 @@ fn learn_driver(
     Driver,
     tempfile::TempDir,
     std::path::PathBuf,
-    std::sync::mpsc::Receiver<String>,
+    ScriptedProvider,
 ) {
     use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig, WireApi};
     use std::collections::BTreeMap;
@@ -339,8 +190,16 @@ fn learn_driver(
     )
     .unwrap();
 
-    let (provider_url, requests) =
-        scripted_learn_provider(learn_tool_args(skill_name), request_count);
+    let mut provider_builder = ScriptedProvider::builder().turn(Turn::ToolCall {
+        id: "learn-save".into(),
+        name: "skill_manage".into(),
+        arguments: learn_tool_args(skill_name),
+    });
+    if request_count > 1 {
+        provider_builder = provider_builder.turn(Turn::Text("Saved the reusable skill.".into()));
+    }
+    let provider = provider_builder.start_blocking();
+    let provider_url = provider.base_url();
     let mut providers = BTreeMap::new();
     providers.insert(
         "scripted".to_string(),
@@ -399,7 +258,7 @@ fn learn_driver(
             ),
         ),
     });
-    (driver, tmp, root, requests)
+    (driver, tmp, root, provider)
 }
 
 fn set_active_delegated_recursion(

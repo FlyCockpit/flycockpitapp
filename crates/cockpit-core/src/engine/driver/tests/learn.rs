@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn learn_saves_conformant_foreground_skill() {
-    let (mut driver, tmp, root, requests) = learn_driver(false, "learned-workflow", 2);
+    let (mut driver, tmp, root, provider) = learn_driver(false, "learned-workflow", 2);
     let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
     let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
     let (turn_tx, _turn_rx) = mpsc::channel(64);
@@ -13,16 +13,17 @@ async fn learn_saves_conformant_foreground_skill() {
         .await
         .unwrap();
 
-    let first_request = requests
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap();
+    let captured = provider.captured();
+    assert_eq!(provider.request_count(), 2);
+    let first_request = captured
+        .first()
+        .expect("learn provider first request")
+        .body
+        .to_string();
     assert!(first_request.contains("cockpit verify --local"));
     assert!(first_request.contains("local verification completed successfully"));
     assert!(first_request.contains("Create a reusable Agent Skill"));
     assert!(first_request.contains("skill_manage"));
-    requests
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap();
 
     let config = crate::config::extended::load_for_cwd(tmp.path());
     let skills = crate::skills::discover(tmp.path(), &config.skills).unwrap();
@@ -37,7 +38,7 @@ async fn learn_saves_conformant_foreground_skill() {
 
 #[tokio::test]
 async fn learn_respects_write_gate() {
-    let (mut driver, _tmp, root, requests) = learn_driver(true, "gated-learn", 1);
+    let (mut driver, _tmp, root, provider) = learn_driver(true, "gated-learn", 1);
     let db = driver.session.db.clone();
     let session_id = driver.session.id;
     let (events, _event_rx) = tokio::sync::broadcast::channel(8);
@@ -82,9 +83,13 @@ async fn learn_respects_write_gate() {
         parked.resume.call_origin,
         crate::db::needs_attention::InterruptCallOrigin::Foreground
     );
-    let first_request = requests
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap();
+    assert_eq!(provider.request_count(), 1);
+    let first_request = provider
+        .captured()
+        .first()
+        .expect("learn gate provider first request")
+        .body
+        .to_string();
     assert!(first_request.contains("cockpit verify --local"));
     assert!(first_request.contains("our verified workflow"));
 }

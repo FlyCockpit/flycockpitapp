@@ -195,25 +195,14 @@ fn write_delegated_model_config(driver: &mut Driver, models: &[&str]) {
     );
 }
 
-fn failing_provider_base_url() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else {
-                continue;
-            };
-            let body = r#"{"error":{"message":"server failed"}}"#;
-            let resp = format!(
-                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
-            let _ = std::io::Write::flush(&mut stream);
-        }
-    });
-    format!("http://{addr}/v1")
+fn failing_provider() -> cockpit_test_support::provider::ScriptedProvider {
+    cockpit_test_support::provider::ScriptedProvider::builder()
+        .turn(cockpit_test_support::provider::Turn::HttpError {
+            status: 500,
+            body: r#"{"error":{"message":"server failed"}}"#.into(),
+        })
+        .repeat_last()
+        .start_blocking()
 }
 
 fn write_delegated_model_config_with_backup(
@@ -477,7 +466,9 @@ fn delegated_child_succeeds_via_fallback_chain_and_export_records_it() {
                 .unwrap()
                 .block_on(async {
                     let (mut driver, _tmp) = test_driver(8);
-                    let primary_url = failing_provider_base_url();
+                    let primary_provider = failing_provider();
+                    // Keep the provider alive for the delegation run; dropping it closes the listener.
+                    let primary_url = primary_provider.base_url();
                     let backup_url = test_provider_base_url();
                     write_delegated_model_config_with_backup(
                         &mut driver,

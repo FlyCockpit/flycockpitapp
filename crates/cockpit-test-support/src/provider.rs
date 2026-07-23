@@ -204,6 +204,24 @@ impl ScriptedProviderBuilder {
             accept_task,
         }
     }
+
+    /// Start the provider from synchronous tests.
+    ///
+    /// When called inside an existing Tokio runtime, startup is delegated to a
+    /// short-lived OS thread so this function does not block that runtime's
+    /// executor. The returned provider owns the background runtime that serves
+    /// accepted connections.
+    pub fn start_blocking(self) -> ScriptedProvider {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                tx.send(start_on_owned_runtime(self))
+                    .expect("send blocking scripted provider");
+            });
+            return rx.recv().expect("receive blocking scripted provider");
+        }
+        start_on_owned_runtime(self)
+    }
 }
 
 impl ScriptedProvider {
@@ -321,10 +339,34 @@ async fn handle_connection(
             write_response(&mut stream, 200, "application/json", &body.to_string()).await;
         }
         other => {
-            let payload = emit_turn(state.dialect, other, turn.usage.as_ref());
+            let payload = emit_turn(
+                state.dialect.for_request_path(&parsed.path),
+                other,
+                turn.usage.as_ref(),
+            );
             write_response(&mut stream, 200, "text/event-stream", &payload).await;
         }
     }
+}
+
+impl WireDialect {
+    fn for_request_path(self, path: &str) -> Self {
+        if self == Self::ChatCompletions && path.ends_with("/responses") {
+            Self::Responses
+        } else {
+            self
+        }
+    }
+}
+
+fn start_on_owned_runtime(builder: ScriptedProviderBuilder) -> ScriptedProvider {
+    let runtime = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build scripted provider runtime"),
+    ));
+    runtime.block_on(builder.start())
 }
 
 impl SharedState {
@@ -1010,18 +1052,22 @@ mod tests {
     #[tokio::test]
     async fn scripted_provider_dispatches_responses_and_chat_paths_from_one_listener() {
         let provider = ScriptedProvider::builder()
-            .dialect(WireDialect::Responses)
             .path_status_for("/v1/responses", 404, 1)
             .turn(Turn::Text("chat fallback".into()))
+            .turn(Turn::Text("responses fallback".into()))
             .start()
             .await;
 
         let responses = request(&provider, "/responses", json!({})).await;
         let chat = request(&provider, "/chat/completions", json!({})).await;
+        let responses_ok = request(&provider, "/responses", json!({})).await;
 
         assert_eq!(responses.status, 404);
         assert_eq!(chat.status, 200);
         assert!(chat.body.contains("chat fallback"));
+        assert_eq!(responses_ok.status, 200);
+        assert!(responses_ok.body.contains("response.output_text.delta"));
+        assert!(responses_ok.body.contains("responses fallback"));
     }
 
     #[tokio::test]

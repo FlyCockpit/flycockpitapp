@@ -1,151 +1,66 @@
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::support::{IsolatedHome, output_text};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use cockpit_test_support::provider::{ScriptedProvider, Turn};
 
 const TOOL_CALL_ID: &str = "run-approval-call";
 
-struct RunProvider {
-    base_url: String,
-    saw_structured_denial: Arc<AtomicBool>,
-    saw_question_headless_guidance: Arc<AtomicBool>,
-}
-
-impl RunProvider {
-    async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind run provider");
-        let addr = listener.local_addr().expect("run provider addr");
-        let saw_structured_denial = Arc::new(AtomicBool::new(false));
-        let denial_probe = saw_structured_denial.clone();
-        let saw_question_headless_guidance = Arc::new(AtomicBool::new(false));
-        let question_probe = saw_question_headless_guidance.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let denial_probe = denial_probe.clone();
-                let question_probe = question_probe.clone();
-                tokio::spawn(async move {
-                    let body = read_http_request(&mut stream).await;
-                    if body.contains(
-                        "noninteractive run: approval auto-denied; re-run with --approve <class> or use the TUI",
-                    ) {
-                        denial_probe.store(true, Ordering::SeqCst);
-                    }
-                    if body.contains("No interactive client is attached")
-                        && body.contains("Proceed on your best judgment")
-                        && body.contains("state the assumption")
-                    {
-                        question_probe.store(true, Ordering::SeqCst);
-                    }
-                    if body.contains("cause inference failure") {
-                        let payload = r#"{"error":{"message":"injected inference failure"}}"#;
-                        let response = format!(
-                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            payload.len(),
-                            payload
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                        let _ = stream.flush().await;
-                        return;
-                    }
-                    let payload = if body.contains("\"role\":\"tool\"") {
-                        text_stream("adapted after approval result")
-                    } else if body.contains("trigger question decision") {
-                        question_call_stream()
-                    } else if body.contains("trigger") && body.contains("approval") {
-                        tool_call_stream(body.contains("sandbox") && cfg!(target_os = "linux"))
-                    } else {
-                        text_stream("run dispatched")
-                    };
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        payload.len(),
-                        payload
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.flush().await;
-                });
-            }
-        });
-        Self {
-            base_url: format!("http://{addr}/v1"),
-            saw_structured_denial,
-            saw_question_headless_guidance,
-        }
+async fn run_provider(turns: Vec<Turn>) -> ScriptedProvider {
+    let mut builder = ScriptedProvider::builder();
+    for turn in turns {
+        builder = builder.turn(turn);
     }
+    builder.start().await
 }
 
-async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 4096];
-    loop {
-        let count = match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => return String::new(),
-            Ok(count) => count,
-        };
-        bytes.extend_from_slice(&chunk[..count]);
-        let text = String::from_utf8_lossy(&bytes);
-        let Some(headers_end) = text.find("\r\n\r\n") else {
-            continue;
-        };
-        let content_len = text[..headers_end]
-            .lines()
-            .find_map(|line| {
-                line.to_ascii_lowercase()
-                    .strip_prefix("content-length:")
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-            })
-            .unwrap_or(0);
-        let body_start = headers_end + 4;
-        if bytes.len() >= body_start + content_len {
-            return String::from_utf8_lossy(&bytes[body_start..body_start + content_len])
-                .to_string();
-        }
-    }
+async fn repeating_text_provider(text: &str) -> ScriptedProvider {
+    ScriptedProvider::builder()
+        .turn(Turn::Text(text.into()))
+        .repeat_last()
+        .start()
+        .await
 }
 
-fn tool_call_stream(sandbox_escalation: bool) -> String {
-    let args = if sandbox_escalation {
+fn approval_tool_turn(sandbox_escalation: bool) -> Turn {
+    let arguments = if sandbox_escalation {
         serde_json::json!({ "command": "cat /etc/hostname" })
     } else {
         serde_json::json!({ "command": "pwd", "cwd": "/etc" })
+    };
+    Turn::ToolCall {
+        id: TOOL_CALL_ID.into(),
+        name: "bash".into(),
+        arguments,
     }
-    .to_string();
-    let escaped_args = serde_json::to_string(&args).expect("serialize tool args");
-    format!(
-        "data: {{\"id\":\"run\",\"model\":\"scripted\",\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"{TOOL_CALL_ID}\",\"type\":\"function\",\"function\":{{\"name\":\"bash\",\"arguments\":{escaped_args}}}}}]}},\"finish_reason\":null}}],\"usage\":null}}\n\n\
-         data: {{\"id\":\"run\",\"model\":\"scripted\",\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}\n\n\
-         data: [DONE]\n\n"
-    )
 }
 
-fn question_call_stream() -> String {
-    let args = serde_json::json!({
-        "questions": [{ "type": "text", "prompt": "Need input?" }]
-    })
-    .to_string();
-    let escaped_args = serde_json::to_string(&args).expect("serialize question args");
-    format!(
-        "data: {{\"id\":\"run\",\"model\":\"scripted\",\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"question-call\",\"type\":\"function\",\"function\":{{\"name\":\"question\",\"arguments\":{escaped_args}}}}}]}},\"finish_reason\":null}}],\"usage\":null}}\n\n\
-         data: {{\"id\":\"run\",\"model\":\"scripted\",\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}\n\n\
-         data: [DONE]\n\n"
-    )
+fn question_tool_turn() -> Turn {
+    Turn::ToolCall {
+        id: "question-call".into(),
+        name: "question".into(),
+        arguments: serde_json::json!({
+            "questions": [{ "type": "text", "prompt": "Need input?" }]
+        }),
+    }
 }
 
-fn text_stream(text: &str) -> String {
-    let text = serde_json::to_string(text).expect("serialize text delta");
-    format!(
-        "data: {{\"id\":\"run\",\"model\":\"scripted\",\"choices\":[{{\"delta\":{{\"content\":{text}}},\"finish_reason\":null}}],\"usage\":null}}\n\n\
-         data: {{\"id\":\"run\",\"model\":\"scripted\",\"choices\":[{{\"delta\":{{\"content\":\"\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}\n\n\
-         data: [DONE]\n\n"
-    )
+fn text_turn(text: &str) -> Turn {
+    Turn::Text(text.into())
+}
+
+fn inference_failure_turn() -> Turn {
+    Turn::HttpError {
+        status: 400,
+        body: r#"{"error":{"message":"injected inference failure"}}"#.into(),
+    }
+}
+
+fn captured_contains(provider: &ScriptedProvider, needle: &str) -> bool {
+    provider
+        .captured()
+        .iter()
+        .any(|request| request.body.to_string().contains(needle))
 }
 
 fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
@@ -207,9 +122,10 @@ fn ephemeral_rejects_continuation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ephemeral_flag_combinations_dispatch() {
-    let provider = RunProvider::start().await;
+    // Keep the provider alive for the spawned run process; dropping it closes the listener.
+    let provider = repeating_text_provider("run dispatched").await;
     let home = IsolatedHome::new();
-    home.write_local_provider_config(&provider.base_url);
+    home.write_local_provider_config(&provider.base_url());
     home.trust_project();
 
     let mut command = home.cockpit();
@@ -243,9 +159,10 @@ async fn ephemeral_flag_combinations_dispatch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inference_failure_is_loud() {
-    let provider = RunProvider::start().await;
+    // Keep the provider alive for the spawned run processes; dropping it closes the listener.
+    let provider = run_provider(vec![inference_failure_turn(), inference_failure_turn()]).await;
     let home = IsolatedHome::new();
-    home.write_local_provider_config(&provider.base_url);
+    home.write_local_provider_config(&provider.base_url());
     home.trust_project();
 
     let mut default_command = home.cockpit();
@@ -290,9 +207,10 @@ async fn inference_failure_is_loud() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn usage_errors_exit_two_and_post_attach_error_keeps_session_id() {
-    let provider = RunProvider::start().await;
+    // Keep the provider alive for the spawned run processes; dropping it closes the listener.
+    let provider = repeating_text_provider("run dispatched").await;
     let home = IsolatedHome::new();
-    home.write_local_provider_config(&provider.base_url);
+    home.write_local_provider_config(&provider.base_url());
     home.trust_project();
 
     let mut invalid_agent = home.cockpit();
@@ -320,9 +238,10 @@ async fn usage_errors_exit_two_and_post_attach_error_keeps_session_id() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cwd_flag_sets_workspace_root() {
-    let provider = RunProvider::start().await;
+    // Keep the provider alive for the spawned run process; dropping it closes the listener.
+    let provider = repeating_text_provider("run dispatched").await;
     let home = IsolatedHome::new();
-    home.write_local_provider_config(&provider.base_url);
+    home.write_local_provider_config(&provider.base_url());
     home.trust_project();
     let target = home.project_path().join("target");
     std::fs::create_dir(&target).expect("create target workspace");
@@ -411,9 +330,18 @@ async fn cwd_flag_sets_workspace_root() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_approval_auto_denied() {
-    let provider = RunProvider::start().await;
+    // Keep the provider alive for the spawned run processes; dropping it closes the listener.
+    let provider = run_provider(vec![
+        approval_tool_turn(cfg!(target_os = "linux")),
+        text_turn("adapted after approval result"),
+        approval_tool_turn(cfg!(target_os = "linux")),
+        text_turn("adapted after approval result"),
+        question_tool_turn(),
+        text_turn("adapted after approval result"),
+    ])
+    .await;
     let home = IsolatedHome::new();
-    home.write_local_provider_config(&provider.base_url);
+    home.write_local_provider_config(&provider.base_url());
     std::fs::write(
         home.config_dir().join("config.json"),
         r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox_escalation_enabled":true}"#,
@@ -440,7 +368,10 @@ async fn run_approval_auto_denied() {
         String::from_utf8_lossy(&default_output.stdout).contains("adapted after approval result")
     );
     assert!(
-        provider.saw_structured_denial.load(Ordering::SeqCst),
+        captured_contains(
+            &provider,
+            "noninteractive run: approval auto-denied; re-run with --approve <class> or use the TUI"
+        ),
         "model did not receive the structured noninteractive denial"
     );
 
@@ -463,12 +394,6 @@ async fn run_approval_auto_denied() {
     );
     assert!(stdout.contains("\"outcome\":\"auto_denied\""), "{stdout}");
 
-    provider
-        .saw_structured_denial
-        .store(false, Ordering::SeqCst);
-    provider
-        .saw_question_headless_guidance
-        .store(false, Ordering::SeqCst);
     let mut question_command = home.cockpit();
     question_command.args(["run", "--ephemeral", "--json", "trigger question decision"]);
     let question_output = spawn_run(question_command);
@@ -478,18 +403,23 @@ async fn run_approval_auto_denied() {
         output_text(&question_output)
     );
     assert!(
-        provider
-            .saw_question_headless_guidance
-            .load(Ordering::SeqCst),
+        captured_contains(&provider, "No interactive client is attached")
+            && captured_contains(&provider, "Proceed on your best judgment")
+            && captured_contains(&provider, "state the assumption"),
         "headless question guidance did not reach the model"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_approve_class_grants() {
-    let provider = RunProvider::start().await;
+    // Keep the provider alive for the spawned run process; dropping it closes the listener.
+    let provider = run_provider(vec![
+        approval_tool_turn(false),
+        text_turn("adapted after approval result"),
+    ])
+    .await;
     let home = IsolatedHome::new();
-    home.write_local_provider_config(&provider.base_url);
+    home.write_local_provider_config(&provider.base_url());
     home.trust_project();
 
     let mut command = home.cockpit();

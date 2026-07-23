@@ -3,85 +3,23 @@ use std::time::Duration;
 
 use crate::support::{IsolatedHome, SpawnedDaemon, assert_failure, assert_success, output_text};
 use cockpit_cli::integration::{DaemonClient, DaemonEvent};
+use cockpit_test_support::provider::{ScriptedProvider, Turn};
 use rusqlite::{Connection, params};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[derive(Clone)]
-struct TextProvider {
-    base_url: String,
-}
-
-impl TextProvider {
-    async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind freshness provider");
-        let addr = listener.local_addr().expect("freshness provider addr");
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    read_http_request(&mut stream).await;
-                    let payload = text_stream("ephemeral history intact");
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        payload.len(),
-                        payload
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.flush().await;
-                });
-            }
-        });
-        Self {
-            base_url: format!("http://{addr}/v1"),
-        }
-    }
-}
-
-async fn read_http_request(stream: &mut tokio::net::TcpStream) {
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 4096];
-    loop {
-        let count = match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
-            Ok(count) => count,
-        };
-        bytes.extend_from_slice(&chunk[..count]);
-        let text = String::from_utf8_lossy(&bytes);
-        let Some(headers_end) = text.find("\r\n\r\n") else {
-            continue;
-        };
-        let content_len = text[..headers_end]
-            .lines()
-            .find_map(|line| {
-                line.to_ascii_lowercase()
-                    .strip_prefix("content-length:")
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-            })
-            .unwrap_or(0);
-        if bytes.len() >= headers_end + 4 + content_len {
-            return;
-        }
-    }
-}
-
-fn text_stream(text: &str) -> String {
-    let text = serde_json::to_string(text).expect("serialize provider text");
-    format!(
-        "data: {{\"id\":\"fresh\",\"model\":\"scripted\",\"choices\":[{{\"delta\":{{\"content\":{text}}},\"finish_reason\":null}}],\"usage\":null}}\n\n\
-         data: {{\"id\":\"fresh\",\"model\":\"scripted\",\"choices\":[{{\"delta\":{{\"content\":\"\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}\n\n\
-         data: [DONE]\n\n"
-    )
+async fn text_provider() -> ScriptedProvider {
+    ScriptedProvider::builder()
+        .turn(Turn::Text("ephemeral history intact".into()))
+        .repeat_last()
+        .start()
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_trust_read_through() {
-    let provider = TextProvider::start().await;
+    // Keep the provider alive for the daemon lifetime; dropping it closes the listener.
+    let provider = text_provider().await;
     let home = IsolatedHome::new();
-    home.write_local_provider_config(&provider.base_url);
+    home.write_local_provider_config(&provider.base_url());
     let daemon = SpawnedDaemon::start_with_home(home).await;
     let client = daemon.client().await;
 
@@ -130,9 +68,10 @@ async fn daemon_trust_read_through() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ephemeral_session_resumes_on_shared_daemon() {
-    let provider = TextProvider::start().await;
+    // Keep the provider alive for the daemon lifetime; dropping it closes the listener.
+    let provider = text_provider().await;
     let home = IsolatedHome::new();
-    home.write_local_provider_config(&provider.base_url);
+    home.write_local_provider_config(&provider.base_url());
     home.trust_project();
 
     let ephemeral_socket = home

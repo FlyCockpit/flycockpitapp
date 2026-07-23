@@ -1,15 +1,12 @@
 use std::future::Future;
 use std::path::Path;
-use std::sync::{
-    Arc, LazyLock, Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use crate::support::{IsolatedHome, SpawnedDaemon, log_tail, output_text, wait_until};
 use cockpit_cli::integration::{AttachedSession, DaemonEvent};
+use cockpit_test_support::provider::{ScriptedProvider, Turn};
 use rusqlite::{Connection, params};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 const TOOL_CALL_ID: &str = "call_lifecycle_bash";
@@ -29,101 +26,17 @@ fn run_daemon_replay_test(test: impl Future<Output = ()>) {
         .block_on(test);
 }
 
-#[derive(Clone)]
-struct ScriptedProvider {
-    base_url: String,
-    requests: Arc<AtomicUsize>,
-}
-
-impl ScriptedProvider {
-    async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind scripted provider");
-        let addr = listener.local_addr().expect("scripted provider addr");
-        let requests = Arc::new(AtomicUsize::new(0));
-        let request_count = requests.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let ordinal = request_count.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(async move {
-                    let _body = read_http_request(&mut stream).await;
-                    let payload = if ordinal == 0 {
-                        tool_call_stream()
-                    } else {
-                        text_stream("lifecycle complete")
-                    };
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        payload.len(),
-                        payload
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    let _ = stream.flush().await;
-                });
-            }
-        });
-        Self {
-            base_url: format!("http://{addr}/v1"),
-            requests,
-        }
-    }
-
-    fn request_count(&self) -> usize {
-        self.requests.load(Ordering::SeqCst)
-    }
-}
-
-async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    loop {
-        let n = match stream.read(&mut tmp).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        buf.extend_from_slice(&tmp[..n]);
-        let s = String::from_utf8_lossy(&buf);
-        if let Some(idx) = s.find("\r\n\r\n") {
-            let header = &s[..idx];
-            let body_start = idx + 4;
-            let content_len = header
-                .lines()
-                .find_map(|l| {
-                    let l = l.to_ascii_lowercase();
-                    l.strip_prefix("content-length:")
-                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                })
-                .unwrap_or(0);
-            if buf.len() >= body_start + content_len {
-                return String::from_utf8_lossy(&buf[body_start..body_start + content_len])
-                    .to_string();
-            }
-        }
-    }
-    String::new()
-}
-
-fn tool_call_stream() -> String {
-    let args = serde_json::json!({ "command": COMMAND }).to_string();
-    let escaped_args = serde_json::to_string(&args).expect("serialize tool args string");
-    format!(
-        "data: {{\"id\":\"c\",\"model\":\"scripted\",\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"{TOOL_CALL_ID}\",\"type\":\"function\",\"function\":{{\"name\":\"bash\",\"arguments\":{escaped_args}}}}}]}},\"finish_reason\":null}}],\"usage\":null}}\n\n\
-         data: {{\"id\":\"c\",\"model\":\"scripted\",\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}\n\n\
-         data: [DONE]\n\n"
-    )
-}
-
-fn text_stream(text: &str) -> String {
-    let text = serde_json::to_string(text).expect("serialize text delta");
-    format!(
-        "data: {{\"id\":\"c\",\"model\":\"scripted\",\"choices\":[{{\"delta\":{{\"content\":{text}}},\"finish_reason\":null}}],\"usage\":null}}\n\n\
-         data: {{\"id\":\"c\",\"model\":\"scripted\",\"choices\":[{{\"delta\":{{\"content\":\"\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}\n\n\
-         data: [DONE]\n\n"
-    )
+async fn lifecycle_provider() -> ScriptedProvider {
+    ScriptedProvider::builder()
+        .turn(Turn::ToolCall {
+            id: TOOL_CALL_ID.into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({ "command": COMMAND }),
+        })
+        .turn(Turn::Text("lifecycle complete".into()))
+        .repeat_last()
+        .start()
+        .await
 }
 
 #[derive(Debug, Clone)]
@@ -368,12 +281,13 @@ async fn drive_auto_replay_to_tool_call(
 async fn create_parked_session_with_hook(
     pause_replay_executing: bool,
 ) -> (ScriptedProvider, SpawnedDaemon, AttachedSession, Uuid) {
-    let provider = ScriptedProvider::start().await;
+    // Keep the provider alive for the daemon lifetime; dropping it closes the listener.
+    let provider = lifecycle_provider().await;
     let mut home = IsolatedHome::new();
     if pause_replay_executing {
         home.set_env("COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING", "1");
     }
-    home.write_local_provider_config(&provider.base_url);
+    home.write_local_provider_config(&provider.base_url());
     home.trust_project();
     let daemon = SpawnedDaemon::start_with_home(home).await;
     let client = daemon.client().await;
@@ -399,12 +313,13 @@ async fn create_parked_session() -> (ScriptedProvider, SpawnedDaemon, AttachedSe
 async fn create_auto_gate_parked_session_with_hook(
     pause_replay_executing: bool,
 ) -> (ScriptedProvider, SpawnedDaemon, AttachedSession, Uuid) {
-    let provider = ScriptedProvider::start().await;
+    // Keep the provider alive for the daemon lifetime; dropping it closes the listener.
+    let provider = lifecycle_provider().await;
     let mut home = IsolatedHome::new();
     if pause_replay_executing {
         home.set_env("COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING", "1");
     }
-    home.write_local_provider_config(&provider.base_url);
+    home.write_local_provider_config(&provider.base_url());
     std::fs::write(
         home.config_dir().join("config.json"),
         r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox_escalation_enabled":true,"defaultApprovalMode":"auto"}"#,

@@ -276,6 +276,7 @@ impl Session {
             trusted_only: Arc::new(AtomicBool::new(false)),
             active_tool_names: Mutex::new(std::collections::HashSet::new()),
             active_sandbox_escalate_eligible: AtomicBool::new(false),
+            has_retrievable_tool_results: AtomicBool::new(false),
             last_tool_call: Mutex::new(None),
             last_recoverable_tool_call: Mutex::new(None),
             // Persisted by default; `create_deferred` overrides this with the

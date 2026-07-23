@@ -229,7 +229,7 @@ impl Driver {
     /// compaction. A prior compaction owns its serialized handoff/tail as one
     /// boundary row, so that boundary's seq represents those messages on a
     /// later compaction instead of inventing ephemeral wire-history indexes.
-    pub(in crate::engine::driver) fn compact_tail_message_seqs(
+    pub(in crate::engine::driver) async fn compact_tail_message_seqs(
         &self,
         tail_turns: usize,
     ) -> Vec<i64> {
@@ -242,7 +242,9 @@ impl Driver {
             &self.session.db,
             self.session.id,
             self.active_agent(),
-        ) else {
+        )
+        .await
+        else {
             return Vec::new();
         };
         let excluded_skill_calls = self
@@ -336,21 +338,27 @@ impl Driver {
         for candidate in prune::condense_candidates(&top.history) {
             let hash =
                 crate::db::compressed_results::compressed_result_hash(&candidate.original_body);
-            match self.session.db.insert_compressed_tool_result(
-                &hash,
-                crate::db::compressed_results::NewCompressedToolResult {
-                    session_id: self.session.id,
-                    agent_id: &agent_name,
-                    tool: &candidate.tool,
-                    call_id: &candidate.call_id,
-                    original_byte_len: candidate.original_body.len(),
-                    compressed_byte_len: Some(candidate.condensed_body.len()),
-                    created_at: chrono::Utc::now().timestamp(),
-                    kind: "prune-boundary",
-                    content: &candidate.original_body,
-                },
-            ) {
+            match self
+                .session
+                .db
+                .insert_compressed_tool_result(
+                    &hash,
+                    crate::db::compressed_results::NewCompressedToolResult {
+                        session_id: self.session.id,
+                        agent_id: &agent_name,
+                        tool: &candidate.tool,
+                        call_id: &candidate.call_id,
+                        original_byte_len: candidate.original_body.len(),
+                        compressed_byte_len: Some(candidate.condensed_body.len()),
+                        created_at: chrono::Utc::now().timestamp(),
+                        kind: "prune-boundary",
+                        content: &candidate.original_body,
+                    },
+                )
+                .await
+            {
                 Ok(()) => {
+                    self.session.set_has_retrievable_tool_results();
                     prune::apply_condensed_tool_result(&mut top.history, &candidate, &hash);
                 }
                 Err(e) => {
@@ -408,19 +416,22 @@ impl Driver {
         // before the next `inference_request` event by construction
         // (auto-prune fires right before a `turn`).
         if bodies > 0
-            && let Err(e) = self.session.record_context_pruned(
-                &agent_name,
-                auto,
-                messages_before,
-                messages_after,
-                tokens_before,
-                tokens_after,
-                &this_elided,
-                &reason,
-                tokens_saved,
-                remaining_budget,
-                trigger_reason,
-            )
+            && let Err(e) = self
+                .session
+                .record_context_pruned(
+                    &agent_name,
+                    auto,
+                    messages_before,
+                    messages_after,
+                    tokens_before,
+                    tokens_after,
+                    &this_elided,
+                    &reason,
+                    tokens_saved,
+                    remaining_budget,
+                    trigger_reason,
+                )
+                .await
         {
             tracing::warn!(error = %e, "record context_pruned event failed");
         }
@@ -491,7 +502,7 @@ impl Driver {
         all_small && climbing
     }
 
-    pub(in crate::engine::driver) fn record_auto_prune_skip(
+    pub(in crate::engine::driver) async fn record_auto_prune_skip(
         &self,
         agent_name: &str,
         trigger_reason: &str,
@@ -510,12 +521,16 @@ impl Driver {
             "plan_reason": classify_prune_reason(plan),
             "watermark_advanced": watermark_advanced,
         });
-        if let Err(e) = self.session.record_event(
-            crate::db::session_log::SessionEventKind::AutoPruneDiagnostic,
-            Some(agent_name),
-            None,
-            &data,
-        ) {
+        if let Err(e) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::AutoPruneDiagnostic,
+                Some(agent_name),
+                None,
+                &data,
+            )
+            .await
+        {
             tracing::warn!(error = %e, "recording auto-prune diagnostic failed");
         }
     }
@@ -617,7 +632,8 @@ impl Driver {
                 tokens_saved,
                 skip_reason,
                 true,
-            );
+            )
+            .await;
             return false;
         }
         // Warm cache + threshold-driven prune → the cache anchor is broken;
@@ -744,7 +760,7 @@ impl Driver {
         )
         .map(|plan| plan.tail_kept)
         .unwrap_or(ctx_cfg.compact_keep_recent_turns);
-        let tail_message_seqs = self.compact_tail_message_seqs(snapshot_tail_turns);
+        let tail_message_seqs = self.compact_tail_message_seqs(snapshot_tail_turns).await;
         let draft = self.compact_brief_draft(tx, snapshot_history.clone()).await;
         let mut prompt_text =
             crate::engine::compact::brief_prompt(draft.prompt_override.as_deref());
@@ -968,6 +984,7 @@ impl Driver {
             .session
             .db
             .list_tool_calls_for_session(self.session.id)
+            .await
             .unwrap_or_default();
         let pins = self.session.pinned_messages();
         let active_goal = self
@@ -1008,7 +1025,7 @@ impl Driver {
         let mut keep = initial_tail_kept;
         let mut tail_positions = candidate_tail.tail_message_positions;
         let (brief, handoff, mut plan) = loop {
-            let tail_message_seqs = self.compact_tail_message_seqs(keep);
+            let tail_message_seqs = self.compact_tail_message_seqs(keep).await;
             let brief = if let Some(ready) = shadow.as_ref() {
                 let revision_history = compact::shadow_revision_history(
                     &ready.snapshot_history,
@@ -1105,10 +1122,14 @@ impl Driver {
             .session
             .db
             .insert_compressed_tool_results(prepared.compressed_entries.clone())
+            .await
         {
             return Err(PreparedCompactionApplyError::StoreCompressedResults(
                 error.to_string(),
             ));
+        }
+        if !prepared.compressed_entries.is_empty() {
+            self.session.set_has_retrievable_tool_results();
         }
         #[cfg(test)]
         self.trace_compaction_apply("compressed_results_persisted");
@@ -1133,24 +1154,28 @@ impl Driver {
         }
 
         // Timeline boundary: `/compact` reset this session in place.
-        if let Err(e) = self.session.record_session_compacted_with_source(
-            &prepared.agent_name,
-            crate::session::SessionCompactionRecord {
-                successor_session_id: self.session.id,
-                successor_short_id: &self.session.short_id,
-                seed_tool_count: prepared.seed_tools.len(),
-                brief_text: &prepared.brief,
-                handoff_text: &prepared.handoff,
-                source: &prepared.source,
-                trigger_ctx_pct: prepared.trigger_ctx_pct,
-                tokens_before: prepared.tokens_before,
-                tokens_after: prepared.tokens_after,
-                turns_summarized: prepared.turns_summarized,
-                tail_kept: prepared.tail_kept,
-                tail_trimmed: prepared.tail_trimmed,
-                tail_messages: &prepared.history[1..],
-            },
-        ) {
+        if let Err(e) = self
+            .session
+            .record_session_compacted_with_source(
+                &prepared.agent_name,
+                crate::session::SessionCompactionRecord {
+                    successor_session_id: self.session.id,
+                    successor_short_id: &self.session.short_id,
+                    seed_tool_count: prepared.seed_tools.len(),
+                    brief_text: &prepared.brief,
+                    handoff_text: &prepared.handoff,
+                    source: &prepared.source,
+                    trigger_ctx_pct: prepared.trigger_ctx_pct,
+                    tokens_before: prepared.tokens_before,
+                    tokens_after: prepared.tokens_after,
+                    turns_summarized: prepared.turns_summarized,
+                    tail_kept: prepared.tail_kept,
+                    tail_trimmed: prepared.tail_trimmed,
+                    tail_messages: &prepared.history[1..],
+                },
+            )
+            .await
+        {
             tracing::warn!(error = %e, "record session_compacted event failed");
         } else {
             #[cfg(test)]
@@ -1313,12 +1338,15 @@ async fn execute_compact_brief(
             prompt: prompt_text.clone(),
             history: draft.history.clone(),
         });
-        let _ = draft.session.record_event(
-            crate::db::session_log::SessionEventKind::InferenceRequest,
-            Some(&draft.agent_name),
-            None,
-            &serde_json::json!({ "usage": null, "purpose": purpose }),
-        );
+        let _ = draft
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::InferenceRequest,
+                Some(&draft.agent_name),
+                None,
+                &serde_json::json!({ "usage": null, "purpose": purpose }),
+            )
+            .await;
         return Some("test compact brief".to_string());
     }
     let call_id = uuid::Uuid::new_v4();
@@ -1338,15 +1366,19 @@ async fn execute_compact_brief(
         .await
     {
         Ok(((_, choice, usage), captured, _timing)) if !cancel.is_cancelled() => {
-            if let Err(e) = draft.session.record_inference_request(
-                call_id,
-                &captured,
-                crate::db::session_log::InferenceRequestStatus::Completed,
-            ) {
+            if let Err(e) = draft
+                .session
+                .record_inference_request(
+                    call_id,
+                    &captured,
+                    crate::db::session_log::InferenceRequestStatus::Completed,
+                )
+                .await
+            {
                 tracing::warn!(error = %e, "compact brief: record_inference_request failed");
             }
             if let Some(u) = usage
-                && let Err(e) = draft.session.record_usage_utility(call_id, u)
+                && let Err(e) = draft.session.record_usage_utility(call_id, u).await
             {
                 tracing::warn!(error = %e, "compact brief: record_usage_utility failed");
             }
@@ -1357,12 +1389,16 @@ async fn execute_compact_brief(
                     "cached_input_tokens": u.cached_input_tokens,
                 })
             });
-            if let Err(e) = draft.session.record_event(
-                crate::db::session_log::SessionEventKind::InferenceRequest,
-                Some(&draft.agent_name),
-                Some(&call_id.to_string()),
-                &serde_json::json!({ "usage": usage_json, "purpose": purpose }),
-            ) {
+            if let Err(e) = draft
+                .session
+                .record_event(
+                    crate::db::session_log::SessionEventKind::InferenceRequest,
+                    Some(&draft.agent_name),
+                    Some(&call_id.to_string()),
+                    &serde_json::json!({ "usage": usage_json, "purpose": purpose }),
+                )
+                .await
+            {
                 tracing::warn!(error = %e, "compact brief: record inference_request event failed");
             }
             let text = crate::engine::message::extract_text(&choice);

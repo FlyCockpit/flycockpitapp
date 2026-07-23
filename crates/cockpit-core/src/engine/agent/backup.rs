@@ -357,27 +357,30 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
 
     // Failure event (Part B): lands in the export's events.json, keyed by the
     // same call_id. Data/export only — never enters model context.
-    if let Err(e) = session.record_event(
-        SessionEventKind::InferenceFailure,
-        Some(agent_name),
-        Some(&call_id.to_string()),
-        &serde_json::json!({
-            "provider": failure.provider,
-            "model": failure.model,
-            "wire_api": wire_api,
-            "routing": routing_metadata,
-            "phase_reached": failure.phase,
-            "error_class": failure.class,
-            "elapsed_ms": failure.elapsed_ms,
-            "detail": failure.detail,
-            "provider_status": diagnostics.provider_status,
-            "provider_body_snippet": diagnostics.provider_body_snippet,
-            "retry_attempts": diagnostics.retry_attempts,
-            "retry_final_decision": diagnostics.retry_final_decision,
-            "classification_rationale": diagnostics.classification_rationale,
-            "recommended_action": diagnostics.recommended_action,
-        }),
-    ) {
+    if let Err(e) = session
+        .record_event(
+            SessionEventKind::InferenceFailure,
+            Some(agent_name),
+            Some(&call_id.to_string()),
+            &serde_json::json!({
+                "provider": failure.provider,
+                "model": failure.model,
+                "wire_api": wire_api,
+                "routing": routing_metadata,
+                "phase_reached": failure.phase,
+                "error_class": failure.class,
+                "elapsed_ms": failure.elapsed_ms,
+                "detail": failure.detail,
+                "provider_status": diagnostics.provider_status,
+                "provider_body_snippet": diagnostics.provider_body_snippet,
+                "retry_attempts": diagnostics.retry_attempts,
+                "retry_final_decision": diagnostics.retry_final_decision,
+                "classification_rationale": diagnostics.classification_rationale,
+                "recommended_action": diagnostics.recommended_action,
+            }),
+        )
+        .await
+    {
         tracing::warn!(error = %e, "record inference_failure event failed");
     }
 
@@ -460,6 +463,7 @@ mod inference_outcome_tests {
         let payload = serde_json::json!({ "model": "mock-model" });
         session
             .record_inference_request(call_id, &payload, InferenceRequestStatus::Pending)
+            .await
             .unwrap();
         let err = anyhow::Error::new(InferenceFailure {
             provider: "mock-provider".into(),
@@ -522,10 +526,12 @@ mod inference_outcome_tests {
         // before the call.
         session
             .record_inference_request(call_id, &payload, InferenceRequestStatus::Pending)
+            .await
             .unwrap();
         let (_, status) = session
             .db
             .get_inference_request(&call_id.to_string())
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(status, "pending", "the hung turn is frozen at pending");
@@ -562,12 +568,13 @@ mod inference_outcome_tests {
         let (_, status) = session
             .db
             .get_inference_request(&call_id.to_string())
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(status, "timed_out");
 
         // A failure event landed in the timeline carrying the diagnostics.
-        let events = session.db.list_session_events(session.id).unwrap();
+        let events = session.db.list_session_events(session.id).await.unwrap();
         let fail = events
             .iter()
             .find(|e| e.kind == "inference_failure")
@@ -619,6 +626,7 @@ mod inference_outcome_tests {
         let payload = serde_json::json!({ "model": "mock-model" });
         session
             .record_inference_request(call_id, &payload, InferenceRequestStatus::Pending)
+            .await
             .unwrap();
         let err = anyhow::Error::new(InferenceFailure {
             provider: "mock-provider".into(),
@@ -644,7 +652,7 @@ mod inference_outcome_tests {
             &err,
         )
         .await;
-        let events = session.db.list_session_events(session.id).unwrap();
+        let events = session.db.list_session_events(session.id).await.unwrap();
         let fail = events
             .iter()
             .find(|e| e.kind == "inference_failure")
@@ -664,6 +672,7 @@ mod inference_outcome_tests {
         let payload = serde_json::json!({ "model": "m" });
         session
             .record_inference_request(call_id, &payload, InferenceRequestStatus::Pending)
+            .await
             .unwrap();
 
         let err = anyhow::Error::new(crate::engine::model::InferenceCancelled);
@@ -687,11 +696,12 @@ mod inference_outcome_tests {
         let (_, status) = session
             .db
             .get_inference_request(&call_id.to_string())
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(status, "cancelled");
         // No failure event, no red error.
-        let events = session.db.list_session_events(session.id).unwrap();
+        let events = session.db.list_session_events(session.id).await.unwrap();
         assert!(!events.iter().any(|e| e.kind == "inference_failure"));
         assert!(rx.try_recv().is_err(), "no UI event on a clean cancel");
     }

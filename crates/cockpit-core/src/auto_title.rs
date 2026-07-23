@@ -690,6 +690,7 @@ mod tests {
                 None,
                 &serde_json::json!({"text": "Diagnose Codex model fetch failures"}),
             )
+            .await
             .unwrap();
         session.rename("manual-title").unwrap();
         assert!(session.user_renamed());

@@ -114,22 +114,25 @@ async fn schedule_subarg_repair_record_round_trips_recovery_and_wire() {
         .expect("repairable call must dispatch");
     // Mirror the TurnOutcome::ScheduleAction recording (outer recovery is
     // Clean here, so the sub-arg repair is the recorded recovery).
-    driver.record_schedule_tool_call(ScheduleToolCallRecord {
-        agent: "builder".to_string(),
-        llm_mode: crate::config::extended::LlmMode::default(),
-        call_id: "call-jobs-repair".to_string(),
-        original_input_json: original.clone(),
-        wire_input_json: dispatch.wire_args.clone(),
-        recovery: dispatch.recovery,
-        hard_fail: false,
-        output: dispatch.output,
-        duration_ms: 1,
-    });
+    driver
+        .record_schedule_tool_call(ScheduleToolCallRecord {
+            agent: "builder".to_string(),
+            llm_mode: crate::config::extended::LlmMode::default(),
+            call_id: "call-jobs-repair".to_string(),
+            original_input_json: original.clone(),
+            wire_input_json: dispatch.wire_args.clone(),
+            recovery: dispatch.recovery,
+            hard_fail: false,
+            output: dispatch.output,
+            duration_ms: 1,
+        })
+        .await;
 
     let rows = driver
         .session
         .db
         .list_tool_calls_for_session(driver.session.id)
+        .await
         .unwrap();
     let row = rows
         .iter()
@@ -216,27 +219,30 @@ async fn dispatch_list_and_capacity_error() {
     assert!(format!("{err}").contains("max concurrent scheduled tasks"));
 }
 
-#[test]
-fn schedule_tool_call_record_persists_wire_and_original() {
+#[tokio::test]
+async fn schedule_tool_call_record_persists_wire_and_original() {
     let (driver, _tmp) = test_driver(8);
     let original = serde_json::json!({ "action": "list" });
     let wire = serde_json::json!({ "action": "list", "args": {} });
-    driver.record_schedule_tool_call(ScheduleToolCallRecord {
-        agent: "builder".to_string(),
-        llm_mode: crate::config::extended::LlmMode::default(),
-        call_id: "call-sched-1".to_string(),
-        original_input_json: original.clone(),
-        wire_input_json: wire.clone(),
-        recovery: crate::db::tool_calls::Recovery::Clean,
-        hard_fail: false,
-        output: "{\"scheduled\":[],\"swarm\":{\"running\":0,\"queued\":0}}".to_string(),
-        duration_ms: 3,
-    });
+    driver
+        .record_schedule_tool_call(ScheduleToolCallRecord {
+            agent: "builder".to_string(),
+            llm_mode: crate::config::extended::LlmMode::default(),
+            call_id: "call-sched-1".to_string(),
+            original_input_json: original.clone(),
+            wire_input_json: wire.clone(),
+            recovery: crate::db::tool_calls::Recovery::Clean,
+            hard_fail: false,
+            output: "{\"scheduled\":[],\"swarm\":{\"running\":0,\"queued\":0}}".to_string(),
+            duration_ms: 3,
+        })
+        .await;
 
     let rows = driver
         .session
         .db
         .list_tool_calls_for_session(driver.session.id)
+        .await
         .unwrap();
     let row = rows.iter().find(|r| r.tool == "schedule").unwrap();
     assert_eq!(row.call_id, "call-sched-1");
@@ -253,25 +259,28 @@ fn schedule_tool_call_record_persists_wire_and_original() {
 /// `schedule` action also lands a `tool_call` row on the export timeline
 /// (`session_events`), not just the `tool_call_events` stats table — so the
 /// export reflects the successful native call, not only failed detours.
-#[test]
-fn schedule_dispatch_emits_tool_call_session_event() {
+#[tokio::test]
+async fn schedule_dispatch_emits_tool_call_session_event() {
     let (driver, _tmp) = test_driver(8);
-    driver.record_schedule_tool_call(ScheduleToolCallRecord {
-        agent: "builder".to_string(),
-        llm_mode: crate::config::extended::LlmMode::default(),
-        call_id: "call-sched-evt".to_string(),
-        original_input_json: serde_json::json!({ "action": "list" }),
-        wire_input_json: serde_json::json!({ "action": "list", "args": {} }),
-        recovery: crate::db::tool_calls::Recovery::Clean,
-        hard_fail: false,
-        output: "{\"scheduled\":[],\"swarm\":{\"running\":0,\"queued\":0}}".to_string(),
-        duration_ms: 3,
-    });
+    driver
+        .record_schedule_tool_call(ScheduleToolCallRecord {
+            agent: "builder".to_string(),
+            llm_mode: crate::config::extended::LlmMode::default(),
+            call_id: "call-sched-evt".to_string(),
+            original_input_json: serde_json::json!({ "action": "list" }),
+            wire_input_json: serde_json::json!({ "action": "list", "args": {} }),
+            recovery: crate::db::tool_calls::Recovery::Clean,
+            hard_fail: false,
+            output: "{\"scheduled\":[],\"swarm\":{\"running\":0,\"queued\":0}}".to_string(),
+            duration_ms: 3,
+        })
+        .await;
 
     let events = driver
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     let tool_call = events
         .iter()
@@ -406,8 +415,8 @@ async fn begin_delegation_shrink_eager_on_no_cache() {
     assert!(prune::dedup_plan(&driver.stack[0].history).is_empty());
 }
 
-#[test]
-fn resolve_child_cwd_accepts_relative_dot_and_absolute_inside_workspace() {
+#[tokio::test]
+async fn resolve_child_cwd_accepts_relative_dot_and_absolute_inside_workspace() {
     let (driver, tmp) = test_driver(8);
     let child_dir = tmp.path().join("child");
     std::fs::create_dir(&child_dir).unwrap();
@@ -426,8 +435,8 @@ fn resolve_child_cwd_accepts_relative_dot_and_absolute_inside_workspace() {
     assert_eq!(absolute.resolved, child_dir.canonicalize().unwrap());
 }
 
-#[test]
-fn resolve_child_cwd_rejects_missing_files_and_outside_workspace() {
+#[tokio::test]
+async fn resolve_child_cwd_rejects_missing_files_and_outside_workspace() {
     let (driver, tmp) = test_driver(8);
     let file = tmp.path().join("not-a-dir.txt");
     std::fs::write(&file, "x").unwrap();
@@ -449,8 +458,8 @@ fn resolve_child_cwd_rejects_missing_files_and_outside_workspace() {
 
 /// A follow-up persists under the SAME handle (passed as `existing`), so
 /// the caller can keep re-querying with one stable handle.
-#[test]
-fn persist_reuses_existing_handle_on_followup() {
+#[tokio::test]
+async fn persist_reuses_existing_handle_on_followup() {
     let (driver, tmp) = test_driver(8);
     let h1 = driver
         .persist_subagent_handle("explore", &[Message::user("q1")], Some(tmp.path()), None)
@@ -476,8 +485,8 @@ fn persist_reuses_existing_handle_on_followup() {
 /// the same transcript, so the follow-up resumes with prior context. The
 /// re-query path is agent-name-agnostic: `builder` rehydrates exactly like
 /// `explore`.
-#[test]
-fn builder_followup_persist_and_rehydrate_round_trip() {
+#[tokio::test]
+async fn builder_followup_persist_and_rehydrate_round_trip() {
     let (driver, tmp) = test_driver(8);
     let history = vec![
         Message::user("implement the flag"),
@@ -504,8 +513,8 @@ fn builder_followup_persist_and_rehydrate_round_trip() {
 
 /// A `builder` follow-up persisting more work under the SAME handle upserts
 /// the transcript (idempotent handle lifecycle), same as `explore`.
-#[test]
-fn builder_followup_refreshes_handle_idempotently() {
+#[tokio::test]
+async fn builder_followup_refreshes_handle_idempotently() {
     let (driver, tmp) = test_driver(8);
     let h1 = driver
         .persist_subagent_handle(
@@ -535,8 +544,8 @@ fn builder_followup_refreshes_handle_idempotently() {
 
 /// The `docs` pipeline is excluded from follow-up: it never persists a
 /// handle, so any `docs` resume is stale (told to spawn fresh).
-#[test]
-fn docs_is_excluded_from_followup() {
+#[tokio::test]
+async fn docs_is_excluded_from_followup() {
     assert!(!crate::engine::builtin::is_followup_eligible("docs"));
     assert!(!crate::engine::builtin::is_followup_eligible(
         "docs-resolver"
@@ -556,8 +565,8 @@ fn docs_is_excluded_from_followup() {
 /// `builder`'s locks are snapshotted on suspend; a follow-up re-acquires them
 /// HASH-MATCHED when the worktree is unchanged, and the §3c write guard
 /// holds (the reawakened builder may write the still-matching file).
-#[test]
-fn write_capable_followup_reacquires_locks_hash_matched() {
+#[tokio::test]
+async fn write_capable_followup_reacquires_locks_hash_matched() {
     let (driver, tmp) = test_driver(8);
     let p = tmp.path().join("a.rs");
     std::fs::write(&p, "v1").unwrap();
@@ -590,8 +599,8 @@ fn write_capable_followup_reacquires_locks_hash_matched() {
 /// No stale write when the worktree changed under a reawakened builder: a
 /// drifted file is NOT reacquired and its §3c read record is dropped, so a
 /// write is refused until the builder re-reads (`readlock`) it.
-#[test]
-fn write_capable_followup_forces_reread_on_drift() {
+#[tokio::test]
+async fn write_capable_followup_forces_reread_on_drift() {
     let (driver, tmp) = test_driver(8);
     let p = tmp.path().join("a.rs");
     std::fs::write(&p, "v1").unwrap();
@@ -660,8 +669,8 @@ async fn write_capable_followup_defers_to_other_lock_holder() {
 /// The cache-aware reuse decision is driven by the session's active cache
 /// config + time-since-last-send. The test driver's provider declares no
 /// cache, so a follow-up takes the no-cache-reuse path deterministically.
-#[test]
-fn followup_reuse_decision_no_cache_provider() {
+#[tokio::test]
+async fn followup_reuse_decision_no_cache_provider() {
     let (driver, _t) = test_driver(8);
     assert_eq!(
         driver.followup_reuse_decision(),

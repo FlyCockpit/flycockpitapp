@@ -594,13 +594,14 @@ mod tests {
         row
     }
 
-    fn child_rows(
+    async fn child_rows(
         session: &Session,
         parent_call_id: &str,
     ) -> Vec<crate::db::tool_calls::ToolCallEvent> {
         session
             .db
             .list_tool_calls_for_session(session.id)
+            .await
             .unwrap()
             .into_iter()
             .filter(|row| row.parent_call_id.as_deref() == Some(parent_call_id))
@@ -815,7 +816,7 @@ mod tests {
         .unwrap();
 
         assert!(out.contains("\"count\":3"), "{out}");
-        let rows = child_rows(&session, "outer-mcp");
+        let rows = child_rows(&session, "outer-mcp").await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "test_count");
         assert_eq!(rows[0].mcp_server.as_deref(), Some("cockpit"));
@@ -872,7 +873,7 @@ mod tests {
             .unwrap();
 
         assert!(out.contains("\"server\":\"external\""), "{out}");
-        let rows = child_rows(&session, "outer-ext");
+        let rows = child_rows(&session, "outer-ext").await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "echo");
         assert_eq!(rows[0].mcp_server.as_deref(), Some("external"));
@@ -1222,7 +1223,7 @@ mod tests {
         .unwrap();
 
         assert!(out.contains("\"input_schema\""), "{out}");
-        let rows = child_rows(&session, "outer-search");
+        let rows = child_rows(&session, "outer-search").await;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].tool, "mcp.search");
         assert_eq!(rows[1].tool, "test_count");
@@ -1252,6 +1253,7 @@ mod tests {
         .unwrap();
 
         let indexes = child_rows(&session, "outer-order")
+            .await
             .into_iter()
             .map(|row| row.parent_child_index.unwrap())
             .collect::<Vec<_>>();
@@ -1277,7 +1279,7 @@ mod tests {
         .unwrap();
 
         assert!(out.contains("\"total_tokens\""), "{out}");
-        let rows = child_rows(&session, "outer-fail");
+        let rows = child_rows(&session, "outer-fail").await;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].parent_child_index, Some(0));
         assert!(rows[0].hard_fail);
@@ -1303,7 +1305,7 @@ mod tests {
         .unwrap();
 
         assert!(out.contains("\"count\":3"), "{out}");
-        assert!(child_rows(&session, "outer-persist").is_empty());
+        assert!(child_rows(&session, "outer-persist").await.is_empty());
         let events = drain_events(&mut rx);
         assert!(
             events.iter().any(
@@ -1331,7 +1333,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rows = child_rows(&session, "outer-cap");
+        let rows = child_rows(&session, "outer-cap").await;
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].parent_child_index, Some(0));
         assert_eq!(rows[1].parent_child_index, Some(1));
@@ -1357,8 +1359,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn json_round_trips_through_monty() {
+    #[tokio::test]
+    async fn json_round_trips_through_monty() {
         let v = serde_json::json!({"a": [1, 2, {"b": true}], "c": "s", "d": null});
         let obj = json_to_monty(&v);
         let back = monty_to_json(&obj);
@@ -1400,8 +1402,8 @@ mod tests {
         assert_eq!(out, "{\"ok\":true}");
     }
 
-    #[test]
-    fn lightweight_search_hits_omit_input_schema() {
+    #[tokio::test]
+    async fn lightweight_search_hits_omit_input_schema() {
         let hits = vec![super::super::catalog::SearchHit {
             server: "typefully".into(),
             tool: "publish_draft".into(),
@@ -1421,8 +1423,8 @@ mod tests {
         assert!(!out.to_string().contains("input_schema"));
     }
 
-    #[test]
-    fn monty_search_and_describe_payloads_sanitize_tool_text() {
+    #[tokio::test]
+    async fn monty_search_and_describe_payloads_sanitize_tool_text() {
         let hits = vec![super::super::catalog::SearchHit {
             server: "srv".into(),
             tool: " bad tool\u{0000};rm -rf / ".into(),
@@ -1442,8 +1444,8 @@ mod tests {
         assert_eq!(describe_out["description"], "Describe [removed] then leak");
     }
 
-    #[test]
-    fn describe_payload_contains_schema_for_one_tool() {
+    #[tokio::test]
+    async fn describe_payload_contains_schema_for_one_tool() {
         let desc = super::super::protocol::ToolDescriptor {
             name: "publish_draft".into(),
             description: "Publish a draft".into(),

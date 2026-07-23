@@ -51,7 +51,7 @@ pub struct ModelSwitchAudit<'a> {
 
 impl Session {
     /// Append one tool-call audit row to the §15b table.
-    pub fn record_tool_call(&self, row: ToolCallRow) -> Result<()> {
+    pub async fn record_tool_call(&self, row: ToolCallRow) -> Result<()> {
         let provider = self.active_provider().unwrap_or_default();
         let model = self.active_model().unwrap_or_default();
         let project_root = self.project_root.to_string_lossy().into_owned();
@@ -93,6 +93,7 @@ impl Session {
         };
         self.db
             .insert_tool_call(&event)
+            .await
             .context("inserting tool_call_event")
     }
 
@@ -106,23 +107,27 @@ impl Session {
     /// captured request body in `inference_requests`
     /// ([`Self::record_inference_request`]) so the metadata row and the
     /// full payload join on `call_id` (session-log-export Part A).
-    pub fn record_usage(&self, call_id: Uuid, usage: crate::tokens::TokenUsage) -> Result<()> {
-        self.record_usage_inner(call_id, usage, false)
+    pub async fn record_usage(
+        &self,
+        call_id: Uuid,
+        usage: crate::tokens::TokenUsage,
+    ) -> Result<()> {
+        self.record_usage_inner(call_id, usage, false).await
     }
 
     /// Like [`Self::record_usage`] but flags the persisted `inference_calls`
     /// row as a utility / background call (the `/export debug` bundle routes
     /// it into `inference_requests_utility/`). Used by background round-trips
     /// (the `/compact` handoff brief, etc.) that aren't foreground user turns.
-    pub fn record_usage_utility(
+    pub async fn record_usage_utility(
         &self,
         call_id: Uuid,
         usage: crate::tokens::TokenUsage,
     ) -> Result<()> {
-        self.record_usage_inner(call_id, usage, true)
+        self.record_usage_inner(call_id, usage, true).await
     }
 
-    fn record_usage_inner(
+    async fn record_usage_inner(
         &self,
         call_id: Uuid,
         usage: crate::tokens::TokenUsage,
@@ -150,6 +155,7 @@ impl Session {
         };
         self.db
             .insert_inference_call(&row)
+            .await
             .context("inserting inference_call")
     }
 
@@ -160,7 +166,7 @@ impl Session {
     /// pass is applied. Written at DISPATCH with status `pending` and updated
     /// to its terminal value on settle so a hung/failed turn still records an
     /// attempt (implementation note).
-    pub fn record_inference_request(
+    pub async fn record_inference_request(
         &self,
         call_id: Uuid,
         payload: &Value,
@@ -168,6 +174,7 @@ impl Session {
     ) -> Result<()> {
         self.db
             .insert_inference_request(&call_id.to_string(), self.id, payload, status)
+            .await
             .context("inserting inference_request")
     }
 
@@ -366,7 +373,7 @@ impl Session {
     /// Append one event to the session timeline (session-log-export Part
     /// B). Always-on, engine/daemon-owned. Returns the assigned monotonic
     /// `seq`. Best-effort callers may ignore the result.
-    pub fn record_event(
+    pub async fn record_event(
         &self,
         kind: crate::db::session_log::SessionEventKind,
         agent: Option<&str>,
@@ -374,9 +381,10 @@ impl Session {
         data: &Value,
     ) -> Result<i64> {
         self.record_event_with_origin(kind, agent, call_id, None, data)
+            .await
     }
 
-    pub fn record_event_with_origin(
+    pub async fn record_event_with_origin(
         &self,
         kind: crate::db::session_log::SessionEventKind,
         agent: Option<&str>,
@@ -398,12 +406,18 @@ impl Session {
                 },
                 data,
             )
+            .await
             .context("inserting session_event")
     }
 
     /// Record a durable user-visible notice. Notice emit sites stay UI-facing;
     /// this helper is the single writer that makes the notice exportable.
-    pub fn record_notice(&self, agent: Option<&str>, text: &str, source: &str) -> Result<i64> {
+    pub async fn record_notice(
+        &self,
+        agent: Option<&str>,
+        text: &str,
+        source: &str,
+    ) -> Result<i64> {
         self.record_event(
             crate::db::session_log::SessionEventKind::Notice,
             agent,
@@ -414,6 +428,7 @@ impl Session {
                 "source": source,
             }),
         )
+        .await
     }
 
     /// Record a `context_pruned` timeline event (session-log-export Part
@@ -428,7 +443,7 @@ impl Session {
     /// elision directly, which is the before/after-prune audit the export
     /// is for. `agent` is the foreground agent the prune targeted.
     #[allow(clippy::too_many_arguments)]
-    pub fn record_context_pruned(
+    pub async fn record_context_pruned(
         &self,
         agent: &str,
         auto: bool,
@@ -473,6 +488,7 @@ impl Session {
                 "reason": reason,
             }),
         )
+        .await
     }
 
     /// Record a `session_compacted` timeline boundary (session-log-export
@@ -482,7 +498,7 @@ impl Session {
     /// ids) the export follows like the fork tree, so both sessions land
     /// in one unified `events.json`. Not a `context_pruned` event.
     #[allow(dead_code)]
-    pub fn record_session_compacted(
+    pub async fn record_session_compacted(
         &self,
         agent: &str,
         successor_session_id: Uuid,
@@ -508,9 +524,10 @@ impl Session {
                 tail_messages: &[],
             },
         )
+        .await
     }
 
-    pub fn record_session_compacted_with_source(
+    pub async fn record_session_compacted_with_source(
         &self,
         agent: &str,
         record: SessionCompactionRecord<'_>,
@@ -537,7 +554,8 @@ impl Session {
         if data.to_string().len() > INLINE_HANDOFF_MAX_BYTES {
             let handoff_id = Uuid::new_v4();
             self.db
-                .store_compaction_payload(handoff_id, self.id, &data.to_string())?;
+                .store_compaction_payload(handoff_id, self.id, &data.to_string())
+                .await?;
             data = serde_json::json!({
                 "kind": "compaction",
                 "predecessor_session_id": self.id.to_string(),
@@ -561,6 +579,7 @@ impl Session {
             None,
             &data,
         )
+        .await
     }
 
     /// Record a `tool_rejected` timeline event (export-audit fidelity). Fired
@@ -575,7 +594,7 @@ impl Session {
     /// one-query check instead of prose inference.
     /// The `call_id` is the model's per-tool-call id so the rejection joins the
     /// assistant turn that emitted it.
-    pub fn record_tool_rejected(
+    pub async fn record_tool_rejected(
         &self,
         agent: &str,
         call_id: &str,
@@ -583,9 +602,10 @@ impl Session {
         reason: &str,
     ) -> Result<i64> {
         self.record_tool_rejected_with_correction(agent, call_id, tool, reason, None)
+            .await
     }
 
-    pub fn record_tool_rejected_with_correction(
+    pub async fn record_tool_rejected_with_correction(
         &self,
         agent: &str,
         call_id: &str,
@@ -606,6 +626,7 @@ impl Session {
             Some(call_id),
             &data,
         )
+        .await
     }
 
     /// Record a `primary_swap` timeline event (export-audit fidelity). Fired
@@ -617,7 +638,7 @@ impl Session {
     /// slash-command swaps inject no kickoff, so `kickoff` is absent there
     /// (`None`) — never fabricated. Carries only `from`/`to`/`trigger`/`display`
     /// /`kickoff` (token economy, project guidance priority #2).
-    pub fn record_primary_swap(
+    pub async fn record_primary_swap(
         &self,
         from: &str,
         to: &str,
@@ -637,6 +658,7 @@ impl Session {
                 "kickoff": kickoff,
             }),
         )
+        .await
     }
 
     /// Record a `model_switch` timeline event for every active-model switch
@@ -644,7 +666,7 @@ impl Session {
     /// ids, the closed trigger/outcome strings, and the real error text when
     /// one exists; the shared session-event redaction path handles payload
     /// scrubbing before export.
-    pub fn record_model_switch(&self, audit: ModelSwitchAudit<'_>) -> Result<i64> {
+    pub async fn record_model_switch(&self, audit: ModelSwitchAudit<'_>) -> Result<i64> {
         self.record_event(
             crate::db::session_log::SessionEventKind::ModelSwitch,
             None,
@@ -659,6 +681,7 @@ impl Session {
                 "error": audit.error,
             }),
         )
+        .await
     }
 
     /// Most recent provider-reported usage, if we've made any calls
@@ -680,7 +703,7 @@ impl Session {
     }
 }
 
-fn notice_severity(text: &str) -> &'static str {
+pub(crate) fn notice_severity(text: &str) -> &'static str {
     let lower = text.to_ascii_lowercase();
     if lower.contains("failed")
         || lower.contains("failure")
@@ -706,8 +729,8 @@ mod notice_tests {
     use super::*;
     use crate::db::Db;
 
-    #[test]
-    fn notice_records_typed_severity_and_source() {
+    #[tokio::test]
+    async fn notice_records_typed_severity_and_source() {
         let db = Db::open_in_memory().unwrap();
         let session = Session::create(db, std::path::PathBuf::from("/proj"), "Build").unwrap();
 
@@ -717,9 +740,10 @@ mod notice_tests {
                 "Resume repair required before continuing.",
                 "daemon_direct",
             )
+            .await
             .unwrap();
 
-        let events = session.db.list_session_events(session.id).unwrap();
+        let events = session.db.list_session_events(session.id).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "notice");
         assert_eq!(events[0].agent.as_deref(), Some("Build"));
@@ -731,16 +755,17 @@ mod notice_tests {
         assert_eq!(events[0].data["source"], "daemon_direct");
     }
 
-    #[test]
-    fn unclassified_notice_defaults_to_info_and_is_not_dropped() {
+    #[tokio::test]
+    async fn unclassified_notice_defaults_to_info_and_is_not_dropped() {
         let db = Db::open_in_memory().unwrap();
         let session = Session::create(db, std::path::PathBuf::from("/proj"), "Build").unwrap();
 
         session
             .record_notice(None, "Background refresh finished.", "engine_turn")
+            .await
             .unwrap();
 
-        let events = session.db.list_session_events(session.id).unwrap();
+        let events = session.db.list_session_events(session.id).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["severity"], "info");
         assert_eq!(events[0].data["source"], "engine_turn");

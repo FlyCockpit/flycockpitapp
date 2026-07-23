@@ -241,7 +241,7 @@ async fn sync_once_with_client(
     let state = db
         .org_sync_state(&credential.server_url, &policy.org_id)?
         .ok_or_else(|| anyhow!("org sync state missing after policy upsert"))?;
-    let built = build_batch(db, credential, &policy, state.cursor_seq, redaction)?;
+    let built = build_batch(db, credential, &policy, state.cursor_seq, redaction).await?;
     match built {
         BatchBuild::Idle => Ok(OrgSyncOnceOutcome::Idle),
         BatchBuild::Filtered { cursor_seq } => {
@@ -296,7 +296,7 @@ enum BatchBuild {
     },
 }
 
-fn build_batch(
+async fn build_batch(
     db: &Db,
     credential: &StoredFlycockpitCredential,
     policy: &OrgLogSyncPolicy,
@@ -316,7 +316,7 @@ fn build_batch(
             batch_cursor_seq = row.seq;
             continue;
         }
-        let event = sync_event_json(db, row, redaction)?;
+        let event = sync_event_json(db, row, redaction).await?;
         let size = serde_json::to_vec(&event)
             .map(|bytes| bytes.len())
             .unwrap_or(0);
@@ -350,7 +350,11 @@ fn build_batch(
     })
 }
 
-fn sync_event_json(db: &Db, row: &SessionEventRow, redaction: &RedactionTable) -> Result<Value> {
+async fn sync_event_json(
+    db: &Db,
+    row: &SessionEventRow,
+    redaction: &RedactionTable,
+) -> Result<Value> {
     let mut event = json!({
         "idempotencyKey": format!("session_event:{}", row.seq),
         "sourceTable": "session_events",
@@ -364,7 +368,7 @@ fn sync_event_json(db: &Db, row: &SessionEventRow, redaction: &RedactionTable) -
     });
     if row.kind == "inference_request"
         && let Some(call_id) = row.call_id.as_deref()
-        && let Some((payload, status)) = db.get_inference_request(call_id)?
+        && let Some((payload, status)) = db.get_inference_request(call_id).await?
     {
         event["inferenceRequest"] = json!({
             "status": status,
@@ -552,7 +556,7 @@ mod tests {
         (outcome, requests, sleeps)
     }
 
-    fn insert_event(db: &Db, kind: SessionEventKind, text: &str) -> i64 {
+    async fn insert_event(db: &Db, kind: SessionEventKind, text: &str) -> i64 {
         let session = db
             .write_blocking(|conn| {
                 crate::db::Db::insert_session_row_conn(
@@ -573,14 +577,15 @@ mod tests {
             None,
             &json!({"text": text}),
         )
+        .await
         .unwrap()
     }
 
     #[tokio::test]
     async fn incremental_cursor_sync_uploads_new_rows() {
         let db = Db::open_in_memory().unwrap();
-        let first = insert_event(&db, SessionEventKind::UserMessage, "one");
-        let second = insert_event(&db, SessionEventKind::AssistantMessage, "two");
+        let first = insert_event(&db, SessionEventKind::UserMessage, "one").await;
+        let second = insert_event(&db, SessionEventKind::AssistantMessage, "two").await;
         let (outcome, requests, _) = sync_with_responses(
             &db,
             vec![response(200, active_policy()), response(200, "{}")],
@@ -602,8 +607,8 @@ mod tests {
     #[tokio::test]
     async fn restart_resume_uses_persisted_cursor() {
         let db = Db::open_in_memory().unwrap();
-        let first = insert_event(&db, SessionEventKind::UserMessage, "old");
-        let second = insert_event(&db, SessionEventKind::UserMessage, "new");
+        let first = insert_event(&db, SessionEventKind::UserMessage, "old").await;
+        let second = insert_event(&db, SessionEventKind::UserMessage, "new").await;
         let (server, requests) =
             start_test_server(vec![response(200, active_policy()), response(200, "{}")]).await;
         db.upsert_org_sync_policy(&server, "org-1", Some("v1"), &json!({}), true)
@@ -632,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_retries_5xx_with_backoff() {
         let db = Db::open_in_memory().unwrap();
-        let seq = insert_event(&db, SessionEventKind::UserMessage, "retry");
+        let seq = insert_event(&db, SessionEventKind::UserMessage, "retry").await;
         let (outcome, requests, sleeps) = sync_with_responses(
             &db,
             vec![
@@ -659,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn retry_after_header_is_honored() {
         let db = Db::open_in_memory().unwrap();
-        let seq = insert_event(&db, SessionEventKind::UserMessage, "retry-after");
+        let seq = insert_event(&db, SessionEventKind::UserMessage, "retry-after").await;
         let (outcome, _, sleeps) = sync_with_responses(
             &db,
             vec![
@@ -682,7 +687,7 @@ mod tests {
     #[tokio::test]
     async fn revocation_stops_sync_and_disables_state() {
         let db = Db::open_in_memory().unwrap();
-        insert_event(&db, SessionEventKind::UserMessage, "secret");
+        insert_event(&db, SessionEventKind::UserMessage, "secret").await;
         let (server, _) = start_test_server(vec![response(401, r#"{"error":"revoked"}"#)]).await;
         db.upsert_org_sync_policy(&server, "org-1", Some("v1"), &json!({}), true)
             .unwrap();
@@ -701,19 +706,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn byte_cap_does_not_advance_past_unuploaded_included_events() {
+    #[tokio::test]
+    async fn byte_cap_does_not_advance_past_unuploaded_included_events() {
         let db = Db::open_in_memory().unwrap();
         let first = insert_event(
             &db,
             SessionEventKind::UserMessage,
             &"a".repeat(MAX_BATCH_BYTES / 2),
-        );
+        )
+        .await;
         let second = insert_event(
             &db,
             SessionEventKind::AssistantMessage,
             &"b".repeat(MAX_BATCH_BYTES / 2),
-        );
+        )
+        .await;
         let policy = OrgLogSyncPolicy {
             org_id: "org-1".to_string(),
             policy_version: Some("v1".to_string()),
@@ -723,7 +730,9 @@ mod tests {
             raw: json!({}),
         };
         let credential = credential("http://localhost:1".to_string());
-        let built = build_batch(&db, &credential, &policy, 0, &RedactionTable::empty()).unwrap();
+        let built = build_batch(&db, &credential, &policy, 0, &RedactionTable::empty())
+            .await
+            .unwrap();
         match built {
             BatchBuild::Ready {
                 cursor_seq,
@@ -743,8 +752,8 @@ mod tests {
     #[tokio::test]
     async fn event_kind_filters_are_applied_and_cursor_advances() {
         let db = Db::open_in_memory().unwrap();
-        let user = insert_event(&db, SessionEventKind::UserMessage, "include me");
-        let assistant = insert_event(&db, SessionEventKind::AssistantMessage, "exclude me");
+        let user = insert_event(&db, SessionEventKind::UserMessage, "include me").await;
+        let assistant = insert_event(&db, SessionEventKind::AssistantMessage, "exclude me").await;
         let policy = json!({
             "orgId": "org-1",
             "policyVersion": "v1",
@@ -783,6 +792,7 @@ mod tests {
             None,
             &json!({"text": "token fci_instance_secret should not leave"}),
         )
+        .await
         .unwrap();
         let (server, requests) =
             start_test_server(vec![response(200, active_policy()), response(200, "{}")]).await;

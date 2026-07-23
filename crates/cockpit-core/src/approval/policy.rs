@@ -31,14 +31,15 @@ impl Approver {
             .find_map(|info| self.store.command_reject_scope(&info.key))
     }
 
-    pub fn record_standing_reject_decision(&self, tool: &str, target: &str, scope: Scope) {
+    pub async fn record_standing_reject_decision(&self, tool: &str, target: &str, scope: Scope) {
         self.record_permission_decision(
             tool,
             target,
             &[],
             Decision::StandingReject { scope },
             DecisionSource::StandingReject,
-        );
+        )
+        .await;
     }
 
     /// Record one resolved permission decision into the session timeline
@@ -51,7 +52,7 @@ impl Approver {
     /// the command line or path being decided; `scopes` is the set of scopes
     /// that were offered (empty for a non-persistable once-only prompt);
     /// `decision` is the resolved verdict; `source` says how it was reached.
-    pub(super) fn record_permission_decision(
+    pub(super) async fn record_permission_decision(
         &self,
         tool: &str,
         target: &str,
@@ -59,10 +60,11 @@ impl Approver {
         decision: Decision,
         source: DecisionSource,
     ) {
-        self.record_permission_decision_with_audit(tool, target, scopes, decision, source, None);
+        self.record_permission_decision_with_audit(tool, target, scopes, decision, source, None)
+            .await;
     }
 
-    pub(super) fn record_permission_decision_with_audit(
+    pub(super) async fn record_permission_decision_with_audit(
         &self,
         tool: &str,
         target: &str,
@@ -107,13 +109,31 @@ impl Approver {
                 }),
             );
         }
-        if let Err(e) = self.db.insert_session_event(
-            self.session_id,
-            crate::db::session_log::SessionEventKind::PermissionDecision,
-            Some(&self.agent_id),
-            None,
-            &data,
-        ) {
+        let data_json = match serde_json::to_string(&data) {
+            Ok(data_json) => data_json,
+            Err(e) => {
+                tracing::warn!(error = %e, tool, source = source.as_str(), "serializing permission_decision event failed");
+                return;
+            }
+        };
+        let session_id = self.session_id;
+        let agent_id = self.agent_id.clone();
+        if let Err(e) = self
+            .db
+            .write(move |conn| {
+                crate::db::Db::insert_session_event_json_conn(
+                    conn,
+                    session_id,
+                    crate::db::session_log::SessionEventKind::PermissionDecision,
+                    Some(&agent_id),
+                    None,
+                    crate::db::session_log::SessionEventContext::default(),
+                    crate::db::session_log::now_ms(),
+                    &data_json,
+                )
+            })
+            .await
+        {
             tracing::warn!(error = %e, tool, source = source.as_str(), "recording permission_decision event failed");
         }
     }
@@ -158,7 +178,8 @@ impl Approver {
             &[Scope::Once],
             decision,
             DecisionSource::UserPrompt,
-        );
+        )
+        .await;
         Ok(decision)
     }
 
@@ -179,7 +200,8 @@ impl Approver {
                 &offered,
                 decision,
                 DecisionSource::StandingReject,
-            );
+            )
+            .await;
             return Ok(decision);
         }
         if let Some(scope) = self.store.mcp_tool_grant_scope(server, tool) {
@@ -190,7 +212,8 @@ impl Approver {
                 &offered,
                 decision,
                 DecisionSource::AlreadyGranted,
-            );
+            )
+            .await;
             return Ok(decision);
         }
 
@@ -240,7 +263,8 @@ impl Approver {
             &offered,
             decision,
             DecisionSource::UserPrompt,
-        );
+        )
+        .await;
         Ok(decision)
     }
 
@@ -296,7 +320,8 @@ impl Approver {
             &[Scope::Once],
             decision,
             DecisionSource::UserPrompt,
-        );
+        )
+        .await;
         Ok(decision)
     }
 }

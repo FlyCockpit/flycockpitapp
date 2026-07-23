@@ -764,7 +764,7 @@ mod tests {
         }
     }
 
-    fn record_msg(db: &Db, sid: uuid::Uuid, text: &str) -> i64 {
+    async fn record_msg(db: &Db, sid: uuid::Uuid, text: &str) -> i64 {
         db.insert_session_event(
             sid,
             SessionEventKind::UserMessage,
@@ -772,6 +772,7 @@ mod tests {
             None,
             &json!({ "text": text }),
         )
+        .await
         .unwrap()
     }
 
@@ -1017,7 +1018,7 @@ mod tests {
         let session = db.create_session("p", "/x", "Build").await.unwrap();
         let sid = session.session_id;
         app.launch.session_id = Some(sid);
-        let seq = record_msg(&db, sid, "pin me");
+        let seq = record_msg(&db, sid, "pin me").await;
 
         app.refresh_pin_state_from_db(sid, &db);
         assert_eq!(app.pin_count, 0);

@@ -2294,7 +2294,7 @@ mod tests {
         String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
     }
 
-    fn record_message(db: &Db, session_id: Uuid, text: &str, assistant: bool) -> i64 {
+    async fn record_message(db: &Db, session_id: Uuid, text: &str, assistant: bool) -> i64 {
         db.insert_session_event(
             session_id,
             if assistant {
@@ -2306,10 +2306,11 @@ mod tests {
             None,
             &serde_json::json!({"text": text}),
         )
+        .await
         .unwrap()
     }
 
-    fn record_tool_timeline(db: &Db, session_id: Uuid, call_id: &str) -> i64 {
+    async fn record_tool_timeline(db: &Db, session_id: Uuid, call_id: &str) -> i64 {
         db.insert_session_event(
             session_id,
             crate::db::session_log::SessionEventKind::ToolCall,
@@ -2317,10 +2318,11 @@ mod tests {
             Some(call_id),
             &serde_json::json!({"tool": "read"}),
         )
+        .await
         .unwrap()
     }
 
-    fn record_tool_call_event(db: &Db, session_id: Uuid, call_id: &str, timestamp: i64) {
+    async fn record_tool_call_event(db: &Db, session_id: Uuid, call_id: &str, timestamp: i64) {
         db.insert_tool_call(&crate::db::tool_calls::ToolCallEvent {
             event_id: Uuid::new_v4(),
             session_id,
@@ -2357,6 +2359,7 @@ mod tests {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
     }
 
@@ -2543,13 +2546,15 @@ mod tests {
             target.session_id,
             "needle phrase belongs to project a",
             false,
-        );
+        )
+        .await;
         record_message(
             &db,
             other.session_id,
             "needle phrase belongs to project b",
             false,
-        );
+        )
+        .await;
 
         let hits = db
             .search_candidates("needle", Some("project-a"), None, None, 10)
@@ -2593,9 +2598,9 @@ mod tests {
         let first = db.create_session("p", "/proj", "Build").await.unwrap();
         let second = db.create_session("p", "/proj", "Build").await.unwrap();
         let other = db.create_session("q", "/other", "Build").await.unwrap();
-        let first_seq = record_message(&db, first.session_id, "newest message", false);
-        let second_seq = record_message(&db, second.session_id, "older message", true);
-        let other_seq = record_message(&db, other.session_id, "newest elsewhere", false);
+        let first_seq = record_message(&db, first.session_id, "newest message", false).await;
+        let second_seq = record_message(&db, second.session_id, "older message", true).await;
+        let other_seq = record_message(&db, other.session_id, "newest elsewhere", false).await;
 
         db.write(move |conn| {
             conn.execute(
@@ -2870,7 +2875,9 @@ mod tests {
         parent.model_system_prompt_snapshot_json =
             r#"{"prompts":{"anthropic":{"opus-4-7":"fork prompt"}}}"#.to_string();
         let parent = db.insert_session_row(&parent).await.unwrap();
-        let fork_point = record_message(&db, parent.session_id, "fork here", false).to_string();
+        let fork_point = record_message(&db, parent.session_id, "fork here", false)
+            .await
+            .to_string();
         let parent = db.get_session(parent.session_id).await.unwrap().unwrap();
         let fork = db
             .create_fork(parent.session_id, Some(fork_point.clone()))
@@ -2908,11 +2915,12 @@ mod tests {
                 None,
                 &serde_json::json!({"text": "parent before fork"}),
             )
+            .await
             .unwrap();
         db.pin_message(parent.session_id, first).unwrap();
 
         let fork = db.create_fork(parent.session_id, None).await.unwrap();
-        let fork_events = db.list_session_events(fork.session_id).unwrap();
+        let fork_events = db.list_session_events(fork.session_id).await.unwrap();
         assert_eq!(fork_events.len(), 1);
         assert_eq!(fork_events[0].data["text"], "parent before fork");
         let fork_pins = db.list_pin_seqs(fork.session_id).unwrap();
@@ -2925,6 +2933,7 @@ mod tests {
             None,
             &serde_json::json!({"text": "parent after fork"}),
         )
+        .await
         .unwrap();
         db.insert_session_event(
             fork.session_id,
@@ -2933,10 +2942,11 @@ mod tests {
             None,
             &serde_json::json!({"text": "child after fork"}),
         )
+        .await
         .unwrap();
 
-        let parent_events = db.list_session_events(parent.session_id).unwrap();
-        let fork_events = db.list_session_events(fork.session_id).unwrap();
+        let parent_events = db.list_session_events(parent.session_id).await.unwrap();
+        let fork_events = db.list_session_events(fork.session_id).await.unwrap();
         assert_eq!(parent_events.len(), 2);
         assert_eq!(fork_events.len(), 2);
         assert_eq!(parent_events[1].data["text"], "parent after fork");
@@ -2947,16 +2957,16 @@ mod tests {
     async fn copy_fork_transcript_truncates_at_seq() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
-        record_message(&db, parent.session_id, "s1", false);
-        let fork_point = record_message(&db, parent.session_id, "s2", true);
-        record_message(&db, parent.session_id, "s3", false);
-        record_message(&db, parent.session_id, "s4", true);
+        record_message(&db, parent.session_id, "s1", false).await;
+        let fork_point = record_message(&db, parent.session_id, "s2", true).await;
+        record_message(&db, parent.session_id, "s3", false).await;
+        record_message(&db, parent.session_id, "s4", true).await;
 
         let fork = db
             .create_fork(parent.session_id, Some(fork_point.to_string()))
             .await
             .unwrap();
-        let fork_events = db.list_session_events(fork.session_id).unwrap();
+        let fork_events = db.list_session_events(fork.session_id).await.unwrap();
         let texts: Vec<_> = fork_events
             .iter()
             .filter_map(|row| row.data["text"].as_str())
@@ -2969,7 +2979,7 @@ mod tests {
     async fn fork_event_copy_failure_rolls_back_child_session() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
-        record_message(&db, parent.session_id, "fail-event-copy", false);
+        record_message(&db, parent.session_id, "fail-event-copy", false).await;
         install_trigger(
             &db,
             "CREATE TEMP TRIGGER fail_fork_event_copy
@@ -2999,8 +3009,8 @@ mod tests {
     async fn fork_tool_call_copy_failure_rolls_back_child_session() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
-        record_tool_timeline(&db, parent.session_id, "fail-tool-copy");
-        record_tool_call_event(&db, parent.session_id, "fail-tool-copy", 100);
+        record_tool_timeline(&db, parent.session_id, "fail-tool-copy").await;
+        record_tool_call_event(&db, parent.session_id, "fail-tool-copy", 100).await;
         install_trigger(
             &db,
             "CREATE TEMP TRIGGER fail_fork_tool_copy
@@ -3030,7 +3040,7 @@ mod tests {
     async fn fork_pin_copy_failure_rolls_back_child_session() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
-        let seq = record_message(&db, parent.session_id, "pinned", false);
+        let seq = record_message(&db, parent.session_id, "pinned", false).await;
         db.pin_message(parent.session_id, seq).unwrap();
         install_trigger(
             &db,
@@ -3060,8 +3070,8 @@ mod tests {
     async fn fork_at_tail_seq_equals_fork_none() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
-        record_message(&db, parent.session_id, "s1", false);
-        let tail = record_message(&db, parent.session_id, "s2", true);
+        record_message(&db, parent.session_id, "s1", false).await;
+        let tail = record_message(&db, parent.session_id, "s2", true).await;
 
         let fork_at_tail = db
             .create_fork(parent.session_id, Some(tail.to_string()))
@@ -3070,12 +3080,14 @@ mod tests {
         let fork_at_none = db.create_fork(parent.session_id, None).await.unwrap();
         let tail_payloads: Vec<_> = db
             .list_session_events(fork_at_tail.session_id)
+            .await
             .unwrap()
             .into_iter()
             .map(|row| row.data)
             .collect();
         let none_payloads: Vec<_> = db
             .list_session_events(fork_at_none.session_id)
+            .await
             .unwrap()
             .into_iter()
             .map(|row| row.data)
@@ -3088,9 +3100,9 @@ mod tests {
     async fn fork_truncates_pins() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
-        let s1 = record_message(&db, parent.session_id, "s1", false);
-        let fork_point = record_message(&db, parent.session_id, "s2", true);
-        let s3 = record_message(&db, parent.session_id, "s3", false);
+        let s1 = record_message(&db, parent.session_id, "s1", false).await;
+        let fork_point = record_message(&db, parent.session_id, "s2", true).await;
+        let s3 = record_message(&db, parent.session_id, "s3", false).await;
         db.pin_message(parent.session_id, s1).unwrap();
         db.pin_message(parent.session_id, s3).unwrap();
 
@@ -3098,7 +3110,7 @@ mod tests {
             .create_fork(parent.session_id, Some(fork_point.to_string()))
             .await
             .unwrap();
-        let fork_events = db.list_session_events(fork.session_id).unwrap();
+        let fork_events = db.list_session_events(fork.session_id).await.unwrap();
         let fork_pins = db.list_pin_seqs(fork.session_id).unwrap();
 
         assert_eq!(fork_pins, vec![fork_events[0].seq]);
@@ -3108,12 +3120,12 @@ mod tests {
     async fn fork_truncates_tool_calls() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
-        record_message(&db, parent.session_id, "s1", false);
-        record_tool_timeline(&db, parent.session_id, "keep");
-        let fork_point = record_message(&db, parent.session_id, "s2", true);
-        record_tool_timeline(&db, parent.session_id, "drop");
-        record_tool_call_event(&db, parent.session_id, "keep", 100);
-        record_tool_call_event(&db, parent.session_id, "drop", 200);
+        record_message(&db, parent.session_id, "s1", false).await;
+        record_tool_timeline(&db, parent.session_id, "keep").await;
+        let fork_point = record_message(&db, parent.session_id, "s2", true).await;
+        record_tool_timeline(&db, parent.session_id, "drop").await;
+        record_tool_call_event(&db, parent.session_id, "keep", 100).await;
+        record_tool_call_event(&db, parent.session_id, "drop", 200).await;
 
         let fork = db
             .create_fork(parent.session_id, Some(fork_point.to_string()))
@@ -3127,7 +3139,7 @@ mod tests {
     async fn fork_unparsable_turn_id_errors() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
-        record_message(&db, parent.session_id, "s1", false);
+        record_message(&db, parent.session_id, "s1", false).await;
 
         let err = db
             .create_fork(parent.session_id, Some("turn-x".to_string()))
@@ -3141,7 +3153,7 @@ mod tests {
     async fn fork_missing_seq_errors() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
-        let only = record_message(&db, parent.session_id, "s1", false);
+        let only = record_message(&db, parent.session_id, "s1", false).await;
 
         let err = db
             .create_fork(parent.session_id, Some((only + 100).to_string()))
@@ -3721,7 +3733,7 @@ mod tests {
     async fn create_ephemeral_fork_marks_row_ephemeral() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/x", "a").await.unwrap();
-        let fork_point = record_message(&db, parent.session_id, "fork here", false);
+        let fork_point = record_message(&db, parent.session_id, "fork here", false).await;
         let side = db
             .create_ephemeral_fork(parent.session_id, Some(fork_point.to_string()))
             .await
@@ -3844,8 +3856,8 @@ mod tests {
     async fn btw_fork_seeded_to_ceiling() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
-        record_message(&db, parent.session_id, "first", false);
-        record_message(&db, parent.session_id, "second", true);
+        record_message(&db, parent.session_id, "first", false).await;
+        record_message(&db, parent.session_id, "second", true).await;
 
         let result = db.create_btw_fork(parent.session_id, false).await.unwrap();
 
@@ -3853,7 +3865,10 @@ mod tests {
         assert_eq!(result.info.parent_session_id, parent.session_id);
         assert!(!result.info.tangent);
         assert_eq!(result.info.message_count, 2);
-        let events = db.list_session_events(result.info.session_id).unwrap();
+        let events = db
+            .list_session_events(result.info.session_id)
+            .await
+            .unwrap();
         let texts: Vec<_> = events
             .iter()
             .map(|event| event.data["text"].as_str().unwrap().to_string())
@@ -3865,7 +3880,7 @@ mod tests {
     async fn btw_tangent_fork_empty() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
-        record_message(&db, parent.session_id, "parent context", false);
+        record_message(&db, parent.session_id, "parent context", false).await;
 
         let result = db.create_btw_fork(parent.session_id, true).await.unwrap();
 
@@ -3874,6 +3889,7 @@ mod tests {
         assert_eq!(result.info.message_count, 0);
         assert!(
             db.list_session_events(result.info.session_id)
+                .await
                 .unwrap()
                 .is_empty()
         );

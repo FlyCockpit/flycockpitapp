@@ -274,7 +274,10 @@ impl Driver {
         }
     }
 
-    pub(in crate::engine::driver) fn record_schedule_tool_call(&self, row: ScheduleToolCallRecord) {
+    pub(in crate::engine::driver) async fn record_schedule_tool_call(
+        &self,
+        row: ScheduleToolCallRecord,
+    ) {
         // A `schedule` action is dispatched to the main-thread authority, not
         // through the ordinary tool-dispatch path, so — unlike every other tool
         // — it never wrote a `tool_call` row to the export timeline; the export
@@ -284,54 +287,62 @@ impl Driver {
         // `tool_call_events` row (`/stats`, history) AND a `tool_call`
         // `session_events` row (the export's dispatch record).
         let (recovery_kind, recovery_stage) = row.recovery.db_fields();
-        if let Err(e) = self.session.record_event(
-            crate::db::session_log::SessionEventKind::ToolCall,
-            Some(&row.agent),
-            Some(&row.call_id),
-            &serde_json::json!({
-                "tool": "schedule",
-                "original_input": row.original_input_json,
-                "wire_input": row.wire_input_json,
-                "recovery_kind": recovery_kind,
-                "recovery_stage": recovery_stage,
-                "hard_fail": row.hard_fail,
-                "output": row.output,
-                "truncated": false,
-                "duration_ms": row.duration_ms,
-            }),
-        ) {
+        if let Err(e) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::ToolCall,
+                Some(&row.agent),
+                Some(&row.call_id),
+                &serde_json::json!({
+                    "tool": "schedule",
+                    "original_input": row.original_input_json,
+                    "wire_input": row.wire_input_json,
+                    "recovery_kind": recovery_kind,
+                    "recovery_stage": recovery_stage,
+                    "hard_fail": row.hard_fail,
+                    "output": row.output,
+                    "truncated": false,
+                    "duration_ms": row.duration_ms,
+                }),
+            )
+            .await
+        {
             tracing::warn!(error = %e, "recording schedule timeline event failed");
         }
-        if let Err(e) = self.session.record_tool_call(crate::session::ToolCallRow {
-            event_id: uuid::Uuid::new_v4(),
-            timestamp: chrono::Utc::now(),
-            agent: row.agent,
-            call_id: row.call_id,
-            parent_call_id: None,
-            parent_child_index: None,
-            identity: crate::session::ToolCallProviderIdentity::default(),
-            tool: "schedule".to_string(),
-            path: None,
-            mcp_server: None,
-            original_input_json: row.original_input_json,
-            wire_input_json: row.wire_input_json,
-            recovery: row.recovery,
-            hard_fail: row.hard_fail,
-            exit_code: None,
-            sandbox_enabled: false,
-            sandboxed: false,
-            sandbox_unavailable_reason: None,
-            output: row.output,
-            truncated: false,
-            duration_ms: row.duration_ms,
-            llm_mode: row.llm_mode,
-            // The schedule meta-tool's fixed minimal-schema repair fingerprint is not
-            // threaded through `ScheduleToolCallRecord`; the §12 fingerprint telemetry
-            // covers the per-tool dispatch path.
-            shape_fingerprint: None,
-            // The hint layer is `bash`-only; a `schedule` call never carries one.
-            hint: None,
-        }) {
+        if let Err(e) = self
+            .session
+            .record_tool_call(crate::session::ToolCallRow {
+                event_id: uuid::Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                agent: row.agent,
+                call_id: row.call_id,
+                parent_call_id: None,
+                parent_child_index: None,
+                identity: crate::session::ToolCallProviderIdentity::default(),
+                tool: "schedule".to_string(),
+                path: None,
+                mcp_server: None,
+                original_input_json: row.original_input_json,
+                wire_input_json: row.wire_input_json,
+                recovery: row.recovery,
+                hard_fail: row.hard_fail,
+                exit_code: None,
+                sandbox_enabled: false,
+                sandboxed: false,
+                sandbox_unavailable_reason: None,
+                output: row.output,
+                truncated: false,
+                duration_ms: row.duration_ms,
+                llm_mode: row.llm_mode,
+                // The schedule meta-tool's fixed minimal-schema repair fingerprint is not
+                // threaded through `ScheduleToolCallRecord`; the §12 fingerprint telemetry
+                // covers the per-tool dispatch path.
+                shape_fingerprint: None,
+                // The hint layer is `bash`-only; a `schedule` call never carries one.
+                hint: None,
+            })
+            .await
+        {
             tracing::warn!(error = %e, "persisting schedule tool_call_event failed");
         }
     }

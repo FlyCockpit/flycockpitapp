@@ -130,6 +130,7 @@ async fn inject_seeds_caps_under_budget_and_injects_pairs() {
         .session
         .db
         .list_tool_calls_for_session(driver.session.id)
+        .await
         .unwrap();
     let seed_rows: Vec<_> = rows.iter().filter(|r| r.tool == "read").collect();
     assert_eq!(
@@ -259,6 +260,7 @@ async fn prefill_child_seeds_injects_native_pairs_in_child_cwd() {
         .session
         .db
         .list_tool_calls_for_session(driver.session.id)
+        .await
         .unwrap();
     let row = rows
         .iter()
@@ -482,6 +484,7 @@ async fn seed_forced_skill_records_and_folds_a_real_skill_call() {
         .session
         .db
         .list_tool_calls_for_session(driver.session.id)
+        .await
         .unwrap();
     let skill_rows: Vec<_> = rows.iter().filter(|r| r.tool == "skill").collect();
     assert_eq!(skill_rows.len(), 1, "one persisted skill tool-call row");

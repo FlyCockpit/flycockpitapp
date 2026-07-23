@@ -51,7 +51,8 @@ impl Driver {
                 trigger,
                 outcome: crate::session::ModelSwitchOutcome::Noop,
                 error: None,
-            });
+            })
+            .await;
             self.emit_active_model_state(tx).await;
             return;
         }
@@ -69,7 +70,8 @@ impl Driver {
                     trigger,
                     outcome: crate::session::ModelSwitchOutcome::BuildFailed,
                     error: Some(&error),
-                });
+                })
+                .await;
                 // Fail loudly, keep the current model active.
                 let _ = tx
                     .send(TurnEvent::Notice {
@@ -100,7 +102,8 @@ impl Driver {
                         trigger,
                         outcome: crate::session::ModelSwitchOutcome::BuildFailed,
                         error: Some(&error),
-                    });
+                    })
+                    .await;
                     let _ = tx
                         .send(TurnEvent::Notice {
                             text: format!(
@@ -127,7 +130,8 @@ impl Driver {
                 trigger,
                 outcome: crate::session::ModelSwitchOutcome::SendFailed,
                 error: Some(&error),
-            });
+            })
+            .await;
             let _ = tx
                 .send(TurnEvent::Notice {
                     text: format!(
@@ -161,7 +165,8 @@ impl Driver {
                         trigger,
                         outcome: crate::session::ModelSwitchOutcome::SendFailed,
                         error: Some(&combined_error),
-                    });
+                    })
+                    .await;
                     let _ = tx
                         .send(TurnEvent::Notice {
                             text: format!(
@@ -188,7 +193,8 @@ impl Driver {
                 trigger,
                 outcome: crate::session::ModelSwitchOutcome::SendFailed,
                 error: Some(&error),
-            });
+            })
+            .await;
             let _ = tx
                 .send(TurnEvent::Notice {
                     text: format!(
@@ -208,7 +214,8 @@ impl Driver {
             trigger,
             outcome: crate::session::ModelSwitchOutcome::Ok,
             error: None,
-        });
+        })
+        .await;
         self.stack[active_idx].agent = rebuilt;
         self.schedule
             .set_agent(self.stack[active_idx].agent.clone());
@@ -327,7 +334,7 @@ impl Driver {
         self.session.set_active_model(provider, model)
     }
 
-    fn record_model_switch_audit(&mut self, audit: crate::session::ModelSwitchAudit<'_>) {
+    async fn record_model_switch_audit(&mut self, audit: crate::session::ModelSwitchAudit<'_>) {
         #[cfg(test)]
         if self.test_fail_next_model_switch_audit_record {
             self.test_fail_next_model_switch_audit_record = false;
@@ -344,7 +351,7 @@ impl Driver {
             return;
         }
 
-        if let Err(e) = self.session.record_model_switch(audit) {
+        if let Err(e) = self.session.record_model_switch(audit).await {
             tracing::warn!(
                 error = %e,
                 from_provider = audit.from_provider,
@@ -505,13 +512,17 @@ impl Driver {
                 tracing::info!(agent = %name, "primary agent swapped");
                 // `primary_swap` timeline event (export-audit fidelity):
                 // from/to + trigger + both halves of the wire-vs-user split.
-                if let Err(e) = self.session.record_primary_swap(
-                    &outgoing,
-                    name,
-                    swap_ctx.trigger,
-                    swap_ctx.display,
-                    swap_ctx.kickoff,
-                ) {
+                if let Err(e) = self
+                    .session
+                    .record_primary_swap(
+                        &outgoing,
+                        name,
+                        swap_ctx.trigger,
+                        swap_ctx.display,
+                        swap_ctx.kickoff,
+                    )
+                    .await
+                {
                     tracing::warn!(error = %e, "record primary_swap event failed");
                 }
                 // Tell the client chrome's active-agent slot about the new

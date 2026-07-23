@@ -1105,10 +1105,11 @@ mod tests {
 
     /// All `permission_decision` events recorded for the approver's session,
     /// in `seq` order — the same rows the exporter folds into `events.json`.
-    fn permission_events(approver: &Approver) -> Vec<serde_json::Value> {
+    async fn permission_events(approver: &Approver) -> Vec<serde_json::Value> {
         approver
             .db
             .list_session_events(approver.session_id)
+            .await
             .unwrap()
             .into_iter()
             .filter(|e| e.kind == "permission_decision")
@@ -1801,7 +1802,7 @@ mod tests {
         assert!(prompts[0].contains(&target), "{prompts:?}");
         assert!(!prompts[0].contains("Run `/`"), "{prompts:?}");
 
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["tool"], "path");
         assert_eq!(events[0]["target"], target);
@@ -1829,6 +1830,7 @@ mod tests {
         assert!(prompts.iter().all(|prompt| !prompt.contains("Run `/`")));
 
         let targets: Vec<_> = permission_events(&approver)
+            .await
             .into_iter()
             .map(|event| event["target"].as_str().unwrap().to_string())
             .collect();
@@ -1873,7 +1875,7 @@ mod tests {
         resolver.await.unwrap();
 
         assert_eq!(decision, Decision::Allow { scope: Scope::Once });
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev["tool"], "bash");
@@ -1907,7 +1909,7 @@ mod tests {
         resolver.await.unwrap();
 
         assert_eq!(decision, Decision::Allow { scope: Scope::Once });
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["source"], "user_prompt");
         assert_eq!(events[0]["approval_policy"]["policy_cap"], "once");
@@ -2016,7 +2018,7 @@ mod tests {
         assert_eq!(decision, Decision::Allow { scope: Scope::Once });
 
         assert_eq!(prompts, vec!["Run `cat`?".to_string()]);
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["tool"], "bash");
         assert_eq!(events[0]["target"], command);
@@ -2084,7 +2086,7 @@ mod tests {
             .unwrap();
         assert!(decision.is_allowed());
 
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1, "one decision recorded");
         let ev = &events[0];
         assert_eq!(ev["tool"], "bash");
@@ -2133,7 +2135,7 @@ mod tests {
             }
         );
 
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1, "one decision recorded");
         let ev = &events[0];
         assert_eq!(ev["tool"], "bash");
@@ -2218,7 +2220,7 @@ mod tests {
                 scope: Scope::Session
             }
         );
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.last().unwrap()["source"], "standing_reject");
     }
 
@@ -2241,7 +2243,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decision, Decision::Deny);
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev["tool"], "path");
@@ -2277,7 +2279,7 @@ mod tests {
                 scope: Scope::Session
             }
         );
-        let last = permission_events(&approver);
+        let last = permission_events(&approver).await;
         assert_eq!(last.last().unwrap()["source"], "standing_reject");
     }
 
@@ -2324,7 +2326,7 @@ mod tests {
         resolver.await.unwrap();
         assert_eq!(decision, Decision::Deny);
 
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1, "one decision recorded");
         let ev = &events[0];
         assert_eq!(ev["tool"], "bash");
@@ -2371,7 +2373,7 @@ mod tests {
         resolver.await.unwrap();
         assert_eq!(decision, Decision::Allow { scope: Scope::Once });
 
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1, "one decision recorded");
         let ev = &events[0];
         assert_eq!(ev["tool"], "add-package");
@@ -2408,7 +2410,7 @@ mod tests {
         resolver.await.unwrap();
         assert_eq!(decision, Decision::Deny);
 
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1, "one decision recorded");
         let ev = &events[0];
         assert_eq!(ev["tool"], "add-package");
@@ -2430,7 +2432,7 @@ mod tests {
             .unwrap();
         assert_eq!(decision, RepeatDecision::Reject);
 
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1, "one decision recorded");
         let ev = &events[0];
         assert_eq!(ev["tool"], "read");
@@ -2461,7 +2463,7 @@ mod tests {
             .unwrap();
         assert_eq!(decision, RepeatDecision::Accept);
 
-        let events = permission_events(&approver);
+        let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev["source"], "loop_guard_rule");

@@ -278,12 +278,16 @@ impl McpChildEventRecorder {
         };
 
         let start_data = self.event_data(&span, None, None, 0);
-        if let Err(e) = self.session.record_event(
-            SessionEventKind::ToolCallStarted,
-            Some(&self.agent),
-            Some(&span.call_id),
-            &start_data,
-        ) {
+        if let Err(e) = self
+            .session
+            .record_event(
+                SessionEventKind::ToolCallStarted,
+                Some(&self.agent),
+                Some(&span.call_id),
+                &start_data,
+            )
+            .await
+        {
             tracing::warn!(
                 error = %e,
                 tool = %span.dispatch.tool,
@@ -325,9 +329,12 @@ impl McpChildEventRecorder {
             Err(anyhow::anyhow!("injected MCP child persistence failure"))
         } else {
             self.persist_row(&span, &output, hard_fail, duration_ms)
+                .await
         };
         #[cfg(not(test))]
-        let persist_result = self.persist_row(&span, &output, hard_fail, duration_ms);
+        let persist_result = self
+            .persist_row(&span, &output, hard_fail, duration_ms)
+            .await;
 
         if let Err(e) = persist_result {
             tracing::warn!(
@@ -338,12 +345,16 @@ impl McpChildEventRecorder {
             );
         }
 
-        let seq = match self.session.record_event(
-            SessionEventKind::ToolCall,
-            Some(&self.agent),
-            Some(&span.call_id),
-            &event_data,
-        ) {
+        let seq = match self
+            .session
+            .record_event(
+                SessionEventKind::ToolCall,
+                Some(&self.agent),
+                Some(&span.call_id),
+                &event_data,
+            )
+            .await
+        {
             Ok(seq) => Some(seq),
             Err(e) => {
                 tracing::warn!(
@@ -419,12 +430,16 @@ impl McpChildEventRecorder {
 
     async fn emit_start(&self, span: &McpChildSpan) {
         let start_data = self.event_data(span, None, None, 0);
-        if let Err(e) = self.session.record_event(
-            SessionEventKind::ToolCallStarted,
-            Some(&self.agent),
-            Some(&span.call_id),
-            &start_data,
-        ) {
+        if let Err(e) = self
+            .session
+            .record_event(
+                SessionEventKind::ToolCallStarted,
+                Some(&self.agent),
+                Some(&span.call_id),
+                &start_data,
+            )
+            .await
+        {
             tracing::warn!(
                 error = %e,
                 tool = %span.dispatch.tool,
@@ -476,39 +491,41 @@ impl McpChildEventRecorder {
         data
     }
 
-    fn persist_row(
+    async fn persist_row(
         &self,
         span: &McpChildSpan,
         output: &str,
         hard_fail: bool,
         duration_ms: u64,
     ) -> Result<()> {
-        self.session.record_tool_call(ToolCallRow {
-            event_id: Uuid::new_v4(),
-            timestamp: Utc::now(),
-            agent: self.agent.clone(),
-            call_id: span.call_id.clone(),
-            parent_call_id: Some(self.parent_call_id.clone()),
-            parent_child_index: Some(span.index),
-            identity: ToolCallProviderIdentity::synthetic_cockpit_call(&span.call_id, None),
-            tool: span.dispatch.tool.clone(),
-            mcp_server: span.dispatch.server.clone(),
-            path: None,
-            original_input_json: span.dispatch.args.clone(),
-            wire_input_json: span.dispatch.args.clone(),
-            recovery: crate::db::tool_calls::Recovery::Clean,
-            hard_fail,
-            exit_code: None,
-            sandbox_enabled: false,
-            sandboxed: false,
-            sandbox_unavailable_reason: None,
-            output: output.to_string(),
-            truncated: false,
-            duration_ms,
-            llm_mode: self.llm_mode,
-            shape_fingerprint: None,
-            hint: None,
-        })
+        self.session
+            .record_tool_call(ToolCallRow {
+                event_id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                agent: self.agent.clone(),
+                call_id: span.call_id.clone(),
+                parent_call_id: Some(self.parent_call_id.clone()),
+                parent_child_index: Some(span.index),
+                identity: ToolCallProviderIdentity::synthetic_cockpit_call(&span.call_id, None),
+                tool: span.dispatch.tool.clone(),
+                mcp_server: span.dispatch.server.clone(),
+                path: None,
+                original_input_json: span.dispatch.args.clone(),
+                wire_input_json: span.dispatch.args.clone(),
+                recovery: crate::db::tool_calls::Recovery::Clean,
+                hard_fail,
+                exit_code: None,
+                sandbox_enabled: false,
+                sandboxed: false,
+                sandbox_unavailable_reason: None,
+                output: output.to_string(),
+                truncated: false,
+                duration_ms,
+                llm_mode: self.llm_mode,
+                shape_fingerprint: None,
+                hint: None,
+            })
+            .await
     }
 }
 
@@ -986,7 +1003,9 @@ async fn invoke_native_tool(ctx: &HostContext, tool: Arc<dyn Tool>, args: Value)
             &mut delivered,
             output.truncated_retention.as_ref(),
             recheck_modified_output,
-        ) {
+        )
+        .await
+        {
             tracing::warn!(
                 error = %error,
                 tool = %tool.name(),

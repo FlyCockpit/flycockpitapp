@@ -200,6 +200,7 @@ pub(crate) async fn removed_primary_notice(
     };
     let already_recorded = db
         .list_session_events(session_id)
+        .await
         .ok()?
         .into_iter()
         .any(|event| {

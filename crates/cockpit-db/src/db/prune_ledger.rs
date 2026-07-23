@@ -12,7 +12,7 @@
 //! is only the small delta that reproduces the *pruned* form.
 
 use anyhow::{Context, Result};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -68,24 +68,29 @@ impl Db {
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
     pub fn load_prune_ledger(&self, session_id: Uuid) -> Result<Option<PruneLedger>> {
-        self.write_blocking(move |conn| {
-            let row: Option<String> = conn
-                .query_row(
-                    "SELECT ledger_json FROM prune_ledger WHERE session_id = ?1",
-                    params![session_id.to_string()],
-                    |r| r.get(0),
-                )
-                .optional()
-                .context("querying prune_ledger")?;
-            match row {
-                Some(json) => {
-                    let ledger: PruneLedger =
-                        serde_json::from_str(&json).context("deserializing prune ledger")?;
-                    Ok(Some(ledger))
-                }
-                None => Ok(None),
+        self.write_blocking(move |conn| Self::load_prune_ledger_conn(conn, session_id))
+    }
+
+    pub fn load_prune_ledger_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<Option<PruneLedger>> {
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT ledger_json FROM prune_ledger WHERE session_id = ?1",
+                params![session_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("querying prune_ledger")?;
+        match row {
+            Some(json) => {
+                let ledger: PruneLedger =
+                    serde_json::from_str(&json).context("deserializing prune ledger")?;
+                Ok(Some(ledger))
             }
-        })
+            None => Ok(None),
+        }
     }
 }
 

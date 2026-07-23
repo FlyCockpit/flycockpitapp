@@ -254,6 +254,7 @@ async fn swap_marker_does_not_leak_into_user_transcript() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap()
         .into_iter()
         .filter(|e| e.kind == "user_message")
@@ -282,8 +283,8 @@ async fn swap_marker_does_not_leak_into_user_transcript() {
     assert!(saw_swapped, "the terse switched-to chrome event fired");
 }
 
-#[test]
-fn stale_tool_owner_ledgers_drop_calls_absent_from_root_history() {
+#[tokio::test]
+async fn stale_tool_owner_ledgers_drop_calls_absent_from_root_history() {
     let (mut driver, _t) = test_driver(1);
     driver.stack[0]
         .history
@@ -315,8 +316,8 @@ fn stale_tool_owner_ledgers_drop_calls_absent_from_root_history() {
     );
 }
 
-#[test]
-fn stale_skill_pairs_drop_when_call_and_result_leave_root_history() {
+#[tokio::test]
+async fn stale_skill_pairs_drop_when_call_and_result_leave_root_history() {
     let (mut driver, _t) = test_driver(1);
     driver.stack[0]
         .history
@@ -366,7 +367,7 @@ async fn persisted_skill_pair_strips_after_resume_swap() {
         .save_skill_pair(driver.session.id, "skillslash-resume", "Build", false)
         .unwrap();
 
-    driver.restore_skill_pairs_after_rehydrate("Build");
+    driver.restore_skill_pairs_after_rehydrate("Build").await;
     assert_eq!(driver.skill_pairs.len(), 1);
     assert_eq!(driver.skill_pairs[0].owner, "Build");
 
@@ -387,8 +388,8 @@ async fn persisted_skill_pair_strips_after_resume_swap() {
     );
 }
 
-#[test]
-fn skill_pair_reconstructs_from_history_and_tool_log_when_db_empty() {
+#[tokio::test]
+async fn skill_pair_reconstructs_from_history_and_tool_log_when_db_empty() {
     let (mut driver, _t) = test_driver(1);
     driver.stack[0]
         .history
@@ -405,9 +406,10 @@ fn skill_pair_reconstructs_from_history_and_tool_log_when_db_empty() {
         "skillslash-rebuilt",
         "Build",
         "pre-migration instructions",
-    );
+    )
+    .await;
 
-    driver.restore_skill_pairs_after_rehydrate("Plan");
+    driver.restore_skill_pairs_after_rehydrate("Plan").await;
 
     assert_eq!(driver.skill_pairs.len(), 1);
     assert_eq!(driver.skill_pairs[0].call_id, "skillslash-rebuilt");
@@ -425,8 +427,8 @@ fn skill_pair_reconstructs_from_history_and_tool_log_when_db_empty() {
     assert_eq!(rows[0].owner, "Build");
 }
 
-#[test]
-fn compact_brief_history_excludes_abandoned_skill_bodies() {
+#[tokio::test]
+async fn compact_brief_history_excludes_abandoned_skill_bodies() {
     let (mut driver, _t) = test_driver(1);
     driver.stack[0]
         .history
@@ -457,8 +459,8 @@ fn compact_brief_history_excludes_abandoned_skill_bodies() {
     );
 }
 
-#[test]
-fn stale_owner_cleanup_bounds_repeated_removed_calls() {
+#[tokio::test]
+async fn stale_owner_cleanup_bounds_repeated_removed_calls() {
     let (mut driver, _t) = test_driver(1);
     driver.stack[0]
         .history
@@ -796,8 +798,8 @@ async fn intentional_steer_skill_pair_survives_swap() {
 /// (repair-required, non-empty) `task` prompt, delivered verbatim as the
 /// child's first `Message::user`. This guards that the delegation path
 /// never stalls on a non-actionable first turn.
-#[test]
-fn delegated_subagent_first_turn_is_the_actionable_brief() {
+#[tokio::test]
+async fn delegated_subagent_first_turn_is_the_actionable_brief() {
     // The interactive spawn path delivers `Message::user(scrub(&brief))`;
     // the noninteractive path delivers `compose_subagent_brief(&brief,&why)`.
     // Both carry the caller's brief verbatim — never an empty / passive
@@ -817,8 +819,8 @@ fn delegated_subagent_first_turn_is_the_actionable_brief() {
     assert!(with_why.contains("the API changed"), "motivation prefixed");
 }
 
-#[test]
-fn ambiguous_turn_keeps_plan_active() {
+#[tokio::test]
+async fn ambiguous_turn_keeps_plan_active() {
     let (driver, _t) = plan_rooted_driver();
     // No `apply_handoff` call (the model emitted no `handoff` tool call).
     assert_eq!(
@@ -833,8 +835,8 @@ fn ambiguous_turn_keeps_plan_active() {
 /// has no live in-memory history. A driver whose root already has a live
 /// context is left untouched — never rebuild over a live context
 /// (implementation note).
-#[test]
-fn rehydrate_skips_a_live_history() {
+#[tokio::test]
+async fn rehydrate_skips_a_live_history() {
     let (mut driver, _t) = test_driver(1);
     // Record a couple of turns to the DB transcript.
     let session = driver.session.clone();
@@ -845,6 +847,7 @@ fn rehydrate_skips_a_live_history() {
             None,
             &serde_json::json!({ "text": "hi" }),
         )
+        .await
         .unwrap();
     session
         .record_event(
@@ -853,11 +856,12 @@ fn rehydrate_skips_a_live_history() {
             Some("infer-1"),
             &serde_json::json!({ "text": "hello" }),
         )
+        .await
         .unwrap();
     // Simulate a LIVE worker: the root frame already has in-memory
     // history. Rehydration must be a no-op.
     driver.stack[0].history = vec![Message::user("a live message")];
-    let r = driver.rehydrate_root_if_empty("Build").unwrap();
+    let r = driver.rehydrate_root_if_empty("Build").await.unwrap();
     assert!(r.is_none(), "must not rebuild over a live context");
     assert_eq!(driver.stack[0].history.len(), 1, "live history untouched");
 }
@@ -867,8 +871,8 @@ fn rehydrate_skips_a_live_history() {
 /// inference boundary, surviving an UNCLEAN kill — no graceful exit
 /// step) are rehydrated by a brand-new driver into the PRUNED form, with
 /// the watermark restored and the context estimate seeded.
-#[test]
-fn fresh_driver_rehydrates_persisted_pruned_context() {
+#[tokio::test]
+async fn fresh_driver_rehydrates_persisted_pruned_context() {
     use rig::OneOrMany;
     use rig::message::{AssistantContent, ToolResultContent, UserContent};
 
@@ -880,54 +884,66 @@ fn fresh_driver_rehydrates_persisted_pruned_context() {
     // Two identical reads → the older is prunable. Record the transcript
     // exactly as the engine does (events + tool_call rows).
     let rec_user = |text: &str| {
-        session
-            .record_event(
-                crate::db::session_log::SessionEventKind::UserMessage,
-                Some("Build"),
-                None,
-                &serde_json::json!({ "text": text }),
-            )
-            .unwrap();
+        let session = session.clone();
+        let text = text.to_string();
+        async move {
+            session
+                .record_event(
+                    crate::db::session_log::SessionEventKind::UserMessage,
+                    Some("Build"),
+                    None,
+                    &serde_json::json!({ "text": text }),
+                )
+                .await
+                .unwrap();
+        }
     };
     let rec_tool = |call_id: &str, body: &str| {
-        session
-            .record_tool_call(crate::session::ToolCallRow {
-                event_id: uuid::Uuid::new_v4(),
-                timestamp: chrono::Utc::now(),
-                agent: "Build".into(),
-                call_id: call_id.into(),
-                parent_call_id: None,
-                parent_child_index: None,
-                identity: crate::session::ToolCallProviderIdentity::default(),
-                tool: "read".into(),
-                path: Some("/f".into()),
-                mcp_server: None,
-                original_input_json: serde_json::json!({ "path": "/f" }),
-                wire_input_json: serde_json::json!({ "path": "/f" }),
-                recovery: crate::db::tool_calls::Recovery::Clean,
-                hard_fail: false,
-                exit_code: None,
-                sandbox_enabled: false,
-                sandboxed: false,
-                sandbox_unavailable_reason: None,
-                output: body.into(),
-                truncated: false,
-                duration_ms: 1,
-                llm_mode: crate::config::extended::LlmMode::default(),
-                shape_fingerprint: None,
-                hint: None,
-            })
-            .unwrap();
-        session
+        let session = session.clone();
+        let call_id = call_id.to_string();
+        let body = body.to_string();
+        async move {
+            session
+                .record_tool_call(crate::session::ToolCallRow {
+                    event_id: uuid::Uuid::new_v4(),
+                    timestamp: chrono::Utc::now(),
+                    agent: "Build".into(),
+                    call_id: call_id.clone(),
+                    parent_call_id: None,
+                    parent_child_index: None,
+                    identity: crate::session::ToolCallProviderIdentity::default(),
+                    tool: "read".into(),
+                    path: Some("/f".into()),
+                    mcp_server: None,
+                    original_input_json: serde_json::json!({ "path": "/f" }),
+                    wire_input_json: serde_json::json!({ "path": "/f" }),
+                    recovery: crate::db::tool_calls::Recovery::Clean,
+                    hard_fail: false,
+                    exit_code: None,
+                    sandbox_enabled: false,
+                    sandboxed: false,
+                    sandbox_unavailable_reason: None,
+                    output: body.clone(),
+                    truncated: false,
+                    duration_ms: 1,
+                    llm_mode: crate::config::extended::LlmMode::default(),
+                    shape_fingerprint: None,
+                    hint: None,
+                })
+                .await
+                .unwrap();
+            session
             .record_event(
                 crate::db::session_log::SessionEventKind::ToolCall,
                 Some("Build"),
-                Some(call_id),
+                Some(&call_id),
                 &serde_json::json!({ "tool": "read", "wire_input": { "path": "/f" }, "output": body }),
             )
+            .await
             .unwrap();
+        }
     };
-    rec_user("read it twice");
+    rec_user("read it twice").await;
     session
         .record_event(
             crate::db::session_log::SessionEventKind::AssistantMessage,
@@ -935,8 +951,9 @@ fn fresh_driver_rehydrates_persisted_pruned_context() {
             Some("infer-1"),
             &serde_json::json!({ "text": "" }),
         )
+        .await
         .unwrap();
-    rec_tool("tc-1", "BODY ONE padding padding padding");
+    rec_tool("tc-1", "BODY ONE padding padding padding").await;
     session
         .record_event(
             crate::db::session_log::SessionEventKind::AssistantMessage,
@@ -944,8 +961,9 @@ fn fresh_driver_rehydrates_persisted_pruned_context() {
             Some("infer-2"),
             &serde_json::json!({ "text": "" }),
         )
+        .await
         .unwrap();
-    rec_tool("tc-2", "BODY TWO padding padding padding");
+    rec_tool("tc-2", "BODY TWO padding padding padding").await;
 
     // Persist the prune ledger as the boundary cadence would — the older
     // read (tc-1) elided.
@@ -1011,6 +1029,7 @@ fn fresh_driver_rehydrates_persisted_pruned_context() {
         Driver::with_max_schedules(s2.clone(), locks, redact, s2.project_root.clone(), agent, 1);
     let r = driver2
         .rehydrate_root_if_empty("Build")
+        .await
         .unwrap()
         .expect("a prior conversation was rebuilt");
     assert!(!r.ledger_fallback);
@@ -1049,8 +1068,8 @@ fn fresh_driver_rehydrates_persisted_pruned_context() {
     let _ = OneOrMany::one(UserContent::text("")); // keep import used
 }
 
-#[test]
-fn new_constructs_idle_driver() {
+#[tokio::test]
+async fn new_constructs_idle_driver() {
     // `Driver::new` is the public default-cap constructor; exercise it
     // so the default path stays alive + correct.
     let (driver, _t) = test_driver(crate::engine::schedule::DEFAULT_MAX_CONCURRENT_SCHEDULES);
@@ -1070,8 +1089,8 @@ fn new_constructs_idle_driver() {
     );
 }
 
-#[test]
-fn live_skill_inventory_publishes_exact_dynamic_toolbox() {
+#[tokio::test]
+async fn live_skill_inventory_publishes_exact_dynamic_toolbox() {
     let (driver, _tmp) = test_driver_without_network(1);
     let mut agent = (*driver.stack[0].agent).clone();
     agent.llm_mode = crate::config::extended::LlmMode::Normal;
@@ -1116,8 +1135,8 @@ fn live_skill_inventory_publishes_exact_dynamic_toolbox() {
 
 /// Persist a transcript under a handle, then rehydrate it: the round trip
 /// returns the same messages, so a follow-up resumes with prior context.
-#[test]
-fn rehydrate_handle_persist_round_trip() {
+#[tokio::test]
+async fn rehydrate_handle_persist_round_trip() {
     let (driver, tmp) = test_driver(8);
     let history = vec![
         Message::user("earlier question"),
@@ -1135,8 +1154,8 @@ fn rehydrate_handle_persist_round_trip() {
 
 /// An unknown handle is a clear tool error telling the caller to spawn
 /// fresh — never a silent cold start.
-#[test]
-fn rehydrate_handle_unknown_is_stale_error() {
+#[tokio::test]
+async fn rehydrate_handle_unknown_is_stale_error() {
     let (driver, tmp) = test_driver(8);
     let err = driver
         .rehydrate_handle("sub-does-not-exist", "explore", Some(tmp.path()), true)
@@ -1148,8 +1167,8 @@ fn rehydrate_handle_unknown_is_stale_error() {
 /// In defensive mode the whole feature is disabled at the capability
 /// level: even a valid handle is rejected (the only path is a fresh
 /// spawn). Gates behavior, not just description text.
-#[test]
-fn rehydrate_handle_disabled_in_defensive() {
+#[tokio::test]
+async fn rehydrate_handle_disabled_in_defensive() {
     let (driver, tmp) = test_driver(8);
     let history = vec![Message::user("q")];
     let handle = driver
@@ -1165,8 +1184,8 @@ fn rehydrate_handle_disabled_in_defensive() {
 
 /// A handle that belongs to a different agent (and, by construction, any
 /// `docs` follow-up — the pipeline never persists a handle) is stale.
-#[test]
-fn rehydrate_handle_wrong_agent_is_stale() {
+#[tokio::test]
+async fn rehydrate_handle_wrong_agent_is_stale() {
     let (driver, tmp) = test_driver(8);
     let handle = driver
         .persist_subagent_handle("explore", &[Message::user("q")], Some(tmp.path()), None)
@@ -1179,8 +1198,8 @@ fn rehydrate_handle_wrong_agent_is_stale() {
     assert!(err.contains("fresh"), "{err}");
 }
 
-#[test]
-fn rehydrate_handle_wrong_cwd_is_stale() {
+#[tokio::test]
+async fn rehydrate_handle_wrong_cwd_is_stale() {
     let (driver, tmp) = test_driver(8);
     let original = tmp.path().join("original");
     let other = tmp.path().join("other");

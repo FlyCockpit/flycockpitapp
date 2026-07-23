@@ -184,6 +184,7 @@ async fn task_unknown_agent_records_tool_rejected_event() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     let event = events
         .iter()
@@ -452,6 +453,7 @@ async fn queued_user_fold_records_and_emits_stable_ids() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     for (expected_text, expected_id, expected_seq) in [
         ("first queued", first_id, first_seq),

@@ -257,11 +257,11 @@ mod tests {
     use serde_json::json;
 
     /// Seed a sibling session with `n` turns; return its (short_id, uuid).
-    fn seed_thread(ctx: &ToolCtx, texts: &[(&str, bool)]) -> (String, Uuid) {
+    async fn seed_thread(ctx: &ToolCtx, texts: &[(&str, bool)]) -> (String, Uuid) {
         let s = ctx
             .session
             .db
-            .write_blocking({
+            .write({
                 let project_id = ctx.session.project_id.clone();
                 move |conn| {
                     crate::db::Db::insert_session_row_conn(
@@ -275,6 +275,7 @@ mod tests {
                     )
                 }
             })
+            .await
             .unwrap();
         for (text, is_assistant) in texts {
             let kind = if *is_assistant {
@@ -285,6 +286,7 @@ mod tests {
             ctx.session
                 .db
                 .insert_session_event(s.session_id, kind, None, None, &json!({ "text": text }))
+                .await
                 .unwrap();
         }
         (s.short_id.unwrap(), s.session_id)
@@ -301,7 +303,8 @@ mod tests {
                 ("a reply", true),
                 ("third", false),
             ],
-        );
+        )
+        .await;
         let out = SessionReadTool
             .call(json!({ "short_id": short }), &ctx)
             .await
@@ -325,7 +328,7 @@ mod tests {
         texts.push(("here we talk about the elusive narwhal".to_string(), false));
         texts.push(("narwhal facts follow".to_string(), true));
         let refs: Vec<(&str, bool)> = texts.iter().map(|(t, a)| (t.as_str(), *a)).collect();
-        let (short, _) = seed_thread(&ctx, &refs);
+        let (short, _) = seed_thread(&ctx, &refs).await;
 
         let out = SessionReadTool
             .call(json!({ "short_id": short, "query": "narwhal" }), &ctx)
@@ -349,7 +352,7 @@ mod tests {
             .map(|i| (format!("turn body {i}"), i % 2 == 1))
             .collect();
         let refs: Vec<(&str, bool)> = texts.iter().map(|(t, a)| (t.as_str(), *a)).collect();
-        let (short, _) = seed_thread(&ctx, &refs);
+        let (short, _) = seed_thread(&ctx, &refs).await;
 
         let out = SessionReadTool
             .call(json!({ "short_id": short }), &ctx)
@@ -377,7 +380,7 @@ mod tests {
     async fn accepts_full_uuid() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
-        let (_, uuid) = seed_thread(&ctx, &[("hello via uuid", false)]);
+        let (_, uuid) = seed_thread(&ctx, &[("hello via uuid", false)]).await;
         let out = SessionReadTool
             .call(json!({ "short_id": uuid.to_string() }), &ctx)
             .await
@@ -389,7 +392,7 @@ mod tests {
     async fn offset_above_i64_max_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
-        let (short, _) = seed_thread(&ctx, &[("hello", false)]);
+        let (short, _) = seed_thread(&ctx, &[("hello", false)]).await;
 
         let err = SessionReadTool
             .call(json!({ "short_id": short, "offset": u64::MAX }), &ctx)

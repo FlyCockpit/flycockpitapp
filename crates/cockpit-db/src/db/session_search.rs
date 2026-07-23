@@ -404,8 +404,9 @@ mod tests {
     use serde_json::json;
 
     /// Insert a message event and return its seq.
-    fn msg(db: &Db, session_id: Uuid, kind: SessionEventKind, text: &str) -> i64 {
+    async fn msg(db: &Db, session_id: Uuid, kind: SessionEventKind, text: &str) -> i64 {
         db.insert_session_event(session_id, kind, None, None, &json!({ "text": text }))
+            .await
             .unwrap()
     }
 
@@ -427,13 +428,15 @@ mod tests {
             a.session_id,
             SessionEventKind::UserMessage,
             "let us discuss widget calibration",
-        );
+        )
+        .await;
         msg(
             &db,
             b.session_id,
             SessionEventKind::UserMessage,
             "totally unrelated gardening notes",
-        );
+        )
+        .await;
 
         // Default scope = projA only.
         let hits = db
@@ -475,7 +478,8 @@ mod tests {
                 s.session_id,
                 SessionEventKind::UserMessage,
                 "shared keyword apricot",
-            );
+            )
+            .await;
         }
         db.archive_session(archived.session_id, false)
             .await
@@ -521,7 +525,8 @@ mod tests {
             s.session_id,
             SessionEventKind::UserMessage,
             "banana split recipe",
-        );
+        )
+        .await;
         let active = db
             .get_session(s.session_id)
             .await
@@ -551,7 +556,8 @@ mod tests {
             s.session_id,
             SessionEventKind::UserMessage,
             "hello world",
-        );
+        )
+        .await;
         let hits = db
             .search_candidates("nonexistentterm", Some("p"), None, None, 10)
             .await
@@ -582,7 +588,8 @@ mod tests {
             s.session_id,
             SessionEventKind::UserMessage,
             "foo bar phrase with a quoted token",
-        );
+        )
+        .await;
 
         for query in [r#""foo"#, "foo)", "(bar", "foo OR bar"] {
             let hits = db
@@ -611,7 +618,8 @@ mod tests {
             s.session_id,
             SessionEventKind::UserMessage,
             "embedded quote syntax and falcon topic",
-        );
+        )
+        .await;
 
         for query in [r#""falcon"#, "falcon)", "(syntax", "falcon OR syntax"] {
             let seqs = db.thread_match_seqs(s.session_id, query).await.unwrap();
@@ -638,7 +646,8 @@ mod tests {
             s.session_id,
             SessionEventKind::AssistantMessage,
             "alpha beta gamma migration",
-        );
+        )
+        .await;
         let hits = db
             .search_candidates("alpha beta", Some("p"), None, None, 10)
             .await
@@ -657,7 +666,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").await.unwrap();
         let secret = "secret_like_indexed_value_123";
-        msg(&db, s.session_id, SessionEventKind::UserMessage, secret);
+        msg(&db, s.session_id, SessionEventKind::UserMessage, secret).await;
 
         db.read(move |conn| {
             let ddl: String = conn.query_row(
@@ -719,7 +728,8 @@ mod tests {
             s.session_id,
             SessionEventKind::UserMessage,
             "original body keyword",
-        );
+        )
+        .await;
 
         db.set_auto_title(s.session_id, "renamed dashboard")
             .await
@@ -814,7 +824,8 @@ mod tests {
             s.session_id,
             SessionEventKind::AssistantMessage,
             "the quokka is a marsupial",
-        );
+        )
+        .await;
 
         // Drop the FTS contents and re-run the backfill to prove the
         // backfill SQL (not just the triggers) reconstructs the index.
@@ -857,19 +868,22 @@ mod tests {
             s.session_id,
             SessionEventKind::UserMessage,
             "what is a kestrel",
-        );
+        )
+        .await;
         let _s2 = msg(
             &db,
             s.session_id,
             SessionEventKind::AssistantMessage,
             "a small falcon",
-        );
+        )
+        .await;
         let s3 = msg(
             &db,
             s.session_id,
             SessionEventKind::UserMessage,
             "and the kestrel diet",
-        );
+        )
+        .await;
 
         let turns = db.thread_turns(s.session_id).await.unwrap();
         assert_eq!(turns.len(), 3);

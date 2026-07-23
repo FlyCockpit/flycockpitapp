@@ -13,7 +13,7 @@
 //! still exports a `pending` record.
 
 use anyhow::{Context, Result};
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -130,26 +130,31 @@ impl Db {
         reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
     )]
     pub fn list_tandem_inference(&self, session_id: Uuid) -> Result<Vec<TandemRecord>> {
-        self.read_blocking(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT session_id, parent_call_id, parent_seq, agent,
-                            provider, model, ts_ms, request_json, response_json,
-                            usage_json, status
-                       FROM tandem_inference
-                      WHERE session_id = ?1
-                      ORDER BY parent_seq ASC, model ASC, id ASC",
-                )
-                .context("preparing list_tandem_inference")?;
-            let rows = stmt
-                .query_map([session_id.to_string()], decode_tandem_row)
-                .context("querying tandem_inference")?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r.context("decoding tandem_inference row")??);
-            }
-            Ok(out)
-        })
+        self.read_blocking(|conn| Self::list_tandem_inference_conn(conn, session_id))
+    }
+
+    pub fn list_tandem_inference_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<Vec<TandemRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, parent_call_id, parent_seq, agent,
+                        provider, model, ts_ms, request_json, response_json,
+                        usage_json, status
+                   FROM tandem_inference
+                  WHERE session_id = ?1
+                  ORDER BY parent_seq ASC, model ASC, id ASC",
+            )
+            .context("preparing list_tandem_inference")?;
+        let rows = stmt
+            .query_map([session_id.to_string()], decode_tandem_row)
+            .context("querying tandem_inference")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("decoding tandem_inference row")??);
+        }
+        Ok(out)
     }
 }
 

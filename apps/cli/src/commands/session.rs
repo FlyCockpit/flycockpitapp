@@ -56,22 +56,19 @@ fn list(args: SessionListArgs) -> Result<()> {
     Ok(())
 }
 
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; CLI session command remains sync until db-async-session-log"
-)]
 fn show(session: &str, json_mode: bool) -> Result<()> {
     let session_id = Uuid::parse_str(session).context("parsing session id")?;
     let db = Db::open_default().context("opening cockpit DB")?;
-    db.write_blocking(move |conn| Db::get_session_conn(conn, session_id))
-        .context("loading session")?
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
-    let compactions = db
-        .list_session_events(session_id)
-        .context("loading session timeline")?
-        .into_iter()
-        .filter(|event| event.kind == "session_compacted")
-        .collect::<Vec<_>>();
+    let compactions = db.blocking_for_sync_cli(move |conn| {
+        Db::get_session_conn(conn, session_id)
+            .context("loading session")?
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+        Ok(Db::list_session_events_conn(conn, session_id)
+            .context("loading session timeline")?
+            .into_iter()
+            .filter(|event| event.kind == "session_compacted")
+            .collect::<Vec<_>>())
+    })?;
 
     if json_mode {
         let values = compactions

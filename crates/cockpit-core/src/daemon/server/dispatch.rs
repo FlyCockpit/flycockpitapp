@@ -765,7 +765,7 @@ pub(super) async fn handle_serialized_request(
         Request::PromoteResource {
             request_id,
             session_id,
-        } => promote_resource_request(ctx, &request_id, session_id),
+        } => promote_resource_request(ctx, &request_id, session_id).await,
 
         Request::CreateScheduledJob { job } => {
             let scheduler = require_scheduler(ctx)?;
@@ -1072,6 +1072,7 @@ pub(super) async fn handle_serialized_request(
                     project_id.as_deref(),
                     chrono::Utc::now().timestamp(),
                 )
+                .await
                 .map_err(internal)?;
             Ok(Response::Ack)
         }
@@ -1081,10 +1082,12 @@ pub(super) async fn handle_serialized_request(
             let models = ctx
                 .db
                 .usage_counts("model", None, since)
+                .await
                 .map_err(internal)?;
             let slash = ctx
                 .db
                 .usage_counts("slash", None, since)
+                .await
                 .map_err(internal)?;
             // Tags are per-project; with no project there's nothing to
             // scope to, so the map is empty rather than a global mash-up.
@@ -1092,6 +1095,7 @@ pub(super) async fn handle_serialized_request(
                 Some(pid) => ctx
                     .db
                     .usage_counts("tag", Some(pid), since)
+                    .await
                     .map_err(internal)?,
                 None => std::collections::HashMap::new(),
             };
@@ -1432,15 +1436,18 @@ pub(super) async fn handle_concurrent_request(
             let models = ctx
                 .db
                 .usage_counts("model", None, since)
+                .await
                 .map_err(internal)?;
             let slash = ctx
                 .db
                 .usage_counts("slash", None, since)
+                .await
                 .map_err(internal)?;
             let tags = match project_id.as_deref() {
                 Some(pid) => ctx
                     .db
                     .usage_counts("tag", Some(pid), since)
+                    .await
                     .map_err(internal)?,
                 None => std::collections::HashMap::new(),
             };
@@ -2375,69 +2382,58 @@ pub(super) async fn export_session_data(
             code: ErrorCode::UnknownSession,
             message: format!("unknown session {session_id}"),
         })?;
-    let data = tokio::task::spawn_blocking(move || -> Result<proto::ExportSessionData> {
-        match kind {
-            proto::ExportSessionKind::TranscriptJson => {
-                let mut messages = Vec::new();
-                let mut before_seq = None;
-                loop {
-                    let (mut page, has_more) =
-                        db.read_session_messages(session_id, before_seq, u32::MAX)?;
-                    if page.is_empty() {
-                        break;
-                    }
-                    before_seq = page.first().map(|message| message.seq);
-                    messages.append(&mut page);
-                    if !has_more {
-                        break;
-                    }
+    let data = match kind {
+        proto::ExportSessionKind::TranscriptJson => {
+            let mut messages = Vec::new();
+            let mut before_seq = None;
+            loop {
+                let (mut page, has_more) = db
+                    .read_session_messages(session_id, before_seq, u32::MAX)
+                    .await
+                    .map_err(internal)?;
+                if page.is_empty() {
+                    break;
                 }
-                messages.sort_by_key(|message| message.seq);
-                let bytes = serde_json::to_vec_pretty(&messages)?;
-                Ok(proto::ExportSessionData {
-                    session_id,
-                    kind,
-                    filename_extension: "json".to_string(),
-                    mime: "application/json".to_string(),
-                    content_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                    byte_len: bytes.len(),
-                    session_count: Some(1),
-                    redacted: true,
-                })
+                before_seq = page.first().map(|message| message.seq);
+                messages.append(&mut page);
+                if !has_more {
+                    break;
+                }
             }
-            proto::ExportSessionKind::DebugBundle => {
-                let bundle = crate::session::export::build_bundle_zip_bytes(
-                    &db,
-                    &target,
-                    include_generated_artifacts,
-                    include_sensitive,
-                )?;
-                Ok(proto::ExportSessionData {
-                    session_id,
-                    kind,
-                    filename_extension: "zip".to_string(),
-                    mime: "application/zip".to_string(),
-                    content_base64: base64::engine::general_purpose::STANDARD.encode(&bundle.bytes),
-                    byte_len: bundle.summary.byte_len,
-                    session_count: Some(bundle.summary.session_count),
-                    redacted: !include_sensitive,
-                })
-            }
+            messages.sort_by_key(|message| message.seq);
+            let bytes = serde_json::to_vec_pretty(&messages).map_err(internal)?;
+            Ok(proto::ExportSessionData {
+                session_id,
+                kind,
+                filename_extension: "json".to_string(),
+                mime: "application/json".to_string(),
+                content_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                byte_len: bytes.len(),
+                session_count: Some(1),
+                redacted: true,
+            })
         }
-    })
-    .await
-    .map_err(internal)?
-    .map_err(|error| {
-        let message = error.to_string();
-        if message.contains("unknown session") {
-            ErrorPayload {
-                code: ErrorCode::UnknownSession,
-                message,
-            }
-        } else {
-            internal(error)
+        proto::ExportSessionKind::DebugBundle => {
+            let bundle = crate::session::export::build_bundle_zip_bytes(
+                &db,
+                &target,
+                include_generated_artifacts,
+                include_sensitive,
+            )
+            .await
+            .map_err(internal)?;
+            Ok(proto::ExportSessionData {
+                session_id,
+                kind,
+                filename_extension: "zip".to_string(),
+                mime: "application/zip".to_string(),
+                content_base64: base64::engine::general_purpose::STANDARD.encode(&bundle.bytes),
+                byte_len: bundle.summary.byte_len,
+                session_count: Some(bundle.summary.session_count),
+                redacted: !include_sensitive,
+            })
         }
-    })?;
+    }?;
     Ok(Response::ExportSessionData { data })
 }
 

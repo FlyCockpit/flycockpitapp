@@ -66,7 +66,7 @@ pub(super) fn resource_scheduler_snapshot(
         })
 }
 
-pub(super) fn promote_resource_request(
+pub(super) async fn promote_resource_request(
     ctx: &DaemonContext,
     request_id: &str,
     fallback_session_id: Option<Uuid>,
@@ -99,7 +99,8 @@ pub(super) fn promote_resource_request(
             token,
             false,
             &message,
-        );
+        )
+        .await;
         return Ok(Response::PromoteResourceResult {
             status: proto::ResourcePromoteStatus::NotQueued,
             message,
@@ -120,7 +121,7 @@ pub(super) fn promote_resource_request(
 
     let Some(promote_id) = promote_id else {
         let message = format!("resource request `{token}` is no longer queued");
-        record_resource_promotion(ctx, audit_session_id, token, false, &message);
+        record_resource_promotion(ctx, audit_session_id, token, false, &message).await;
         return Ok(Response::PromoteResourceResult {
             status: proto::ResourcePromoteStatus::NotFound,
             message,
@@ -152,7 +153,7 @@ pub(super) fn promote_resource_request(
             false,
         ),
     };
-    record_resource_promotion(ctx, audit_session_id, token, applied, &message);
+    record_resource_promotion(ctx, audit_session_id, token, applied, &message).await;
     Ok(Response::PromoteResourceResult {
         status,
         message,
@@ -160,7 +161,7 @@ pub(super) fn promote_resource_request(
     })
 }
 
-pub(super) fn record_resource_promotion(
+pub(super) async fn record_resource_promotion(
     ctx: &DaemonContext,
     session_id: Option<Uuid>,
     request_id: &str,
@@ -176,13 +177,16 @@ pub(super) fn record_resource_promotion(
         "message": message,
         "source": "tui",
     });
-    let _ = ctx.db.insert_session_event(
-        session_id,
-        crate::db::session_log::SessionEventKind::ResourcePromotion,
-        None,
-        None,
-        &data,
-    );
+    let _ = ctx
+        .db
+        .insert_session_event(
+            session_id,
+            crate::db::session_log::SessionEventKind::ResourcePromotion,
+            None,
+            None,
+            &data,
+        )
+        .await;
 }
 
 pub(super) async fn fork_session(
@@ -380,6 +384,7 @@ pub(super) async fn record_session_note(
             None,
             &serde_json::json!({ "text": text }),
         )
+        .await
         .map_err(internal)?;
     Ok(Response::NoteRecorded { seq })
 }

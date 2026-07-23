@@ -167,22 +167,32 @@ impl RehydrateRepairRequired {
 /// - the rebuilt conversation is not provider-valid (corrupt / unpairable
 ///   rows) → `Err`, surfaced as a clear failure.
 #[allow(dead_code)]
-pub fn rehydrate_session(
+pub async fn rehydrate_session(
     db: &Db,
     session_id: Uuid,
     root_agent: &str,
 ) -> Result<Option<Rehydrated>> {
-    rehydrate_session_with_policy(db, session_id, root_agent, RehydratePolicy::heal())
+    rehydrate_session_with_policy(db, session_id, root_agent, RehydratePolicy::heal()).await
 }
 
-pub fn rehydrate_session_with_policy(
+pub async fn rehydrate_session_with_policy(
     db: &Db,
     session_id: Uuid,
     root_agent: &str,
     policy: RehydratePolicy,
 ) -> Result<Option<Rehydrated>> {
-    let mut events = db
-        .list_session_events(session_id)
+    let root_agent = root_agent.to_string();
+    db.read(move |conn| rehydrate_session_with_policy_conn(conn, session_id, &root_agent, policy))
+        .await
+}
+
+pub fn rehydrate_session_with_policy_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    root_agent: &str,
+    policy: RehydratePolicy,
+) -> Result<Option<Rehydrated>> {
+    let mut events = Db::list_session_events_conn(conn, session_id)
         .map_err(|e| anyhow!("loading session events for rehydration: {e}"))?;
     for event in &mut events {
         if event.kind == "session_compacted"
@@ -190,14 +200,13 @@ pub fn rehydrate_session_with_policy(
                 .data
                 .get("handoff_ref")
                 .and_then(|value| value.as_str())
-            && let Some(payload) = db.compaction_payload(session_id, reference)?
+            && let Some(payload) = Db::compaction_payload_conn(conn, session_id, reference)?
         {
             event.data = serde_json::from_str(&payload)
                 .context("decoding stored compaction payload for rehydration")?;
         }
     }
-    let tool_calls = db
-        .list_tool_calls_for_session(session_id)
+    let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
         .map_err(|e| anyhow!("loading tool calls for rehydration: {e}"))?;
 
     // Per-rehydrate history pipeline (fixed order, idempotent — a reorder is a
@@ -238,7 +247,7 @@ pub fn rehydrate_session_with_policy(
     // Re-apply the prune ledger so the rebuilt history returns in pruned
     // form. A missing/corrupt/inconsistent ledger falls back to the full
     // unpruned form with a warning — never a silent fresh context.
-    let (watermark, ledger_fallback) = match load_ledger(db, session_id) {
+    let (watermark, ledger_fallback) = match load_ledger_conn(conn, session_id) {
         Some(ledger) if !ledger_is_empty(&ledger) => match reapply_ledger(&ledger, &mut history) {
             Ok(_) => (ledger.watermark, false),
             Err(missing) => {
@@ -288,16 +297,14 @@ pub fn rehydrate_session_with_policy(
 /// own recorded fields so the transcript shows it rather than silently
 /// dropping it.
 #[allow(dead_code)]
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-)]
-pub fn history_snapshot(
+pub async fn history_snapshot(
     db: &Db,
     session_id: Uuid,
     root_agent: &str,
 ) -> Result<Vec<proto::HistoryEntry>> {
-    db.read_blocking(|conn| history_snapshot_conn(conn, session_id, root_agent))
+    let root_agent = root_agent.to_string();
+    db.read(move |conn| history_snapshot_conn(conn, session_id, &root_agent))
+        .await
 }
 
 pub fn history_snapshot_conn(
@@ -945,10 +952,8 @@ fn hint_text(hint: Option<&serde_json::Value>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Load the prune ledger, treating a corrupt/unreadable row as absent (we
-/// then rebuild the full unpruned form — never a silent fresh context).
-fn load_ledger(db: &Db, session_id: Uuid) -> Option<PruneLedger> {
-    match db.load_prune_ledger(session_id) {
+fn load_ledger_conn(conn: &Connection, session_id: Uuid) -> Option<PruneLedger> {
+    match Db::load_prune_ledger_conn(conn, session_id) {
         Ok(l) => l,
         Err(e) => {
             tracing::warn!(session_id = %session_id, error = %e, "resume: reading prune ledger failed; treating as absent");
@@ -1962,43 +1967,51 @@ mod tests {
         s
     }
 
-    fn record_user(s: &Session, text: &str) {
+    async fn record_user(s: &Session, text: &str) {
         s.record_event(
             crate::db::session_log::SessionEventKind::UserMessage,
             Some("Build"),
             None,
             &json!({ "text": text }),
         )
+        .await
         .unwrap();
     }
 
-    fn record_assistant(s: &Session, call_id: &str, text: &str) {
+    async fn record_assistant(s: &Session, call_id: &str, text: &str) {
         s.record_event(
             crate::db::session_log::SessionEventKind::AssistantMessage,
             Some("Build"),
             Some(call_id),
             &json!({ "text": text }),
         )
+        .await
         .unwrap();
     }
 
     /// Record an assistant turn the way the engine does for an
     /// inline-`<think>` model: the stored `text` is already STRIPPED (no
     /// tags), and the reasoning rides its own `data_json` field.
-    fn record_assistant_with_reasoning(s: &Session, call_id: &str, text: &str, reasoning: &str) {
+    async fn record_assistant_with_reasoning(
+        s: &Session,
+        call_id: &str,
+        text: &str,
+        reasoning: &str,
+    ) {
         s.record_event(
             crate::db::session_log::SessionEventKind::AssistantMessage,
             Some("Build"),
             Some(call_id),
             &json!({ "text": text, "reasoning": reasoning }),
         )
+        .await
         .unwrap();
     }
 
     /// Record a real tool call (both the timeline event and the audit row,
     /// as the engine does), with a chosen wire input distinct from the
     /// original to prove `wire_input_json` is the source used.
-    fn record_tool(
+    async fn record_tool(
         s: &Session,
         call_id: &str,
         tool: &str,
@@ -2032,6 +2045,7 @@ mod tests {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::ToolCall,
@@ -2044,10 +2058,11 @@ mod tests {
                 "output": output,
             }),
         )
+        .await
         .unwrap();
     }
 
-    fn record_tool_with_identity(
+    async fn record_tool_with_identity(
         s: &Session,
         call_id: &str,
         identity: crate::session::ToolCallProviderIdentity,
@@ -2078,6 +2093,7 @@ mod tests {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::ToolCall,
@@ -2090,16 +2106,18 @@ mod tests {
                 "output": "body",
             }),
         )
+        .await
         .unwrap();
     }
 
-    fn record_inference_failure(s: &Session, data: serde_json::Value) {
+    async fn record_inference_failure(s: &Session, data: serde_json::Value) {
         s.record_event(
             crate::db::session_log::SessionEventKind::InferenceFailure,
             Some("Build"),
             None,
             &data,
         )
+        .await
         .unwrap();
     }
 
@@ -2205,15 +2223,18 @@ mod tests {
     }
 
     /// A plain user/assistant exchange rebuilds with correct roles + order.
-    #[test]
-    fn rebuilds_plain_exchange() {
+    #[tokio::test]
+    async fn rebuilds_plain_exchange() {
         let s = root_session();
-        record_user(&s, "hello");
-        record_assistant(&s, "call-1", "hi there");
-        record_user(&s, "bye");
-        record_assistant(&s, "call-2", "goodbye");
+        record_user(&s, "hello").await;
+        record_assistant(&s, "call-1", "hi there").await;
+        record_user(&s, "bye").await;
+        record_assistant(&s, "call-2", "goodbye").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         assert_eq!(h.len(), 4);
         assert_eq!(user_text(&h[0]), "hello");
@@ -2222,10 +2243,10 @@ mod tests {
         assert_eq!(assistant_text(&h[3]), "goodbye");
     }
 
-    #[test]
-    fn rehydrate_model_context_omits_inference_failure_events() {
+    #[tokio::test]
+    async fn rehydrate_model_context_omits_inference_failure_events() {
         let s = root_session();
-        record_user(&s, "hello");
+        record_user(&s, "hello").await;
         record_inference_failure(
             &s,
             json!({
@@ -2234,21 +2255,25 @@ mod tests {
                 "error_class": "network",
                 "detail": "first line\nsecond line",
             }),
-        );
-        record_user(&s, "after");
+        )
+        .await;
+        record_user(&s, "after").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         assert_eq!(h.len(), 2);
         assert_eq!(user_text(&h[0]), "hello");
         assert_eq!(user_text(&h[1]), "after");
     }
 
-    #[test]
-    fn rehydrate_model_context_omits_mcp_child_tool_events() {
+    #[tokio::test]
+    async fn rehydrate_model_context_omits_mcp_child_tool_events() {
         let s = root_session();
-        record_user(&s, "use mcp");
-        record_assistant(&s, "infer-1", "calling mcp");
+        record_user(&s, "use mcp").await;
+        record_assistant(&s, "infer-1", "calling mcp").await;
         record_tool(
             &s,
             "outer-mcp",
@@ -2256,7 +2281,8 @@ mod tests {
             json!({ "script": "mcp.invoke('cockpit', 'context_usage', {})" }),
             json!({ "script": "mcp.invoke('cockpit', 'context_usage', {})" }),
             "{\"ok\":true}",
-        );
+        )
+        .await;
 
         s.record_tool_call(ToolCallRow {
             event_id: Uuid::new_v4(),
@@ -2295,6 +2321,7 @@ mod tests {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::ToolCall,
@@ -2316,9 +2343,13 @@ mod tests {
                 "output": "{\"snapshot\":\"unavailable\"}",
             }),
         )
+        .await
         .unwrap();
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         assert_eq!(h.len(), 3);
         let calls = assistant_calls(&h[1]);
@@ -2328,10 +2359,10 @@ mod tests {
         assert_eq!(tool_result_body(&h[2]), "{\"ok\":true}");
     }
 
-    #[test]
-    fn history_snapshot_includes_inference_failure_display_rows_in_order() {
+    #[tokio::test]
+    async fn history_snapshot_includes_inference_failure_display_rows_in_order() {
         let s = root_session();
-        record_user(&s, "before");
+        record_user(&s, "before").await;
         record_inference_failure(
             &s,
             json!({
@@ -2340,10 +2371,11 @@ mod tests {
                 "error_class": "network",
                 "detail": "first line\nsecond line",
             }),
-        );
-        record_user(&s, "after");
+        )
+        .await;
+        record_user(&s, "after").await;
 
-        let snapshot = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let snapshot = history_snapshot(&s.db, s.id, "Build").await.unwrap();
         assert_eq!(snapshot.len(), 3);
         assert!(matches!(snapshot[0], proto::HistoryEntry::User { .. }));
         match &snapshot[1] {
@@ -2358,8 +2390,8 @@ mod tests {
         assert!(matches!(snapshot[2], proto::HistoryEntry::User { .. }));
     }
 
-    #[test]
-    fn history_snapshot_handles_old_inference_failure_without_detail() {
+    #[tokio::test]
+    async fn history_snapshot_handles_old_inference_failure_without_detail() {
         let s = root_session();
         record_inference_failure(
             &s,
@@ -2368,9 +2400,10 @@ mod tests {
                 "model": "slow",
                 "error_class": "timeout_ttft",
             }),
-        );
+        )
+        .await;
 
-        let snapshot = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let snapshot = history_snapshot(&s.db, s.id, "Build").await.unwrap();
         assert_eq!(snapshot.len(), 1);
         match &snapshot[0] {
             proto::HistoryEntry::InferenceError {
@@ -2390,19 +2423,23 @@ mod tests {
     /// history that carries NO `<think>` tags (the stored text is already
     /// stripped) and NEVER injects the separately-stored reasoning into the
     /// model context (token economy — implementation note).
-    #[test]
-    fn rehydrated_history_is_tag_free_and_omits_reasoning() {
+    #[tokio::test]
+    async fn rehydrated_history_is_tag_free_and_omits_reasoning() {
         let s = root_session();
-        record_user(&s, "do it");
+        record_user(&s, "do it").await;
         // Stored as the engine now stores it: clean body + reasoning aside.
         record_assistant_with_reasoning(
             &s,
             "infer-1",
             "the clean answer",
             "the model's hidden chain of thought",
-        );
+        )
+        .await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         assert_eq!(h.len(), 2);
         let rebuilt = assistant_text(&h[1]);
@@ -2417,13 +2454,13 @@ mod tests {
     /// resume/export can repopulate the thinking chip; it lives on its own
     /// `data_json` field (and the `reasoning` generated column), separate
     /// from the model-bound `text`.
-    #[test]
-    fn stored_reasoning_persists_on_the_event() {
+    #[tokio::test]
+    async fn stored_reasoning_persists_on_the_event() {
         let s = root_session();
-        record_user(&s, "go");
-        record_assistant_with_reasoning(&s, "infer-1", "answer", "secret reasoning");
+        record_user(&s, "go").await;
+        record_assistant_with_reasoning(&s, "infer-1", "answer", "secret reasoning").await;
 
-        let events = s.db.list_session_events(s.id).unwrap();
+        let events = s.db.list_session_events(s.id).await.unwrap();
         let am = events
             .iter()
             .find(|e| e.kind == "assistant_message")
@@ -2438,11 +2475,11 @@ mod tests {
     /// A tool turn rebuilds with the assistant tool_use + a paired
     /// tool_result, and the tool args come from `wire_input_json` (not the
     /// model's original input).
-    #[test]
-    fn rebuilds_tool_turn_using_wire_input() {
+    #[tokio::test]
+    async fn rebuilds_tool_turn_using_wire_input() {
         let s = root_session();
-        record_user(&s, "read the file");
-        record_assistant(&s, "infer-1", "let me read it");
+        record_user(&s, "read the file").await;
+        record_assistant(&s, "infer-1", "let me read it").await;
         record_tool(
             &s,
             "tc-1",
@@ -2450,10 +2487,14 @@ mod tests {
             json!({ "path": "src/main.rs", "typo": true }),
             json!({ "path": "src/main.rs" }),
             "fn main() {}",
-        );
-        record_assistant(&s, "infer-2", "done");
+        )
+        .await;
+        record_assistant(&s, "infer-2", "done").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         // user / assistant(text+toolcall) / user(toolresult) / assistant
         assert_eq!(h.len(), 4);
@@ -2473,11 +2514,11 @@ mod tests {
         validate_pairing(&h).expect("provider-valid");
     }
 
-    #[test]
-    fn rebuilds_parallel_tool_calls_as_one_assistant_turn() {
+    #[tokio::test]
+    async fn rebuilds_parallel_tool_calls_as_one_assistant_turn() {
         let s = root_session();
-        record_user(&s, "read both files");
-        record_assistant(&s, "infer-1", "reading both");
+        record_user(&s, "read both files").await;
+        record_assistant(&s, "infer-1", "reading both").await;
         record_tool(
             &s,
             "tc-1",
@@ -2485,7 +2526,8 @@ mod tests {
             json!({ "path": "a.rs" }),
             json!({ "path": "a.rs" }),
             "A",
-        );
+        )
+        .await;
         record_tool(
             &s,
             "tc-2",
@@ -2493,10 +2535,14 @@ mod tests {
             json!({ "path": "b.rs" }),
             json!({ "path": "b.rs" }),
             "B",
-        );
-        record_assistant(&s, "infer-2", "done");
+        )
+        .await;
+        record_assistant(&s, "infer-2", "done").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         assert_eq!(h.len(), 5);
         let calls = assistant_calls(&h[1]);
@@ -2510,11 +2556,11 @@ mod tests {
         validate_pairing(&h).expect("provider-valid");
     }
 
-    #[test]
-    fn rehydrates_historical_task_sibling_wire_input_without_rewriting() {
+    #[tokio::test]
+    async fn rehydrates_historical_task_sibling_wire_input_without_rewriting() {
         let s = root_session();
-        record_user(&s, "delegate");
-        record_assistant(&s, "infer-1", "spawning");
+        record_user(&s, "delegate").await;
+        record_assistant(&s, "infer-1", "spawning").await;
         record_tool(
             &s,
             "task-legacy",
@@ -2528,9 +2574,13 @@ mod tests {
                 "delegate": { "agent": "builder", "prompt": "old shape" }
             }),
             "done",
-        );
+        )
+        .await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         let calls = assistant_calls(&h[1]);
         assert_eq!(calls.len(), 1);
@@ -2547,11 +2597,11 @@ mod tests {
         validate_pairing(&h).expect("provider-valid");
     }
 
-    #[test]
-    fn rehydrated_tool_turn_preserves_provider_call_identity() {
+    #[tokio::test]
+    async fn rehydrated_tool_turn_preserves_provider_call_identity() {
         let s = root_session();
-        record_user(&s, "read the file");
-        record_assistant(&s, "infer-1", "let me read it");
+        record_user(&s, "read the file").await;
+        record_assistant(&s, "infer-1", "let me read it").await;
         record_tool_with_identity(
             &s,
             "cockpit-internal",
@@ -2562,9 +2612,13 @@ mod tests {
                 wire_api: Some("responses".into()),
                 provider_family: Some("codex".into()),
             },
-        );
+        )
+        .await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         let calls = assistant_calls(&h[1]);
         assert_eq!(calls.len(), 1);
@@ -2576,11 +2630,11 @@ mod tests {
         assert_eq!(results[0].call_id.as_deref(), Some("provider-call"));
     }
 
-    #[test]
-    fn strict_responses_rehydrate_accepts_identified_tool_pair() {
+    #[tokio::test]
+    async fn strict_responses_rehydrate_accepts_identified_tool_pair() {
         let s = root_session();
-        record_user(&s, "read the file");
-        record_assistant(&s, "infer-1", "let me read it");
+        record_user(&s, "read the file").await;
+        record_assistant(&s, "infer-1", "let me read it").await;
         record_tool_with_identity(
             &s,
             "cockpit-internal",
@@ -2591,20 +2645,22 @@ mod tests {
                 wire_api: Some("responses".into()),
                 provider_family: Some("codex".into()),
             },
-        );
+        )
+        .await;
 
         let r = rehydrate_session_with_policy(&s.db, s.id, "Build", RehydratePolicy::strict())
+            .await
             .unwrap()
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
         assert_eq!(calls[0].call_id.as_deref(), Some("provider-call"));
     }
 
-    #[test]
-    fn strict_responses_rehydrate_requires_provider_call_identity() {
+    #[tokio::test]
+    async fn strict_responses_rehydrate_requires_provider_call_identity() {
         let s = root_session();
-        record_user(&s, "read the file");
-        record_assistant(&s, "infer-1", "let me read it");
+        record_user(&s, "read the file").await;
+        record_assistant(&s, "infer-1", "let me read it").await;
         record_tool(
             &s,
             "call-without-provider-id",
@@ -2612,9 +2668,11 @@ mod tests {
             json!({ "path": "/f" }),
             json!({ "path": "/f" }),
             "body",
-        );
+        )
+        .await;
 
         let err = rehydrate_session_with_policy(&s.db, s.id, "Build", RehydratePolicy::strict())
+            .await
             .unwrap_err();
         let repair = err
             .downcast_ref::<RehydrateRepairRequired>()
@@ -2626,10 +2684,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn strict_responses_rehydrate_accepts_synthetic_skill_slash_identity() {
+    #[tokio::test]
+    async fn strict_responses_rehydrate_accepts_synthetic_skill_slash_identity() {
         let s = root_session();
-        record_user(&s, "/skill test-skill");
+        record_user(&s, "/skill test-skill").await;
         let call_id = "skillslash-synthetic";
         let identity = crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
             call_id,
@@ -2661,6 +2719,7 @@ mod tests {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::ToolCall,
@@ -2681,9 +2740,11 @@ mod tests {
                 },
             }),
         )
+        .await
         .unwrap();
 
         let r = rehydrate_session_with_policy(&s.db, s.id, "Build", RehydratePolicy::strict())
+            .await
             .unwrap()
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
@@ -2694,11 +2755,11 @@ mod tests {
         assert_eq!(results[0].call_id.as_deref(), Some(call_id));
     }
 
-    #[test]
-    fn strict_responses_rehydrate_accepts_synthetic_seed_identity() {
+    #[tokio::test]
+    async fn strict_responses_rehydrate_accepts_synthetic_seed_identity() {
         let s = root_session();
-        record_user(&s, "delegate with seed");
-        record_assistant(&s, "infer-1", "reading seed");
+        record_user(&s, "delegate with seed").await;
+        record_assistant(&s, "infer-1", "reading seed").await;
         let call_id = "seed-synthetic";
         let identity = crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
             call_id,
@@ -2730,6 +2791,7 @@ mod tests {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::ToolCall,
@@ -2750,9 +2812,11 @@ mod tests {
                 },
             }),
         )
+        .await
         .unwrap();
 
         let r = rehydrate_session_with_policy(&s.db, s.id, "Build", RehydratePolicy::strict())
+            .await
             .unwrap()
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
@@ -2763,8 +2827,8 @@ mod tests {
         assert_eq!(results[0].call_id.as_deref(), Some(call_id));
     }
 
-    #[test]
-    fn responses_fc_prefix_rehydrate_accepts_old_and_new_prefixes() {
+    #[tokio::test]
+    async fn responses_fc_prefix_rehydrate_accepts_old_and_new_prefixes() {
         for call_id in [
             "skillslash-persisted",
             "fc-skillslash-fresh",
@@ -2772,10 +2836,10 @@ mod tests {
             "fc-seed-fresh",
         ] {
             let s = root_session();
-            record_user(&s, "synthetic tool context");
+            record_user(&s, "synthetic tool context").await;
             let is_skill = call_id.contains("skillslash");
             if !is_skill {
-                record_assistant(&s, "infer-1", "reading seed");
+                record_assistant(&s, "infer-1", "reading seed").await;
             }
             let tool = if is_skill { "skill" } else { "read" };
             let identity = crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
@@ -2820,6 +2884,7 @@ mod tests {
                 shape_fingerprint: None,
                 hint: None,
             })
+            .await
             .unwrap();
             s.record_event(
                 crate::db::session_log::SessionEventKind::ToolCall,
@@ -2849,9 +2914,11 @@ mod tests {
                     },
                 }),
             )
+            .await
             .unwrap();
 
             let r = rehydrate_session_with_policy(&s.db, s.id, "Build", RehydratePolicy::strict())
+                .await
                 .unwrap()
                 .unwrap();
             let calls = assistant_calls(&r.history[1]);
@@ -2865,17 +2932,18 @@ mod tests {
 
     /// A `task` delegation rebuilds as a `task` tool_use paired with the
     /// subagent report as its result.
-    #[test]
-    fn rebuilds_task_delegation_with_report() {
+    #[tokio::test]
+    async fn rebuilds_task_delegation_with_report() {
         let s = root_session();
-        record_user(&s, "investigate");
-        record_assistant(&s, "infer-1", "delegating");
+        record_user(&s, "investigate").await;
+        record_assistant(&s, "infer-1", "delegating").await;
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentSpawned,
             Some("Build"),
             Some("task-1"),
             &json!({ "child_agent": "explore", "task_call_id": "task-1", "prompt": "look around" }),
         )
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentReport,
@@ -2883,10 +2951,14 @@ mod tests {
             Some("task-1"),
             &json!({ "report": "found three modules" }),
         )
+        .await
         .unwrap();
-        record_assistant(&s, "infer-2", "thanks");
+        record_assistant(&s, "infer-2", "thanks").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         let calls = assistant_calls(&h[1]);
         assert_eq!(calls.len(), 1);
@@ -2903,11 +2975,11 @@ mod tests {
         validate_pairing(&h).expect("provider-valid");
     }
 
-    #[test]
-    fn routing_amend_event_does_not_break_task_pairing() {
+    #[tokio::test]
+    async fn routing_amend_event_does_not_break_task_pairing() {
         let s = root_session();
-        record_user(&s, "investigate");
-        record_assistant(&s, "infer-1", "delegating");
+        record_user(&s, "investigate").await;
+        record_assistant(&s, "infer-1", "delegating").await;
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentSpawned,
             Some("Build"),
@@ -2919,6 +2991,7 @@ mod tests {
                 "prompt": "look around"
             }),
         )
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentRouting,
@@ -2935,6 +3008,7 @@ mod tests {
                 "routing": { "resolved_model": "child-model" }
             }),
         )
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentReport,
@@ -2942,10 +3016,14 @@ mod tests {
             Some("task-1"),
             &json!({ "report": "found three modules" }),
         )
+        .await
         .unwrap();
-        record_assistant(&s, "infer-2", "thanks");
+        record_assistant(&s, "infer-2", "thanks").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         let calls = assistant_calls(&h[1]);
         assert_eq!(calls.len(), 1);
@@ -2958,11 +3036,11 @@ mod tests {
         validate_pairing(&h).expect("provider-valid");
     }
 
-    #[test]
-    fn strict_responses_rehydrate_preserves_task_provider_call_identity() {
+    #[tokio::test]
+    async fn strict_responses_rehydrate_preserves_task_provider_call_identity() {
         let s = root_session();
-        record_user(&s, "investigate");
-        record_assistant(&s, "infer-1", "delegating");
+        record_user(&s, "investigate").await;
+        record_assistant(&s, "infer-1", "delegating").await;
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentSpawned,
             Some("Build"),
@@ -2981,6 +3059,7 @@ mod tests {
                 "prompt": "look around"
             }),
         )
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentReport,
@@ -2998,9 +3077,11 @@ mod tests {
                 }
             }),
         )
+        .await
         .unwrap();
 
         let r = rehydrate_session_with_policy(&s.db, s.id, "Build", RehydratePolicy::strict())
+            .await
             .unwrap()
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
@@ -3018,11 +3099,11 @@ mod tests {
         assert_eq!(results[0].call_id.as_deref(), Some("call-provider-task"));
     }
 
-    #[test]
-    fn strict_responses_rehydrate_accepts_synthetic_task_provider_call_identity() {
+    #[tokio::test]
+    async fn strict_responses_rehydrate_accepts_synthetic_task_provider_call_identity() {
         let s = root_session();
-        record_user(&s, "investigate");
-        record_assistant(&s, "infer-1", "delegating");
+        record_user(&s, "investigate").await;
+        record_assistant(&s, "infer-1", "delegating").await;
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentSpawned,
             Some("Build"),
@@ -3041,6 +3122,7 @@ mod tests {
                 "prompt": "look around"
             }),
         )
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentReport,
@@ -3058,9 +3140,11 @@ mod tests {
                 }
             }),
         )
+        .await
         .unwrap();
 
         let r = rehydrate_session_with_policy(&s.db, s.id, "Build", RehydratePolicy::strict())
+            .await
             .unwrap()
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
@@ -3075,11 +3159,11 @@ mod tests {
         assert_eq!(results[0].call_id.as_deref(), Some("task-synthetic"));
     }
 
-    #[test]
-    fn strict_responses_rehydrate_preserves_interactive_task_provider_call_identity() {
+    #[tokio::test]
+    async fn strict_responses_rehydrate_preserves_interactive_task_provider_call_identity() {
         let s = root_session();
-        record_user(&s, "investigate");
-        record_assistant(&s, "infer-1", "delegating");
+        record_user(&s, "investigate").await;
+        record_assistant(&s, "infer-1", "delegating").await;
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentSpawned,
             Some("Build"),
@@ -3100,6 +3184,7 @@ mod tests {
                 "prompt": "look around"
             }),
         )
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentReport,
@@ -3120,9 +3205,11 @@ mod tests {
                 }
             }),
         )
+        .await
         .unwrap();
 
         let r = rehydrate_session_with_policy(&s.db, s.id, "Build", RehydratePolicy::strict())
+            .await
             .unwrap()
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
@@ -3144,17 +3231,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn strict_responses_rehydrate_backfills_legacy_completed_task_identity() {
+    #[tokio::test]
+    async fn strict_responses_rehydrate_backfills_legacy_completed_task_identity() {
         let s = root_session();
-        record_user(&s, "investigate");
-        record_assistant(&s, "infer-1", "delegating");
+        record_user(&s, "investigate").await;
+        record_assistant(&s, "infer-1", "delegating").await;
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentSpawned,
             Some("Build"),
             Some("task-legacy"),
             &json!({ "child_agent": "explore", "task_call_id": "task-legacy", "prompt": "look" }),
         )
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentReport,
@@ -3162,9 +3250,11 @@ mod tests {
             Some("task-legacy"),
             &json!({ "report": "done" }),
         )
+        .await
         .unwrap();
 
         let r = rehydrate_session_with_policy(&s.db, s.id, "Build", RehydratePolicy::strict())
+            .await
             .unwrap()
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
@@ -3173,11 +3263,11 @@ mod tests {
         assert_eq!(results[0].call_id.as_deref(), Some("task-legacy"));
     }
 
-    #[test]
-    fn strict_responses_rehydrate_rejects_mismatched_task_report_identity() {
+    #[tokio::test]
+    async fn strict_responses_rehydrate_rejects_mismatched_task_report_identity() {
         let s = root_session();
-        record_user(&s, "investigate");
-        record_assistant(&s, "infer-1", "delegating");
+        record_user(&s, "investigate").await;
+        record_assistant(&s, "infer-1", "delegating").await;
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentSpawned,
             Some("Build"),
@@ -3189,6 +3279,7 @@ mod tests {
                 "prompt": "look around"
             }),
         )
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentReport,
@@ -3199,9 +3290,11 @@ mod tests {
                 "provider_call_id": "different-provider-call"
             }),
         )
+        .await
         .unwrap();
 
         let err = rehydrate_session_with_policy(&s.db, s.id, "Build", RehydratePolicy::strict())
+            .await
             .unwrap_err();
         let repair = err
             .downcast_ref::<RehydrateRepairRequired>()
@@ -3210,11 +3303,11 @@ mod tests {
         assert_eq!(repair.failing_tool_call_ids, vec!["task-1"]);
     }
 
-    #[test]
-    fn rehydrate_prunes_completed_long_task_prompt() {
+    #[tokio::test]
+    async fn rehydrate_prunes_completed_long_task_prompt() {
         let s = root_session();
-        record_user(&s, "investigate");
-        record_assistant(&s, "infer-1", "delegating");
+        record_user(&s, "investigate").await;
+        record_assistant(&s, "infer-1", "delegating").await;
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentSpawned,
             Some("Build"),
@@ -3226,6 +3319,7 @@ mod tests {
                 "model": "slow",
             }),
         )
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentReport,
@@ -3233,9 +3327,13 @@ mod tests {
             Some("task-1"),
             &json!({ "report": "found three modules" }),
         )
+        .await
         .unwrap();
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         let calls = assistant_calls(&h[1]);
         assert_eq!(calls.len(), 1);
@@ -3256,11 +3354,11 @@ mod tests {
         validate_pairing(&h).expect("provider-valid");
     }
 
-    #[test]
-    fn rebuilds_parallel_independent_task_calls_as_one_assistant_turn() {
+    #[tokio::test]
+    async fn rebuilds_parallel_independent_task_calls_as_one_assistant_turn() {
         let s = root_session();
-        record_user(&s, "investigate auth and db");
-        record_assistant(&s, "infer-1", "delegating both");
+        record_user(&s, "investigate auth and db").await;
+        record_assistant(&s, "infer-1", "delegating both").await;
         for (call_id, child, prompt, report) in [
             ("task-auth", "explore", "inspect auth", "auth report"),
             ("task-db", "explore", "inspect db", "db report"),
@@ -3271,6 +3369,7 @@ mod tests {
                 Some(call_id),
                 &json!({ "child_agent": child, "task_call_id": call_id, "prompt": prompt }),
             )
+            .await
             .unwrap();
             s.record_event(
                 crate::db::session_log::SessionEventKind::SubagentReport,
@@ -3278,11 +3377,15 @@ mod tests {
                 Some(call_id),
                 &json!({ "child_agent": child, "task_call_id": call_id, "report": report }),
             )
+            .await
             .unwrap();
         }
-        record_assistant(&s, "infer-2", "thanks");
+        record_assistant(&s, "infer-2", "thanks").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         assert_eq!(h.len(), 5);
         let calls = assistant_calls(&h[1]);
@@ -3297,11 +3400,11 @@ mod tests {
         validate_pairing(&h).expect("provider-valid");
     }
 
-    #[test]
-    fn rebuilds_parallel_task_delegation_with_aggregate_report() {
+    #[tokio::test]
+    async fn rebuilds_parallel_task_delegation_with_aggregate_report() {
         let s = root_session();
-        record_user(&s, "investigate auth and db");
-        record_assistant(&s, "infer-1", "delegating");
+        record_user(&s, "investigate auth and db").await;
+        record_assistant(&s, "infer-1", "delegating").await;
         for (label, prompt) in [("auth", "inspect auth"), ("db", "inspect db")] {
             s.record_event(
                 crate::db::session_log::SessionEventKind::SubagentSpawned,
@@ -3323,6 +3426,7 @@ mod tests {
                     "why": "compare both areas",
                 }),
             )
+            .await
             .unwrap();
         }
         for (label, report) in [("auth", "auth report"), ("db", "db report")] {
@@ -3345,11 +3449,13 @@ mod tests {
                     },
                 }),
             )
+            .await
             .unwrap();
         }
-        record_assistant(&s, "infer-2", "thanks");
+        record_assistant(&s, "infer-2", "thanks").await;
 
         let r = rehydrate_session_with_policy(&s.db, s.id, "Build", RehydratePolicy::strict())
+            .await
             .unwrap()
             .unwrap();
         let h = r.history;
@@ -3385,11 +3491,11 @@ mod tests {
     }
 
     /// Subagent (non-root) turns are excluded from the root model history.
-    #[test]
-    fn excludes_subagent_turns() {
+    #[tokio::test]
+    async fn excludes_subagent_turns() {
         let s = root_session();
-        record_user(&s, "go");
-        record_assistant(&s, "infer-1", "root says hi");
+        record_user(&s, "go").await;
+        record_assistant(&s, "infer-1", "root says hi").await;
         // An explore subagent's own assistant turn — must not leak in.
         s.record_event(
             crate::db::session_log::SessionEventKind::AssistantMessage,
@@ -3397,9 +3503,13 @@ mod tests {
             Some("infer-x"),
             &json!({ "text": "subagent internal reasoning" }),
         )
+        .await
         .unwrap();
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         assert_eq!(h.len(), 2);
         assert_eq!(assistant_text(&h[1]), "root says hi");
@@ -3410,11 +3520,11 @@ mod tests {
     /// model-bound history. It sits chronologically between two real turns yet
     /// rehydration skips it entirely — the rebuilt context is byte-identical to
     /// one with no note at all, so prior note text never reaches the model.
-    #[test]
-    fn rehydration_skips_user_note_events() {
+    #[tokio::test]
+    async fn rehydration_skips_user_note_events() {
         let s = root_session();
-        record_user(&s, "first");
-        record_assistant(&s, "infer-1", "ok");
+        record_user(&s, "first").await;
+        record_assistant(&s, "infer-1", "ok").await;
         // A user note recorded mid-conversation (between turns).
         s.record_event(
             crate::db::session_log::SessionEventKind::UserNote,
@@ -3422,11 +3532,15 @@ mod tests {
             None,
             &json!({ "text": "remember: secret sk-NOTE-123 caused the bug" }),
         )
+        .await
         .unwrap();
-        record_user(&s, "second");
-        record_assistant(&s, "infer-2", "done");
+        record_user(&s, "second").await;
+        record_assistant(&s, "infer-2", "done").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         // Exactly the four real turns — the note contributes nothing.
         assert_eq!(h.len(), 4);
@@ -3445,19 +3559,24 @@ mod tests {
     }
 
     /// Empty session → nothing to rehydrate.
-    #[test]
-    fn empty_session_rehydrates_to_none() {
+    #[tokio::test]
+    async fn empty_session_rehydrates_to_none() {
         let s = root_session();
-        assert!(rehydrate_session(&s.db, s.id, "Build").unwrap().is_none());
+        assert!(
+            rehydrate_session(&s.db, s.id, "Build")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The ledger re-applies, yielding byte-identical pruned bodies: the
     /// elided tool-result body becomes the exact marker.
-    #[test]
-    fn ledger_reapply_yields_byte_identical_pruned_form() {
+    #[tokio::test]
+    async fn ledger_reapply_yields_byte_identical_pruned_form() {
         let s = root_session();
-        record_user(&s, "read twice");
-        record_assistant(&s, "infer-1", "");
+        record_user(&s, "read twice").await;
+        record_assistant(&s, "infer-1", "").await;
         record_tool(
             &s,
             "tc-1",
@@ -3465,8 +3584,9 @@ mod tests {
             json!({ "path": "/f" }),
             json!({ "path": "/f" }),
             "FIRST BODY",
-        );
-        record_assistant(&s, "infer-2", "");
+        )
+        .await;
+        record_assistant(&s, "infer-2", "").await;
         record_tool(
             &s,
             "tc-2",
@@ -3474,7 +3594,8 @@ mod tests {
             json!({ "path": "/f" }),
             json!({ "path": "/f" }),
             "SECOND BODY",
-        );
+        )
+        .await;
 
         // Persist a ledger that elides the older read (tc-1).
         let ledger = PruneLedger {
@@ -3487,7 +3608,10 @@ mod tests {
         };
         s.db.save_prune_ledger(s.id, &ledger).unwrap();
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!r.ledger_fallback);
         assert_eq!(r.watermark, 4);
         // tc-1's body is the exact marker; tc-2's body is intact.
@@ -3503,11 +3627,11 @@ mod tests {
     /// A ledger referencing an id that isn't in the rebuilt history is
     /// inconsistent → fall back to the FULL UNPRUNED form + flag, never a
     /// fresh context.
-    #[test]
-    fn bad_ledger_falls_back_to_full_unpruned() {
+    #[tokio::test]
+    async fn bad_ledger_falls_back_to_full_unpruned() {
         let s = root_session();
-        record_user(&s, "read once");
-        record_assistant(&s, "infer-1", "");
+        record_user(&s, "read once").await;
+        record_assistant(&s, "infer-1", "").await;
         record_tool(
             &s,
             "tc-1",
@@ -3515,7 +3639,8 @@ mod tests {
             json!({ "path": "/f" }),
             json!({ "path": "/f" }),
             "ONLY BODY",
-        );
+        )
+        .await;
 
         // Ledger points at a non-existent id.
         let ledger = PruneLedger {
@@ -3528,7 +3653,10 @@ mod tests {
         };
         s.db.save_prune_ledger(s.id, &ledger).unwrap();
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(r.ledger_fallback, "inconsistent ledger → fallback");
         assert_eq!(r.watermark, 0, "fallback resets the watermark");
         // Body is the full original — NOT a marker, NOT dropped.
@@ -3539,11 +3667,11 @@ mod tests {
     /// body never landed durably) is HEALED with an honest aborted stub —
     /// the prior conversation rebuilds instead of dead-ending, and the heal
     /// is surfaced as a `Recovery::ResumeHeal` audit record.
-    #[test]
-    fn missing_tool_call_row_is_stubbed_not_an_error() {
+    #[tokio::test]
+    async fn missing_tool_call_row_is_stubbed_not_an_error() {
         let s = root_session();
-        record_user(&s, "go");
-        record_assistant(&s, "infer-1", "calling a tool");
+        record_user(&s, "go").await;
+        record_assistant(&s, "infer-1", "calling a tool").await;
         // A tool_call timeline event WITHOUT the audit row.
         s.record_event(
             crate::db::session_log::SessionEventKind::ToolCall,
@@ -3551,9 +3679,13 @@ mod tests {
             Some("orphan"),
             &json!({ "tool": "read", "wire_input": { "path": "/f" }, "output": "x" }),
         )
+        .await
         .unwrap();
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         // The stubbed call is paired with an honest aborted result.
         validate_pairing(&r.history).expect("healed history is provider-valid");
         let calls = assistant_calls(&r.history[1]);
@@ -3574,11 +3706,11 @@ mod tests {
     /// stored pre-redaction and `redact::scrub()` runs on the outbound
     /// prompt at send time exactly as for a live history — never stored
     /// redacted, never double-applied. The rebuilt bodies must be verbatim.
-    #[test]
-    fn rehydration_does_not_redact() {
+    #[tokio::test]
+    async fn rehydration_does_not_redact() {
         let s = root_session();
-        record_user(&s, "my token is sk-SECRET-123");
-        record_assistant(&s, "infer-1", "noted: sk-SECRET-123");
+        record_user(&s, "my token is sk-SECRET-123").await;
+        record_assistant(&s, "infer-1", "noted: sk-SECRET-123").await;
         record_tool(
             &s,
             "tc-1",
@@ -3586,10 +3718,14 @@ mod tests {
             json!({ "path": "/f" }),
             json!({ "path": "/f" }),
             "file contains sk-SECRET-123",
-        );
-        record_assistant(&s, "infer-2", "");
+        )
+        .await;
+        record_assistant(&s, "infer-2", "").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         let h = r.history;
         // Verbatim — no scrub applied (the send path scrubs, as today).
         assert_eq!(user_text(&h[0]), "my token is sk-SECRET-123");
@@ -3601,12 +3737,12 @@ mod tests {
     /// transcript (rehydration returns `Some`). The session_worker gate
     /// keys off this `Some`/`None` to skip seed-tool re-execution — the two
     /// paths are mutually exclusive (implementation note).
-    #[test]
-    fn successor_with_turns_rebuilds_from_transcript() {
+    #[tokio::test]
+    async fn successor_with_turns_rebuilds_from_transcript() {
         let s = root_session();
-        record_user(&s, "continue from compact");
-        record_assistant(&s, "infer-1", "carrying on");
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap();
+        record_user(&s, "continue from compact").await;
+        record_assistant(&s, "infer-1", "carrying on").await;
+        let r = rehydrate_session(&s.db, s.id, "Build").await.unwrap();
         assert!(
             r.is_some(),
             "a successor with turns rebuilds → seeds are skipped"
@@ -3616,6 +3752,7 @@ mod tests {
         let fresh = root_session();
         assert!(
             rehydrate_session(&fresh.db, fresh.id, "Build")
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -3623,12 +3760,15 @@ mod tests {
 
     /// No ledger at all → the rebuilt full form IS the pruned form (no
     /// fallback flag, watermark 0).
-    #[test]
-    fn no_ledger_rebuilds_full_form() {
+    #[tokio::test]
+    async fn no_ledger_rebuilds_full_form() {
         let s = root_session();
-        record_user(&s, "hi");
-        record_assistant(&s, "infer-1", "hello");
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        record_user(&s, "hi").await;
+        record_assistant(&s, "infer-1", "hello").await;
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!r.ledger_fallback);
         assert_eq!(r.watermark, 0);
         assert_eq!(r.history.len(), 2);
@@ -3666,22 +3806,26 @@ mod tests {
 
     /// A `task` delegation whose `subagent_report` never landed is HEALED
     /// with an honest "delegation did not complete" stub instead of erroring.
-    #[test]
-    fn missing_subagent_report_is_stubbed_not_an_error() {
+    #[tokio::test]
+    async fn missing_subagent_report_is_stubbed_not_an_error() {
         let s = root_session();
-        record_user(&s, "investigate");
-        record_assistant(&s, "infer-1", "delegating");
+        record_user(&s, "investigate").await;
+        record_assistant(&s, "infer-1", "delegating").await;
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentSpawned,
             Some("Build"),
             Some("task-1"),
             &json!({ "child_agent": "explore", "task_call_id": "task-1", "prompt": "look" }),
         )
+        .await
         .unwrap();
         // No SubagentReport recorded.
-        record_assistant(&s, "infer-2", "continuing without it");
+        record_assistant(&s, "infer-2", "continuing without it").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         validate_pairing(&r.history).expect("healed history is provider-valid");
         let calls = assistant_calls(&r.history[1]);
         assert_eq!(calls[0].function.name, "task");
@@ -3698,8 +3842,8 @@ mod tests {
 
     /// An orphan tool_use (assistant tool-call with no following result) is
     /// stubbed with an honest aborted result; the healed history validates.
-    #[test]
-    fn heal_stubs_orphan_tool_use() {
+    #[tokio::test]
+    async fn heal_stubs_orphan_tool_use() {
         let mut history = vec![
             Message::user("go"),
             assistant_with_calls(&["c1"]),
@@ -3722,8 +3866,8 @@ mod tests {
 
     /// An orphan tool_result (no preceding tool_use of its id) is dropped;
     /// the healed history validates and the heal is recorded.
-    #[test]
-    fn heal_drops_orphan_tool_result() {
+    #[tokio::test]
+    async fn heal_drops_orphan_tool_result() {
         let mut history = vec![
             Message::user("go"),
             // A bare tool_result with no preceding assistant tool_use.
@@ -3748,8 +3892,8 @@ mod tests {
 
     /// Dropping an orphan result must not disturb a sibling paired result in
     /// the same user message (multiple results defensively handled).
-    #[test]
-    fn heal_drops_only_the_orphan_sibling_result() {
+    #[tokio::test]
+    async fn heal_drops_only_the_orphan_sibling_result() {
         // Assistant issues c1 only; a user message carries BOTH c1 (paired)
         // and ghost (orphan) results.
         let mixed = Message::User {
@@ -3784,8 +3928,8 @@ mod tests {
 
     /// Multiple mixed orphans in one transcript heal in a single pass and the
     /// result passes `validate_pairing`.
-    #[test]
-    fn heal_handles_mixed_orphans_in_one_pass() {
+    #[tokio::test]
+    async fn heal_handles_mixed_orphans_in_one_pass() {
         let mut history = vec![
             Message::user("start"),
             // Orphan result with no preceding call.
@@ -3815,8 +3959,8 @@ mod tests {
 
     /// Idempotence: healing an already-healed history is a no-op (no edits,
     /// no new heals).
-    #[test]
-    fn heal_is_idempotent() {
+    #[tokio::test]
+    async fn heal_is_idempotent() {
         let mut history = vec![
             Message::user("start"),
             result_msg("ghost", "stale"),
@@ -3843,8 +3987,8 @@ mod tests {
     /// result and — crucially — does NOT double-stub `task`, whose own result
     /// is carried by the not-yet-pushed `prompt`. The send sequence
     /// (history + prompt) is provider-valid.
-    #[test]
-    fn live_heal_structural_then_sibling_pairs_without_double_stubbing() {
+    #[tokio::test]
+    async fn live_heal_structural_then_sibling_pairs_without_double_stubbing() {
         // history ends with the assistant turn carrying BOTH calls; no result
         // for either is in history yet (the dispatch loop returned early on
         // `task`).
@@ -3893,8 +4037,8 @@ mod tests {
 
     /// The live heal is a no-op (byte-identical, no heals) on an already-paired
     /// turn — the overwhelmingly common path, run every turn.
-    #[test]
-    fn live_heal_is_a_noop_on_paired_history() {
+    #[tokio::test]
+    async fn live_heal_is_a_noop_on_paired_history() {
         let history = vec![
             Message::user("read it"),
             assistant_with_calls(&["c1"]),
@@ -3918,8 +4062,8 @@ mod tests {
     /// The live heal is idempotent across turns: after it stubs the sibling,
     /// the next turn (with the structural result now pushed into history) heals
     /// nothing — no double-stub, no drift.
-    #[test]
-    fn live_heal_is_idempotent_across_turns() {
+    #[tokio::test]
+    async fn live_heal_is_idempotent_across_turns() {
         let mut history = vec![
             Message::user("do X"),
             assistant_with_calls(&["task", "read"]),
@@ -3944,11 +4088,11 @@ mod tests {
     /// A transcript with an orphan tool_use, an orphan tool_result, AND a
     /// `task` delegation missing its report resumes successfully end-to-end:
     /// validates, preserves prior context, and records one heal per orphan.
-    #[test]
-    fn mixed_orphans_resume_successfully_end_to_end() {
+    #[tokio::test]
+    async fn mixed_orphans_resume_successfully_end_to_end() {
         let s = root_session();
-        record_user(&s, "do work");
-        record_assistant(&s, "infer-1", "calling read");
+        record_user(&s, "do work").await;
+        record_assistant(&s, "infer-1", "calling read").await;
         // Orphan tool-call: timeline event, no audit row → stubbed.
         s.record_event(
             crate::db::session_log::SessionEventKind::ToolCall,
@@ -3956,8 +4100,9 @@ mod tests {
             Some("orphan-call"),
             &json!({ "tool": "read", "wire_input": { "path": "/f" }, "output": "" }),
         )
+        .await
         .unwrap();
-        record_assistant(&s, "infer-2", "delegating");
+        record_assistant(&s, "infer-2", "delegating").await;
         // Task delegation with no report → stubbed.
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentSpawned,
@@ -3965,10 +4110,14 @@ mod tests {
             Some("task-1"),
             &json!({ "child_agent": "explore", "task_call_id": "task-1", "prompt": "p" }),
         )
+        .await
         .unwrap();
-        record_assistant(&s, "infer-3", "wrapping up");
+        record_assistant(&s, "infer-3", "wrapping up").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         validate_pairing(&r.history).expect("healed history is provider-valid");
         // Prior user context preserved.
         assert_eq!(user_text(&r.history[0]), "do work");
@@ -3987,11 +4136,11 @@ mod tests {
 
     /// Clean-history no-op: a well-formed transcript rehydrates with NO heals
     /// (and thus no resume Notice) — the common path stays silent.
-    #[test]
-    fn clean_transcript_produces_no_heals() {
+    #[tokio::test]
+    async fn clean_transcript_produces_no_heals() {
         let s = root_session();
-        record_user(&s, "read the file");
-        record_assistant(&s, "infer-1", "reading");
+        record_user(&s, "read the file").await;
+        record_assistant(&s, "infer-1", "reading").await;
         record_tool(
             &s,
             "tc-1",
@@ -3999,10 +4148,14 @@ mod tests {
             json!({ "path": "/f" }),
             json!({ "path": "/f" }),
             "body",
-        );
-        record_assistant(&s, "infer-2", "done");
+        )
+        .await;
+        record_assistant(&s, "infer-2", "done").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(r.heals.is_empty(), "clean transcript heals nothing");
         validate_pairing(&r.history).expect("clean transcript is already valid");
     }
@@ -4020,11 +4173,11 @@ mod tests {
     /// the heal pass AGAIN, is unchanged (`heal(heal(x)) == heal(x)`) and still
     /// passes `validate_pairing`. Drives the rebuilt history straight off
     /// `rehydrate_session`, so it composes the real rebuild output.
-    #[test]
-    fn composed_heal_then_validate_is_idempotent_on_rebuilt_history() {
+    #[tokio::test]
+    async fn composed_heal_then_validate_is_idempotent_on_rebuilt_history() {
         let s = root_session();
-        record_user(&s, "go");
-        record_assistant(&s, "infer-1", "calling a tool");
+        record_user(&s, "go").await;
+        record_assistant(&s, "infer-1", "calling a tool").await;
         // Orphan tool-call: timeline event, no audit row → healed at rebuild.
         s.record_event(
             crate::db::session_log::SessionEventKind::ToolCall,
@@ -4032,10 +4185,14 @@ mod tests {
             Some("orphan"),
             &json!({ "tool": "read", "wire_input": { "path": "/f" }, "output": "x" }),
         )
+        .await
         .unwrap();
-        record_assistant(&s, "infer-2", "done");
+        record_assistant(&s, "infer-2", "done").await;
 
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!r.heals.is_empty(), "the transcript required healing");
         let healed = r.history.clone();
         validate_pairing(&healed).expect("rebuilt+healed history is provider-valid");
@@ -4054,11 +4211,11 @@ mod tests {
     /// with the same heal records — the orphans were stubbed/dropped in the
     /// rebuilt history, never written back, so the second rehydrate re-derives
     /// an identical result (no drift, no double-stub).
-    #[test]
-    fn composed_resume_cycle_is_stable() {
+    #[tokio::test]
+    async fn composed_resume_cycle_is_stable() {
         let s = root_session();
-        record_user(&s, "do work");
-        record_assistant(&s, "infer-1", "calling read");
+        record_user(&s, "do work").await;
+        record_assistant(&s, "infer-1", "calling read").await;
         // Orphan tool-call (no audit row) → stubbed at rebuild.
         s.record_event(
             crate::db::session_log::SessionEventKind::ToolCall,
@@ -4066,8 +4223,9 @@ mod tests {
             Some("orphan-call"),
             &json!({ "tool": "read", "wire_input": { "path": "/f" }, "output": "" }),
         )
+        .await
         .unwrap();
-        record_assistant(&s, "infer-2", "delegating");
+        record_assistant(&s, "infer-2", "delegating").await;
         // Task delegation with no report → stubbed at rebuild.
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentSpawned,
@@ -4075,11 +4233,18 @@ mod tests {
             Some("task-1"),
             &json!({ "child_agent": "explore", "task_call_id": "task-1", "prompt": "p" }),
         )
+        .await
         .unwrap();
-        record_assistant(&s, "infer-3", "wrapping up");
+        record_assistant(&s, "infer-3", "wrapping up").await;
 
-        let first = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
-        let second = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let first = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
+        let second = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         // Same healed history and the same heal records on the second resume.
         assert_eq!(first.history, second.history, "resume cycle is stable");
         assert_eq!(first.heals, second.heals, "no new ResumeHeal records");
@@ -4090,11 +4255,11 @@ mod tests {
     /// orphans rehydrates successfully (Ok) instead of hard-erroring. Proven by
     /// contrast: the rebuilt-but-UNhealed history would FAIL `validate_pairing`,
     /// yet `rehydrate_session` (heal-then-validate) returns Ok.
-    #[test]
-    fn composed_heal_precedes_validate_so_orphans_resume() {
+    #[tokio::test]
+    async fn composed_heal_precedes_validate_so_orphans_resume() {
         let s = root_session();
-        record_user(&s, "go");
-        record_assistant(&s, "infer-1", "calling a tool");
+        record_user(&s, "go").await;
+        record_assistant(&s, "infer-1", "calling a tool").await;
         // Orphan tool-call with no audit row → an orphan tool_use at rebuild.
         s.record_event(
             crate::db::session_log::SessionEventKind::ToolCall,
@@ -4102,6 +4267,7 @@ mod tests {
             Some("orphan"),
             &json!({ "tool": "read", "wire_input": { "path": "/f" }, "output": "x" }),
         )
+        .await
         .unwrap();
 
         // The rebuilt-but-unhealed history would not pass validation: rebuild
@@ -4116,7 +4282,10 @@ mod tests {
 
         // …while the full pipeline (heal-then-validate) resumes the real
         // orphaned transcript successfully.
-        let r = rehydrate_session(&s.db, s.id, "Build").unwrap().unwrap();
+        let r = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
         validate_pairing(&r.history).expect("heal ran before validate → Ok");
         assert!(!r.heals.is_empty());
     }
@@ -4125,8 +4294,8 @@ mod tests {
     /// `validate_pairing` failure remains a HARD ERROR. We feed an explicitly
     /// unpairable history straight to the validator (bypassing heal) to pin
     /// that the final assertion is real and not weakened to a warning.
-    #[test]
-    fn composed_post_heal_validate_failure_is_a_hard_error() {
+    #[tokio::test]
+    async fn composed_post_heal_validate_failure_is_a_hard_error() {
         // An assistant tool_use with no matching tool_result anywhere — the
         // shape heal is designed to prevent, so if it ever reaches validate
         // unhealed, validate must hard-error.
@@ -4137,8 +4306,8 @@ mod tests {
 
     // ---- wire history snapshot (implementation note) -----
 
-    #[test]
-    fn rehydrate_user_message_prefers_display_text() {
+    #[tokio::test]
+    async fn rehydrate_user_message_prefers_display_text() {
         let s = root_session();
         s.record_event(
             crate::db::session_log::SessionEventKind::UserMessage,
@@ -4155,9 +4324,10 @@ mod tests {
                 }]
             }),
         )
+        .await
         .unwrap();
 
-        let snapshot = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let snapshot = history_snapshot(&s.db, s.id, "Build").await.unwrap();
         match &snapshot[0] {
             proto::HistoryEntry::User {
                 text,
@@ -4174,12 +4344,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rehydrate_user_message_legacy_text_fallback() {
+    #[tokio::test]
+    async fn rehydrate_user_message_legacy_text_fallback() {
         let s = root_session();
-        record_user(&s, "legacy wire text");
+        record_user(&s, "legacy wire text").await;
 
-        let snapshot = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let snapshot = history_snapshot(&s.db, s.id, "Build").await.unwrap();
         match &snapshot[0] {
             proto::HistoryEntry::User {
                 text,
@@ -4200,11 +4370,11 @@ mod tests {
     /// not just the tool call (the old `list_tool_calls_for_session`-only path
     /// dropped every message). The seq order is the same one model rehydration
     /// uses, so the two never drift.
-    #[test]
-    fn history_snapshot_includes_messages_and_tool_calls_in_order() {
+    #[tokio::test]
+    async fn history_snapshot_includes_messages_and_tool_calls_in_order() {
         let s = root_session();
-        record_user(&s, "read the file");
-        record_assistant(&s, "infer-1", "let me read it");
+        record_user(&s, "read the file").await;
+        record_assistant(&s, "infer-1", "let me read it").await;
         record_tool(
             &s,
             "tc-1",
@@ -4213,9 +4383,10 @@ mod tests {
             json!({ "path": "src/main.rs", "typo": true }),
             json!({ "path": "src/main.rs" }),
             "fn main() {}",
-        );
+        )
+        .await;
 
-        let snap = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let snap = history_snapshot(&s.db, s.id, "Build").await.unwrap();
         assert_eq!(snap.len(), 3, "all three kinds present, none dropped");
 
         match &snap[0] {
@@ -4266,7 +4437,7 @@ mod tests {
     #[tokio::test]
     async fn btw_events_absent_from_parent_history() {
         let parent = root_session();
-        record_user(&parent, "parent before btw");
+        record_user(&parent, "parent before btw").await;
         let btw = parent
             .db
             .create_btw_fork(parent.id, true)
@@ -4275,16 +4446,20 @@ mod tests {
         let btw_session = Session::resume(parent.db.clone(), btw.info.session_id)
             .unwrap()
             .expect("btw session");
-        record_user(&btw_session, "btw-only prompt");
-        record_assistant(&btw_session, "btw-call", "btw-only answer");
+        record_user(&btw_session, "btw-only prompt").await;
+        record_assistant(&btw_session, "btw-call", "btw-only answer").await;
 
-        let parent_snapshot = history_snapshot(&parent.db, parent.id, "Build").unwrap();
+        let parent_snapshot = history_snapshot(&parent.db, parent.id, "Build")
+            .await
+            .unwrap();
         assert_eq!(parent_snapshot.len(), 1);
         assert!(
             matches!(&parent_snapshot[0], proto::HistoryEntry::User { text, .. } if text == "parent before btw")
         );
 
-        let btw_snapshot = history_snapshot(&parent.db, btw.info.session_id, "Build").unwrap();
+        let btw_snapshot = history_snapshot(&parent.db, btw.info.session_id, "Build")
+            .await
+            .unwrap();
         assert!(
             btw_snapshot.iter().any(
                 |entry| matches!(entry, proto::HistoryEntry::User { text, .. } if text == "btw-only prompt")
@@ -4294,14 +4469,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
     async fn history_snapshot_conn_matches_db_wrapper_byte_for_byte() {
         let s = root_session();
-        record_user(&s, "read the file");
-        record_assistant(&s, "infer-1", "let me read it");
+        record_user(&s, "read the file").await;
+        record_assistant(&s, "infer-1", "let me read it").await;
         record_tool(
             &s,
             "tc-1",
@@ -4309,11 +4480,14 @@ mod tests {
             json!({ "path": "src/main.rs", "typo": true }),
             json!({ "path": "src/main.rs" }),
             "fn main() {}",
-        );
+        )
+        .await;
 
-        let wrapped = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let wrapped = history_snapshot(&s.db, s.id, "Build").await.unwrap();
+        let session_id = s.id;
         let direct =
-            s.db.read_blocking(|conn| history_snapshot_conn(conn, s.id, "Build"))
+            s.db.read(move |conn| history_snapshot_conn(conn, session_id, "Build"))
+                .await
                 .unwrap();
 
         assert_eq!(
@@ -4323,28 +4497,61 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
+    async fn db_async_rehydrate_full_history_read_uses_async_api() {
+        let s = root_session();
+        record_user(&s, "inspect src/main.rs").await;
+        record_assistant(&s, "infer-1", "reading it").await;
+        record_tool(
+            &s,
+            "tc-1",
+            "read",
+            json!({"path": "src/main.rs"}),
+            json!({"path": "src/main.rs"}),
+            "fn main() {}",
+        )
+        .await;
+
+        let snapshot = history_snapshot(&s.db, s.id, "Build").await.unwrap();
+        assert_eq!(snapshot.len(), 3);
+        assert!(matches!(
+            &snapshot[0],
+            proto::HistoryEntry::User { text, .. } if text == "inspect src/main.rs"
+        ));
+        assert!(matches!(
+            &snapshot[1],
+            proto::HistoryEntry::Assistant { text, .. } if text == "reading it"
+        ));
+        assert!(matches!(
+            &snapshot[2],
+            proto::HistoryEntry::ToolCall { call_id, output, .. }
+                if call_id == "tc-1" && output == "fn main() {}"
+        ));
+    }
+
+    #[tokio::test]
     async fn history_snapshot_since_replays_only_rows_after_cursor() {
         let s = root_session();
-        record_user(&s, "already rendered");
-        record_assistant(&s, "infer-1", "also rendered");
+        record_user(&s, "already rendered").await;
+        record_assistant(&s, "infer-1", "also rendered").await;
         let cursor =
             s.db.list_session_events(s.id)
+                .await
                 .unwrap()
                 .into_iter()
                 .map(|row| row.seq)
                 .max()
                 .unwrap();
-        record_user(&s, "missed user");
-        record_assistant(&s, "infer-2", "missed assistant");
+        record_user(&s, "missed user").await;
+        record_assistant(&s, "infer-2", "missed assistant").await;
 
+        let session_id = s.id;
         let replay =
-            s.db.read_blocking(|conn| {
-                history_snapshot_since_with_active_subagent_conn(conn, s.id, "Build", None, cursor)
+            s.db.read(move |conn| {
+                history_snapshot_since_with_active_subagent_conn(
+                    conn, session_id, "Build", None, cursor,
+                )
             })
+            .await
             .unwrap();
 
         assert_eq!(replay.len(), 2);
@@ -4365,18 +4572,16 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
     async fn history_page_before_returns_newest_entries_oldest_first() {
         let s = root_session();
-        record_user(&s, "one");
-        record_user(&s, "two");
-        record_user(&s, "three");
+        record_user(&s, "one").await;
+        record_user(&s, "two").await;
+        record_user(&s, "three").await;
 
+        let session_id = s.id;
         let page =
-            s.db.read_blocking(|conn| history_page_before_conn(conn, s.id, "Build", None, 2))
+            s.db.read(move |conn| history_page_before_conn(conn, session_id, "Build", None, 2))
+                .await
                 .unwrap();
 
         assert!(page.has_more);
@@ -4391,25 +4596,26 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
     async fn history_page_before_walk_reconstructs_full_snapshot() {
         let s = root_session();
-        record_user(&s, "one");
-        record_assistant(&s, "infer-1", "two");
-        record_user(&s, "three");
-        record_assistant(&s, "infer-2", "four");
-        record_user(&s, "five");
+        record_user(&s, "one").await;
+        record_assistant(&s, "infer-1", "two").await;
+        record_user(&s, "three").await;
+        record_assistant(&s, "infer-2", "four").await;
+        record_user(&s, "five").await;
 
-        let full = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let full = history_snapshot(&s.db, s.id, "Build").await.unwrap();
         let mut cursor = None;
         let mut pages = Vec::new();
+        let session_id = s.id;
         loop {
+            let before_seq = cursor;
             let page =
-                s.db.read_blocking(|conn| history_page_before_conn(conn, s.id, "Build", cursor, 2))
-                    .unwrap();
+                s.db.read(move |conn| {
+                    history_page_before_conn(conn, session_id, "Build", before_seq, 2)
+                })
+                .await
+                .unwrap();
             let has_more = page.has_more;
             cursor = page.oldest_seq;
             pages.push(page.entries);
@@ -4429,32 +4635,34 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
     async fn history_page_before_reports_has_more_until_first_entry() {
         let s = root_session();
-        record_user(&s, "one");
-        record_user(&s, "two");
-        record_user(&s, "three");
-        record_user(&s, "four");
-        record_user(&s, "five");
+        record_user(&s, "one").await;
+        record_user(&s, "two").await;
+        record_user(&s, "three").await;
+        record_user(&s, "four").await;
+        record_user(&s, "five").await;
 
+        let session_id = s.id;
         let first =
-            s.db.read_blocking(|conn| history_page_before_conn(conn, s.id, "Build", None, 2))
+            s.db.read(move |conn| history_page_before_conn(conn, session_id, "Build", None, 2))
+                .await
                 .unwrap();
         assert!(first.has_more);
+        let second_before_seq = first.oldest_seq;
         let second =
-            s.db.read_blocking(|conn| {
-                history_page_before_conn(conn, s.id, "Build", first.oldest_seq, 2)
+            s.db.read(move |conn| {
+                history_page_before_conn(conn, session_id, "Build", second_before_seq, 2)
             })
+            .await
             .unwrap();
         assert!(second.has_more);
+        let third_before_seq = second.oldest_seq;
         let third =
-            s.db.read_blocking(|conn| {
-                history_page_before_conn(conn, s.id, "Build", second.oldest_seq, 2)
+            s.db.read(move |conn| {
+                history_page_before_conn(conn, session_id, "Build", third_before_seq, 2)
             })
+            .await
             .unwrap();
         assert!(!third.has_more);
         assert_eq!(third.entries.len(), 1);
@@ -4464,15 +4672,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
     async fn history_page_before_empty_session_returns_empty_page() {
         let s = root_session();
 
+        let session_id = s.id;
         let page =
-            s.db.read_blocking(|conn| history_page_before_conn(conn, s.id, "Build", None, 20))
+            s.db.read(move |conn| history_page_before_conn(conn, session_id, "Build", None, 20))
+                .await
                 .unwrap();
 
         assert!(page.entries.is_empty());
@@ -4481,10 +4687,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
     async fn history_page_before_carries_compact_boundary_brief() {
         let s = root_session();
         let handoff_id = Uuid::new_v4();
@@ -4498,6 +4700,7 @@ mod tests {
             })
             .to_string(),
         )
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::SessionCompacted,
@@ -4507,11 +4710,14 @@ mod tests {
                 "handoff_ref": handoff_id.to_string(),
             }),
         )
+        .await
         .unwrap();
 
-        let full = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let full = history_snapshot(&s.db, s.id, "Build").await.unwrap();
+        let session_id = s.id;
         let page =
-            s.db.read_blocking(|conn| history_page_before_conn(conn, s.id, "Build", None, 1))
+            s.db.read(move |conn| history_page_before_conn(conn, session_id, "Build", None, 1))
+                .await
                 .unwrap();
 
         assert_eq!(
@@ -4530,8 +4736,8 @@ mod tests {
     #[tokio::test]
     async fn attach_read_conn_shape_completes_without_relocking() {
         let s = root_session();
-        record_user(&s, "go");
-        record_assistant(&s, "infer-1", "done");
+        record_user(&s, "go").await;
+        record_assistant(&s, "infer-1", "done").await;
         let db = s.db.clone();
         let session_id = s.id;
         let cfg = crate::config::extended::ExtendedConfig::default();
@@ -4556,8 +4762,8 @@ mod tests {
         assert!(row.is_some());
     }
 
-    #[test]
-    fn history_snapshot_carries_compact_boundary_brief_when_present() {
+    #[tokio::test]
+    async fn history_snapshot_carries_compact_boundary_brief_when_present() {
         let s = root_session();
         s.record_event(
             crate::db::session_log::SessionEventKind::SessionCompacted,
@@ -4569,6 +4775,7 @@ mod tests {
                 "brief_text": "handoff summary",
             }),
         )
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::SessionCompacted,
@@ -4579,9 +4786,10 @@ mod tests {
                 "seed_tool_count": 1,
             }),
         )
+        .await
         .unwrap();
 
-        let snap = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let snap = history_snapshot(&s.db, s.id, "Build").await.unwrap();
         assert_eq!(snap.len(), 2);
         match &snap[0] {
             proto::HistoryEntry::CompactBoundary {
@@ -4605,10 +4813,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
     async fn session_compacted_persists_handoff() {
         let s = root_session();
         let handoff = format!("## Decisions\n{}", "durable ".repeat(3_000));
@@ -4634,16 +4838,19 @@ mod tests {
                 tail_messages: &tail,
             },
         )
+        .await
         .unwrap();
+        let session_id = s.id;
         let raw_data: String = s
             .db
-            .read_blocking(|conn| {
+            .read(move |conn| {
                 Ok(conn.query_row(
                     "SELECT data_json FROM session_events WHERE session_id = ?1 AND type = 'session_compacted'",
-                    [s.id.to_string()],
+                    [session_id.to_string()],
                     |row| row.get(0),
                 )?)
             })
+            .await
             .unwrap();
         let raw_data: serde_json::Value = serde_json::from_str(&raw_data).unwrap();
         assert!(raw_data["handoff_ref"].as_str().is_some());
@@ -4654,6 +4861,7 @@ mod tests {
 
         let event =
             s.db.list_session_events(s.id)
+                .await
                 .unwrap()
                 .into_iter()
                 .find(|event| event.kind == "session_compacted")
@@ -4661,7 +4869,7 @@ mod tests {
         assert_eq!(event.data["handoff_text"], handoff);
         assert!(event.data["tail_messages"].is_array());
 
-        let snapshot = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let snapshot = history_snapshot(&s.db, s.id, "Build").await.unwrap();
         match &snapshot[0] {
             proto::HistoryEntry::CompactBoundary {
                 handoff: Some(restored),
@@ -4679,12 +4887,12 @@ mod tests {
             other => panic!("expected durable compaction entry, got {other:?}"),
         }
 
-        let preview = s.db.read_session_messages(s.id, None, 10).unwrap().0;
+        let preview = s.db.read_session_messages(s.id, None, 10).await.unwrap().0;
         assert!(preview.iter().any(|message| message.text == handoff));
     }
 
-    #[test]
-    fn compaction_payload_refs_are_session_scoped() {
+    #[tokio::test]
+    async fn compaction_payload_refs_are_session_scoped() {
         let owner = root_session();
         let other = root_session();
         let payload_id = Uuid::new_v4();
@@ -4692,12 +4900,14 @@ mod tests {
         owner
             .db
             .store_compaction_payload(payload_id, owner.id, &payload)
+            .await
             .unwrap();
 
         assert_eq!(
             owner
                 .db
                 .compaction_payload(owner.id, &payload_id.to_string())
+                .await
                 .unwrap()
                 .as_deref(),
             Some(payload.as_str())
@@ -4706,16 +4916,13 @@ mod tests {
             owner
                 .db
                 .compaction_payload(other.id, &payload_id.to_string())
+                .await
                 .unwrap()
                 .is_none()
         );
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
     async fn compaction_entries_survive_replay() {
         let s = root_session();
         let seq = s
@@ -4737,11 +4944,20 @@ mod tests {
                     tail_messages: &[],
                 },
             )
+            .await
             .unwrap();
+        let session_id = s.id;
         let replay =
-            s.db.read_blocking(|conn| {
-                history_snapshot_since_with_active_subagent_conn(conn, s.id, "Build", None, seq - 1)
+            s.db.read(move |conn| {
+                history_snapshot_since_with_active_subagent_conn(
+                    conn,
+                    session_id,
+                    "Build",
+                    None,
+                    seq - 1,
+                )
             })
+            .await
             .unwrap();
         assert!(matches!(
             &replay[..],
@@ -4753,8 +4969,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn compacted_model_history_rehydrates_handoff_and_tail() {
+    #[tokio::test]
+    async fn compacted_model_history_rehydrates_handoff_and_tail() {
         let s = root_session();
         let tail = vec![
             Message::user("recent user"),
@@ -4778,8 +4994,10 @@ mod tests {
                 tail_messages: &tail,
             },
         )
+        .await
         .unwrap();
         let restored = rehydrate_session(&s.db, s.id, "Build")
+            .await
             .unwrap()
             .unwrap()
             .history;
@@ -4791,11 +5009,11 @@ mod tests {
 
     /// Recovery chip survives into the snapshot for a repaired tool call
     /// (wire-vs-user split, GOALS §14).
-    #[test]
-    fn history_snapshot_carries_recovery_chip() {
+    #[tokio::test]
+    async fn history_snapshot_carries_recovery_chip() {
         let s = root_session();
-        record_user(&s, "edit it");
-        record_assistant(&s, "infer-1", "");
+        record_user(&s, "edit it").await;
+        record_assistant(&s, "infer-1", "").await;
         s.record_tool_call(crate::session::ToolCallRow {
             event_id: Uuid::new_v4(),
             timestamp: chrono::Utc::now(),
@@ -4826,6 +5044,7 @@ mod tests {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::ToolCall,
@@ -4833,9 +5052,10 @@ mod tests {
             Some("tc-1"),
             &json!({ "tool": "read", "wire_input": { "path": "/f" }, "output": "ok" }),
         )
+        .await
         .unwrap();
 
-        let snap = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let snap = history_snapshot(&s.db, s.id, "Build").await.unwrap();
         let tc = snap
             .iter()
             .find(|e| matches!(e, proto::HistoryEntry::ToolCall { .. }))
@@ -4855,18 +5075,23 @@ mod tests {
 
     /// An empty session yields an empty snapshot (no error) — the brand-new
     /// session edge case.
-    #[test]
-    fn history_snapshot_empty_session_is_empty() {
+    #[tokio::test]
+    async fn history_snapshot_empty_session_is_empty() {
         let s = root_session();
-        assert!(history_snapshot(&s.db, s.id, "Build").unwrap().is_empty());
+        assert!(
+            history_snapshot(&s.db, s.id, "Build")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A session with tool calls but no assistant text still renders the
     /// subset that exists, in order (edge case: subset-only history).
-    #[test]
-    fn history_snapshot_tool_calls_without_assistant_text() {
+    #[tokio::test]
+    async fn history_snapshot_tool_calls_without_assistant_text() {
         let s = root_session();
-        record_user(&s, "go");
+        record_user(&s, "go").await;
         record_tool(
             &s,
             "tc-1",
@@ -4874,8 +5099,9 @@ mod tests {
             json!({ "command": "ls" }),
             json!({ "command": "ls" }),
             "a.rs",
-        );
-        let snap = history_snapshot(&s.db, s.id, "Build").unwrap();
+        )
+        .await;
+        let snap = history_snapshot(&s.db, s.id, "Build").await.unwrap();
         assert_eq!(snap.len(), 2);
         assert!(matches!(snap[0], proto::HistoryEntry::User { .. }));
         assert!(matches!(snap[1], proto::HistoryEntry::ToolCall { .. }));
@@ -4883,32 +5109,29 @@ mod tests {
 
     /// Subagent (non-root) turns are excluded from the snapshot, exactly as
     /// model rehydration excludes them — single source of truth, same gate.
-    #[test]
-    fn history_snapshot_excludes_subagent_turns() {
+    #[tokio::test]
+    async fn history_snapshot_excludes_subagent_turns() {
         let s = root_session();
-        record_user(&s, "go");
-        record_assistant(&s, "infer-1", "root says hi");
+        record_user(&s, "go").await;
+        record_assistant(&s, "infer-1", "root says hi").await;
         s.record_event(
             crate::db::session_log::SessionEventKind::AssistantMessage,
             Some("explore"),
             Some("infer-x"),
             &json!({ "text": "subagent internal" }),
         )
+        .await
         .unwrap();
-        let snap = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let snap = history_snapshot(&s.db, s.id, "Build").await.unwrap();
         assert_eq!(snap.len(), 2);
         assert!(matches!(snap[1], proto::HistoryEntry::Assistant { .. }));
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
     async fn history_snapshot_active_subagent_includes_running_row_and_child_turns() {
         let s = root_session();
-        record_user(&s, "build it");
-        record_assistant(&s, "infer-1", "delegating");
+        record_user(&s, "build it").await;
+        record_assistant(&s, "infer-1", "delegating").await;
         s.record_event(
             crate::db::session_log::SessionEventKind::SubagentSpawned,
             Some("Build"),
@@ -4921,6 +5144,7 @@ mod tests {
                 "prompt": "build it",
             }),
         )
+        .await
         .unwrap();
         s.record_event(
             crate::db::session_log::SessionEventKind::AssistantMessage,
@@ -4928,6 +5152,7 @@ mod tests {
             Some("infer-child"),
             &json!({ "text": "child progress" }),
         )
+        .await
         .unwrap();
 
         let active = proto::ActiveSubagent {
@@ -4936,10 +5161,18 @@ mod tests {
             task_call_id: "task-1".into(),
             label: "default".into(),
         };
+        let session_id = s.id;
+        let active_for_read = active.clone();
         let snap =
-            s.db.read_blocking(|conn| {
-                history_snapshot_with_active_subagent_conn(conn, s.id, "Build", Some(&active))
+            s.db.read(move |conn| {
+                history_snapshot_with_active_subagent_conn(
+                    conn,
+                    session_id,
+                    "Build",
+                    Some(&active_for_read),
+                )
             })
+            .await
             .unwrap();
 
         assert_eq!(snap.len(), 4);
@@ -4968,7 +5201,7 @@ mod tests {
             other => panic!("snap[3] should be child Assistant, got {other:?}"),
         }
 
-        let root_only = history_snapshot(&s.db, s.id, "Build").unwrap();
+        let root_only = history_snapshot(&s.db, s.id, "Build").await.unwrap();
         assert_eq!(
             root_only.len(),
             2,
@@ -4999,10 +5232,6 @@ mod subagent_observe_tests {
     use serde_json::json;
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
     async fn subagent_snapshot_isolates_interleaved_runs_with_same_agent() {
         let db = Db::open_in_memory().unwrap();
         let session = db
@@ -5023,6 +5252,7 @@ mod subagent_observe_tests {
             },
             &json!({ "text": "brief a" }),
         )
+        .await
         .unwrap();
         db.insert_session_event_with_context(
             sid,
@@ -5036,6 +5266,7 @@ mod subagent_observe_tests {
             },
             &json!({ "text": "brief b" }),
         )
+        .await
         .unwrap();
         db.insert_session_event_with_context(
             sid,
@@ -5049,6 +5280,7 @@ mod subagent_observe_tests {
             },
             &json!({ "text": "answer a", "reasoning": "ra" }),
         )
+        .await
         .unwrap();
         db.insert_session_event_with_context(
             sid,
@@ -5062,10 +5294,12 @@ mod subagent_observe_tests {
             },
             &json!({ "text": "answer b", "reasoning": "rb" }),
         )
+        .await
         .unwrap();
 
         let child_a = db
-            .read_blocking(|conn| subagent_history_snapshot_conn(conn, sid, "task-a", "default"))
+            .read(move |conn| subagent_history_snapshot_conn(conn, sid, "task-a", "default"))
+            .await
             .unwrap();
         assert_eq!(child_a.len(), 2);
         assert!(matches!(&child_a[0], proto::HistoryEntry::User { text, .. } if text == "brief a"));
@@ -5074,7 +5308,8 @@ mod subagent_observe_tests {
         );
 
         let child_b = db
-            .read_blocking(|conn| subagent_history_snapshot_conn(conn, sid, "task-b", "default"))
+            .read(move |conn| subagent_history_snapshot_conn(conn, sid, "task-b", "default"))
+            .await
             .unwrap();
         assert_eq!(child_b.len(), 2);
         assert!(matches!(&child_b[0], proto::HistoryEntry::User { text, .. } if text == "brief b"));
@@ -5084,10 +5319,6 @@ mod subagent_observe_tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
     async fn root_snapshot_hides_finished_child_rows() {
         let db = Db::open_in_memory().unwrap();
         let session = db
@@ -5102,6 +5333,7 @@ mod subagent_observe_tests {
             None,
             &json!({ "text": "root prompt" }),
         )
+        .await
         .unwrap();
         db.insert_session_event_with_context(
             sid,
@@ -5115,12 +5347,12 @@ mod subagent_observe_tests {
             },
             &json!({ "text": "hidden child", "reasoning": "" }),
         )
+        .await
         .unwrap();
 
         let root = db
-            .read_blocking(|conn| {
-                history_snapshot_with_active_subagent_conn(conn, sid, "Build", None)
-            })
+            .read(move |conn| history_snapshot_with_active_subagent_conn(conn, sid, "Build", None))
+            .await
             .unwrap();
         assert_eq!(root.len(), 1);
         assert!(

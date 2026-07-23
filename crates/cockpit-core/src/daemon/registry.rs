@@ -955,21 +955,40 @@ impl SessionRegistry {
             "Daemon shutdown interrupted active work",
         ) {
             Ok(interrupt_id) => {
-                if let Err(error) = self.inner.db.insert_session_event(
-                    handle.session_id,
-                    crate::db::session_log::SessionEventKind::TurnInterrupted,
-                    Some(&handle.active_agent_name),
-                    None,
-                    &json!({
-                        "reason": "daemon_shutdown_grace_expired",
-                        "interrupt_id": interrupt_id.to_string(),
-                        "grace_ms": grace_ms,
-                        "activity_state": activity_state,
-                        "has_active_schedules": has_active_schedules,
-                        "processing": processing,
-                        "tool_running": tool_running,
-                    }),
-                ) {
+                let data = json!({
+                    "reason": "daemon_shutdown_grace_expired",
+                    "interrupt_id": interrupt_id.to_string(),
+                    "grace_ms": grace_ms,
+                    "activity_state": activity_state,
+                    "has_active_schedules": has_active_schedules,
+                    "processing": processing,
+                    "tool_running": tool_running,
+                });
+                let data_json = match serde_json::to_string(&data) {
+                    Ok(data_json) => data_json,
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = %handle.session_id,
+                            error = %error,
+                            "serializing forced drain interruption event failed"
+                        );
+                        return;
+                    }
+                };
+                let session_id = handle.session_id;
+                let active_agent_name = handle.active_agent_name.clone();
+                if let Err(error) = self.inner.db.blocking_write_for_sync_event(move |conn| {
+                    crate::db::Db::insert_session_event_json_conn(
+                        conn,
+                        session_id,
+                        crate::db::session_log::SessionEventKind::TurnInterrupted,
+                        Some(&active_agent_name),
+                        None,
+                        crate::db::session_log::SessionEventContext::default(),
+                        crate::db::session_log::now_ms(),
+                        &data_json,
+                    )
+                }) {
                     tracing::warn!(
                         session_id = %handle.session_id,
                         error = %error,
@@ -2047,7 +2066,7 @@ mod tests {
             summary.activity_state,
             Some(crate::daemon::proto::SessionActivityState::Interrupted)
         );
-        let events = reg.inner.db.list_session_events(id).unwrap();
+        let events = reg.inner.db.list_session_events(id).await.unwrap();
         let interrupted = events
             .iter()
             .find(|event| event.kind == "turn_interrupted")
@@ -2104,7 +2123,12 @@ mod tests {
             killed.load(Ordering::SeqCst),
             "forced drain must abort the long-running worker task"
         );
-        let events = reg.inner.db.list_session_events(long_running_id).unwrap();
+        let events = reg
+            .inner
+            .db
+            .list_session_events(long_running_id)
+            .await
+            .unwrap();
         let interrupted = events
             .iter()
             .find(|event| event.kind == "turn_interrupted")
@@ -2139,7 +2163,7 @@ mod tests {
             .find(|summary| summary.session_id == id)
             .unwrap();
         assert_eq!(summary.activity_state, None);
-        let events = reg.inner.db.list_session_events(id).unwrap();
+        let events = reg.inner.db.list_session_events(id).await.unwrap();
         assert!(events.iter().all(|event| event.kind != "turn_interrupted"));
     }
 

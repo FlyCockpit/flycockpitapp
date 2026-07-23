@@ -178,7 +178,8 @@ impl Approver {
                         &offered_scopes,
                         Decision::Allow { scope },
                         DecisionSource::UserPrompt,
-                    );
+                    )
+                    .await;
                 }
                 Ok(SandboxEscalationApproval::GrantAndRetryConfined { scope })
             }
@@ -240,7 +241,8 @@ impl Approver {
                 &[],
                 decision,
                 DecisionSource::StandingReject,
-            );
+            )
+            .await;
             return Ok(decision);
         }
 
@@ -271,7 +273,8 @@ impl Approver {
                 &[],
                 decision,
                 DecisionSource::AlreadyGranted,
-            );
+            )
+            .await;
             return Ok(decision);
         }
 
@@ -317,7 +320,8 @@ impl Approver {
                     decision,
                     DecisionSource::UserPrompt,
                     Some(audit),
-                );
+                )
+                .await;
                 return Ok(decision);
             }
             let CommandStepDecision::Decision(decision) = step_decision else {
@@ -337,7 +341,8 @@ impl Approver {
                         decision,
                         source,
                         Some(audit.clone()),
-                    );
+                    )
+                    .await;
                     return Ok(decision);
                 }
                 Decision::Allow { scope } => {
@@ -353,7 +358,8 @@ impl Approver {
             decision,
             DecisionSource::UserPrompt,
             Some(audit),
-        );
+        )
+        .await;
         Ok(decision)
     }
 

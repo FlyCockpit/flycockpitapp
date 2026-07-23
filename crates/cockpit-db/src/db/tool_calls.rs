@@ -171,11 +171,7 @@ pub struct ToolCallEvent {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn insert_tool_call(&self, ev: &ToolCallEvent) -> Result<()> {
+    pub async fn insert_tool_call(&self, ev: &ToolCallEvent) -> Result<()> {
         let language = ev.path.as_deref().and_then(language_for_path);
         let (recovery_kind, recovery_stage) = ev.recovery.db_fields();
 
@@ -190,7 +186,7 @@ impl Db {
             .transpose()?;
 
         let ev = ev.clone();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO tool_call_events (
                     event_id, session_id, call_id, parent_call_id, parent_child_index, timestamp,
@@ -257,6 +253,7 @@ impl Db {
             .context("inserting tool_call_event")?;
             Ok(())
         })
+        .await
     }
 
     /// Recent rows where the call either hard-failed or fired any
@@ -272,12 +269,11 @@ impl Db {
     ///   `recovery_kind` are included too — useful for spotting
     ///   patterns the catalog is already catching.
     /// - `limit`: max rows returned.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_failed_tool_calls(&self, filter: FailedCallsFilter) -> Result<Vec<ToolCallEvent>> {
-        self.read_blocking(|conn| {
+    pub async fn list_failed_tool_calls(
+        &self,
+        filter: FailedCallsFilter,
+    ) -> Result<Vec<ToolCallEvent>> {
+        self.read(move |conn| {
             let mut where_sql = PredicateBuilder::new();
             where_sql.push_value("timestamp >=", filter.since_epoch);
             if filter.include_recovered {
@@ -330,23 +326,20 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 
     /// Lookup one tool call by model call id within a session. Used by `escalate`:
     /// sandbox refusals and confined non-zero exits are ordinary tool results,
     /// not hard failures, so this intentionally does not apply the failed-call
     /// filter.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn get_tool_call_by_call_id(
+    pub async fn get_tool_call_by_call_id(
         &self,
         session_id: Uuid,
         call_id: &str,
     ) -> Result<Option<ToolCallEvent>> {
         let call_id = call_id.to_string();
-        self.read_blocking(move |conn| {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT event_id, session_id, call_id,
@@ -375,16 +368,17 @@ impl Db {
             let raw = decode_row(row).context("decoding tool_call row")?;
             Ok(Some(raw.try_into()?))
         })
+        .await
     }
 
     /// All tool-call rows for one session, oldest-first. Used by
     /// `Attach` to rebuild the user transcript on the client.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_tool_calls_for_session(&self, session_id: Uuid) -> Result<Vec<ToolCallEvent>> {
-        self.read_blocking(|conn| Self::list_tool_calls_for_session_conn(conn, session_id))
+    pub async fn list_tool_calls_for_session(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<ToolCallEvent>> {
+        self.read(move |conn| Self::list_tool_calls_for_session_conn(conn, session_id))
+            .await
     }
 
     pub fn list_tool_calls_for_session_conn(
@@ -760,8 +754,8 @@ mod tests {
             shape_fingerprint: None,
             hint: None,
         };
-        db.insert_tool_call(&ev).unwrap();
-        let rows = db.list_tool_calls_for_session(sid).unwrap();
+        db.insert_tool_call(&ev).await.unwrap();
+        let rows = db.list_tool_calls_for_session(sid).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "read");
         assert_eq!(rows[0].path.as_deref(), Some("src/main.rs"));
@@ -789,11 +783,11 @@ mod tests {
         child_b.parent_child_index = Some(1);
         child_b.mcp_server = Some("external".into());
 
-        db.insert_tool_call(&parent).unwrap();
-        db.insert_tool_call(&child_a).unwrap();
-        db.insert_tool_call(&child_b).unwrap();
+        db.insert_tool_call(&parent).await.unwrap();
+        db.insert_tool_call(&child_a).await.unwrap();
+        db.insert_tool_call(&child_b).await.unwrap();
 
-        let rows = db.list_tool_calls_for_session(sid).unwrap();
+        let rows = db.list_tool_calls_for_session(sid).await.unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].parent_call_id, None);
         assert_eq!(rows[0].parent_child_index, None);
@@ -813,9 +807,9 @@ mod tests {
         let sid = fixture(&db).await;
         let ev = tool_call_fixture(sid, "top-level", "read", 100);
 
-        db.insert_tool_call(&ev).unwrap();
+        db.insert_tool_call(&ev).await.unwrap();
 
-        let rows = db.list_tool_calls_for_session(sid).unwrap();
+        let rows = db.list_tool_calls_for_session(sid).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].parent_call_id, None);
         assert_eq!(rows[0].parent_child_index, None);
@@ -867,8 +861,10 @@ mod tests {
         };
 
         db.insert_tool_call(&mk("read", 100, false, Recovery::Clean))
+            .await
             .unwrap();
         db.insert_tool_call(&mk("read", 200, true, Recovery::Clean))
+            .await
             .unwrap();
         db.insert_tool_call(&mk(
             "editunlock",
@@ -879,8 +875,10 @@ mod tests {
                 path: "old_string".into(),
             },
         ))
+        .await
         .unwrap();
         db.insert_tool_call(&mk("bash", 400, true, Recovery::Clean))
+            .await
             .unwrap();
 
         // hard-fail only, newest-first.
@@ -893,6 +891,7 @@ mod tests {
                 include_recovered: false,
                 limit: 10,
             })
+            .await
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].tool, "bash");
@@ -908,6 +907,7 @@ mod tests {
                 include_recovered: true,
                 limit: 10,
             })
+            .await
             .unwrap();
         assert_eq!(rows.len(), 3);
 
@@ -921,6 +921,7 @@ mod tests {
                 include_recovered: true,
                 limit: 10,
             })
+            .await
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "bash");
@@ -935,15 +936,12 @@ mod tests {
                 include_recovered: true,
                 limit: 10,
             })
+            .await
             .unwrap();
         assert_eq!(rows.len(), 2);
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn language_populated_from_extension() {
         let db = Db::open_in_memory().unwrap();
         let sid = fixture(&db).await;
@@ -983,24 +981,21 @@ mod tests {
             shape_fingerprint: None,
             hint: None,
         };
-        db.insert_tool_call(&ev).unwrap();
+        db.insert_tool_call(&ev).await.unwrap();
         let language: Option<String> = db
-            .read_blocking(|c| {
+            .read(|c| {
                 Ok(
                     c.query_row("SELECT language FROM tool_call_events LIMIT 1", [], |r| {
                         r.get(0)
                     })?,
                 )
             })
+            .await
             .unwrap();
         assert_eq!(language.as_deref(), Some("Python"));
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn shape_fingerprint_persists_and_groups_by_model_and_fingerprint() {
         let db = Db::open_in_memory().unwrap();
         let sid = fixture(&db).await;
@@ -1043,22 +1038,26 @@ mod tests {
         // Two calls of the same shape on model-a, one on model-b, one with a
         // different shape on model-a.
         db.insert_tool_call(&mk("model-a", Some("abc123abc123"), 100))
+            .await
             .unwrap();
         db.insert_tool_call(&mk("model-a", Some("abc123abc123"), 200))
+            .await
             .unwrap();
         db.insert_tool_call(&mk("model-b", Some("abc123abc123"), 300))
+            .await
             .unwrap();
         db.insert_tool_call(&mk("model-a", Some("deadbeefdead"), 400))
+            .await
             .unwrap();
 
         // The column round-trips on read.
-        let rows = db.list_tool_calls_for_session(sid).unwrap();
+        let rows = db.list_tool_calls_for_session(sid).await.unwrap();
         assert_eq!(rows.len(), 4);
         assert!(rows.iter().all(|r| r.shape_fingerprint.is_some()));
 
         // Grouping by (model, fingerprint) — the failed-calls audit query.
         let counts: Vec<(String, String, i64)> = db
-            .read_blocking(|conn| {
+            .read(|conn| {
                 let mut stmt = conn.prepare(
                     "SELECT model, shape_fingerprint, COUNT(*)
                        FROM tool_call_events
@@ -1075,6 +1074,7 @@ mod tests {
                 })?;
                 Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
             })
+            .await
             .unwrap();
         assert_eq!(
             counts,

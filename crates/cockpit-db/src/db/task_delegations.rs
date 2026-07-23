@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -656,23 +656,28 @@ impl Db {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<TaskDelegationSteerRow>> {
-        self.read_blocking(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT s.id, s.task_call_id, s.label, s.body, s.origin_principal,
-                            s.delivered, s.created_at, s.delivered_at
-                       FROM task_delegation_steers s
-                       JOIN task_delegation_jobs j ON j.task_call_id = s.task_call_id
-                      WHERE j.parent_session_id = ?1
-                      ORDER BY s.id ASC",
-                )
-                .context("preparing task delegation steers list")?;
-            let rows = stmt
-                .query_map(params![session_id.to_string()], decode_steer)
-                .context("querying task delegation steers")?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .context("decoding task delegation steers")
-        })
+        self.read_blocking(|conn| Self::list_task_delegation_steers_conn(conn, session_id))
+    }
+
+    pub fn list_task_delegation_steers_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<Vec<TaskDelegationSteerRow>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.task_call_id, s.label, s.body, s.origin_principal,
+                        s.delivered, s.created_at, s.delivered_at
+                   FROM task_delegation_steers s
+                   JOIN task_delegation_jobs j ON j.task_call_id = s.task_call_id
+                  WHERE j.parent_session_id = ?1
+                  ORDER BY s.id ASC",
+            )
+            .context("preparing task delegation steers list")?;
+        let rows = stmt
+            .query_map(params![session_id.to_string()], decode_steer)
+            .context("querying task delegation steers")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("decoding task delegation steers")
     }
 }
 

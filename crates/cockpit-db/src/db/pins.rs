@@ -217,8 +217,9 @@ mod tests {
 
     /// Record a user/assistant message event and return its seq — the
     /// stable id a pin references.
-    fn record_msg(db: &Db, sid: Uuid, kind: SessionEventKind, text: &str) -> i64 {
+    async fn record_msg(db: &Db, sid: Uuid, kind: SessionEventKind, text: &str) -> i64 {
         db.insert_session_event(sid, kind, Some("Auto"), None, &json!({ "text": text }))
+            .await
             .unwrap()
     }
 
@@ -227,8 +228,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
-        let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello");
-        let a = record_msg(&db, sid, SessionEventKind::AssistantMessage, "hi there");
+        let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello").await;
+        let a = record_msg(&db, sid, SessionEventKind::AssistantMessage, "hi there").await;
 
         assert_eq!(db.count_pins(sid).unwrap(), 0);
         assert!(!db.is_pinned(sid, u).unwrap());
@@ -250,7 +251,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
-        let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello");
+        let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello").await;
 
         assert!(db.pin_message(sid, u).unwrap(), "first pin returns true");
         assert!(
@@ -265,7 +266,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
-        let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello");
+        let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello").await;
 
         assert!(db.toggle_pin(sid, u).unwrap(), "toggle on → now pinned");
         assert!(db.is_pinned(sid, u).unwrap());
@@ -278,8 +279,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
-        let u = record_msg(&db, sid, SessionEventKind::UserMessage, "the question");
-        let a = record_msg(&db, sid, SessionEventKind::AssistantMessage, "the answer");
+        let u = record_msg(&db, sid, SessionEventKind::UserMessage, "the question").await;
+        let a = record_msg(&db, sid, SessionEventKind::AssistantMessage, "the answer").await;
 
         db.pin_message(sid, a).unwrap();
         db.pin_message(sid, u).unwrap();
@@ -307,7 +308,7 @@ mod tests {
         let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
         let original = "FULL ORIGINAL MESSAGE BODY with lots of content here";
-        let a = record_msg(&db, sid, SessionEventKind::AssistantMessage, original);
+        let a = record_msg(&db, sid, SessionEventKind::AssistantMessage, original).await;
         db.pin_message(sid, a).unwrap();
 
         // Simulate `/prune` + `/compact`: both append timeline markers and
@@ -321,6 +322,7 @@ mod tests {
             None,
             &json!({ "bodies": 1 }),
         )
+        .await
         .unwrap();
         db.insert_session_event(
             sid,
@@ -329,6 +331,7 @@ mod tests {
             None,
             &json!({ "successor": "abc123" }),
         )
+        .await
         .unwrap();
 
         // The pin still resolves the ORIGINAL full text from the durable
@@ -345,8 +348,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let a = db.create_session("p", "/x", "Auto").await.unwrap();
         let b = db.create_session("p", "/y", "Auto").await.unwrap();
-        let ua = record_msg(&db, a.session_id, SessionEventKind::UserMessage, "in a");
-        let ub = record_msg(&db, b.session_id, SessionEventKind::UserMessage, "in b");
+        let ua = record_msg(&db, a.session_id, SessionEventKind::UserMessage, "in a").await;
+        let ub = record_msg(&db, b.session_id, SessionEventKind::UserMessage, "in b").await;
         db.pin_message(a.session_id, ua).unwrap();
         db.pin_message(b.session_id, ub).unwrap();
 
@@ -365,7 +368,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
-        let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello");
+        let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello").await;
         db.pin_message(sid, u).unwrap();
         assert_eq!(db.count_pins(sid).unwrap(), 1);
 

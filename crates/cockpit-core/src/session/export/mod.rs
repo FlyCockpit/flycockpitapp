@@ -43,6 +43,7 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use uuid::Uuid;
 use zip::write::{SimpleFileOptions, ZipWriter};
@@ -53,6 +54,7 @@ use crate::daemon::proto;
 use crate::db::Db;
 use crate::db::session_log::SessionEventRow;
 use crate::db::sessions::SessionRow;
+use crate::db::task_delegation_payloads::{LoadedTaskDelegationPayload, TaskDelegationPayloadRow};
 use crate::db::tool_calls::ToolCallEvent;
 use crate::redact::RedactionTable;
 
@@ -80,8 +82,26 @@ const DELEGATION_STEERS_DIR: &str = "delegation_steers";
 /// compaction predecessors remain part of `/export debug`, and rows that never
 /// persist to the DB (local command errors, local commands, warning notices,
 /// maintenance lines, skill auto-injection notices) cannot appear here.
-pub fn transcript_json(db: &Db, session_id: Uuid, root_agent: &str) -> Result<Value> {
-    let history = crate::engine::rehydrate::history_snapshot(db, session_id, root_agent)?;
+pub async fn transcript_json(db: &Db, session_id: Uuid, root_agent: &str) -> Result<Value> {
+    let history = crate::engine::rehydrate::history_snapshot(db, session_id, root_agent).await?;
+    Ok(transcript_json_from_history(&history))
+}
+
+pub fn transcript_json_blocking_for_sync_cli(
+    db: &Db,
+    session_id: Uuid,
+    root_agent: &str,
+) -> Result<Value> {
+    let root_agent = root_agent.to_string();
+    db.blocking_for_sync_cli(move |conn| transcript_json_conn(conn, session_id, &root_agent))
+}
+
+pub fn transcript_json_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    root_agent: &str,
+) -> Result<Value> {
+    let history = crate::engine::rehydrate::history_snapshot_conn(conn, session_id, root_agent)?;
     Ok(transcript_json_from_history(&history))
 }
 
@@ -360,29 +380,35 @@ pub struct BundleBytes {
 
 /// Assemble the full debug bundle for `target` and return the zip bytes
 /// instead of writing them to a caller-selected path.
-pub fn build_bundle_zip_bytes(
+pub async fn build_bundle_zip_bytes(
     db: &Db,
     target: &SessionRow,
     include_generated_artifacts: bool,
     include_sensitive: bool,
 ) -> Result<BundleBytes> {
-    // The walk is cheap point-lookups per session; the read is bounded
-    // by each session's history.
-    let bundle = collect_bundle(db, target.session_id)?;
-    let bytes = build_zip_with_options(
-        db,
-        target,
-        &bundle,
-        ExportBundleOptions {
-            include_generated_artifacts,
-            include_sensitive,
-        },
-    )?;
-    let summary = BundleSummary {
-        session_count: bundle.len(),
-        byte_len: bytes.len(),
-    };
-    Ok(BundleBytes { bytes, summary })
+    let db_for_files = db.clone();
+    let target = target.clone();
+    db.read(move |conn| {
+        let bundle = collect_bundle_conn(conn, target.session_id)?;
+        let env = process_env_map();
+        let bytes = build_zip_with_options_and_env_conn(
+            &db_for_files,
+            conn,
+            &target,
+            &bundle,
+            ExportBundleOptions {
+                include_generated_artifacts,
+                include_sensitive,
+            },
+            &env,
+        )?;
+        let summary = BundleSummary {
+            session_count: bundle.len(),
+            byte_len: bytes.len(),
+        };
+        Ok(BundleBytes { bytes, summary })
+    })
+    .await
 }
 
 /// Assemble the full debug bundle for `target` (the session plus its
@@ -395,7 +421,7 @@ pub fn build_bundle_zip_bytes(
 /// `true` replaces it unconditionally (the TUI path, which has no force
 /// flag and is specified to overwrite its own prior export). The CLI
 /// passes `args.force` here, so its guarantee is preserved.
-pub fn write_bundle_zip(
+pub async fn write_bundle_zip(
     db: &Db,
     target: &SessionRow,
     out_path: &std::path::Path,
@@ -411,7 +437,58 @@ pub fn write_bundle_zip(
     }
 
     let bundle =
-        build_bundle_zip_bytes(db, target, include_generated_artifacts, include_sensitive)?;
+        build_bundle_zip_bytes(db, target, include_generated_artifacts, include_sensitive).await?;
+
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating export directory `{}`", parent.display()))?;
+    }
+    std::fs::write(out_path, &bundle.bytes)
+        .with_context(|| format!("writing export to `{}`", out_path.display()))?;
+
+    Ok(bundle.summary)
+}
+
+pub fn write_bundle_zip_blocking_for_sync_cli(
+    db: &Db,
+    target: &SessionRow,
+    out_path: &std::path::Path,
+    overwrite: bool,
+    include_generated_artifacts: bool,
+    include_sensitive: bool,
+) -> Result<BundleSummary> {
+    if out_path.exists() && !overwrite {
+        anyhow::bail!(
+            "output path `{}` already exists — pass `--force` to overwrite",
+            out_path.display()
+        );
+    }
+
+    let db_for_files = db.clone();
+    let target = target.clone();
+    let bundle = db.blocking_for_sync_cli(move |conn| {
+        collect_bundle_conn(conn, target.session_id).and_then(|bundle| {
+            let env = process_env_map();
+            let bytes = build_zip_with_options_and_env_conn(
+                &db_for_files,
+                conn,
+                &target,
+                &bundle,
+                ExportBundleOptions {
+                    include_generated_artifacts,
+                    include_sensitive,
+                },
+                &env,
+            )?;
+            let summary = BundleSummary {
+                session_count: bundle.len(),
+                byte_len: bytes.len(),
+            };
+            Ok(BundleBytes { bytes, summary })
+        })
+    })?;
 
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
@@ -429,23 +506,25 @@ pub fn write_bundle_zip(
 /// success; `Ok(Err(message))` for a usage error (not found / ambiguous)
 /// the caller surfaces with exit 64. A full UUID resolves directly; any
 /// other string is treated as a `short_id` and matched globally.
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; export command remains sync until db-async-session-log"
-)]
-pub fn resolve_session(db: &Db, ident: &str) -> Result<std::result::Result<SessionRow, String>> {
+pub async fn resolve_session(
+    db: &Db,
+    ident: &str,
+) -> Result<std::result::Result<SessionRow, String>> {
     if let Ok(uuid) = Uuid::parse_str(ident) {
         return Ok(
-            match db.write_blocking(move |conn| crate::db::Db::get_session_conn(conn, uuid))? {
+            match db
+                .read(move |conn| crate::db::Db::get_session_conn(conn, uuid))
+                .await?
+            {
                 Some(row) => Ok(row),
                 None => Err(format!("no session with id `{ident}`")),
             },
         );
     }
     let ident_for_db = ident.to_string();
-    let matches = db.write_blocking(move |conn| {
-        crate::db::Db::find_sessions_by_short_id_global_conn(conn, &ident_for_db)
-    })?;
+    let matches = db
+        .read(move |conn| crate::db::Db::find_sessions_by_short_id_global_conn(conn, &ident_for_db))
+        .await?;
     match matches.len() {
         0 => Ok(Err(format!("no session with short id `{ident}`"))),
         1 => Ok(Ok(matches.into_iter().next().unwrap())),
@@ -459,11 +538,7 @@ pub fn resolve_session(db: &Db, ident: &str) -> Result<std::result::Result<Sessi
 /// Walk the fork tree (descendant `parent_session_id`) and follow every
 /// `/compact` successor link, breadth-first, deduping. Returns the
 /// session rows in discovery order with the target first.
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; export command remains sync until db-async-session-log"
-)]
-fn collect_bundle(db: &Db, target_id: Uuid) -> Result<Vec<SessionRow>> {
+fn collect_bundle_conn(conn: &Connection, target_id: Uuid) -> Result<Vec<SessionRow>> {
     let mut seen: HashSet<Uuid> = HashSet::new();
     let mut order: Vec<SessionRow> = Vec::new();
     let mut frontier: VecDeque<Uuid> = VecDeque::new();
@@ -473,19 +548,18 @@ fn collect_bundle(db: &Db, target_id: Uuid) -> Result<Vec<SessionRow>> {
         if !seen.insert(id) {
             continue;
         }
-        let Some(row) = db.write_blocking(move |conn| crate::db::Db::get_session_conn(conn, id))?
-        else {
+        let Some(row) = Db::get_session_conn(conn, id)? else {
             continue;
         };
         order.push(row);
 
         // Descendant forks.
-        for child in db.write_blocking(move |conn| crate::db::Db::list_forks_conn(conn, id))? {
+        for child in Db::list_forks_conn(conn, id)? {
             frontier.push_back(child.session_id);
         }
         // `/compact` successor sessions (a session boundary, not a fork —
         // followed like the fork tree per Part C).
-        for ev in db.list_session_events(id)? {
+        for ev in Db::list_session_events_conn(conn, id)? {
             if ev.kind == "session_compacted"
                 && let Some(succ) = ev
                     .data
@@ -498,6 +572,12 @@ fn collect_bundle(db: &Db, target_id: Uuid) -> Result<Vec<SessionRow>> {
         }
     }
     Ok(order)
+}
+
+#[cfg(test)]
+async fn collect_bundle(db: &Db, target_id: Uuid) -> Result<Vec<SessionRow>> {
+    db.read(move |conn| collect_bundle_conn(conn, target_id))
+        .await
 }
 
 /// Assemble the `.zip` bytes in memory: `manifest.json`, the unified
@@ -515,7 +595,7 @@ fn test_export_env() -> HashMap<String, String> {
 }
 
 #[cfg(test)]
-fn build_zip(db: &Db, target: &SessionRow, bundle: &[SessionRow]) -> Result<Vec<u8>> {
+async fn build_zip(db: &Db, target: &SessionRow, bundle: &[SessionRow]) -> Result<Vec<u8>> {
     build_zip_with_options_and_env(
         db,
         target,
@@ -523,20 +603,30 @@ fn build_zip(db: &Db, target: &SessionRow, bundle: &[SessionRow]) -> Result<Vec<
         ExportBundleOptions::default(),
         &test_export_env(),
     )
+    .await
 }
 
-fn build_zip_with_options(
+#[cfg(test)]
+async fn build_zip_with_options_and_env(
     db: &Db,
     target: &SessionRow,
     bundle: &[SessionRow],
     options: ExportBundleOptions,
+    env: &HashMap<String, String>,
 ) -> Result<Vec<u8>> {
-    let env = process_env_map();
-    build_zip_with_options_and_env(db, target, bundle, options, &env)
+    let db_for_files = db.clone();
+    let target = target.clone();
+    let bundle = bundle.to_vec();
+    let env = env.clone();
+    db.read(move |conn| {
+        build_zip_with_options_and_env_conn(&db_for_files, conn, &target, &bundle, options, &env)
+    })
+    .await
 }
 
-fn build_zip_with_options_and_env(
+fn build_zip_with_options_and_env_conn(
     db: &Db,
+    conn: &Connection,
     target: &SessionRow,
     bundle: &[SessionRow],
     options: ExportBundleOptions,
@@ -558,7 +648,7 @@ fn build_zip_with_options_and_env(
     // Gather + merge every session's events into one seq-sorted timeline.
     let mut all_events: Vec<SessionEventRow> = Vec::new();
     for s in bundle {
-        all_events.extend(db.list_session_events(s.session_id)?);
+        all_events.extend(Db::list_session_events_conn(conn, s.session_id)?);
     }
     all_events.sort_by_key(|e| e.seq);
 
@@ -571,7 +661,7 @@ fn build_zip_with_options_and_env(
         .filter(|e| e.kind == "inference_request")
         .filter_map(|e| e.call_id.clone())
         .collect();
-    let utility_call_ids = db.utility_call_ids(&candidate_call_ids)?;
+    let utility_call_ids = Db::utility_call_ids_conn(conn, &candidate_call_ids)?;
     let export_redactor = export_redaction_table_with_env(target, env);
 
     // Call ids that have a successful `inference_request` event: those own the
@@ -601,7 +691,7 @@ fn build_zip_with_options_and_env(
     let mut delegation_steer_index: Vec<Value> = Vec::new();
     let mut tool_identity_by_call: BTreeMap<(Uuid, String), Value> = BTreeMap::new();
     for s in bundle {
-        for tool_call in db.list_tool_calls_for_session(s.session_id)? {
+        for tool_call in Db::list_tool_calls_for_session_conn(conn, s.session_id)? {
             let identity = tool_provider_identity_json(&tool_call)?;
             tool_identity_by_call
                 .insert((tool_call.session_id, tool_call.call_id.clone()), identity);
@@ -610,7 +700,7 @@ fn build_zip_with_options_and_env(
             .get(&s.session_id)
             .cloned()
             .unwrap_or_else(|| s.session_id.to_string());
-        for entry in db.list_compressed_tool_results(s.session_id)? {
+        for entry in Db::list_compressed_tool_results_conn(conn, s.session_id)? {
             let path = format!(
                 "{COMPRESSED_TOOL_RESULTS_DIR}/{}_{}.txt",
                 short,
@@ -634,7 +724,7 @@ fn build_zip_with_options_and_env(
             compressed_result_index.push(index_entry);
             compressed_result_files.push((path, entry.content));
         }
-        for row in db.list_task_delegation_steers(s.session_id)? {
+        for row in Db::list_task_delegation_steers_conn(conn, s.session_id)? {
             let body =
                 redact_string_for_export(row.body, &export_redactor, options.include_sensitive);
             delegation_steer_index.push(json!({
@@ -650,7 +740,7 @@ fn build_zip_with_options_and_env(
                 "delivered_at": row.delivered_at,
             }));
         }
-        for row in db.list_task_delegation_payloads(s.session_id)? {
+        for row in Db::list_task_delegation_payloads_conn(conn, s.session_id)? {
             let file = format!(
                 "{DELEGATION_PAYLOADS_DIR}/{}_{}_{}_{}.txt",
                 short,
@@ -658,7 +748,7 @@ fn build_zip_with_options_and_env(
                 fs_safe(&row.label),
                 fs_safe(&row.payload_hash)
             );
-            let loaded = db.load_task_delegation_payload(&row.task_call_id, &row.label);
+            let loaded = load_task_delegation_payload_from_row(db, &row);
             let (excerpt, load_error, emit_file) = match loaded {
                 Ok(payload) => {
                     let body = redact_string_for_export(
@@ -809,7 +899,7 @@ fn build_zip_with_options_and_env(
 
     let mut tandem_files: Vec<(String, Value)> = Vec::new(); // (path, file body)
     for s in bundle {
-        for rec in db.list_tandem_inference(s.session_id)? {
+        for rec in Db::list_tandem_inference_conn(conn, s.session_id)? {
             let (parent_seq, short) = parent_info
                 .get(&rec.parent_call_id)
                 .cloned()
@@ -887,10 +977,10 @@ fn build_zip_with_options_and_env(
             })
     });
 
-    let manifest = build_manifest(db, target, bundle, options, env);
+    let manifest = build_manifest_conn(conn, target, bundle, options, env);
     let config_entries =
         collect_config_entries_with_env(target, options.include_generated_artifacts, env);
-    let approval_entries = collect_approval_entries(db, bundle)?;
+    let approval_entries = collect_approval_entries_conn(conn, bundle)?;
 
     // Write the archive.
     let mut buf = Cursor::new(Vec::<u8>::new());
@@ -915,7 +1005,7 @@ fn build_zip_with_options_and_env(
         // — no second redaction pass (the leak-detection use case wants the
         // exact wire form).
         for (path, call_id) in &request_files {
-            let mut payload = match db.get_inference_request(call_id)? {
+            let mut payload = match Db::get_inference_request_conn(conn, call_id)? {
                 // Surface the dispatch-time lifecycle `status` on the emitted
                 // file so a hung/failed turn's record carries its non-
                 // `completed` status without a separate lookup
@@ -1020,10 +1110,30 @@ fn build_zip_with_options_and_env(
     Ok(buf.into_inner())
 }
 
+fn load_task_delegation_payload_from_row(
+    db: &Db,
+    row: &TaskDelegationPayloadRow,
+) -> Result<LoadedTaskDelegationPayload> {
+    if let Some(body) = row.body_inline.clone() {
+        return Ok(LoadedTaskDelegationPayload { body });
+    }
+    let path = db
+        .task_delegation_payload_sidecar_abs_path(row)?
+        .with_context(|| {
+            format!(
+                "task delegation payload `{}`:`{}` has no inline body or sidecar",
+                row.task_call_id, row.label
+            )
+        })?;
+    let body = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading delegation payload sidecar {}", path.display()))?;
+    Ok(LoadedTaskDelegationPayload { body })
+}
+
 /// Build `manifest.json`: target session metadata + the fork/compaction
 /// tree across the whole bundle. Kept small.
-fn build_manifest(
-    db: &Db,
+fn build_manifest_conn(
+    conn: &Connection,
     target: &SessionRow,
     bundle: &[SessionRow],
     options: ExportBundleOptions,
@@ -1083,7 +1193,7 @@ fn build_manifest(
         "include_sensitive": options.include_sensitive,
         "sessions": sessions,
     });
-    if let Some(repair) = export_resume_repair_state(db, target)
+    if let Some(repair) = export_resume_repair_state_conn(conn, target)
         && let Some(obj) = manifest.as_object_mut()
     {
         obj.insert("resume_repair_required".to_string(), repair);
@@ -1150,7 +1260,7 @@ fn active_models_diverged(
         || session_model.get("model") != config_active_model.get("model")
 }
 
-fn export_resume_repair_state(db: &Db, target: &SessionRow) -> Option<Value> {
+fn export_resume_repair_state_conn(conn: &Connection, target: &SessionRow) -> Option<Value> {
     let provider = target.provider.clone().unwrap_or_default();
     let model = target.model.clone().unwrap_or_default();
     let providers = crate::secret_ref::load_effective(Path::new(&target.project_root));
@@ -1163,8 +1273,8 @@ fn export_resume_repair_state(db: &Db, target: &SessionRow) -> Option<Value> {
     if !matches!(wire_api, crate::config::providers::WireApi::Responses) {
         return None;
     }
-    let err = crate::engine::rehydrate::rehydrate_session_with_policy(
-        db,
+    let err = crate::engine::rehydrate::rehydrate_session_with_policy_conn(
+        conn,
         target.session_id,
         &target.active_agent,
         crate::engine::rehydrate::RehydratePolicy::strict(),
@@ -1358,8 +1468,11 @@ fn collect_config_entries_with_env(
 /// - session scope: SQLite `approval_grants` + `loop_guard_rules`,
 /// - project scope: each bundled session's project-root `.cockpit/approvals.json`,
 /// - global scope: user-level `~/.config/cockpit/approvals.json`.
-fn collect_approval_entries(db: &Db, bundle: &[SessionRow]) -> Result<Vec<(String, String)>> {
-    let session_grants = session_approval_snapshot(db, bundle)?;
+fn collect_approval_entries_conn(
+    conn: &Connection,
+    bundle: &[SessionRow],
+) -> Result<Vec<(String, String)>> {
+    let session_grants = session_approval_snapshot_conn(conn, bundle)?;
 
     let mut project_roots: Vec<PathBuf> = bundle
         .iter()
@@ -1400,11 +1513,7 @@ fn collect_approval_entries(db: &Db, bundle: &[SessionRow]) -> Result<Vec<(Strin
     )])
 }
 
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-)]
-fn session_approval_snapshot(db: &Db, bundle: &[SessionRow]) -> Result<Vec<Value>> {
+fn session_approval_snapshot_conn(conn: &Connection, bundle: &[SessionRow]) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     for session in bundle {
         let session_id = session.session_id.to_string();
@@ -1413,7 +1522,7 @@ fn session_approval_snapshot(db: &Db, bundle: &[SessionRow]) -> Result<Vec<Value
             Vec<Value>,
             Vec<String>,
             Vec<String>,
-        ) = db.write_blocking(move |conn| {
+        ) = {
             let read_keys = |sql: &str| -> Result<Vec<String>> {
                 let mut stmt = conn.prepare(sql)?;
                 let rows = stmt.query_map([session_id.as_str()], |row| row.get::<_, String>(0))?;
@@ -1458,7 +1567,7 @@ fn session_approval_snapshot(db: &Db, bundle: &[SessionRow]) -> Result<Vec<Value
                 Ok(values)
             };
 
-            Ok((
+            Ok::<_, anyhow::Error>((
                 read_commands()?,
                 read_paths()?,
                 read_keys(
@@ -1472,7 +1581,7 @@ fn session_approval_snapshot(db: &Db, bundle: &[SessionRow]) -> Result<Vec<Value
                      ORDER BY signature",
                 )?,
             ))
-        })?;
+        }?;
 
         out.push(json!({
             "session_id": session.session_id.to_string(),

@@ -713,7 +713,8 @@ impl ProductionJobExecutor {
             .create_assistant_session(&project_id, &root_str, &assistant, &assistant)
             .await
             .context("creating scheduled assistant session")?;
-        self.prompt_runner
+        let result = self
+            .prompt_runner
             .run_prompt_turn(
                 &self.db,
                 &job,
@@ -722,18 +723,26 @@ impl ProductionJobExecutor {
                 prompt,
                 crate::env_snapshot::EnvSnapshot::from_process(EnvSnapshotSource::DaemonStart),
             )
-            .await
-            .inspect_err(|error| {
+            .await;
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
                 let text = format!("scheduled job `{}` refused: {error}", job.id);
-                let _ = self.db.insert_session_event(
-                    session.session_id,
-                    crate::db::session_log::SessionEventKind::Notice,
-                    Some(&assistant),
-                    None,
-                    &json!({ "text": text, "source": "daemon_scheduler" }),
-                );
-            })
-            .with_context(|| format!("running scheduled assistant session {}", session.session_id))
+                let _ = self
+                    .db
+                    .insert_session_event(
+                        session.session_id,
+                        crate::db::session_log::SessionEventKind::Notice,
+                        Some(&assistant),
+                        None,
+                        &json!({ "text": text, "source": "daemon_scheduler" }),
+                    )
+                    .await;
+                Err(error).with_context(|| {
+                    format!("running scheduled assistant session {}", session.session_id)
+                })
+            }
+        }
     }
 }
 
@@ -1440,7 +1449,8 @@ mod tests {
                 Some(assistant),
                 None,
                 &json!({ "text": "fake scheduled turn completed", "source": "test_prompt_runner" }),
-            )?;
+            )
+            .await?;
             Ok(format!("fake scheduled turn completed for `{assistant}`"))
         }
     }
@@ -2591,6 +2601,7 @@ mod tests {
         );
         assert!(
             !db.list_session_events(session.session_id)
+                .await
                 .unwrap()
                 .is_empty(),
             "prompt runner should persist session events"

@@ -1,7 +1,7 @@
 use super::*;
 
-#[test]
-fn child_failure_carries_structured_envelope_to_parent() {
+#[tokio::test]
+async fn child_failure_carries_structured_envelope_to_parent() {
     let fallback_tried = vec![crate::engine::agent::FailoverAttempt {
         provider: "flaky".to_string(),
         model: "primary".to_string(),
@@ -37,8 +37,8 @@ fn child_failure_carries_structured_envelope_to_parent() {
     assert_eq!(carried.suggested_action, "retry_or_choose_another_model");
 }
 
-#[test]
-fn failover_walk_completes_before_parent_sees_envelope() {
+#[tokio::test]
+async fn failover_walk_completes_before_parent_sees_envelope() {
     let fallback_tried = vec![
         crate::engine::agent::FailoverAttempt {
             provider: "dead".to_string(),
@@ -90,8 +90,8 @@ fn failover_walk_completes_before_parent_sees_envelope() {
     );
 }
 
-#[test]
-fn child_routing_metadata_carries_fallback_chain() {
+#[tokio::test]
+async fn child_routing_metadata_carries_fallback_chain() {
     let decision = crate::engine::agent::BackupFallbackDecision {
         primary_model: "primary".to_string(),
         error_class: "timeout_ttft".to_string(),
@@ -124,8 +124,8 @@ fn child_routing_metadata_carries_fallback_chain() {
     assert_eq!(routing.routing["fallback_tried"][1]["outcome"], "succeeded");
 }
 
-#[test]
-fn delegation_retry_budget_bounds_a_spinning_parent() {
+#[tokio::test]
+async fn delegation_retry_budget_bounds_a_spinning_parent() {
     let (mut driver, _tmp) = test_driver(1);
     driver.reset_delegation_retry_budget();
 
@@ -542,6 +542,7 @@ async fn delegated_child_succeeds_via_fallback_chain_and_export_records_it() {
                         .session
                         .db
                         .list_session_events(driver.session.id)
+                        .await
                         .unwrap()
                         .into_iter()
                         .find(|event| {
@@ -1075,6 +1076,7 @@ async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_r
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     let event = events
         .iter()
@@ -1156,6 +1158,7 @@ async fn noninteractive_report_stamps_child_model() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     let event = events
         .iter()
@@ -1214,6 +1217,7 @@ async fn noninteractive_batch_report_stamps_child_model() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     let event = events
         .iter()
@@ -1450,8 +1454,8 @@ async fn noninteractive_batch_result_includes_task_repair_notes() {
     );
 }
 
-#[test]
-fn queued_user_input_backgrounds_running_single_delegation() {
+#[tokio::test]
+async fn queued_user_input_backgrounds_running_single_delegation() {
     let mut registry = NoninteractiveDelegationRegistry::default();
     registry.register_running(
         "task-single",
@@ -1476,8 +1480,8 @@ fn queued_user_input_backgrounds_running_single_delegation() {
     );
 }
 
-#[test]
-fn queued_user_input_backgrounds_running_batch_delegation() {
+#[tokio::test]
+async fn queued_user_input_backgrounds_running_batch_delegation() {
     let mut registry = NoninteractiveDelegationRegistry::default();
     registry.register_running(
         "task-batch",
@@ -1494,8 +1498,8 @@ fn queued_user_input_backgrounds_running_batch_delegation() {
     assert_eq!(registry.child_agent("task-batch", "first"), Some("explore"));
 }
 
-#[test]
-fn noninteractive_registry_is_live_only_for_running_and_backgrounded() {
+#[tokio::test]
+async fn noninteractive_registry_is_live_only_for_running_and_backgrounded() {
     let mut registry = NoninteractiveDelegationRegistry::default();
     assert!(!registry.is_live("task-1", "default"));
     registry.register_running(
@@ -1520,8 +1524,8 @@ fn noninteractive_registry_is_live_only_for_running_and_backgrounded() {
     assert!(!registry.is_live("task-2", "default"));
 }
 
-#[test]
-fn noninteractive_registry_completion_status_uses_host_flag() {
+#[tokio::test]
+async fn noninteractive_registry_completion_status_uses_host_flag() {
     let mut registry = NoninteractiveDelegationRegistry::default();
     registry.register_running(
         "task-1",
@@ -1561,16 +1565,16 @@ fn noninteractive_registry_completion_status_uses_host_flag() {
     );
 }
 
-#[test]
-fn host_failure_sentinel_matches_only_host_error_shape() {
+#[tokio::test]
+async fn host_failure_sentinel_matches_only_host_error_shape() {
     assert!(is_host_failure_sentinel("Error: boom"));
     assert!(is_host_failure_sentinel("  Error: leading ws"));
     assert!(!is_host_failure_sentinel("Error:nospace"));
     assert!(!is_host_failure_sentinel("## Accomplished\nError: quoted"));
 }
 
-#[test]
-fn task_control_orphan_list_status_cancel_and_refuse_live_actions() {
+#[tokio::test]
+async fn task_control_orphan_list_status_cancel_and_refuse_live_actions() {
     let (mut driver, _tmp) = test_driver(8);
     seed_task_delegation(&driver, "task-orphan", "default");
 
@@ -1652,8 +1656,8 @@ fn task_control_orphan_list_status_cancel_and_refuse_live_actions() {
     );
 }
 
-#[test]
-fn task_control_live_registry_entry_keeps_happy_path() {
+#[tokio::test]
+async fn task_control_live_registry_entry_keeps_happy_path() {
     let (mut driver, _tmp) = test_driver(8);
     seed_task_delegation(&driver, "task-live", "default");
     driver.noninteractive_delegations.register_running(
@@ -1792,8 +1796,8 @@ async fn task_query_reports_db_and_none_sources() {
     );
 }
 
-#[test]
-fn late_noninteractive_completion_delivers_once() {
+#[tokio::test]
+async fn late_noninteractive_completion_delivers_once() {
     let mut registry = NoninteractiveDelegationRegistry::default();
     registry.register_running(
         "task-1",
@@ -1830,8 +1834,8 @@ fn late_noninteractive_completion_delivers_once() {
     );
 }
 
-#[test]
-fn background_ack_is_small_deterministic_and_omits_original_prompt() {
+#[tokio::test]
+async fn background_ack_is_small_deterministic_and_omits_original_prompt() {
     let completed = vec![("first".to_string(), "first report".to_string())];
     let running = vec!["second".to_string()];
     let body = format_delegation_background_ack("task-batch", &completed, &running);
@@ -1858,8 +1862,8 @@ fn background_ack_is_small_deterministic_and_omits_original_prompt() {
     assert!(!body.contains("original child prompt"));
 }
 
-#[test]
-fn async_delegation_result_lists_only_new_children_with_status() {
+#[tokio::test]
+async fn async_delegation_result_lists_only_new_children_with_status() {
     let completed = vec![
         AsyncDelegationChildResult {
             label: "second".to_string(),
@@ -1899,8 +1903,8 @@ fn async_delegation_result_lists_only_new_children_with_status() {
 /// originating `job_id` (implementation note), identically
 /// across every job kind (`loop`/`timer`/`background`/`swarm`). Drives the
 /// real `ScheduleKind::as_str` so a kind-vocabulary drift is caught.
-#[test]
-fn async_result_header_names_kind_and_job_id_for_every_kind() {
+#[tokio::test]
+async fn async_result_header_names_kind_and_job_id_for_every_kind() {
     use crate::engine::schedule::spec::ScheduleKind;
     let job_id = "sched-f36b81df";
     for kind in [
@@ -1922,8 +1926,8 @@ fn async_result_header_names_kind_and_job_id_for_every_kind() {
 /// (implementation note). Round-trips through the real DB
 /// serialization so the exported `events.json` shape is what's asserted.
 /// Ordinary input (no job) omits the key entirely.
-#[test]
-fn delivery_event_data_carries_job_id_round_trip() {
+#[tokio::test]
+async fn delivery_event_data_carries_job_id_round_trip() {
     let (driver, _t) = test_driver(1);
     let session = driver.session.clone();
 
@@ -1944,6 +1948,7 @@ fn delivery_event_data_carries_job_id_round_trip() {
             None,
             &delivery,
         )
+        .await
         .unwrap();
     // Ordinary user input: no `job_id` key.
     let ordinary = user_message_event_data("hello", None, &[], None, &[], None, None);
@@ -1958,9 +1963,10 @@ fn delivery_event_data_carries_job_id_round_trip() {
             None,
             &ordinary,
         )
+        .await
         .unwrap();
 
-    let events = session.db.list_session_events(session.id).unwrap();
+    let events = session.db.list_session_events(session.id).await.unwrap();
     let delivery_row = events
         .iter()
         .find(|e| e.data.get("job_id").is_some())

@@ -26,14 +26,16 @@ async fn failed_calls(args: FailedCallsArgs) -> Result<()> {
     let project_id = args.project.as_ref().map(project_id_for);
     let since_epoch = Utc::now().timestamp() - (args.days as i64) * 86_400;
 
-    let rows = db.list_failed_tool_calls(FailedCallsFilter {
-        since_epoch,
-        tool: args.tool.clone(),
-        model: args.model.clone(),
-        project_id,
-        include_recovered: args.include_recovered,
-        limit: args.limit as usize,
-    })?;
+    let rows = db
+        .list_failed_tool_calls(FailedCallsFilter {
+            since_epoch,
+            tool: args.tool.clone(),
+            model: args.model.clone(),
+            project_id,
+            include_recovered: args.include_recovered,
+            limit: args.limit as usize,
+        })
+        .await?;
 
     if args.json {
         for r in &rows {

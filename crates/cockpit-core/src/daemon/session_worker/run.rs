@@ -73,13 +73,28 @@ pub(super) fn record_interrupt_decision_event(
         );
         redaction_failed_interrupt_decision_payload(interrupt_id, decision)
     });
+    let data_json = match serde_json::to_string(&redacted_data) {
+        Ok(data_json) => data_json,
+        Err(error) => {
+            tracing::warn!(%error, %interrupt_id, "serializing interrupt decision failed");
+            return None;
+        }
+    };
+    let session_id = session.id;
     session
-        .record_event(
-            crate::db::session_log::SessionEventKind::InterruptDecision,
-            None,
-            None,
-            &redacted_data,
-        )
+        .db
+        .blocking_write_for_sync_event(move |conn| {
+            crate::db::Db::insert_session_event_json_conn(
+                conn,
+                session_id,
+                crate::db::session_log::SessionEventKind::InterruptDecision,
+                None,
+                None,
+                crate::db::session_log::SessionEventContext::default(),
+                crate::db::session_log::now_ms(),
+                &data_json,
+            )
+        })
         .map_err(|error| {
             tracing::warn!(%error, %interrupt_id, "recording interrupt decision failed");
             error
@@ -654,6 +669,7 @@ pub(super) async fn run_worker(
     };
     let rehydrated = match driver
         .rehydrate_root_if_empty_with_policy(&root_agent_name, rehydrate_policy)
+        .await
     {
         Ok(r) => r,
         Err(e) => {
@@ -1389,24 +1405,27 @@ pub(super) async fn run_worker(
                             let text = format!(
                                 "Responses resume repair approved: synthetic resume heal applied to {heal_count} tool call(s)."
                             );
-                            if let Err(error) = session.record_event(
-                                crate::db::session_log::SessionEventKind::UserNote,
-                                Some(&root_agent_name),
-                                None,
-                                &serde_json::json!({
-                                    "text": text,
-                                    "resume_repair": {
-                                        "approved": true,
-                                        "failure_kind": state.failure_kind,
-                                        "failing_tool_call_ids": state.failing_tool_call_ids,
-                                        "provider": state.provider,
-                                        "model": state.model,
-                                        "wire_api": state.wire_api,
-                                        "synthetic_heal_count": heal_count,
-                                        "detail": state.detail,
-                                    }
-                                }),
-                            ) {
+                            if let Err(error) = session
+                                .record_event(
+                                    crate::db::session_log::SessionEventKind::UserNote,
+                                    Some(&root_agent_name),
+                                    None,
+                                    &serde_json::json!({
+                                        "text": text,
+                                        "resume_repair": {
+                                            "approved": true,
+                                            "failure_kind": state.failure_kind,
+                                            "failing_tool_call_ids": state.failing_tool_call_ids,
+                                            "provider": state.provider,
+                                            "model": state.model,
+                                            "wire_api": state.wire_api,
+                                            "synthetic_heal_count": heal_count,
+                                            "detail": state.detail,
+                                        }
+                                    }),
+                                )
+                                .await
+                            {
                                 tracing::warn!(%error, %session_id, "record resume repair provenance failed");
                             }
                             send_current_session_event(

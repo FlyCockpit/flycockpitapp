@@ -656,10 +656,6 @@ impl SessionsPane {
     /// ordering / scoping / fork-grouping match. `Err` only when the DB
     /// couldn't be opened (handle is `None`) or the query itself failed —
     /// both surface as the pane's inline error, never a crash.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; daemonless sessions pane remains sync until db-async-session-log"
-    )]
     fn list_sessions_daemonless(
         &self,
         project_id: Option<&str>,
@@ -669,7 +665,7 @@ impl SessionsPane {
             return Err("could not open the session database".to_string());
         };
         let project_id = project_id.map(str::to_string);
-        db.write_blocking(move |conn| {
+        db.blocking_read_for_sync_ui(move |conn| {
             cockpit_db::Db::list_session_summaries_conn(
                 conn,
                 project_id.as_deref(),
@@ -852,8 +848,15 @@ impl SessionsPane {
         let Some(db) = self.db.as_ref() else {
             return Err("could not open the session database".to_string());
         };
-        db.read_session_messages(session_id, before_seq, PREVIEW_PAGE_LIMIT)
-            .map_err(|error| error.to_string())
+        db.blocking_read_for_sync_ui(move |conn| {
+            cockpit_db::Db::read_session_messages_conn(
+                conn,
+                session_id,
+                before_seq,
+                PREVIEW_PAGE_LIMIT,
+            )
+        })
+        .map_err(|error| error.to_string())
     }
 
     /// Handle a key. Returns `Some(outcome)` for close/resume; `None`
@@ -2729,6 +2732,7 @@ mod tests {
             None,
             &serde_json::json!({"text": "preview on first render"}),
         )
+        .await
         .unwrap();
         let mut loader = test_pane_mode(vec![], false);
         loader.db = Some(db);

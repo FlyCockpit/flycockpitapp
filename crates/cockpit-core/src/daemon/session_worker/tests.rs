@@ -179,8 +179,8 @@ async fn turn_completion_watcher_after_forwarder_close_resolves_closed() {
     assert!(completion.await.is_err());
 }
 
-#[test]
-fn stream_delta_coalescer_merges_rapid_consecutive_text() {
+#[tokio::test]
+async fn stream_delta_coalescer_merges_rapid_consecutive_text() {
     let mut c = StreamDeltaCoalescer::default();
     assert!(c.push(text_delta("builder", "hel")).is_empty());
     assert!(c.push(text_delta("builder", "lo")).is_empty());
@@ -193,8 +193,8 @@ fn stream_delta_coalescer_merges_rapid_consecutive_text() {
     ));
 }
 
-#[test]
-fn stream_delta_coalescer_flushes_before_non_delta_event() {
+#[tokio::test]
+async fn stream_delta_coalescer_flushes_before_non_delta_event() {
     let mut c = StreamDeltaCoalescer::default();
     assert!(c.push(text_delta("builder", "a")).is_empty());
     let out = c.push(proto::Event::AgentIdle {
@@ -210,8 +210,8 @@ fn stream_delta_coalescer_flushes_before_non_delta_event() {
     assert!(matches!(&out[1], proto::Event::AgentIdle { .. }));
 }
 
-#[test]
-fn stream_delta_coalescer_keeps_agents_and_delta_kinds_separate() {
+#[tokio::test]
+async fn stream_delta_coalescer_keeps_agents_and_delta_kinds_separate() {
     let mut c = StreamDeltaCoalescer::default();
     assert!(c.push(text_delta("builder", "a")).is_empty());
     let out = c.push(text_delta("reviewer", "b"));
@@ -236,8 +236,8 @@ fn stream_delta_coalescer_keeps_agents_and_delta_kinds_separate() {
     ));
 }
 
-#[test]
-fn stream_delta_coalescer_byte_cap_flushes_before_window() {
+#[tokio::test]
+async fn stream_delta_coalescer_byte_cap_flushes_before_window() {
     let mut c = StreamDeltaCoalescer::default();
     assert!(c.push(text_delta("builder", "a")).is_empty());
     let big = "x".repeat(STREAM_DELTA_COALESCE_BYTE_CAP);
@@ -251,8 +251,8 @@ fn stream_delta_coalescer_byte_cap_flushes_before_window() {
     assert!(!c.has_pending());
 }
 
-#[test]
-fn stream_delta_coalescer_sets_flush_deadline_only_while_buffered() {
+#[tokio::test]
+async fn stream_delta_coalescer_sets_flush_deadline_only_while_buffered() {
     let mut c = StreamDeltaCoalescer::default();
     assert!(c.deadline().is_none());
     assert!(c.push(text_delta("builder", "a")).is_empty());
@@ -295,8 +295,8 @@ fn capture_warn_log(f: impl FnOnce()) -> String {
     String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
 }
 
-#[test]
-fn steer_side_channel_stores_raw_and_stamps_origin() {
+#[tokio::test]
+async fn steer_side_channel_stores_raw_and_stamps_origin() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
@@ -346,8 +346,8 @@ fn steer_side_channel_stores_raw_and_stamps_origin() {
     assert!(steers[0].body.contains("secret-user-steer-token"));
 }
 
-#[test]
-fn steer_side_channel_rejects_non_running_child_without_enqueue() {
+#[tokio::test]
+async fn steer_side_channel_rejects_non_running_child_without_enqueue() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
@@ -440,15 +440,15 @@ async fn turn_refresh_sends_rebuilt_redaction_table_to_driver() {
     assert!(!persisted.scrub("worker-secret").contains("worker-secret"));
 }
 
-fn persisted_notice_text(session: &Session) -> String {
-    let events = session.db.list_session_events(session.id).unwrap();
+async fn persisted_notice_text(session: &Session) -> String {
+    let events = session.db.list_session_events(session.id).await.unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kind, "notice");
     events[0].data["text"].as_str().unwrap().to_string()
 }
 
-#[test]
-fn engine_notice_is_recorded_as_durable_session_event() {
+#[tokio::test]
+async fn engine_notice_is_recorded_as_durable_session_event() {
     let session = Session::create(
         Db::open_in_memory().unwrap(),
         PathBuf::from("/proj"),
@@ -473,7 +473,7 @@ fn engine_notice_is_recorded_as_durable_session_event() {
         NoticeSource::EngineTurn,
     );
 
-    let rows = session.db.list_session_events(session.id).unwrap();
+    let rows = session.db.list_session_events(session.id).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].kind, "notice");
     assert_eq!(rows[0].data["text"], "Engine notice text.");
@@ -481,8 +481,8 @@ fn engine_notice_is_recorded_as_durable_session_event() {
     assert_eq!(rows[0].data["severity"], "info");
 }
 
-#[test]
-fn notice_is_recorded_exactly_once_across_both_paths() {
+#[tokio::test]
+async fn notice_is_recorded_exactly_once_across_both_paths() {
     let session = Session::create(
         Db::open_in_memory().unwrap(),
         PathBuf::from("/proj"),
@@ -502,14 +502,14 @@ fn notice_is_recorded_exactly_once_across_both_paths() {
         send_session_event(&session, &event_tx, &table, event, NoticeSource::EngineTurn);
     }
 
-    let rows = session.db.list_session_events(session.id).unwrap();
+    let rows = session.db.list_session_events(session.id).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].kind, "notice");
     assert_eq!(rows[0].data["text"], "Single notice.");
 }
 
-#[test]
-fn daemon_direct_notice_is_recorded_as_durable_session_event() {
+#[tokio::test]
+async fn daemon_direct_notice_is_recorded_as_durable_session_event() {
     let session = Session::create(
         Db::open_in_memory().unwrap(),
         PathBuf::from("/proj"),
@@ -530,7 +530,7 @@ fn daemon_direct_notice_is_recorded_as_durable_session_event() {
         NoticeSource::DaemonDirect,
     );
 
-    let rows = session.db.list_session_events(session.id).unwrap();
+    let rows = session.db.list_session_events(session.id).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].kind, "notice");
     assert_eq!(rows[0].data["text"], "Daemon warning.");
@@ -538,8 +538,8 @@ fn daemon_direct_notice_is_recorded_as_durable_session_event() {
     assert_eq!(rows[0].data["severity"], "warning");
 }
 
-#[test]
-fn sessionless_notice_is_dropped_without_error() {
+#[tokio::test]
+async fn sessionless_notice_is_dropped_without_error() {
     let table = RedactionTable::empty();
     record_notice_event_with_agent(
         None,
@@ -553,8 +553,8 @@ fn sessionless_notice_is_dropped_without_error() {
     );
 }
 
-#[test]
-fn recorded_notice_text_is_redacted() {
+#[tokio::test]
+async fn recorded_notice_text_is_redacted() {
     let tmp = tempfile::TempDir::new().unwrap();
     let cfg = crate::config::extended::RedactConfig {
         denylist: vec!["session-secret-token".to_string()],
@@ -580,13 +580,13 @@ fn recorded_notice_text_is_redacted() {
         NoticeSource::DaemonDirect,
     );
 
-    let text = persisted_notice_text(&session);
+    let text = persisted_notice_text(&session).await;
     assert!(!text.contains("session-secret-token"));
     assert!(text.contains("REDACTED"));
 }
 
-#[test]
-fn session_driver_failed_event_is_latched() {
+#[tokio::test]
+async fn session_driver_failed_event_is_latched() {
     let (event_tx, mut event_rx) = broadcast::channel(8);
     let completions = Arc::new(Mutex::new(TurnCompletions::default()));
     let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
@@ -811,16 +811,16 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
     }
 }
 
-#[test]
-fn roster_trim_initial_active_agent_uses_build_or_plan() {
+#[tokio::test]
+async fn roster_trim_initial_active_agent_uses_build_or_plan() {
     use crate::config::extended::DefaultPrimaryAgent as D;
 
     assert_eq!(initial_active_agent(&cfg_with(D::Build)), "Build");
     assert_eq!(initial_active_agent(&cfg_with(D::Plan)), "Plan");
 }
 
-#[test]
-fn seed_tool_drain_failure_warns_with_session_id_without_payload() {
+#[tokio::test]
+async fn seed_tool_drain_failure_warns_with_session_id_without_payload() {
     let session_id = Uuid::new_v4();
     let log = capture_warn_log(|| {
         let error = anyhow::anyhow!("db unavailable");
@@ -887,6 +887,7 @@ async fn roster_trim_removed_primary_notice_is_one_time() {
             "source": NoticeSource::DaemonDirect.as_str(),
         }),
     )
+    .await
     .unwrap();
     assert!(
         removed_primary_notice(row.session_id, &db, &cfg_with(D::Plan))
@@ -922,6 +923,7 @@ async fn roster_trim_removed_default_primary_notice_is_one_time() {
             "source": NoticeSource::DaemonDirect.as_str(),
         }),
     )
+    .await
     .unwrap();
     assert!(
         removed_primary_notice(row.session_id, &db, &cfg)
@@ -1005,8 +1007,8 @@ async fn assistant_session_root_agent_loads_assistant_definition() {
     assert!(root.tools.names().contains(&"read"));
 }
 
-#[test]
-fn sandbox_default_precedence_daemon_wins() {
+#[tokio::test]
+async fn sandbox_default_precedence_daemon_wins() {
     use crate::tools::sandbox_mode::SandboxMode;
 
     // (a) daemon `--no-sandbox` -> OFF regardless of the client flag.
@@ -1020,8 +1022,8 @@ fn sandbox_default_precedence_daemon_wins() {
     );
 }
 
-#[test]
-fn sandbox_default_precedence_client_then_on() {
+#[tokio::test]
+async fn sandbox_default_precedence_client_then_on() {
     use crate::tools::sandbox_mode::SandboxMode;
 
     // (b) no daemon flag, client `--no-sandbox` -> OFF.
@@ -1039,8 +1041,8 @@ fn sandbox_default_precedence_client_then_on() {
 /// The concurrent-write-during-plan warning fires once per plan episode per
 /// session, re-arms on a different plan, and is mode-aware
 /// (`plan-concurrent-build-and-merge.md`).
-#[test]
-fn lifecycle_turn_id_maps_to_proto_events() {
+#[tokio::test]
+async fn lifecycle_turn_id_maps_to_proto_events() {
     let sid = Uuid::new_v4();
     let out = proto::turn_event_to_proto(
         TurnEvent::ThinkingStarted {
@@ -1087,8 +1089,8 @@ fn lifecycle_turn_id_maps_to_proto_events() {
     }
 }
 
-#[test]
-fn foreground_input_target_maps_to_proto_event() {
+#[tokio::test]
+async fn foreground_input_target_maps_to_proto_event() {
     let sid = Uuid::new_v4();
     let out = proto::turn_event_to_proto(
         TurnEvent::ForegroundInputTarget {
@@ -1109,8 +1111,8 @@ fn foreground_input_target_maps_to_proto_event() {
     }
 }
 
-#[test]
-fn nested_turn_event_maps_to_wrapped_proto_event() {
+#[tokio::test]
+async fn nested_turn_event_maps_to_wrapped_proto_event() {
     let sid = Uuid::new_v4();
     let out = proto::turn_event_to_proto(
         TurnEvent::NestedTurn {
@@ -1155,8 +1157,8 @@ fn nested_turn_event_maps_to_wrapped_proto_event() {
     }
 }
 
-#[test]
-fn live_foreground_snapshot_tracks_nested_active_subagent() {
+#[tokio::test]
+async fn live_foreground_snapshot_tracks_nested_active_subagent() {
     let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
     let target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
         "Build",
@@ -1235,8 +1237,8 @@ fn live_foreground_snapshot_tracks_nested_active_subagent() {
     );
 }
 
-#[test]
-fn routing_amend_does_not_alter_foreground_state() {
+#[tokio::test]
+async fn routing_amend_does_not_alter_foreground_state() {
     let foreground = Arc::new(Mutex::new(LiveForegroundState::new("Build".to_string())));
     let target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
         "Build",
@@ -1292,8 +1294,8 @@ fn routing_amend_does_not_alter_foreground_state() {
 
 /// §6.5: the sandbox-unavailable `TurnEvent` maps to the wire broadcast
 /// carrying the session_id + the verbatim diagnosed remedy.
-#[test]
-fn sandbox_unavailable_maps_to_broadcast_with_remedy() {
+#[tokio::test]
+async fn sandbox_unavailable_maps_to_broadcast_with_remedy() {
     let sid = Uuid::new_v4();
     let remedy = "unprivileged user namespaces are restricted by AppArmor (Ubuntu 23.10+); \
              `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` re-enables confinement"
@@ -1324,8 +1326,8 @@ fn sandbox_unavailable_maps_to_broadcast_with_remedy() {
     }
 }
 
-#[test]
-fn command_capability_unavailable_maps_to_broadcast_with_fix_command() {
+#[tokio::test]
+async fn command_capability_unavailable_maps_to_broadcast_with_fix_command() {
     let sid = Uuid::new_v4();
     let text = "Required command capability unavailable: `demo` missing for `tool`.";
     let fix_command = "sudo apt-get install demo";
@@ -1451,8 +1453,8 @@ async fn active_interrupt_hydration_rebroadcasts_with_rehydration_reason() {
     }
 }
 
-#[test]
-fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending_paused_work() {
+#[tokio::test]
+async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending_paused_work() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
@@ -1499,8 +1501,8 @@ fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending_pause
 /// Two failed `bash` calls (two `SandboxUnavailable` events) → one forward;
 /// `set_sandbox` re-arms it (clearing the latch) so a renewed condition
 /// after a `/sandbox` toggle can surface a fresh notice.
-#[test]
-fn sandbox_unavailable_dedupes_per_session() {
+#[tokio::test]
+async fn sandbox_unavailable_dedupes_per_session() {
     let armed = AtomicBool::new(false);
     // First failed bash → forward.
     assert!(forward_sandbox_unavailable(&armed));
@@ -1519,8 +1521,8 @@ fn sandbox_unavailable_dedupes_per_session() {
 use std::sync::atomic::AtomicUsize;
 
 /// The detach edge fires only on the LAST detach (count 1→0) while idle.
-#[test]
-fn detach_should_release_only_on_last_detach_while_idle() {
+#[tokio::test]
+async fn detach_should_release_only_on_last_detach_while_idle() {
     // Last detach (1→0), idle → release.
     assert!(detach_should_release(1, false));
     // Last detach but mid-turn → do NOT release.
@@ -1765,8 +1767,8 @@ fn snapshot_for_tests() -> SessionConfigSnapshot {
 
 /// Criterion 2: engine components read config through the session handle,
 /// and the value read matches the worker's current snapshot and generation.
-#[test]
-fn engine_reads_config_through_session_handle() {
+#[tokio::test]
+async fn engine_reads_config_through_session_handle() {
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.llm_mode = crate::config::extended::LlmMode::Frontier;
     extended.max_primary_rounds = 9;
@@ -1812,8 +1814,8 @@ fn engine_reads_config_through_session_handle() {
 /// view for its whole duration; a mid-turn re-resolution does not change
 /// what the in-flight turn's (pinned) handle reads, and the next turn's
 /// re-pin observes the new generation.
-#[test]
-fn turn_pinned_handle_view_survives_reresolve() {
+#[tokio::test]
+async fn turn_pinned_handle_view_survives_reresolve() {
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.llm_mode = crate::config::extended::LlmMode::Defensive;
     let shared = Arc::new(RwLock::new(SessionConfigSnapshot::new(
@@ -1865,8 +1867,8 @@ fn turn_pinned_handle_view_survives_reresolve() {
 /// values the pre-adoption direct disk reads produced. The expected values
 /// are pinned here (captured from the fixture) so a resolution regression
 /// fails this test.
-#[test]
-fn turn_config_values_match_pre_adoption_resolution() {
+#[tokio::test]
+async fn turn_config_values_match_pre_adoption_resolution() {
     let tmp = tempfile::tempdir().unwrap();
     let cockpit = tmp.path().join(".cockpit");
     std::fs::create_dir_all(cockpit.join("providers")).unwrap();
@@ -1918,8 +1920,8 @@ fn turn_config_values_match_pre_adoption_resolution() {
     assert_eq!(active.model, "gpt-parity");
 }
 
-#[test]
-fn config_snapshot_event_still_carries_no_secrets() {
+#[tokio::test]
+async fn config_snapshot_event_still_carries_no_secrets() {
     let mut snapshot = snapshot_for_tests();
     snapshot
         .extended
@@ -1939,8 +1941,8 @@ fn config_snapshot_event_still_carries_no_secrets() {
     assert!(provider.entry.credential_ref.is_none());
 }
 
-#[test]
-fn config_snapshot_carries_resolved_provider_view() {
+#[tokio::test]
+async fn config_snapshot_carries_resolved_provider_view() {
     let wire = snapshot_for_tests().to_proto(Uuid::new_v4());
     assert_eq!(
         wire.providers.active_model.as_ref().unwrap().model,
@@ -1951,8 +1953,8 @@ fn config_snapshot_carries_resolved_provider_view() {
     assert_eq!(provider.entry.models[0].context_length, Some(128_000));
 }
 
-#[test]
-fn provider_view_covers_enumerated_tui_consumer_fields() {
+#[tokio::test]
+async fn provider_view_covers_enumerated_tui_consumer_fields() {
     let wire = snapshot_for_tests().to_proto(Uuid::new_v4());
     let provider = wire.providers.providers.get("openai").unwrap();
     assert!(wire.providers.active_model.is_some());
@@ -1967,8 +1969,8 @@ fn provider_view_covers_enumerated_tui_consumer_fields() {
     assert_eq!(provider.headers[0].name, "Authorization");
 }
 
-#[test]
-fn provider_view_requires_no_client_side_secret_resolution() {
+#[tokio::test]
+async fn provider_view_requires_no_client_side_secret_resolution() {
     let wire = snapshot_for_tests().to_proto(Uuid::new_v4());
     let provider = wire.providers.providers.get("openai").unwrap();
     assert!(provider.entry.credential_ref.is_none());
@@ -1976,8 +1978,8 @@ fn provider_view_requires_no_client_side_secret_resolution() {
     assert!(provider.credential_configured);
 }
 
-#[test]
-fn replace_config_snapshot_unchanged_values_do_not_bump_generation() {
+#[tokio::test]
+async fn replace_config_snapshot_unchanged_values_do_not_bump_generation() {
     let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
     let replacement = snapshot.read().unwrap().clone();
     let result = replace_config_snapshot(&snapshot, replacement);
@@ -1986,8 +1988,8 @@ fn replace_config_snapshot_unchanged_values_do_not_bump_generation() {
     assert_eq!(snapshot.read().unwrap().generation, 0);
 }
 
-#[test]
-fn replace_config_snapshot_changed_values_bump_generation() {
+#[tokio::test]
+async fn replace_config_snapshot_changed_values_bump_generation() {
     let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
     let result = replace_config_snapshot(
         &snapshot,
@@ -2001,16 +2003,16 @@ fn replace_config_snapshot_changed_values_bump_generation() {
     assert_eq!(result.generation, 1);
 }
 
-#[test]
-fn config_snapshot_generation_stable_without_reresolve() {
+#[tokio::test]
+async fn config_snapshot_generation_stable_without_reresolve() {
     let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
     let before = snapshot.read().unwrap().generation;
     let _current = snapshot.read().unwrap().clone();
     assert_eq!(snapshot.read().unwrap().generation, before);
 }
 
-#[test]
-fn invalid_config_reresolve_keeps_last_good_snapshot() {
+#[tokio::test]
+async fn invalid_config_reresolve_keeps_last_good_snapshot() {
     let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
     let failed: anyhow::Result<(
         crate::config::providers::ProvidersConfig,
@@ -2027,8 +2029,8 @@ fn invalid_config_reresolve_keeps_last_good_snapshot() {
     assert!(current.providers.providers.contains_key("openai"));
 }
 
-#[test]
-fn config_reresolve_does_not_mutate_inflight_turn_view() {
+#[tokio::test]
+async fn config_reresolve_does_not_mutate_inflight_turn_view() {
     let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
     let inflight = snapshot.read().unwrap().clone();
     let updated = crate::config::extended::ExtendedConfig {
@@ -2053,8 +2055,8 @@ fn config_reresolve_does_not_mutate_inflight_turn_view() {
     );
 }
 
-#[test]
-fn llm_mode_reads_are_consistent_within_a_generation() {
+#[tokio::test]
+async fn llm_mode_reads_are_consistent_within_a_generation() {
     let tmp = tempfile::tempdir().unwrap();
     let snapshot = snapshot_for_tests();
     let session = Session::create(
@@ -2072,8 +2074,8 @@ fn llm_mode_reads_are_consistent_within_a_generation() {
     assert_eq!(first, second);
 }
 
-#[test]
-fn session_llm_mode_stays_immediate_and_prune_free() {
+#[tokio::test]
+async fn session_llm_mode_stays_immediate_and_prune_free() {
     use crate::config::extended::LlmMode;
     use crate::engine::driver::DriverControl;
 
@@ -2093,8 +2095,8 @@ fn session_llm_mode_stays_immediate_and_prune_free() {
     ));
 }
 
-#[test]
-fn worker_uses_registry_resolved_config_snapshot() {
+#[tokio::test]
+async fn worker_uses_registry_resolved_config_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let snapshot = snapshot_for_tests();
     let session = Session::create(
@@ -2109,8 +2111,8 @@ fn worker_uses_registry_resolved_config_snapshot() {
     assert_eq!(crate::config::extended::load_for_cwd_call_count(), 0);
 }
 
-#[test]
-fn worker_broadcast_delivers_config_snapshot_to_subscriber() {
+#[tokio::test]
+async fn worker_broadcast_delivers_config_snapshot_to_subscriber() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
@@ -2133,8 +2135,8 @@ fn worker_broadcast_delivers_config_snapshot_to_subscriber() {
     ));
 }
 
-#[test]
-fn replace_config_snapshot_no_change_emits_no_config_snapshot_event() {
+#[tokio::test]
+async fn replace_config_snapshot_no_change_emits_no_config_snapshot_event() {
     let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
     let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(16);
     let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
@@ -2149,8 +2151,8 @@ fn replace_config_snapshot_no_change_emits_no_config_snapshot_event() {
     assert!(event_rx.try_recv().is_err());
 }
 
-#[test]
-fn dispatch_reresolve_fans_out_to_all_attached_clients() {
+#[tokio::test]
+async fn dispatch_reresolve_fans_out_to_all_attached_clients() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
@@ -2187,8 +2189,8 @@ fn dispatch_reresolve_fans_out_to_all_attached_clients() {
 /// session-creation snapshot, or the definition site — and resolves config
 /// once at its own boundary). Any other occurrence is a turn-scoped read
 /// that bypasses the session snapshot and fails this guard.
-#[test]
-fn session_scoped_code_has_no_direct_config_reads() {
+#[tokio::test]
+async fn session_scoped_code_has_no_direct_config_reads() {
     fn collect_rs(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -2292,8 +2294,8 @@ fn session_scoped_code_has_no_direct_config_reads() {
     );
 }
 
-#[test]
-fn config_reresolve_rereads_trust_policy() {
+#[tokio::test]
+async fn config_reresolve_rereads_trust_policy() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let dispatch =
         std::fs::read_to_string(manifest_dir.join("src/daemon/server/dispatch.rs")).unwrap();
@@ -2324,8 +2326,8 @@ fn config_reresolve_rereads_trust_policy() {
     );
 }
 
-#[test]
-fn queue_item_carries_display_text() {
+#[tokio::test]
+async fn queue_item_carries_display_text() {
     let item = crate::engine::message::QueuedUserMessage {
         id: uuid::Uuid::new_v4(),
         status: crate::engine::message::QueueItemStatus::Queued,

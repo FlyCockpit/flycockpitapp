@@ -235,18 +235,14 @@ pub fn now_ms() -> i64 {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn store_compaction_payload(
+    pub async fn store_compaction_payload(
         &self,
         handoff_id: Uuid,
         session_id: Uuid,
         payload_json: &str,
     ) -> Result<()> {
         let payload_json = payload_json.to_string();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO compaction_handoffs (handoff_id, session_id, payload_json, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -260,6 +256,7 @@ impl Db {
             .context("storing compaction payload")?;
             Ok(())
         })
+        .await
     }
 
     pub fn compaction_payload_conn(
@@ -283,12 +280,34 @@ impl Db {
             .context("decoding compaction payload")
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn compaction_payload(&self, session_id: Uuid, handoff_id: &str) -> Result<Option<String>> {
-        self.read_blocking(|conn| Self::compaction_payload_conn(conn, session_id, handoff_id))
+    pub async fn compaction_payload(
+        &self,
+        session_id: Uuid,
+        handoff_id: &str,
+    ) -> Result<Option<String>> {
+        let handoff_id = handoff_id.to_string();
+        self.read(move |conn| Self::compaction_payload_conn(conn, session_id, &handoff_id))
+            .await
+    }
+
+    pub fn get_inference_request_conn(
+        conn: &Connection,
+        call_id: &str,
+    ) -> Result<Option<(Value, String)>> {
+        let result: rusqlite::Result<(String, String)> = conn.query_row(
+            "SELECT payload_json, status FROM inference_requests WHERE call_id = ?1",
+            [call_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        match result {
+            Ok((payload_json, status)) => {
+                let payload: Value =
+                    serde_json::from_str(&payload_json).context("deserializing payload_json")?;
+                Ok(Some((payload, status)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("querying inference_request"),
+        }
     }
 
     /// Store the full assembled (post-redaction) request body for one
@@ -301,11 +320,7 @@ impl Db {
     /// (implementation note). The
     /// dispatch `ts_ms` is preserved across the update via `COALESCE` so the
     /// recorded timestamp is when the request went out, not when it settled.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn insert_inference_request(
+    pub async fn insert_inference_request(
         &self,
         call_id: &str,
         session_id: Uuid,
@@ -315,7 +330,7 @@ impl Db {
         let payload_json = serde_json::to_string(payload).context("serializing request payload")?;
         let ts_ms = now_ms();
         let call_id = call_id.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO inference_requests
                    (call_id, session_id, ts_ms, payload_json, status)
@@ -334,11 +349,12 @@ impl Db {
             .context("inserting inference_request")?;
             Ok(())
         })
+        .await
     }
 
     /// Append one event to the per-session timeline. Returns the assigned
     /// monotonic `seq` (the rowid). `data` carries the per-type payload.
-    pub fn insert_session_event(
+    pub async fn insert_session_event(
         &self,
         session_id: Uuid,
         kind: SessionEventKind,
@@ -347,9 +363,10 @@ impl Db {
         data: &Value,
     ) -> Result<i64> {
         self.insert_session_event_with_origin(session_id, kind, agent, call_id, None, data)
+            .await
     }
 
-    pub fn insert_session_event_with_origin(
+    pub async fn insert_session_event_with_origin(
         &self,
         session_id: Uuid,
         kind: SessionEventKind,
@@ -370,13 +387,10 @@ impl Db {
             },
             data,
         )
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn insert_session_event_with_context(
+    pub async fn insert_session_event_with_context(
         &self,
         session_id: Uuid,
         kind: SessionEventKind,
@@ -392,36 +406,61 @@ impl Db {
         let task_call_id = context.task_call_id.map(str::to_owned);
         let label = context.label.map(str::to_owned);
         let origin_principal = context.origin_principal.map(str::to_owned);
-        self.write_blocking(move |conn| {
-            conn.execute(
-                "INSERT INTO session_events
-                 (session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal, data_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    session_id.to_string(),
-                    ts_ms,
-                    kind.as_str(),
-                    agent,
-                    call_id,
-                    task_call_id,
-                    label,
-                    origin_principal,
-                    data_json,
-                ],
+        self.write(move |conn| {
+            Self::insert_session_event_json_conn(
+                conn,
+                session_id,
+                kind,
+                agent.as_deref(),
+                call_id.as_deref(),
+                SessionEventContext {
+                    origin_principal: origin_principal.as_deref(),
+                    task_call_id: task_call_id.as_deref(),
+                    label: label.as_deref(),
+                },
+                ts_ms,
+                &data_json,
             )
-            .context("inserting session_event")?;
-            Ok(conn.last_insert_rowid())
         })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_session_event_json_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        kind: SessionEventKind,
+        agent: Option<&str>,
+        call_id: Option<&str>,
+        context: SessionEventContext<'_>,
+        ts_ms: i64,
+        data_json: &str,
+    ) -> Result<i64> {
+        conn.execute(
+            "INSERT INTO session_events
+             (session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal, data_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                session_id.to_string(),
+                ts_ms,
+                kind.as_str(),
+                agent,
+                call_id,
+                context.task_call_id,
+                context.label,
+                context.origin_principal,
+                data_json,
+            ],
+        )
+        .context("inserting session_event")?;
+        Ok(conn.last_insert_rowid())
     }
 
     /// All events for one session, ordered by `seq` (oldest first). Used
     /// by the exporter to merge per-fork timelines.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_session_events(&self, session_id: Uuid) -> Result<Vec<SessionEventRow>> {
-        self.read_blocking(|conn| Self::list_session_events_conn(conn, session_id))
+    pub async fn list_session_events(&self, session_id: Uuid) -> Result<Vec<SessionEventRow>> {
+        self.read(move |conn| Self::list_session_events_conn(conn, session_id))
+            .await
     }
 
     pub fn list_session_events_conn(
@@ -473,19 +512,16 @@ impl Db {
         Ok(events)
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_session_events_before(
+    pub async fn list_session_events_before(
         &self,
         session_id: Uuid,
         before_seq: Option<i64>,
         limit: u32,
     ) -> Result<SessionEventPage> {
-        self.read_blocking(|conn| {
+        self.read(move |conn| {
             Self::list_session_events_before_conn(conn, session_id, before_seq, limit)
         })
+        .await
     }
 
     pub fn list_session_events_before_conn(
@@ -531,19 +567,14 @@ impl Db {
         })
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn read_session_messages(
+    pub async fn read_session_messages(
         &self,
         session_id: Uuid,
         before_seq: Option<i64>,
         limit: u32,
     ) -> Result<(Vec<crate::db::wire::SessionMessage>, bool)> {
-        self.read_blocking(|conn| {
-            Self::read_session_messages_conn(conn, session_id, before_seq, limit)
-        })
+        self.read(move |conn| Self::read_session_messages_conn(conn, session_id, before_seq, limit))
+            .await
     }
 
     pub fn read_session_messages_conn(
@@ -612,27 +643,10 @@ impl Db {
     /// pre-0009 call). The export writes the payload verbatim and surfaces the
     /// status on the emitted file so a hung/failed turn's record carries its
     /// non-`completed` status.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn get_inference_request(&self, call_id: &str) -> Result<Option<(Value, String)>> {
-        self.read_blocking(|conn| {
-            let result: rusqlite::Result<(String, String)> = conn.query_row(
-                "SELECT payload_json, status FROM inference_requests WHERE call_id = ?1",
-                [call_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            );
-            match result {
-                Ok((payload_json, status)) => {
-                    let payload: Value = serde_json::from_str(&payload_json)
-                        .context("deserializing payload_json")?;
-                    Ok(Some((payload, status)))
-                }
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e) => Err(e).context("querying inference_request"),
-            }
-        })
+    pub async fn get_inference_request(&self, call_id: &str) -> Result<Option<(Value, String)>> {
+        let call_id = call_id.to_string();
+        self.read(move |conn| Self::get_inference_request_conn(conn, &call_id))
+            .await
     }
 }
 
@@ -738,14 +752,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn insert_numbered_events(db: &Db, session_id: Uuid, count: usize) -> Vec<i64> {
-        (1..=count)
-            .map(|index| {
-                let kind = match index % 3 {
-                    0 => SessionEventKind::ToolCall,
-                    1 => SessionEventKind::UserMessage,
-                    _ => SessionEventKind::AssistantMessage,
-                };
+    async fn insert_numbered_events(db: &Db, session_id: Uuid, count: usize) -> Vec<i64> {
+        let mut seqs = Vec::new();
+        for index in 1..=count {
+            let kind = match index % 3 {
+                0 => SessionEventKind::ToolCall,
+                1 => SessionEventKind::UserMessage,
+                _ => SessionEventKind::AssistantMessage,
+            };
+            seqs.push(
                 db.insert_session_event(
                     session_id,
                     kind,
@@ -753,9 +768,260 @@ mod tests {
                     None,
                     &json!({"text": format!("event-{index}")}),
                 )
-                .unwrap()
+                .await
+                .unwrap(),
+            );
+        }
+        seqs
+    }
+
+    #[tokio::test]
+    async fn db_async_session_log_append_and_list_roundtrip_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let first = json!({"text": "hello"});
+        let second = json!({"text": "world"});
+
+        db.insert_session_event(
+            session.session_id,
+            SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &first,
+        )
+        .await
+        .unwrap();
+        db.insert_session_event(
+            session.session_id,
+            SessionEventKind::AssistantMessage,
+            Some("Build"),
+            Some("call-1"),
+            &second,
+        )
+        .await
+        .unwrap();
+
+        let events = db.list_session_events(session.session_id).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "user_message");
+        assert_eq!(events[0].data, first);
+        assert_eq!(events[1].kind, "assistant_message");
+        assert_eq!(events[1].call_id.as_deref(), Some("call-1"));
+        assert_eq!(events[1].data, second);
+    }
+
+    #[tokio::test]
+    async fn db_async_session_log_append_then_read_sees_committed_event() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+
+        let seq = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "committed"}),
+            )
+            .await
+            .unwrap();
+
+        let events = db.list_session_events(session.session_id).await.unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![seq]
+        );
+        let (messages, has_more) = db
+            .read_session_messages(session.session_id, None, 10)
+            .await
+            .unwrap();
+        assert!(!has_more);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].seq, seq);
+        assert_eq!(messages[0].text, "committed");
+    }
+
+    #[tokio::test]
+    async fn db_async_session_log_writes_from_one_task_apply_in_order() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let writer_db = db.clone();
+        let session_id = session.session_id;
+
+        let seqs = tokio::spawn(async move {
+            let mut seqs = Vec::new();
+            for text in ["one", "two", "three"] {
+                seqs.push(
+                    writer_db
+                        .insert_session_event(
+                            session_id,
+                            SessionEventKind::UserMessage,
+                            Some("Build"),
+                            None,
+                            &json!({"text": text}),
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+            seqs
+        })
+        .await
+        .unwrap();
+
+        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]));
+        let events = db.list_session_events(session.session_id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.data["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["one", "two", "three"]
+        );
+    }
+
+    #[tokio::test]
+    async fn db_async_session_log_event_and_counter_update_is_atomic() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        db.write(|conn| {
+            conn.execute(
+                "CREATE TEMP TABLE db_async_session_log_counter (value INTEGER)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO db_async_session_log_counter (value) VALUES (0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let session_id = session.session_id;
+        let data_json = serde_json::to_string(&json!({"text": "rolled back"})).unwrap();
+
+        let result: Result<()> = db
+            .write(move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute(
+                    "INSERT INTO session_events
+                     (session_id, ts_ms, type, agent, data_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        session_id.to_string(),
+                        now_ms(),
+                        SessionEventKind::UserMessage.as_str(),
+                        "Build",
+                        data_json,
+                    ],
+                )?;
+                tx.execute(
+                    "UPDATE db_async_session_log_counter SET value = value + 1",
+                    [],
+                )?;
+                anyhow::bail!("injected failure after event and counter update");
             })
-            .collect()
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            db.list_session_events(session.session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let counter: i64 = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT value FROM db_async_session_log_counter",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(counter, 0);
+    }
+
+    #[tokio::test]
+    async fn db_async_session_log_tool_call_payload_is_serialized_before_write_submit() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let payload = json!({
+            "tool": "bash",
+            "original_input": {"cmd": "printf '%s' \"$VALUE\""},
+            "wire_input": {"cmd": "printf '%s' \"$VALUE\"", "timeout_ms": 1000},
+        });
+
+        let seq = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::ToolCall,
+                Some("Build"),
+                Some("tool-call-1"),
+                &payload,
+            )
+            .await
+            .unwrap();
+
+        let raw: String = db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT data_json FROM session_events WHERE seq = ?1",
+                    [seq],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&raw).unwrap(),
+            payload
+        );
+    }
+
+    #[tokio::test]
+    async fn db_async_session_log_concurrent_reads_proceed_during_slow_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("db.sqlite3")).unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        db.insert_session_event(
+            session.session_id,
+            SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &json!({"text": "already visible"}),
+        )
+        .await
+        .unwrap();
+        let (write_started_tx, write_started_rx) = tokio::sync::oneshot::channel();
+        let (release_write_tx, release_write_rx) = std::sync::mpsc::channel();
+        let writer_db = db.clone();
+
+        let writer = tokio::spawn(async move {
+            writer_db
+                .write(move |_conn| {
+                    write_started_tx.send(()).ok();
+                    release_write_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        });
+
+        write_started_rx.await.unwrap();
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            db.list_session_events(session.session_id),
+        )
+        .await
+        .expect("read should not wait behind slow writer")
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["text"], "already visible");
+
+        release_write_tx.send(()).unwrap();
+        writer.await.unwrap();
     }
 
     fn assert_session_event_rows_eq(left: &[SessionEventRow], right: &[SessionEventRow]) {
@@ -804,19 +1070,16 @@ mod tests {
             &payload,
             InferenceRequestStatus::Completed,
         )
+        .await
         .unwrap();
-        let (got, status) = db.get_inference_request(&call_id).unwrap().unwrap();
+        let (got, status) = db.get_inference_request(&call_id).await.unwrap().unwrap();
         assert_eq!(got, payload);
         assert_eq!(status, "completed");
         // Unknown call_id resolves to None.
-        assert!(db.get_inference_request("missing").unwrap().is_none());
+        assert!(db.get_inference_request("missing").await.unwrap().is_none());
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn inference_request_dispatch_then_terminal_update_supersedes() {
         // The dispatch-time write (status `pending`) and the terminal update
         // (status `timed_out`) for one call_id collapse onto a single row,
@@ -833,8 +1096,9 @@ mod tests {
             &pending_payload,
             InferenceRequestStatus::Pending,
         )
+        .await
         .unwrap();
-        let (_, status) = db.get_inference_request(&call_id).unwrap().unwrap();
+        let (_, status) = db.get_inference_request(&call_id).await.unwrap().unwrap();
         assert_eq!(status, "pending");
 
         // Terminal update: a hung turn that timed out.
@@ -845,21 +1109,24 @@ mod tests {
             &final_payload,
             InferenceRequestStatus::TimedOut,
         )
+        .await
         .unwrap();
-        let (got, status) = db.get_inference_request(&call_id).unwrap().unwrap();
+        let (got, status) = db.get_inference_request(&call_id).await.unwrap().unwrap();
         assert_eq!(status, "timed_out");
         assert_eq!(got, final_payload, "terminal payload supersedes pending");
 
         // Exactly one row — the update collapsed onto the dispatch row.
+        let count_call_id = call_id.clone();
         let count: i64 = db
-            .read_blocking(|c| {
+            .read(move |c| {
                 c.query_row(
                     "SELECT COUNT(*) FROM inference_requests WHERE call_id = ?1",
-                    [&call_id],
+                    [count_call_id.as_str()],
                     |r| r.get(0),
                 )
                 .map_err(anyhow::Error::from)
             })
+            .await
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -886,8 +1153,9 @@ mod tests {
             None,
             &data,
         )
+        .await
         .unwrap();
-        let events = db.list_session_events(s.session_id).unwrap();
+        let events = db.list_session_events(s.session_id).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "permission_decision");
         assert_eq!(events[0].data, data);
@@ -914,6 +1182,7 @@ mod tests {
             Some("tc-1"),
             &rejected,
         )
+        .await
         .unwrap();
         let swap = json!({
             "from": "Auto",
@@ -929,6 +1198,7 @@ mod tests {
             None,
             &swap,
         )
+        .await
         .unwrap();
         let model_switch = json!({
             "from_provider": "provider-a",
@@ -946,9 +1216,10 @@ mod tests {
             None,
             &model_switch,
         )
+        .await
         .unwrap();
 
-        let events = db.list_session_events(sid).unwrap();
+        let events = db.list_session_events(sid).await.unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].kind, "tool_rejected");
         assert_eq!(events[0].data, rejected);
@@ -983,13 +1254,14 @@ mod tests {
                     None,
                     &json!({ "text": long }),
                 )
+                .await
                 .unwrap();
             assert!(seq > 0, "a monotonic seq is assigned");
         }
         // A fresh handle (a restart / resume) still sees the note in place.
         {
             let db = Db::open(&path).unwrap();
-            let events = db.list_session_events(sid).unwrap();
+            let events = db.list_session_events(sid).await.unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].kind, "user_note");
             assert_eq!(events[0].seq, seq);
@@ -1016,6 +1288,7 @@ mod tests {
                 None,
                 &json!({"text": "first"}),
             )
+            .await
             .unwrap();
         let s2 = db
             .insert_session_event(
@@ -1025,6 +1298,7 @@ mod tests {
                 None,
                 &json!({"text": "second"}),
             )
+            .await
             .unwrap();
         let s3 = db
             .insert_session_event(
@@ -1034,16 +1308,17 @@ mod tests {
                 Some("call-1"),
                 &json!({"file": "00003_x_call-1.json"}),
             )
+            .await
             .unwrap();
         assert!(s1 < s2 && s2 < s3, "seq must be globally monotonic");
 
-        let a_events = db.list_session_events(a.session_id).unwrap();
+        let a_events = db.list_session_events(a.session_id).await.unwrap();
         assert_eq!(a_events.len(), 2);
         assert_eq!(a_events[0].kind, "user_message");
         assert_eq!(a_events[1].kind, "inference_request");
         assert_eq!(a_events[1].call_id.as_deref(), Some("call-1"));
 
-        let b_events = db.list_session_events(b.session_id).unwrap();
+        let b_events = db.list_session_events(b.session_id).await.unwrap();
         assert_eq!(b_events.len(), 1);
         assert_eq!(b_events[0].kind, "assistant_message");
         assert_eq!(b_events[0].data, json!({"text": "second"}));
@@ -1056,11 +1331,11 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let session = db.create_session("p", "/x", "builder").await.unwrap();
 
-        let mut threads = Vec::new();
+        let mut tasks = Vec::new();
         for worker in 0..8 {
             let db = db.clone();
             let session_id = session.session_id;
-            threads.push(std::thread::spawn(move || {
+            tasks.push(tokio::spawn(async move {
                 let mut seqs = Vec::new();
                 for index in 0..10 {
                     seqs.push(
@@ -1071,6 +1346,7 @@ mod tests {
                             None,
                             &json!({ "worker": worker, "index": index }),
                         )
+                        .await
                         .unwrap(),
                     );
                 }
@@ -1078,16 +1354,16 @@ mod tests {
             }));
         }
 
-        let mut seqs = threads
-            .into_iter()
-            .flat_map(|thread| thread.join().unwrap())
-            .collect::<Vec<_>>();
+        let mut seqs = Vec::new();
+        for task in tasks {
+            seqs.extend(task.await.unwrap());
+        }
         assert_eq!(seqs.len(), 80);
         seqs.sort_unstable();
         seqs.dedup();
         assert_eq!(seqs.len(), 80, "each concurrent append gets one seq");
 
-        let events = db.list_session_events(session.session_id).unwrap();
+        let events = db.list_session_events(session.session_id).await.unwrap();
         assert_eq!(events.len(), 80);
         assert!(
             events.windows(2).all(|pair| pair[0].seq < pair[1].seq),
@@ -1109,6 +1385,7 @@ mod tests {
                 None,
                 &json!({"text": "committed"}),
             )
+            .await
             .unwrap();
         drop(db);
 
@@ -1132,7 +1409,10 @@ mod tests {
         }
 
         let reopened = Db::open(&path).unwrap();
-        let events = reopened.list_session_events(session.session_id).unwrap();
+        let events = reopened
+            .list_session_events(session.session_id)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].seq, committed);
         assert_eq!(events[0].data, json!({"text": "committed"}));
@@ -1152,6 +1432,7 @@ mod tests {
                 None,
                 &json!({"text": "before"}),
             )
+            .await
             .unwrap();
         let assistant_seq = db
             .insert_session_event(
@@ -1161,6 +1442,7 @@ mod tests {
                 None,
                 &json!({"text": "still committed"}),
             )
+            .await
             .unwrap();
         drop(db);
 
@@ -1214,10 +1496,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn list_session_events_since_filters_strictly_after_seq() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
@@ -1229,6 +1507,7 @@ mod tests {
                 None,
                 &json!({"text": "one"}),
             )
+            .await
             .unwrap();
         let seq2 = db
             .insert_session_event(
@@ -1238,6 +1517,7 @@ mod tests {
                 None,
                 &json!({"text": "two"}),
             )
+            .await
             .unwrap();
         let seq3 = db
             .insert_session_event(
@@ -1247,16 +1527,19 @@ mod tests {
                 None,
                 &json!({"text": "three"}),
             )
+            .await
             .unwrap();
 
         let rows = db
-            .read_blocking(|conn| Db::list_session_events_since_conn(conn, s.session_id, seq1))
+            .read(move |conn| Db::list_session_events_since_conn(conn, s.session_id, seq1))
+            .await
             .unwrap();
         let got: Vec<i64> = rows.into_iter().map(|row| row.seq).collect();
         assert_eq!(got, vec![seq2, seq3]);
 
         let rows = db
-            .read_blocking(|conn| Db::list_session_events_since_conn(conn, s.session_id, seq3))
+            .read(move |conn| Db::list_session_events_since_conn(conn, s.session_id, seq3))
+            .await
             .unwrap();
         assert!(rows.is_empty());
     }
@@ -1265,10 +1548,11 @@ mod tests {
     async fn list_session_events_before_returns_newest_page_oldest_first() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
-        let seqs = insert_numbered_events(&db, s.session_id, 5);
+        let seqs = insert_numbered_events(&db, s.session_id, 5).await;
 
         let page = db
             .list_session_events_before(s.session_id, None, 2)
+            .await
             .expect("newest page");
         assert_eq!(
             page.events
@@ -1282,6 +1566,7 @@ mod tests {
 
         let missing_cursor_page = db
             .list_session_events_before(s.session_id, Some(seqs[4] + 100), 2)
+            .await
             .expect("page before missing cursor");
         assert_eq!(
             missing_cursor_page
@@ -1297,14 +1582,15 @@ mod tests {
     async fn list_session_events_before_walk_reconstructs_full_event_list() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
-        insert_numbered_events(&db, s.session_id, 7);
-        let full = db.list_session_events(s.session_id).unwrap();
+        insert_numbered_events(&db, s.session_id, 7).await;
+        let full = db.list_session_events(s.session_id).await.unwrap();
 
         let mut pages = Vec::new();
         let mut before_seq = None;
         loop {
             let page = db
                 .list_session_events_before(s.session_id, before_seq, 3)
+                .await
                 .expect("page before cursor");
             before_seq = page.oldest_seq;
             pages.push(page.events);
@@ -1325,10 +1611,11 @@ mod tests {
     async fn list_session_events_before_reports_has_more_until_oldest_event() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
-        let seqs = insert_numbered_events(&db, s.session_id, 5);
+        let seqs = insert_numbered_events(&db, s.session_id, 5).await;
 
         let first = db
             .list_session_events_before(s.session_id, None, 2)
+            .await
             .expect("first page");
         assert_eq!(
             first
@@ -1343,6 +1630,7 @@ mod tests {
 
         let second = db
             .list_session_events_before(s.session_id, first.oldest_seq, 2)
+            .await
             .expect("second page");
         assert_eq!(
             second
@@ -1357,6 +1645,7 @@ mod tests {
 
         let third = db
             .list_session_events_before(s.session_id, second.oldest_seq, 2)
+            .await
             .expect("third page");
         assert_eq!(
             third
@@ -1371,6 +1660,7 @@ mod tests {
 
         let before_oldest = db
             .list_session_events_before(s.session_id, Some(0), 2)
+            .await
             .expect("before oldest seq");
         assert!(before_oldest.events.is_empty());
         assert!(!before_oldest.has_more);
@@ -1381,10 +1671,11 @@ mod tests {
     async fn list_session_events_before_clamps_limit() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
-        let seqs = insert_numbered_events(&db, s.session_id, 501);
+        let seqs = insert_numbered_events(&db, s.session_id, 501).await;
 
         let minimum = db
             .list_session_events_before(s.session_id, None, 0)
+            .await
             .expect("minimum clamped page");
         assert_eq!(minimum.events.len(), 1);
         assert_eq!(minimum.events[0].seq, *seqs.last().unwrap());
@@ -1393,6 +1684,7 @@ mod tests {
 
         let capped = db
             .list_session_events_before(s.session_id, None, u32::MAX)
+            .await
             .expect("maximum clamped page");
         assert_eq!(capped.events.len(), LIST_SESSION_EVENTS_MAX_LIMIT as usize);
         assert!(capped.has_more);
@@ -1415,6 +1707,7 @@ mod tests {
             "brief_text": "stored brief",
         });
         db.store_compaction_payload(handoff_id, s.session_id, &payload.to_string())
+            .await
             .unwrap();
         let compacted = db
             .insert_session_event(
@@ -1424,11 +1717,13 @@ mod tests {
                 None,
                 &json!({"handoff_ref": handoff_id.to_string(), "brief_text": "inline brief"}),
             )
+            .await
             .unwrap();
 
-        let full = db.list_session_events(s.session_id).unwrap();
+        let full = db.list_session_events(s.session_id).await.unwrap();
         let page = db
             .list_session_events_before(s.session_id, None, 10)
+            .await
             .expect("compaction page");
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].seq, compacted);
@@ -1443,6 +1738,7 @@ mod tests {
 
         let page = db
             .list_session_events_before(s.session_id, None, 10)
+            .await
             .expect("empty session page");
         assert!(page.events.is_empty());
         assert!(!page.has_more);
@@ -1450,6 +1746,7 @@ mod tests {
 
         let unknown = db
             .list_session_events_before(Uuid::new_v4(), None, 10)
+            .await
             .expect("unknown session page");
         assert!(unknown.events.is_empty());
         assert!(!unknown.has_more);
@@ -1470,6 +1767,7 @@ mod tests {
                 None,
                 &json!({"text": "a-one"}),
             )
+            .await
             .unwrap();
         let b1 = db
             .insert_session_event(
@@ -1479,6 +1777,7 @@ mod tests {
                 None,
                 &json!({"text": "b-one"}),
             )
+            .await
             .unwrap();
         let a2 = db
             .insert_session_event(
@@ -1488,6 +1787,7 @@ mod tests {
                 None,
                 &json!({"text": "a-two"}),
             )
+            .await
             .unwrap();
         let b2 = db
             .insert_session_event(
@@ -1497,10 +1797,12 @@ mod tests {
                 None,
                 &json!({"text": "b-two"}),
             )
+            .await
             .unwrap();
 
         let a_page = db
             .list_session_events_before(a.session_id, None, 10)
+            .await
             .expect("session a page");
         assert_eq!(
             a_page
@@ -1513,6 +1815,7 @@ mod tests {
 
         let b_page = db
             .list_session_events_before(b.session_id, Some(b2), 10)
+            .await
             .expect("session b older page");
         assert_eq!(
             b_page
@@ -1542,6 +1845,7 @@ mod tests {
                 None,
                 &json!({"text": "one"}),
             )
+            .await
             .unwrap();
         db.insert_session_event(
             s.session_id,
@@ -1550,6 +1854,7 @@ mod tests {
             None,
             &json!({"text": "ignored tool"}),
         )
+        .await
         .unwrap();
         let agent_two = db
             .insert_session_event(
@@ -1559,6 +1864,7 @@ mod tests {
                 None,
                 &json!({"text": "two"}),
             )
+            .await
             .unwrap();
         let user_three = db
             .insert_session_event(
@@ -1568,6 +1874,7 @@ mod tests {
                 None,
                 &json!({"text": "three"}),
             )
+            .await
             .unwrap();
 
         let before = db
@@ -1577,6 +1884,7 @@ mod tests {
             .remove(0);
         let (page, has_more) = db
             .read_session_messages(s.session_id, None, 2)
+            .await
             .expect("newest page");
         assert!(has_more);
         assert_eq!(
@@ -1590,6 +1898,7 @@ mod tests {
 
         let (older, has_more) = db
             .read_session_messages(s.session_id, Some(agent_two), 2)
+            .await
             .expect("older page");
         assert!(!has_more);
         assert_eq!(older.len(), 1);

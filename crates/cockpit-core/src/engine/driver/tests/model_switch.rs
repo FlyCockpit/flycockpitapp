@@ -1,7 +1,7 @@
 use super::*;
 
-#[test]
-fn reasoning_params_prefer_native_capability_over_legacy_thinking_mode() {
+#[tokio::test]
+async fn reasoning_params_prefer_native_capability_over_legacy_thinking_mode() {
     use crate::config::providers::{
         ActiveModelRef, ActiveReasoningEffort, CapabilitySource, CapabilityValue, ModelEntry,
         ProviderEntry, ProvidersConfig, ReasoningEffortCapability, ReasoningEffortRequestMapping,
@@ -216,7 +216,7 @@ async fn live_model_switch_commits_config_and_session_together() {
     );
     assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
     assert_disk_config_active_model(tmp.path(), "provider-b", "model-b");
-    assert_one_model_switch_event(&driver, "ok", false);
+    assert_one_model_switch_event(&driver, "ok", false).await;
     drain_until_active_model_state(&mut rx);
 }
 
@@ -337,7 +337,7 @@ async fn live_model_switch_failure_leaves_config_and_session_on_old_model() {
         Some("provider-a")
     );
     assert_config_active_model(&driver, "provider-a", "model-a");
-    assert_one_model_switch_event(&driver, "build_failed", true);
+    assert_one_model_switch_event(&driver, "build_failed", true).await;
     drain_until_active_model_state(&mut rx);
 }
 
@@ -371,7 +371,7 @@ async fn live_model_switch_session_persist_failure_rolls_back() {
     );
     assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
     assert_config_active_model(&driver, "provider-a", "model-a");
-    assert_one_model_switch_event(&driver, "send_failed", true);
+    assert_one_model_switch_event(&driver, "send_failed", true).await;
     drain_until_active_model_state(&mut rx);
 }
 
@@ -405,7 +405,7 @@ async fn live_model_switch_config_write_failure_rolls_back() {
     );
     assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
     assert_config_active_model(&driver, "provider-a", "model-a");
-    assert_one_model_switch_event(&driver, "send_failed", true);
+    assert_one_model_switch_event(&driver, "send_failed", true).await;
     drain_until_active_model_state(&mut rx);
 }
 
@@ -524,7 +524,7 @@ async fn live_model_switch_same_model_is_noop() {
         .await;
 
     assert_eq!(Arc::as_ptr(&driver.stack[0].agent), before);
-    assert_one_model_switch_event(&driver, "noop", false);
+    assert_one_model_switch_event(&driver, "noop", false).await;
     drain_until_active_model_state(&mut rx);
 }
 
@@ -610,11 +610,12 @@ fn assert_config_active_model(driver: &Driver, provider: &str, model: &str) {
     assert_eq!(active.model, model);
 }
 
-fn assert_one_model_switch_event(driver: &Driver, outcome: &str, error_present: bool) {
+async fn assert_one_model_switch_event(driver: &Driver, outcome: &str, error_present: bool) {
     let events = driver
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap()
         .into_iter()
         .filter(|event| event.kind == "model_switch")
@@ -1099,8 +1100,8 @@ async fn model_switch_inside_subagent_frame_rebuild_failure_keeps_child() {
     );
 }
 
-#[test]
-fn refresh_rebuild_inherits_wire_state_only_for_same_identity() {
+#[tokio::test]
+async fn refresh_rebuild_inherits_wire_state_only_for_same_identity() {
     use crate::config::providers::WireApi;
 
     let (driver, _tmp) = model_switch_driver();

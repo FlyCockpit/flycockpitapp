@@ -968,34 +968,38 @@ impl Driver {
             &task_call_id,
             task_function_call_id.as_deref(),
         );
-        if let Err(e) = self.session.record_event(
-            crate::db::session_log::SessionEventKind::SubagentSpawned,
-            Some(&self.stack.last().unwrap().agent.name),
-            Some(&task_call_id),
-            &serde_json::json!({
-                "child_agent": child_agent.clone(),
-                "task_call_id": task_call_id,
-                "provider_call_id": task_identity.provider_call_id,
-                "provider_call_id_source": task_identity.provider_call_id_source,
-                "provider_identity": task_identity.event_identity_json(&task_call_id),
-                "label": "default",
-                "noninteractive": true,
-                "prompt": delivered_brief.clone(),
-                "why": why.clone(),
-                "model": model_selector_json(&model),
-                "trusted_only": self.stack.last().unwrap().agent.model.trusted_only_enabled(),
-                "model_trusted": self.stack.last().unwrap().agent.model.is_trusted(),
-                "routing": routing,
-                "remaining_depth": remaining_depth,
-                "resume_handle": resume_handle.clone(),
-                "requested_cwd": child_cwd.requested_json(),
-                "resolved_cwd": child_cwd.resolved_display(),
-                "grant_tools": granted_tools.clone(),
-                "seed": prefill_seeds.clone(),
-                "skill_seed": skill_seed.clone(),
-                "todo_ids": todo_ids.clone(),
-            }),
-        ) {
+        if let Err(e) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::SubagentSpawned,
+                Some(&self.stack.last().unwrap().agent.name),
+                Some(&task_call_id),
+                &serde_json::json!({
+                    "child_agent": child_agent.clone(),
+                    "task_call_id": task_call_id,
+                    "provider_call_id": task_identity.provider_call_id,
+                    "provider_call_id_source": task_identity.provider_call_id_source,
+                    "provider_identity": task_identity.event_identity_json(&task_call_id),
+                    "label": "default",
+                    "noninteractive": true,
+                    "prompt": delivered_brief.clone(),
+                    "why": why.clone(),
+                    "model": model_selector_json(&model),
+                    "trusted_only": self.stack.last().unwrap().agent.model.trusted_only_enabled(),
+                    "model_trusted": self.stack.last().unwrap().agent.model.is_trusted(),
+                    "routing": routing,
+                    "remaining_depth": remaining_depth,
+                    "resume_handle": resume_handle.clone(),
+                    "requested_cwd": child_cwd.requested_json(),
+                    "resolved_cwd": child_cwd.resolved_display(),
+                    "grant_tools": granted_tools.clone(),
+                    "seed": prefill_seeds.clone(),
+                    "skill_seed": skill_seed.clone(),
+                    "todo_ids": todo_ids.clone(),
+                }),
+            )
+            .await
+        {
             tracing::warn!(error = %e, "record single subagent_spawned event failed");
         }
 
@@ -1134,16 +1138,20 @@ impl Driver {
                     }
                     if resume_handle.is_some() {
                         let reuse = self.followup_reuse_decision();
-                        if let Err(e) = self.session.record_event(
-                            crate::db::session_log::SessionEventKind::SubagentSpawned,
-                            Some(&child_agent),
-                            Some(&task_call_id),
-                            &serde_json::json!({
-                                "followup_resume": true,
-                                "reuse_decision": format!("{reuse:?}"),
-                                "write_capable": write_capable,
-                            }),
-                        ) {
+                        if let Err(e) = self
+                            .session
+                            .record_event(
+                                crate::db::session_log::SessionEventKind::SubagentSpawned,
+                                Some(&child_agent),
+                                Some(&task_call_id),
+                                &serde_json::json!({
+                                    "followup_resume": true,
+                                    "reuse_decision": format!("{reuse:?}"),
+                                    "write_capable": write_capable,
+                                }),
+                            )
+                            .await
+                        {
                             tracing::warn!(error = %e, "record followup reuse event failed");
                         }
                     }
@@ -1388,12 +1396,16 @@ impl Driver {
                 with_model_routing_metadata(report_data, &self.stack.last().unwrap().agent.model)
             }
         };
-        if let Err(e) = self.session.record_event(
-            crate::db::session_log::SessionEventKind::SubagentReport,
-            Some(&child_agent),
-            Some(&task_call_id),
-            &report_data,
-        ) {
+        if let Err(e) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::SubagentReport,
+                Some(&child_agent),
+                Some(&task_call_id),
+                &report_data,
+            )
+            .await
+        {
             tracing::warn!(error = %e, "record subagent_report event failed");
         }
         let fallback_routing =
@@ -2608,7 +2620,7 @@ impl Driver {
                     "todo_ids": entry.todo_ids.clone(),
                     "output_dir": entry.output_dir.clone(),
                 }),
-            ) {
+            ).await {
                 tracing::warn!(error = %e, "record batch subagent_spawned event failed");
             }
 
@@ -2838,12 +2850,16 @@ impl Driver {
                     &self.stack.last().unwrap().agent.model,
                 ),
             };
-            if let Err(e) = self.session.record_event(
-                crate::db::session_log::SessionEventKind::SubagentReport,
-                Some(&entry.child_agent),
-                Some(&task_call_id),
-                &report_data,
-            ) {
+            if let Err(e) = self
+                .session
+                .record_event(
+                    crate::db::session_log::SessionEventKind::SubagentReport,
+                    Some(&entry.child_agent),
+                    Some(&task_call_id),
+                    &report_data,
+                )
+                .await
+            {
                 tracing::warn!(error = %e, "record batch subagent_report event failed");
             }
             let routing = outcome.child_routing.as_ref().cloned().unwrap_or_else(|| {

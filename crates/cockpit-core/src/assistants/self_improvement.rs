@@ -289,8 +289,8 @@ const REVIEW_SYSTEM: &str = "You are an isolated background skill-review subagen
 mod tests {
     use super::*;
 
-    #[test]
-    fn review_triggers_at_boundary() {
+    #[tokio::test]
+    async fn review_triggers_at_boundary() {
         let mut schedule = ReviewSchedule::default();
         assert!(!schedule.record_idle_boundary("helper", 2));
         assert!(schedule.record_idle_boundary("helper", 2));
@@ -299,16 +299,16 @@ mod tests {
         assert!(!schedule.record_idle_boundary("other", 2));
     }
 
-    #[test]
-    fn review_skips_env_dependent_failure() {
+    #[tokio::test]
+    async fn review_skips_env_dependent_failure() {
         let digest =
             "User hit a transient network outage caused by a missing secret in local environment.";
         assert!(should_skip_capture(digest));
         assert!(build_review_prompt("helper", digest).is_none());
     }
 
-    #[test]
-    fn review_scratch_not_persisted() {
+    #[tokio::test]
+    async fn review_scratch_not_persisted() {
         let tmp = tempfile::tempdir().unwrap();
         let real_db = crate::db::Db::open_in_memory().unwrap();
         let real =
@@ -324,7 +324,14 @@ mod tests {
                 None,
                 &serde_json::json!({"text": "scratch only"}),
             )
+            .await
             .unwrap();
-        assert!(real_db.list_session_events(real.id).unwrap().is_empty());
+        assert!(
+            real_db
+                .list_session_events(real.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -207,7 +207,37 @@ fn record_notice_event_with_agent(
         return;
     };
     let scrubbed = redact.scrub(text);
-    if let Err(error) = session.record_notice(agent, &scrubbed, source.as_str()) {
+    let data = serde_json::json!({
+        "text": scrubbed,
+        "severity": crate::session::notice_severity(&scrubbed),
+        "source": source.as_str(),
+    });
+    let data_json = match serde_json::to_string(&data) {
+        Ok(data_json) => data_json,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                session_id = %session.id,
+                source = source.as_str(),
+                "serializing notice event failed"
+            );
+            return;
+        }
+    };
+    let agent = agent.map(str::to_owned);
+    let session_id = session.id;
+    if let Err(error) = session.db.blocking_write_for_sync_event(move |conn| {
+        crate::db::Db::insert_session_event_json_conn(
+            conn,
+            session_id,
+            crate::db::session_log::SessionEventKind::Notice,
+            agent.as_deref(),
+            None,
+            crate::db::session_log::SessionEventContext::default(),
+            crate::db::session_log::now_ms(),
+            &data_json,
+        )
+    }) {
         tracing::warn!(
             %error,
             session_id = %session.id,

@@ -204,8 +204,8 @@ mod loop_collapse_tests {
 
     /// N identical rejected calls collapse to exactly ONE synthesized message;
     /// it carries the tool name, the attempt count, and the tool-name list.
-    #[test]
-    fn n_identical_rejects_collapse_to_one_message() {
+    #[tokio::test]
+    async fn n_identical_rejects_collapse_to_one_message() {
         let args = serde_json::json!({"command": "cargo build"});
         let available = ["read", "bash", "edit"];
         let mut history: Vec<Message> = Vec::new();
@@ -242,8 +242,8 @@ mod loop_collapse_tests {
 
     /// Idempotence: a further identical attempt UPDATES the single message's
     /// count rather than appending a second.
-    #[test]
-    fn further_attempt_updates_count_in_place() {
+    #[tokio::test]
+    async fn further_attempt_updates_count_in_place() {
         let args = serde_json::json!({"path": "src/x.rs"});
         let available = ["read", "write"];
         let mut history: Vec<Message> = Vec::new();
@@ -266,8 +266,8 @@ mod loop_collapse_tests {
 
     /// A differing call between repeats breaks the run: the earlier collapse
     /// message is NOT removed (no collapse across the break).
-    #[test]
-    fn differing_call_between_repeats_breaks_run() {
+    #[tokio::test]
+    async fn differing_call_between_repeats_breaks_run() {
         let args = serde_json::json!({"command": "ls"});
         let available = ["bash"];
         let mut history: Vec<Message> = Vec::new();
@@ -302,8 +302,8 @@ mod loop_collapse_tests {
 
     /// The collapse is WIRE-only: the session-DB tool_call rows (and thus the
     /// user-facing timeline) keep one entry per attempt.
-    #[test]
-    fn db_rows_kept_one_per_attempt() {
+    #[tokio::test]
+    async fn db_rows_kept_one_per_attempt() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
         let session =
@@ -344,10 +344,15 @@ mod loop_collapse_tests {
                     shape_fingerprint: None,
                     hint: None,
                 })
+                .await
                 .unwrap();
         }
 
-        let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
         let bash_rows = rows.iter().filter(|r| r.tool == "bash").count();
         assert_eq!(
             bash_rows, 3,
@@ -355,8 +360,8 @@ mod loop_collapse_tests {
         );
     }
 
-    #[test]
-    fn repeated_recoverable_tree_call_is_short_circuited_before_dispatch() {
+    #[tokio::test]
+    async fn repeated_recoverable_tree_call_is_short_circuited_before_dispatch() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
         let session =

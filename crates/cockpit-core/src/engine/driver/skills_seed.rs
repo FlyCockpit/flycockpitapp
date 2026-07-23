@@ -64,7 +64,7 @@ impl Driver {
     /// post-migration resumes can reconstruct from the durable skill-slash
     /// tool-call audit rows because those rows carry both `call_id` and the
     /// agent active when the slash command ran.
-    pub(in crate::engine::driver) fn restore_skill_pairs_after_rehydrate(
+    pub(in crate::engine::driver) async fn restore_skill_pairs_after_rehydrate(
         &mut self,
         root_agent: &str,
     ) {
@@ -88,7 +88,9 @@ impl Driver {
         let known: std::collections::HashSet<String> =
             restored.iter().map(|pair| pair.call_id.clone()).collect();
         if known.len() < present.len() {
-            let mut inferred = self.reconstruct_skill_pairs_from_tool_log(root_agent, &present);
+            let mut inferred = self
+                .reconstruct_skill_pairs_from_tool_log(root_agent, &present)
+                .await;
             inferred.retain(|pair| !known.contains(&pair.call_id));
             for pair in &inferred {
                 if let Err(e) = self.session.db.save_skill_pair(
@@ -106,7 +108,7 @@ impl Driver {
         self.skill_pairs = restored;
     }
 
-    pub(in crate::engine::driver) fn reconstruct_skill_pairs_from_tool_log(
+    pub(in crate::engine::driver) async fn reconstruct_skill_pairs_from_tool_log(
         &self,
         root_agent: &str,
         present: &std::collections::HashSet<String>,
@@ -115,6 +117,7 @@ impl Driver {
             .session
             .db
             .list_tool_calls_for_session(self.session.id)
+            .await
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "loading tool calls for skill-pair reconstruction failed");
                 Vec::new()
@@ -364,60 +367,68 @@ impl Driver {
             // is emitted verbatim, so `wire == original` and there is no
             // recovery. Without this the injected pair would stream to the
             // live client but vanish from a session export.
-            if let Err(e) = self.session.record_tool_call(crate::session::ToolCallRow {
-                event_id: uuid::Uuid::new_v4(),
-                timestamp: chrono::Utc::now(),
-                agent: agent.name.clone(),
-                call_id: call_id.clone(),
-                parent_call_id: None,
-                parent_child_index: None,
-                identity: provider_identity.clone(),
-                tool: seed.tool.clone(),
-                path: None,
-                mcp_server: None,
-                original_input_json: seed.args.clone(),
-                wire_input_json: seed.args.clone(),
-                recovery: crate::db::tool_calls::Recovery::Clean,
-                hard_fail,
-                exit_code: None,
-                sandbox_enabled: false,
-                sandboxed: false,
-                sandbox_unavailable_reason: None,
-                output: body.clone(),
-                truncated: false,
-                duration_ms,
-                llm_mode: agent.llm_mode,
-                // Seed re-exec — not the §12 dispatch path; no repair fingerprint.
-                shape_fingerprint: None,
-                // The hint layer is `bash`-only; a seed re-exec never carries one.
-                hint: None,
-            }) {
+            if let Err(e) = self
+                .session
+                .record_tool_call(crate::session::ToolCallRow {
+                    event_id: uuid::Uuid::new_v4(),
+                    timestamp: chrono::Utc::now(),
+                    agent: agent.name.clone(),
+                    call_id: call_id.clone(),
+                    parent_call_id: None,
+                    parent_child_index: None,
+                    identity: provider_identity.clone(),
+                    tool: seed.tool.clone(),
+                    path: None,
+                    mcp_server: None,
+                    original_input_json: seed.args.clone(),
+                    wire_input_json: seed.args.clone(),
+                    recovery: crate::db::tool_calls::Recovery::Clean,
+                    hard_fail,
+                    exit_code: None,
+                    sandbox_enabled: false,
+                    sandboxed: false,
+                    sandbox_unavailable_reason: None,
+                    output: body.clone(),
+                    truncated: false,
+                    duration_ms,
+                    llm_mode: agent.llm_mode,
+                    // Seed re-exec — not the §12 dispatch path; no repair fingerprint.
+                    shape_fingerprint: None,
+                    // The hint layer is `bash`-only; a seed re-exec never carries one.
+                    hint: None,
+                })
+                .await
+            {
                 tracing::warn!(error = %e, tool = %seed.tool, "persisting seed tool_call failed");
             }
-            if let Err(e) = self.session.record_event(
-                crate::db::session_log::SessionEventKind::ToolCall,
-                Some(&agent.name),
-                Some(&call_id),
-                &serde_json::json!({
-                    "tool": seed.tool,
-                    "original_input": seed.args,
-                    "wire_input": seed.args,
-                    "recovery_kind": Option::<&str>::None,
-                    "recovery_stage": Option::<&str>::None,
-                    "hard_fail": hard_fail,
-                    "output": body,
-                    "truncated": false,
-                    "duration_ms": duration_ms,
-                    "seed": true,
-                    "provider_identity": {
-                        "provider_item_id": provider_identity.provider_item_id,
-                        "provider_call_id": provider_identity.provider_call_id,
-                        "provider_call_id_source": provider_identity.provider_call_id_source,
-                        "wire_api": provider_identity.wire_api,
-                        "provider_family": provider_identity.provider_family,
-                    },
-                }),
-            ) {
+            if let Err(e) = self
+                .session
+                .record_event(
+                    crate::db::session_log::SessionEventKind::ToolCall,
+                    Some(&agent.name),
+                    Some(&call_id),
+                    &serde_json::json!({
+                        "tool": seed.tool,
+                        "original_input": seed.args,
+                        "wire_input": seed.args,
+                        "recovery_kind": Option::<&str>::None,
+                        "recovery_stage": Option::<&str>::None,
+                        "hard_fail": hard_fail,
+                        "output": body,
+                        "truncated": false,
+                        "duration_ms": duration_ms,
+                        "seed": true,
+                        "provider_identity": {
+                            "provider_item_id": provider_identity.provider_item_id,
+                            "provider_call_id": provider_identity.provider_call_id,
+                            "provider_call_id_source": provider_identity.provider_call_id_source,
+                            "wire_api": provider_identity.wire_api,
+                            "provider_family": provider_identity.provider_family,
+                        },
+                    }),
+                )
+                .await
+            {
                 tracing::warn!(error = %e, "recording seed timeline event failed");
             }
             seed_calls.push(ToolCall {
@@ -843,60 +854,68 @@ impl Driver {
         // Persist the synthesized call as a tool-call audit row + timeline
         // event (GOALS §14), exactly like a call the agent made itself: it is
         // emitted verbatim, so `wire == original` and there is no recovery.
-        if let Err(e) = self.session.record_tool_call(crate::session::ToolCallRow {
-            event_id: uuid::Uuid::new_v4(),
-            timestamp: chrono::Utc::now(),
-            agent: agent.name.clone(),
-            call_id: call_id.clone(),
-            parent_call_id: None,
-            parent_child_index: None,
-            identity: provider_identity.clone(),
-            tool: "skill".to_string(),
-            path: None,
-            mcp_server: None,
-            original_input_json: args.clone(),
-            wire_input_json: args.clone(),
-            recovery: crate::db::tool_calls::Recovery::Clean,
-            hard_fail,
-            exit_code: None,
-            sandbox_enabled: false,
-            sandboxed: false,
-            sandbox_unavailable_reason: None,
-            output: body.clone(),
-            truncated: false,
-            duration_ms,
-            llm_mode: agent.llm_mode,
-            // Synthesized clean skill-slash call — never goes through §12 repair.
-            shape_fingerprint: None,
-            // The hint layer is `bash`-only; a skill-slash call never carries one.
-            hint: None,
-        }) {
+        if let Err(e) = self
+            .session
+            .record_tool_call(crate::session::ToolCallRow {
+                event_id: uuid::Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                agent: agent.name.clone(),
+                call_id: call_id.clone(),
+                parent_call_id: None,
+                parent_child_index: None,
+                identity: provider_identity.clone(),
+                tool: "skill".to_string(),
+                path: None,
+                mcp_server: None,
+                original_input_json: args.clone(),
+                wire_input_json: args.clone(),
+                recovery: crate::db::tool_calls::Recovery::Clean,
+                hard_fail,
+                exit_code: None,
+                sandbox_enabled: false,
+                sandboxed: false,
+                sandbox_unavailable_reason: None,
+                output: body.clone(),
+                truncated: false,
+                duration_ms,
+                llm_mode: agent.llm_mode,
+                // Synthesized clean skill-slash call — never goes through §12 repair.
+                shape_fingerprint: None,
+                // The hint layer is `bash`-only; a skill-slash call never carries one.
+                hint: None,
+            })
+            .await
+        {
             tracing::warn!(error = %e, "persisting skill-slash tool_call failed");
         }
-        if let Err(e) = self.session.record_event(
-            crate::db::session_log::SessionEventKind::ToolCall,
-            Some(&agent.name),
-            Some(&call_id),
-            &serde_json::json!({
-                "tool": "skill",
-                "original_input": args,
-                "wire_input": args,
-                "recovery_kind": Option::<&str>::None,
-                "recovery_stage": Option::<&str>::None,
-                "hard_fail": hard_fail,
-                "output": body,
-                "truncated": false,
-                "duration_ms": duration_ms,
-                "skill_slash": true,
-                "provider_identity": {
-                    "provider_item_id": provider_identity.provider_item_id,
-                    "provider_call_id": provider_identity.provider_call_id,
-                    "provider_call_id_source": provider_identity.provider_call_id_source,
-                    "wire_api": provider_identity.wire_api,
-                    "provider_family": provider_identity.provider_family,
-                },
-            }),
-        ) {
+        if let Err(e) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::ToolCall,
+                Some(&agent.name),
+                Some(&call_id),
+                &serde_json::json!({
+                    "tool": "skill",
+                    "original_input": args,
+                    "wire_input": args,
+                    "recovery_kind": Option::<&str>::None,
+                    "recovery_stage": Option::<&str>::None,
+                    "hard_fail": hard_fail,
+                    "output": body,
+                    "truncated": false,
+                    "duration_ms": duration_ms,
+                    "skill_slash": true,
+                    "provider_identity": {
+                        "provider_item_id": provider_identity.provider_item_id,
+                        "provider_call_id": provider_identity.provider_call_id,
+                        "provider_call_id_source": provider_identity.provider_call_id_source,
+                        "wire_api": provider_identity.wire_api,
+                        "provider_family": provider_identity.provider_family,
+                    },
+                }),
+            )
+            .await
+        {
             tracing::warn!(error = %e, "recording skill-slash timeline event failed");
         }
 

@@ -378,11 +378,7 @@ fn toolbox_with_retrieval_if_needed(
     } else {
         tools = tools.without("escalate");
     }
-    if session
-        .db
-        .session_has_compressed_tool_results(session.id)
-        .unwrap_or(false)
-    {
+    if session.has_retrievable_tool_results() {
         tools = tools.with(Arc::new(
             crate::tools::tool_result_retrieve::ToolResultRetrieveTool,
         ));
@@ -415,7 +411,7 @@ fn truncated_tool_result_is_retrievable(tool: &str) -> bool {
 }
 
 #[cfg(test)]
-fn store_genuinely_compressed_tool_result(
+async fn store_genuinely_compressed_tool_result(
     session: &Session,
     agent_id: &str,
     tool: &str,
@@ -424,24 +420,28 @@ fn store_genuinely_compressed_tool_result(
     compressed: &str,
 ) -> Result<String> {
     let hash = crate::db::compressed_results::compressed_result_hash(original);
-    session.db.insert_compressed_tool_result(
-        &hash,
-        crate::db::compressed_results::NewCompressedToolResult {
-            session_id: session.id,
-            agent_id,
-            tool,
-            call_id,
-            original_byte_len: original.len(),
-            compressed_byte_len: Some(compressed.len()),
-            created_at: Utc::now().timestamp(),
-            kind: "prune-boundary",
-            content: original,
-        },
-    )?;
+    session
+        .db
+        .insert_compressed_tool_result(
+            &hash,
+            crate::db::compressed_results::NewCompressedToolResult {
+                session_id: session.id,
+                agent_id,
+                tool,
+                call_id,
+                original_byte_len: original.len(),
+                compressed_byte_len: Some(compressed.len()),
+                created_at: Utc::now().timestamp(),
+                kind: "prune-boundary",
+                content: original,
+            },
+        )
+        .await?;
+    session.set_has_retrievable_tool_results();
     Ok(hash)
 }
 
-fn store_truncated_tool_result(
+async fn store_truncated_tool_result(
     session: &Session,
     agent_id: &str,
     tool: &str,
@@ -449,24 +449,28 @@ fn store_truncated_tool_result(
     retained: &crate::engine::tool::RetainedTruncatedOutput,
 ) -> Result<String> {
     let hash = crate::db::compressed_results::compressed_result_hash(&retained.content);
-    session.db.insert_compressed_tool_result(
-        &hash,
-        crate::db::compressed_results::NewCompressedToolResult {
-            session_id: session.id,
-            agent_id,
-            tool,
-            call_id,
-            original_byte_len: retained.original_byte_len,
-            compressed_byte_len: None,
-            created_at: Utc::now().timestamp(),
-            kind: "truncated",
-            content: &retained.content,
-        },
-    )?;
+    session
+        .db
+        .insert_compressed_tool_result(
+            &hash,
+            crate::db::compressed_results::NewCompressedToolResult {
+                session_id: session.id,
+                agent_id,
+                tool,
+                call_id,
+                original_byte_len: retained.original_byte_len,
+                compressed_byte_len: None,
+                created_at: Utc::now().timestamp(),
+                kind: "truncated",
+                content: &retained.content,
+            },
+        )
+        .await?;
+    session.set_has_retrievable_tool_results();
     Ok(hash)
 }
 
-pub(crate) fn maybe_store_retrievable_truncated_tool_result(
+pub(crate) async fn maybe_store_retrievable_truncated_tool_result(
     session: &Session,
     agent_id: &str,
     tool: &str,
@@ -491,7 +495,7 @@ pub(crate) fn maybe_store_retrievable_truncated_tool_result(
         return Ok(None);
     }
 
-    let hash = store_truncated_tool_result(session, agent_id, tool, call_id, retained)?;
+    let hash = store_truncated_tool_result(session, agent_id, tool, call_id, retained).await?;
     let partial = if retained.partial { " partial" } else { "" };
     let lines = retained.content.lines().count();
     delivered_body.push_str(&format!(
@@ -519,9 +523,7 @@ async fn record_usage_blocking(
     call_id: Uuid,
     usage: crate::tokens::TokenUsage,
 ) -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(move || session.record_usage(call_id, usage))
-        .await
-        .map_err(|e| anyhow::anyhow!("record_usage task join failed: {e}"))?
+    session.record_usage(call_id, usage).await
 }
 
 /// Drive one round-trip with the model + dispatch any tool calls. The
@@ -1204,8 +1206,8 @@ mod compressed_tool_result_tests {
     use super::*;
     use std::path::PathBuf;
 
-    #[test]
-    fn retrieval_tool_advertisement_is_sticky_after_store() {
+    #[tokio::test]
+    async fn retrieval_tool_advertisement_is_sticky_after_store() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
         session.set_sandbox_escalation_enabled(false);
@@ -1227,6 +1229,7 @@ mod compressed_tool_result_tests {
             "redacted original output",
             "redacted",
         )
+        .await
         .unwrap();
         assert!(
             toolbox_with_retrieval_if_needed(
@@ -1239,8 +1242,8 @@ mod compressed_tool_result_tests {
         );
     }
 
-    #[test]
-    fn truncate_only_store_leaves_compressed_len_none() {
+    #[tokio::test]
+    async fn truncate_only_store_leaves_compressed_len_none() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
         let retained = crate::engine::tool::RetainedTruncatedOutput {
@@ -1249,11 +1252,13 @@ mod compressed_tool_result_tests {
             partial: false,
         };
 
-        let hash =
-            store_truncated_tool_result(&session, "Build", "tree", "call-1", &retained).unwrap();
+        let hash = store_truncated_tool_result(&session, "Build", "tree", "call-1", &retained)
+            .await
+            .unwrap();
         let row = session
             .db
             .compressed_tool_result(session.id, &hash)
+            .await
             .unwrap()
             .expect("stored truncated result");
 
@@ -1263,8 +1268,8 @@ mod compressed_tool_result_tests {
         assert_eq!(row.content, retained.content);
     }
 
-    #[test]
-    fn retrieval_advertisement_suppressed_when_retrieval_adds_nothing() {
+    #[tokio::test]
+    async fn retrieval_advertisement_suppressed_when_retrieval_adds_nothing() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
         session.set_sandbox_escalation_enabled(false);
@@ -1285,6 +1290,7 @@ mod compressed_tool_result_tests {
             Some(&retained),
             false,
         )
+        .await
         .unwrap();
 
         assert!(stored.is_none());
@@ -1300,8 +1306,8 @@ mod compressed_tool_result_tests {
         );
     }
 
-    #[test]
-    fn truncated_marker_reports_line_count() {
+    #[tokio::test]
+    async fn truncated_marker_reports_line_count() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
         let mut delivered = "visible line\n[truncated]\n".to_string();
@@ -1320,6 +1326,7 @@ mod compressed_tool_result_tests {
             Some(&retained),
             false,
         )
+        .await
         .unwrap();
 
         assert!(stored.is_some());
@@ -1347,8 +1354,8 @@ mod compressed_tool_result_tests {
         assert!(truncated_tool_result_is_retrievable("bash"));
     }
 
-    #[test]
-    fn sandbox_escalate_tool_is_conditional_and_notice_is_debounced() {
+    #[tokio::test]
+    async fn sandbox_escalate_tool_is_conditional_and_notice_is_debounced() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
         let tools = ToolBox::new()
@@ -1410,8 +1417,8 @@ mod compressed_tool_result_tests {
         assert!(removed_by_mode.contains("now unavailable"));
     }
 
-    #[test]
-    fn escalate_is_absent_from_a_defensive_toolbox() {
+    #[tokio::test]
+    async fn escalate_is_absent_from_a_defensive_toolbox() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
         session.set_sandbox_escalation_enabled(true);

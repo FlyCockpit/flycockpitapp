@@ -4,7 +4,7 @@
 //! on `call_id` when /stats needs to attribute tokens.
 
 use anyhow::{Context, Result};
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -37,13 +37,9 @@ pub struct InferenceCallRow {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn insert_inference_call(&self, row: &InferenceCallRow) -> Result<()> {
+    pub async fn insert_inference_call(&self, row: &InferenceCallRow) -> Result<()> {
         let row = row.clone();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO inference_calls (
                     call_id, session_id, project_id, project_root,
@@ -71,6 +67,7 @@ impl Db {
             .context("inserting inference_call")?;
             Ok(())
         })
+        .await
     }
 
     /// The set of `call_id`s among `call_ids` whose `inference_calls` row has
@@ -81,35 +78,37 @@ impl Db {
     /// `inference_calls` row (e.g. a pre-flag call, or a captured request
     /// without a usage row) is simply absent from the result → treated as
     /// non-utility.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn utility_call_ids(
+    pub async fn utility_call_ids(
         &self,
         call_ids: &[String],
     ) -> Result<std::collections::HashSet<String>> {
-        let mut out = std::collections::HashSet::new();
         if call_ids.is_empty() {
-            return Ok(out);
+            return Ok(std::collections::HashSet::new());
         }
-        self.read_blocking(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT is_utility FROM inference_calls WHERE call_id = ?1")
-                .context("preparing utility_call_ids")?;
-            for id in call_ids {
-                let flag: rusqlite::Result<i64> = stmt.query_row(params![id], |row| row.get(0));
-                match flag {
-                    Ok(v) if v != 0 => {
-                        out.insert(id.clone());
-                    }
-                    Ok(_) => {}
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {}
-                    Err(e) => return Err(e).context("querying is_utility"),
+        let call_ids = call_ids.to_vec();
+        self.read(move |conn| Self::utility_call_ids_conn(conn, &call_ids))
+            .await
+    }
+
+    pub fn utility_call_ids_conn(
+        conn: &Connection,
+        call_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut out = std::collections::HashSet::new();
+        let mut stmt = conn
+            .prepare("SELECT is_utility FROM inference_calls WHERE call_id = ?1")
+            .context("preparing utility_call_ids")?;
+        for id in call_ids {
+            let flag: rusqlite::Result<i64> = stmt.query_row(params![id], |row| row.get(0));
+            match flag {
+                Ok(v) if v != 0 => {
+                    out.insert(id.clone());
                 }
+                Ok(_) => {}
+                Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                Err(e) => return Err(e).context("querying is_utility"),
             }
-            Ok(())
-        })?;
+        }
         Ok(out)
     }
 }
@@ -119,10 +118,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn insert_round_trip() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").await.unwrap();
@@ -141,23 +136,24 @@ mod tests {
             cost_usd_micros: Some(420),
             is_utility: false,
         };
-        db.insert_inference_call(&row).unwrap();
+        db.insert_inference_call(&row).await.unwrap();
         let count: i64 = db
-            .read_blocking(|c| {
-                Ok(c.query_row("SELECT COUNT(*) FROM inference_calls", [], |r| r.get(0))?)
-            })
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM inference_calls", [], |r| r.get(0))?))
+            .await
             .unwrap();
         assert_eq!(count, 1);
         // The cache-creation column round-trips
         // (prompt `prompt-caching-strategy.md`).
+        let call_id = row.call_id.to_string();
         let creation: i64 = db
-            .read_blocking(|c| {
+            .read(move |c| {
                 Ok(c.query_row(
                     "SELECT cache_creation_input_tokens FROM inference_calls WHERE call_id = ?1",
-                    params![row.call_id.to_string()],
+                    params![call_id],
                     |r| r.get(0),
                 )?)
             })
+            .await
             .unwrap();
         assert_eq!(creation, 1112);
     }
@@ -186,18 +182,23 @@ mod tests {
             cost_usd_micros: None,
             is_utility,
         };
-        db.insert_inference_call(&base(regular, false)).unwrap();
-        db.insert_inference_call(&base(utility, true)).unwrap();
+        db.insert_inference_call(&base(regular, false))
+            .await
+            .unwrap();
+        db.insert_inference_call(&base(utility, true))
+            .await
+            .unwrap();
 
         let unknown = Uuid::new_v4().to_string();
         let flagged = db
             .utility_call_ids(&[regular.to_string(), utility.to_string(), unknown.clone()])
+            .await
             .unwrap();
         assert!(flagged.contains(&utility.to_string()));
         assert!(!flagged.contains(&regular.to_string()));
         // Unknown call_id (no row) is treated as non-utility.
         assert!(!flagged.contains(&unknown));
         // Empty input is a clean no-op.
-        assert!(db.utility_call_ids(&[]).unwrap().is_empty());
+        assert!(db.utility_call_ids(&[]).await.unwrap().is_empty());
     }
 }

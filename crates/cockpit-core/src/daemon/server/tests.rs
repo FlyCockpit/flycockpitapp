@@ -99,6 +99,7 @@ async fn read_session_messages_requires_read_access_returns_page_and_does_not_sp
             None,
             &serde_json::json!({"text": "hello"}),
         )
+        .await
         .unwrap();
     let request = Request::ReadSessionMessages {
         session_id: session.session_id,
@@ -157,6 +158,7 @@ async fn read_history_page_requires_read_access_returns_page_and_does_not_spawn_
             None,
             &serde_json::json!({"text": "hello"}),
         )
+        .await
         .unwrap();
     let request = Request::ReadHistoryPage {
         session_id: session.session_id,
@@ -513,8 +515,8 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     ));
 }
 
-#[test]
-fn new_session_state_requests_are_classified() {
+#[tokio::test]
+async fn new_session_state_requests_are_classified() {
     let session_id = Uuid::from_u128(42);
     let state = owner_state();
     let cases = [
@@ -713,6 +715,7 @@ async fn stats_rollup_runs_off_request_loop() {
             cost_usd_micros: None,
             is_utility: false,
         })
+        .await
         .unwrap();
     let mut state = owner_state();
 
@@ -854,6 +857,7 @@ async fn auto_title_rpc_generates_title() {
             None,
             &serde_json::json!({"text": "fetch the codex model list"}),
         )
+        .await
         .unwrap();
     let mut state = owner_state();
 
@@ -995,6 +999,7 @@ async fn export_rpc_returns_redacted_data() {
             None,
             &serde_json::json!({"text": "hello [redacted]"}),
         )
+        .await
         .unwrap();
     ctx.db
         .insert_inference_request(
@@ -1008,6 +1013,7 @@ async fn export_rpc_returns_redacted_data() {
             }),
             crate::db::session_log::InferenceRequestStatus::Completed,
         )
+        .await
         .unwrap();
     ctx.db
         .insert_session_event(
@@ -1017,6 +1023,7 @@ async fn export_rpc_returns_redacted_data() {
             Some(&call_id),
             &serde_json::json!({}),
         )
+        .await
         .unwrap();
     let mut state = owner_state();
 
@@ -1196,8 +1203,8 @@ async fn curator_rpc_failure_leaves_skills_unchanged() {
     assert!(skill_root.join("curated").join("SKILL.md").is_file());
 }
 
-#[test]
-fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
+#[tokio::test]
+async fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
     let table = table_for("client-boundary-secret");
     let event = proto::Event::AssistantText {
         session_id: Uuid::new_v4(),
@@ -1223,8 +1230,8 @@ fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
     assert_eq!(text, "visible [redacted]");
 }
 
-#[test]
-fn boundary_scrubs_streaming_deltas_for_non_owner() {
+#[tokio::test]
+async fn boundary_scrubs_streaming_deltas_for_non_owner() {
     let table = table_for("stream-secret");
     for event in [
         proto::Event::AssistantTextDelta {
@@ -1252,8 +1259,8 @@ fn boundary_scrubs_streaming_deltas_for_non_owner() {
     }
 }
 
-#[test]
-fn boundary_scrubs_nested_json_text_for_non_owner() {
+#[tokio::test]
+async fn boundary_scrubs_nested_json_text_for_non_owner() {
     let table = table_for("nested-secret");
     let event = proto::Event::ToolStart {
         session_id: Uuid::new_v4(),
@@ -1275,8 +1282,8 @@ fn boundary_scrubs_nested_json_text_for_non_owner() {
     assert!(rendered.contains("[redacted]"), "{rendered}");
 }
 
-#[test]
-fn boundary_uses_emit_time_table_not_later_table() {
+#[tokio::test]
+async fn boundary_uses_emit_time_table_not_later_table() {
     let emit_table = table_for("emit-secret");
     let _later_table = table_for("later-secret");
     let event = proto::Event::AssistantTextDelta {
@@ -1298,8 +1305,8 @@ fn boundary_uses_emit_time_table_not_later_table() {
     assert_eq!(delta, "[redacted] later-secret");
 }
 
-#[test]
-fn session_and_global_events_use_their_own_tables() {
+#[tokio::test]
+async fn session_and_global_events_use_their_own_tables() {
     let session_id = Uuid::new_v4();
     let session_event = proto::Event::Notice {
         session_id,
@@ -1336,8 +1343,8 @@ fn session_and_global_events_use_their_own_tables() {
     assert_eq!(text, "session-secret [redacted]");
 }
 
-#[test]
-fn attach_history_is_scrubbed_only_for_non_owner() {
+#[tokio::test]
+async fn attach_history_is_scrubbed_only_for_non_owner() {
     let table = table_for("history-secret");
     let history = vec![proto::HistoryEntry::ToolCall {
         seq: 1,
@@ -2090,8 +2097,8 @@ async fn promote_resource_request_stale_id_is_nonfatal() {
     }
 }
 
-#[test]
-fn boot_housekeeping_succeeds_with_empty_task_delegation_tables() {
+#[tokio::test]
+async fn boot_housekeeping_succeeds_with_empty_task_delegation_tables() {
     let db = Db::open_in_memory().expect("in-memory db");
     run_boot_housekeeping(&db);
     assert_eq!(db.reconcile_orphaned_task_delegations().unwrap(), 0);
@@ -2251,8 +2258,8 @@ fn attached_state_with_worker_receiver(
     )
 }
 
-#[test]
-fn client_state_split_snapshot_republishes_on_attach_and_detach() {
+#[tokio::test]
+async fn client_state_split_snapshot_republishes_on_attach_and_detach() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, session_id) = attached_state(&ctx, tmp.path());
@@ -2271,8 +2278,8 @@ fn client_state_split_snapshot_republishes_on_attach_and_detach() {
     assert!(detached.attached.is_none());
 }
 
-#[test]
-fn client_state_split_handler_holding_a_stale_snapshot_still_scrubs() {
+#[tokio::test]
+async fn client_state_split_handler_holding_a_stale_snapshot_still_scrubs() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path());
@@ -3486,8 +3493,8 @@ fn assert_dispatch_matrix_coverage_complete() {
     );
 }
 
-#[test]
-fn dispatch_matrix_readonly_coverage_is_complete() {
+#[tokio::test]
+async fn dispatch_matrix_readonly_coverage_is_complete() {
     assert_dispatch_matrix_coverage_complete();
 }
 
@@ -3521,7 +3528,7 @@ async fn authz_dispatch_matrix_covers_every_controlled_kind() {
     assert_dispatch_matrix_coverage_complete();
     for case in authz_dispatch_cases() {
         for level in AuthzLevel::ALL {
-            let scenario = authz_socket_scenario(case.kind, level);
+            let scenario = authz_socket_scenario(case.kind, level).await;
             let result = dispatch_authz_request_after(
                 &scenario.ctx,
                 scenario.principal,
@@ -3657,7 +3664,7 @@ async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: Aut
 }
 
 #[cfg(unix)]
-fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
+async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path());
@@ -3672,6 +3679,7 @@ fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketSc
             None,
             &serde_json::json!({"text": "authz matrix"}),
         )
+        .await
         .unwrap();
 
     let needs_attached = authz_kind_needs_attached_state(kind, level);
@@ -4293,6 +4301,7 @@ impl ReadonlyDispatchCaseKind {
                         None,
                         &serde_json::json!({"text": "hello"}),
                     )
+                    .await
                     .unwrap();
                 let response = dispatch_matrix_request(
                     &ctx,
@@ -4322,6 +4331,7 @@ impl ReadonlyDispatchCaseKind {
                         None,
                         &serde_json::json!({"text": "hello"}),
                     )
+                    .await
                     .unwrap();
                 let response = dispatch_matrix_request(
                     &ctx,
@@ -5032,7 +5042,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             .await
             .expect_err("empty usage key is rejected");
             assert_eq!(err.code, ErrorCode::BadRequest);
-            let counts = ctx.db.usage_counts("slash", None, 0).unwrap();
+            let counts = ctx.db.usage_counts("slash", None, 0).await.unwrap();
             assert!(counts.is_empty());
         }
         "store_flycockpit_credential" | "clear_flycockpit_credential" => {
@@ -6387,7 +6397,11 @@ async fn assert_session_db_mutating_happy(kind: &str) {
                 panic!("expected NoteRecorded");
             };
             assert!(seq > 0);
-            let events = ctx.db.list_session_events(session.session_id).unwrap();
+            let events = ctx
+                .db
+                .list_session_events(session.session_id)
+                .await
+                .unwrap();
             assert!(events.iter().any(|event| {
                 event.kind == "user_note"
                     && event.data.get("text").and_then(|v| v.as_str()) == Some("note")
@@ -6734,7 +6748,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
             .await
             .expect("record usage");
             assert!(matches!(response, Response::Ack));
-            let counts = ctx.db.usage_counts("slash", None, 0).unwrap();
+            let counts = ctx.db.usage_counts("slash", None, 0).await.unwrap();
             assert_eq!(counts.get("/help"), Some(&1));
         }
         "store_flycockpit_credential" | "clear_flycockpit_credential" => {
@@ -6986,8 +7000,8 @@ macro_rules! request_ordering_rows_from_command_table {
     }};
 }
 
-#[test]
-fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_reads() {
+#[tokio::test]
+async fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_reads() {
     let rows = proto::command!(request_ordering_rows_from_command_table);
     assert!(
         rows.len() > 80,
@@ -10721,7 +10735,7 @@ async fn record_session_note_persists_event_without_inference() {
 
     // The event landed durably with its discriminant + verbatim text, and
     // no worker/turn was started (no AttachedSession was ever created).
-    let events = ctx.db.list_session_events(s.session_id).unwrap();
+    let events = ctx.db.list_session_events(s.session_id).await.unwrap();
     assert_eq!(
         events.len(),
         1,
@@ -10936,6 +10950,7 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
             None,
             &serde_json::json!({"text": "already applied"}),
         )
+        .await
         .unwrap();
     let seq2 = ctx
         .db
@@ -10946,6 +10961,7 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
             None,
             &serde_json::json!({"text": "missed while disconnected"}),
         )
+        .await
         .unwrap();
     let live_session = Arc::new(
         Session::resume(ctx.db.clone(), session.session_id)

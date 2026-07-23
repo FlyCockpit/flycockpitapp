@@ -362,12 +362,16 @@ pub(crate) async fn execute_ordinary_call(
             "recovery_kind": start_recovery_kind,
             "recovery_stage": start_recovery_stage,
         });
-        match env.session.record_event(
-            crate::db::session_log::SessionEventKind::ToolCallStarted,
-            Some(&env.agent.name),
-            Some(&tc.id),
-            &start_data,
-        ) {
+        match env
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::ToolCallStarted,
+                Some(&env.agent.name),
+                Some(&tc.id),
+                &start_data,
+            )
+            .await
+        {
             Ok(seq) => {
                 assistant_seq = Some(seq);
             }
@@ -686,7 +690,9 @@ pub(crate) async fn execute_ordinary_call(
             &mut output_str,
             retained,
             recheck_modified_output,
-        ) {
+        )
+        .await
+        {
             Ok(_) => {}
             Err(e) => {
                 tracing::error!(
@@ -728,41 +734,45 @@ pub(crate) async fn execute_ordinary_call(
     let providers = env.ctx.config.providers();
     let active_provider = env.session.active_provider();
     let active_model = env.session.active_model();
-    if let Err(e) = env.session.record_tool_call(ToolCallRow {
-        event_id: Uuid::new_v4(),
-        timestamp: Utc::now(),
-        agent: env.agent.name.clone(),
-        call_id: tc.id.clone(),
-        parent_call_id: None,
-        parent_child_index: None,
-        identity: crate::session::ToolCallProviderIdentity::from_provider_call(
-            active_provider.as_deref(),
-            active_model.as_deref(),
-            Some(&providers),
-            Some(env.model.current_wire_api()),
-            tc.id.clone(),
-            tc.call_id.clone(),
-        ),
-        tool: resolved_name.to_string(),
-        path: tool_path,
-        mcp_server: None,
-        original_input_json: original.clone(),
-        wire_input_json: args.clone(),
-        recovery: recovery.clone(),
-        hard_fail,
-        exit_code,
-        sandbox_enabled: sandbox_meta.as_ref().is_some_and(|m| m.enabled),
-        sandboxed: sandbox_meta.as_ref().is_some_and(|m| m.confined),
-        sandbox_unavailable_reason: sandbox_meta
-            .as_ref()
-            .and_then(|m| m.unavailable_reason.clone()),
-        output: output_str.clone(),
-        truncated,
-        duration_ms,
-        llm_mode: env.agent.llm_mode,
-        shape_fingerprint: repair_fingerprint.clone(),
-        hint: hint_value.clone(),
-    }) {
+    if let Err(e) = env
+        .session
+        .record_tool_call(ToolCallRow {
+            event_id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            agent: env.agent.name.clone(),
+            call_id: tc.id.clone(),
+            parent_call_id: None,
+            parent_child_index: None,
+            identity: crate::session::ToolCallProviderIdentity::from_provider_call(
+                active_provider.as_deref(),
+                active_model.as_deref(),
+                Some(&providers),
+                Some(env.model.current_wire_api()),
+                tc.id.clone(),
+                tc.call_id.clone(),
+            ),
+            tool: resolved_name.to_string(),
+            path: tool_path,
+            mcp_server: None,
+            original_input_json: original.clone(),
+            wire_input_json: args.clone(),
+            recovery: recovery.clone(),
+            hard_fail,
+            exit_code,
+            sandbox_enabled: sandbox_meta.as_ref().is_some_and(|m| m.enabled),
+            sandboxed: sandbox_meta.as_ref().is_some_and(|m| m.confined),
+            sandbox_unavailable_reason: sandbox_meta
+                .as_ref()
+                .and_then(|m| m.unavailable_reason.clone()),
+            output: output_str.clone(),
+            truncated,
+            duration_ms,
+            llm_mode: env.agent.llm_mode,
+            shape_fingerprint: repair_fingerprint.clone(),
+            hint: hint_value.clone(),
+        })
+        .await
+    {
         // Auditing must not break the live conversation. Log and
         // continue — the model still sees the tool result.
         tracing::warn!(error = %e, tool = %resolved_name, "persisting tool_call_event failed");
@@ -829,18 +839,23 @@ pub(crate) async fn execute_ordinary_call(
     // failures. The `tool_call` row still records the diagnostic the model
     // saw; this names *why* it never dispatched.
     if let Some(reason) = rejection_reason
-        && let Err(e) =
-            env.session
-                .record_tool_rejected(&env.agent.name, &tc.id, resolved_name, reason)
+        && let Err(e) = env
+            .session
+            .record_tool_rejected(&env.agent.name, &tc.id, resolved_name, reason)
+            .await
     {
         tracing::warn!(error = %e, tool = %resolved_name, "record tool_rejected event failed");
     }
-    let tool_call_seq = match env.session.record_event(
-        crate::db::session_log::SessionEventKind::ToolCall,
-        Some(&env.agent.name),
-        Some(&tc.id),
-        &event_data,
-    ) {
+    let tool_call_seq = match env
+        .session
+        .record_event(
+            crate::db::session_log::SessionEventKind::ToolCall,
+            Some(&env.agent.name),
+            Some(&tc.id),
+            &event_data,
+        )
+        .await
+    {
         Ok(seq) => Some(seq),
         Err(e) => {
             tracing::warn!(error = %e, tool = %resolved_name, "record tool_call event failed");
@@ -912,12 +927,16 @@ pub(crate) async fn execute_ordinary_call(
         if let Some(hint) = &hint_value {
             completed_data["hint"] = hint.clone();
         }
-        if let Err(e) = env.session.record_event(
-            crate::db::session_log::SessionEventKind::ToolCallCompleted,
-            Some(&env.agent.name),
-            Some(&tc.id),
-            &completed_data,
-        ) {
+        if let Err(e) = env
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::ToolCallCompleted,
+                Some(&env.agent.name),
+                Some(&tc.id),
+                &completed_data,
+            )
+            .await
+        {
             tracing::warn!(error = %e, tool = %resolved_name, "record tool_call_completed event failed");
         }
     }
@@ -1649,11 +1668,19 @@ mod tests {
         panic!("timed out waiting for interrupt to park");
     }
 
-    fn assert_parked_call_has_no_result(session: &Session, history: &[Message], call_id: &str) {
-        let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
+    async fn assert_parked_call_has_no_result(
+        session: &Session,
+        history: &[Message],
+        call_id: &str,
+    ) {
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
         assert!(rows.is_empty(), "parked call recorded audit rows: {rows:?}");
 
-        let events = session.db.list_session_events(session.id).unwrap();
+        let events = session.db.list_session_events(session.id).await.unwrap();
         let tool_result_events: Vec<_> = events
             .iter()
             .filter(|event| {
@@ -1805,6 +1832,7 @@ mod tests {
         let rows = session
             .db
             .list_tool_calls_for_session(session.id)
+            .await
             .expect("tool audit rows load");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "echo");
@@ -1861,6 +1889,7 @@ mod tests {
             session
                 .db
                 .list_tool_calls_for_session(session.id)
+                .await
                 .unwrap()
                 .is_empty(),
             "denied pre-approval call must not be audited as executed"
@@ -1904,7 +1933,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(last_tool_result_text(&history), "allowed");
-        let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "readonly_echo");
     }
@@ -1943,6 +1976,7 @@ mod tests {
             session
                 .db
                 .list_tool_calls_for_session(session.id)
+                .await
                 .unwrap()
                 .len(),
             1
@@ -2036,7 +2070,11 @@ mod tests {
             received.lock().unwrap().take().unwrap(),
             serde_json::json!({ "outer": { "required": "kept" } })
         );
-        let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1, "normalized call must reach real dispatch");
     }
 
@@ -2083,7 +2121,7 @@ mod tests {
 
         assert!(crate::engine::interrupt::is_parked(&err), "{err:#}");
         assert_eq!(history.len(), 1);
-        assert_parked_call_has_no_result(&session, &history, &call.id);
+        assert_parked_call_has_no_result(&session, &history, &call.id).await;
 
         let interrupt_id = parked_interrupt_id(&session);
         let response = crate::daemon::proto::ResolveResponse::Single {
@@ -2122,7 +2160,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(history.len(), 2);
-        let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].call_id, call.id);
     }
@@ -2173,7 +2215,7 @@ mod tests {
 
         assert!(crate::engine::interrupt::is_parked(&err), "{err:#}");
         assert_eq!(history.len(), 1);
-        assert_parked_call_has_no_result(&session, &history, &call.id);
+        assert_parked_call_has_no_result(&session, &history, &call.id).await;
 
         let interrupt_id = parked_interrupt_id(&session);
         let response = crate::daemon::proto::ResolveResponse::Freetext {
@@ -2206,7 +2248,11 @@ mod tests {
         .unwrap();
         assert_eq!(history.len(), 2);
         assert!(last_tool_result_text(&history).contains("continue"));
-        let rows = session.db.list_tool_calls_for_session(session.id).unwrap();
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].call_id, call.id);
     }
@@ -2300,6 +2346,7 @@ mod tests {
         let rows = session
             .db
             .list_tool_calls_for_session(session.id)
+            .await
             .expect("tool audit rows load");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "missing");
@@ -2307,6 +2354,7 @@ mod tests {
         let rejected = session
             .db
             .list_session_events(session.id)
+            .await
             .unwrap()
             .into_iter()
             .find(|event| event.kind == "tool_rejected")
@@ -2430,6 +2478,7 @@ mod tests {
         let row = session
             .db
             .list_tool_calls_for_session(session.id)
+            .await
             .unwrap()
             .pop()
             .unwrap();
@@ -2437,6 +2486,7 @@ mod tests {
         let event = session
             .db
             .list_session_events(session.id)
+            .await
             .unwrap()
             .into_iter()
             .find(|event| event.kind == "tool_call_completed")
@@ -2496,6 +2546,7 @@ mod tests {
         let event = session
             .db
             .list_session_events(session.id)
+            .await
             .unwrap()
             .into_iter()
             .find(|event| event.kind == "tool_call_completed")
@@ -2591,6 +2642,7 @@ mod tests {
         let row = session
             .db
             .list_tool_calls_for_session(session.id)
+            .await
             .unwrap()
             .pop()
             .unwrap();
@@ -2639,6 +2691,7 @@ mod tests {
         let row = session
             .db
             .list_tool_calls_for_session(session.id)
+            .await
             .unwrap()
             .pop()
             .unwrap();
@@ -2678,6 +2731,7 @@ mod tests {
         let row = session
             .db
             .list_tool_calls_for_session(session.id)
+            .await
             .unwrap()
             .pop()
             .unwrap();
@@ -2721,7 +2775,11 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = session.db.list_compressed_tool_results(session.id).unwrap();
+        let stored = session
+            .db
+            .list_compressed_tool_results(session.id)
+            .await
+            .unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].kind, "truncated");
         assert_eq!(stored[0].compressed_byte_len, None);
@@ -2816,7 +2874,11 @@ mod tests {
 
         let wire = last_tool_result_text(&history);
         assert!(wire.contains("[truncated partial tool result:"), "{wire}");
-        let stored = session.db.list_compressed_tool_results(session.id).unwrap();
+        let stored = session
+            .db
+            .list_compressed_tool_results(session.id)
+            .await
+            .unwrap();
         assert_eq!(stored[0].original_byte_len, 10_000);
         assert!(stored[0].original_byte_len > stored[0].content.len());
     }
@@ -2862,8 +2924,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recheck_modified_output_does_not_store_unrechecked_body() {
+    #[tokio::test]
+    async fn recheck_modified_output_does_not_store_unrechecked_body() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Session::create(db, std::path::PathBuf::from("/x"), "Build").unwrap();
         let mut delivered = "[tool result withheld]".to_string();
@@ -2882,6 +2944,7 @@ mod tests {
             Some(&retained),
             true,
         )
+        .await
         .unwrap();
 
         assert!(stored.is_none());
@@ -2890,6 +2953,7 @@ mod tests {
             session
                 .db
                 .list_compressed_tool_results(session.id)
+                .await
                 .unwrap()
                 .is_empty()
         );

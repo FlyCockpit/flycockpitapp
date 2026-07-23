@@ -158,6 +158,7 @@ async fn auto_prune_skips_zero_savings_plan_without_pruned_event() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     assert!(
         events.iter().all(|ev| ev.kind != "context_pruned"),
@@ -202,6 +203,7 @@ async fn auto_prune_skips_trivial_cache_cold_plan_with_diagnostic() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     assert!(
         events.iter().all(|ev| ev.kind != "context_pruned"),
@@ -261,6 +263,7 @@ async fn auto_prune_material_cache_cold_plan_records_trigger_reason() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     let pruned = events
         .iter()
@@ -316,8 +319,8 @@ async fn auto_prune_noop_when_nothing_prunable() {
 /// request's prompt size against the model's context window, inert when
 /// the window is unknown or no usage has been reported
 /// (implementation note).
-#[test]
-fn context_metrics_compute_and_inert_cases() {
+#[tokio::test]
+async fn context_metrics_compute_and_inert_cases() {
     // 60k of a 100k window → 60% ctx; 30k prunable → 30% prunable.
     let m = context_metrics(Some(100_000), Some(60_000), 30_000).unwrap();
     assert!((m.ctx_pct - 60.0).abs() < 1e-9);
@@ -346,8 +349,8 @@ fn context_metrics_compute_and_inert_cases() {
     assert!(mid.ctx_pct < 60.0);
 }
 
-#[test]
-fn active_context_length_uses_probed_capability() {
+#[tokio::test]
+async fn active_context_length_uses_probed_capability() {
     use crate::config::providers::{
         ActiveModelRef, CapabilitySource, ModelCapabilities, ModelEntry, ProviderEntry,
         ProvidersConfig, WireApi,
@@ -402,7 +405,7 @@ async fn shadow_brief_predrafts() {
         ContextConfig::default(),
         10_000,
     );
-    record_test_context_tokens(&driver, 5_500);
+    record_test_context_tokens(&driver, 5_500).await;
 
     assert!(driver.maybe_shadow_brief(&tx).await);
     assert!(matches!(
@@ -411,7 +414,7 @@ async fn shadow_brief_predrafts() {
     ));
     wait_for_shadow_brief(&mut driver).await;
     assert_eq!(
-        compact_inference_purposes(&driver),
+        compact_inference_purposes(&driver).await,
         ["compact_shadow_brief"]
     );
     assert!(
@@ -437,7 +440,7 @@ async fn compact_uses_shadow_delta() {
         ContextConfig::default(),
         10_000,
     );
-    record_test_context_tokens(&driver, 5_500);
+    record_test_context_tokens(&driver, 5_500).await;
     assert!(driver.maybe_shadow_brief(&tx).await);
     wait_for_shadow_brief(&mut driver).await;
     append_complete_test_turns(&mut driver, 1);
@@ -445,7 +448,7 @@ async fn compact_uses_shadow_delta() {
     driver.do_compact(&tx).await;
     drop(tx);
     while rx.recv().await.is_some() {}
-    let purposes = compact_inference_purposes(&driver);
+    let purposes = compact_inference_purposes(&driver).await;
     assert_eq!(
         purposes
             .iter()
@@ -493,7 +496,7 @@ async fn ready_brief_survives_driver_drop() {
         ContextConfig::default(),
         10_000,
     );
-    record_test_context_tokens(&driver, 5_500);
+    record_test_context_tokens(&driver, 5_500).await;
     assert!(driver.maybe_shadow_brief(&tx).await);
     wait_for_shadow_brief(&mut driver).await;
 
@@ -517,7 +520,7 @@ async fn ready_brief_survives_driver_drop() {
     drop(tx);
     while rx.recv().await.is_some() {}
 
-    let purposes = compact_inference_purposes(&restored);
+    let purposes = compact_inference_purposes(&restored).await;
     assert_eq!(
         purposes
             .iter()
@@ -549,7 +552,7 @@ async fn consumed_brief_is_deleted() {
         ContextConfig::default(),
         10_000,
     );
-    record_test_context_tokens(&driver, 5_500);
+    record_test_context_tokens(&driver, 5_500).await;
     assert!(driver.maybe_shadow_brief(&tx).await);
     wait_for_shadow_brief(&mut driver).await;
     assert!(
@@ -577,8 +580,8 @@ async fn consumed_brief_is_deleted() {
     );
 }
 
-#[test]
-fn load_without_row_clears_memory_view() {
+#[tokio::test]
+async fn load_without_row_clears_memory_view() {
     let (mut driver, _tmp) = test_driver_without_network(8);
     driver.shadow_brief_generation = 2;
     driver.shadow_brief = Some(ShadowBriefState::Ready(ShadowBriefReady {
@@ -597,8 +600,8 @@ fn load_without_row_clears_memory_view() {
     );
 }
 
-#[test]
-fn loaded_brief_generation_is_persisted_and_compared() {
+#[tokio::test]
+async fn loaded_brief_generation_is_persisted_and_compared() {
     let (driver, _tmp) = test_driver_without_network(8);
     let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief {
         generation: 7,
@@ -654,8 +657,8 @@ fn loaded_brief_generation_is_persisted_and_compared() {
     );
 }
 
-#[test]
-fn stale_loaded_brief_is_discarded() {
+#[tokio::test]
+async fn stale_loaded_brief_is_discarded() {
     let (mut driver, _tmp) = test_driver_without_network(8);
     let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief {
         generation: 3,
@@ -709,7 +712,7 @@ async fn killswitch_writes_no_rows() {
         ..ContextConfig::default()
     };
     install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
-    record_test_context_tokens(&driver, 5_500);
+    record_test_context_tokens(&driver, 5_500).await;
 
     assert!(!driver.maybe_shadow_brief(&tx).await);
 
@@ -755,7 +758,7 @@ async fn ephemeral_session_writes_no_rows() {
         ContextConfig::default(),
         10_000,
     );
-    record_test_context_tokens(&driver, 5_500);
+    record_test_context_tokens(&driver, 5_500).await;
 
     assert!(driver.maybe_shadow_brief(&tx).await);
     wait_for_shadow_brief(&mut driver).await;
@@ -773,7 +776,7 @@ async fn ephemeral_session_writes_no_rows() {
 
 #[tokio::test]
 async fn durable_shadow_payload_round_trips_with_prepared_compaction() {
-    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
     let prepared = driver
         .prepare_compaction_with_source(&tx, "manual")
@@ -786,8 +789,8 @@ async fn durable_shadow_payload_round_trips_with_prepared_compaction() {
     assert_eq!(decoded, payload);
 }
 
-#[test]
-fn staleness_rule_has_one_implementation() {
+#[tokio::test]
+async fn staleness_rule_has_one_implementation() {
     assert_eq!(shadow_stale_after_turns(0), 8);
     assert_eq!(shadow_stale_after_turns(3), 8);
     assert_eq!(shadow_stale_after_turns(8), 12);
@@ -815,7 +818,7 @@ async fn manual_compact_cancels_shadow() {
     assert!(observed_cancel.is_cancelled());
     drop(tx);
     while rx.recv().await.is_some() {}
-    assert_eq!(compact_inference_purposes(&driver), ["compact_brief"]);
+    assert_eq!(compact_inference_purposes(&driver).await, ["compact_brief"]);
 
     let (mut ending_driver, _tmp2) = test_driver_without_network(8);
     let ending_cancel = tokio_util::sync::CancellationToken::new();
@@ -889,7 +892,7 @@ async fn shadow_gated_on_prune_effectiveness() {
     let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
-    record_test_context_tokens(&driver, 50);
+    record_test_context_tokens(&driver, 50).await;
     assert!(
         !driver.maybe_shadow_brief(&tx).await,
         "effective pruning gates early band"
@@ -920,15 +923,15 @@ async fn shadow_killswitch_restores_sync() {
         ..ContextConfig::default()
     };
     install_test_providers(&mut driver, CacheMode::None, cfg, 100);
-    record_test_context_tokens(&driver, 55);
+    record_test_context_tokens(&driver, 55).await;
     assert!(!driver.maybe_shadow_brief(&tx).await);
     driver.do_compact(&tx).await;
     drop(tx);
     while rx.recv().await.is_some() {}
-    assert_eq!(compact_inference_purposes(&driver), ["compact_brief"]);
+    assert_eq!(compact_inference_purposes(&driver).await, ["compact_brief"]);
 }
 
-fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
+async fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
     use crate::engine::message::{AssistantContent, OneOrMany};
     use rig::message::{ToolCall, ToolFunction};
 
@@ -984,6 +987,7 @@ fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
 
     let original = (0..700)
@@ -1045,11 +1049,12 @@ fn compact_ready_without_session_id(event: &TurnEvent) -> serde_json::Value {
     }
 }
 
-fn compact_record_without_session_ids(driver: &Driver) -> serde_json::Value {
+async fn compact_record_without_session_ids(driver: &Driver) -> serde_json::Value {
     let events = driver
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     let mut data = events
         .iter()
@@ -1077,13 +1082,14 @@ fn test_json_hash(value: &serde_json::Value) -> String {
 
 #[tokio::test]
 async fn prepare_commits_nothing() {
-    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
     let before_history = serde_json::to_value(&driver.stack[0].history).unwrap();
     let events_before = driver
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
 
     let prepared = driver
@@ -1102,6 +1108,7 @@ async fn prepare_commits_nothing() {
             .session
             .db
             .list_compressed_tool_results(driver.session.id)
+            .await
             .unwrap()
             .is_empty(),
         "prepare must not persist compressed results"
@@ -1119,6 +1126,7 @@ async fn prepare_commits_nothing() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     assert_eq!(
         events_before
@@ -1136,7 +1144,7 @@ async fn prepare_commits_nothing() {
 
 #[tokio::test]
 async fn prepared_compaction_round_trips_serde() {
-    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
 
     let prepared = driver
@@ -1151,27 +1159,27 @@ async fn prepared_compaction_round_trips_serde() {
 
 #[tokio::test]
 async fn apply_runs_no_inference() {
-    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let prepared = driver
         .prepare_compaction_with_source(&tx, "manual")
         .await
         .expect("prepare succeeds");
-    let before = compact_inference_purposes(&driver);
+    let before = compact_inference_purposes(&driver).await;
 
     driver
         .apply_prepared_compaction(prepared, &tx)
         .await
         .expect("apply succeeds");
 
-    assert_eq!(compact_inference_purposes(&driver), before);
+    assert_eq!(compact_inference_purposes(&driver).await, before);
     drop(tx);
     while rx.recv().await.is_some() {}
 }
 
 #[tokio::test]
 async fn apply_rejects_stale_prepared_compaction() {
-    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(16);
     let prepared = driver
         .prepare_compaction_with_source(&tx, "manual")
@@ -1195,6 +1203,7 @@ async fn apply_rejects_stale_prepared_compaction() {
             .session
             .db
             .list_compressed_tool_results(driver.session.id)
+            .await
             .unwrap()
             .is_empty()
     );
@@ -1203,6 +1212,7 @@ async fn apply_rejects_stale_prepared_compaction() {
             .session
             .db
             .list_session_events(driver.session.id)
+            .await
             .unwrap()
             .iter()
             .all(|event| event.kind != "session_compacted")
@@ -1212,8 +1222,8 @@ async fn apply_rejects_stale_prepared_compaction() {
 
 #[tokio::test]
 async fn apply_of_prepared_matches_synchronous_path() {
-    let (mut split_driver, _tmp_a) = prepare_apply_fixture();
-    let (mut sync_driver, _tmp_b) = prepare_apply_fixture();
+    let (mut split_driver, _tmp_a) = prepare_apply_fixture().await;
+    let (mut sync_driver, _tmp_b) = prepare_apply_fixture().await;
     let (split_tx, mut split_rx) = mpsc::channel::<TurnEvent>(64);
     let (sync_tx, mut sync_rx) = mpsc::channel::<TurnEvent>(64);
 
@@ -1255,8 +1265,8 @@ async fn apply_of_prepared_matches_synchronous_path() {
         compact_ready_without_session_id(sync_ready)
     );
     assert_eq!(
-        compact_record_without_session_ids(&split_driver),
-        compact_record_without_session_ids(&sync_driver)
+        compact_record_without_session_ids(&split_driver).await,
+        compact_record_without_session_ids(&sync_driver).await
     );
     assert_eq!(
         split_driver
@@ -1274,7 +1284,7 @@ async fn apply_of_prepared_matches_synchronous_path() {
 
 #[tokio::test]
 async fn compact_end_to_end_unchanged() {
-    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
 
     driver.do_compact_with_source(&tx, "manual").await;
@@ -1291,7 +1301,7 @@ async fn compact_end_to_end_unchanged() {
     let snapshot = serde_json::json!({
         "history_hash": test_json_hash(&serde_json::to_value(&driver.stack[0].history).unwrap()),
         "compact_ready": compact_ready_without_session_id(ready),
-        "session_compacted_hash": test_json_hash(&compact_record_without_session_ids(&driver)),
+        "session_compacted_hash": test_json_hash(&compact_record_without_session_ids(&driver).await),
         "seed_tools": driver.session.db.take_seed_tools(driver.session.id).unwrap(),
     });
     assert_eq!(
@@ -1338,6 +1348,7 @@ async fn compact_end_to_end_unchanged() {
             .session
             .db
             .list_session_events(driver.session.id)
+            .await
             .unwrap()
             .iter()
             .filter(|event| event.kind == "session_compacted")
@@ -1348,7 +1359,7 @@ async fn compact_end_to_end_unchanged() {
 
 #[tokio::test]
 async fn apply_ordering_persists_then_runs_seeds_then_emits_ready() {
-    let (mut driver, _tmp) = prepare_apply_fixture();
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let apply_trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     driver.test_compaction_apply_trace = Some(apply_trace.clone());
@@ -1389,6 +1400,7 @@ async fn apply_ordering_persists_then_runs_seeds_then_emits_ready() {
         .session
         .db
         .list_compressed_tool_results(driver.session.id)
+        .await
         .unwrap();
     assert_eq!(stored.len(), 1);
     let persisted_seeds = driver
@@ -1401,6 +1413,7 @@ async fn apply_ordering_persists_then_runs_seeds_then_emits_ready() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     assert!(
         db_events
@@ -1449,6 +1462,7 @@ async fn rollback_paths_are_gone_because_prepare_is_pure() {
             .session
             .db
             .list_compressed_tool_results(driver.session.id)
+            .await
             .unwrap()
             .is_empty()
     );
@@ -1457,6 +1471,7 @@ async fn rollback_paths_are_gone_because_prepare_is_pure() {
             .session
             .db
             .list_session_events(driver.session.id)
+            .await
             .unwrap()
             .iter()
             .all(|event| event.kind != "session_compacted")
@@ -1501,6 +1516,7 @@ async fn auto_prune_threshold_branch_prunes_warm_cache_with_cache_break() {
                 cache_creation_input_tokens: 0,
             },
         )
+        .await
         .unwrap();
 
     assert!(
@@ -1575,6 +1591,7 @@ async fn auto_compact_fires_at_threshold_once() {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
 
     // 50% < 60 → no compact.
@@ -1589,6 +1606,7 @@ async fn auto_compact_fires_at_threshold_once() {
                 cache_creation_input_tokens: 0,
             },
         )
+        .await
         .unwrap();
     assert!(
         !driver.maybe_auto_compact(&tx).await,
@@ -1607,6 +1625,7 @@ async fn auto_compact_fires_at_threshold_once() {
                 cache_creation_input_tokens: 0,
             },
         )
+        .await
         .unwrap();
     assert!(driver.maybe_auto_compact(&tx).await, "at/over 60% compacts");
     // One-shot: a second call no-ops even while still hot.
@@ -1639,8 +1658,8 @@ async fn auto_compact_fires_at_threshold_once() {
     );
 }
 
-#[test]
-fn effective_auto_compact_pct_mode_defaults_when_unset() {
+#[tokio::test]
+async fn effective_auto_compact_pct_mode_defaults_when_unset() {
     use crate::config::extended::LlmMode;
     use crate::config::providers::ContextConfig;
     let (driver, _tmp) = test_driver_without_network(8);
@@ -1660,8 +1679,8 @@ fn effective_auto_compact_pct_mode_defaults_when_unset() {
     );
 }
 
-#[test]
-fn effective_auto_compact_pct_stays_60_without_mcp() {
+#[tokio::test]
+async fn effective_auto_compact_pct_stays_60_without_mcp() {
     use crate::config::extended::LlmMode;
     use crate::config::providers::ContextConfig;
     let (driver, _tmp) = test_driver_without_network(8);
@@ -1672,8 +1691,8 @@ fn effective_auto_compact_pct_stays_60_without_mcp() {
     }
 }
 
-#[test]
-fn effective_auto_compact_pct_explicit_override_wins() {
+#[tokio::test]
+async fn effective_auto_compact_pct_explicit_override_wins() {
     use crate::config::extended::LlmMode;
     use crate::config::providers::ContextConfig;
     let (driver, _tmp) = test_driver_without_network(8);
@@ -1706,12 +1725,12 @@ async fn auto_compact_fires_at_mode_resolved_line() {
     capable.stack[0].agent = Arc::new(agent);
     capable.session.set_active_tool_names(["mcp"], false);
 
-    record_test_context_tokens(&capable, 70_000);
+    record_test_context_tokens(&capable, 70_000).await;
     assert!(
         !capable.maybe_auto_compact(&tx).await,
         "normal+mcp stays below the resolved 80% line at 70%"
     );
-    record_test_context_tokens(&capable, 82_000);
+    record_test_context_tokens(&capable, 82_000).await;
     assert!(
         capable.maybe_auto_compact(&tx).await,
         "normal+mcp compacts at the resolved 80% line"
@@ -1731,7 +1750,7 @@ async fn auto_compact_fires_at_mode_resolved_line() {
     agent.llm_mode = LlmMode::Normal;
     no_mcp.stack[0].agent = Arc::new(agent);
     no_mcp.session.set_active_tool_names([], false);
-    record_test_context_tokens(&no_mcp, 65_000);
+    record_test_context_tokens(&no_mcp, 65_000).await;
     assert!(
         no_mcp.maybe_auto_compact(&tx).await,
         "normal without mcp keeps the 60% forced line"
@@ -1757,7 +1776,7 @@ async fn auto_compact_defers_equal_line_until_compact_nudge_fires() {
     agent.llm_mode = LlmMode::Defensive;
     driver.stack[0].agent = Arc::new(agent);
     driver.session.set_active_tool_names(["mcp"], false);
-    record_test_context_tokens(&driver, 65_000);
+    record_test_context_tokens(&driver, 65_000).await;
 
     assert!(
         !driver.maybe_auto_compact(&tx).await,
@@ -1778,8 +1797,8 @@ async fn auto_compact_defers_equal_line_until_compact_nudge_fires() {
     while rx.recv().await.is_some() {}
 }
 
-#[test]
-fn context_usage_reports_nudge_and_resolved_forced_pct() {
+#[tokio::test]
+async fn context_usage_reports_nudge_and_resolved_forced_pct() {
     use crate::config::extended::LlmMode;
     use crate::config::providers::{CacheMode, ContextConfig};
 
@@ -1794,7 +1813,7 @@ fn context_usage_reports_nudge_and_resolved_forced_pct() {
     agent.llm_mode = LlmMode::Normal;
     driver.stack[0].agent = Arc::new(agent);
     driver.session.set_active_tool_names(["mcp"], false);
-    record_test_context_tokens(&driver, 62_000);
+    record_test_context_tokens(&driver, 62_000).await;
 
     let snapshot = driver.context_usage_snapshot();
 
@@ -1833,6 +1852,7 @@ async fn oversized_compact_handoff_leaves_history_unchanged() {
             .session
             .db
             .list_session_events(driver.session.id)
+            .await
             .unwrap()
             .iter()
             .all(|event| event.kind != "session_compacted"),
@@ -1942,13 +1962,14 @@ async fn compact_private_prune_preserves_shell_condensation() {
         .session
         .db
         .list_compressed_tool_results(driver.session.id)
+        .await
         .unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].content, original);
 }
 
-#[test]
-fn compact_tail_prompt_uses_durable_session_event_seqs() {
+#[tokio::test]
+async fn compact_tail_prompt_uses_durable_session_event_seqs() {
     let (mut driver, _tmp) = test_driver_without_network(8);
     let agent = driver.active_agent().to_string();
     let mut recorded = Vec::new();
@@ -1963,6 +1984,7 @@ fn compact_tail_prompt_uses_durable_session_event_seqs() {
                     None,
                     &serde_json::json!({"text": format!("user {index}")}),
                 )
+                .await
                 .unwrap(),
         );
         if index == 1 {
@@ -1979,6 +2001,7 @@ fn compact_tail_prompt_uses_durable_session_event_seqs() {
                             "output": "injected body",
                         }),
                     )
+                    .await
                     .unwrap(),
             );
             driver.skill_pairs.push(SkillPair {
@@ -1996,14 +2019,16 @@ fn compact_tail_prompt_uses_durable_session_event_seqs() {
                     None,
                     &serde_json::json!({"text": format!("assistant {index}")}),
                 )
+                .await
                 .unwrap(),
         );
     }
 
-    assert_eq!(driver.compact_tail_message_seqs(1), recorded[2..]);
+    assert_eq!(driver.compact_tail_message_seqs(1).await, recorded[2..]);
     assert!(
         !driver
             .compact_tail_message_seqs(1)
+            .await
             .contains(&excluded_skill_seq.unwrap())
     );
 }
@@ -2036,6 +2061,7 @@ async fn request_compact_honored_at_safe_boundary() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     let compact_events: Vec<_> = events
         .iter()
@@ -2060,6 +2086,7 @@ async fn request_compact_coalesces() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     let compact_count = events
         .iter()
@@ -2172,6 +2199,7 @@ async fn ineffective_prunes_escalate_to_compaction_below_compact_line() {
                 cache_creation_input_tokens: 0,
             },
         )
+        .await
         .unwrap();
     // No ineffective history yet → below the line, no compact.
     assert!(
@@ -2280,6 +2308,7 @@ async fn no_context_length_makes_ctx_gated_paths_inert() {
                 cache_creation_input_tokens: 0,
             },
         )
+        .await
         .unwrap();
     assert!(
         !driver.maybe_auto_compact(&tx).await,

@@ -42,8 +42,10 @@ pub(crate) fn phase_07_history_push() {}
 pub(crate) fn phase_08_text_embedded_tool_call_recovery() {}
 pub(crate) fn phase_09_terminal_text_emit() {}
 
-fn record_task_unknown_agent_rejection(session: &Arc<Session>, agent: &Agent, tc: &ToolCall) {
-    if let Err(e) = session.record_tool_rejected(&agent.name, &tc.id, "task", "task_unknown_agent")
+async fn record_task_unknown_agent_rejection(session: &Arc<Session>, agent: &Agent, tc: &ToolCall) {
+    if let Err(e) = session
+        .record_tool_rejected(&agent.name, &tc.id, "task", "task_unknown_agent")
+        .await
     {
         tracing::warn!(error = %e, tool = "task", "record tool_rejected event failed");
     }
@@ -91,12 +93,10 @@ pub(crate) async fn phase_10_dispatch_one_call(
         ) {
             Ok(parsed) => parsed,
             Err(err) => {
-                if let Err(e) = session.record_tool_rejected(
-                    &agent.name,
-                    &tc.id,
-                    "task",
-                    "task_intent_parse_failed",
-                ) {
+                if let Err(e) = session
+                    .record_tool_rejected(&agent.name, &tc.id, "task", "task_intent_parse_failed")
+                    .await
+                {
                     tracing::warn!(error = %e, tool = "task", "record tool_rejected event failed");
                 }
                 return_structural!(task_refusal(
@@ -243,7 +243,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             &session.db,
                         )
                     {
-                        record_task_unknown_agent_rejection(session, agent, tc);
+                        record_task_unknown_agent_rejection(session, agent, tc).await;
                         return_structural!(task_refusal(
                             &tc.id,
                             tc.call_id.clone(),
@@ -361,7 +361,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         &session.db,
                     )
                 {
-                    record_task_unknown_agent_rejection(session, agent, tc);
+                    record_task_unknown_agent_rejection(session, agent, tc).await;
                     return_structural!(task_refusal(&tc.id, tc.call_id.clone(), message));
                 }
                 let mode = args.get("mode").and_then(Value::as_str);
@@ -423,33 +423,36 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             tc.call_id.as_deref(),
                         );
                     let routing = agent.model.routing_metadata_json(None);
-                    if let Err(e) = session.record_event(
-                        crate::db::session_log::SessionEventKind::SubagentSpawned,
-                        Some(&agent.name),
-                        Some(&tc.id),
-                        &serde_json::json!({
-                            "child_agent": child,
-                            "task_call_id": tc.id,
-                            "provider_call_id": task_identity.provider_call_id,
-                            "provider_call_id_source": task_identity.provider_call_id_source,
-                            "provider_identity": task_identity.event_identity_json(&tc.id),
-                            "label": "default",
-                            "noninteractive": false,
-                            "prompt": prompt,
-                            "mode": mode,
-                            "model": model.as_ref().map(|selector| selector.to_json()),
-                            "trusted_only": agent.model.trusted_only_enabled(),
-                            "model_trusted": agent.model.is_trusted(),
-                            "routing": routing.clone(),
-                            "remaining_depth": remaining_depth,
-                            "why": why,
-                            "resume_handle": resume_handle.clone(),
-                            "grant_tools": granted_tools.clone(),
-                            "seed": seeds.clone(),
-                            "skill_seed": skill_seed.clone(),
-                            "todo_ids": todo_ids.clone(),
-                        }),
-                    ) {
+                    if let Err(e) = session
+                        .record_event(
+                            crate::db::session_log::SessionEventKind::SubagentSpawned,
+                            Some(&agent.name),
+                            Some(&tc.id),
+                            &serde_json::json!({
+                                "child_agent": child,
+                                "task_call_id": tc.id,
+                                "provider_call_id": task_identity.provider_call_id,
+                                "provider_call_id_source": task_identity.provider_call_id_source,
+                                "provider_identity": task_identity.event_identity_json(&tc.id),
+                                "label": "default",
+                                "noninteractive": false,
+                                "prompt": prompt,
+                                "mode": mode,
+                                "model": model.as_ref().map(|selector| selector.to_json()),
+                                "trusted_only": agent.model.trusted_only_enabled(),
+                                "model_trusted": agent.model.is_trusted(),
+                                "routing": routing.clone(),
+                                "remaining_depth": remaining_depth,
+                                "why": why,
+                                "resume_handle": resume_handle.clone(),
+                                "grant_tools": granted_tools.clone(),
+                                "seed": seeds.clone(),
+                                "skill_seed": skill_seed.clone(),
+                                "todo_ids": todo_ids.clone(),
+                            }),
+                        )
+                        .await
+                    {
                         tracing::warn!(error = %e, "record subagent_spawned event failed");
                     }
                     let _ = tx
@@ -945,15 +948,18 @@ pub(crate) async fn run_turn(
             "cache_creation_input_tokens": u.cache_creation_input_tokens,
         })
     });
-    if let Err(e) = session.record_event(
-        crate::db::session_log::SessionEventKind::InferenceRequest,
-        Some(&agent.name),
-        Some(&call_id.to_string()),
-        &serde_json::json!({
-            "usage": usage_json,
-            "routing": model.routing_metadata_json(None),
-        }),
-    ) {
+    if let Err(e) = session
+        .record_event(
+            crate::db::session_log::SessionEventKind::InferenceRequest,
+            Some(&agent.name),
+            Some(&call_id.to_string()),
+            &serde_json::json!({
+                "usage": usage_json,
+                "routing": model.routing_metadata_json(None),
+            }),
+        )
+        .await
+    {
         tracing::warn!(error = %e, "record inference_request event (completed) failed");
     }
 
@@ -1311,12 +1317,15 @@ pub(crate) async fn run_turn(
                 event_data["original_text"] = serde_json::json!(original);
             }
         }
-        let seq = match session.record_event(
-            crate::db::session_log::SessionEventKind::AssistantMessage,
-            Some(&agent.name),
-            Some(&call_id.to_string()),
-            &event_data,
-        ) {
+        let seq = match session
+            .record_event(
+                crate::db::session_log::SessionEventKind::AssistantMessage,
+                Some(&agent.name),
+                Some(&call_id.to_string()),
+                &event_data,
+            )
+            .await
+        {
             Ok(seq) => Some(seq),
             Err(e) => {
                 tracing::warn!(error = %e, "record assistant_message event failed");

@@ -132,7 +132,7 @@ pub(super) async fn safety_gate_decision_with_configs(
         }
         ApprovalMode::Auto => {}
     }
-    if let Some(block) = standing_reject_gate_block(tool, args, ctx) {
+    if let Some(block) = standing_reject_gate_block(tool, args, ctx).await {
         return GateOutcome::Block(block);
     }
     if let Some(payload) = crate::engine::interrupt::current_interrupt_park_payload()
@@ -257,13 +257,15 @@ async fn evaluate_for_gate(
     .await
 }
 
-fn standing_reject_gate_block(tool: &str, args: &Value, ctx: &ToolCtx) -> Option<GateBlock> {
+async fn standing_reject_gate_block(tool: &str, args: &Value, ctx: &ToolCtx) -> Option<GateBlock> {
     let approver = ctx.approver.as_ref()?;
     match tool {
         "bash" => {
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
             let scope = approver.command_standing_reject_scope(command)?;
-            approver.record_standing_reject_decision("bash", command, scope);
+            approver
+                .record_standing_reject_decision("bash", command, scope)
+                .await;
             Some(standing_reject_block("bash", scope))
         }
         "mcp" => {
@@ -275,7 +277,9 @@ fn standing_reject_gate_block(tool: &str, args: &Value, ctx: &ToolCtx) -> Option
                 {
                     let target =
                         crate::approval::store::mcp_tool_key(&invocation.server, &invocation.tool);
-                    approver.record_standing_reject_decision("mcp_tool", &target, scope);
+                    approver
+                        .record_standing_reject_decision("mcp_tool", &target, scope)
+                        .await;
                     return Some(standing_reject_block("mcp", scope));
                 }
             }

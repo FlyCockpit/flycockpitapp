@@ -7,8 +7,7 @@ use crate::engine::tool::Tool;
 use crate::session::{Session, ToolCallProviderIdentity, ToolCallRow};
 use std::io::Read;
 
-#[allow(deprecated)]
-fn create_test_session(
+async fn create_test_session(
     db: &crate::db::Db,
     project_id: &str,
     project_root: &str,
@@ -17,7 +16,7 @@ fn create_test_session(
     let project_id = project_id.to_string();
     let project_root = project_root.to_string();
     let active_agent = active_agent.to_string();
-    db.write_blocking(move |conn| {
+    db.write(move |conn| {
         let row = crate::db::Db::build_new_session_row_conn(
             conn,
             &project_id,
@@ -26,12 +25,12 @@ fn create_test_session(
         )?;
         crate::db::Db::insert_session_row_conn(conn, &row)
     })
+    .await
     .unwrap()
 }
 
-#[allow(deprecated)]
-fn create_test_fork(db: &crate::db::Db, parent_session_id: Uuid) -> SessionRow {
-    db.write_blocking(move |conn| {
+async fn create_test_fork(db: &crate::db::Db, parent_session_id: Uuid) -> SessionRow {
+    db.write(move |conn| {
         crate::db::Db::create_fork_conn(
             conn,
             parent_session_id,
@@ -41,12 +40,13 @@ fn create_test_fork(db: &crate::db::Db, parent_session_id: Uuid) -> SessionRow {
             chrono::Utc::now().timestamp(),
         )
     })
+    .await
     .unwrap()
 }
 
-#[allow(deprecated)]
-fn get_test_session(db: &crate::db::Db, session_id: Uuid) -> SessionRow {
-    db.write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+async fn get_test_session(db: &crate::db::Db, session_id: Uuid) -> SessionRow {
+    db.read(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+        .await
         .unwrap()
         .unwrap()
 }
@@ -67,8 +67,8 @@ fn entry_names(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn export_redaction_helper_scrubs_by_default_and_preserves_with_opt_in() {
+#[tokio::test]
+async fn export_redaction_helper_scrubs_by_default_and_preserves_with_opt_in() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = crate::config::extended::RedactConfig {
         denylist: vec!["exact-secret-value".to_string()],
@@ -92,7 +92,7 @@ fn export_redaction_helper_scrubs_by_default_and_preserves_with_opt_in() {
     assert!(sensitive.to_string().contains("exact-secret-value"));
 }
 
-fn responses_session_with_intro() -> Session {
+async fn responses_session_with_intro() -> Session {
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db, PathBuf::from("/proj"), "Build").unwrap();
     session.set_active_model("codex-oauth", "gpt-5.4").unwrap();
@@ -103,6 +103,7 @@ fn responses_session_with_intro() -> Session {
             None,
             &json!({ "text": "investigate" }),
         )
+        .await
         .unwrap();
     session
         .record_event(
@@ -111,6 +112,7 @@ fn responses_session_with_intro() -> Session {
             Some("infer-1"),
             &json!({ "text": "delegating" }),
         )
+        .await
         .unwrap();
     session
 }
@@ -120,12 +122,8 @@ fn transcript_session() -> Session {
     Session::create(db, PathBuf::from("/proj"), "Build").unwrap()
 }
 
-#[expect(
-    deprecated,
-    reason = "export transcript tests pin deterministic session_events timestamps"
-)]
-fn set_event_ts(db: &Db, seq: i64, ts_ms: i64) {
-    db.write_blocking(move |conn| {
+async fn set_event_ts(db: &Db, seq: i64, ts_ms: i64) {
+    db.write(move |conn| {
         conn.execute(
             "UPDATE session_events SET ts_ms = ?1 WHERE seq = ?2",
             [ts_ms, seq],
@@ -133,6 +131,7 @@ fn set_event_ts(db: &Db, seq: i64, ts_ms: i64) {
         .context("setting deterministic event timestamp")?;
         Ok(())
     })
+    .await
     .unwrap();
 }
 
@@ -143,7 +142,7 @@ fn ts(ms: i64) -> String {
         .to_rfc3339()
 }
 
-fn record_transcript_event(
+async fn record_transcript_event(
     session: &Session,
     kind: SessionEventKind,
     agent: Option<&str>,
@@ -151,8 +150,11 @@ fn record_transcript_event(
     data: Value,
     ts_ms: i64,
 ) {
-    let seq = session.record_event(kind, agent, call_id, &data).unwrap();
-    set_event_ts(&session.db, seq, ts_ms);
+    let seq = session
+        .record_event(kind, agent, call_id, &data)
+        .await
+        .unwrap();
+    set_event_ts(&session.db, seq, ts_ms).await;
 }
 
 struct TranscriptTool<'a> {
@@ -165,7 +167,7 @@ struct TranscriptTool<'a> {
     ts_ms: i64,
 }
 
-fn record_transcript_tool(session: &Session, row: TranscriptTool<'_>) {
+async fn record_transcript_tool(session: &Session, row: TranscriptTool<'_>) {
     session
         .record_tool_call(ToolCallRow {
             event_id: Uuid::new_v4(),
@@ -193,6 +195,7 @@ fn record_transcript_tool(session: &Session, row: TranscriptTool<'_>) {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
     record_transcript_event(
         session,
@@ -206,11 +209,12 @@ fn record_transcript_tool(session: &Session, row: TranscriptTool<'_>) {
             "output": row.output,
         }),
         row.ts_ms,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn transcript_json_is_ordered_user_facing_turns() {
+#[tokio::test]
+async fn transcript_json_is_ordered_user_facing_turns() {
     let session = transcript_session();
     record_transcript_event(
         &session,
@@ -219,7 +223,8 @@ fn transcript_json_is_ordered_user_facing_turns() {
         None,
         json!({ "text": "do a thing" }),
         1_000,
-    );
+    )
+    .await;
     record_transcript_event(
         &session,
         SessionEventKind::AssistantMessage,
@@ -227,7 +232,8 @@ fn transcript_json_is_ordered_user_facing_turns() {
         Some("infer-1"),
         json!({ "text": "on it", "reasoning": "thinking" }),
         2_000,
-    );
+    )
+    .await;
     record_transcript_tool(
         &session,
         TranscriptTool {
@@ -239,9 +245,12 @@ fn transcript_json_is_ordered_user_facing_turns() {
             hard_fail: false,
             ts_ms: 3_000,
         },
-    );
+    )
+    .await;
 
-    let exported = transcript_json(&session.db, session.id, "Build").unwrap();
+    let exported = transcript_json(&session.db, session.id, "Build")
+        .await
+        .unwrap();
 
     assert_eq!(
         exported,
@@ -279,8 +288,8 @@ fn transcript_json_is_ordered_user_facing_turns() {
     );
 }
 
-#[test]
-fn transcript_json_includes_user_note_in_order() {
+#[tokio::test]
+async fn transcript_json_includes_user_note_in_order() {
     let session = transcript_session();
     record_transcript_event(
         &session,
@@ -289,7 +298,8 @@ fn transcript_json_includes_user_note_in_order() {
         None,
         json!({ "text": "go" }),
         1_000,
-    );
+    )
+    .await;
     record_transcript_event(
         &session,
         SessionEventKind::UserNote,
@@ -297,7 +307,8 @@ fn transcript_json_includes_user_note_in_order() {
         None,
         json!({ "text": "remember the retry change broke it" }),
         1_500,
-    );
+    )
+    .await;
     record_transcript_event(
         &session,
         SessionEventKind::AssistantMessage,
@@ -305,10 +316,13 @@ fn transcript_json_includes_user_note_in_order() {
         Some("infer-1"),
         json!({ "text": "ok" }),
         2_000,
-    );
+    )
+    .await;
 
     assert_eq!(
-        transcript_json(&session.db, session.id, "Build").unwrap(),
+        transcript_json(&session.db, session.id, "Build")
+            .await
+            .unwrap(),
         json!([
             {
                 "type": "user",
@@ -332,8 +346,8 @@ fn transcript_json_includes_user_note_in_order() {
     );
 }
 
-#[test]
-fn transcript_json_includes_interrupt_decision_rows() {
+#[tokio::test]
+async fn transcript_json_includes_interrupt_decision_rows() {
     let session = transcript_session();
     record_transcript_event(
         &session,
@@ -351,10 +365,13 @@ fn transcript_json_includes_interrupt_decision_rows() {
             },
         }),
         1_000,
-    );
+    )
+    .await;
 
     assert_eq!(
-        transcript_json(&session.db, session.id, "Build").unwrap(),
+        transcript_json(&session.db, session.id, "Build")
+            .await
+            .unwrap(),
         json!([{
             "type": "interrupt_decision",
             "permission": false,
@@ -367,8 +384,8 @@ fn transcript_json_includes_interrupt_decision_rows() {
     );
 }
 
-#[test]
-fn transcript_json_includes_inference_error_summary_and_detail() {
+#[tokio::test]
+async fn transcript_json_includes_inference_error_summary_and_detail() {
     let session = transcript_session();
     record_transcript_event(
         &session,
@@ -382,10 +399,13 @@ fn transcript_json_includes_inference_error_summary_and_detail() {
             "detail": "first line\nrequest id: abc",
         }),
         1_000,
-    );
+    )
+    .await;
 
     assert_eq!(
-        transcript_json(&session.db, session.id, "Build").unwrap(),
+        transcript_json(&session.db, session.id, "Build")
+            .await
+            .unwrap(),
         json!([{
             "type": "inference_error",
             "text": "Inference failed (p/m): network: first line",
@@ -395,8 +415,8 @@ fn transcript_json_includes_inference_error_summary_and_detail() {
     );
 }
 
-#[test]
-fn transcript_json_db_snapshot_exports_all_persisted_turns() {
+#[tokio::test]
+async fn transcript_json_db_snapshot_exports_all_persisted_turns() {
     let session = transcript_session();
     for idx in 0..25 {
         record_transcript_event(
@@ -406,10 +426,13 @@ fn transcript_json_db_snapshot_exports_all_persisted_turns() {
             None,
             json!({ "text": format!("turn {idx}") }),
             1_000 + idx,
-        );
+        )
+        .await;
     }
 
-    let exported = transcript_json(&session.db, session.id, "Build").unwrap();
+    let exported = transcript_json(&session.db, session.id, "Build")
+        .await
+        .unwrap();
     let turns = exported.as_array().unwrap();
 
     assert_eq!(turns.len(), 25);
@@ -417,7 +440,7 @@ fn transcript_json_db_snapshot_exports_all_persisted_turns() {
     assert_eq!(turns[24]["text"], "turn 24");
 }
 
-fn record_responses_task_pair(
+async fn record_responses_task_pair(
     session: &Session,
     task_call_id: &str,
     provider_call_id: &str,
@@ -445,6 +468,7 @@ fn record_responses_task_pair(
                 "prompt": format!("look around {label}"),
             }),
         )
+        .await
         .unwrap();
     session
         .record_event(
@@ -461,18 +485,20 @@ fn record_responses_task_pair(
                 "report": format!("done {label}"),
             }),
         )
+        .await
         .unwrap();
 }
 
-fn build_session_zip(session: &Session) -> Vec<u8> {
+async fn build_session_zip(session: &Session) -> Vec<u8> {
     let session_id = session.id;
     let target = session
         .db
-        .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+        .read(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+        .await
         .unwrap()
         .unwrap();
-    let bundle = collect_bundle(&session.db, session.id).unwrap();
-    build_zip(&session.db, &target, &bundle).unwrap()
+    let bundle = collect_bundle(&session.db, session.id).await.unwrap();
+    build_zip(&session.db, &target, &bundle).await.unwrap()
 }
 
 fn assert_manifest_has_no_resume_repair(zip: &[u8]) {
@@ -555,8 +581,8 @@ fn validations(request: &Value, response: &Value) -> Vec<Value> {
 /// A session that delegates to a subagent (same session_id, distinct
 /// agent) produces a zip with manifest + events + one inference_request
 /// file per call across main AND subagent.
-#[test]
-fn export_bundles_main_and_subagent_requests() {
+#[tokio::test]
+async fn export_bundles_main_and_subagent_requests() {
     let tmp = tempfile::TempDir::new().unwrap();
     std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
     std::fs::write(
@@ -565,7 +591,7 @@ fn export_bundles_main_and_subagent_requests() {
         )
         .unwrap();
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", tmp.path().to_string_lossy().as_ref(), "Build");
+    let s = create_test_session(&db, "p", tmp.path().to_string_lossy().as_ref(), "Build").await;
     let sid = s.session_id;
 
     // Main agent inference call + captured request.
@@ -576,6 +602,7 @@ fn export_bundles_main_and_subagent_requests() {
         &json!({"model": "m", "system": "sys", "tools": [], "history": [{"role":"user"}]}),
         crate::db::session_log::InferenceRequestStatus::Completed,
     )
+    .await
     .unwrap();
     db.insert_session_event(
         sid,
@@ -584,6 +611,7 @@ fn export_bundles_main_and_subagent_requests() {
         Some(&call_main.to_string()),
         &json!({"usage": {"input_tokens": 10}}),
     )
+    .await
     .unwrap();
     // A delegation to a subagent.
     db.insert_session_event(
@@ -593,6 +621,7 @@ fn export_bundles_main_and_subagent_requests() {
         Some("task-1"),
         &json!({"child_agent": "explore"}),
     )
+    .await
     .unwrap();
     // Subagent inference call (shares session_id, distinct agent).
     let call_sub = Uuid::new_v4();
@@ -602,6 +631,7 @@ fn export_bundles_main_and_subagent_requests() {
         &json!({"model": "m", "system": "explore-sys", "tools": [], "history": []}),
         crate::db::session_log::InferenceRequestStatus::Completed,
     )
+    .await
     .unwrap();
     db.insert_session_event(
         sid,
@@ -610,6 +640,7 @@ fn export_bundles_main_and_subagent_requests() {
         Some(&call_sub.to_string()),
         &json!({"usage": {"input_tokens": 5}}),
     )
+    .await
     .unwrap();
     // A tool call with a recovery (the wire-vs-user split must survive).
     db.insert_session_event(
@@ -626,11 +657,12 @@ fn export_bundles_main_and_subagent_requests() {
             "hard_fail": false,
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
 
     let names = entry_names(&zip);
     assert!(names.contains(&"manifest.json".to_string()));
@@ -685,8 +717,8 @@ fn export_bundles_main_and_subagent_requests() {
     assert_eq!(tool_call["data"]["wire_input"]["path"], "/proj/a.rs");
 }
 
-#[test]
-fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preserves() {
+#[tokio::test]
+async fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preserves() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -697,7 +729,7 @@ fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preserves() 
     .unwrap();
 
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", tmp.path().to_str().unwrap(), "Build");
+    let s = create_test_session(&db, "p", tmp.path().to_str().unwrap(), "Build").await;
     let call = Uuid::new_v4();
     db.insert_inference_request(
         &call.to_string(),
@@ -710,6 +742,7 @@ fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preserves() 
         }),
         crate::db::session_log::InferenceRequestStatus::Completed,
     )
+    .await
     .unwrap();
     db.insert_session_event(
         s.session_id,
@@ -718,10 +751,11 @@ fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preserves() 
         Some(&call.to_string()),
         &json!({"routing": {"trust": "trusted", "note": "trusted-secret-value"}}),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, s.session_id);
-    let bundle = collect_bundle(&db, s.session_id).unwrap();
+    let target = get_test_session(&db, s.session_id).await;
+    let bundle = collect_bundle(&db, s.session_id).await.unwrap();
     let safe = build_zip_with_options_and_env(
         &db,
         &target,
@@ -729,6 +763,7 @@ fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preserves() 
         ExportBundleOptions::default(),
         &test_export_env(),
     )
+    .await
     .unwrap();
     let safe_body = entry_names(&safe)
         .into_iter()
@@ -752,6 +787,7 @@ fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preserves() 
         },
         &test_export_env(),
     )
+    .await
     .unwrap();
     let sensitive_body = entry_names(&sensitive)
         .into_iter()
@@ -766,10 +802,10 @@ fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preserves() 
     );
 }
 
-#[test]
-fn export_tool_call_event_includes_provider_identity_provenance() {
+#[tokio::test]
+async fn export_tool_call_event_includes_provider_identity_provenance() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
 
     db.insert_tool_call(&ToolCallEvent {
@@ -808,6 +844,7 @@ fn export_tool_call_event_includes_provider_identity_provenance() {
         shape_fingerprint: None,
         hint: None,
     })
+    .await
     .unwrap();
     db.insert_session_event(
         sid,
@@ -820,11 +857,12 @@ fn export_tool_call_event_includes_provider_identity_provenance() {
             "wire_input": {"path": "/proj/a.rs"},
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let events: Vec<Value> =
         serde_json::from_str(&read_zip_entry(&zip, "events.json").unwrap()).unwrap();
     let tool_call = events
@@ -845,10 +883,10 @@ fn export_tool_call_event_includes_provider_identity_provenance() {
     );
 }
 
-#[test]
-fn export_completions_wire_tool_call_event_includes_provider_identity() {
+#[tokio::test]
+async fn export_completions_wire_tool_call_event_includes_provider_identity() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     let providers = crate::config::providers::ProvidersConfig {
         providers: [(
@@ -909,6 +947,7 @@ fn export_completions_wire_tool_call_event_includes_provider_identity() {
         shape_fingerprint: None,
         hint: None,
     })
+    .await
     .unwrap();
     db.insert_session_event(
         sid,
@@ -921,11 +960,12 @@ fn export_completions_wire_tool_call_event_includes_provider_identity() {
             "wire_input": {"path": "/proj/a.rs"},
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let events: Vec<Value> =
         serde_json::from_str(&read_zip_entry(&zip, "events.json").unwrap()).unwrap();
     let tool_call = events
@@ -946,10 +986,10 @@ fn export_completions_wire_tool_call_event_includes_provider_identity() {
     );
 }
 
-#[test]
-fn export_synthetic_seed_tool_call_event_includes_provider_identity() {
+#[tokio::test]
+async fn export_synthetic_seed_tool_call_event_includes_provider_identity() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     let identity = ToolCallProviderIdentity::synthetic_cockpit_call(
         "seed-export",
@@ -992,6 +1032,7 @@ fn export_synthetic_seed_tool_call_event_includes_provider_identity() {
         shape_fingerprint: None,
         hint: None,
     })
+    .await
     .unwrap();
     db.insert_session_event(
         sid,
@@ -1005,11 +1046,12 @@ fn export_synthetic_seed_tool_call_event_includes_provider_identity() {
             "seed": true,
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let events = zip_events(&zip);
     let seed = events
         .iter()
@@ -1030,9 +1072,9 @@ fn export_synthetic_seed_tool_call_event_includes_provider_identity() {
     );
 }
 
-#[test]
-fn export_responses_single_task_has_provider_identity_without_resume_repair() {
-    let session = responses_session_with_intro();
+#[tokio::test]
+async fn export_responses_single_task_has_provider_identity_without_resume_repair() {
+    let session = responses_session_with_intro().await;
     record_responses_task_pair(
         &session,
         "task-single",
@@ -1040,9 +1082,10 @@ fn export_responses_single_task_has_provider_identity_without_resume_repair() {
         "default",
         "explore",
         true,
-    );
+    )
+    .await;
 
-    let zip = build_session_zip(&session);
+    let zip = build_session_zip(&session).await;
     assert_manifest_has_no_resume_repair(&zip);
     let events = zip_events(&zip);
     assert_task_event_identity(
@@ -1061,9 +1104,9 @@ fn export_responses_single_task_has_provider_identity_without_resume_repair() {
     );
 }
 
-#[test]
-fn export_responses_batch_task_has_provider_identity_without_resume_repair() {
-    let session = responses_session_with_intro();
+#[tokio::test]
+async fn export_responses_batch_task_has_provider_identity_without_resume_repair() {
+    let session = responses_session_with_intro().await;
     record_responses_task_pair(
         &session,
         "task-batch",
@@ -1071,7 +1114,8 @@ fn export_responses_batch_task_has_provider_identity_without_resume_repair() {
         "alpha",
         "explore",
         true,
-    );
+    )
+    .await;
     record_responses_task_pair(
         &session,
         "task-batch",
@@ -1079,9 +1123,10 @@ fn export_responses_batch_task_has_provider_identity_without_resume_repair() {
         "beta",
         "docs",
         true,
-    );
+    )
+    .await;
 
-    let zip = build_session_zip(&session);
+    let zip = build_session_zip(&session).await;
     assert_manifest_has_no_resume_repair(&zip);
     let events = zip_events(&zip);
     for label in ["alpha", "beta"] {
@@ -1102,9 +1147,9 @@ fn export_responses_batch_task_has_provider_identity_without_resume_repair() {
     }
 }
 
-#[test]
-fn export_responses_interactive_subagent_has_provider_identity_without_resume_repair() {
-    let session = responses_session_with_intro();
+#[tokio::test]
+async fn export_responses_interactive_subagent_has_provider_identity_without_resume_repair() {
+    let session = responses_session_with_intro().await;
     record_responses_task_pair(
         &session,
         "task-interactive",
@@ -1112,9 +1157,10 @@ fn export_responses_interactive_subagent_has_provider_identity_without_resume_re
         "default",
         "explore",
         false,
-    );
+    )
+    .await;
 
-    let zip = build_session_zip(&session);
+    let zip = build_session_zip(&session).await;
     assert_manifest_has_no_resume_repair(&zip);
     let events = zip_events(&zip);
     assert_task_event_identity(
@@ -1138,8 +1184,8 @@ fn export_responses_interactive_subagent_has_provider_identity_without_resume_re
     assert_eq!(spawn["data"]["noninteractive"], false);
 }
 
-#[test]
-fn export_rejects_invalid_responses_provider_identity() {
+#[tokio::test]
+async fn export_rejects_invalid_responses_provider_identity() {
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db, PathBuf::from("/proj"), "Build").unwrap();
     session.set_active_model("codex-oauth", "gpt-5.4").unwrap();
@@ -1150,6 +1196,7 @@ fn export_rejects_invalid_responses_provider_identity() {
             None,
             &json!({ "text": "read the file" }),
         )
+        .await
         .unwrap();
     session
         .record_event(
@@ -1158,6 +1205,7 @@ fn export_rejects_invalid_responses_provider_identity() {
             Some("infer-1"),
             &json!({ "text": "I'll inspect it." }),
         )
+        .await
         .unwrap();
     session
         .record_tool_call(ToolCallRow {
@@ -1190,6 +1238,7 @@ fn export_rejects_invalid_responses_provider_identity() {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
     session
         .record_event(
@@ -1203,20 +1252,21 @@ fn export_rejects_invalid_responses_provider_identity() {
                 "output": "body",
             }),
         )
+        .await
         .unwrap();
 
-    let target = get_test_session(&session.db, session.id);
-    let bundle = collect_bundle(&session.db, session.id).unwrap();
-    let err = build_zip(&session.db, &target, &bundle).unwrap_err();
+    let target = get_test_session(&session.db, session.id).await;
+    let bundle = collect_bundle(&session.db, session.id).await.unwrap();
+    let err = build_zip(&session.db, &target, &bundle).await.unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("invalid provider identity"), "{msg}");
     assert!(msg.contains("call-without-provider-id"), "{msg}");
 }
 
-#[test]
-fn export_sanitizes_inference_request_call_id_filename_segment() {
+#[tokio::test]
+async fn export_sanitizes_inference_request_call_id_filename_segment() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     let call_id = "call/../evil:id?";
 
@@ -1226,6 +1276,7 @@ fn export_sanitizes_inference_request_call_id_filename_segment() {
         &json!({"model": "m", "system": "sys", "tools": [], "history": []}),
         crate::db::session_log::InferenceRequestStatus::Completed,
     )
+    .await
     .unwrap();
     db.insert_session_event(
         sid,
@@ -1234,11 +1285,12 @@ fn export_sanitizes_inference_request_call_id_filename_segment() {
         Some(call_id),
         &json!({}),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let names = entry_names(&zip);
     let request_files: Vec<&String> = names
         .iter()
@@ -1262,8 +1314,8 @@ fn export_sanitizes_inference_request_call_id_filename_segment() {
 /// A synthetic `context_pruned` event flows through the recorder API
 /// and appears in an exported `events.json`, ordered immediately
 /// before the next `inference_request`.
-#[test]
-fn export_includes_context_pruned_before_next_inference_request() {
+#[tokio::test]
+async fn export_includes_context_pruned_before_next_inference_request() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), PathBuf::from("/proj"), "builder").unwrap();
@@ -1285,6 +1337,7 @@ fn export_includes_context_pruned_before_next_inference_request() {
             Some(98_800),
             Some("cache_already_cold"),
         )
+        .await
         .unwrap();
     let call = Uuid::new_v4();
     db.insert_inference_request(
@@ -1293,6 +1346,7 @@ fn export_includes_context_pruned_before_next_inference_request() {
         &json!({"model": "m", "system": "s", "tools": [], "history": []}),
         crate::db::session_log::InferenceRequestStatus::Completed,
     )
+    .await
     .unwrap();
     session
         .record_event(
@@ -1301,11 +1355,12 @@ fn export_includes_context_pruned_before_next_inference_request() {
             Some(&call.to_string()),
             &json!({"usage": null}),
         )
+        .await
         .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
 
     let events_str = read_zip_entry(&zip, "events.json").unwrap();
     let events: Vec<Value> = serde_json::from_str(&events_str).unwrap();
@@ -1326,8 +1381,8 @@ fn export_includes_context_pruned_before_next_inference_request() {
     assert_eq!(data["trigger_reason"], "cache_already_cold");
 }
 
-#[test]
-fn export_includes_goal_progress_diagnostic() {
+#[tokio::test]
+async fn export_includes_goal_progress_diagnostic() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), PathBuf::from("/proj"), "builder").unwrap();
@@ -1344,11 +1399,12 @@ fn export_includes_goal_progress_diagnostic() {
                 "reason": "completed_inference_without_visible_progress",
             }),
         )
+        .await
         .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let events: Vec<Value> =
         serde_json::from_str(&read_zip_entry(&zip, "events.json").unwrap()).unwrap();
     assert_eq!(events.len(), 1);
@@ -1357,8 +1413,8 @@ fn export_includes_goal_progress_diagnostic() {
     assert_eq!(events[0]["data"]["anchor_seq"], 42);
 }
 
-#[test]
-fn export_includes_queued_user_fold_metadata() {
+#[tokio::test]
+async fn export_includes_queued_user_fold_metadata() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), PathBuf::from("/proj"), "builder").unwrap();
@@ -1382,11 +1438,12 @@ fn export_includes_queued_user_fold_metadata() {
                 "preflight_cleaned": null,
             }),
         )
+        .await
         .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let events: Vec<Value> =
         serde_json::from_str(&read_zip_entry(&zip, "events.json").unwrap()).unwrap();
     assert_eq!(events.len(), 1);
@@ -1402,8 +1459,8 @@ fn export_includes_queued_user_fold_metadata() {
 /// (NO `inference_request` event). The export must (a) emit a file for the
 /// failure call carrying the `timed_out` status + captured body, and
 /// (b) include the failure event with provider/model/phase/class/elapsed.
-#[test]
-fn export_of_hung_turn_has_inference_record_and_failure_event() {
+#[tokio::test]
+async fn export_of_hung_turn_has_inference_record_and_failure_event() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), PathBuf::from("/proj"), "builder").unwrap();
@@ -1418,6 +1475,7 @@ fn export_of_hung_turn_has_inference_record_and_failure_event() {
         &json!({"model": "qwen3", "system": "s", "tools": [], "history": []}),
         crate::db::session_log::InferenceRequestStatus::TimedOut,
     )
+    .await
     .unwrap();
     // The failure event (no `inference_request` event for this call).
     session
@@ -1433,11 +1491,12 @@ fn export_of_hung_turn_has_inference_record_and_failure_event() {
                 "elapsed_ms": 120_000,
             }),
         )
+        .await
         .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
 
     // The failure event is present with its diagnostics, and it names a
     // real file in the archive.
@@ -1460,14 +1519,15 @@ fn export_of_hung_turn_has_inference_record_and_failure_event() {
 /// A `/compact` successor session (a session boundary, not a fork) is
 /// followed like the fork tree and lands in the same unified
 /// `events.json`.
-#[test]
-fn export_follows_session_compacted_successor() {
+#[tokio::test]
+async fn export_follows_session_compacted_successor() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
     let pred = Session::create(db.clone(), PathBuf::from("/proj"), "builder").unwrap();
     // The successor is a fresh session (NOT a fork — no parent link).
     let succ = Session::create(db.clone(), PathBuf::from("/proj"), "builder").unwrap();
     pred.record_session_compacted("builder", succ.id, &succ.short_id, 3, "handoff brief")
+        .await
         .unwrap();
     // Each session has one inference call.
     for s in [&pred, &succ] {
@@ -1478,6 +1538,7 @@ fn export_follows_session_compacted_successor() {
             &json!({"model": "m", "system": "s", "tools": [], "history": []}),
             crate::db::session_log::InferenceRequestStatus::Completed,
         )
+        .await
         .unwrap();
         db.insert_session_event(
             s.id,
@@ -1486,16 +1547,17 @@ fn export_follows_session_compacted_successor() {
             Some(&call.to_string()),
             &json!({}),
         )
+        .await
         .unwrap();
     }
 
-    let target = get_test_session(&db, pred.id);
-    let bundle = collect_bundle(&db, pred.id).unwrap();
+    let target = get_test_session(&db, pred.id).await;
+    let bundle = collect_bundle(&db, pred.id).await.unwrap();
     // Both predecessor and successor are in the bundle.
     assert_eq!(bundle.len(), 2);
     assert!(bundle.iter().any(|s| s.session_id == succ.id));
 
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let names = entry_names(&zip);
     let req_files = names
         .iter()
@@ -1518,10 +1580,10 @@ fn export_follows_session_compacted_successor() {
 /// (no exporter mapping needed — the export passes `data` through) and
 /// lands in `events.json` with its `decision` / `source` / `target`
 /// fields intact, linkable back to the tool it gated.
-#[test]
-fn export_includes_permission_decision_event() {
+#[tokio::test]
+async fn export_includes_permission_decision_event() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "builder");
+    let s = create_test_session(&db, "p", "/proj", "builder").await;
     let sid = s.session_id;
     db.insert_session_event(
         sid,
@@ -1538,11 +1600,12 @@ fn export_includes_permission_decision_event() {
             "source": "user_prompt",
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
 
     let events: Vec<Value> =
         serde_json::from_str(&read_zip_entry(&zip, "events.json").unwrap()).unwrap();
@@ -1559,16 +1622,12 @@ fn export_includes_permission_decision_event() {
 /// Durable approval grants explain why later tool calls may not prompt.
 /// They are not event decisions, so the export includes an explicit
 /// snapshot under `approvals/grants.json`.
-#[test]
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-)]
-fn export_includes_persisted_approval_grants_snapshot() {
+#[tokio::test]
+async fn export_includes_persisted_approval_grants_snapshot() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "builder");
+    let s = create_test_session(&db, "p", "/proj", "builder").await;
     let sid = s.session_id;
-    db.write_blocking(move |conn| {
+    db.write(move |conn| {
         conn.execute(
             "INSERT INTO approval_grants \
                  (session_id, grant_kind, grant_key, granted_at, risk_tier) \
@@ -1592,11 +1651,12 @@ fn export_includes_persisted_approval_grants_snapshot() {
         .unwrap();
         Ok(())
     })
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
 
     let approvals: Value =
         serde_json::from_str(&read_zip_entry(&zip, "approvals/grants.json").unwrap()).unwrap();
@@ -1619,8 +1679,8 @@ fn export_includes_persisted_approval_grants_snapshot() {
 /// tool `name` and `reason`, so a hallucinated / unrepairable call is a
 /// one-query check instead of prose inference. Both reason enum values
 /// round-trip.
-#[test]
-fn export_includes_tool_rejected_event() {
+#[tokio::test]
+async fn export_includes_tool_rejected_event() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), PathBuf::from("/proj"), "Build").unwrap();
@@ -1628,6 +1688,7 @@ fn export_includes_tool_rejected_event() {
 
     session
         .record_tool_rejected("Build", "tc-hallu", "handoff", "not_in_advertised_set")
+        .await
         .unwrap();
     session
         .record_tool_rejected_with_correction(
@@ -1641,11 +1702,12 @@ fn export_includes_tool_rejected_event() {
                 "corrected_shape_hint": "retry with {path,content}",
             })),
         )
+        .await
         .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
 
     let events: Vec<Value> =
         serde_json::from_str(&read_zip_entry(&zip, "events.json").unwrap()).unwrap();
@@ -1683,8 +1745,8 @@ fn export_includes_tool_rejected_event() {
 /// model-facing wire `kickoff` — plus from/to/trigger. The `handoff` path
 /// carries a kickoff; a `/plan`/`/build`/`/swarm` slash-command swap
 /// injects none, so its `kickoff` is null (never fabricated).
-#[test]
-fn export_includes_primary_swap_event_both_halves() {
+#[tokio::test]
+async fn export_includes_primary_swap_event_both_halves() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), PathBuf::from("/proj"), "Auto").unwrap();
@@ -1699,15 +1761,17 @@ fn export_includes_primary_swap_event_both_halves() {
             Some("Handed off to `Build`."),
             Some("User's request:\nfix the bug\n\nBegin now."),
         )
+        .await
         .unwrap();
     // Slash-command swap: no kickoff injected.
     session
         .record_primary_swap("Build", "Plan", "swap_command", None, None)
+        .await
         .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
 
     let events: Vec<Value> =
         serde_json::from_str(&read_zip_entry(&zip, "events.json").unwrap()).unwrap();
@@ -1744,8 +1808,7 @@ fn export_includes_primary_swap_event_both_halves() {
     assert!(cmd["data"]["display"].is_null());
 }
 
-#[allow(deprecated)]
-fn build_model_switch_zip(
+async fn build_model_switch_zip(
     trigger: crate::session::ModelSwitchTrigger,
     outcome: crate::session::ModelSwitchOutcome,
     error: Option<&str>,
@@ -1763,14 +1826,16 @@ fn build_model_switch_zip(
             outcome,
             error,
         })
+        .await
         .unwrap();
     let session_id = session.id;
     let target = db
-        .write_blocking(move |conn| Db::get_session_conn(conn, session_id))
+        .read(move |conn| Db::get_session_conn(conn, session_id))
+        .await
         .unwrap()
         .unwrap();
-    let bundle = collect_bundle(&db, session.id).unwrap();
-    build_zip(&db, &target, &bundle).unwrap()
+    let bundle = collect_bundle(&db, session.id).await.unwrap();
+    build_zip(&db, &target, &bundle).await.unwrap()
 }
 
 fn only_model_switch_event(zip: &[u8]) -> Value {
@@ -1781,13 +1846,14 @@ fn only_model_switch_event(zip: &[u8]) -> Value {
         .expect("model_switch event exported")
 }
 
-#[test]
-fn export_includes_model_switch_event_payload_shape() {
+#[tokio::test]
+async fn export_includes_model_switch_event_payload_shape() {
     let zip = build_model_switch_zip(
         crate::session::ModelSwitchTrigger::Picker,
         crate::session::ModelSwitchOutcome::Ok,
         None,
-    );
+    )
+    .await;
     let event = only_model_switch_event(&zip);
     let data = event["data"].as_object().expect("model_switch data object");
     let mut keys = data.keys().map(String::as_str).collect::<Vec<_>>();
@@ -1814,56 +1880,60 @@ fn export_includes_model_switch_event_payload_shape() {
     assert!(event["data"]["error"].is_null());
 }
 
-#[test]
-fn export_includes_model_switch_ok_event() {
+#[tokio::test]
+async fn export_includes_model_switch_ok_event() {
     let zip = build_model_switch_zip(
         crate::session::ModelSwitchTrigger::Picker,
         crate::session::ModelSwitchOutcome::Ok,
         None,
-    );
+    )
+    .await;
     let event = only_model_switch_event(&zip);
     assert_eq!(event["data"]["outcome"], "ok");
     assert!(event["data"]["error"].is_null());
 }
 
-#[test]
-fn export_includes_model_switch_build_failed_event() {
+#[tokio::test]
+async fn export_includes_model_switch_build_failed_event() {
     let zip = build_model_switch_zip(
         crate::session::ModelSwitchTrigger::Picker,
         crate::session::ModelSwitchOutcome::BuildFailed,
         Some("provider not configured"),
-    );
+    )
+    .await;
     let event = only_model_switch_event(&zip);
     assert_eq!(event["data"]["outcome"], "build_failed");
     assert_eq!(event["data"]["error"], "provider not configured");
 }
 
-#[test]
-fn export_includes_model_switch_send_failed_event() {
+#[tokio::test]
+async fn export_includes_model_switch_send_failed_event() {
     let zip = build_model_switch_zip(
         crate::session::ModelSwitchTrigger::Picker,
         crate::session::ModelSwitchOutcome::SendFailed,
         Some("config write failed"),
-    );
+    )
+    .await;
     let event = only_model_switch_event(&zip);
     assert_eq!(event["data"]["outcome"], "send_failed");
     assert_eq!(event["data"]["error"], "config write failed");
 }
 
-#[test]
-fn export_includes_model_switch_noop_event() {
+#[tokio::test]
+async fn export_includes_model_switch_noop_event() {
     let zip = build_model_switch_zip(
         crate::session::ModelSwitchTrigger::Picker,
         crate::session::ModelSwitchOutcome::Noop,
         None,
-    );
+    )
+    .await;
     let event = only_model_switch_event(&zip);
     assert_eq!(event["data"]["outcome"], "noop");
     assert!(event["data"]["error"].is_null());
 }
 
-#[test]
-fn export_model_switch_event_records_all_triggers() {
+#[tokio::test]
+async fn export_model_switch_event_records_all_triggers() {
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), PathBuf::from("/proj"), "Build").unwrap();
     session.set_active_model("provider-a", "model-a").unwrap();
@@ -1883,11 +1953,12 @@ fn export_model_switch_event_records_all_triggers() {
                 outcome: crate::session::ModelSwitchOutcome::Ok,
                 error: None,
             })
+            .await
             .unwrap();
     }
-    let target = get_test_session(&db, session.id);
-    let bundle = collect_bundle(&db, session.id).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, session.id).await;
+    let bundle = collect_bundle(&db, session.id).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let triggers = zip_events(&zip)
         .into_iter()
         .filter(|event| event["type"] == "model_switch")
@@ -1901,10 +1972,10 @@ fn export_model_switch_event_records_all_triggers() {
 /// human-readable `exit: N` text kept in `output` for backward
 /// compatibility. Resource scheduler metadata rides alongside it as
 /// out-of-band event data.
-#[test]
-fn export_bash_tool_call_carries_exit_code_field() {
+#[tokio::test]
+async fn export_bash_tool_call_carries_exit_code_field() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     // A failing bash call: the event data the dispatcher writes today plus
     // the new authoritative `exit_code` field.
@@ -1942,11 +2013,12 @@ fn export_bash_tool_call_carries_exit_code_field() {
             },
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
 
     let events: Vec<Value> =
         serde_json::from_str(&read_zip_entry(&zip, "events.json").unwrap()).unwrap();
@@ -1966,10 +2038,10 @@ fn export_bash_tool_call_carries_exit_code_field() {
     assert_eq!(bash["data"]["resource"]["wait_ms"], 5);
 }
 
-#[test]
-fn export_tool_lifecycle_events_distinguish_start_and_completion() {
+#[tokio::test]
+async fn export_tool_lifecycle_events_distinguish_start_and_completion() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     db.insert_session_event(
         sid,
@@ -1984,6 +2056,7 @@ fn export_tool_lifecycle_events_distinguish_start_and_completion() {
             "recovery_stage": null,
         }),
     )
+    .await
     .unwrap();
     db.insert_session_event(
         sid,
@@ -2001,11 +2074,12 @@ fn export_tool_lifecycle_events_distinguish_start_and_completion() {
             "exit_code": 0,
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let events: Vec<Value> =
         serde_json::from_str(&read_zip_entry(&zip, "events.json").unwrap()).unwrap();
 
@@ -2026,8 +2100,8 @@ fn export_tool_lifecycle_events_distinguish_start_and_completion() {
     assert_eq!(completed["data"]["exit_code"], 0);
 }
 
-#[test]
-fn export_includes_notice_events() {
+#[tokio::test]
+async fn export_includes_notice_events() {
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), PathBuf::from("/proj"), "Build").unwrap();
     session
@@ -2037,9 +2111,11 @@ fn export_includes_notice_events() {
             None,
             &json!({ "text": "start" }),
         )
+        .await
         .unwrap();
     session
         .record_notice(Some("Build"), "Model fallback applied.", "engine_turn")
+        .await
         .unwrap();
     session
         .record_event(
@@ -2048,11 +2124,12 @@ fn export_includes_notice_events() {
             None,
             &json!({ "text": "done" }),
         )
+        .await
         .unwrap();
 
-    let target = get_test_session(&db, session.id);
-    let bundle = collect_bundle(&db, session.id).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, session.id).await;
+    let bundle = collect_bundle(&db, session.id).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let events = zip_events(&zip);
     let event_types: Vec<&str> = events
         .iter()
@@ -2068,10 +2145,10 @@ fn export_includes_notice_events() {
     assert_eq!(notice["data"]["source"], "engine_turn");
 }
 
-#[test]
-fn export_labels_orphaned_tool_call_started() {
+#[tokio::test]
+async fn export_labels_orphaned_tool_call_started() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     db.insert_session_event(
         sid,
@@ -2086,11 +2163,12 @@ fn export_labels_orphaned_tool_call_started() {
             "recovery_stage": null,
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let events = zip_events(&zip);
     let started = events
         .iter()
@@ -2099,10 +2177,10 @@ fn export_labels_orphaned_tool_call_started() {
     assert_eq!(started["data"]["orphaned"], true);
 }
 
-#[test]
-fn export_does_not_label_completed_tool_call_started() {
+#[tokio::test]
+async fn export_does_not_label_completed_tool_call_started() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     db.insert_session_event(
         sid,
@@ -2117,6 +2195,7 @@ fn export_does_not_label_completed_tool_call_started() {
             "recovery_stage": null,
         }),
     )
+    .await
     .unwrap();
     db.insert_session_event(
         sid,
@@ -2133,11 +2212,12 @@ fn export_does_not_label_completed_tool_call_started() {
             "duration_ms": 1,
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let events = zip_events(&zip);
     let started = events
         .iter()
@@ -2146,11 +2226,11 @@ fn export_does_not_label_completed_tool_call_started() {
     assert!(started["data"].get("orphaned").is_none());
 }
 
-#[test]
-fn export_orphan_detection_is_bundle_scoped() {
+#[tokio::test]
+async fn export_orphan_detection_is_bundle_scoped() {
     let db = Db::open_in_memory().unwrap();
-    let parent = create_test_session(&db, "p", "/proj", "Build");
-    let child = create_test_fork(&db, parent.session_id);
+    let parent = create_test_session(&db, "p", "/proj", "Build").await;
+    let child = create_test_fork(&db, parent.session_id).await;
     db.insert_session_event(
         parent.session_id,
         SessionEventKind::ToolCallStarted,
@@ -2164,6 +2244,7 @@ fn export_orphan_detection_is_bundle_scoped() {
             "recovery_stage": null,
         }),
     )
+    .await
     .unwrap();
     db.insert_session_event(
         child.session_id,
@@ -2180,11 +2261,12 @@ fn export_orphan_detection_is_bundle_scoped() {
             "duration_ms": 1,
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, parent.session_id);
-    let bundle = collect_bundle(&db, parent.session_id).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, parent.session_id).await;
+    let bundle = collect_bundle(&db, parent.session_id).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let events = zip_events(&zip);
     let started = events
         .iter()
@@ -2193,10 +2275,10 @@ fn export_orphan_detection_is_bundle_scoped() {
     assert!(started["data"].get("orphaned").is_none());
 }
 
-#[test]
-fn export_tool_lifecycle_blocked_completion_is_not_dispatched() {
+#[tokio::test]
+async fn export_tool_lifecycle_blocked_completion_is_not_dispatched() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     db.insert_session_event(
         sid,
@@ -2211,6 +2293,7 @@ fn export_tool_lifecycle_blocked_completion_is_not_dispatched() {
             "recovery_stage": null,
         }),
     )
+    .await
     .unwrap();
     db.insert_session_event(
         sid,
@@ -2227,11 +2310,12 @@ fn export_tool_lifecycle_blocked_completion_is_not_dispatched() {
             "duration_ms": 0,
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let events: Vec<Value> =
         serde_json::from_str(&read_zip_entry(&zip, "events.json").unwrap()).unwrap();
 
@@ -2244,10 +2328,10 @@ fn export_tool_lifecycle_blocked_completion_is_not_dispatched() {
     assert!(completed["data"].get("exit_code").is_none());
 }
 
-#[test]
-fn export_tool_output_sidecar_writes_file_and_keeps_event_bounded() {
+#[tokio::test]
+async fn export_tool_output_sidecar_writes_file_and_keeps_event_bounded() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     let full_stdout = "line\n".repeat(3000);
     db.insert_session_event(
@@ -2284,11 +2368,12 @@ fn export_tool_output_sidecar_writes_file_and_keeps_event_bounded() {
             }
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let events: Vec<Value> =
         serde_json::from_str(&read_zip_entry(&zip, "events.json").unwrap()).unwrap();
     let event = events
@@ -2313,10 +2398,10 @@ fn export_tool_output_sidecar_writes_file_and_keeps_event_bounded() {
     assert_eq!(sidecar["display"]["truncated"], true);
 }
 
-#[test]
-fn export_compressed_tool_results_writes_index_and_payload() {
+#[tokio::test]
+async fn export_compressed_tool_results_writes_index_and_payload() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     db.insert_compressed_tool_result(
         "0123456789abcdefabcdef12",
@@ -2332,11 +2417,12 @@ fn export_compressed_tool_results_writes_index_and_payload() {
             content: "redacted output",
         },
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let names = entry_names(&zip);
     assert!(
         names
@@ -2358,10 +2444,10 @@ fn export_compressed_tool_results_writes_index_and_payload() {
     assert_eq!(read_zip_entry(&zip, file).unwrap(), "redacted output");
 }
 
-#[test]
-fn export_truncate_only_result_omits_compressed_byte_len() {
+#[tokio::test]
+async fn export_truncate_only_result_omits_compressed_byte_len() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     db.insert_compressed_tool_result(
         "fedcba987654321001234567",
@@ -2377,11 +2463,12 @@ fn export_truncate_only_result_omits_compressed_byte_len() {
             content: "retained pre-truncation body",
         },
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let index: Vec<Value> =
         serde_json::from_str(&read_zip_entry(&zip, "compressed_tool_results/index.json").unwrap())
             .unwrap();
@@ -2396,10 +2483,10 @@ fn export_truncate_only_result_omits_compressed_byte_len() {
     );
 }
 
-#[test]
-fn export_task_delegation_payloads_writes_bounded_index_and_payload() {
+#[tokio::test]
+async fn export_task_delegation_payloads_writes_bounded_index_and_payload() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     db.upsert_task_delegation_job(
         sid,
@@ -2434,9 +2521,9 @@ fn export_task_delegation_payloads_writes_bounded_index_and_payload() {
     db.mark_task_delegation_payload_delivered("task-long", "alpha")
         .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let names = entry_names(&zip);
     assert!(names.iter().any(|n| n == "delegation_payloads/index.json"));
     let index: Vec<Value> =
@@ -2452,8 +2539,8 @@ fn export_task_delegation_payloads_writes_bounded_index_and_payload() {
     assert_eq!(read_zip_entry(&zip, file).unwrap(), body);
 }
 
-#[test]
-fn export_task_delegation_steers_includes_origin_and_redacted_body() {
+#[tokio::test]
+async fn export_task_delegation_steers_includes_origin_and_redacted_body() {
     let tmp = tempfile::TempDir::new().unwrap();
     std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
     std::fs::write(
@@ -2462,7 +2549,7 @@ fn export_task_delegation_steers_includes_origin_and_redacted_body() {
         )
         .unwrap();
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", tmp.path().to_string_lossy().as_ref(), "Build");
+    let s = create_test_session(&db, "p", tmp.path().to_string_lossy().as_ref(), "Build").await;
     let sid = s.session_id;
     db.upsert_task_delegation_job(
         sid,
@@ -2489,9 +2576,9 @@ fn export_task_delegation_steers_includes_origin_and_redacted_body() {
     )
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let names = entry_names(&zip);
     assert!(names.iter().any(|n| n == "delegation_steers/index.json"));
     let index: Vec<Value> =
@@ -2511,10 +2598,10 @@ fn export_task_delegation_steers_includes_origin_and_redacted_body() {
 /// `tool_call` with no `exit_code`) — still parses unchanged, and a
 /// consumer that filters for the new shapes simply finds nothing rather
 /// than failing.
-#[test]
-fn export_older_events_without_new_fields_still_parse() {
+#[tokio::test]
+async fn export_older_events_without_new_fields_still_parse() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     // A pre-feature bash tool_call: no `exit_code` key at all.
     db.insert_session_event(
@@ -2534,11 +2621,12 @@ fn export_older_events_without_new_fields_still_parse() {
             "duration_ms": 1,
         }),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
 
     // Parses fine.
     let events: Vec<Value> =
@@ -2562,26 +2650,31 @@ fn export_older_events_without_new_fields_still_parse() {
     assert_eq!(manifest["schema"], "cockpit-session-export/1");
 }
 
-#[test]
-fn resolve_unknown_short_id_is_usage_error() {
+#[tokio::test]
+async fn resolve_unknown_short_id_is_usage_error() {
     let db = Db::open_in_memory().unwrap();
-    let r = resolve_session(&db, "zzzzzz").unwrap();
+    let r = resolve_session(&db, "zzzzzz").await.unwrap();
     assert!(r.is_err(), "unknown short id must be a usage error");
 }
 
-#[test]
-fn resolve_accepts_uuid_and_short_id() {
+#[tokio::test]
+async fn resolve_accepts_uuid_and_short_id() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/x", "builder");
+    let s = create_test_session(&db, "p", "/x", "builder").await;
     let short = s.short_id.clone().unwrap();
     // By short id.
     assert_eq!(
-        resolve_session(&db, &short).unwrap().unwrap().session_id,
+        resolve_session(&db, &short)
+            .await
+            .unwrap()
+            .unwrap()
+            .session_id,
         s.session_id
     );
     // By full UUID.
     assert_eq!(
         resolve_session(&db, &s.session_id.to_string())
+            .await
             .unwrap()
             .unwrap()
             .session_id,
@@ -2590,6 +2683,7 @@ fn resolve_accepts_uuid_and_short_id() {
     // Unknown UUID is a usage error, not a crash.
     assert!(
         resolve_session(&db, &Uuid::new_v4().to_string())
+            .await
             .unwrap()
             .is_err()
     );
@@ -2597,10 +2691,10 @@ fn resolve_accepts_uuid_and_short_id() {
 
 /// End-to-end: the zip is written to disk under the default name, and
 /// re-writing without `--force` refuses to clobber.
-#[test]
-fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
+#[tokio::test]
+async fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "builder");
+    let s = create_test_session(&db, "p", "/proj", "builder").await;
     let call = Uuid::new_v4();
     db.insert_inference_request(
         &call.to_string(),
@@ -2608,6 +2702,7 @@ fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
         &json!({"model": "m", "system": "s", "tools": [], "history": []}),
         crate::db::session_log::InferenceRequestStatus::Completed,
     )
+    .await
     .unwrap();
     db.insert_session_event(
         s.session_id,
@@ -2616,11 +2711,12 @@ fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
         Some(&call.to_string()),
         &json!({}),
     )
+    .await
     .unwrap();
 
-    let target = get_test_session(&db, s.session_id);
-    let bundle = collect_bundle(&db, s.session_id).unwrap();
-    let bytes = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, s.session_id).await;
+    let bundle = collect_bundle(&db, s.session_id).await.unwrap();
+    let bytes = build_zip(&db, &target, &bundle).await.unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join(default_output_path(&target));
@@ -2645,10 +2741,10 @@ fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
 /// CLI's no-clobber-without-`--force` guarantee; `overwrite = true`
 /// (the TUI path, which has no force flag) replaces the prior file.
 /// It also creates the export directory if missing.
-#[test]
-fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
+#[tokio::test]
+async fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "builder");
+    let s = create_test_session(&db, "p", "/proj", "builder").await;
     let call = Uuid::new_v4();
     db.insert_inference_request(
         &call.to_string(),
@@ -2656,6 +2752,7 @@ fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
         &json!({"model": "m", "system": "s", "tools": [], "history": []}),
         crate::db::session_log::InferenceRequestStatus::Completed,
     )
+    .await
     .unwrap();
     db.insert_session_event(
         s.session_id,
@@ -2664,8 +2761,9 @@ fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
         Some(&call.to_string()),
         &json!({}),
     )
+    .await
     .unwrap();
-    let target = get_test_session(&db, s.session_id);
+    let target = get_test_session(&db, s.session_id).await;
 
     let tmp = tempfile::tempdir().unwrap();
     // A nested dir that does not exist yet — the writer must create it.
@@ -2673,17 +2771,23 @@ fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
     assert!(!out.parent().unwrap().exists());
 
     // First write succeeds and creates the directory.
-    let summary = write_bundle_zip(&db, &target, &out, false, false, false).unwrap();
+    let summary = write_bundle_zip(&db, &target, &out, false, false, false)
+        .await
+        .unwrap();
     assert_eq!(summary.session_count, 1);
     assert!(summary.byte_len > 0);
     assert!(out.exists());
 
     // Clobber guard: a second write with `overwrite = false` is refused.
-    let err = write_bundle_zip(&db, &target, &out, false, false, false).unwrap_err();
+    let err = write_bundle_zip(&db, &target, &out, false, false, false)
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("already exists"));
 
     // Overwrite mode replaces the file unconditionally (TUI path).
-    let again = write_bundle_zip(&db, &target, &out, true, false, false).unwrap();
+    let again = write_bundle_zip(&db, &target, &out, true, false, false)
+        .await
+        .unwrap();
     assert_eq!(again.session_count, 1);
     assert!(out.exists());
 }
@@ -2691,7 +2795,7 @@ fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
 /// Insert one captured inference call: an `inference_calls` row (carrying
 /// the `is_utility` flag), the request payload, and the timeline event the
 /// export iterates. Returns the call_id.
-fn add_inference_call(db: &Db, sid: Uuid, agent: &str, is_utility: bool) -> Uuid {
+async fn add_inference_call(db: &Db, sid: Uuid, agent: &str, is_utility: bool) -> Uuid {
     let call_id = Uuid::new_v4();
     db.insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
         call_id,
@@ -2708,6 +2812,7 @@ fn add_inference_call(db: &Db, sid: Uuid, agent: &str, is_utility: bool) -> Uuid
         cost_usd_micros: None,
         is_utility,
     })
+    .await
     .unwrap();
     db.insert_inference_request(
         &call_id.to_string(),
@@ -2715,6 +2820,7 @@ fn add_inference_call(db: &Db, sid: Uuid, agent: &str, is_utility: bool) -> Uuid
         &json!({"model": "m", "system": "s", "tools": [], "history": []}),
         crate::db::session_log::InferenceRequestStatus::Completed,
     )
+    .await
     .unwrap();
     db.insert_session_event(
         sid,
@@ -2723,6 +2829,7 @@ fn add_inference_call(db: &Db, sid: Uuid, agent: &str, is_utility: bool) -> Uuid
         Some(&call_id.to_string()),
         &json!({}),
     )
+    .await
     .unwrap();
     call_id
 }
@@ -2730,18 +2837,18 @@ fn add_inference_call(db: &Db, sid: Uuid, agent: &str, is_utility: bool) -> Uuid
 /// A utility-flagged inference call lands in `inference_requests_utility/`
 /// while a regular one lands in `inference_requests/`, and each
 /// `events.json` `file` reference points at the correct folder.
-#[test]
-fn export_splits_utility_and_regular_inference_requests() {
+#[tokio::test]
+async fn export_splits_utility_and_regular_inference_requests() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
 
-    let regular = add_inference_call(&db, sid, "Build", false);
-    let utility = add_inference_call(&db, sid, "Build", true);
+    let regular = add_inference_call(&db, sid, "Build", false).await;
+    let utility = add_inference_call(&db, sid, "Build", true).await;
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
 
     let names = entry_names(&zip);
     let regular_files: Vec<&String> = names
@@ -2790,15 +2897,15 @@ fn export_splits_utility_and_regular_inference_requests() {
 /// model), each holding `{ provider, model, status, request, response,
 /// usage }`; a `tandem_inference` event links each back to the main call.
 /// An in-flight (`pending`) tandem record exports without blocking.
-#[test]
-fn export_includes_tandem_sibling_dir_and_events() {
+#[tokio::test]
+async fn export_includes_tandem_sibling_dir_and_events() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
 
     // One main call, shadowed by two tandem models — one settled, one
     // still pending.
-    let main = add_inference_call(&db, sid, "Build", false);
+    let main = add_inference_call(&db, sid, "Build", false).await;
     db.upsert_tandem_inference(
         "tan-a",
         sid,
@@ -2828,9 +2935,9 @@ fn export_includes_tandem_sibling_dir_and_events() {
     )
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
 
     let names = entry_names(&zip);
     let tandem_files: Vec<&String> = names
@@ -2884,10 +2991,10 @@ fn export_includes_tandem_sibling_dir_and_events() {
     );
 }
 
-#[test]
-fn export_sanitizes_tandem_parent_call_id_filename_segment() {
+#[tokio::test]
+async fn export_sanitizes_tandem_parent_call_id_filename_segment() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
     let parent_call_id = "main/../../call:id?";
 
@@ -2898,6 +3005,7 @@ fn export_sanitizes_tandem_parent_call_id_filename_segment() {
         Some(parent_call_id),
         &json!({}),
     )
+    .await
     .unwrap();
     db.upsert_tandem_inference(
         "tan-unsafe-parent",
@@ -2914,9 +3022,9 @@ fn export_sanitizes_tandem_parent_call_id_filename_segment() {
     )
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let names = entry_names(&zip);
     let tandem_files: Vec<&String> = names
         .iter()
@@ -2941,8 +3049,8 @@ fn export_sanitizes_tandem_parent_call_id_filename_segment() {
     assert!(read_zip_entry(&zip, file).is_some());
 }
 
-#[test]
-fn tandem_validation_marks_valid_read_tree_search_calls() {
+#[tokio::test]
+async fn tandem_validation_marks_valid_read_tree_search_calls() {
     let request = request_with_tools(vec![
         tool_def("read", crate::tools::read::ReadTool.parameters()),
         tool_def("tree", crate::tools::intel::TreeTool.parameters()),
@@ -2961,8 +3069,8 @@ fn tandem_validation_marks_valid_read_tree_search_calls() {
     assert!(rows.iter().all(|r| r["available"] == true));
 }
 
-#[test]
-fn tandem_validation_distinguishes_unavailable_and_unknown_tools() {
+#[tokio::test]
+async fn tandem_validation_distinguishes_unavailable_and_unknown_tools() {
     let request = request_with_tools(vec![tool_def(
         "read",
         crate::tools::read::ReadTool.parameters(),
@@ -2980,8 +3088,8 @@ fn tandem_validation_distinguishes_unavailable_and_unknown_tools() {
     assert_eq!(rows[1]["status"], "invalid_tool");
 }
 
-#[test]
-fn tandem_validation_marks_invalid_schema() {
+#[tokio::test]
+async fn tandem_validation_marks_invalid_schema() {
     let request = request_with_tools(vec![tool_def(
         "read",
         crate::tools::read::ReadTool.parameters(),
@@ -2997,8 +3105,8 @@ fn tandem_validation_marks_invalid_schema() {
     assert!(rows[0]["reasons"][0].as_str().unwrap().contains("`path`"));
 }
 
-#[test]
-fn tandem_validation_applies_bash_session_boundary_without_running() {
+#[tokio::test]
+async fn tandem_validation_applies_bash_session_boundary_without_running() {
     let request = request_with_tools(vec![tool_def(
         "bash",
         crate::tools::bash::BashTool::new().parameters(),
@@ -3027,8 +3135,8 @@ fn tandem_validation_applies_bash_session_boundary_without_running() {
     assert_eq!(rows[2]["status"], "would_require_approval");
 }
 
-#[test]
-fn tandem_validation_classifies_write_and_lock_capable_tools() {
+#[tokio::test]
+async fn tandem_validation_classifies_write_and_lock_capable_tools() {
     let request = request_with_tools(vec![tool_def(
         "writeunlock",
         crate::tools::writeunlock::WriteunlockTool.parameters(),
@@ -3044,12 +3152,12 @@ fn tandem_validation_classifies_write_and_lock_capable_tools() {
     assert_eq!(rows[0]["schema_valid"], true);
 }
 
-#[test]
-fn export_includes_tandem_tool_call_validation_in_file_and_event() {
+#[tokio::test]
+async fn export_includes_tandem_tool_call_validation_in_file_and_event() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "Build");
+    let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
-    let main = add_inference_call(&db, sid, "Build", false);
+    let main = add_inference_call(&db, sid, "Build", false).await;
 
     db.upsert_tandem_inference(
         "tan-validated",
@@ -3071,9 +3179,9 @@ fn export_includes_tandem_tool_call_validation_in_file_and_event() {
     )
     .unwrap();
 
-    let target = get_test_session(&db, sid);
-    let bundle = collect_bundle(&db, sid).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let file = entry_names(&zip)
         .into_iter()
         .find(|n| n.starts_with("inference_requests_tandem/"))
@@ -3094,13 +3202,13 @@ fn export_includes_tandem_tool_call_validation_in_file_and_event() {
 
 /// `manifest.json` carries the running cockpit version and the target
 /// session's date as both an ISO-8601 string and the raw epoch value.
-#[test]
-fn manifest_has_version_and_session_date() {
+#[tokio::test]
+async fn manifest_has_version_and_session_date() {
     let db = Db::open_in_memory().unwrap();
-    let s = create_test_session(&db, "p", "/proj", "builder");
-    let target = get_test_session(&db, s.session_id);
-    let bundle = collect_bundle(&db, s.session_id).unwrap();
-    let zip = build_zip(&db, &target, &bundle).unwrap();
+    let s = create_test_session(&db, "p", "/proj", "builder").await;
+    let target = get_test_session(&db, s.session_id).await;
+    let bundle = collect_bundle(&db, s.session_id).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
 
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
@@ -3129,6 +3237,7 @@ fn manifest_has_version_and_session_date() {
         },
         &test_export_env(),
     )
+    .await
     .unwrap();
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
@@ -3152,7 +3261,7 @@ fn write_manifest_active_model_config(root: &Path, provider: &str, model: &str) 
     .unwrap();
 }
 
-fn build_zip_with_config_override(
+async fn build_zip_with_config_override(
     db: &Db,
     target: &SessionRow,
     bundle: &[SessionRow],
@@ -3164,25 +3273,27 @@ fn build_zip_with_config_override(
         config_path.to_string_lossy().into_owned(),
     );
     build_zip_with_options_and_env(db, target, bundle, ExportBundleOptions::default(), &env)
+        .await
         .unwrap()
 }
 
-#[test]
-fn export_manifest_includes_session_and_config_active_model() {
+#[tokio::test]
+async fn export_manifest_includes_session_and_config_active_model() {
     let tmp = tempfile::TempDir::new().unwrap();
     write_manifest_active_model_config(tmp.path(), "provider-a", "model-a");
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
     session.set_active_model("provider-a", "model-a").unwrap();
 
-    let target = get_test_session(&db, session.id);
-    let bundle = collect_bundle(&db, session.id).unwrap();
+    let target = get_test_session(&db, session.id).await;
+    let bundle = collect_bundle(&db, session.id).await.unwrap();
     let zip = build_zip_with_config_override(
         &db,
         &target,
         &bundle,
         &tmp.path().join(".cockpit/config.json"),
-    );
+    )
+    .await;
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
 
@@ -3197,22 +3308,23 @@ fn export_manifest_includes_session_and_config_active_model() {
     assert_eq!(manifest["target"]["active_model_diverged"], false);
 }
 
-#[test]
-fn export_manifest_flags_active_model_divergence() {
+#[tokio::test]
+async fn export_manifest_flags_active_model_divergence() {
     let tmp = tempfile::TempDir::new().unwrap();
     write_manifest_active_model_config(tmp.path(), "provider-b", "model-b");
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
     session.set_active_model("provider-a", "model-a").unwrap();
 
-    let target = get_test_session(&db, session.id);
-    let bundle = collect_bundle(&db, session.id).unwrap();
+    let target = get_test_session(&db, session.id).await;
+    let bundle = collect_bundle(&db, session.id).await.unwrap();
     let zip = build_zip_with_config_override(
         &db,
         &target,
         &bundle,
         &tmp.path().join(".cockpit/config.json"),
-    );
+    )
+    .await;
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
 
@@ -3227,21 +3339,22 @@ fn export_manifest_flags_active_model_divergence() {
     assert_eq!(manifest["target"]["active_model_diverged"], true);
 }
 
-#[test]
-fn export_manifest_active_model_without_config_is_null() {
+#[tokio::test]
+async fn export_manifest_active_model_without_config_is_null() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
     session.set_active_model("provider-a", "model-a").unwrap();
 
-    let target = get_test_session(&db, session.id);
-    let bundle = collect_bundle(&db, session.id).unwrap();
+    let target = get_test_session(&db, session.id).await;
+    let bundle = collect_bundle(&db, session.id).await.unwrap();
     let zip = build_zip_with_config_override(
         &db,
         &target,
         &bundle,
         &tmp.path().join(".cockpit/missing-config.json"),
-    );
+    )
+    .await;
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
 
@@ -3256,8 +3369,8 @@ fn export_manifest_active_model_without_config_is_null() {
 /// The `config/` folder holds the deep-merged effective config plus raw
 /// per-layer copies, with secrets scrubbed by the redaction table. The
 /// closer (project) layer wins the deep merge.
-#[test]
-fn config_entries_deep_merge_raw_layers_and_redaction() {
+#[tokio::test]
+async fn config_entries_deep_merge_raw_layers_and_redaction() {
     use crate::config::dirs::{ConfigDir, ConfigDirKind};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -3342,8 +3455,8 @@ fn config_entries_deep_merge_raw_layers_and_redaction() {
     assert!(raw_config.contains(&redactor.scrub("SUPER_SECRET_VALUE")));
 }
 
-#[test]
-fn config_entries_exclude_generated_artifacts_by_default() {
+#[tokio::test]
+async fn config_entries_exclude_generated_artifacts_by_default() {
     use crate::config::dirs::{ConfigDir, ConfigDirKind};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -3383,8 +3496,8 @@ fn config_entries_exclude_generated_artifacts_by_default() {
     assert!(kept.contains(&redactor.scrub("SUPER_SECRET_VALUE")));
 }
 
-#[test]
-fn config_entries_include_generated_artifacts_when_requested() {
+#[tokio::test]
+async fn config_entries_include_generated_artifacts_when_requested() {
     use crate::config::dirs::{ConfigDir, ConfigDirKind};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -3407,8 +3520,8 @@ fn config_entries_include_generated_artifacts_when_requested() {
     );
 }
 
-#[test]
-fn config_entries_structurally_redact_config_and_provider_secrets_without_redactor() {
+#[tokio::test]
+async fn config_entries_structurally_redact_config_and_provider_secrets_without_redactor() {
     use crate::config::dirs::{ConfigDir, ConfigDirKind};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -3459,8 +3572,8 @@ fn config_entries_structurally_redact_config_and_provider_secrets_without_redact
     assert!(map["config/effective-providers.json"].contains("[REDACTED]"));
 }
 
-#[test]
-fn config_entries_sanitize_mcp_config_structurally() {
+#[tokio::test]
+async fn config_entries_sanitize_mcp_config_structurally() {
     use crate::config::dirs::{ConfigDir, ConfigDirKind};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -3519,8 +3632,8 @@ fn config_entries_sanitize_mcp_config_structurally() {
 
 /// No config layers anywhere → a marker entry, never an empty `config/`
 /// nor a failure.
-#[test]
-fn config_entries_missing_config_writes_marker() {
+#[tokio::test]
+async fn config_entries_missing_config_writes_marker() {
     let entries = config_entries_from_layers(&[], &RedactionTable::empty(), false);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].0, "config/NO-CONFIG-FOUND.txt");

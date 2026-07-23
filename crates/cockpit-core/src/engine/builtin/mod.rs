@@ -4717,8 +4717,8 @@ mod tests {
         assert!(names.contains(&"webfetch"));
     }
 
-    #[test]
-    fn can_delegate_false_hides_delegation_tools() {
+    #[tokio::test]
+    async fn can_delegate_false_hides_delegation_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args_with_provider_can_delegate(tmp.path(), Some(false));
         let agent = build(&args);
@@ -4741,8 +4741,8 @@ mod tests {
         assert!(!names.contains(&"spawn"), "{names:?}");
     }
 
-    #[test]
-    fn can_delegate_unset_keeps_delegation_tools() {
+    #[tokio::test]
+    async fn can_delegate_unset_keeps_delegation_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args_with_provider_can_delegate(tmp.path(), None);
         let agent = build(&args);
@@ -4765,8 +4765,8 @@ mod tests {
         assert!(!names.contains(&"spawn"), "{names:?}");
     }
 
-    #[test]
-    fn can_delegate_gates_subagent_turns() {
+    #[tokio::test]
+    async fn can_delegate_gates_subagent_turns() {
         // Subagent and primary turns share `turn_toolbox`; proving the filter
         // there covers every spawned child before the model sees its tools.
         let tmp = tempfile::tempdir().unwrap();

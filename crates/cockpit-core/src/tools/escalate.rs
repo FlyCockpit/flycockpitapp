@@ -88,7 +88,8 @@ impl Tool for EscalateTool {
         let Some(row) = ctx
             .session
             .db
-            .get_tool_call_by_call_id(ctx.session.id, call_id)?
+            .get_tool_call_by_call_id(ctx.session.id, call_id)
+            .await?
         else {
             return Err(invalid_input(format!(
                 "unknown tool call id `{call_id}` in this session"
@@ -237,7 +238,9 @@ async fn approval_for_escalation(
                     .command_standing_reject_scope(command)
                     .map(|scope| (approver, scope))
             }) {
-                approver.record_standing_reject_decision("bash", command, scope);
+                approver
+                    .record_standing_reject_decision("bash", command, scope)
+                    .await;
                 return Ok(EscalationApproval::StandingReject { scope });
             }
             let (extended, providers) = ctx.config.configs();
@@ -269,7 +272,9 @@ async fn prompt_user(
         return Ok(EscalationApproval::Deny);
     };
     if let Some(scope) = approver.command_standing_reject_scope(command) {
-        approver.record_standing_reject_decision("bash", command, scope);
+        approver
+            .record_standing_reject_decision("bash", command, scope)
+            .await;
         return Ok(EscalationApproval::StandingReject { scope });
     }
     let confined_exit = row.exit_code.unwrap_or(1);
@@ -305,7 +310,7 @@ mod tests {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    fn record_bash_call(ctx: &ToolCtx, call_id: &str, exit_code: Option<i32>) {
+    async fn record_bash_call(ctx: &ToolCtx, call_id: &str, exit_code: Option<i32>) {
         ctx.session
             .record_tool_call(ToolCallRow {
                 event_id: Uuid::new_v4(),
@@ -333,6 +338,7 @@ mod tests {
                 shape_fingerprint: None,
                 hint: None,
             })
+            .await
             .unwrap();
     }
 
@@ -396,8 +402,8 @@ mod tests {
         })
     }
 
-    #[test]
-    fn escalate_has_no_defensive_variants() {
+    #[tokio::test]
+    async fn escalate_has_no_defensive_variants() {
         assert!(EscalateTool.defensive_description().is_none());
         assert!(EscalateTool.defensive_parameters().is_none());
     }
@@ -419,11 +425,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (ctx, approver, db, session_id, hub) = ctx_with_approver(tmp.path());
         ctx.session.set_sandbox_escalation_enabled(true);
-        record_bash_call(&ctx, "call-route", Some(1));
+        record_bash_call(&ctx, "call-route", Some(1)).await;
         let row = ctx
             .session
             .db
             .get_tool_call_by_call_id(ctx.session.id, "call-route")
+            .await
             .unwrap()
             .expect("stored row");
         let offer = crate::approval::SandboxEscalationGrantOffer {
@@ -505,7 +512,7 @@ mod tests {
         ctx.session
             .set_approval_mode(crate::config::extended::ApprovalMode::Auto);
         ctx.session.set_sandbox_escalation_enabled(true);
-        record_bash_call(&ctx, "call-standing-reject", Some(1));
+        record_bash_call(&ctx, "call-standing-reject", Some(1)).await;
         let classification = crate::approval::classify::classify("printf escalated");
         let info = classification.simple_commands().iter().next().unwrap();
         approver
@@ -529,6 +536,7 @@ mod tests {
             .session
             .db
             .list_session_events(ctx.session.id)
+            .await
             .unwrap()
             .into_iter()
             .find(|event| event.kind == "permission_decision")
@@ -547,7 +555,7 @@ mod tests {
             .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
         ctx.session.set_sandbox_enabled(true);
         ctx.session.set_sandbox_escalation_enabled(true);
-        record_bash_call(&ctx, "call-esc-1", Some(1));
+        record_bash_call(&ctx, "call-esc-1", Some(1)).await;
 
         let out = EscalateTool
             .call(json!({ "call_id": "call-esc-1" }), &ctx)
@@ -559,16 +567,17 @@ mod tests {
         assert!(!sandbox.confined);
     }
 
-    #[test]
-    fn lookup_round_trips_typed_sandbox_failure_columns() {
+    #[tokio::test]
+    async fn lookup_round_trips_typed_sandbox_failure_columns() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
-        record_bash_call(&ctx, "call-lookup", Some(13));
+        record_bash_call(&ctx, "call-lookup", Some(13)).await;
 
         let row = ctx
             .session
             .db
             .get_tool_call_by_call_id(ctx.session.id, "call-lookup")
+            .await
             .unwrap()
             .expect("stored row");
         assert_eq!(row.exit_code, Some(13));
@@ -577,8 +586,8 @@ mod tests {
         assert!(row.sandbox_unavailable_reason.is_none());
     }
 
-    #[test]
-    fn suggested_paths_resolve_against_failed_call_cwd_and_are_capped() {
+    #[tokio::test]
+    async fn suggested_paths_resolve_against_failed_call_cwd_and_are_capped() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().join("subdir");
         let offer = validate_grant_offer(
@@ -597,8 +606,8 @@ mod tests {
         assert!(format!("{err}").contains("at most"));
     }
 
-    #[test]
-    fn base_description_carries_suggested_paths_guidance() {
+    #[tokio::test]
+    async fn base_description_carries_suggested_paths_guidance() {
         let tool = EscalateTool;
         let normal = crate::engine::tool::definition_of(
             &tool,

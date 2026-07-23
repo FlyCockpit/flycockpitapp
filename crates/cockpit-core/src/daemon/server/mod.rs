@@ -1933,7 +1933,9 @@ fn run_boot_housekeeping(db: &Db) {
     // Drop autocomplete-tally rows that have aged out of the 30-day
     // window. Best-effort — a prune failure shouldn't block boot.
     let before = chrono::Utc::now().timestamp() - crate::db::usage_events::USAGE_WINDOW_SECS;
-    if let Err(e) = db.prune_usage_events(before) {
+    if let Err(e) = db.blocking_write_for_sync_maintenance(move |conn| {
+        crate::db::usage_events::prune_usage_events_conn(conn, before)
+    }) {
         tracing::warn!(error = %e, "pruning usage_events on boot failed");
     }
     // SIGKILL backstop for `/side`: a side conversation whose owning process

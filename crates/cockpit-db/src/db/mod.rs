@@ -510,12 +510,58 @@ impl Db {
         self.write_blocking_unguarded(f)
     }
 
+    /// Blocking read access for synchronous TUI render/input edges.
+    ///
+    /// This uses the read pool for file-backed databases and never touches
+    /// the writer connection. Async application code should still use
+    /// [`Self::read`]; this exists for synchronous UI paths that cannot
+    /// await while rendering or handling input.
+    pub fn blocking_read_for_sync_ui<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        self.read_blocking_unguarded(f)
+    }
+
+    /// Blocking write access for synchronous event fanout callbacks.
+    ///
+    /// This is intentionally narrower than [`Self::blocking_for_sync_cli`]:
+    /// it exists for call stacks that must synchronously broadcast an event
+    /// and persist its audit row from a non-async callback.
+    pub fn blocking_write_for_sync_event<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.write_blocking_unguarded(f)
+    }
+
+    /// Blocking write access for synchronous startup maintenance.
+    ///
+    /// Startup housekeeping is called before the daemon context is fully
+    /// assembled, while some tests exercise it from an async harness. Keep
+    /// this out of regular async code; prefer [`Self::write`] there.
+    pub fn blocking_write_for_sync_maintenance<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.write_blocking_unguarded(f)
+    }
+
     /// Explicit blocking read access for legacy synchronous paths.
     /// Async code should prefer [`Self::read`]. Removed by `db-blocking-api-removal`.
     #[deprecated(
         note = "temporary db-async-foundation bridge; migrate to Db::read/Db::write before db-blocking-api-removal"
     )]
     pub fn read_blocking<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        self.read_blocking_unguarded(f)
+    }
+
+    fn read_blocking_unguarded<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T>,
     {

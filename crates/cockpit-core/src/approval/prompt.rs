@@ -86,7 +86,8 @@ impl Approver {
                 &loop_offered,
                 repeat_to_decision(repeat),
                 DecisionSource::LoopGuardRule,
-            );
+            )
+            .await;
             return Ok(repeat);
         }
 
@@ -99,7 +100,8 @@ impl Approver {
                 &loop_offered,
                 Decision::Deny,
                 DecisionSource::HeadlessAutoReject,
-            );
+            )
+            .await;
             return Ok(RepeatDecision::Reject);
         }
 
@@ -129,7 +131,8 @@ impl Approver {
             &loop_offered,
             repeat_to_decision(repeat),
             DecisionSource::UserPrompt,
-        );
+        )
+        .await;
         Ok(repeat)
     }
 

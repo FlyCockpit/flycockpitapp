@@ -30,7 +30,8 @@ impl Approver {
                 &[],
                 Decision::Deny,
                 DecisionSource::StandingReject,
-            );
+            )
+            .await;
             return Ok(Decision::Deny);
         }
         if self.store.is_path_granted_for(path, required) {
@@ -43,7 +44,8 @@ impl Approver {
                 &[],
                 decision,
                 DecisionSource::AlreadyGranted,
-            );
+            )
+            .await;
             return Ok(decision);
         }
         // Paths are never wrappers → all four scopes are offered.
@@ -89,7 +91,8 @@ impl Approver {
             &offered,
             decision,
             DecisionSource::UserPrompt,
-        );
+        )
+        .await;
         Ok(decision)
     }
 
@@ -125,7 +128,8 @@ impl Approver {
                     &[],
                     Decision::NoninteractiveDeny,
                     DecisionSource::HeadlessAutoReject,
-                );
+                )
+                .await;
                 return Ok(GitignoreReadOutcome::NoninteractiveReject);
             }
             GitignoreShape::Reject => {
@@ -135,7 +139,8 @@ impl Approver {
                     &[],
                     Decision::Deny,
                     DecisionSource::UserPrompt,
-                );
+                )
+                .await;
                 return Ok(GitignoreReadOutcome::Reject);
             }
             GitignoreShape::File => file_glob.to_string(),
@@ -174,7 +179,8 @@ impl Approver {
             &offered,
             decision,
             DecisionSource::UserPrompt,
-        );
+        )
+        .await;
         Ok(outcome)
     }
 

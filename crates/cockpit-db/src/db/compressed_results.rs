@@ -1,7 +1,7 @@
 //! Durable store for retrievable compressed tool results.
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -44,7 +44,7 @@ pub fn compressed_result_hash(content: &str) -> String {
 }
 
 impl Db {
-    pub fn insert_compressed_tool_result(
+    pub async fn insert_compressed_tool_result(
         &self,
         hash: &str,
         entry: NewCompressedToolResult<'_>,
@@ -71,20 +71,17 @@ impl Db {
             kind,
             content,
         }])
+        .await
     }
 
     /// Atomically persist every recoverable original needed by one private
     /// prune transform. Compaction uses this only after its handoff plan fits,
     /// so an aborted compaction leaves neither partial rows nor false markers.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn insert_compressed_tool_results(
+    pub async fn insert_compressed_tool_results(
         &self,
         entries: Vec<CompressedToolResultEntry>,
     ) -> Result<()> {
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("starting compressed_tool_results batch")?;
@@ -129,18 +126,16 @@ impl Db {
             tx.commit()
                 .context("committing compressed_tool_results batch")
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn compressed_tool_result(
+    pub async fn compressed_tool_result(
         &self,
         session_id: Uuid,
         hash: &str,
     ) -> Result<Option<CompressedToolResultEntry>> {
-        self.read_blocking(|conn| {
+        let hash = hash.to_string();
+        self.read(move |conn| {
             conn.query_row(
                 "SELECT hash, session_id, agent_id, tool, call_id,
                         original_byte_len, compressed_byte_len, created_at, kind, content
@@ -152,14 +147,11 @@ impl Db {
             .optional()
             .context("querying compressed_tool_result")
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn session_has_compressed_tool_results(&self, session_id: Uuid) -> Result<bool> {
-        self.read_blocking(|conn| {
+    pub async fn session_has_compressed_tool_results(&self, session_id: Uuid) -> Result<bool> {
+        self.read(move |conn| {
             let exists: i64 = conn
                 .query_row(
                     "SELECT EXISTS(
@@ -171,35 +163,38 @@ impl Db {
                 .context("checking compressed_tool_results presence")?;
             Ok(exists != 0)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_compressed_tool_results(
+    pub async fn list_compressed_tool_results(
         &self,
         session_id: Uuid,
     ) -> Result<Vec<CompressedToolResultEntry>> {
-        self.read_blocking(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT hash, session_id, agent_id, tool, call_id,
-                            original_byte_len, compressed_byte_len, created_at, kind, content
-                       FROM compressed_tool_results
-                      WHERE session_id = ?1
-                      ORDER BY created_at ASC, rowid ASC",
-                )
-                .context("preparing list_compressed_tool_results")?;
-            let rows = stmt
-                .query_map([session_id.to_string()], decode_entry)
-                .context("querying compressed_tool_results")?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.context("decoding compressed_tool_result")?);
-            }
-            Ok(out)
-        })
+        self.read(move |conn| Self::list_compressed_tool_results_conn(conn, session_id))
+            .await
+    }
+
+    pub fn list_compressed_tool_results_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<Vec<CompressedToolResultEntry>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT hash, session_id, agent_id, tool, call_id,
+                        original_byte_len, compressed_byte_len, created_at, kind, content
+                   FROM compressed_tool_results
+                  WHERE session_id = ?1
+                  ORDER BY created_at ASC, rowid ASC",
+            )
+            .context("preparing list_compressed_tool_results")?;
+        let rows = stmt
+            .query_map([session_id.to_string()], decode_entry)
+            .context("querying compressed_tool_results")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding compressed_tool_result")?);
+        }
+        Ok(out)
     }
 }
 
@@ -246,6 +241,7 @@ mod tests {
                 content: "redacted\n",
             },
         )
+        .await
         .unwrap();
         db.insert_compressed_tool_result(
             hash,
@@ -261,15 +257,18 @@ mod tests {
                 content: "redacted\n",
             },
         )
+        .await
         .unwrap();
 
         let row = db
             .compressed_tool_result(session.session_id, hash)
+            .await
             .unwrap()
             .expect("stored");
         assert_eq!(row.content, "redacted\n");
         assert!(
             db.session_has_compressed_tool_results(session.session_id)
+                .await
                 .unwrap()
         );
 
@@ -288,6 +287,7 @@ mod tests {
                     content: "other",
                 },
             )
+            .await
             .unwrap_err();
         assert!(err.to_string().contains("hash collision"));
     }

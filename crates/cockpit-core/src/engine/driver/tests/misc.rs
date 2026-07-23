@@ -62,7 +62,7 @@ async fn stale_shadow_discarded() {
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
     append_complete_test_turns(&mut driver, 1);
     install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
-    record_test_context_tokens(&driver, 55);
+    record_test_context_tokens(&driver, 55).await;
     assert!(driver.maybe_shadow_brief(&tx).await);
     wait_for_shadow_brief(&mut driver).await;
     append_complete_test_turns(&mut driver, 9);
@@ -70,7 +70,7 @@ async fn stale_shadow_discarded() {
     driver.do_compact(&tx).await;
     drop(tx);
     while rx.recv().await.is_some() {}
-    let purposes = compact_inference_purposes(&driver);
+    let purposes = compact_inference_purposes(&driver).await;
     assert!(purposes.iter().any(|p| p == "compact_shadow_brief"));
     assert!(purposes.iter().any(|p| p == "compact_brief"));
     assert!(!purposes.iter().any(|p| p == "compact_brief_delta"));

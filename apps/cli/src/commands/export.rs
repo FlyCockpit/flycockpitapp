@@ -18,7 +18,7 @@ use crate::db::sessions::SessionRow;
 
 pub async fn run(args: ExportArgs) -> Result<()> {
     let db = Db::open_default()?;
-    let target = resolve_target_session(&db, &args)?;
+    let target = resolve_target_session(&db, &args).await?;
 
     // Collect the target plus all descendant forks and `/compact`
     // successor sessions, then assemble the archive. The walk is cheap
@@ -43,7 +43,8 @@ pub async fn run(args: ExportArgs) -> Result<()> {
         args.force,
         args.include_generated,
         args.include_sensitive,
-    )?;
+    )
+    .await?;
 
     println!(
         "Exported session `{}` ({} session{}, {} bytes) → {}",
@@ -56,7 +57,7 @@ pub async fn run(args: ExportArgs) -> Result<()> {
     Ok(())
 }
 
-fn resolve_target_session(db: &Db, args: &ExportArgs) -> Result<SessionRow> {
+async fn resolve_target_session(db: &Db, args: &ExportArgs) -> Result<SessionRow> {
     let ident = args
         .session_id
         .as_deref()
@@ -66,7 +67,7 @@ fn resolve_target_session(db: &Db, args: &ExportArgs) -> Result<SessionRow> {
             CommandUsageError::new("a session identifier (`short_id` or UUID) is required")
         })?;
 
-    match resolve_session(db, ident)? {
+    match resolve_session(db, ident).await? {
         Ok(row) => Ok(row),
         Err(message) => Err(CommandUsageError::new(message).into()),
     }
@@ -76,8 +77,8 @@ fn resolve_target_session(db: &Db, args: &ExportArgs) -> Result<SessionRow> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn export_missing_identifier_returns_typed_usage_error() {
+    #[tokio::test]
+    async fn export_missing_identifier_returns_typed_usage_error() {
         let db = Db::open_in_memory().unwrap();
         let err = resolve_target_session(
             &db,
@@ -89,6 +90,7 @@ mod tests {
                 include_sensitive: false,
             },
         )
+        .await
         .unwrap_err();
         let usage = err
             .downcast_ref::<CommandUsageError>()
@@ -99,8 +101,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn export_unknown_identifier_returns_typed_usage_error() {
+    #[tokio::test]
+    async fn export_unknown_identifier_returns_typed_usage_error() {
         let db = Db::open_in_memory().unwrap();
         let err = resolve_target_session(
             &db,
@@ -112,6 +114,7 @@ mod tests {
                 include_sensitive: false,
             },
         )
+        .await
         .unwrap_err();
         let usage = err
             .downcast_ref::<CommandUsageError>()
@@ -119,14 +122,10 @@ mod tests {
         assert_eq!(usage.message(), "no session with short id `zzzzzz`");
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
-    fn export_ambiguous_identifier_returns_typed_usage_error() {
+    #[tokio::test]
+    async fn export_ambiguous_identifier_returns_typed_usage_error() {
         let db = Db::open_in_memory().unwrap();
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             let a = crate::db::Db::insert_session_row_conn(
                 conn,
                 &crate::db::Db::build_new_session_row_conn(conn, "p1", "/x", "builder")?,
@@ -141,6 +140,7 @@ mod tests {
             )?;
             Ok(())
         })
+        .await
         .unwrap();
 
         let err = resolve_target_session(
@@ -153,6 +153,7 @@ mod tests {
                 include_sensitive: false,
             },
         )
+        .await
         .unwrap_err();
         let usage = err
             .downcast_ref::<CommandUsageError>()

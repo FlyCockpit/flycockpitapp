@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -142,19 +142,25 @@ impl Db {
         task_call_id: &str,
         label: &str,
     ) -> Result<Option<TaskDelegationPayloadRow>> {
-        self.read_blocking(|conn| {
-            conn.query_row(
-                "SELECT task_call_id, label, payload_hash, parent_session_id,
-                        parent_agent, function_call_id, child_agent, prompt_byte_len,
-                        body_inline, sidecar_path, created_at, delivered_at
-                   FROM task_delegation_payloads
-                  WHERE task_call_id = ?1 AND label = ?2",
-                params![task_call_id, label],
-                decode_payload_row,
-            )
-            .optional()
-            .context("querying task delegation payload")
-        })
+        self.read_blocking(|conn| Self::task_delegation_payload_conn(conn, task_call_id, label))
+    }
+
+    pub fn task_delegation_payload_conn(
+        conn: &Connection,
+        task_call_id: &str,
+        label: &str,
+    ) -> Result<Option<TaskDelegationPayloadRow>> {
+        conn.query_row(
+            "SELECT task_call_id, label, payload_hash, parent_session_id,
+                    parent_agent, function_call_id, child_agent, prompt_byte_len,
+                    body_inline, sidecar_path, created_at, delivered_at
+               FROM task_delegation_payloads
+              WHERE task_call_id = ?1 AND label = ?2",
+            params![task_call_id, label],
+            decode_payload_row,
+        )
+        .optional()
+        .context("querying task delegation payload")
     }
 
     #[expect(
@@ -258,26 +264,31 @@ impl Db {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<TaskDelegationPayloadRow>> {
-        self.read_blocking(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT task_call_id, label, payload_hash, parent_session_id,
-                            parent_agent, function_call_id, child_agent, prompt_byte_len,
-                            body_inline, sidecar_path, created_at, delivered_at
-                       FROM task_delegation_payloads
-                      WHERE parent_session_id = ?1
-                      ORDER BY created_at ASC, task_call_id ASC, label ASC",
-                )
-                .context("preparing task delegation payload list")?;
-            let rows = stmt
-                .query_map([session_id.to_string()], decode_payload_row)
-                .context("querying task delegation payloads")?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.context("decoding task delegation payload")?);
-            }
-            Ok(out)
-        })
+        self.read_blocking(|conn| Self::list_task_delegation_payloads_conn(conn, session_id))
+    }
+
+    pub fn list_task_delegation_payloads_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<Vec<TaskDelegationPayloadRow>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_call_id, label, payload_hash, parent_session_id,
+                        parent_agent, function_call_id, child_agent, prompt_byte_len,
+                        body_inline, sidecar_path, created_at, delivered_at
+                   FROM task_delegation_payloads
+                  WHERE parent_session_id = ?1
+                  ORDER BY created_at ASC, task_call_id ASC, label ASC",
+            )
+            .context("preparing task delegation payload list")?;
+        let rows = stmt
+            .query_map([session_id.to_string()], decode_payload_row)
+            .context("querying task delegation payloads")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding task delegation payload")?);
+        }
+        Ok(out)
     }
 
     pub fn task_delegation_payload_sidecar_abs_path(

@@ -70,7 +70,8 @@ impl Tool for ToolResultRetrieveTool {
         let Some(entry) = ctx
             .session
             .db
-            .compressed_tool_result(ctx.session.id, hash)?
+            .compressed_tool_result(ctx.session.id, hash)
+            .await?
         else {
             return Ok(ToolOutput::text(format!(
                 "No stored tool result with hash `{hash}` is available in this session."
@@ -186,7 +187,7 @@ mod tests {
             .collect()
     }
 
-    fn store_body(ctx: &ToolCtx, content: &str) {
+    async fn store_body(ctx: &ToolCtx, content: &str) {
         ctx.session
             .db
             .insert_compressed_tool_result(
@@ -203,26 +204,27 @@ mod tests {
                     content,
                 },
             )
+            .await
             .unwrap();
     }
 
     async fn retrieve(content: &str, args: Value) -> ToolOutput {
         let tmp = tempfile::tempdir().unwrap();
         let (ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
-        store_body(&ctx, content);
+        store_body(&ctx, content).await;
         ToolResultRetrieveTool.call(args, &ctx).await.unwrap()
     }
 
-    #[test]
-    fn validates_short_hash() {
+    #[tokio::test]
+    async fn validates_short_hash() {
         assert!(valid_short_hash("0123456789abcdefabcdef12"));
         assert!(!valid_short_hash("0123456789ABCDEFabcdef"));
         assert!(!valid_short_hash("0123456789abcdefabcdef1"));
         assert!(!valid_short_hash("0123456789abcdefabcdeg"));
     }
 
-    #[test]
-    fn renders_line_range() {
+    #[tokio::test]
+    async fn renders_line_range() {
         let output = render_capped_line_range("a\nb\nc\n", 2, 3, OUTPUT_BYTE_CAP, "h");
         assert_eq!(output.content, "b\nc\n");
         assert!(!output.truncated);
@@ -330,8 +332,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tool_result_retrieve_description_drops_redacted_claim() {
+    #[tokio::test]
+    async fn tool_result_retrieve_description_drops_redacted_claim() {
         let tool = ToolResultRetrieveTool;
 
         assert!(!tool.description().contains("redacted"));
@@ -343,8 +345,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tool_result_retrieve_description_shows_marker_shape_and_elided_caveat() {
+    #[tokio::test]
+    async fn tool_result_retrieve_description_shows_marker_shape_and_elided_caveat() {
         let description = ToolResultRetrieveTool
             .defensive_description()
             .expect("defensive description");
@@ -355,8 +357,8 @@ mod tests {
         assert!(description.contains("does not work"));
     }
 
-    #[test]
-    fn tool_result_retrieve_terse_description_names_hash_and_range() {
+    #[tokio::test]
+    async fn tool_result_retrieve_terse_description_names_hash_and_range() {
         let description = ToolResultRetrieveTool.description();
 
         assert_eq!(description.lines().count(), 1);

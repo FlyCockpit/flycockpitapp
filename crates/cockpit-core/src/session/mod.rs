@@ -42,6 +42,7 @@ pub mod export;
 mod gitignore;
 mod lifecycle;
 mod recording;
+pub(crate) use recording::notice_severity;
 pub use recording::{ModelSwitchAudit, ModelSwitchOutcome, ModelSwitchTrigger};
 mod title;
 mod toggles;
@@ -171,6 +172,7 @@ pub struct Session {
     /// activation matches execution, including config tools and grants.
     active_tool_names: Mutex<std::collections::HashSet<String>>,
     active_sandbox_escalate_eligible: AtomicBool,
+    has_retrievable_tool_results: AtomicBool,
     /// 6-char human-display id, unique within `project_id`
     /// (GOALS §17b). Populated at create-time; backfilled lazily for
     /// pre-§17 rows on [`Session::resume`].
@@ -335,6 +337,15 @@ impl Session {
             .iter()
             .cloned()
             .collect()
+    }
+
+    pub fn set_has_retrievable_tool_results(&self) {
+        self.has_retrievable_tool_results
+            .store(true, Ordering::Relaxed);
+    }
+
+    pub fn has_retrievable_tool_results(&self) -> bool {
+        self.has_retrievable_tool_results.load(Ordering::Relaxed)
     }
 
     pub fn model_system_prompt_snapshot(&self) -> Arc<ModelSystemPromptSnapshot> {
@@ -831,8 +842,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn provider_family_resolves_for_non_builtin_provider() {
+    #[tokio::test]
+    async fn provider_family_resolves_for_non_builtin_provider() {
         let providers = providers_config([(
             "openrouter",
             provider_entry(Some("openrouter"), WireApi::Completions),
@@ -850,8 +861,8 @@ mod tests {
         assert_ne!(identity.provider_family.as_deref(), Some("unknown"));
     }
 
-    #[test]
-    fn provider_family_resolves_for_custom_named_provider() {
+    #[tokio::test]
+    async fn provider_family_resolves_for_custom_named_provider() {
         let providers =
             providers_config([("my-llama-box", provider_entry(None, WireApi::Completions))]);
 
@@ -867,8 +878,8 @@ mod tests {
         assert_ne!(identity.provider_family.as_deref(), Some("unknown"));
     }
 
-    #[test]
-    fn builtin_provider_families_are_unchanged() {
+    #[tokio::test]
+    async fn builtin_provider_families_are_unchanged() {
         let providers = providers_config([
             ("openai", provider_entry(Some("openai"), WireApi::Responses)),
             (
@@ -904,8 +915,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unset_provider_is_distinct_from_unknown_provider() {
+    #[tokio::test]
+    async fn unset_provider_is_distinct_from_unknown_provider() {
         let providers = ProvidersConfig::default();
         let unset = identity_for(None, Some("model"), Some(&providers), None, None);
         let unknown = identity_for(
@@ -920,8 +931,8 @@ mod tests {
         assert_eq!(unknown.provider_family.as_deref(), Some("unknown"));
     }
 
-    #[test]
-    fn completions_wire_mirrors_item_id_into_call_id() {
+    #[tokio::test]
+    async fn completions_wire_mirrors_item_id_into_call_id() {
         let identity = identity_for(
             Some("openrouter"),
             Some("model"),
@@ -939,8 +950,8 @@ mod tests {
         assert_eq!(identity.wire_api.as_deref(), Some("completions"));
     }
 
-    #[test]
-    fn mirrored_call_id_never_claims_provider_source() {
+    #[tokio::test]
+    async fn mirrored_call_id_never_claims_provider_source() {
         let identity = identity_for(
             Some("openrouter"),
             Some("model"),
@@ -956,8 +967,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn responses_wire_call_id_sources_are_unchanged() {
+    #[tokio::test]
+    async fn responses_wire_call_id_sources_are_unchanged() {
         let supplied = identity_for(
             Some("codex-oauth"),
             Some("gpt-5"),
@@ -988,8 +999,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wire_api_honors_explicit_config_override() {
+    #[tokio::test]
+    async fn wire_api_honors_explicit_config_override() {
         // `gpt-5-override` under the OpenAI provider would be detected as
         // Responses by the legacy id heuristic; the explicit provider config
         // must win.
@@ -1013,8 +1024,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wire_api_auto_is_reachable_and_recorded() {
+    #[tokio::test]
+    async fn wire_api_auto_is_reachable_and_recorded() {
         let identity = identity_for(
             Some("openai"),
             Some("gpt-5-auto"),
@@ -1028,8 +1039,8 @@ mod tests {
         assert_eq!(identity.provider_call_id_source, None);
     }
 
-    #[test]
-    fn synthetic_call_in_completions_session_is_not_labeled_responses() {
+    #[tokio::test]
+    async fn synthetic_call_in_completions_session_is_not_labeled_responses() {
         let identity =
             ToolCallProviderIdentity::synthetic_cockpit_call("seed-1", Some(WireApi::Completions));
 
@@ -1042,8 +1053,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn synthetic_call_with_unresolved_wire_records_none() {
+    #[tokio::test]
+    async fn synthetic_call_with_unresolved_wire_records_none() {
         let identity = ToolCallProviderIdentity::synthetic_cockpit_call("seed-1", None);
 
         assert_eq!(identity.wire_api, None);
@@ -1054,8 +1065,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn create_and_resume_round_trip() {
+    #[tokio::test]
+    async fn create_and_resume_round_trip() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db.clone(), PathBuf::from("/x"), "Build").unwrap();
         let id = s.id;
@@ -1069,8 +1080,8 @@ mod tests {
         assert!(!s2.user_renamed());
     }
 
-    #[test]
-    fn fork_inherits_parent_metadata() {
+    #[tokio::test]
+    async fn fork_inherits_parent_metadata() {
         let db = Db::open_in_memory().unwrap();
         let parent = Session::create(db.clone(), PathBuf::from("/x"), "Build").unwrap();
         parent.set_active_model("anthropic", "opus-4-7").unwrap();
@@ -1081,6 +1092,7 @@ mod tests {
                 None,
                 &serde_json::json!({"text": "fork here"}),
             )
+            .await
             .unwrap();
         let fork =
             Session::create_fork(db.clone(), parent.id, Some(fork_point.to_string())).unwrap();
@@ -1097,8 +1109,8 @@ mod tests {
         assert_ne!(fork.short_id, parent.short_id);
     }
 
-    #[test]
-    fn rename_persists_and_blocks_auto_title() {
+    #[tokio::test]
+    async fn rename_persists_and_blocks_auto_title() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db.clone(), PathBuf::from("/x"), "a").unwrap();
         s.rename("hand-picked").unwrap();
@@ -1108,8 +1120,8 @@ mod tests {
         assert_eq!(s.title().as_deref(), Some("hand-picked"));
     }
 
-    #[test]
-    fn time_prelude_fires_on_first_call() {
+    #[tokio::test]
+    async fn time_prelude_fires_on_first_call() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         let prelude = s.take_time_prelude(5);
@@ -1119,8 +1131,8 @@ mod tests {
         assert!(body.ends_with(']'), "got {body:?}");
     }
 
-    #[test]
-    fn time_prelude_suppressed_within_interval() {
+    #[tokio::test]
+    async fn time_prelude_suppressed_within_interval() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         assert!(s.take_time_prelude(5).is_some(), "first call should fire");
@@ -1130,8 +1142,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn time_prelude_fires_at_zero_interval() {
+    #[tokio::test]
+    async fn time_prelude_fires_at_zero_interval() {
         // A 0-minute interval is the "always inject" config, mainly for
         // tests. Two back-to-back calls both fire.
         let db = Db::open_in_memory().unwrap();
@@ -1153,8 +1165,8 @@ mod tests {
         s
     }
 
-    #[test]
-    fn note_user_content_eager_fires_on_first_short_message() {
+    #[tokio::test]
+    async fn note_user_content_eager_fires_on_first_short_message() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         let msg = "a short message";
@@ -1164,8 +1176,8 @@ mod tests {
         assert_eq!(s.title_stage(), 1);
     }
 
-    #[test]
-    fn note_user_content_uses_bounded_turn_slots() {
+    #[tokio::test]
+    async fn note_user_content_uses_bounded_turn_slots() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         let observed: Vec<_> = (1..=17)
@@ -1188,8 +1200,8 @@ mod tests {
         assert_eq!(s.title_stage(), 16);
     }
 
-    #[test]
-    fn scheduled_slot_is_consumed_even_without_title_success() {
+    #[tokio::test]
+    async fn scheduled_slot_is_consumed_even_without_title_success() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         assert_eq!(s.note_user_content("first"), TitleAction::Eager);
@@ -1201,8 +1213,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nudge_fires_at_slot_8_and_16_only_when_untitled() {
+    #[tokio::test]
+    async fn nudge_fires_at_slot_8_and_16_only_when_untitled() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         let observed: Vec<_> = (1..=17)
@@ -1220,8 +1232,8 @@ mod tests {
         assert!(observed[1].1.contains("after 16 user turns"));
     }
 
-    #[test]
-    fn nudge_does_not_fire_once_titled() {
+    #[tokio::test]
+    async fn nudge_does_not_fire_once_titled() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         let observed: Vec<_> = (1..=17)
@@ -1238,8 +1250,8 @@ mod tests {
         assert!(observed.is_empty(), "{observed:?}");
     }
 
-    #[test]
-    fn resumed_session_does_not_renudge_a_passed_slot() {
+    #[tokio::test]
+    async fn resumed_session_does_not_renudge_a_passed_slot() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db.clone(), PathBuf::from("/x"), "a").unwrap();
         let id = s.id;
@@ -1250,6 +1262,7 @@ mod tests {
                 None,
                 &json!({"text": format!("turn {turn}")}),
             )
+            .await
             .unwrap();
             let _ = s.note_user_content(&format!("turn {turn}"));
         }
@@ -1276,8 +1289,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compact_self_nudge_two_shot_latch() {
+    #[tokio::test]
+    async fn compact_self_nudge_two_shot_latch() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
 
@@ -1312,8 +1325,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compact_self_nudge_suppressed_when_unactionable() {
+    #[tokio::test]
+    async fn compact_self_nudge_suppressed_when_unactionable() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
 
@@ -1332,8 +1345,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compact_self_nudge_latch_reset_only_on_compaction() {
+    #[tokio::test]
+    async fn compact_self_nudge_latch_reset_only_on_compaction() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
 
@@ -1356,8 +1369,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn note_user_content_skips_when_user_renamed() {
+    #[tokio::test]
+    async fn note_user_content_skips_when_user_renamed() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         s.rename("user-set").unwrap();
@@ -1367,8 +1380,8 @@ mod tests {
         assert_eq!(s.note_user_content(&big), TitleAction::None);
     }
 
-    #[test]
-    fn note_user_content_empty_is_noop() {
+    #[tokio::test]
+    async fn note_user_content_empty_is_noop() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         assert_eq!(s.note_user_content(""), TitleAction::None);
@@ -1376,8 +1389,8 @@ mod tests {
         assert_eq!(s.user_content_turns(), 0);
     }
 
-    #[test]
-    fn non_slot_turns_do_not_fire_even_with_large_content() {
+    #[tokio::test]
+    async fn non_slot_turns_do_not_fire_even_with_large_content() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         let big = text_of_at_least(crate::auto_title::TITLE_TOKEN_THRESHOLD * 2);
@@ -1386,8 +1399,8 @@ mod tests {
         assert_eq!(s.note_user_content(&big), TitleAction::None);
     }
 
-    #[test]
-    fn title_progress_survives_resume() {
+    #[tokio::test]
+    async fn title_progress_survives_resume() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db.clone(), PathBuf::from("/x"), "a").unwrap();
         let id = s.id;
@@ -1397,6 +1410,7 @@ mod tests {
             None,
             &json!({"text": "hello"}),
         )
+        .await
         .unwrap();
         assert_eq!(s.note_user_content("hello"), TitleAction::Eager);
         let carried = s.user_content_tokens();
@@ -1418,8 +1432,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn note_user_content_refine_skips_when_user_renamed_after_eager() {
+    #[tokio::test]
+    async fn note_user_content_refine_skips_when_user_renamed_after_eager() {
         // A /rename after an eager title wins and blocks later scheduled slots.
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
@@ -1430,8 +1444,8 @@ mod tests {
         assert_eq!(s.note_user_content(&big), TitleAction::None);
     }
 
-    #[test]
-    fn title_failure_notice_is_one_per_session() {
+    #[tokio::test]
+    async fn title_failure_notice_is_one_per_session() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         assert!(s.claim_title_failure_notice(), "first claim wins");
@@ -1441,8 +1455,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fork_inherits_user_content_counter() {
+    #[tokio::test]
+    async fn fork_inherits_user_content_counter() {
         let db = Db::open_in_memory().unwrap();
         let parent = Session::create(db.clone(), PathBuf::from("/x"), "a").unwrap();
         let _ = parent.note_user_content(&"x".repeat(1000));
@@ -1450,8 +1464,8 @@ mod tests {
         assert_eq!(fork.user_content_tokens(), parent.user_content_tokens());
     }
 
-    #[test]
-    fn tmp_dir_is_per_session_and_isolated() {
+    #[tokio::test]
+    async fn tmp_dir_is_per_session_and_isolated() {
         // Two sessions get distinct private tmp dirs (sandboxing part 2),
         // so neither can read the other's scratch.
         let db = Db::open_in_memory().unwrap();
@@ -1466,8 +1480,8 @@ mod tests {
         assert_eq!(a.tmp_dir().unwrap(), da);
     }
 
-    #[test]
-    fn tmp_dir_removed_on_end() {
+    #[tokio::test]
+    async fn tmp_dir_removed_on_end() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
         let dir = s.tmp_dir().unwrap();
@@ -1477,8 +1491,8 @@ mod tests {
         assert!(!dir.exists(), "tmp dir must be cleaned up on session end");
     }
 
-    #[test]
-    fn host_shim_dir_is_under_data_dir() {
+    #[tokio::test]
+    async fn host_shim_dir_is_under_data_dir() {
         let data_dir = PathBuf::from("/data/cockpit");
         let session_id = uuid::Uuid::new_v4();
 
@@ -1494,8 +1508,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn host_shim_dir_removed_on_end() {
+    #[tokio::test]
+    async fn host_shim_dir_removed_on_end() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
@@ -1512,8 +1526,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tmp_dir_removed_on_drop() {
+    #[tokio::test]
+    async fn tmp_dir_removed_on_drop() {
         let db = Db::open_in_memory().unwrap();
         let dir = {
             let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
@@ -1524,8 +1538,8 @@ mod tests {
         assert!(!dir.exists(), "drop is the cleanup backstop");
     }
 
-    #[test]
-    fn sandbox_flag_defaults_on_and_toggles() {
+    #[tokio::test]
+    async fn sandbox_flag_defaults_on_and_toggles() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
         // Sandboxing-enabled (sandboxing part 2): defaults ON.
@@ -1541,8 +1555,8 @@ mod tests {
         assert!(s.sandbox_enabled());
     }
 
-    #[test]
-    fn approval_mode_defaults_manual_and_round_trips() {
+    #[tokio::test]
+    async fn approval_mode_defaults_manual_and_round_trips() {
         use crate::config::extended::ApprovalMode;
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
@@ -1555,8 +1569,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bump_consecutive_counts_back_to_back_repeats() {
+    #[tokio::test]
+    async fn bump_consecutive_counts_back_to_back_repeats() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
         // First call of a signature → count 1.
@@ -1567,8 +1581,8 @@ mod tests {
         assert_eq!(s.bump_consecutive_call("sig-a"), 3);
     }
 
-    #[test]
-    fn bump_consecutive_resets_on_a_different_call() {
+    #[tokio::test]
+    async fn bump_consecutive_resets_on_a_different_call() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
         assert_eq!(s.bump_consecutive_call("sig-a"), 1);
@@ -1581,8 +1595,8 @@ mod tests {
         assert_eq!(s.bump_consecutive_call("sig-a"), 1);
     }
 
-    #[test]
-    fn repeated_recoverable_tool_call_message_matches_and_clears_on_difference() {
+    #[tokio::test]
+    async fn repeated_recoverable_tool_call_message_matches_and_clears_on_difference() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
 
@@ -1599,8 +1613,8 @@ mod tests {
         assert_eq!(s.repeated_recoverable_tool_call_message("sig-a"), None);
     }
 
-    #[test]
-    fn clear_recoverable_tool_call_drops_memory() {
+    #[tokio::test]
+    async fn clear_recoverable_tool_call_drops_memory() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
 
@@ -1687,8 +1701,8 @@ mod tests {
         assert!(db.get_session(s.id).await.unwrap().is_some());
     }
 
-    #[test]
-    fn record_tool_call_writes_row() {
+    #[tokio::test]
+    async fn record_tool_call_writes_row() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db.clone(), PathBuf::from("/x"), "builder").unwrap();
         s.set_active_model("anthropic", "claude-opus-4-7").unwrap();
@@ -1718,15 +1732,16 @@ mod tests {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
-        let rows = db.list_tool_calls_for_session(s.id).unwrap();
+        let rows = db.list_tool_calls_for_session(s.id).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].model, "claude-opus-4-7");
         assert_eq!(rows[0].provider, "anthropic");
     }
 
-    #[test]
-    fn record_tool_call_persists_provider_identity_separately() {
+    #[tokio::test]
+    async fn record_tool_call_persists_provider_identity_separately() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db.clone(), PathBuf::from("/x"), "builder").unwrap();
         s.set_active_model("codex-oauth", "gpt-5.5").unwrap();
@@ -1767,9 +1782,15 @@ mod tests {
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
 
-        let row = db.list_tool_calls_for_session(s.id).unwrap().pop().unwrap();
+        let row = db
+            .list_tool_calls_for_session(s.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
         assert_eq!(row.call_id, "cockpit-internal");
         assert_eq!(row.provider_item_id.as_deref(), Some("provider-item"));
         assert_eq!(row.provider_call_id.as_deref(), Some("provider-call"));
@@ -1792,8 +1813,8 @@ mod tests {
         (s, tmp, path)
     }
 
-    #[test]
-    fn snapshot_records_baseline_and_contents() {
+    #[tokio::test]
+    async fn snapshot_records_baseline_and_contents() {
         let (s, tmp, _path) = guidance_session("RULE A\nRULE B\n");
         s.snapshot_guidance_baseline(tmp.path());
         let baseline = s.db.guidance_baseline(s.id).unwrap().expect("baseline set");
@@ -1828,8 +1849,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deferred_guidance_edit_injects_after_first_message_persist() {
+    #[tokio::test]
+    async fn deferred_guidance_edit_injects_after_first_message_persist() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("AGENTS.md");
         std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
@@ -1851,8 +1872,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resumed_session_guidance_baseline_still_updates() {
+    #[tokio::test]
+    async fn resumed_session_guidance_baseline_still_updates() {
         let (s, tmp, path) = guidance_session("v1\n");
         s.snapshot_guidance_baseline(tmp.path());
         let resumed = Session::resume(s.db.clone(), s.id)
@@ -1866,8 +1887,8 @@ mod tests {
         assert!(resumed.guidance_change_injection(tmp.path()).is_some());
     }
 
-    #[test]
-    fn snapshot_with_no_guidance_file_leaves_null_baseline() {
+    #[tokio::test]
+    async fn snapshot_with_no_guidance_file_leaves_null_baseline() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
@@ -1877,8 +1898,8 @@ mod tests {
         assert!(s.guidance_change_injection(tmp.path()).is_none());
     }
 
-    #[test]
-    fn in_place_edit_injects_unified_diff_then_is_idempotent() {
+    #[tokio::test]
+    async fn in_place_edit_injects_unified_diff_then_is_idempotent() {
         let (s, tmp, path) =
             guidance_session("line one\nline two\nline three\nline four\nline five\n");
         s.snapshot_guidance_baseline(tmp.path());
@@ -1924,8 +1945,8 @@ mod tests {
         assert!(!msg2.contains("+ line THREE"), "second diff: {msg2}");
     }
 
-    #[test]
-    fn near_total_rewrite_injects_full_contents_not_a_diff() {
+    #[tokio::test]
+    async fn near_total_rewrite_injects_full_contents_not_a_diff() {
         let (s, tmp, path) = guidance_session("alpha\nbeta\ngamma\ndelta\nepsilon\n");
         s.snapshot_guidance_baseline(tmp.path());
         // Rewrite every line.
@@ -1946,8 +1967,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deleted_file_injects_nothing_and_does_not_error() {
+    #[tokio::test]
+    async fn deleted_file_injects_nothing_and_does_not_error() {
         let (s, tmp, path) = guidance_session("RULES\n");
         s.snapshot_guidance_baseline(tmp.path());
         std::fs::remove_file(&path).unwrap();
@@ -1957,8 +1978,8 @@ mod tests {
         assert!(s.db.guidance_baseline(s.id).unwrap().is_some());
     }
 
-    #[test]
-    fn switched_file_injects_nothing() {
+    #[tokio::test]
+    async fn switched_file_injects_nothing() {
         // Start with AGENTS.md as the resolved file.
         let (s, tmp, agents) = guidance_session("AGENTS RULES\n");
         s.snapshot_guidance_baseline(tmp.path());
@@ -1970,8 +1991,8 @@ mod tests {
         assert!(s.guidance_change_injection(tmp.path()).is_none());
     }
 
-    #[test]
-    fn snapshot_is_recomputed_to_current_file_on_each_call() {
+    #[tokio::test]
+    async fn snapshot_is_recomputed_to_current_file_on_each_call() {
         // Mirrors a worker respawn (resume): re-snapshotting picks up the
         // current file as the new baseline, so a post-snapshot edit diffs
         // from the latest body.

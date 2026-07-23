@@ -94,12 +94,16 @@ impl Driver {
         .await;
         if !diagnostics.is_empty() {
             let data = serde_json::json!({ "rejections": diagnostics.rejections });
-            if let Err(e) = self.session.record_event(
-                crate::db::session_log::SessionEventKind::SkillAutoSelect,
-                Some(&self.stack[0].agent.name),
-                None,
-                &data,
-            ) {
+            if let Err(e) = self
+                .session
+                .record_event(
+                    crate::db::session_log::SessionEventKind::SkillAutoSelect,
+                    Some(&self.stack[0].agent.name),
+                    None,
+                    &data,
+                )
+                .await
+            {
                 tracing::warn!(error = %e, "recording skill auto-select diagnostics failed");
             }
         }

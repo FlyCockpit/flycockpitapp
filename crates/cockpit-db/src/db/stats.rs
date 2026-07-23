@@ -863,7 +863,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn ic(
+    async fn ic(
         db: &Db,
         sid: Uuid,
         project_id: &str,
@@ -877,10 +877,11 @@ mod tests {
         ic_with_cache_creation(
             db, sid, project_id, model, provider, ts, input, output, cached, 0,
         )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn ic_with_cache_creation(
+    async fn ic_with_cache_creation(
         db: &Db,
         sid: Uuid,
         project_id: &str,
@@ -908,12 +909,13 @@ mod tests {
             cost_usd_micros: None,
             is_utility: false,
         })
+        .await
         .unwrap();
         call_id
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn tce(
+    async fn tce(
         db: &Db,
         sid: Uuid,
         project_id: &str,
@@ -929,11 +931,12 @@ mod tests {
         tce_with_dims(
             db, sid, project_id, call_id, model, ts, agent, tool, path, recovery, hard_fail, None,
             None,
-        );
+        )
+        .await;
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn tce_with_dims(
+    async fn tce_with_dims(
         db: &Db,
         sid: Uuid,
         project_id: &str,
@@ -984,6 +987,7 @@ mod tests {
             shape_fingerprint: shape_fingerprint.map(str::to_string),
             hint: None,
         })
+        .await
         .unwrap();
     }
 
@@ -1001,9 +1005,9 @@ mod tests {
     async fn token_rollup_without_pricing() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        ic_with_cache_creation(&db, sid, "p1", "opus", "anthropic", 1000, 100, 50, 10, 20);
-        ic(&db, sid, "p1", "opus", "anthropic", 2000, 200, 60, 0);
-        ic(&db, sid, "p1", "gpt-5", "openai", 3000, 5, 5, 0);
+        ic_with_cache_creation(&db, sid, "p1", "opus", "anthropic", 1000, 100, 50, 10, 20).await;
+        ic(&db, sid, "p1", "opus", "anthropic", 2000, 200, 60, 0).await;
+        ic(&db, sid, "p1", "gpt-5", "openai", 3000, 5, 5, 0).await;
 
         let r = run(
             &db,
@@ -1039,7 +1043,8 @@ mod tests {
             1_000_000,
             1_000_000,
             1_000_000,
-        );
+        )
+        .await;
 
         let mut by_model = std::collections::HashMap::new();
         by_model.insert(
@@ -1070,7 +1075,7 @@ mod tests {
     async fn recovery_percentages() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
+        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
         // 10 calls: 6 clean, 2 recovered (shape_repair), 1 relational
         // (not malformed), 1 hard-fail.
         for _ in 0..6 {
@@ -1086,7 +1091,8 @@ mod tests {
                 Some("a.rs"),
                 Recovery::Clean,
                 false,
-            );
+            )
+            .await;
         }
         for _ in 0..2 {
             tce(
@@ -1105,7 +1111,8 @@ mod tests {
                     hint: None,
                 },
                 false,
-            );
+            )
+            .await;
         }
         // relational_default isn't in the Recovery enum's db_fields as a
         // distinct variant here; emulate by inserting a clean row — the
@@ -1123,7 +1130,8 @@ mod tests {
             None,
             Recovery::Clean,
             true,
-        );
+        )
+        .await;
         // pad back to 10 with a clean call.
         tce(
             &db,
@@ -1137,7 +1145,8 @@ mod tests {
             Some("b.rs"),
             Recovery::Clean,
             false,
-        );
+        )
+        .await;
 
         let r = run(
             &db,
@@ -1176,7 +1185,7 @@ mod tests {
     async fn recovery_by_llm_mode_groups_and_percentages() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
+        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
 
         tce_with_dims(
             &db,
@@ -1196,7 +1205,8 @@ mod tests {
             false,
             Some("normal"),
             Some("shape-a"),
-        );
+        )
+        .await;
         tce_with_dims(
             &db,
             sid,
@@ -1211,7 +1221,8 @@ mod tests {
             true,
             Some("normal"),
             Some("shape-b"),
-        );
+        )
+        .await;
         tce_with_dims(
             &db,
             sid,
@@ -1226,7 +1237,8 @@ mod tests {
             false,
             Some("defensive"),
             None,
-        );
+        )
+        .await;
 
         let r = run(
             &db,
@@ -1262,7 +1274,7 @@ mod tests {
     async fn recovery_by_llm_mode_buckets_blank_mode_as_unknown() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
+        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
 
         tce_with_dims(
             &db,
@@ -1278,7 +1290,8 @@ mod tests {
             false,
             Some(""),
             None,
-        );
+        )
+        .await;
 
         let r = run(
             &db,
@@ -1299,7 +1312,7 @@ mod tests {
     async fn recovery_hard_fail_shapes_group_by_mode_tool_fingerprint() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
+        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
 
         for _ in 0..2 {
             tce_with_dims(
@@ -1316,7 +1329,8 @@ mod tests {
                 true,
                 Some("normal"),
                 Some("shape-a"),
-            );
+            )
+            .await;
         }
         tce_with_dims(
             &db,
@@ -1332,7 +1346,8 @@ mod tests {
             true,
             Some("defensive"),
             Some("shape-b"),
-        );
+        )
+        .await;
         tce_with_dims(
             &db,
             sid,
@@ -1351,7 +1366,8 @@ mod tests {
             false,
             Some("normal"),
             Some("shape-a"),
-        );
+        )
+        .await;
 
         let r = run(
             &db,
@@ -1383,7 +1399,7 @@ mod tests {
     async fn recovery_hard_fail_shapes_bucket_null_fingerprint() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
+        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
 
         tce_with_dims(
             &db,
@@ -1399,7 +1415,8 @@ mod tests {
             true,
             Some("normal"),
             None,
-        );
+        )
+        .await;
 
         let r = run(
             &db,
@@ -1419,7 +1436,7 @@ mod tests {
     async fn recovery_hard_fail_shapes_limited_to_twenty() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
+        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
 
         for idx in 0..25 {
             tce_with_dims(
@@ -1436,7 +1453,8 @@ mod tests {
                 true,
                 Some("normal"),
                 Some(&format!("shape-{idx:02}")),
-            );
+            )
+            .await;
         }
 
         let r = run(
@@ -1452,7 +1470,7 @@ mod tests {
     async fn recovery_existing_sections_unchanged_by_new_dimensions() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0);
+        let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
 
         tce_with_dims(
             &db,
@@ -1472,7 +1490,8 @@ mod tests {
             false,
             Some("normal"),
             Some("shape-a"),
-        );
+        )
+        .await;
         tce_with_dims(
             &db,
             sid,
@@ -1487,7 +1506,8 @@ mod tests {
             true,
             Some("defensive"),
             Some("shape-b"),
-        );
+        )
+        .await;
         tce_with_dims(
             &db,
             sid,
@@ -1502,7 +1522,8 @@ mod tests {
             false,
             Some("normal"),
             None,
-        );
+        )
+        .await;
 
         let r = run(
             &db,
@@ -1538,7 +1559,7 @@ mod tests {
     async fn language_top8_and_other_folding() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic(&db, sid, "p1", "m", "p", 1000, 1, 1, 0);
+        let cid = ic(&db, sid, "p1", "m", "p", 1000, 1, 1, 0).await;
         // 9 distinct languages so one folds into Other. Use descending
         // counts so the fold target is deterministic.
         let langs = [
@@ -1566,7 +1587,8 @@ mod tests {
                     Some(path),
                     Recovery::Clean,
                     false,
-                );
+                )
+                .await;
             }
         }
         // Non-file activity.
@@ -1583,7 +1605,8 @@ mod tests {
                 None,
                 Recovery::Clean,
                 false,
-            );
+            )
+            .await;
         }
         for _ in 0..2 {
             tce(
@@ -1598,7 +1621,8 @@ mod tests {
                 None,
                 Recovery::Clean,
                 false,
-            );
+            )
+            .await;
         }
 
         let r = run(
@@ -1630,9 +1654,9 @@ mod tests {
         let s1 = seed_session(&db, "p1").await;
         let s2 = seed_session(&db, "p2").await;
         // p1: recent + old; p2: recent only.
-        ic(&db, s1, "p1", "m", "p", 1_000_000 - 100, 10, 0, 0); // in 7d
-        ic(&db, s1, "p1", "m", "p", 1_000, 99, 0, 0); // old (outside 7d)
-        ic(&db, s2, "p2", "m", "p", 1_000_000 - 100, 5, 0, 0); // other project
+        ic(&db, s1, "p1", "m", "p", 1_000_000 - 100, 10, 0, 0).await; // in 7d
+        ic(&db, s1, "p1", "m", "p", 1_000, 99, 0, 0).await; // old (outside 7d)
+        ic(&db, s2, "p2", "m", "p", 1_000_000 - 100, 5, 0, 0).await; // other project
 
         // Scope=p1, range=all → both p1 rows.
         let r = run(
@@ -1695,8 +1719,8 @@ mod tests {
     async fn by_role_breakdown() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid_builder = ic(&db, sid, "p1", "m", "p", 1000, 100, 0, 0);
-        let cid_docs = ic(&db, sid, "p1", "m", "p", 1000, 30, 0, 0);
+        let cid_builder = ic(&db, sid, "p1", "m", "p", 1000, 100, 0, 0).await;
+        let cid_docs = ic(&db, sid, "p1", "m", "p", 1000, 30, 0, 0).await;
         tce(
             &db,
             sid,
@@ -1709,7 +1733,8 @@ mod tests {
             Some("a.rs"),
             Recovery::Clean,
             false,
-        );
+        )
+        .await;
         tce(
             &db,
             sid,
@@ -1722,7 +1747,8 @@ mod tests {
             Some("b.md"),
             Recovery::Clean,
             false,
-        );
+        )
+        .await;
 
         let r = db
             .read_blocking(|conn| {
@@ -1752,7 +1778,7 @@ mod tests {
     async fn by_role_same_agent_multiple_tool_rows_count_once() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
-        let cid = ic_with_cache_creation(&db, sid, "p1", "m", "p", 1000, 100, 20, 5, 7);
+        let cid = ic_with_cache_creation(&db, sid, "p1", "m", "p", 1000, 100, 20, 5, 7).await;
         for tool in ["read", "grep"] {
             tce(
                 &db,
@@ -1766,7 +1792,8 @@ mod tests {
                 Some("a.rs"),
                 Recovery::Clean,
                 false,
-            );
+            )
+            .await;
         }
 
         let r = db

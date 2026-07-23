@@ -1149,6 +1149,7 @@ mod tests {
             .session
             .db
             .list_session_events(sid)
+            .await
             .unwrap()
             .into_iter()
             .find(|event| event.kind == "permission_decision")

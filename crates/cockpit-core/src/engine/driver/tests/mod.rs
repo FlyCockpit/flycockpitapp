@@ -292,7 +292,7 @@ fn write_recursion_policy(root: &std::path::Path) {
     .unwrap();
 }
 
-fn record_goal_tool_event(driver: &Driver, tool: &str, wire_input: serde_json::Value) {
+async fn record_goal_tool_event(driver: &Driver, tool: &str, wire_input: serde_json::Value) {
     driver
         .session
         .record_event(
@@ -305,6 +305,7 @@ fn record_goal_tool_event(driver: &Driver, tool: &str, wire_input: serde_json::V
                 "original_input": wire_input,
             }),
         )
+        .await
         .unwrap();
 }
 
@@ -539,7 +540,7 @@ fn history_text(history: &[Message]) -> String {
     out
 }
 
-fn record_skill_tool_row(driver: &Driver, call_id: &str, agent: &str, output: &str) {
+async fn record_skill_tool_row(driver: &Driver, call_id: &str, agent: &str, output: &str) {
     driver
         .session
         .record_tool_call(crate::session::ToolCallRow {
@@ -568,6 +569,7 @@ fn record_skill_tool_row(driver: &Driver, call_id: &str, agent: &str, output: &s
             shape_fingerprint: None,
             hint: None,
         })
+        .await
         .unwrap();
 }
 
@@ -824,6 +826,7 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     let event = events
         .iter()
@@ -920,7 +923,7 @@ fn install_test_providers(
     driver.test_providers_override = Some((cfg, "lmstudio".into(), "local".into()));
 }
 
-fn record_test_context_tokens(driver: &Driver, input_tokens: u64) {
+async fn record_test_context_tokens(driver: &Driver, input_tokens: u64) {
     driver
         .session
         .record_usage(
@@ -932,6 +935,7 @@ fn record_test_context_tokens(driver: &Driver, input_tokens: u64) {
                 cache_creation_input_tokens: 0,
             },
         )
+        .await
         .unwrap();
 }
 
@@ -960,11 +964,12 @@ async fn wait_for_shadow_brief(driver: &mut Driver) {
     .expect("fixture shadow brief should finish");
 }
 
-fn compact_inference_purposes(driver: &Driver) -> Vec<String> {
+async fn compact_inference_purposes(driver: &Driver) -> Vec<String> {
     driver
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap()
         .into_iter()
         .filter_map(|event| {

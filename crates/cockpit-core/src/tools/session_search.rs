@@ -209,6 +209,7 @@ mod tests {
                 None,
                 &json!({ "text": "we discussed the peregrine migration route" }),
             )
+            .await
             .unwrap();
 
         let out = SessionSearchTool
@@ -244,6 +245,7 @@ mod tests {
                 None,
                 &json!({ "text": "current session mentions the wombat" }),
             )
+            .await
             .unwrap();
         let out = SessionSearchTool
             .call(json!({ "query": "wombat" }), &ctx)

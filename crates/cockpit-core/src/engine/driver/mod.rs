@@ -1038,12 +1038,16 @@ impl Driver {
         label: &str,
         routing: &ChildRoutingMetadata,
     ) {
-        if let Err(e) = self.session.record_event(
-            crate::db::session_log::SessionEventKind::SubagentRouting,
-            Some(child_agent),
-            Some(task_call_id),
-            &subagent_routing_event_data(child_agent, task_call_id, label, routing),
-        ) {
+        if let Err(e) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::SubagentRouting,
+                Some(child_agent),
+                Some(task_call_id),
+                &subagent_routing_event_data(child_agent, task_call_id, label, routing),
+            )
+            .await
+        {
             tracing::warn!(error = %e, "record subagent_routing event failed");
         }
         let _ = tx
@@ -1876,7 +1880,7 @@ impl Driver {
     /// the worker surfaces a clear error rather than sending a malformed or
     /// silently-fresh context (priority #1).
     #[allow(dead_code)]
-    pub fn rehydrate_root_if_empty(
+    pub async fn rehydrate_root_if_empty(
         &mut self,
         root_agent: &str,
     ) -> Result<Option<crate::engine::rehydrate::Rehydrated>> {
@@ -1884,9 +1888,10 @@ impl Driver {
             root_agent,
             crate::engine::rehydrate::RehydratePolicy::heal(),
         )
+        .await
     }
 
-    pub fn rehydrate_root_if_empty_with_policy(
+    pub async fn rehydrate_root_if_empty_with_policy(
         &mut self,
         root_agent: &str,
         policy: crate::engine::rehydrate::RehydratePolicy,
@@ -1902,14 +1907,15 @@ impl Driver {
             self.session.id,
             root_agent,
             policy,
-        )?
+        )
+        .await?
         else {
             return Ok(None);
         };
         // Restore the rebuilt (pruned) history + the depth-1 prune
         // watermark so auto-prune's short-circuit stays consistent.
         self.stack[0].history = rehydrated.history.clone();
-        self.restore_skill_pairs_after_rehydrate(root_agent);
+        self.restore_skill_pairs_after_rehydrate(root_agent).await;
         if rehydrated.watermark > 0 {
             self.prune_watermark.insert(1, rehydrated.watermark);
         }
@@ -2820,7 +2826,7 @@ impl Driver {
                     .run_next_pending_noninteractive_completion(&input_queue, tx)
                     .await?
             {
-                self.reset_goal_progress_tracking();
+                self.reset_goal_progress_tracking().await;
                 self.clear_goal_idle_intervention();
                 self.maybe_continue_active_goal(&input_queue, tx).await?;
                 self.refresh_goal_watchdog(&mut goal_watchdog);
@@ -2848,7 +2854,7 @@ impl Driver {
                         // dispatch their own utility inference.
                         self.preempt_shadow_brief_for_foreground().await;
                         self.preempt_self_improvement_review_for_foreground();
-                        self.reset_goal_progress_tracking();
+                        self.reset_goal_progress_tracking().await;
                         self.clear_goal_idle_intervention();
                         self.goal_usage_limit_auto_resume_attempts = 0;
                     }
@@ -2877,7 +2883,7 @@ impl Driver {
                     goal_watchdog = None;
                     match ev {
                         Some(event) => {
-                            self.reset_goal_progress_tracking();
+                            self.reset_goal_progress_tracking().await;
                             self.clear_goal_idle_intervention();
                             self.run_job_event(event, &input_queue, tx).await?;
                             self.maybe_continue_active_goal(&input_queue, tx).await?;
@@ -2892,7 +2898,7 @@ impl Driver {
                         .deliver_background_noninteractive_completion(completion, &input_queue, tx)
                         .await?;
                     if delivered {
-                        self.reset_goal_progress_tracking();
+                        self.reset_goal_progress_tracking().await;
                         self.clear_goal_idle_intervention();
                         self.maybe_continue_active_goal(&input_queue, tx).await?;
                         self.refresh_goal_watchdog(&mut goal_watchdog);
@@ -3069,10 +3075,13 @@ impl Driver {
                 root_agent,
                 respond_to,
             } => {
-                let result = match self.rehydrate_root_if_empty_with_policy(
-                    &root_agent,
-                    crate::engine::rehydrate::RehydratePolicy::heal(),
-                ) {
+                let result = match self
+                    .rehydrate_root_if_empty_with_policy(
+                        &root_agent,
+                        crate::engine::rehydrate::RehydratePolicy::heal(),
+                    )
+                    .await
+                {
                     Ok(Some(rehydrated)) => Ok(rehydrated.heals.len()),
                     Ok(None) => Ok(0),
                     Err(error) => Err(format!("{error:#}")),
@@ -3209,12 +3218,12 @@ impl Driver {
                 if self.goal_was_active_recently {
                     self.pending_idle_reason = Some(crate::engine::IdleReason::GoalComplete);
                 }
-                self.reset_goal_progress_tracking();
+                self.reset_goal_progress_tracking().await;
                 self.clear_goal_idle_intervention();
                 return Ok(());
             };
             if goal.status != crate::db::session_goals::GoalStatus::Active {
-                self.reset_goal_progress_tracking();
+                self.reset_goal_progress_tracking().await;
                 self.clear_goal_idle_intervention();
                 return Ok(());
             }
@@ -3235,7 +3244,7 @@ impl Driver {
                     None,
                     Some("token budget exhausted"),
                 );
-                self.reset_goal_progress_tracking();
+                self.reset_goal_progress_tracking().await;
                 self.clear_goal_idle_intervention();
                 return Ok(());
             }
@@ -3244,7 +3253,7 @@ impl Driver {
                     .root_last_user_text()
                     .is_some_and(|text| !is_continue_command(&text))
                 {
-                    self.reset_goal_progress_tracking();
+                    self.reset_goal_progress_tracking().await;
                     self.clear_goal_idle_intervention();
                 }
                 return Ok(());
@@ -3252,7 +3261,7 @@ impl Driver {
             if !self.schedule.snapshot().is_empty() {
                 return Ok(());
             }
-            let observation = self.observe_goal_progress_turn()?;
+            let observation = self.observe_goal_progress_turn().await?;
             if !observation.no_progress()
                 || (self.goal_turns_since_mutating_action < GOAL_NO_PROGRESS_NUDGE_BOUND
                     && self.goal_turns_since_goal_context_delta < GOAL_NO_PROGRESS_NUDGE_BOUND)
@@ -3273,11 +3282,11 @@ impl Driver {
         }
     }
 
-    fn reset_goal_progress_tracking(&mut self) {
+    async fn reset_goal_progress_tracking(&mut self) {
         self.goal_no_tool_idle_count = 0;
         self.goal_turns_since_mutating_action = 0;
         self.goal_turns_since_goal_context_delta = 0;
-        self.goal_progress_last_seq = self.latest_session_event_seq();
+        self.goal_progress_last_seq = self.latest_session_event_seq().await;
     }
 
     fn clear_goal_idle_intervention(&mut self) {
@@ -3328,12 +3337,16 @@ impl Driver {
                 None
             },
         });
-        if let Err(e) = self.session.record_event(
-            crate::db::session_log::SessionEventKind::GoalProgressDiagnostic,
-            Some(self.active_agent()),
-            None,
-            &data,
-        ) {
+        if let Err(e) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::GoalProgressDiagnostic,
+                Some(self.active_agent()),
+                None,
+                &data,
+            )
+            .await
+        {
             tracing::warn!(error = %e, "recording goal no-progress budget diagnostic failed");
         }
         let _ = tx
@@ -3341,7 +3354,7 @@ impl Driver {
                 text: "goal: needs intervention — agent_failed_to_progress_budget_exhausted; run `/goal resume` after adding direction or budget".to_string(),
             })
             .await;
-        self.reset_goal_progress_tracking();
+        self.reset_goal_progress_tracking().await;
         self.goal_idle_intervention_pending = true;
         self.goal_idle_intervention_code = Some(code);
         self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
@@ -3383,7 +3396,7 @@ impl Driver {
             tracing::warn!(error = %e, "marking goal usage_limited failed");
             return false;
         }
-        self.reset_goal_progress_tracking();
+        self.reset_goal_progress_tracking().await;
         self.clear_goal_idle_intervention();
         if self.goal_usage_limit_auto_resume_attempts >= GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS {
             self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
@@ -3448,15 +3461,17 @@ impl Driver {
         Ok(GoalUsageLimitWatchdogAction::AutoResume)
     }
 
-    fn observe_goal_progress_turn(&mut self) -> Result<GoalProgressObservation> {
-        let latest_seq = self.latest_session_event_seq();
+    async fn observe_goal_progress_turn(&mut self) -> Result<GoalProgressObservation> {
+        let latest_seq = self.latest_session_event_seq().await;
         if self.goal_progress_last_seq < 0 {
             self.goal_progress_last_seq = latest_seq;
             if !self.root_last_assistant_was_prose_without_tools() {
                 return Ok(GoalProgressObservation::default());
             }
         }
-        let observation = self.goal_progress_observation_since(self.goal_progress_last_seq)?;
+        let observation = self
+            .goal_progress_observation_since(self.goal_progress_last_seq)
+            .await?;
         self.goal_progress_last_seq = latest_seq;
         if !observation.observed_turn {
             return Ok(observation);
@@ -3476,7 +3491,10 @@ impl Driver {
         Ok(observation)
     }
 
-    fn goal_progress_observation_since(&self, anchor_seq: i64) -> Result<GoalProgressObservation> {
+    async fn goal_progress_observation_since(
+        &self,
+        anchor_seq: i64,
+    ) -> Result<GoalProgressObservation> {
         let mut observation = GoalProgressObservation {
             observed_turn: self.root_last_assistant_was_prose_without_tools(),
             mutating_action: false,
@@ -3485,7 +3503,8 @@ impl Driver {
         for event in self
             .session
             .db
-            .list_session_events(self.session.id)?
+            .list_session_events(self.session.id)
+            .await?
             .into_iter()
             .filter(|event| event.seq > anchor_seq)
         {
@@ -3593,20 +3612,26 @@ impl Driver {
             .is_some_and(|goal| goal.status == crate::db::session_goals::GoalStatus::Active)
     }
 
-    fn latest_session_event_seq(&self) -> i64 {
+    async fn latest_session_event_seq(&self) -> i64 {
         self.session
             .db
             .list_session_events(self.session.id)
+            .await
             .ok()
             .and_then(|events| events.last().map(|event| event.seq))
             .unwrap_or(0)
     }
 
-    fn failed_turn_retry_prompt_for(&self, text: &str) -> Option<(String, String)> {
+    async fn failed_turn_retry_prompt_for(&self, text: &str) -> Option<(String, String)> {
         if !is_continue_command(text) {
             return None;
         }
-        let events = self.session.db.list_session_events(self.session.id).ok()?;
+        let events = self
+            .session
+            .db
+            .list_session_events(self.session.id)
+            .await
+            .ok()?;
         for event in events.iter().rev() {
             if event.kind != "failed_turn_recovery" {
                 continue;
@@ -3639,20 +3664,24 @@ impl Driver {
         recovery_id: &str,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
-        if let Err(e) = self.session.record_event(
-            crate::db::session_log::SessionEventKind::FailedTurnRecovery,
-            Some(self.active_agent()),
-            Some(recovery_id),
-            &serde_json::json!({
-                "status": "retry_started",
-                "recovery_id": recovery_id,
-                "trigger": "continue",
-                "recommended_action": {
-                    "kind": "retry_same_turn",
-                    "consumed": true,
-                },
-            }),
-        ) {
+        if let Err(e) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::FailedTurnRecovery,
+                Some(self.active_agent()),
+                Some(recovery_id),
+                &serde_json::json!({
+                    "status": "retry_started",
+                    "recovery_id": recovery_id,
+                    "trigger": "continue",
+                    "recommended_action": {
+                        "kind": "retry_same_turn",
+                        "consumed": true,
+                    },
+                }),
+            )
+            .await
+        {
             tracing::warn!(error = %e, "record failed_turn_recovery retry_started event failed");
         }
         let _ = tx
@@ -3743,12 +3772,16 @@ impl Driver {
                 "dirty_files": progress.dirty_owned_changes,
             },
         });
-        if let Err(e) = self.session.record_event(
-            crate::db::session_log::SessionEventKind::FailedTurnRecovery,
-            Some(&agent.name),
-            Some(&recovery_id),
-            &data,
-        ) {
+        if let Err(e) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::FailedTurnRecovery,
+                Some(&agent.name),
+                Some(&recovery_id),
+                &data,
+            )
+            .await
+        {
             tracing::warn!(error = %e, "record failed_turn_recovery event failed");
         }
         let _ = tx
@@ -3758,8 +3791,8 @@ impl Driver {
             .await;
     }
 
-    fn goal_continue_progress_since(&self, anchor_seq: i64) -> bool {
-        let Ok(events) = self.session.db.list_session_events(self.session.id) else {
+    async fn goal_continue_progress_since(&self, anchor_seq: i64) -> bool {
+        let Ok(events) = self.session.db.list_session_events(self.session.id).await else {
             return false;
         };
         events
@@ -3802,16 +3835,20 @@ impl Driver {
             "anchor_seq": anchor_seq,
             "reason": "completed_inference_without_visible_progress",
         });
-        if let Err(e) = self.session.record_event(
-            crate::db::session_log::SessionEventKind::GoalProgressDiagnostic,
-            Some(self.active_agent()),
-            None,
-            &data,
-        ) {
+        if let Err(e) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::GoalProgressDiagnostic,
+                Some(self.active_agent()),
+                None,
+                &data,
+            )
+            .await
+        {
             tracing::warn!(error = %e, "recording goal progress diagnostic failed");
         }
         let _ = tx.send(TurnEvent::Notice { text }).await;
-        self.reset_goal_progress_tracking();
+        self.reset_goal_progress_tracking().await;
         self.goal_idle_intervention_pending = true;
         self.goal_idle_intervention_code = Some("agent_failed_to_progress_after_continue");
     }
@@ -3837,13 +3874,17 @@ impl Driver {
             Some(&target),
             folded.preflight_cleaned.as_deref(),
         );
-        let seq = match self.session.record_event_with_origin(
-            crate::db::session_log::SessionEventKind::UserMessage,
-            Some(target.agent.as_str()),
-            None,
-            folded.origin_principal.as_deref(),
-            &data,
-        ) {
+        let seq = match self
+            .session
+            .record_event_with_origin(
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some(target.agent.as_str()),
+                None,
+                folded.origin_principal.as_deref(),
+                &data,
+            )
+            .await
+        {
             Ok(seq) => Some(seq),
             Err(e) => {
                 tracing::warn!(error = %e, "record queued user fold event failed");
@@ -4975,22 +5016,26 @@ impl Driver {
             &child.agent.model,
             child.fallback_decision.as_ref(),
         );
-        if let Err(e) = self.session.record_event(
-            crate::db::session_log::SessionEventKind::SubagentReport,
-            Some(&child.agent.name),
-            task_call_id,
-            &with_child_routing_metadata(
-                subagent_report_event_data(
-                    &child.agent.name,
-                    task_call_id,
-                    task_function_call_id,
-                    "default",
-                    &report,
-                    None,
+        if let Err(e) = self
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::SubagentReport,
+                Some(&child.agent.name),
+                task_call_id,
+                &with_child_routing_metadata(
+                    subagent_report_event_data(
+                        &child.agent.name,
+                        task_call_id,
+                        task_function_call_id,
+                        "default",
+                        &report,
+                        None,
+                    ),
+                    &routing,
                 ),
-                &routing,
-            ),
-        ) {
+            )
+            .await
+        {
             tracing::warn!(error = %e, "record subagent_report event failed");
         }
         let _ = tx
@@ -5082,22 +5127,26 @@ impl Driver {
                 &child.agent.model,
                 child.fallback_decision.as_ref(),
             );
-            if let Err(e) = self.session.record_event(
-                crate::db::session_log::SessionEventKind::SubagentReport,
-                Some(&child.agent.name),
-                task_call_id,
-                &with_child_routing_metadata(
-                    subagent_report_event_data(
-                        &child.agent.name,
-                        task_call_id,
-                        task_function_call_id,
-                        "default",
-                        &report,
-                        None,
+            if let Err(e) = self
+                .session
+                .record_event(
+                    crate::db::session_log::SessionEventKind::SubagentReport,
+                    Some(&child.agent.name),
+                    task_call_id,
+                    &with_child_routing_metadata(
+                        subagent_report_event_data(
+                            &child.agent.name,
+                            task_call_id,
+                            task_function_call_id,
+                            "default",
+                            &report,
+                            None,
+                        ),
+                        &routing,
                     ),
-                    &routing,
-                ),
-            ) {
+                )
+                .await
+            {
                 tracing::warn!(error = %e, "record aborted subagent_report event failed");
             }
             let _ = tx
@@ -5239,9 +5288,11 @@ impl Driver {
         // `UserMessageRecorded` so the transcript shows the cleaned text + chip
         // and reveals the original on click. `None` when preflight didn't run.
         let preflight_cleaned = submission.preflight_cleaned;
-        let goal_continue_anchor_seq = self
-            .is_goal_intervention_continue(&user_text)
-            .then(|| self.latest_session_event_seq());
+        let goal_continue_anchor_seq = if self.is_goal_intervention_continue(&user_text) {
+            Some(self.latest_session_event_seq().await)
+        } else {
+            None
+        };
         // Install a fresh cancellation token for this run so a user ctrl+c
         // (`SessionWork::Cancel` → `CancelHandle::cancel`) can abort the
         // in-flight inference and kill any running `bash` subprocess. The
@@ -5271,13 +5322,17 @@ impl Driver {
             queue_target.as_ref(),
             preflight_cleaned.as_deref(),
         );
-        match self.session.record_event_with_origin(
-            crate::db::session_log::SessionEventKind::UserMessage,
-            Some(self.active_agent()),
-            None,
-            submission.origin_principal.as_deref(),
-            &event_data,
-        ) {
+        match self
+            .session
+            .record_event_with_origin(
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some(self.active_agent()),
+                None,
+                submission.origin_principal.as_deref(),
+                &event_data,
+            )
+            .await
+        {
             // Carry the assigned `seq` (the message's stable id) back to the
             // client so it can stamp the already-pushed user history row,
             // letting a pin reference this message by id (`pinned-messages`).
@@ -5410,7 +5465,7 @@ impl Driver {
             }
         }
 
-        let retry_recovery = self.failed_turn_retry_prompt_for(&raw_user_text);
+        let retry_recovery = self.failed_turn_retry_prompt_for(&raw_user_text).await;
         let mut next_prompt = if let Some((recovery_id, recovered_text)) = &retry_recovery {
             self.record_failed_turn_retry_started(recovery_id, tx).await;
             crate::engine::message::build_user_message(UserSubmission {
@@ -5793,8 +5848,8 @@ impl Driver {
                         }
                     }
                     if let Some(anchor_seq) = goal_continue_anchor_seq {
-                        if self.goal_continue_progress_since(anchor_seq) {
-                            self.reset_goal_progress_tracking();
+                        if self.goal_continue_progress_since(anchor_seq).await {
+                            self.reset_goal_progress_tracking().await;
                             self.clear_goal_idle_intervention();
                         } else {
                             self.emit_goal_continue_no_progress(anchor_seq, tx).await;
@@ -6432,7 +6487,8 @@ impl Driver {
                         hard_fail,
                         output: output.clone(),
                         duration_ms: start.elapsed().as_millis() as u64,
-                    });
+                    })
+                    .await;
                     next_prompt = Message::tool_result_with_call_id(
                         task_call_id,
                         task_function_call_id,

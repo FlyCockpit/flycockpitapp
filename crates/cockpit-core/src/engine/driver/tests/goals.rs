@@ -1,7 +1,7 @@
 use super::*;
 
-#[test]
-fn goal_read_only_turns_count_as_no_progress_after_bound() {
+#[tokio::test]
+async fn goal_read_only_turns_count_as_no_progress_after_bound() {
     let (mut driver, _tmp) = test_driver(1);
     driver
         .session
@@ -14,10 +14,10 @@ fn goal_read_only_turns_count_as_no_progress_after_bound() {
             None,
         )
         .unwrap();
-    driver.goal_progress_last_seq = driver.latest_session_event_seq();
+    driver.goal_progress_last_seq = driver.latest_session_event_seq().await;
 
-    record_goal_tool_event(&driver, "read", serde_json::json!({"path": "src/lib.rs"}));
-    let first = driver.observe_goal_progress_turn().unwrap();
+    record_goal_tool_event(&driver, "read", serde_json::json!({"path": "src/lib.rs"})).await;
+    let first = driver.observe_goal_progress_turn().await.unwrap();
     assert!(first.no_progress());
     assert_eq!(driver.goal_turns_since_mutating_action, 1);
     assert_eq!(driver.goal_turns_since_goal_context_delta, 1);
@@ -26,8 +26,9 @@ fn goal_read_only_turns_count_as_no_progress_after_bound() {
         &driver,
         "grep",
         serde_json::json!({"pattern": "TODO", "path": "src"}),
-    );
-    let second = driver.observe_goal_progress_turn().unwrap();
+    )
+    .await;
+    let second = driver.observe_goal_progress_turn().await.unwrap();
 
     assert!(second.no_progress());
     assert_eq!(
@@ -41,8 +42,8 @@ fn goal_read_only_turns_count_as_no_progress_after_bound() {
     assert_eq!(driver.goal_stall_prompt(), GOAL_IDLE_CONTINUATION);
 }
 
-#[test]
-fn goal_mutating_action_and_context_delta_reset_progress_counters() {
+#[tokio::test]
+async fn goal_mutating_action_and_context_delta_reset_progress_counters() {
     let (mut driver, _tmp) = test_driver(1);
     driver
         .session
@@ -55,7 +56,7 @@ fn goal_mutating_action_and_context_delta_reset_progress_counters() {
             None,
         )
         .unwrap();
-    driver.goal_progress_last_seq = driver.latest_session_event_seq();
+    driver.goal_progress_last_seq = driver.latest_session_event_seq().await;
     driver.goal_turns_since_mutating_action = 4;
     driver.goal_turns_since_goal_context_delta = 4;
 
@@ -63,8 +64,9 @@ fn goal_mutating_action_and_context_delta_reset_progress_counters() {
         &driver,
         "writeunlock",
         serde_json::json!({"path": "src/lib.rs", "content": "changed"}),
-    );
-    let mutating = driver.observe_goal_progress_turn().unwrap();
+    )
+    .await;
+    let mutating = driver.observe_goal_progress_turn().await.unwrap();
     assert!(mutating.mutating_action);
     assert_eq!(driver.goal_turns_since_mutating_action, 0);
     assert_eq!(driver.goal_turns_since_goal_context_delta, 5);
@@ -77,15 +79,16 @@ fn goal_mutating_action_and_context_delta_reset_progress_counters() {
             "status": "active",
             "context_delta": "edited src/lib.rs"
         }),
-    );
-    let context = driver.observe_goal_progress_turn().unwrap();
+    )
+    .await;
+    let context = driver.observe_goal_progress_turn().await.unwrap();
     assert!(context.context_delta);
     assert_eq!(driver.goal_turns_since_goal_context_delta, 0);
     assert_eq!(driver.goal_turns_since_mutating_action, 1);
 }
 
-#[test]
-fn delegation_brief_todo_block_omits_append_note_instruction() {
+#[tokio::test]
+async fn delegation_brief_todo_block_omits_append_note_instruction() {
     let (driver, _tmp) = test_driver(1);
     let todo = driver
         .session
@@ -106,8 +109,8 @@ fn delegation_brief_todo_block_omits_append_note_instruction() {
     assert!(!brief.contains("todo(action=\"append_note\")"));
 }
 
-#[test]
-fn delegation_brief_todo_block_keeps_todo_delta_instruction() {
+#[tokio::test]
+async fn delegation_brief_todo_block_keeps_todo_delta_instruction() {
     let (driver, _tmp) = test_driver(1);
     let todo = driver
         .session
@@ -128,8 +131,8 @@ fn delegation_brief_todo_block_keeps_todo_delta_instruction() {
     assert!(brief.contains("\"suggested_edits\""));
 }
 
-#[test]
-fn goal_prose_without_tools_counts_as_no_progress_subset() {
+#[tokio::test]
+async fn goal_prose_without_tools_counts_as_no_progress_subset() {
     let (mut driver, _tmp) = test_driver(1);
     driver
         .session
@@ -142,7 +145,7 @@ fn goal_prose_without_tools_counts_as_no_progress_subset() {
             None,
         )
         .unwrap();
-    driver.goal_progress_last_seq = driver.latest_session_event_seq();
+    driver.goal_progress_last_seq = driver.latest_session_event_seq().await;
     driver
         .stack
         .first_mut()
@@ -150,7 +153,7 @@ fn goal_prose_without_tools_counts_as_no_progress_subset() {
         .history
         .push(Message::assistant("I will keep working."));
 
-    let observation = driver.observe_goal_progress_turn().unwrap();
+    let observation = driver.observe_goal_progress_turn().await.unwrap();
 
     assert!(observation.no_progress());
     assert_eq!(driver.goal_turns_since_mutating_action, 1);
@@ -205,6 +208,7 @@ async fn goal_no_progress_intervention_waits_for_budget_cap() {
             cost_usd_micros: None,
             is_utility: false,
         })
+        .await
         .unwrap();
     driver
         .session
@@ -273,6 +277,7 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
             cost_usd_micros: None,
             is_utility: false,
         })
+        .await
         .unwrap();
     driver
         .session
@@ -328,6 +333,7 @@ async fn stalled_goal_token_budget_exhaustion_needs_intervention() {
             cost_usd_micros: None,
             is_utility: false,
         })
+        .await
         .unwrap();
     driver
         .session
@@ -404,8 +410,8 @@ async fn goal_usage_limit_failure_pauses_goal_and_arms_backoff() {
     }
 }
 
-#[test]
-fn goal_usage_limit_watchdog_auto_resumes_to_active() {
+#[tokio::test]
+async fn goal_usage_limit_watchdog_auto_resumes_to_active() {
     let (mut driver, _tmp) = test_driver(1);
     driver
         .session
@@ -501,8 +507,8 @@ async fn persistent_goal_usage_limit_requires_manual_resume_after_bound() {
     }
 }
 
-#[test]
-fn ordinary_non_goal_idle_reason_is_completed() {
+#[tokio::test]
+async fn ordinary_non_goal_idle_reason_is_completed() {
     let (mut driver, _tmp) = test_driver(1);
 
     assert_eq!(
@@ -560,7 +566,7 @@ async fn goal_continue_only_maintenance_events_emits_diagnostic_and_keeps_latch(
         )
         .unwrap();
     driver.goal_idle_intervention_pending = true;
-    let anchor = driver.latest_session_event_seq();
+    let anchor = driver.latest_session_event_seq().await;
     driver
         .session
         .record_event(
@@ -569,6 +575,7 @@ async fn goal_continue_only_maintenance_events_emits_diagnostic_and_keeps_latch(
             None,
             &serde_json::json!({"text": "continue"}),
         )
+        .await
         .unwrap();
     driver
         .session
@@ -578,6 +585,7 @@ async fn goal_continue_only_maintenance_events_emits_diagnostic_and_keeps_latch(
             None,
             &serde_json::json!({"rejections": []}),
         )
+        .await
         .unwrap();
     driver
         .session
@@ -594,6 +602,7 @@ async fn goal_continue_only_maintenance_events_emits_diagnostic_and_keeps_latch(
             None,
             Some("cache_already_cold"),
         )
+        .await
         .unwrap();
     let call_id = uuid::Uuid::new_v4().to_string();
     driver
@@ -604,10 +613,11 @@ async fn goal_continue_only_maintenance_events_emits_diagnostic_and_keeps_latch(
             Some(&call_id),
             &serde_json::json!({"usage": null}),
         )
+        .await
         .unwrap();
 
     assert!(
-        !driver.goal_continue_progress_since(anchor),
+        !driver.goal_continue_progress_since(anchor).await,
         "skill diagnostics, context_pruned, and inference_request are maintenance only"
     );
 
@@ -628,6 +638,7 @@ async fn goal_continue_only_maintenance_events_emits_diagnostic_and_keeps_latch(
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     let diagnostic = events
         .iter()
@@ -637,8 +648,8 @@ async fn goal_continue_only_maintenance_events_emits_diagnostic_and_keeps_latch(
     assert_eq!(diagnostic.data["anchor_seq"], serde_json::json!(anchor));
 }
 
-#[test]
-fn goal_continue_progress_accepts_goal_status_update() {
+#[tokio::test]
+async fn goal_continue_progress_accepts_goal_status_update() {
     let (driver, _tmp) = test_driver(1);
     driver
         .session
@@ -651,7 +662,7 @@ fn goal_continue_progress_accepts_goal_status_update() {
             None,
         )
         .unwrap();
-    let anchor = driver.latest_session_event_seq();
+    let anchor = driver.latest_session_event_seq().await;
     driver
         .session
         .record_event(
@@ -660,6 +671,7 @@ fn goal_continue_progress_accepts_goal_status_update() {
             None,
             &serde_json::json!({"text": "continue"}),
         )
+        .await
         .unwrap();
     driver
         .session
@@ -679,7 +691,7 @@ fn goal_continue_progress_accepts_goal_status_update() {
         .unwrap();
 
     assert!(
-        driver.goal_continue_progress_since(anchor),
+        driver.goal_continue_progress_since(anchor).await,
         "terminal goal status is progress even if no further tool is needed"
     );
 }
@@ -734,6 +746,7 @@ async fn failed_turn_recovery_records_retry_context_and_progress() {
         .session
         .db
         .list_session_events(driver.session.id)
+        .await
         .unwrap();
     let recovery = events
         .iter()
@@ -791,10 +804,12 @@ async fn failed_turn_continue_reuses_and_consumes_recovery_record() {
                 }
             }),
         )
+        .await
         .unwrap();
 
     let (id, prompt) = driver
         .failed_turn_retry_prompt_for("continue")
+        .await
         .expect("continue should recover prompt");
     assert_eq!(id, recovery_id);
     assert_eq!(prompt, "original failed prompt");
@@ -806,7 +821,10 @@ async fn failed_turn_continue_reuses_and_consumes_recovery_record() {
         TurnEvent::Notice { text } if text.contains("retrying failed turn")
     ));
     assert!(
-        driver.failed_turn_retry_prompt_for("continue").is_none(),
+        driver
+            .failed_turn_retry_prompt_for("continue")
+            .await
+            .is_none(),
         "retry_started should prevent stale repeated continue"
     );
 }

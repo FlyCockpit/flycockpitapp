@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 
 use tokio::sync::{Mutex, MutexGuard};
 
+pub mod provider;
+
 const COCKPIT_CONFIG_ENV: &str = "COCKPIT_CONFIG";
 const COCKPIT_TRUST_ROOT_ENV: &str = "COCKPIT_TRUST_ROOT";
 const COCKPIT_TRUST_MODE_ENV: &str = "COCKPIT_TRUST_MODE";

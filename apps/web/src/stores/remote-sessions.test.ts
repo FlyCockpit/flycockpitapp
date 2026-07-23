@@ -1,133 +1,250 @@
-import { attachResultSchema, type LiveEvent } from "@flycockpit/cockpit-protocol";
 import { describe, expect, it, vi } from "vitest";
 import {
   addOptimisticUserMessage,
   applyLiveEvent,
   mergeAttach,
+  reduceRemoteSessionEvent,
+  resetRemoteSessionEventWarningsForTests,
+  updateSessionSharedWithCollaborators,
   useRemoteSessionsStore,
+  type WebSessionSummary,
+  warnUnhandledRemoteSessionEvent,
 } from "./remote-sessions";
 
-const attachFixture = {
-  session: {
-    sessionId: "s1",
-    projectRoot: "/work/app",
-    title: "Fix checkout",
-    shortId: "s1",
-    status: "needs_attention",
-    archived: false,
-    pinned: true,
-    forkCount: 1,
-    turnCount: 2,
-    attention: { kind: "approval", interruptId: "int1" },
-    updatedAt: 1783296000,
-    createdBy: { userId: "u1", displayName: "Chris", origin: "web" },
-    agent: "codex",
-    model: "gpt-5",
-  },
-  history: [
-    {
-      id: "h1",
-      seq: 1,
-      ts: 1783296000,
-      kind: "user_message",
-      text: "Please fix checkout",
-      actor: { userId: "u1", displayName: "Chris", origin: "web" },
-      attachments: [],
-    },
-    { id: "h2", seq: 2, ts: 1783296010, kind: "assistant_text", text: "I will inspect." },
-    {
-      id: "h3",
-      seq: 3,
-      ts: 1783296020,
-      kind: "tool_call",
-      callId: "tool1",
-      name: "shell",
-      status: "succeeded",
-      durationMs: 230,
-      userFacing: true,
-      output: { summary: "tests failed" },
-    },
-    {
-      id: "h4",
-      seq: 4,
-      ts: 1783296030,
-      kind: "interrupt",
-      interrupt: {
-        interruptId: "int1",
-        kind: "approval",
-        title: "Run migration?",
-        body: "Approve running db push?",
-        choices: ["approve", "deny"],
-        resolved: false,
-      },
-    },
-  ],
-  nextSeq: 5,
-  schedules: [],
-};
+const sessionId = "11111111-1111-4111-8111-111111111111";
+const interruptId = "22222222-2222-4222-8222-222222222222";
 
 const empty = {
   status: "connected" as const,
   projects: [],
   sessionsByProject: {},
   detailsBySession: {},
+  statsRollupByProject: {},
 };
 
+const attachFixture = {
+  session_id: sessionId,
+  short_id: "s1",
+  project_root: "/work/app",
+  project_id: "project_1",
+  active_agent: "Build",
+  history: [
+    { role: "assistant" as const, seq: 2, agent: "Build", text: "I will inspect." },
+    { role: "user" as const, seq: 1, text: "Please fix checkout" },
+  ],
+};
+
+function withDetail() {
+  return mergeAttach(empty, attachFixture);
+}
+
+function event(event: string, data: Record<string, unknown>) {
+  return { v: 1, kind: "evt", event, data } as const;
+}
+
 describe("remote session reducers", () => {
-  it("orders attach backfill by sequence and tracks nextSeq", () => {
-    const attach = attachResultSchema.parse({
-      ...attachFixture,
-      history: [...attachFixture.history].reverse(),
-    });
-    const state = mergeAttach(empty, attach);
-    const detail = state.detailsBySession.s1;
-    expect(detail.history.map((entry) => entry.seq)).toEqual([1, 2, 3, 4]);
-    expect(detail.nextSeq).toBe(5);
+  it("orders attach history by sequence and tracks nextSeq", () => {
+    const state = mergeAttach(empty, attachFixture);
+    const detail = state.detailsBySession[sessionId];
+    expect(detail.history.map((entry) => entry.seq)).toEqual([1, 2]);
+    expect(detail.nextSeq).toBe(3);
+    expect(detail.summary.sessionId).toBe(sessionId);
   });
 
   it("merges reconnect backfill without dropping newer optimistic entries", () => {
-    const attach = attachResultSchema.parse(attachFixture);
-    const first = addOptimisticUserMessage(
-      mergeAttach(empty, attach),
-      "s1",
-      "newer",
-      "local-1",
-      1783296050000,
-    );
-    const reattach = attachResultSchema.parse({ ...attachFixture, nextSeq: 5 });
-    const state = mergeAttach(first, reattach);
-    expect(state.detailsBySession.s1.history.some((entry) => entry.id === "local-1")).toBe(true);
+    const first = addOptimisticUserMessage(withDetail(), sessionId, "newer", "local-1");
+    const state = mergeAttach(first, attachFixture);
+    expect(
+      state.detailsBySession[sessionId].history.some(
+        (entry) => entry.id === "user:pending:local-1",
+      ),
+    ).toBe(true);
   });
 
-  it("applies history entries and assistant deltas in order", () => {
-    const attach = attachResultSchema.parse(attachFixture);
-    const withAttach = mergeAttach(empty, attach);
-    const entryEvent: LiveEvent = {
-      type: "history_entry",
-      sessionId: "s1",
-      entry: { id: "h5", seq: 5, ts: 1783296040, kind: "assistant_text", text: "Hello" },
-    };
-    const deltaEvent: LiveEvent = {
-      type: "assistant_delta",
-      sessionId: "s1",
+  it("applies committed history replay and assistant deltas", () => {
+    const withAttach = withDetail();
+    const replayed = applyLiveEvent(
+      withAttach,
+      event("history_replay", {
+        session_id: sessionId,
+        max_seq: 5,
+        entries: [{ role: "assistant", seq: 5, agent: "Build", text: "Hello" }],
+      }),
+    );
+    const streamed = applyLiveEvent(
+      replayed,
+      event("assistant_text_delta", { session_id: sessionId, agent: "Build", delta: " world" }),
+    );
+    const final = applyLiveEvent(
+      streamed,
+      event("assistant_text", {
+        session_id: sessionId,
+        agent: "Build",
+        seq: 6,
+        text: "Hello world",
+      }),
+    );
+    expect(final.detailsBySession[sessionId].history).toContainEqual({
+      id: "assistant:6",
+      kind: "assistant_text",
       seq: 6,
-      entryId: "h5",
-      delta: " world",
-    };
-    const state = applyLiveEvent(applyLiveEvent(withAttach, entryEvent), deltaEvent);
-    const entry = state.detailsBySession.s1.history.find((entry) => entry.id === "h5");
-    expect(entry).toMatchObject({ kind: "assistant_text", text: "Hello world" });
-    expect(state.detailsBySession.s1.nextSeq).toBe(7);
+      text: "Hello world",
+    });
+  });
+
+  it("applies reasoning deltas and tool-call lifecycle", () => {
+    const started = applyLiveEvent(
+      withDetail(),
+      event("tool_start", {
+        session_id: sessionId,
+        agent: "Build",
+        call_id: "tool1",
+        tool: "shell",
+        args: { cmd: "pnpm test" },
+      }),
+    );
+    const reasoned = applyLiveEvent(
+      started,
+      event("reasoning_delta", { session_id: sessionId, agent: "Build", delta: "Thinking" }),
+    );
+    const ended = applyLiveEvent(
+      reasoned,
+      event("tool_end", {
+        session_id: sessionId,
+        agent: "Build",
+        call_id: "tool1",
+        tool: "shell",
+        seq: 7,
+        output: "ok",
+      }),
+    );
+    expect(ended.detailsBySession[sessionId].history).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "assistant_reasoning", text: "Thinking" }),
+        expect.objectContaining({ kind: "tool_call", callId: "tool1", status: "succeeded" }),
+      ]),
+    );
+  });
+
+  it("adds and resolves interrupts through daemon question shapes", () => {
+    const raised = applyLiveEvent(
+      withDetail(),
+      event("interrupt_raised", {
+        session_id: sessionId,
+        interrupt_id: interruptId,
+        agent: "Build",
+        description: "Approval needed",
+        question: {
+          kind: "single",
+          data: {
+            prompt: "Run command?",
+            options: [{ id: "approve_once", label: "Approve once" }],
+            permission: true,
+          },
+        },
+      }),
+    );
+    const resolved = applyLiveEvent(
+      raised,
+      event("interrupt_resolved", { session_id: sessionId, interrupt_id: interruptId, seq: 8 }),
+    );
+    expect(resolved.detailsBySession[sessionId].history).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "interrupt",
+          interrupt: expect.objectContaining({ interruptId, resolved: true }),
+        }),
+      ]),
+    );
+  });
+
+  it("updates session summaries and usage without losing details", () => {
+    const withUsage = applyLiveEvent(
+      withDetail(),
+      event("usage", {
+        session_id: sessionId,
+        agent: "Build",
+        input_tokens: 1,
+        output_tokens: 2,
+      }),
+    );
+    const updated = applyLiveEvent(
+      withUsage,
+      event("agent_idle", {
+        session_id: sessionId,
+        turn_id: "turn1",
+        reason: { kind: "needs_intervention" },
+      }),
+    );
+    expect(updated.detailsBySession[sessionId].usage?.totalTokens).toBe(3);
+    expect(updated.detailsBySession[sessionId].summary.status).toBe("needs_intervention");
+  });
+
+  it("tolerates and warns once for unknown event kinds", () => {
+    resetRemoteSessionEventWarningsForTests();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const state = withDetail();
+    const result = reduceRemoteSessionEvent(
+      state,
+      event("future_event", { session_id: sessionId }),
+    );
+    expect(result.state).toBe(state);
+    warnUnhandledRemoteSessionEvent(result.warningKind, false);
+    warnUnhandledRemoteSessionEvent(result.warningKind, false);
+    warnUnhandledRemoteSessionEvent("prod_only", true);
+    expect(warn).toHaveBeenCalledExactlyOnceWith("[remote-sessions] unhandled event: future_event");
+    warn.mockRestore();
+  });
+
+  it("tolerates malformed known-kind event without dropping siblings", () => {
+    const state = withDetail();
+    const malformed = reduceRemoteSessionEvent(
+      state,
+      event("assistant_text", { session_id: sessionId }),
+    );
+    const valid = reduceRemoteSessionEvent(
+      malformed.state,
+      event("assistant_text", { session_id: sessionId, seq: 9, text: "valid" }),
+    );
+    expect(malformed.state).toBe(state);
+    expect(malformed.warningKind).toBe("assistant_text");
+    expect(valid.state.detailsBySession[sessionId].history).toContainEqual({
+      id: "assistant:9",
+      kind: "assistant_text",
+      seq: 9,
+      text: "valid",
+    });
+
+    const malformedTool = reduceRemoteSessionEvent(
+      state,
+      event("tool_start", { session_id: sessionId, tool: "shell" }),
+    );
+    expect(malformedTool.state).toBe(state);
+    expect(malformedTool.warningKind).toBe("tool_start");
+
+    const malformedToolEnd = reduceRemoteSessionEvent(
+      state,
+      event("tool_end", { session_id: sessionId, call_id: "tool1", tool: "shell" }),
+    );
+    expect(malformedToolEnd.state).toBe(state);
+    expect(malformedToolEnd.warningKind).toBe("tool_end");
   });
 
   it("optimistically shares sessions and reverts when the daemon rejects the toggle", async () => {
-    const attach = attachResultSchema.parse({
-      ...attachFixture,
-      session: { ...attachFixture.session, sharedWithCollaborators: false },
-    });
-    const base = mergeAttach(
-      { ...empty, sessionsByProject: { [attach.session.projectRoot]: [attach.session] } },
-      attach,
+    const baseSummary: WebSessionSummary = {
+      ...withDetail().detailsBySession[sessionId].summary,
+      sharedWithCollaborators: false,
+    };
+    const base = updateSessionSharedWithCollaborators(
+      {
+        ...withDetail(),
+        sessionsByProject: { [baseSummary.projectRoot]: [baseSummary] },
+        detailsBySession: {
+          [sessionId]: { ...withDetail().detailsBySession[sessionId], summary: baseSummary },
+        },
+      },
+      sessionId,
+      false,
     );
     const shareSession = vi.fn().mockRejectedValueOnce(new Error("denied"));
     useRemoteSessionsStore.setState({
@@ -135,41 +252,13 @@ describe("remote session reducers", () => {
       clients: { i1: { shareSession } as never },
     });
 
-    await expect(useRemoteSessionsStore.getState().shareSession("i1", "s1", true)).rejects.toThrow(
-      "denied",
-    );
+    await expect(
+      useRemoteSessionsStore.getState().shareSession("i1", sessionId, true),
+    ).rejects.toThrow("denied");
 
-    expect(shareSession).toHaveBeenCalledWith("s1", true);
+    expect(shareSession).toHaveBeenCalledWith(sessionId, true);
     const state = useRemoteSessionsStore.getState().instances.i1;
-    expect(state.detailsBySession.s1.summary.sharedWithCollaborators).toBe(false);
+    expect(state.detailsBySession[sessionId].summary.sharedWithCollaborators).toBe(false);
     expect(state.sessionsByProject["/work/app"][0]?.sharedWithCollaborators).toBe(false);
-  });
-
-  it("marks interrupts resolved for all viewers", () => {
-    const attach = attachResultSchema.parse(attachFixture);
-    const state = applyLiveEvent(mergeAttach(empty, attach), {
-      type: "interrupt_resolved",
-      sessionId: "s1",
-      interruptId: "int1",
-      seq: 7,
-    });
-    const interrupt = state.detailsBySession.s1.history.find((entry) => entry.kind === "interrupt");
-    expect(interrupt).toMatchObject({ interrupt: { resolved: true } });
-  });
-
-  it("updates session summaries and usage without losing details", () => {
-    const attach = attachResultSchema.parse(attachFixture);
-    const withAttach = mergeAttach(empty, attach);
-    const updated = applyLiveEvent(withAttach, {
-      type: "session_updated",
-      summary: { ...attach.session, title: "Renamed", updatedAt: attach.session.updatedAt + 10 },
-    });
-    const withUsage = applyLiveEvent(updated, {
-      type: "usage",
-      sessionId: "s1",
-      usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
-    });
-    expect(withUsage.detailsBySession.s1.summary.title).toBe("Renamed");
-    expect(withUsage.detailsBySession.s1.usage?.totalTokens).toBe(3);
   });
 });

@@ -1,4 +1,4 @@
-import type { SessionSummary } from "@flycockpit/cockpit-protocol";
+import type { WebSessionSummary } from "@/stores/remote-sessions";
 
 export type SharingGrant = {
   scope: string;
@@ -36,7 +36,7 @@ export function canMutateSessions(mode: SessionViewerMode) {
 }
 
 export function shouldShowSessionAttribution(input: {
-  session: SessionSummary;
+  session: WebSessionSummary;
   viewerMode: SessionViewerMode;
   viewerUserId?: string;
 }) {
@@ -46,6 +46,6 @@ export function shouldShowSessionAttribution(input: {
   );
 }
 
-export function sessionAttributionName(session: SessionSummary, fallback: string) {
+export function sessionAttributionName(session: WebSessionSummary, fallback: string) {
   return session.createdBy?.displayName ?? session.createdBy?.userId ?? fallback;
 }

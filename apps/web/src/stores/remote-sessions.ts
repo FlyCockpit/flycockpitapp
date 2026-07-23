@@ -1,30 +1,112 @@
 import type {
   AttachResult,
-  CockpitUsage,
-  HistoryEntry,
-  LiveEvent,
-  ProjectSummary,
-  SessionSummary,
+  EventEnvelope,
+  FsListResult,
+  FsReadResult,
+  FsWriteResult,
+  GitDiffFileResult,
+  GitStatusResult,
+  InterruptQuestion,
+  ResolveResponse,
+  HistoryEntry as WireHistoryEntry,
+  SessionSummary as WireSessionSummary,
 } from "@flycockpit/cockpit-protocol";
+import { eventEnvelopeSchema } from "@flycockpit/cockpit-protocol";
 import { RemoteSessionClient } from "@flycockpit/cockpit-protocol/client";
 import { create } from "zustand";
 
 type ConnectionStatus = "idle" | "connecting" | "connected" | "offline" | "error";
 
+export type WebProjectRow = {
+  projectId: string;
+  projectRoot: string;
+  displayName: string;
+  sessionCount: number;
+  archivedCount: number;
+  attentionCount: number;
+};
+
+export type WebSessionSummary = {
+  sessionId: string;
+  projectId: string;
+  projectRoot: string;
+  title: string;
+  shortId?: string;
+  status: string;
+  archived: boolean;
+  pinned: boolean;
+  forkCount: number;
+  turnCount: number;
+  attention: { kind: "approval"; interruptId: string } | null;
+  updatedAt: number;
+  createdBy: { userId: string; displayName?: string; origin?: string } | null;
+  agent: string;
+  model?: string;
+  sharedWithCollaborators: boolean;
+};
+
+export type WebInterrupt = {
+  interruptId: string;
+  kind: "question" | "approval";
+  title: string;
+  body?: string;
+  resolved: boolean;
+  question: InterruptQuestion;
+};
+
+export type WebHistoryEntry =
+  | {
+      id: string;
+      seq: number;
+      ts?: number;
+      kind:
+        | "user_message"
+        | "user_note"
+        | "assistant_text"
+        | "assistant_reasoning"
+        | "inference_error";
+      text: string;
+      actor?: { userId?: string; displayName?: string; origin?: string };
+    }
+  | {
+      id: string;
+      seq: number;
+      ts?: number;
+      kind: "tool_call";
+      callId: string;
+      name: string;
+      status: "running" | "succeeded" | "failed";
+      input?: unknown;
+      output?: unknown;
+    }
+  | { id: string; seq: number; ts?: number; kind: "boundary"; label: string }
+  | { id: string; seq: number; ts?: number; kind: "subagent_report"; title: string; body: string }
+  | { id: string; seq: number; ts?: number; kind: "interrupt"; interrupt: WebInterrupt };
+
+export type WebUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+};
+
+const webInterruptResolutionValues = ["approve", "deny", "answer"] as const;
+export type WebInterruptResolution = (typeof webInterruptResolutionValues)[number];
+
 export type SessionDetail = {
-  summary: SessionSummary;
-  history: HistoryEntry[];
+  summary: WebSessionSummary;
+  history: WebHistoryEntry[];
   schedules: unknown[];
   nextSeq: number;
-  usage: CockpitUsage | null;
+  usage: WebUsage | null;
 };
 
 type InstanceRemoteState = {
   status: ConnectionStatus;
   statusDetail?: string;
-  projects: ProjectSummary[];
-  sessionsByProject: Record<string, SessionSummary[]>;
+  projects: WebProjectRow[];
+  sessionsByProject: Record<string, WebSessionSummary[]>;
   detailsBySession: Record<string, SessionDetail>;
+  statsRollupByProject: Record<string, unknown>;
 };
 
 type TokenInfo = { token: string; relayUrl: string };
@@ -37,18 +119,19 @@ type RemoteSessionState = {
   disconnect: (instanceId: string) => void;
   loadProjects: (instanceId: string) => Promise<void>;
   loadSessions: (instanceId: string, projectRoot: string) => Promise<void>;
+  loadStatsRollup: (instanceId: string, projectId: string) => Promise<void>;
   attach: (instanceId: string, sessionId: string) => Promise<void>;
   createSession: (
     instanceId: string,
     input: { projectRoot: string; title?: string; agent?: string; model?: string },
-  ) => Promise<AttachResult>;
+  ) => Promise<SessionDetail>;
   sendMessage: (instanceId: string, sessionId: string, text: string) => Promise<void>;
   resolveInterrupt: (
     instanceId: string,
     input: {
       sessionId: string;
       interruptId: string;
-      resolution: "approve" | "deny" | "answer";
+      resolution: WebInterruptResolution;
       answer?: string;
     },
   ) => Promise<void>;
@@ -59,15 +142,15 @@ type RemoteSessionState = {
   listFiles: (
     instanceId: string,
     input: { projectRoot: string; path: string; showHidden: boolean },
-  ) => Promise<import("@flycockpit/cockpit-protocol").FsListResult>;
+  ) => Promise<FsListResult>;
   readFile: (
     instanceId: string,
     input: { projectRoot: string; path: string },
-  ) => Promise<import("@flycockpit/cockpit-protocol").FsReadResult>;
+  ) => Promise<FsReadResult>;
   writeFile: (
     instanceId: string,
     input: { projectRoot: string; path: string; content: string; baseHash?: string },
-  ) => Promise<import("@flycockpit/cockpit-protocol").FsWriteResult>;
+  ) => Promise<FsWriteResult>;
   createDirectory: (
     instanceId: string,
     input: { projectRoot: string; path: string },
@@ -77,155 +160,586 @@ type RemoteSessionState = {
     input: { projectRoot: string; fromPath: string; toPath: string },
   ) => Promise<void>;
   deletePath: (instanceId: string, input: { projectRoot: string; path: string }) => Promise<void>;
-  gitStatus: (
-    instanceId: string,
-    input: { projectRoot: string },
-  ) => Promise<import("@flycockpit/cockpit-protocol").GitStatusResult>;
+  gitStatus: (instanceId: string, input: { projectRoot: string }) => Promise<GitStatusResult>;
   gitDiffFile: (
     instanceId: string,
     input: { projectRoot: string; path: string },
-  ) => Promise<import("@flycockpit/cockpit-protocol").GitDiffFileResult>;
+  ) => Promise<GitDiffFileResult>;
 };
+
+const pendingAssistantId = "assistant:pending";
+const pendingReasoningId = "reasoning:pending";
+const pendingUserPrefix = "user:pending:";
+const pendingUserSeq = Number.MAX_SAFE_INTEGER - 3;
+const pendingReasoningSeq = Number.MAX_SAFE_INTEGER - 2;
+const pendingAssistantSeq = Number.MAX_SAFE_INTEGER - 1;
+const pendingInterruptSeq = Number.MAX_SAFE_INTEGER;
+const warnedEventKinds = new Set<string>();
 
 const emptyInstance = (): InstanceRemoteState => ({
   status: "idle",
   projects: [],
   sessionsByProject: {},
   detailsBySession: {},
+  statsRollupByProject: {},
 });
 
-function sortHistory(history: HistoryEntry[]) {
+function stringField(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function numberField(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+function booleanField(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function recordField(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function eventData(event: EventEnvelope) {
+  const data = event.data;
+  return data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+}
+
+function sortHistory(history: WebHistoryEntry[]) {
   return [...history].sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
 }
 
-function upsertHistory(history: HistoryEntry[], entry: HistoryEntry) {
+function upsertHistory(history: WebHistoryEntry[], entry: WebHistoryEntry) {
   return sortHistory([entry, ...history.filter((item) => item.id !== entry.id)]);
+}
+
+function nextLocalSeq(history: WebHistoryEntry[]) {
+  const maxSeq = history.reduce(
+    (max, entry) => (entry.seq < pendingUserSeq ? Math.max(max, entry.seq) : max),
+    0,
+  );
+  return maxSeq + 1;
+}
+
+function projectDisplayName(projectRoot: string) {
+  return projectRoot.split("/").filter(Boolean).at(-1) ?? projectRoot;
+}
+
+export function toWebSessionSummary(session: WireSessionSummary): WebSessionSummary {
+  const raw = session as Record<string, unknown>;
+  const createdByPrincipal = stringField(raw, "created_by_principal");
+  return {
+    sessionId: session.session_id,
+    projectId: session.project_id,
+    projectRoot: session.project_root,
+    title: session.title ?? session.short_id ?? session.session_id,
+    shortId: session.short_id,
+    status: stringField(raw, "activity_state") ?? "idle",
+    archived: booleanField(raw, "archived") ?? false,
+    pinned: booleanField(raw, "pinned") ?? false,
+    forkCount: numberField(raw, "fork_count") ?? 0,
+    turnCount: session.turns,
+    attention: null,
+    updatedAt: session.last_active_at,
+    createdBy: createdByPrincipal ? { userId: createdByPrincipal, origin: "daemon" } : null,
+    agent: session.active_agent,
+    model: stringField(raw, "model"),
+    sharedWithCollaborators: session.shared_with_collaborators ?? false,
+  };
+}
+
+export function projectsFromSessions(sessions: WireSessionSummary[]): WebProjectRow[] {
+  const projects = new Map<string, WebProjectRow>();
+  for (const session of sessions) {
+    const summary = toWebSessionSummary(session);
+    const existing = projects.get(summary.projectId);
+    if (existing) {
+      existing.sessionCount += 1;
+      if (summary.archived) existing.archivedCount += 1;
+      if (summary.attention) existing.attentionCount += 1;
+      continue;
+    }
+    projects.set(summary.projectId, {
+      projectId: summary.projectId,
+      projectRoot: summary.projectRoot,
+      displayName: projectDisplayName(summary.projectRoot),
+      sessionCount: 1,
+      archivedCount: summary.archived ? 1 : 0,
+      attentionCount: summary.attention ? 1 : 0,
+    });
+  }
+  return [...projects.values()].sort((a, b) => a.projectRoot.localeCompare(b.projectRoot));
+}
+
+function toWebHistoryEntry(entry: WireHistoryEntry, fallbackSeq = 0): WebHistoryEntry {
+  const seq = typeof entry.seq === "number" ? entry.seq : fallbackSeq;
+  if (entry.role === "user") {
+    return {
+      id: "user:" + seq,
+      seq,
+      ts: entry.ts_ms ? Math.floor(entry.ts_ms / 1000) : undefined,
+      kind: "user_message",
+      text: entry.display_text ?? entry.text,
+      actor: { origin: entry.origin_principal ?? "daemon" },
+    };
+  }
+  if (entry.role === "user_note") {
+    return { id: "user-note:" + seq, seq, ts: entry.ts_ms, kind: "user_note", text: entry.text };
+  }
+  if (entry.role === "assistant") {
+    return {
+      id: "assistant:" + seq,
+      seq,
+      ts: entry.ts_ms ? Math.floor(entry.ts_ms / 1000) : undefined,
+      kind: "assistant_text",
+      text: entry.text,
+    };
+  }
+  if (entry.role === "tool_call") {
+    return {
+      id: "tool:" + entry.call_id,
+      seq,
+      kind: "tool_call",
+      callId: entry.call_id,
+      name: entry.tool,
+      status: entry.hard_fail ? "failed" : "succeeded",
+      input: entry.original_input,
+      output: entry.output,
+    };
+  }
+  if (entry.role === "inference_error") {
+    return {
+      id: "inference:" + seq,
+      seq,
+      kind: "inference_error",
+      text: entry.detail ? `${entry.summary}\n${entry.detail}` : entry.summary,
+    };
+  }
+  if (entry.role === "compact_boundary") {
+    return {
+      id: "boundary:" + seq,
+      seq,
+      kind: "boundary",
+      label: entry.brief ?? `Compact handoff from ${entry.predecessor_short_id}`,
+    };
+  }
+  if (entry.role === "subagent") {
+    return {
+      id: "subagent:" + entry.task_call_id,
+      seq,
+      kind: "subagent_report",
+      title: entry.label,
+      body: `${entry.parent} -> ${entry.child}`,
+    };
+  }
+  return {
+    id: "interrupt-decision:" + seq,
+    seq,
+    kind: "assistant_reasoning",
+    text: entry.decision.cancelled ? "Interrupt cancelled" : "Interrupt resolved",
+  };
+}
+
+function nextSeqFromHistory(history: WebHistoryEntry[]) {
+  return history.reduce(
+    (max, entry) => (entry.seq < pendingUserSeq ? Math.max(max, entry.seq + 1) : max),
+    1,
+  );
+}
+
+function attachSummary(attach: AttachResult, current?: WebSessionSummary): WebSessionSummary {
+  return {
+    sessionId: attach.session_id,
+    projectId: attach.project_id,
+    projectRoot: attach.project_root,
+    title: current?.title ?? attach.short_id,
+    shortId: attach.short_id,
+    status: current?.status ?? "idle",
+    archived: current?.archived ?? false,
+    pinned: current?.pinned ?? false,
+    forkCount: current?.forkCount ?? 0,
+    turnCount: current?.turnCount ?? 0,
+    attention: current?.attention ?? null,
+    updatedAt: current?.updatedAt ?? Date.now(),
+    createdBy: current?.createdBy ?? null,
+    agent: attach.active_agent,
+    model: current?.model,
+    sharedWithCollaborators: current?.sharedWithCollaborators ?? false,
+  };
 }
 
 export function mergeAttach(
   existing: InstanceRemoteState,
   attach: AttachResult,
 ): InstanceRemoteState {
-  const current = existing.detailsBySession[attach.session.sessionId];
+  const current = existing.detailsBySession[attach.session_id];
+  const mappedHistory = attach.history.map((entry, index) => toWebHistoryEntry(entry, index));
+  const nextSeq = nextSeqFromHistory(mappedHistory);
   const mergedHistory = sortHistory([
-    ...(current?.history ?? []).filter((entry) => entry.seq >= attach.nextSeq),
-    ...attach.history,
+    ...(current?.history ?? []).filter((entry) => entry.seq >= nextSeq),
+    ...mappedHistory,
   ]);
+  const summary = attachSummary(attach, current?.summary);
   return {
     ...existing,
+    sessionsByProject: {
+      ...existing.sessionsByProject,
+      [summary.projectRoot]: upsertSession(
+        existing.sessionsByProject[summary.projectRoot] ?? [],
+        summary,
+      ),
+    },
     detailsBySession: {
       ...existing.detailsBySession,
-      [attach.session.sessionId]: {
-        summary: attach.session,
+      [summary.sessionId]: {
+        summary,
         history: mergedHistory,
-        schedules: attach.schedules,
-        nextSeq: attach.nextSeq,
+        schedules: current?.schedules ?? [],
+        nextSeq: nextSeqFromHistory(mergedHistory),
         usage: current?.usage ?? null,
       },
     },
   };
 }
 
-export function applyLiveEvent(
-  existing: InstanceRemoteState,
-  event: LiveEvent,
-): InstanceRemoteState {
-  if (event.type === "session_updated") {
-    const projectRoot = event.summary.projectRoot;
-    const sessions = existing.sessionsByProject[projectRoot] ?? [];
-    const nextSessions = [
-      event.summary,
-      ...sessions.filter((s) => s.sessionId !== event.summary.sessionId),
-    ].sort((a, b) => b.updatedAt - a.updatedAt);
-    const detail = existing.detailsBySession[event.summary.sessionId];
-    return {
-      ...existing,
-      sessionsByProject: { ...existing.sessionsByProject, [projectRoot]: nextSessions },
-      detailsBySession: detail
-        ? {
-            ...existing.detailsBySession,
-            [event.summary.sessionId]: { ...detail, summary: event.summary },
-          }
-        : existing.detailsBySession,
-    };
-  }
+function upsertSession(sessions: WebSessionSummary[], summary: WebSessionSummary) {
+  return [summary, ...sessions.filter((session) => session.sessionId !== summary.sessionId)].sort(
+    (a, b) => b.updatedAt - a.updatedAt,
+  );
+}
 
-  const sessionId = "sessionId" in event ? event.sessionId : null;
-  if (!sessionId) return existing;
+function sessionIdFromEvent(event: EventEnvelope) {
+  const data = eventData(event);
+  return data ? stringField(data, "session_id") : undefined;
+}
+
+function eventWarningKind(raw: unknown) {
+  if (!raw || typeof raw !== "object") return "unknown";
+  const record = raw as Record<string, unknown>;
+  const event = record.event ?? record.type;
+  return typeof event === "string" && event ? event : "unknown";
+}
+
+function updateDetail(
+  existing: InstanceRemoteState,
+  sessionId: string,
+  updater: (detail: SessionDetail) => SessionDetail,
+) {
   const detail = existing.detailsBySession[sessionId];
   if (!detail) return existing;
+  return {
+    ...existing,
+    detailsBySession: {
+      ...existing.detailsBySession,
+      [sessionId]: updater(detail),
+    },
+  };
+}
 
-  if (event.type === "history_entry") {
+function appendAssistantDelta(history: WebHistoryEntry[], delta: string) {
+  const pending = history.find((entry) => entry.id === pendingAssistantId);
+  if (pending?.kind === "assistant_text") {
+    return history.map((entry) =>
+      entry.id === pendingAssistantId && entry.kind === "assistant_text"
+        ? { ...entry, text: entry.text + delta }
+        : entry,
+    );
+  }
+  return sortHistory([
+    ...history,
+    { id: pendingAssistantId, seq: pendingAssistantSeq, kind: "assistant_text", text: delta },
+  ]);
+}
+
+function appendReasoningDelta(history: WebHistoryEntry[], delta: string) {
+  const pending = history.find((entry) => entry.id === pendingReasoningId);
+  if (pending?.kind === "assistant_reasoning") {
+    return history.map((entry) =>
+      entry.id === pendingReasoningId && entry.kind === "assistant_reasoning"
+        ? { ...entry, text: entry.text + delta }
+        : entry,
+    );
+  }
+  return sortHistory([
+    ...history,
+    { id: pendingReasoningId, seq: pendingReasoningSeq, kind: "assistant_reasoning", text: delta },
+  ]);
+}
+
+function applyAssistantText(history: WebHistoryEntry[], data: Record<string, unknown>) {
+  const text = stringField(data, "text");
+  if (!text) return null;
+  const seq = numberField(data, "seq") ?? nextLocalSeq(history);
+  return upsertHistory(
+    history.filter((entry) => entry.id !== pendingAssistantId),
+    { id: "assistant:" + seq, seq, kind: "assistant_text", text },
+  );
+}
+
+function applyToolStart(history: WebHistoryEntry[], data: Record<string, unknown>) {
+  const callId = stringField(data, "call_id");
+  const tool = stringField(data, "tool");
+  if (!callId || !tool) return null;
+  return upsertHistory(history, {
+    id: "tool:" + callId,
+    seq: pendingInterruptSeq - 10,
+    kind: "tool_call",
+    callId,
+    name: tool,
+    status: "running",
+    input: data.args,
+  });
+}
+
+function applyToolFinish(
+  history: WebHistoryEntry[],
+  data: Record<string, unknown>,
+  failed: boolean,
+) {
+  const callId = stringField(data, "call_id");
+  const tool = stringField(data, "tool");
+  if (!callId || !tool) return null;
+  const seq = numberField(data, "seq") ?? nextLocalSeq(history);
+  return upsertHistory(history, {
+    id: "tool:" + callId,
+    seq,
+    kind: "tool_call",
+    callId,
+    name: tool,
+    status: failed ? "failed" : "succeeded",
+    output: failed ? stringField(data, "error") : stringField(data, "output"),
+  });
+}
+
+function interruptQuestionTitle(question: InterruptQuestion) {
+  return question.data.prompt;
+}
+
+function interruptQuestionBody(question: InterruptQuestion, fallback: string) {
+  if (question.kind === "single") return question.data.command_detail?.full_command ?? fallback;
+  return fallback;
+}
+
+function resolveResponseForInterrupt(
+  question: InterruptQuestion,
+  resolution: WebInterruptResolution,
+  answer?: string,
+): ResolveResponse {
+  if (resolution === "deny") return { kind: "cancel" };
+  if (question.kind === "freetext") return { kind: "freetext", data: { text: answer ?? "" } };
+  if (question.kind === "multi") {
+    const selected = question.data.options[0]?.id;
+    return selected ? { kind: "multi", data: { selected_ids: [selected] } } : { kind: "cancel" };
+  }
+  const selected = question.data.options[0]?.id;
+  return selected ? { kind: "single", data: { selected_id: selected } } : { kind: "cancel" };
+}
+
+function usageFromData(data: Record<string, unknown>): WebUsage {
+  const inputTokens = numberField(data, "input_tokens") ?? 0;
+  const outputTokens = numberField(data, "output_tokens") ?? 0;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+  };
+}
+
+export function reduceRemoteSessionEvent(
+  existing: InstanceRemoteState,
+  raw: unknown,
+): { state: InstanceRemoteState; warningKind?: string } {
+  const parsed = eventEnvelopeSchema.safeParse(raw);
+  if (!parsed.success) return { state: existing, warningKind: eventWarningKind(raw) };
+  const event = parsed.data;
+  if ("__unknown" in event && event.__unknown) {
+    return { state: existing, warningKind: event.event };
+  }
+
+  const data = eventData(event);
+  const sessionId = sessionIdFromEvent(event);
+
+  if (event.event === "assistant_text_delta") {
+    if (!sessionId || typeof data?.delta !== "string")
+      return { state: existing, warningKind: event.event };
     return {
-      ...existing,
-      detailsBySession: {
-        ...existing.detailsBySession,
-        [sessionId]: {
-          ...detail,
-          history: upsertHistory(detail.history, event.entry),
-          nextSeq: Math.max(detail.nextSeq, event.entry.seq + 1),
-        },
-      },
+      state: updateDetail(existing, sessionId, (detail) => ({
+        ...detail,
+        history: appendAssistantDelta(detail.history, data.delta as string),
+      })),
     };
   }
 
-  if (event.type === "assistant_delta") {
+  if (event.event === "reasoning_delta") {
+    if (!sessionId || typeof data?.delta !== "string")
+      return { state: existing, warningKind: event.event };
     return {
-      ...existing,
-      detailsBySession: {
-        ...existing.detailsBySession,
-        [sessionId]: {
-          ...detail,
-          history: detail.history.map((entry) =>
-            entry.id === event.entryId && entry.kind === "assistant_text"
-              ? { ...entry, text: entry.text + event.delta }
-              : entry,
-          ),
-          nextSeq: Math.max(detail.nextSeq, event.seq + 1),
-        },
-      },
+      state: updateDetail(existing, sessionId, (detail) => ({
+        ...detail,
+        history: appendReasoningDelta(detail.history, data.delta as string),
+      })),
     };
   }
 
-  if (event.type === "interrupt_resolved") {
+  if (event.event === "assistant_text") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    if (typeof data.text !== "string") return { state: existing, warningKind: event.event };
+    const state = updateDetail(existing, sessionId, (detail) => {
+      const history = applyAssistantText(detail.history, data);
+      if (!history) return detail;
+      return { ...detail, history, nextSeq: nextSeqFromHistory(history) };
+    });
+    return { state };
+  }
+
+  if (event.event === "history_replay") {
+    const entries = data?.entries;
+    if (!sessionId || !Array.isArray(entries)) return { state: existing, warningKind: event.event };
     return {
-      ...existing,
-      detailsBySession: {
-        ...existing.detailsBySession,
-        [sessionId]: {
-          ...detail,
-          history: detail.history.map((entry) =>
-            entry.kind === "interrupt" && entry.interrupt.interruptId === event.interruptId
-              ? { ...entry, interrupt: { ...entry.interrupt, resolved: true } }
-              : entry,
-          ),
-          nextSeq: event.seq ? Math.max(detail.nextSeq, event.seq + 1) : detail.nextSeq,
-        },
-      },
+      state: updateDetail(existing, sessionId, (detail) => {
+        const history = sortHistory(
+          entries.map((entry, index) => toWebHistoryEntry(entry as WireHistoryEntry, index)),
+        );
+        return { ...detail, history, nextSeq: nextSeqFromHistory(history) };
+      }),
     };
   }
 
-  if (event.type === "usage") {
+  if (event.event === "user_message_recorded") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
     return {
-      ...existing,
-      detailsBySession: {
-        ...existing.detailsBySession,
-        [sessionId]: { ...detail, usage: event.usage },
-      },
+      state: updateDetail(existing, sessionId, (detail) => {
+        const pending = detail.history.find(
+          (entry) => entry.kind === "user_message" && entry.id.startsWith(pendingUserPrefix),
+        );
+        const text =
+          stringField(data, "preflight_cleaned") ??
+          (pending?.kind === "user_message" ? pending.text : null);
+        if (!text) return detail;
+        const seq = numberField(data, "seq") ?? nextLocalSeq(detail.history);
+        const history = upsertHistory(
+          detail.history.filter((entry) => entry.id !== pending?.id),
+          { id: "user:" + seq, seq, kind: "user_message", text, actor: { origin: "web" } },
+        );
+        return { ...detail, history, nextSeq: nextSeqFromHistory(history) };
+      }),
     };
   }
 
-  if (event.type === "schedule_updated") {
+  if (event.event === "tool_start") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    if (!stringField(data, "call_id") || !stringField(data, "tool"))
+      return { state: existing, warningKind: event.event };
     return {
-      ...existing,
-      detailsBySession: {
-        ...existing.detailsBySession,
-        [sessionId]: { ...detail, schedules: [event.schedule] },
-      },
+      state: updateDetail(existing, sessionId, (detail) => {
+        const history = applyToolStart(detail.history, data);
+        return history ? { ...detail, history } : detail;
+      }),
     };
   }
 
-  return existing;
+  if (event.event === "tool_end" || event.event === "tool_error") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    if (!stringField(data, "call_id") || !stringField(data, "tool"))
+      return { state: existing, warningKind: event.event };
+    if (event.event === "tool_end" && typeof data.output !== "string")
+      return { state: existing, warningKind: event.event };
+    if (event.event === "tool_error" && typeof data.error !== "string")
+      return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => {
+        const history = applyToolFinish(detail.history, data, event.event === "tool_error");
+        return history ? { ...detail, history, nextSeq: nextSeqFromHistory(history) } : detail;
+      }),
+    };
+  }
+
+  if (event.event === "interrupt_raised") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    const interruptId = stringField(data, "interrupt_id");
+    const description = stringField(data, "description") ?? "";
+    const question = data.question as InterruptQuestion | null | undefined;
+    if (!interruptId || !question) return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => ({
+        ...detail,
+        history: upsertHistory(detail.history, {
+          id: "interrupt:" + interruptId,
+          seq: pendingInterruptSeq,
+          kind: "interrupt",
+          interrupt: {
+            interruptId,
+            kind: question.kind === "freetext" ? "question" : "approval",
+            title: interruptQuestionTitle(question),
+            body: interruptQuestionBody(question, description),
+            resolved: false,
+            question,
+          },
+        }),
+      })),
+    };
+  }
+
+  if (event.event === "interrupt_resolved") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    const interruptId = stringField(data, "interrupt_id");
+    if (!interruptId) return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => ({
+        ...detail,
+        history: detail.history.map((entry) =>
+          entry.kind === "interrupt" && entry.interrupt.interruptId === interruptId
+            ? { ...entry, interrupt: { ...entry.interrupt, resolved: true } }
+            : entry,
+        ),
+        nextSeq: Math.max(detail.nextSeq, (numberField(data, "seq") ?? detail.nextSeq - 1) + 1),
+      })),
+    };
+  }
+
+  if (event.event === "usage") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => ({
+        ...detail,
+        usage: usageFromData(data),
+      })),
+    };
+  }
+
+  if (event.event === "agent_idle") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    const reason = recordField(data, "reason");
+    const status = reason ? stringField(reason, "kind") : undefined;
+    if (!status) return { state: existing, warningKind: event.event };
+    return { state: updateSessionSummary(existing, sessionId, { status }) };
+  }
+
+  return { state: existing, warningKind: event.event };
+}
+
+export function applyLiveEvent(
+  existing: InstanceRemoteState,
+  event: EventEnvelope,
+): InstanceRemoteState {
+  return reduceRemoteSessionEvent(existing, event).state;
+}
+
+export function warnUnhandledRemoteSessionEvent(
+  kind: string | undefined,
+  prod = import.meta.env.PROD,
+) {
+  if (!kind || prod || warnedEventKinds.has(kind)) return;
+  warnedEventKinds.add(kind);
+  console.warn(`[remote-sessions] unhandled event: ${kind}`);
+}
+
+export function resetRemoteSessionEventWarningsForTests() {
+  warnedEventKinds.clear();
 }
 
 export function addOptimisticUserMessage(
@@ -233,30 +747,17 @@ export function addOptimisticUserMessage(
   sessionId: string,
   text: string,
   clientMessageId: string,
-  now = Date.now(),
 ): InstanceRemoteState {
-  const detail = existing.detailsBySession[sessionId];
-  if (!detail) return existing;
-  const optimistic: HistoryEntry = {
-    id: clientMessageId,
-    seq: detail.nextSeq,
-    ts: Math.floor(now / 1000),
-    kind: "user_message",
-    text,
-    attachments: [],
-    actor: { origin: "web" },
-  };
-  return {
-    ...existing,
-    detailsBySession: {
-      ...existing.detailsBySession,
-      [sessionId]: {
-        ...detail,
-        history: upsertHistory(detail.history, optimistic),
-        nextSeq: detail.nextSeq + 1,
-      },
-    },
-  };
+  return updateDetail(existing, sessionId, (detail) => {
+    const history = upsertHistory(detail.history, {
+      id: pendingUserPrefix + clientMessageId,
+      seq: pendingUserSeq,
+      kind: "user_message",
+      text,
+      actor: { origin: "web" },
+    });
+    return { ...detail, history };
+  });
 }
 
 export function updateSessionSharedWithCollaborators(
@@ -264,7 +765,7 @@ export function updateSessionSharedWithCollaborators(
   sessionId: string,
   sharedWithCollaborators: boolean,
 ): InstanceRemoteState {
-  const updateSummary = (summary: SessionSummary): SessionSummary =>
+  const updateSummary = (summary: WebSessionSummary): WebSessionSummary =>
     summary.sessionId === sessionId ? { ...summary, sharedWithCollaborators } : summary;
   const sessionsByProject = Object.fromEntries(
     Object.entries(existing.sessionsByProject).map(([projectRoot, sessions]) => [
@@ -293,6 +794,13 @@ function setInstance(
   return { ...instances, [instanceId]: updater(instances[instanceId] ?? emptyInstance()) };
 }
 
+function projectIdForRoot(current: InstanceRemoteState, projectRoot: string) {
+  return (
+    current.projects.find((project) => project.projectRoot === projectRoot)?.projectId ??
+    projectRoot
+  );
+}
+
 export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) => ({
   instances: {},
   clients: {},
@@ -306,7 +814,6 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
       instanceId,
       relayUrl: tokenInfo.relayUrl,
       token: tokenInfo.token,
-      idPrefix: "web",
       baseUrl: window.location.origin,
       onStatus: (status, statusDetail) => {
         set((state) => ({
@@ -318,11 +825,16 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
         }));
       },
       onEvent: (event) => {
-        set((state) => ({
-          instances: setInstance(state.instances, instanceId, (current) =>
-            applyLiveEvent(current, event as LiveEvent),
-          ),
-        }));
+        set((state) => {
+          const result = reduceRemoteSessionEvent(
+            state.instances[instanceId] ?? emptyInstance(),
+            event,
+          );
+          warnUnhandledRemoteSessionEvent(result.warningKind);
+          return {
+            instances: { ...state.instances, [instanceId]: result.state },
+          };
+        });
       },
     });
     set((state) => ({
@@ -345,28 +857,54 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
     }));
   },
   loadProjects: async (instanceId) => {
-    const result = await get().clients[instanceId]?.listProjects();
+    const result = await get().clients[instanceId]?.listSessions({});
     if (!result) return;
     set((state) => ({
       instances: setInstance(state.instances, instanceId, (current) => ({
         ...current,
-        projects: result.projects,
+        projects: projectsFromSessions(result.sessions),
       })),
     }));
   },
   loadSessions: async (instanceId, projectRoot) => {
-    const result = await get().clients[instanceId]?.listSessions(projectRoot);
+    const current = get().instances[instanceId] ?? emptyInstance();
+    const result = await get().clients[instanceId]?.listSessions({
+      project_id: projectIdForRoot(current, projectRoot),
+    });
     if (!result) return;
+    const sessions = result.sessions.map(toWebSessionSummary);
     set((state) => ({
       instances: setInstance(state.instances, instanceId, (current) => ({
         ...current,
-        sessionsByProject: { ...current.sessionsByProject, [projectRoot]: result.sessions },
+        sessionsByProject: { ...current.sessionsByProject, [projectRoot]: sessions },
+      })),
+    }));
+  },
+  loadStatsRollup: async (instanceId, projectId) => {
+    let result: unknown;
+    try {
+      result = await get().clients[instanceId]?.statsRollup({
+        project_id: projectId,
+        range: "all_time",
+      });
+    } catch {
+      return;
+    }
+    const rollup =
+      result && typeof result === "object" && "rollup" in result ? result.rollup : null;
+    if (!rollup) return;
+    set((state) => ({
+      instances: setInstance(state.instances, instanceId, (current) => ({
+        ...current,
+        statsRollupByProject: { ...current.statsRollupByProject, [projectId]: rollup },
       })),
     }));
   },
   attach: async (instanceId, sessionId) => {
-    const current = get().instances[instanceId]?.detailsBySession[sessionId];
-    const result = await get().clients[instanceId]?.attach(sessionId, current?.nextSeq);
+    const result = await get().clients[instanceId]?.attach({
+      session_id: sessionId,
+      interactive: true,
+    });
     if (!result) return;
     set((state) => ({
       instances: setInstance(state.instances, instanceId, (current) =>
@@ -375,14 +913,34 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
     }));
   },
   createSession: async (instanceId, input) => {
-    const result = await get().clients[instanceId]?.createSession(input);
+    const result = await get().clients[instanceId]?.attach({
+      project_root: input.projectRoot,
+      interactive: true,
+      model_override: input.model,
+    });
     if (!result) throw new Error("Instance connection is not open.");
+    let created: SessionDetail | null = null;
     set((state) => ({
-      instances: setInstance(state.instances, instanceId, (current) =>
-        mergeAttach(current, result),
-      ),
+      instances: setInstance(state.instances, instanceId, (current) => {
+        const next = mergeAttach(current, result);
+        created = next.detailsBySession[result.session_id] ?? null;
+        return next;
+      }),
     }));
-    return result;
+    if (!created) throw new Error("Instance did not return a session.");
+    if (input.agent) await get().clients[instanceId]?.setAgent(input.agent);
+    if (input.title) await get().clients[instanceId]?.renameSession(result.session_id, input.title);
+    if (input.agent || input.title) {
+      set((state) => ({
+        instances: setInstance(state.instances, instanceId, (current) =>
+          updateSessionSummary(current, result.session_id, {
+            agent: input.agent ?? created?.summary.agent,
+            title: input.title ?? created?.summary.title,
+          }),
+        ),
+      }));
+    }
+    return created;
   },
   sendMessage: async (instanceId, sessionId, text) => {
     const clientMessageId = crypto.randomUUID();
@@ -391,41 +949,34 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
         addOptimisticUserMessage(current, sessionId, text, clientMessageId),
       ),
     }));
-    await get().clients[instanceId]?.sendUserMessage(sessionId, text, clientMessageId);
+    await get().clients[instanceId]?.sendUserMessage({ text });
   },
   resolveInterrupt: async (instanceId, input) => {
-    await get().clients[instanceId]?.resolveInterrupt(input);
+    const detail = get().instances[instanceId]?.detailsBySession[input.sessionId];
+    const entry = detail?.history.find(
+      (entry) => entry.kind === "interrupt" && entry.interrupt.interruptId === input.interruptId,
+    );
+    if (entry?.kind !== "interrupt") return;
+    await get().clients[instanceId]?.resolveInterrupt(
+      input.interruptId,
+      resolveResponseForInterrupt(entry.interrupt.question, input.resolution, input.answer),
+    );
   },
   renameSession: async (instanceId, sessionId, title) => {
     await get().clients[instanceId]?.renameSession(sessionId, title);
     set((state) => ({
-      instances: setInstance(state.instances, instanceId, (current) => {
-        const detail = current.detailsBySession[sessionId];
-        if (!detail) return current;
-        return {
-          ...current,
-          detailsBySession: {
-            ...current.detailsBySession,
-            [sessionId]: { ...detail, summary: { ...detail.summary, title } },
-          },
-        };
-      }),
+      instances: setInstance(state.instances, instanceId, (current) =>
+        updateSessionSummary(current, sessionId, { title }),
+      ),
     }));
   },
   archiveSession: async (instanceId, sessionId, archived) => {
-    await get().clients[instanceId]?.archiveSession(sessionId, archived);
+    if (archived) await get().clients[instanceId]?.archiveSession(sessionId);
+    else await get().clients[instanceId]?.unarchiveSession(sessionId);
     set((state) => ({
-      instances: setInstance(state.instances, instanceId, (current) => {
-        const detail = current.detailsBySession[sessionId];
-        if (!detail) return current;
-        return {
-          ...current,
-          detailsBySession: {
-            ...current.detailsBySession,
-            [sessionId]: { ...detail, summary: { ...detail.summary, archived } },
-          },
-        };
-      }),
+      instances: setInstance(state.instances, instanceId, (current) =>
+        updateSessionSummary(current, sessionId, { archived }),
+      ),
     }));
   },
   shareSession: async (instanceId, sessionId, shared) => {
@@ -452,7 +1003,7 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
     }
   },
   forkSession: async (instanceId, sessionId) => {
-    await get().clients[instanceId]?.forkSession(sessionId);
+    await get().clients[instanceId]?.forkSession({ parent_session_id: sessionId });
   },
   listFiles: async (instanceId, input) => {
     const result = await get().clients[instanceId]?.listFiles(
@@ -504,3 +1055,29 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
     return result;
   },
 }));
+
+function updateSessionSummary(
+  existing: InstanceRemoteState,
+  sessionId: string,
+  patch: Partial<WebSessionSummary>,
+) {
+  const updateSummary = (summary: WebSessionSummary): WebSessionSummary =>
+    summary.sessionId === sessionId ? { ...summary, ...patch } : summary;
+  const sessionsByProject = Object.fromEntries(
+    Object.entries(existing.sessionsByProject).map(([projectRoot, sessions]) => [
+      projectRoot,
+      sessions.map(updateSummary),
+    ]),
+  );
+  const detail = existing.detailsBySession[sessionId];
+  return {
+    ...existing,
+    sessionsByProject,
+    detailsBySession: detail
+      ? {
+          ...existing.detailsBySession,
+          [sessionId]: { ...detail, summary: updateSummary(detail.summary) },
+        }
+      : existing.detailsBySession,
+  };
+}

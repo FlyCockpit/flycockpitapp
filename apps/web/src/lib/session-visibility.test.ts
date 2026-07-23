@@ -1,5 +1,5 @@
-import type { SessionSummary } from "@flycockpit/cockpit-protocol";
 import { describe, expect, it } from "vitest";
+import type { WebSessionSummary } from "@/stores/remote-sessions";
 import {
   canMutateSessions,
   resolveSessionViewerMode,
@@ -7,8 +7,9 @@ import {
   shouldShowSessionAttribution,
 } from "./session-visibility";
 
-const session = (createdBy: SessionSummary["createdBy"]): SessionSummary => ({
-  sessionId: "s1",
+const session = (createdBy: WebSessionSummary["createdBy"]): WebSessionSummary => ({
+  sessionId: "11111111-1111-4111-8111-111111111111",
+  projectId: "repo",
   projectRoot: "/repo",
   title: "Fix checkout",
   status: "idle",
@@ -16,8 +17,10 @@ const session = (createdBy: SessionSummary["createdBy"]): SessionSummary => ({
   pinned: false,
   forkCount: 0,
   turnCount: 0,
+  attention: null,
   updatedAt: 1783296000,
   createdBy,
+  agent: "Build",
   sharedWithCollaborators: false,
 });
 

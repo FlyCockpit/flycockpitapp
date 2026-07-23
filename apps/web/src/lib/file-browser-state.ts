@@ -33,13 +33,17 @@ export function childPath(base: string, name: string) {
   return normalizeProjectPath([normalizeProjectPath(base), name].filter(Boolean).join("/"));
 }
 
-export function visibleEntries<T extends { name: string; gitignored: boolean }>(
+export function visibleEntries<T extends { name: string; gitignored?: boolean }>(
   entries: T[],
   showHidden: boolean,
 ) {
   return [...entries]
     .filter((entry) => showHidden || !entry.name.startsWith("."))
-    .sort((a, b) => Number(a.gitignored) - Number(b.gitignored) || a.name.localeCompare(b.name));
+    .sort(
+      (a, b) =>
+        Number(a.gitignored ?? false) - Number(b.gitignored ?? false) ||
+        a.name.localeCompare(b.name),
+    );
 }
 
 export function canEditFile(input: { connected: boolean; blocked: boolean; kind: string }) {

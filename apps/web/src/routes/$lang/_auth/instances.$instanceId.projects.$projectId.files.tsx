@@ -113,7 +113,7 @@ function ProjectFilesPage() {
     })),
   );
   const project = remote?.projects.find((item) => item.projectId === projectId);
-  const projectRoot = project?.projectRoot ?? decodeURIComponent(projectId);
+  const projectRoot = project?.projectRoot ?? projectRootFromRouteParam(projectId);
   const connected = remote?.status === "connected";
 
   const {
@@ -123,8 +123,13 @@ function ProjectFilesPage() {
     refetch: refetchDirectory,
   } = useQuery({
     queryKey: ["remote-files", instanceId, projectRoot, directoryPath, showHidden],
-    enabled: connected,
-    queryFn: () => listFiles(instanceId, { projectRoot, path: directoryPath, showHidden }),
+    enabled: connected && Boolean(projectRoot),
+    queryFn: () =>
+      listFiles(instanceId, {
+        projectRoot: requireProjectRoot(projectRoot),
+        path: directoryPath,
+        showHidden,
+      }),
   });
   const entries = visibleEntries(directoryData?.entries ?? [], showHidden);
   const selectedEntry = entries.find((entry) => entry.path === selectedFile) ?? null;
@@ -136,13 +141,14 @@ function ProjectFilesPage() {
     refetch: refetchFile,
   } = useQuery({
     queryKey: ["remote-file", instanceId, projectRoot, selectedFile],
-    enabled: connected && Boolean(selectedFile),
-    queryFn: () => readFile(instanceId, { projectRoot, path: selectedFile }),
+    enabled: connected && Boolean(projectRoot) && Boolean(selectedFile),
+    queryFn: () =>
+      readFile(instanceId, { projectRoot: requireProjectRoot(projectRoot), path: selectedFile }),
   });
   const { data: statusData } = useQuery({
     queryKey: ["remote-git-status", instanceId, projectRoot],
-    enabled: connected,
-    queryFn: () => gitStatus(instanceId, { projectRoot }),
+    enabled: connected && Boolean(projectRoot),
+    queryFn: () => gitStatus(instanceId, { projectRoot: requireProjectRoot(projectRoot) }),
   });
   const {
     data: diffData,
@@ -151,8 +157,9 @@ function ProjectFilesPage() {
     refetch: refetchDiff,
   } = useQuery({
     queryKey: ["remote-git-diff", instanceId, projectRoot, selectedFile],
-    enabled: connected && Boolean(selectedFile),
-    queryFn: () => gitDiffFile(instanceId, { projectRoot, path: selectedFile }),
+    enabled: connected && Boolean(projectRoot) && Boolean(selectedFile),
+    queryFn: () =>
+      gitDiffFile(instanceId, { projectRoot: requireProjectRoot(projectRoot), path: selectedFile }),
   });
 
   const invalidateProjectFiles = async () => {
@@ -168,9 +175,16 @@ function ProjectFilesPage() {
     mutationFn: async (input: { kind: "file" | "directory"; name: string }) => {
       const target = childPath(directoryPath, input.name);
       if (input.kind === "directory") {
-        await createDirectory(instanceId, { projectRoot, path: target });
+        await createDirectory(instanceId, {
+          projectRoot: requireProjectRoot(projectRoot),
+          path: target,
+        });
       } else {
-        await writeFile(instanceId, { projectRoot, path: target, content: "" });
+        await writeFile(instanceId, {
+          projectRoot: requireProjectRoot(projectRoot),
+          path: target,
+          content: "",
+        });
       }
       return { ...input, path: target };
     },
@@ -204,7 +218,11 @@ function ProjectFilesPage() {
   const renameMutation = useMutation({
     mutationFn: async (input: { entry: FsEntry; name: string }) => {
       const toPath = childPath(parentPath(input.entry.path), input.name);
-      await renamePath(instanceId, { projectRoot, fromPath: input.entry.path, toPath });
+      await renamePath(instanceId, {
+        projectRoot: requireProjectRoot(projectRoot),
+        fromPath: input.entry.path,
+        toPath,
+      });
       return { entry: input.entry, toPath };
     },
     onSuccess: async (result) => {
@@ -226,7 +244,10 @@ function ProjectFilesPage() {
   });
   const deleteMutation = useMutation({
     mutationFn: async (entry: FsEntry) => {
-      await deletePath(instanceId, { projectRoot, path: entry.path });
+      await deletePath(instanceId, {
+        projectRoot: requireProjectRoot(projectRoot),
+        path: entry.path,
+      });
       return entry;
     },
     onSuccess: async (entry) => {
@@ -273,11 +294,11 @@ function ProjectFilesPage() {
           <h1 className="truncate text-2xl font-semibold tracking-tight">
             {project?.displayName ?? t("files.title")}
           </h1>
-          <p className="truncate text-sm text-muted-foreground">{projectRoot}</p>
+          <p className="truncate text-sm text-muted-foreground">{projectRoot ?? projectId}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <CreateEntryDialog
-            connected={connected}
+            connected={connected && Boolean(projectRoot)}
             isPending={createMutation.isPending}
             onSubmit={(input) => createMutation.mutate(input)}
           />
@@ -401,7 +422,12 @@ function ProjectFilesPage() {
                 connected={connected}
                 blocked={selectedEntry?.blocked ?? false}
                 writeFile={(content, baseHash) =>
-                  writeFile(instanceId, { projectRoot, path: selectedFile, content, baseHash })
+                  writeFile(instanceId, {
+                    projectRoot: requireProjectRoot(projectRoot),
+                    path: selectedFile,
+                    content,
+                    baseHash,
+                  })
                 }
                 onSaved={invalidateProjectFiles}
               />
@@ -455,6 +481,16 @@ function ProjectFilesPage() {
       />
     </div>
   );
+}
+
+function projectRootFromRouteParam(projectId: string) {
+  const decoded = decodeURIComponent(projectId);
+  return decoded.startsWith("/") || decoded.includes("/") ? decoded : null;
+}
+
+function requireProjectRoot(projectRoot: string | null) {
+  if (!projectRoot) throw new Error("Project root is not loaded.");
+  return projectRoot;
 }
 
 function CreateEntryDialog({
@@ -823,7 +859,7 @@ function FileMeta({ entry }: { entry: FsEntry }) {
   return (
     <p className="truncate text-xs text-muted-foreground">
       {t("files.kind." + entry.kind)} · {formatBytes(entry.size)}
-      {entry.mtimeMs ? " · " + new Date(entry.mtimeMs).toLocaleString() : ""}
+      {entry.mtime_ms ? " · " + new Date(entry.mtime_ms).toLocaleString() : ""}
       {entry.gitignored ? " · " + t("files.gitignored") : ""}
     </p>
   );

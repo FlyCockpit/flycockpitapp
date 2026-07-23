@@ -111,6 +111,8 @@
     "archivedSessions": "Sesiones archivadas",
     "turns": "{{count}} turnos",
     "tokens": "tokens",
+    "statsModels": "Modelos",
+    "statsModes": "Modos",
     "renamePlaceholder": "Nuevo titulo",
     "rename": "Renombrar",
     "fork": "Bifurcar",

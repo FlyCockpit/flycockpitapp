@@ -1,4 +1,3 @@
-import type { HistoryEntry, SessionSummary } from "@flycockpit/cockpit-protocol";
 import { Button } from "@flycockpit/ui/components/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@flycockpit/ui/components/card";
 import {
@@ -41,7 +40,13 @@ import {
   sessionAttributionName,
   shouldShowSessionAttribution,
 } from "@/lib/session-visibility";
-import { useRemoteSessionsStore } from "@/stores/remote-sessions";
+import { statsRollupToView } from "@/lib/stats-rollup-view";
+import {
+  useRemoteSessionsStore,
+  type WebHistoryEntry,
+  type WebInterruptResolution,
+  type WebSessionSummary,
+} from "@/stores/remote-sessions";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
@@ -81,8 +86,8 @@ function ProjectSessionPage() {
       })),
     );
   const project = remote?.projects.find((item) => item.projectId === projectId);
-  const projectRoot = project?.projectRoot ?? decodeURIComponent(projectId);
-  const sessions = remote?.sessionsByProject[projectRoot] ?? [];
+  const projectRoot = project?.projectRoot ?? projectRootFromRouteParam(projectId);
+  const sessions = projectRoot ? (remote?.sessionsByProject[projectRoot] ?? []) : [];
   const selectedSessionId =
     search.session ??
     sessions.find((session) => !session.archived)?.sessionId ??
@@ -90,11 +95,16 @@ function ProjectSessionPage() {
     null;
   useRemoteProjectSessions({
     instanceId,
+    projectId,
     projectRoot,
     sessionId: selectedSessionId,
     connected: remote?.status === "connected",
   });
   const detail = selectedSessionId ? remote?.detailsBySession[selectedSessionId] : null;
+  const statsView = statsRollupToView(
+    remote?.statsRollupByProject[projectId],
+    detail?.usage?.totalTokens,
+  );
   const [message, setMessage] = useState("");
   const [renameTitle, setRenameTitle] = useState("");
 
@@ -102,7 +112,7 @@ function ProjectSessionPage() {
   const archivedSessions = sessions.filter((session) => session.archived);
   const viewerMode = resolveSessionViewerMode({
     instanceId,
-    projectRoot,
+    projectRoot: projectRoot ?? "",
     ownedInstanceIds: ownedInstances.data?.instances.map((item) => item.id) ?? [],
     sharedInstances: sharedInstances.data?.sharedInstances ?? [],
   });
@@ -148,9 +158,9 @@ function ProjectSessionPage() {
               {t("instances:remote.backToProjects")}
             </Link>
             <h1 className="truncate font-semibold text-lg">
-              {project?.displayName ?? projectRoot}
+              {project?.displayName ?? projectRoot ?? projectId}
             </h1>
-            <p className="truncate text-sm text-muted-foreground">{projectRoot}</p>
+            <p className="truncate text-sm text-muted-foreground">{projectRoot ?? projectId}</p>
           </div>
           <div className="flex flex-wrap gap-2">
             <Link
@@ -168,7 +178,7 @@ function ProjectSessionPage() {
               <FileCode className="size-4" />
               {t("instances:files.open")}
             </Link>
-            {canWriteSessions ? (
+            {canWriteSessions && projectRoot ? (
               <NewSessionDialog
                 instanceId={instanceId}
                 projectRoot={projectRoot}
@@ -224,12 +234,7 @@ function ProjectSessionPage() {
               <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
                 <div className="min-w-0">
                   <h2 className="truncate font-medium">{detail.summary.title}</h2>
-                  <p className="text-xs text-muted-foreground">
-                    {t("instances:remote.turns", { count: detail.summary.turnCount })}
-                    {detail.usage?.totalTokens
-                      ? " · " + detail.usage.totalTokens + " " + t("instances:remote.tokens")
-                      : ""}
-                  </p>
+                  <SessionStatsSummary turns={detail.summary.turnCount} statsView={statsView} />
                 </div>
                 <div className="flex flex-wrap gap-2">
                   {canShareSessions ? (
@@ -359,6 +364,48 @@ function ProjectSessionPage() {
   );
 }
 
+function SessionStatsSummary({
+  turns,
+  statsView,
+}: {
+  turns: number;
+  statsView: ReturnType<typeof statsRollupToView>;
+}) {
+  const { t } = useTranslation("instances");
+  const tokenRows = statsView.tokenRows.slice(0, 2);
+  const modeRows = statsView.recoveryModeRows.slice(0, 2);
+  return (
+    <div className="text-xs text-muted-foreground">
+      <span>{t("instances:remote.turns", { count: turns })}</span>
+      {statsView.fallbackTotal ? (
+        <span>
+          {" · "}
+          {statsView.fallbackTotal} {t("instances:remote.tokens")}
+        </span>
+      ) : null}
+      {tokenRows.length ? (
+        <span>
+          {" · "}
+          {t("instances:remote.statsModels")}:{" "}
+          {tokenRows.map((row) => `${row.label} ${row.value}`).join(", ")}
+        </span>
+      ) : null}
+      {modeRows.length ? (
+        <span>
+          {" · "}
+          {t("instances:remote.statsModes")}:{" "}
+          {modeRows.map((row) => `${row.label} ${row.detail ?? row.value}`).join(", ")}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+function projectRootFromRouteParam(projectId: string) {
+  const decoded = decodeURIComponent(projectId);
+  return decoded.startsWith("/") || decoded.includes("/") ? decoded : null;
+}
+
 function SessionSection({
   title,
   sessions,
@@ -370,7 +417,7 @@ function SessionSection({
   viewerUserId,
 }: {
   title: string;
-  sessions: SessionSummary[];
+  sessions: WebSessionSummary[];
   selectedSessionId: string | null;
   lang: string;
   instanceId: string;
@@ -425,12 +472,12 @@ function Transcript({
   readOnly,
   onResolve,
 }: {
-  history: HistoryEntry[];
+  history: WebHistoryEntry[];
   interruptFocus?: string;
   readOnly: boolean;
   onResolve: (
     interruptId: string,
-    resolution: "approve" | "deny" | "answer",
+    resolution: WebInterruptResolution,
     answer?: string,
   ) => Promise<void>;
 }) {
@@ -455,12 +502,12 @@ function TranscriptEntry({
   readOnly,
   onResolve,
 }: {
-  entry: HistoryEntry;
+  entry: WebHistoryEntry;
   focused: boolean;
   readOnly: boolean;
   onResolve: (
     interruptId: string,
-    resolution: "approve" | "deny" | "answer",
+    resolution: WebInterruptResolution,
     answer?: string,
   ) => Promise<void>;
 }) {
@@ -562,7 +609,7 @@ function SessionVisibilityToggle({
   disabled,
 }: {
   instanceId: string;
-  session: SessionSummary;
+  session: WebSessionSummary;
   disabled: boolean;
 }) {
   const { t } = useTranslation("instances");
@@ -625,7 +672,7 @@ function NewSessionDialog({
       });
       setOpen(false);
       setTitle("");
-      onCreated(result.session.sessionId);
+      onCreated(result.summary.sessionId);
     } catch {
       toast.error(t("remote.createFailed"));
     }

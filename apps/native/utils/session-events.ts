@@ -1,10 +1,19 @@
 import {
+  type AttachResult,
   type EventEnvelope,
   eventEnvelopeSchema,
   type HistoryEntry,
   type InterruptQuestion,
   type ResolveResponse,
 } from "@flycockpit/cockpit-protocol";
+import { daemonStateReducer, emptyNativeDaemonState, type NativeDaemonState } from "./daemon-state";
+import {
+  type ActiveModelState,
+  type AuthFailureKind,
+  activeModelReducer,
+  type InferenceFailureView,
+  inferenceFailureView,
+} from "./inference-failure-view";
 
 export const NATIVE_REMOTE_EVENT_WARN_PREFIX = "[native-remote] unknown event";
 
@@ -21,13 +30,14 @@ export type NativeHistoryEntry =
   | {
       id: string;
       seq: number;
-      kind:
-        | "user_message"
-        | "user_note"
-        | "assistant_text"
-        | "assistant_reasoning"
-        | "inference_error";
+      kind: "user_message" | "user_note" | "assistant_text" | "assistant_reasoning";
       text: string;
+    }
+  | {
+      id: string;
+      seq: number;
+      kind: "inference_error";
+      view: InferenceFailureView;
     }
   | {
       id: string;
@@ -59,11 +69,20 @@ export type NativeHistoryEntry =
 export type NativeSessionEventState = {
   history: NativeHistoryEntry[];
   selectedSessionId: string | null;
+  daemonState?: NativeDaemonState;
+  activeModel?: ActiveModelState | null;
+  llmMode?: string | null;
 };
 
 export type NativeSessionEventResult = {
   state: NativeSessionEventState;
   warning?: string;
+};
+
+export type NativeAttachRuntimeState = {
+  daemonState: NativeDaemonState;
+  activeModel: ActiveModelState | null;
+  llmMode: string | null;
 };
 
 export type InterruptResolutionAction = "approve" | "deny" | "answer";
@@ -88,6 +107,58 @@ function eventWarning(event: string) {
 function eventDataRecord(event: EventEnvelope) {
   const data = event.data;
   return data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+}
+
+function eventStateWithDaemon(
+  state: NativeSessionEventState,
+  event: EventEnvelope,
+): NativeSessionEventState {
+  return {
+    ...state,
+    daemonState: daemonStateReducer(
+      state.daemonState ?? emptyNativeDaemonState,
+      event,
+      state.selectedSessionId,
+    ),
+  };
+}
+
+function activeModelInputFromRecord(value: unknown) {
+  if (!value || typeof value !== "object") return null;
+  const data = value as Record<string, unknown>;
+  return {
+    provider: typeof data.provider === "string" ? data.provider : undefined,
+    model: typeof data.model === "string" ? data.model : undefined,
+    config_provider: typeof data.config_provider === "string" ? data.config_provider : undefined,
+    config_model: typeof data.config_model === "string" ? data.config_model : undefined,
+    diverged: typeof data.diverged === "boolean" ? data.diverged : undefined,
+    generation: typeof data.generation === "number" ? data.generation : undefined,
+  };
+}
+
+function authFailureFromData(value: unknown): AuthFailureKind | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (record.kind === "credentials_rejected") {
+    return {
+      kind: "credentials_rejected",
+      status: typeof record.status === "number" ? record.status : null,
+    };
+  }
+  if (record.kind === "missing_entitlement") {
+    return {
+      kind: "missing_entitlement",
+      feature: typeof record.feature === "string" ? record.feature : null,
+    };
+  }
+  if (record.kind === "oauth_expired") {
+    return {
+      kind: "oauth_expired",
+      provider: typeof record.provider === "string" ? record.provider : null,
+    };
+  }
+  if (record.kind === "provider_not_configured") return { kind: "provider_not_configured" };
+  return null;
 }
 
 function seqOf(entry: { seq?: number }, fallback: number) {
@@ -146,7 +217,10 @@ export function toNativeHistoryEntry(entry: HistoryEntry, fallbackSeq = 0): Nati
       id: entryId("inference", seq),
       seq,
       kind: "inference_error",
-      text: entry.detail ? `${entry.summary}\n${entry.detail}` : entry.summary,
+      view: inferenceFailureView({
+        error_class: entry.summary,
+        detail: entry.detail ?? entry.summary,
+      }),
     };
   }
   if (entry.role === "compact_boundary") {
@@ -179,6 +253,28 @@ export function toNativeHistoryEntry(entry: HistoryEntry, fallbackSeq = 0): Nati
     seq,
     kind: "assistant_reasoning",
     text: "Unknown transcript entry",
+  };
+}
+
+export function nativeAttachRuntimeState(
+  attach: AttachResult,
+  previousDaemonState: NativeDaemonState = emptyNativeDaemonState,
+): NativeAttachRuntimeState {
+  const raw = attach as AttachResult & {
+    active_model_state?: unknown;
+    paused_work?: unknown;
+  };
+  const activeModelInput = activeModelInputFromRecord(raw.active_model_state);
+  const pausedWork = Array.isArray(raw.paused_work)
+    ? raw.paused_work.filter((item) => item && typeof item === "object")
+    : [];
+  return {
+    daemonState: {
+      ...previousDaemonState,
+      pausedWork: pausedWork.length ? { sessionId: attach.session_id, items: pausedWork } : null,
+    },
+    activeModel: activeModelInput ? activeModelReducer(null, activeModelInput) : null,
+    llmMode: null,
   };
 }
 
@@ -306,6 +402,58 @@ export function reduceNativeSessionEvent(
 
   const sessionId = sessionIdFromEvent(event);
   if (sessionId && sessionId !== state.selectedSessionId) return { state };
+
+  if (
+    event.event === "daemon_draining" ||
+    event.event === "sandbox_unavailable" ||
+    event.event === "sandbox_state" ||
+    event.event === "waiting_for_lock" ||
+    event.event === "paused_work_available"
+  ) {
+    return { state: eventStateWithDaemon(state, event) };
+  }
+
+  if (event.event === "active_model_state") {
+    const data = eventDataRecord(event);
+    if (!data) return { state, warning: eventWarning(event.event) };
+    return {
+      state: {
+        ...state,
+        activeModel: activeModelReducer(state.activeModel ?? null, {
+          ...activeModelInputFromRecord(data),
+        }),
+      },
+    };
+  }
+
+  if (event.event === "llm_mode_changed") {
+    const data = eventDataRecord(event);
+    if (typeof data?.mode !== "string") return { state, warning: eventWarning(event.event) };
+    return { state: { ...state, llmMode: data.mode } };
+  }
+
+  if (event.event === "inference_failed") {
+    const data = eventDataRecord(event);
+    if (!data) return { state, warning: eventWarning(event.event) };
+    const seq = nextLocalSeq(state.history);
+    return {
+      state: {
+        ...state,
+        history: upsertHistory(state.history, {
+          id: entryId("inference", seq),
+          seq,
+          kind: "inference_error",
+          view: inferenceFailureView({
+            provider: typeof data.provider === "string" ? data.provider : undefined,
+            model: typeof data.model === "string" ? data.model : undefined,
+            error_class: typeof data.error_class === "string" ? data.error_class : undefined,
+            detail: typeof data.detail === "string" ? data.detail : undefined,
+            auth_failure: authFailureFromData(data.auth_failure),
+          }),
+        }),
+      },
+    };
+  }
 
   if (event.event === "history_replay") {
     const data = event.data as { entries: HistoryEntry[] };

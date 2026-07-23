@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import { emptyNativeDaemonState } from "./daemon-state";
 import {
   appendOptimisticUserMessage,
   type NativeSessionEventState,
+  nativeAttachRuntimeState,
   reconcileRecordedUserMessage,
   reduceNativeSessionEvent,
   removeOptimisticUserMessage,
@@ -89,6 +91,90 @@ describe("native session event helpers", () => {
     expect(result.state.history).toEqual([
       { id: "user:7", kind: "user_message", seq: 7, text: "hello" },
     ]);
+  });
+
+  it("turns live inference failures into structured transcript surfaces", () => {
+    const result = reduceNativeSessionEvent(initialState, {
+      v: 1,
+      kind: "evt",
+      event: "inference_failed",
+      data: {
+        session_id: sessionId,
+        agent: "Build",
+        provider: "openai",
+        model: "gpt-5",
+        error_class: "auth",
+        detail: "bad token",
+        auth_failure: { kind: "credentials_rejected", status: 401 },
+      },
+    });
+
+    expect(result.state.history).toEqual([
+      {
+        id: "inference:1",
+        kind: "inference_error",
+        seq: 1,
+        view: expect.objectContaining({
+          headline: "openai gpt-5 failed",
+          errorClass: "auth",
+          recovery: expect.objectContaining({
+            kind: "reauthenticate",
+            label: "Credentials rejected (HTTP 401)",
+            action: "reauthenticate",
+          }),
+        }),
+      },
+    ]);
+  });
+
+  it("hydrates attach-time active model and paused work state", () => {
+    const runtime = nativeAttachRuntimeState(
+      {
+        session_id: sessionId,
+        short_id: "s1",
+        project_root: "/work/app",
+        project_id: "project_1",
+        active_agent: "Build",
+        history: [],
+        active_model_state: {
+          provider: "openai",
+          model: "gpt-4o",
+          config_provider: "openai",
+          config_model: "gpt-5",
+          diverged: true,
+          generation: 4,
+        },
+        paused_work: [{ session_id: sessionId, reason: "daemon_shutdown" }],
+      } as never,
+      {
+        ...emptyNativeDaemonState,
+        draining: { forced: false, copy: "Daemon draining" },
+        sandboxNotice: { remedy: "Start Docker", fixCommand: "open -a Docker" },
+        waitingForLock: { path: "/work/app", holderAgent: "Build" },
+      },
+    );
+
+    expect(runtime.activeModel).toMatchObject({
+      provider: "openai",
+      model: "gpt-4o",
+      configProvider: "openai",
+      configModel: "gpt-5",
+      diverged: true,
+      generation: 4,
+    });
+    expect(runtime.daemonState.pausedWork).toEqual({
+      sessionId,
+      items: [{ session_id: sessionId, reason: "daemon_shutdown" }],
+    });
+    expect(runtime.daemonState.draining).toEqual({ forced: false, copy: "Daemon draining" });
+    expect(runtime.daemonState.sandboxNotice).toEqual({
+      remedy: "Start Docker",
+      fixCommand: "open -a Docker",
+    });
+    expect(runtime.daemonState.waitingForLock).toEqual({
+      path: "/work/app",
+      holderAgent: "Build",
+    });
   });
 
   it("streams assistant deltas into a pending row and replaces it with final text", () => {

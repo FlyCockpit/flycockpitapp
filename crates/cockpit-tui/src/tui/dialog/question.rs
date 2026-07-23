@@ -33,10 +33,6 @@ use cockpit_core::daemon::proto::{
     SandboxEscalation,
 };
 
-/// Codex-style cap on visible option rows. Longer lists scroll, keeping
-/// the focused row in view, instead of clipping.
-const MAX_VISIBLE_OPTION_ROWS: usize = 8;
-
 /// Hard ceiling on the *collapsed* overlay's height (rows, incl. border +
 /// footer) so a giant question can't eat the whole screen. The dialog
 /// sizes to content up to this; beyond it the regions scroll. `Ctrl+E`
@@ -60,7 +56,6 @@ const MIN_PROMPT_ROWS: usize = 2;
 const MIN_ANSWER_ROWS: usize = 3;
 
 const CUSTOM_LABEL: &str = "Other…";
-const NEXT_LABEL: &str = "Next";
 
 /// Leading hover/cursor glyph on every option row: "▸ " when focused,
 /// two spaces otherwise. Both render two cells wide, so the column a row's
@@ -337,9 +332,31 @@ impl QuestionDialog {
         let chrome: u16 = 3;
         let body = self.body_line_count();
         let want = chrome.saturating_add(body);
-        let max = self.effective_height_cap(self.state.is_expanded());
+        let option_growth = self.options_need_physical_growth(chrome);
+        let max = self.effective_height_cap(self.state.is_expanded() || option_growth);
         let low = max.min(4);
         want.clamp(low, max)
+    }
+
+    fn options_need_physical_growth(&self, chrome: u16) -> bool {
+        if self.state.on_confirm_page() || self.state.is_expanded() {
+            return false;
+        }
+        let page = &self.state.pages()[self.state.current_page()];
+        if matches!(page.kind, PageKind::Text) {
+            return false;
+        }
+
+        let prompt_want = self.prompt_region_height();
+        let answer_want = self.answer_region_want();
+        let collapsed_body = MAX_DIALOG_HEIGHT.saturating_sub(chrome) as usize;
+        let expanded_body = self.effective_height_cap(true).saturating_sub(chrome) as usize;
+        if expanded_body <= collapsed_body {
+            return false;
+        }
+
+        let (_, collapsed_answer_h) = split_regions(collapsed_body, prompt_want, answer_want);
+        answer_want > collapsed_answer_h
     }
 
     /// Height ceiling after reserving the pinned status row and one row of
@@ -363,7 +380,7 @@ impl QuestionDialog {
 
     /// Number of body lines the current view wants (before capping). Sums the
     /// prompt region (description + prompt + command block, wrapped) and the
-    /// answer region (option list capped at [`MAX_VISIBLE_OPTION_ROWS`] rows).
+    /// answer region (all option rows, clamped later by physical fit).
     fn body_line_count(&self) -> u16 {
         if self.state.on_confirm_page() {
             // Title + blank + one row per question + blank + status row, plus
@@ -372,8 +389,8 @@ impl QuestionDialog {
             let lines = self.confirm_content_lines();
             return (lines as u16).max(1);
         }
-        let prompt = self.prompt_region_height();
-        let answer = self.answer_region_want();
+        let prompt = self.prompt_region_height().max(MIN_PROMPT_ROWS);
+        let answer = self.answer_region_want().max(MIN_ANSWER_ROWS);
         ((prompt + answer) as u16).max(1)
     }
 
@@ -385,9 +402,8 @@ impl QuestionDialog {
         wrapped_height(&lines, self.last_inner_width)
     }
 
-    /// Logical-line count the answer region wants (option/custom/Next rows in
-    /// the focused window, descriptions included), capped at
-    /// [`MAX_VISIBLE_OPTION_ROWS`] rows. A text page wants its one input row.
+    /// Logical-line count the answer region wants (option/custom rows,
+    /// descriptions included). A text page wants its one input row.
     fn answer_region_want(&self) -> usize {
         let page_idx = self.state.current_page();
         let page = &self.state.pages()[page_idx];
@@ -395,31 +411,25 @@ impl QuestionDialog {
             PageKind::Text => 1,
             PageKind::Select | PageKind::Multiselect => {
                 let rows = self.row_line_counts(page_idx, page);
-                let total_rows = rows.len();
-                let scroll = self.state.scroll().min(total_rows);
-                let shown = MAX_VISIBLE_OPTION_ROWS.min(total_rows.saturating_sub(scroll));
-                rows[scroll..scroll + shown]
-                    .iter()
-                    .copied()
-                    .sum::<usize>()
-                    .max(1)
+                rows.iter().copied().sum::<usize>().max(1)
             }
         }
     }
 
     /// Per-row line count for the current page's row list (options, then
-    /// the custom affordance, then the multiselect "Next" entry). A row
-    /// is one line plus one per description line.
+    /// the custom affordance). A row is one line plus one per description
+    /// line.
     fn row_line_counts(&self, _page_idx: usize, page: &Page) -> Vec<usize> {
         let mut counts: Vec<usize> = page
             .options
             .iter()
-            .map(|o| {
+            .enumerate()
+            .map(|(idx, o)| {
                 1 + o
                     .description
                     .as_deref()
                     .map(|description| {
-                        let indent = OPTION_CURSOR_WIDTH + 3 + 4;
+                        let indent = option_description_indent(idx, page.kind_is_select());
                         wrap_indented_text(
                             description,
                             indent,
@@ -443,10 +453,6 @@ impl QuestionDialog {
                     self.last_inner_width.saturating_sub(4),
                 )
             });
-        }
-        // Multiselect "Next" entry.
-        if page.next_index().is_some() {
-            counts.push(1);
         }
         counts
     }
@@ -482,8 +488,8 @@ impl QuestionDialog {
         self.state
             .set_prompt_metrics(prompt_want, prompt_visible.max(1));
 
-        // Answer region: how many option rows fit in `answer_h` lines,
-        // capped at the codex row cap, with the focused row kept in view.
+        // Answer region: how many option rows physically fit in `answer_h`
+        // lines, with the focused row kept in view.
         let page_idx = self.state.current_page();
         let page = self.state.pages()[page_idx].clone();
         if matches!(page.kind, PageKind::Text) {
@@ -496,7 +502,7 @@ impl QuestionDialog {
         let scroll = self.state.scroll().min(rows.len().saturating_sub(1));
         let mut fit = 0usize;
         let mut used = 0usize;
-        for &c in rows.iter().skip(scroll).take(MAX_VISIBLE_OPTION_ROWS) {
+        for &c in rows.iter().skip(scroll) {
             if used + c > answer_h && fit > 0 {
                 break;
             }
@@ -693,8 +699,12 @@ impl QuestionDialog {
                     DialogBindingId::ConfirmAgain,
                     DialogBindingId::Move,
                 ]);
-            } else if self.state.next_index().is_some() {
-                ids.extend([DialogBindingId::Toggle, DialogBindingId::Move]);
+            } else if self.current_page_is_multiselect() {
+                ids.extend([
+                    DialogBindingId::Toggle,
+                    DialogBindingId::Move,
+                    DialogBindingId::Choose,
+                ]);
             } else {
                 ids.extend([
                     DialogBindingId::Pick,
@@ -721,6 +731,14 @@ impl QuestionDialog {
         self.format_footer(ids, width)
     }
 
+    fn current_page_is_multiselect(&self) -> bool {
+        !self.state.on_confirm_page()
+            && matches!(
+                self.state.pages()[self.state.current_page()].kind,
+                PageKind::Multiselect
+            )
+    }
+
     fn format_footer(&self, ids: Vec<DialogBindingId>, width: u16) -> String {
         let mut rows = dialog_footer_bindings(&ids, self.keyboard_enhancement_active);
         rows.sort_by_key(|row| row.priority);
@@ -743,12 +761,6 @@ impl QuestionDialog {
     fn expand_binding_id(&self) -> Option<DialogBindingId> {
         if self.state.is_expanded() {
             Some(DialogBindingId::Collapse)
-        } else if self.state.next_index().is_some() {
-            if self.has_more_than_collapsed_fits() {
-                Some(DialogBindingId::Expand)
-            } else {
-                None
-            }
         } else if self.has_more_than_collapsed_fits() {
             Some(DialogBindingId::Expand)
         } else {
@@ -935,7 +947,6 @@ impl QuestionDialog {
                 let viewport = self.answer_viewport_rows();
                 let shown = viewport.min(total_rows.saturating_sub(scroll));
                 let custom_idx = page.options.len();
-                let next_idx = page.next_index();
 
                 // The options region carries no "more" markers — the
                 // scroll-margin keeps the next option in view, so the
@@ -948,10 +959,10 @@ impl QuestionDialog {
                         let opt = &page.options[row_idx];
                         let checked = selected.contains(&opt.id);
                         let marker = match (radio, checked) {
-                            (true, true) => "(•) ",
-                            (true, false) => "( ) ",
-                            (false, true) => "[x] ",
-                            (false, false) => "[ ] ",
+                            (true, true) => "◉ ",
+                            (true, false) => "◯ ",
+                            (false, true) => "■ ",
+                            (false, false) => "□ ",
                         };
                         let num = if row_idx < 9 {
                             format!("{}. ", row_idx + 1)
@@ -962,9 +973,7 @@ impl QuestionDialog {
                         if let Some(desc) = opt.description.as_deref() {
                             // Continuation line aligned under the label
                             // column (cursor + number + marker width).
-                            let indent = OPTION_CURSOR_WIDTH
-                                + UnicodeWidthStr::width(num.as_str())
-                                + UnicodeWidthStr::width(marker);
+                            let indent = option_description_indent(row_idx, radio);
                             lines.extend(wrap_indented_text(desc, indent, area.width, muted));
                         }
                     } else if row_idx == custom_idx {
@@ -983,7 +992,7 @@ impl QuestionDialog {
                         } else if page.kind_is_select() || typed.is_empty() {
                             "+ "
                         } else {
-                            "[x] "
+                            "■ "
                         };
                         let custom_line = self.option_line("", marker, &label, hovered);
                         lines.extend(wrap_lines(&[custom_line], area.width));
@@ -1003,8 +1012,6 @@ impl QuestionDialog {
                             let row = (lines.len() - 1) as u16;
                             cursor = Some((area.x + col, area.y + row));
                         }
-                    } else if Some(row_idx) == next_idx {
-                        lines.push(self.option_line("", "→ ", NEXT_LABEL, hovered));
                     }
                     if hovered {
                         hovered_rows = Some((row_start, lines.len()));
@@ -1046,13 +1053,15 @@ impl QuestionDialog {
     }
 
     /// Visible answer rows the core last reported (its `viewport`), falling
-    /// back to the codex row cap before the first viewport sync.
+    /// back to the full row count before the first viewport sync.
     fn answer_viewport_rows(&self) -> usize {
         let v = self.state.viewport();
         if v == 0 {
-            MAX_VISIBLE_OPTION_ROWS
+            let page_idx = self.state.current_page();
+            self.row_line_counts(page_idx, &self.state.pages()[page_idx])
+                .len()
         } else {
-            v.min(MAX_VISIBLE_OPTION_ROWS)
+            v
         }
     }
 
@@ -1324,6 +1333,12 @@ fn split_regions(body_h: usize, prompt_want: usize, answer_want: usize) -> (usiz
         return (prompt_h + slack, answer_h);
     }
     (prompt_h, answer_h)
+}
+
+fn option_description_indent(row_idx: usize, radio: bool) -> usize {
+    let num = if row_idx < 9 { "1. " } else { "   " };
+    let marker = if radio { "◯ " } else { "□ " };
+    OPTION_CURSOR_WIDTH + UnicodeWidthStr::width(num) + UnicodeWidthStr::width(marker)
 }
 
 fn risk_tier_color(tier: &str) -> Option<Color> {
@@ -2026,13 +2041,52 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(
-            desc_rows.iter().all(|row| row.starts_with("         ")),
+            desc_rows.iter().all(|row| row.starts_with("       ")),
             "{rows:?}"
         );
         assert!(
-            desc_rows.iter().all(|row| !row.starts_with("          ")),
-            "indent is display width 9, not byte width 11: {rows:?}"
+            desc_rows.iter().all(|row| !row.starts_with("        ")),
+            "indent is display width 7, not byte width 8: {rows:?}"
         );
+    }
+
+    #[test]
+    fn dialog_ux_glyphs_circles_and_squares() {
+        let select_set = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Pick".into(),
+                options: vec![opt("a", "A"), opt("b", "B")],
+                allow_freetext: false,
+                command_detail: None,
+                permission: false,
+                approval_class: None,
+                sandbox_escalation: None,
+            }],
+        };
+        let mut select = dialog(select_set);
+        select.handle_key(press(KeyCode::Char(' ')));
+        let select_text = render_lines(&select, Rect::new(0, 0, 60, 10)).join("\n");
+        assert!(select_text.contains("1. ◉ A"), "{select_text}");
+        assert!(select_text.contains("2. ◯ B"), "{select_text}");
+
+        let multi_set = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Multi {
+                prompt: "Pick".into(),
+                options: vec![opt("a", "A"), opt("b", "B")],
+                allow_freetext: true,
+            }],
+        };
+        let mut multi = dialog(multi_set);
+        multi.handle_key(press(KeyCode::Char(' ')));
+        multi.handle_key(press(KeyCode::Down));
+        multi.handle_key(press(KeyCode::Down));
+        multi.handle_key(press(KeyCode::Char(' ')));
+        multi.handle_key(press(KeyCode::Char('x')));
+        multi.handle_key(press(KeyCode::Esc));
+        let multi_text = render_lines(&multi, Rect::new(0, 0, 60, 10)).join("\n");
+        assert!(multi_text.contains("1. ■ A"), "{multi_text}");
+        assert!(multi_text.contains("2. □ B"), "{multi_text}");
+        assert!(multi_text.contains("■ x"), "{multi_text}");
     }
 
     #[test]
@@ -2071,8 +2125,8 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("9. ( ) Option 9"));
-        assert!(text.contains("   ( ) Option 10"));
+        assert!(text.contains("9. ◯ Option 9"));
+        assert!(text.contains("   ◯ Option 10"));
         assert!(!text.contains("10. Option 10"));
         assert!(!text.contains("11. Option 11"));
         assert!(!text.contains("12. Option 12"));
@@ -2099,10 +2153,48 @@ mod tests {
             d.handle_key(press(KeyCode::Char(ch)));
         }
         d.handle_key(press(KeyCode::Esc)); // leave typing, keep custom text
-        d.handle_key(press(KeyCode::Down)); // navigate to Next
 
         let text = render_lines(&d, Rect::new(0, 0, 60, 10)).join("\n");
-        assert!(text.contains("[x] custom value"), "{text}");
+        assert!(text.contains("■ custom value"), "{text}");
+    }
+
+    #[test]
+    fn dialog_ux_multiselect_next_row_removed() {
+        let set = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Multi {
+                prompt: "Pick".into(),
+                options: vec![opt("a", "A"), opt("b", "B")],
+                allow_freetext: true,
+            }],
+        };
+        let mut d = dialog(set);
+        d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Down));
+        assert_eq!(d.state.cursor(), 2, "cursor reaches custom row");
+        d.handle_key(press(KeyCode::Down));
+        assert_eq!(d.state.cursor(), 0, "no Next row after custom");
+
+        let text = render_lines(&d, Rect::new(0, 0, 60, 10)).join("\n");
+        assert!(!text.contains("Next"), "{text}");
+        assert!(!text.contains('→'), "{text}");
+    }
+
+    #[test]
+    fn dialog_ux_footer_hints_updated() {
+        let set = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Multi {
+                prompt: "Pick".into(),
+                options: vec![opt("a", "A"), opt("b", "B")],
+                allow_freetext: true,
+            }],
+        };
+        let d = dialog(set);
+        let hint = d.footer_hint();
+
+        assert!(hint.contains("1-9/space: toggle"), "{hint}");
+        assert!(hint.contains("enter: confirm"), "{hint}");
+        assert!(!hint.contains("enter: toggle"), "{hint}");
+        assert!(!hint.contains("Next"), "{hint}");
     }
 
     #[test]
@@ -2253,30 +2345,106 @@ mod tests {
         assert!(!d.state.is_typing());
         let joined = render_lines(&d, area).join("\n");
         assert!(joined.contains("abc"), "typed text survives Esc: {joined}");
-        // Re-enter typing (Enter on the custom affordance with text present
-        // commits on single-select; Space re-enters). Use Space to resume.
-        d.handle_key(press(KeyCode::Char(' ')));
+        // Re-enter typing with Enter even though the row already has text.
+        d.handle_key(press(KeyCode::Enter));
         assert!(d.state.is_typing(), "resumes typing");
         assert_eq!(d.state.custom_text(0), "abc", "resumes from same text");
     }
 
-    #[test]
-    fn long_list_scrolls_keeping_focus_visible() {
-        let options: Vec<InterruptOption> = (0..20)
-            .map(|i| opt(&format!("o{i}"), &format!("Option {i}")))
-            .collect();
-        let set = InterruptQuestionSet {
+    fn numbered_option_set(count: usize) -> InterruptQuestionSet {
+        InterruptQuestionSet {
             questions: vec![InterruptQuestion::Single {
                 prompt: "Pick".into(),
-                options,
+                options: (1..=count)
+                    .map(|n| opt(&format!("o{n}"), &format!("Option {n}")))
+                    .collect(),
                 allow_freetext: true,
                 command_detail: None,
                 permission: false,
                 approval_class: None,
                 sandbox_escalation: None,
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn dialog_ux_all_options_visible_when_room() {
+        let mut d = dialog(numbered_option_set(15));
+        d.sync_viewport(Rect::new(0, 0, 80, 40), 40);
+
+        assert_eq!(d.desired_height(), 21);
+        assert_eq!(d.state.viewport(), 16, "15 options plus custom fit");
+        assert_eq!(d.state.scroll(), 0);
+        let text = render_lines(&d, Rect::new(0, 0, 80, 21)).join("\n");
+        assert!(text.contains("1. ◯ Option 1"), "{text}");
+        assert!(text.contains("9. ◯ Option 9"), "{text}");
+        assert!(text.contains("   ◯ Option 15"), "{text}");
+        assert!(text.contains(CUSTOM_LABEL), "{text}");
+    }
+
+    #[test]
+    fn dialog_ux_mid_sized_options_grow_past_prompt_floor() {
+        let mut d = dialog(numbered_option_set(12));
+        d.sync_viewport(Rect::new(0, 0, 80, 16), 40);
+
+        let height = d.desired_height();
+        assert_eq!(height, 18);
+        d.sync_viewport(Rect::new(0, 0, 80, height), 40);
+        assert_eq!(d.state.viewport(), 13, "12 options plus custom fit");
+        assert_eq!(d.state.scroll(), 0);
+    }
+
+    #[test]
+    fn dialog_ux_description_height_uses_rendered_glyph_indent() {
+        let mut set = single_q();
+        if let InterruptQuestion::Single { options, .. } = &mut set.questions[0] {
+            options[0].description = Some("alpha beta xyz".into());
+        }
         let mut d = dialog(set);
+        d.sync_viewport(Rect::new(0, 0, 24, 16), 40);
+        let page = &d.state.pages()[0];
+        let rows = d.row_line_counts(0, page);
+
+        assert_eq!(rows[0], 2, "option plus one rendered description row");
+    }
+
+    #[test]
+    fn dialog_ux_overflow_falls_back_to_scroll() {
+        let mut set = numbered_option_set(15);
+        if let InterruptQuestion::Single { prompt, .. } = &mut set.questions[0] {
+            *prompt = "Pick one option. ".repeat(18);
+        }
+        let mut d = dialog(set);
+        d.sync_viewport(Rect::new(0, 0, 80, 20), 24);
+
+        assert!(d.state.viewport() < 16, "viewport should physically cap");
+        for _ in 0..12 {
+            d.handle_key(press(KeyCode::Down));
+            d.sync_viewport(Rect::new(0, 0, 80, 20), 24);
+        }
+        assert!(d.state.scroll() > 0, "overflowing options scroll");
+        let cursor = d.state.cursor();
+        let scroll = d.state.scroll();
+        let vp = d.answer_viewport_rows();
+        assert!(cursor >= scroll && cursor < scroll + vp);
+    }
+
+    #[test]
+    fn dialog_ux_ctrl_e_still_expands_prompt() {
+        let mut d = tall_approval_dialog();
+        d.sync_viewport(Rect::new(0, 0, 80, 16), 40);
+        let collapsed = d.desired_height();
+
+        assert!(!d.handle_key(ctrl(KeyCode::Char('e'))));
+        d.sync_viewport(Rect::new(0, 0, 80, 16), 40);
+
+        assert!(d.desired_height() > collapsed);
+        assert!(d.footer_hint().contains("ctrl+e: collapse"));
+    }
+
+    #[test]
+    fn long_list_scrolls_keeping_focus_visible() {
+        let mut d = dialog(numbered_option_set(20));
         // Tight overlay: only a few answer rows fit in the answer region.
         let area = Rect::new(0, 0, 60, 11);
         d.sync_viewport(area, 40);
@@ -2290,7 +2458,7 @@ mod tests {
         let cursor = d.state.cursor();
         assert!(cursor >= scroll, "cursor not above the window");
         assert!(
-            cursor < scroll + MAX_VISIBLE_OPTION_ROWS,
+            cursor < scroll + d.answer_viewport_rows(),
             "cursor not below the window"
         );
         assert!(scroll > 0, "list should have scrolled");
@@ -2348,34 +2516,19 @@ mod tests {
     /// fits one more option than it did when a marker row was reserved.
     #[test]
     fn dropping_marker_reclaims_an_option_row() {
-        let options: Vec<InterruptOption> = (0..20)
-            .map(|i| opt(&format!("o{i}"), &format!("Option {i}")))
-            .collect();
-        let set = InterruptQuestionSet {
-            questions: vec![InterruptQuestion::Single {
-                prompt: "Pick".into(),
-                options,
-                allow_freetext: true,
-                command_detail: None,
-                permission: false,
-                approval_class: None,
-                sandbox_escalation: None,
-            }],
-        };
-        let mut d = dialog(set);
+        let mut d = dialog(numbered_option_set(20));
         // Compute the answer slice geometry directly, then confirm the
         // viewport uses the WHOLE slice (no marker-row reservation): for a
         // list of single-line options the fitted viewport equals the slice
-        // height (capped at the row cap).
+        // height.
         let area = Rect::new(0, 0, 60, 14);
         d.sync_viewport(area, 40);
         let body_h = (area.height - 3) as usize;
         let (_p, answer_h) =
             split_regions(body_h, d.prompt_region_height(), d.answer_region_want());
-        let expected = answer_h.min(MAX_VISIBLE_OPTION_ROWS);
         assert_eq!(
             d.state.viewport(),
-            expected,
+            answer_h,
             "answer viewport uses the full slice with no marker-row reserved"
         );
     }
@@ -3156,7 +3309,7 @@ mod tests {
         assert!(!d.footer_hint().contains("ctrl+e"));
     }
 
-    // ---- permission-prompt presentation (no marker, no freeform) --------
+    // ---- permission-prompt presentation (radio marker, no freeform) -----
 
     #[test]
     fn permission_prompt_shows_radio_marker_and_drops_freeform_row() {
@@ -3178,7 +3331,7 @@ mod tests {
         let area = Rect::new(0, 0, 80, 16);
         let text = render_text(&d, area);
         assert!(
-            text.contains("( )"),
+            text.contains("◯"),
             "selection marker is visible on a permission prompt"
         );
         assert!(
@@ -3187,10 +3340,10 @@ mod tests {
         );
         // Numbered prefixes + labels survive.
         assert!(
-            text.contains("1. ( ) Yes, once"),
+            text.contains("1. ◯ Yes, once"),
             "numbered prefix kept: {text}"
         );
-        assert!(text.contains("2. ( ) Yes, for this session"));
+        assert!(text.contains("2. ◯ Yes, for this session"));
     }
 
     #[test]
@@ -3263,13 +3416,13 @@ mod tests {
 
     #[test]
     fn question_prompt_keeps_radio_and_freeform_row() {
-        // The default (question) presentation is unchanged: radio markers
+        // The default (question) presentation keeps radio markers
         // and the `Type your own answer` row both render.
         let d = dialog(single_q());
         let area = Rect::new(0, 0, 60, 12);
         let text = render_text(&d, area);
         assert!(
-            text.contains("(•)") || text.contains("( )"),
+            text.contains("◉") || text.contains("◯"),
             "radio marker kept: {text}"
         );
         assert!(

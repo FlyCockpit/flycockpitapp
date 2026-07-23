@@ -745,8 +745,10 @@ impl App {
         };
         let lockout = match reason {
             cockpit_core::daemon::proto::InterruptRaiseReason::Initial => self.dialog_lockout(),
-            cockpit_core::daemon::proto::InterruptRaiseReason::Advance
-            | cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
+            cockpit_core::daemon::proto::InterruptRaiseReason::Advance => {
+                crate::tui::dialog::DialogState::NO_LOCKOUT
+            }
+            cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
                 self.fresh_dialog_lockout()
             }
         };
@@ -806,13 +808,27 @@ mod tests {
     }
 
     fn interrupt(session_id: Uuid, description: &str, permission: bool) -> TurnEvent {
+        interrupt_with_reason(
+            session_id,
+            description,
+            permission,
+            InterruptRaiseReason::Initial,
+        )
+    }
+
+    fn interrupt_with_reason(
+        session_id: Uuid,
+        description: &str,
+        permission: bool,
+        reason: InterruptRaiseReason,
+    ) -> TurnEvent {
         TurnEvent::InterruptRaised {
             session_id,
             interrupt_id: Uuid::new_v4(),
             description: description.to_string(),
             questions: question_set(permission),
             pending_count: 0,
-            reason: InterruptRaiseReason::Initial,
+            reason,
         }
     }
 
@@ -1007,6 +1023,31 @@ mod tests {
             "side approval is labeled/routed as btw"
         );
         assert!(app.question_dialog.as_ref().expect("dialog").is_approval());
+    }
+
+    #[test]
+    fn dialog_ux_lockout_only_first_of_chain_btw_path() {
+        for (reason, expected_locked) in [
+            (InterruptRaiseReason::Initial, true),
+            (InterruptRaiseReason::Advance, false),
+            (InterruptRaiseReason::Rehydration, true),
+        ] {
+            let side = info(false);
+            let mut app = App::new(None, false);
+            app.open_btw_pane_from_info(side.clone(), false);
+            app.composer_active_since_dialog = true;
+
+            app.handle_btw_interrupt(interrupt_with_reason(
+                side.session_id,
+                "side question",
+                false,
+                reason,
+            ));
+
+            let dialog = app.question_dialog.as_ref().expect("dialog");
+            assert!(app.question_dialog_btw);
+            assert_eq!(dialog.locked(), expected_locked, "{reason:?}");
+        }
     }
 
     #[test]

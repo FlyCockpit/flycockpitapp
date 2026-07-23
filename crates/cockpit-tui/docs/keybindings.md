@@ -59,12 +59,12 @@ Open the in-TUI keybinding overlay with `Ctrl+K` or `/keys`. `Esc`, `q`, or `Ctr
 | --- | --- | --- |
 | `1-9` | select | choose a numbered option |
 | `1-9/Enter` | select | select an approval option |
-| `1-9/Enter` | toggle | toggle a multiselect option |
+| `1-9/Space` | toggle | toggle a multiselect option |
 | `↑/↓ or j/k` | move | highlight an option |
 | `Enter` | choose | choose the highlighted answer |
 | `Enter` | confirm | confirm a selected approval choice |
 | `←/→ or h/l` | questions | move between question pages |
-| `Space` | toggle/type | toggle selection or edit Other... |
+| `Space` | select/toggle | select or toggle without advancing |
 | `Enter` | select/confirm | select, then confirm permission choices |
 | `PgUp/PgDn` | prompt scroll | scroll dialog prompt content |
 | `Shift+PgUp/PgDn` | chat scroll | scroll the transcript behind the dialog |
@@ -82,12 +82,12 @@ Open the in-TUI keybinding overlay with `Ctrl+K` or `/keys`. `Esc`, `q`, or `Ctr
 | --- | --- | --- |
 | `1-9` | select | choose a numbered option |
 | `1-9/Enter` | select | select an approval option |
-| `1-9/Enter` | toggle | toggle a multiselect option |
+| `1-9/Space` | toggle | toggle a multiselect option |
 | `↑/↓ or j/k` | move | highlight an option |
 | `Enter` | choose | choose the highlighted answer |
 | `Enter` | confirm | confirm a selected approval choice |
 | `←/→ or h/l` | questions | move between question pages |
-| `Space` | toggle/type | toggle selection or edit Other... |
+| `Space` | select/toggle | select or toggle without advancing |
 | `Enter` | select/confirm | select, then confirm permission choices |
 | `PgUp/PgDn` | prompt scroll | scroll dialog prompt content |
 | `Shift+PgUp/PgDn` | chat scroll | scroll the transcript behind the dialog |

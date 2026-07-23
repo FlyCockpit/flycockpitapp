@@ -965,15 +965,18 @@ impl App {
                 // A `question` tool blocked the agent (GOALS §3b). Open
                 // the answering dialog over the composer. The
                 // anti-misfire lockout arms with the configured delay on the
-                // genuine composer→dialog edge, queue advancement, and attach
-                // rehydration. A same-id re-raise only updates queue metadata
-                // for the visible dialog.
+                // genuine composer→dialog edge and attach rehydration. Queue
+                // advancement is immediately interactive because the composer
+                // never regains focus between dialogs. A same-id re-raise only
+                // updates queue metadata for the visible dialog.
                 let lockout = match reason {
                     cockpit_core::daemon::proto::InterruptRaiseReason::Initial => {
                         self.dialog_lockout()
                     }
-                    cockpit_core::daemon::proto::InterruptRaiseReason::Advance
-                    | cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
+                    cockpit_core::daemon::proto::InterruptRaiseReason::Advance => {
+                        crate::tui::dialog::DialogState::NO_LOCKOUT
+                    }
+                    cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
                         self.fresh_dialog_lockout()
                     }
                 };

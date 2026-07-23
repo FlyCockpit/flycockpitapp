@@ -83,8 +83,8 @@ pub struct Page {
     pub options: Vec<DialogOption>,
     secondary_options: Vec<DialogOption>,
     /// Presentation: when `true` this page is rendered in the stripped
-    /// **permission/approval** style — no selection marker (`(•)`/`( )`)
-    /// and no free-text custom affordance. Default `false` keeps the question
+    /// **permission/approval** style — no free-text custom affordance.
+    /// Default `false` keeps the question
     /// presentation exactly as before. Set only by the approval callers (the
     /// scope dialog and any tool-permission interrupt); every other caller
     /// leaves it at its default.
@@ -197,15 +197,12 @@ impl Page {
     }
 
     /// Cursor positions on this page. A `text` page has a single
-    /// position (its input). A select page is `[options…] ([custom])`. A
-    /// multiselect page is `[options…] [custom] [Next]` — the explicit
-    /// "Next" advance entry (Enter toggles options, never auto-advances).
-    /// A permission page drops the custom affordance (`[options…]` only).
+    /// position (its input). Select and multiselect pages are
+    /// `[options…] ([custom])`. A permission page drops the custom
+    /// affordance (`[options…]` only).
     fn cursor_count(&self) -> usize {
         if self.is_text() {
             1
-        } else if self.is_multiselect() {
-            self.options.len() + 2
         } else if self.has_custom() {
             self.options.len() + 1
         } else {
@@ -219,16 +216,6 @@ impl Page {
     fn custom_index(&self) -> Option<usize> {
         if self.has_custom() {
             Some(self.options.len())
-        } else {
-            None
-        }
-    }
-
-    /// Index of the explicit "Next" advance entry on a multiselect page
-    /// (the row after the custom affordance). `None` for non-multiselect.
-    fn next_index(&self) -> Option<usize> {
-        if self.is_multiselect() {
-            Some(self.options.len() + 1)
         } else {
             None
         }
@@ -292,9 +279,9 @@ pub struct DialogState {
     /// here.
     created_at: Instant,
     lockout: Duration,
-    /// Max visible rows the renderer last reported (the codex-style cap).
-    /// Zero means "unbounded" (no scrolling) until the renderer reports a
-    /// cap.
+    /// Max visible rows the renderer last reported from the physical answer
+    /// region. Zero means "unbounded" (no scrolling) until the renderer
+    /// reports a cap.
     viewport: usize,
     /// First visible line of the **prompt region** (interrupt description +
     /// question prompt + any command-detail block). The answer region above
@@ -432,9 +419,8 @@ impl DialogState {
         let st = &self.page_states[page];
         match self.pages[page].kind {
             PageKind::Text => !st.custom.text().trim().is_empty(),
-            PageKind::Select | PageKind::Multiselect => {
-                !st.selected.is_empty() || !st.custom.text().trim().is_empty()
-            }
+            PageKind::Select => !st.selected.is_empty() || !st.custom.text().trim().is_empty(),
+            PageKind::Multiselect => true,
         }
     }
 
@@ -467,26 +453,16 @@ impl DialogState {
         self.list.scroll()
     }
 
-    /// Visible option rows the renderer last reported (the codex-style cap).
+    /// Visible option rows the renderer last reported.
     /// Zero before the first viewport sync.
     pub fn viewport(&self) -> usize {
         self.viewport
     }
 
-    /// The cursor index of the multiselect "Next" advance entry on the
-    /// current page, if any. Lets the renderer draw it as a row.
-    pub fn next_index(&self) -> Option<usize> {
-        if self.on_confirm_page() {
-            None
-        } else {
-            self.pages[self.page].next_index()
-        }
-    }
-
-    /// Tell the core how many option rows the renderer can show at once
-    /// (the codex-style cap, after line-accounting for multi-line rows),
-    /// and clamp scroll so the focused cursor stays in view. Called from
-    /// the renderer each frame with the height it computed.
+    /// Tell the core how many option rows the renderer can physically show at
+    /// once after line-accounting for multi-line rows, and clamp scroll so the
+    /// focused cursor stays in view. Called from the renderer each frame with
+    /// the height it computed.
     pub fn set_viewport(&mut self, rows: usize) {
         self.viewport = rows;
         self.clamp_scroll();
@@ -678,12 +654,8 @@ impl DialogState {
                     return self.fast_path_submit_or_advance();
                 }
                 // Select/multiselect custom field: Enter commits the typed
-                // answer. Multiselect stays put (advance is the "Next"
-                // entry); single-select fast-paths.
+                // answer and advances when it supplies an answer.
                 self.typing = false;
-                if page.is_multiselect() {
-                    return DialogOutcome::Continue;
-                }
                 if self.page_states[self.page].custom.text().trim().is_empty() {
                     return DialogOutcome::Continue;
                 }
@@ -791,13 +763,9 @@ impl DialogState {
     }
 
     /// Space on a page: toggle the hovered option, or enter typing mode
-    /// on the custom affordance. The "Next" entry (multiselect only) is
-    /// not a toggle target — space there is a no-op (Enter advances).
+    /// on the custom affordance.
     fn toggle_or_type(&mut self) {
         let page = &self.pages[self.page];
-        if Some(self.list.cursor()) == page.next_index() {
-            return;
-        }
         if Some(self.list.cursor()) == page.custom_index() {
             // Hovering "Type your own answer": space begins typing.
             self.begin_custom_typing();
@@ -839,30 +807,19 @@ impl DialogState {
         if self.pages[self.page].is_select() {
             self.page_states[self.page].selected.clear();
         }
+        let current = self.page_states[self.page].custom.text().to_string();
+        self.page_states[self.page].custom.set(current);
         self.typing = true;
     }
 
     /// Enter on a select/multiselect page (cursor mode).
     fn enter_on_page(&mut self) -> DialogOutcome {
         let page = &self.pages[self.page];
-        // Multiselect "Next" entry: the explicit advance.
-        if Some(self.list.cursor()) == page.next_index() {
-            return self.fast_path_submit_or_advance();
-        }
         if Some(self.list.cursor()) == page.custom_index() {
-            // On the custom affordance: with text already typed, enter =
-            // choose+submit that custom answer; with nothing typed, enter
-            // = begin typing.
-            if self.page_states[self.page].custom.text().trim().is_empty() {
-                self.begin_custom_typing();
-                return DialogOutcome::Continue;
-            }
-            // A multiselect never auto-advances on choosing custom; the
-            // "Next" entry advances. A single-select fast-paths.
-            if page.is_multiselect() {
-                return DialogOutcome::Continue;
-            }
-            return self.fast_path_submit_or_advance();
+            // Enter on the custom affordance always resumes editing; Enter
+            // from typing mode is the commit/advance action.
+            self.begin_custom_typing();
+            return DialogOutcome::Continue;
         }
         // Hovering a proposed option.
         let Some(option) = page.options.get(self.list.cursor()) else {
@@ -892,15 +849,7 @@ impl DialogState {
             st.custom.set("");
             self.fast_path_submit_or_advance()
         } else {
-            // Multiselect: Enter TOGGLES the focused option, never
-            // advances. The "Next" entry advances.
-            let st = &mut self.page_states[self.page];
-            if let Some(pos) = st.selected.iter().position(|s| *s == id) {
-                st.selected.remove(pos);
-            } else {
-                st.selected.push(id);
-            }
-            DialogOutcome::Continue
+            self.fast_path_submit_or_advance()
         }
     }
 
@@ -1162,6 +1111,32 @@ mod tests {
     }
 
     #[test]
+    fn dialog_ux_select_enter_advances_space_stays() {
+        let mut d = unlocked(vec![
+            Page::select("q1", vec![opt("a"), opt("b")]),
+            Page::text("q2"),
+        ]);
+
+        d.handle_key(press(KeyCode::Char(' ')));
+        assert_eq!(d.selected_ids(0), &["a".to_string()]);
+        assert_eq!(d.current_page(), 0, "Space selects without advancing");
+        d.handle_key(press(KeyCode::Char(' ')));
+        assert!(d.selected_ids(0).is_empty(), "Space re-press clears");
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.selected_ids(0), &["a".to_string()]);
+        assert_eq!(d.current_page(), 1, "Enter selects and advances");
+
+        let mut approval = unlocked(vec![
+            Page::select("Approve?", vec![opt("a"), opt("b")]).permission(),
+        ]);
+        assert_eq!(
+            approval.handle_key(press(KeyCode::Char('1'))),
+            DialogOutcome::Continue
+        );
+        assert_eq!(approval.selected_ids(0), &["a".to_string()]);
+    }
+
+    #[test]
     fn multiselect_space_is_independent() {
         let mut d = unlocked(vec![Page::multiselect("?", vec![opt("a"), opt("b")])]);
         d.handle_key(press(KeyCode::Char(' '))); // a
@@ -1252,6 +1227,30 @@ mod tests {
     }
 
     #[test]
+    fn dialog_ux_custom_row_enter_resumes_typing() {
+        let mut d = unlocked(vec![Page::select("?", vec![opt("a")])]);
+        d.handle_key(press(KeyCode::Down));
+        assert_eq!(d.cursor(), 1);
+
+        d.handle_key(press(KeyCode::Enter));
+        assert!(d.is_typing(), "empty custom row enters typing");
+        d.handle_key(press(KeyCode::Char('h')));
+        d.handle_key(press(KeyCode::Char('i')));
+        d.handle_key(press(KeyCode::Esc));
+        assert!(!d.is_typing());
+        assert_eq!(d.custom_text(0), "hi");
+
+        d.handle_key(press(KeyCode::Enter));
+        assert!(d.is_typing(), "text-bearing custom row resumes typing");
+        d.handle_key(press(KeyCode::Char('!')));
+        assert_eq!(d.custom_text(0), "hi!", "resume parks cursor at end");
+        assert_eq!(
+            d.handle_key(press(KeyCode::Enter)),
+            DialogOutcome::Submit(vec![Answer::Text { text: "hi!".into() }])
+        );
+    }
+
+    #[test]
     fn single_select_custom_and_radio_are_mutually_exclusive() {
         // Two select pages so Enter on a select-custom field advances
         // (leaving the typed custom in place) rather than submitting — that
@@ -1292,29 +1291,41 @@ mod tests {
     }
 
     #[test]
-    fn multiselect_enter_toggles_and_next_advances() {
+    fn dialog_ux_multiselect_enter_confirms_set() {
         let mut d = unlocked(vec![
             Page::multiselect("q1", vec![opt("a"), opt("b")]),
             Page::text("q2"),
         ]);
-        // Enter on the focused option toggles it (no advance).
-        d.handle_key(press(KeyCode::Enter));
+        // Space toggles without advancing.
+        d.handle_key(press(KeyCode::Char(' ')));
         assert_eq!(d.selected_ids(0), &["a".to_string()]);
-        assert_eq!(d.current_page(), 0, "multiselect Enter never advances");
-        // Enter again toggles it back off.
-        d.handle_key(press(KeyCode::Enter));
-        assert!(d.selected_ids(0).is_empty());
-        // Number key toggles a different option.
+        assert_eq!(d.current_page(), 0, "Space stays on multiselect page");
+        // Number key toggles a different option without advancing.
         d.handle_key(press(KeyCode::Char('2')));
-        assert_eq!(d.selected_ids(0), &["b".to_string()]);
-        // Navigate to the explicit "Next" entry and Enter: advances.
-        // Layout: [a, b, custom, Next] => Next at index 3. The number key
-        // left the cursor on index 1, so step down to custom then Next.
-        d.handle_key(press(KeyCode::Down)); // index 2 (custom)
-        d.handle_key(press(KeyCode::Down)); // index 3 (Next)
-        assert_eq!(d.cursor(), 3);
+        assert_eq!(d.selected_ids(0), &["a".to_string(), "b".to_string()]);
+        assert_eq!(d.current_page(), 0);
+        // Enter confirms the current set and advances.
         d.handle_key(press(KeyCode::Enter));
-        assert_eq!(d.current_page(), 1, "Next advanced to the next question");
+        assert_eq!(d.current_page(), 1, "Enter advanced to the next question");
+    }
+
+    #[test]
+    fn dialog_ux_multiselect_empty_enter_confirms_none() {
+        let mut d = unlocked(vec![
+            Page::multiselect("q1", vec![opt("a"), opt("b")]),
+            Page::text("q2"),
+        ]);
+
+        d.handle_key(press(KeyCode::Enter));
+
+        assert_eq!(d.current_page(), 1);
+        assert_eq!(
+            d.collect_answers()[0],
+            Answer::Multi {
+                ids: Vec::new(),
+                custom: None
+            }
+        );
     }
 
     #[test]

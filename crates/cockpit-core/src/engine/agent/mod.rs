@@ -16,9 +16,9 @@
 //! in [`crate::engine::driver`].
 
 use std::sync::Arc;
-use std::time::Instant;
+use tokio::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use futures::FutureExt;
 use serde_json::Value;
@@ -46,6 +46,7 @@ mod outcome;
 mod recheck;
 mod text_recovery;
 pub(crate) mod tool_dispatch;
+mod tool_timeout;
 mod turn_phases;
 
 #[cfg(test)]
@@ -60,6 +61,7 @@ pub use events::{
 };
 pub use outcome::{BatchTaskEntry, TaskControlAction, TurnOutcome};
 pub(crate) use recheck::{ResultRecheckCtx, result_recheck};
+pub(crate) use tool_timeout::dispatch_arc_with_default_timeout;
 
 use backup::*;
 use gate::*;
@@ -982,13 +984,7 @@ async fn dispatch_one(
     ctx: &ToolCtx,
     current_tool_call_id: Option<&str>,
 ) -> Result<ToolOutput> {
-    let tool = tools
-        .get(name)
-        .with_context(|| format!("unknown tool `{name}`"))?;
-    let args = crate::engine::model::wire_schema::strip_wire_nulls(&tool.parameters(), args);
-    let mut ctx = ctx.clone();
-    ctx.current_tool_call_id = current_tool_call_id.map(str::to_string);
-    tool.call(args, &ctx).await
+    tool_timeout::dispatch_with_default_timeout(tools, name, args, ctx, current_tool_call_id).await
 }
 
 async fn dispatch_one_timed(

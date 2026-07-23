@@ -966,8 +966,14 @@ async fn invoke_native_tool(ctx: &HostContext, tool: Arc<dyn Tool>, args: Value)
         }
     }
 
-    let args = crate::engine::model::wire_schema::strip_wire_nulls(&tool.parameters(), args);
-    let output = tool.call(args, &tool_ctx).await?;
+    let current_tool_call_id = tool_ctx.current_tool_call_id.clone();
+    let output = crate::engine::agent::dispatch_arc_with_default_timeout(
+        tool.clone(),
+        args,
+        &tool_ctx,
+        current_tool_call_id.as_deref(),
+    )
+    .await?;
     let mut delivered = ctx
         .native_tool_ctx
         .as_ref()
@@ -1294,6 +1300,10 @@ mod tests {
         }
     }
 
+    struct PendingMontyTool {
+        abandon_count: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl Tool for MontyAdapterTool {
         fn name(&self) -> &str {
@@ -1345,6 +1355,34 @@ mod tests {
                 output = output.with_truncated_retention(retention);
             }
             Ok(output)
+        }
+    }
+
+    #[async_trait]
+    impl Tool for PendingMontyTool {
+        fn name(&self) -> &str {
+            "pending"
+        }
+
+        fn description(&self) -> &str {
+            "pending adapter test tool"
+        }
+
+        fn effect(&self) -> ToolEffect {
+            ToolEffect::ReadOnly
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            std::future::pending::<Result<ToolOutput>>().await
+        }
+
+        async fn on_abandon(&self, _ctx: &ToolCtx) -> Result<()> {
+            self.abandon_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -2011,6 +2049,32 @@ mod tests {
         assert!(err.to_string().contains("closed for test"), "{err}");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn monty_adapter_native_tool_invoke_uses_dispatch_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let abandon_count = Arc::new(AtomicUsize::new(0));
+        let host = host_with_tool(
+            tmp.path(),
+            Arc::new(PendingMontyTool {
+                abandon_count: abandon_count.clone(),
+            }),
+        );
+        let dispatch =
+            tokio::spawn(async move { invoke(&host, "pending", serde_json::json!({})).await });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        let value = dispatch.await.expect("dispatch join").expect("mcp value");
+
+        assert_eq!(
+            value,
+            Value::String(
+                "tool `pending` did not return within 120s and was abandoned".to_string()
+            )
+        );
+        assert_eq!(abandon_count.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn monty_adapter_descriptor_is_sanitized_and_search_uses_cached_schema() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2043,13 +2107,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monty_adapter_host_context_to_tool_ctx_propagates_identity_and_cancel() {
+    async fn monty_adapter_host_context_to_tool_ctx_propagates_identity() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = Arc::new(MontyAdapterTool::new("ctx_probe", "ok"));
         let seen = tool.seen_ctx.clone();
         let mut ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.has_bash = true;
-        ctx.cancel.cancel();
         let host = HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool));
 
         let out = invoke(&host, "ctx_probe", serde_json::json!({}))
@@ -2059,8 +2122,31 @@ mod tests {
         assert_eq!(out, Value::String("ok".to_string()));
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![(ctx.session.id, true, true)],
-            "session identity, sandbox/tool surface flag, and cancellation propagate"
+            vec![(ctx.session.id, true, false)],
+            "session identity and sandbox/tool surface flag propagate"
+        );
+    }
+
+    #[tokio::test]
+    async fn monty_adapter_host_context_cancel_aborts_before_native_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = Arc::new(MontyAdapterTool::new("ctx_probe", "ok"));
+        let seen = tool.seen_ctx.clone();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.cancel.cancel();
+        let host = HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool));
+
+        let out = invoke(&host, "ctx_probe", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out,
+            Value::String("tool `ctx_probe` was cancelled by the user and abandoned".to_string())
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "pre-cancelled nested dispatch must not enter the native tool"
         );
     }
 

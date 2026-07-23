@@ -70,6 +70,10 @@ impl Tool for ReadlockTool {
         ToolPresentation::with_parts(Some("🔒"), "readlock", summary, full_input)
     }
 
+    fn honors_dispatch_cancel(&self) -> bool {
+        true
+    }
+
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let path_arg = args
             .get("path")

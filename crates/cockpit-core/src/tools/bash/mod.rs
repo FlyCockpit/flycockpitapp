@@ -157,6 +157,10 @@ impl Tool for BashTool {
         Self::declared_binary_requirements()
     }
 
+    fn honors_dispatch_cancel(&self) -> bool {
+        true
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",

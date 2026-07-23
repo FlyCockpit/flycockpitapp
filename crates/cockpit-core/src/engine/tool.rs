@@ -366,6 +366,20 @@ pub trait Tool: Send + Sync {
     /// validate-clean) before this call; the implementor only needs to
     /// look up the fields it cares about.
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput>;
+
+    /// True for tools whose `call` future actively observes [`ToolCtx::cancel`]
+    /// and performs its own cleanup before returning from cancellation.
+    fn honors_dispatch_cancel(&self) -> bool {
+        false
+    }
+
+    /// Cleanup hook invoked by the dispatcher after abandoning an in-flight
+    /// call due to timeout or turn cancellation. Most tools are abandon-safe
+    /// and keep the default no-op; transport-backed tools can override this to
+    /// tear down poisoned protocol state before the next call.
+    async fn on_abandon(&self, _ctx: &ToolCtx) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Tool output shape.

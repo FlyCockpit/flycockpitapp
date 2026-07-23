@@ -259,6 +259,10 @@ impl Tool for WebSearchTool {
         )
     }
 
+    fn honors_dispatch_cancel(&self) -> bool {
+        true
+    }
+
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let query = required_non_empty_string(&args, "query")?;
         let limit = search_limit(args.get("limit"));
@@ -343,6 +347,10 @@ impl Tool for WebFetchTool {
                 let (summary, full_input) = readable_args(args);
                 ToolPresentation::with_parts(None, self.name(), summary, full_input)
             })
+    }
+
+    fn honors_dispatch_cancel(&self) -> bool {
+        true
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

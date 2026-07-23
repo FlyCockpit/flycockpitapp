@@ -33,6 +33,12 @@ pub(crate) const INDEX_LOGIC_VERSION: i64 = 1;
 const CHUNK_TARGET_TOKENS: usize = 400;
 const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
+const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
+
+#[cfg(test)]
+pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
+    &[MEMORY_SEARCH_TOOL_NAME]
+}
 
 unsafe extern "C" {
     #[link_name = "sqlite3_vec_init"]
@@ -1121,7 +1127,7 @@ pub(crate) fn with_memory_search_if_attached(
     if attached_bundles_available(session, cwd, config) {
         toolbox.with(Arc::new(MemorySearchTool))
     } else {
-        toolbox.without("memory_search")
+        toolbox.without(MEMORY_SEARCH_TOOL_NAME)
     }
 }
 
@@ -1137,7 +1143,7 @@ struct MemorySearchArgs {
 #[async_trait]
 impl Tool for MemorySearchTool {
     fn name(&self) -> &str {
-        "memory_search"
+        MEMORY_SEARCH_TOOL_NAME
     }
 
     fn description(&self) -> &str {

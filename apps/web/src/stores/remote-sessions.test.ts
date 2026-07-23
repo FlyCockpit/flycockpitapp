@@ -1,8 +1,11 @@
+import type { HistoryPageResult } from "@flycockpit/cockpit-protocol";
 import { describe, expect, it, vi } from "vitest";
 import {
   addOptimisticUserMessage,
   applyLiveEvent,
+  interruptDecisionView,
   mergeAttach,
+  mergeHistoryPage,
   reduceRemoteSessionEvent,
   resetRemoteSessionEventWarningsForTests,
   updateSessionSharedWithCollaborators,
@@ -48,6 +51,12 @@ describe("remote session reducers", () => {
     const detail = state.detailsBySession[sessionId];
     expect(detail.history.map((entry) => entry.seq)).toEqual([1, 2]);
     expect(detail.nextSeq).toBe(3);
+    expect(detail.paging).toEqual({
+      oldestSeq: 1,
+      hasMore: true,
+      isLoading: false,
+      error: null,
+    });
     expect(detail.summary.sessionId).toBe(sessionId);
   });
 
@@ -89,6 +98,193 @@ describe("remote session reducers", () => {
       kind: "assistant_text",
       seq: 6,
       text: "Hello world",
+    });
+  });
+
+  it("prepends older history pages, dedupes replayed rows, and updates paging state", () => {
+    const detail = withDetail().detailsBySession[sessionId];
+    const merged = mergeHistoryPage(detail, {
+      session_id: sessionId,
+      entries: [
+        { role: "user", seq: 0, text: "Earlier question" },
+        { role: "user", seq: 1, text: "Duplicate from page" },
+        {
+          role: "tool_call",
+          seq: 2,
+          agent: "Build",
+          call_id: "duplicate-seq-tool",
+          tool: "shell",
+          original_input: {},
+          wire_input: {},
+          output: "duplicate",
+          hard_fail: false,
+          truncated: false,
+        },
+      ],
+      has_more: false,
+    });
+
+    expect(merged.history.map((entry) => entry.seq)).toEqual([0, 1, 2]);
+    expect(
+      merged.history.find((entry) => entry.seq === 1 && entry.kind === "user_message"),
+    ).toMatchObject({ text: "Please fix checkout" });
+    expect(merged.history.find((entry) => entry.seq === 2)).toMatchObject({
+      kind: "assistant_text",
+      text: "I will inspect.",
+    });
+    expect(merged.nextSeq).toBe(3);
+    expect(merged.paging).toEqual({
+      oldestSeq: 0,
+      hasMore: false,
+      isLoading: false,
+      error: null,
+    });
+  });
+
+  it("keeps live-tail entries ordered after an older page is prepended", () => {
+    const paged = {
+      ...withDetail(),
+      detailsBySession: {
+        [sessionId]: mergeHistoryPage(withDetail().detailsBySession[sessionId], {
+          session_id: sessionId,
+          entries: [{ role: "user", seq: 0, text: "Earlier question" }],
+          has_more: true,
+        }),
+      },
+    };
+    const live = applyLiveEvent(
+      paged,
+      event("assistant_text", {
+        session_id: sessionId,
+        agent: "Build",
+        seq: 3,
+        text: "Live response",
+      }),
+    );
+
+    expect(live.detailsBySession[sessionId].history.map((entry) => entry.seq)).toEqual([
+      0, 1, 2, 3,
+    ]);
+  });
+
+  it("preserves synthetic pending rows that share sentinel sequences during page merges", () => {
+    const withPendingUsers = addOptimisticUserMessage(
+      addOptimisticUserMessage(withDetail(), sessionId, "first pending", "local-1"),
+      sessionId,
+      "second pending",
+      "local-2",
+    );
+    const withRunningTools = applyLiveEvent(
+      applyLiveEvent(
+        withPendingUsers,
+        event("tool_start", {
+          session_id: sessionId,
+          agent: "Build",
+          call_id: "tool1",
+          tool: "shell",
+          args: { cmd: "one" },
+        }),
+      ),
+      event("tool_start", {
+        session_id: sessionId,
+        agent: "Build",
+        call_id: "tool2",
+        tool: "shell",
+        args: { cmd: "two" },
+      }),
+    );
+    const merged = mergeHistoryPage(withRunningTools.detailsBySession[sessionId], {
+      session_id: sessionId,
+      entries: [{ role: "user", seq: 0, text: "Earlier question" }],
+      has_more: true,
+    });
+
+    expect(
+      merged.history.filter((entry) => entry.kind === "user_message" && entry.seq > 1000),
+    ).toHaveLength(2);
+    expect(
+      merged.history.filter((entry) => entry.kind === "tool_call" && entry.status === "running"),
+    ).toHaveLength(2);
+  });
+
+  it("keeps already-paged older rows when attach refreshes a truncated snapshot", () => {
+    const paged = mergeHistoryPage(withDetail().detailsBySession[sessionId], {
+      session_id: sessionId,
+      entries: [{ role: "user", seq: 0, text: "Earlier question" }],
+      has_more: false,
+    });
+    const state = mergeAttach(
+      {
+        ...withDetail(),
+        detailsBySession: { [sessionId]: paged },
+      },
+      attachFixture,
+    );
+
+    expect(state.detailsBySession[sessionId].history.map((entry) => entry.seq)).toEqual([0, 1, 2]);
+    expect(state.detailsBySession[sessionId].paging).toMatchObject({
+      oldestSeq: 0,
+      hasMore: false,
+    });
+  });
+
+  it("keeps already-paged older rows when history replay refreshes a truncated snapshot", () => {
+    const paged = mergeHistoryPage(withDetail().detailsBySession[sessionId], {
+      session_id: sessionId,
+      entries: [{ role: "user", seq: 0, text: "Earlier question" }],
+      has_more: false,
+    });
+    const replayed = applyLiveEvent(
+      {
+        ...withDetail(),
+        detailsBySession: { [sessionId]: paged },
+      },
+      event("history_replay", {
+        session_id: sessionId,
+        max_seq: 2,
+        entries: [{ role: "assistant", seq: 2, agent: "Build", text: "Updated snapshot" }],
+      }),
+    );
+
+    expect(replayed.detailsBySession[sessionId].history.map((entry) => entry.seq)).toEqual([
+      0, 1, 2,
+    ]);
+    expect(
+      replayed.detailsBySession[sessionId].history.find((entry) => entry.seq === 2),
+    ).toMatchObject({
+      kind: "assistant_text",
+      text: "Updated snapshot",
+    });
+    expect(replayed.detailsBySession[sessionId].paging).toMatchObject({
+      oldestSeq: 0,
+      hasMore: false,
+    });
+  });
+
+  it("maps interrupt decisions as resolved non-interactive history records", () => {
+    const state = mergeAttach(empty, {
+      ...attachFixture,
+      history: [
+        {
+          role: "interrupt_decision" as const,
+          seq: 4,
+          decision: {
+            permission: true,
+            cancelled: false,
+            lines: [{ prompt: "Run command?", answer: "Approved once" }],
+          },
+        },
+      ],
+    });
+    const entry = state.detailsBySession[sessionId].history[0];
+    if (!entry) throw new Error("missing interrupt decision entry");
+
+    expect(entry).toMatchObject({ kind: "interrupt_decision", seq: 4 });
+    expect(interruptDecisionView(entry)).toEqual({
+      interactive: false,
+      permission: true,
+      cancelled: false,
+      lines: [{ prompt: "Run command?", answer: "Approved once" }],
     });
   });
 
@@ -260,5 +456,76 @@ describe("remote session reducers", () => {
     const state = useRemoteSessionsStore.getState().instances.i1;
     expect(state.detailsBySession[sessionId].summary.sharedWithCollaborators).toBe(false);
     expect(state.sessionsByProject["/work/app"][0]?.sharedWithCollaborators).toBe(false);
+  });
+
+  it("allows only one older-history request in flight and stops when exhausted", async () => {
+    let resolvePage: (page: HistoryPageResult) => void = () => {};
+    const readHistoryPage = vi.fn(
+      () =>
+        new Promise<HistoryPageResult>((resolve) => {
+          resolvePage = resolve;
+        }),
+    );
+    useRemoteSessionsStore.setState({
+      instances: { i1: withDetail() },
+      clients: { i1: { readHistoryPage } as never },
+    });
+
+    const first = useRemoteSessionsStore.getState().loadOlderHistory("i1", sessionId);
+    const second = useRemoteSessionsStore.getState().loadOlderHistory("i1", sessionId);
+    await Promise.resolve();
+
+    expect(readHistoryPage).toHaveBeenCalledExactlyOnceWith({
+      session_id: sessionId,
+      before_seq: 1,
+      limit: 100,
+    });
+    expect(
+      useRemoteSessionsStore.getState().instances.i1.detailsBySession[sessionId].paging,
+    ).toMatchObject({ isLoading: true, error: null });
+
+    useRemoteSessionsStore.setState((state) => ({
+      instances: {
+        ...state.instances,
+        i1: mergeAttach(state.instances.i1 ?? empty, attachFixture),
+      },
+      clients: state.clients,
+    }));
+    await useRemoteSessionsStore.getState().loadOlderHistory("i1", sessionId);
+    expect(readHistoryPage).toHaveBeenCalledTimes(1);
+
+    resolvePage({
+      session_id: sessionId,
+      entries: [{ role: "user", seq: 0, text: "Earlier question" }],
+      has_more: false,
+    });
+    await first;
+    await second;
+    await useRemoteSessionsStore.getState().loadOlderHistory("i1", sessionId);
+
+    expect(readHistoryPage).toHaveBeenCalledTimes(1);
+    expect(
+      useRemoteSessionsStore.getState().instances.i1.detailsBySession[sessionId].paging,
+    ).toMatchObject({ oldestSeq: 0, hasMore: false, isLoading: false, error: null });
+  });
+
+  it("keeps current history intact when older-history loading fails", async () => {
+    const readHistoryPage = vi.fn().mockRejectedValueOnce(new Error("relay unavailable"));
+    const base = withDetail();
+    useRemoteSessionsStore.setState({
+      instances: { i1: base },
+      clients: { i1: { readHistoryPage } as never },
+    });
+
+    await useRemoteSessionsStore.getState().loadOlderHistory("i1", sessionId);
+
+    const detail = useRemoteSessionsStore.getState().instances.i1.detailsBySession[sessionId];
+    expect(detail.history).toEqual(base.detailsBySession[sessionId].history);
+    expect(detail.paging).toMatchObject({
+      oldestSeq: 1,
+      hasMore: true,
+      isLoading: false,
+      error: "relay unavailable",
+    });
   });
 });

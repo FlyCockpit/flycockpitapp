@@ -135,6 +135,13 @@
     "user": "Tu",
     "assistant": "Asistente",
     "reasoning": "Razonamiento",
+    "loadOlder": "Cargar anteriores",
+    "loadingOlder": "Cargando anteriores...",
+    "loadOlderRetry": "Reintentar carga anterior",
+    "interruptDecisionAnswered": "Decision de interrupcion",
+    "interruptDecisionCancelled": "Interrupcion cancelada",
+    "interruptDecisionPermission": "Solicitud de permiso",
+    "interruptDecisionQuestion": "Pregunta",
     "interruptResolved": "Ya atendida",
     "approve": "Aprobar",
     "deny": "Denegar"

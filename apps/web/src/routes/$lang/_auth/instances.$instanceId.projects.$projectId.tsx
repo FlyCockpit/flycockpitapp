@@ -26,13 +26,14 @@ import {
   ShieldAlert,
   WifiOff,
 } from "lucide-react";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import ReactMarkdown from "react-markdown";
 import { useShallow } from "zustand/react/shallow";
 import { InlineRetry } from "@/components/inline-retry";
 import { useRemoteInstanceConnection } from "@/hooks/use-remote-instance-connection";
 import { useRemoteProjectSessions } from "@/hooks/use-remote-project-sessions";
+import { useTranscriptHistoryPaging } from "@/hooks/use-transcript-history-paging";
 import {
   canMutateSessions,
   resolveSessionViewerMode,
@@ -42,6 +43,7 @@ import {
 } from "@/lib/session-visibility";
 import { statsRollupToView } from "@/lib/stats-rollup-view";
 import {
+  type SessionPagingState,
   useRemoteSessionsStore,
   type WebHistoryEntry,
   type WebInterruptResolution,
@@ -74,17 +76,25 @@ function ProjectSessionPage() {
   const ownedInstances = useQuery(orpc.instances.listMine.queryOptions());
   const sharedInstances = useQuery(orpc.instanceSharing.listSharedWithMe.queryOptions());
   useRemoteInstanceConnection(instanceId, tokenData);
-  const { remote, sendMessage, resolveInterrupt, renameSession, archiveSession, forkSession } =
-    useRemoteSessionsStore(
-      useShallow((state) => ({
-        remote: state.instances[instanceId],
-        sendMessage: state.sendMessage,
-        resolveInterrupt: state.resolveInterrupt,
-        renameSession: state.renameSession,
-        archiveSession: state.archiveSession,
-        forkSession: state.forkSession,
-      })),
-    );
+  const {
+    remote,
+    sendMessage,
+    resolveInterrupt,
+    renameSession,
+    archiveSession,
+    forkSession,
+    loadOlderHistory,
+  } = useRemoteSessionsStore(
+    useShallow((state) => ({
+      remote: state.instances[instanceId],
+      sendMessage: state.sendMessage,
+      resolveInterrupt: state.resolveInterrupt,
+      renameSession: state.renameSession,
+      archiveSession: state.archiveSession,
+      forkSession: state.forkSession,
+      loadOlderHistory: state.loadOlderHistory,
+    })),
+  );
   const project = remote?.projects.find((item) => item.projectId === projectId);
   const projectRoot = project?.projectRoot ?? projectRootFromRouteParam(projectId);
   const sessions = projectRoot ? (remote?.sessionsByProject[projectRoot] ?? []) : [];
@@ -107,6 +117,16 @@ function ProjectSessionPage() {
   );
   const [message, setMessage] = useState("");
   const [renameTitle, setRenameTitle] = useState("");
+  const loadOlderSelectedHistory = useCallback(
+    () => (selectedSessionId ? loadOlderHistory(instanceId, selectedSessionId) : Promise.resolve()),
+    [instanceId, loadOlderHistory, selectedSessionId],
+  );
+  const transcriptPaging = useTranscriptHistoryPaging({
+    anchorKey: selectedSessionId,
+    hasMore: detail?.paging.hasMore ?? false,
+    isLoading: detail?.paging.isLoading ?? false,
+    onLoadOlder: loadOlderSelectedHistory,
+  });
 
   const activeSessions = sessions.filter((session) => !session.archived);
   const archivedSessions = sessions.filter((session) => session.archived);
@@ -296,9 +316,15 @@ function ProjectSessionPage() {
                   ) : null}
                 </div>
               </div>
-              <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+              <div
+                ref={transcriptPaging.containerRef}
+                className="min-h-0 flex-1 overflow-y-auto px-4 py-4"
+                onScroll={transcriptPaging.onScroll}
+              >
                 <Transcript
                   history={detail.history}
+                  paging={detail.paging}
+                  onLoadOlder={transcriptPaging.loadOlderWithAnchor}
                   interruptFocus={search.interrupt}
                   readOnly={!canWriteSessions}
                   onResolve={(interruptId, resolution, answer) =>
@@ -468,11 +494,15 @@ function SessionSection({
 
 function Transcript({
   history,
+  paging,
+  onLoadOlder,
   interruptFocus,
   readOnly,
   onResolve,
 }: {
   history: WebHistoryEntry[];
+  paging: SessionPagingState;
+  onLoadOlder: () => Promise<void>;
   interruptFocus?: string;
   readOnly: boolean;
   onResolve: (
@@ -481,8 +511,27 @@ function Transcript({
     answer?: string,
   ) => Promise<void>;
 }) {
+  const { t } = useTranslation("instances");
   return (
     <div className="space-y-3">
+      {paging.hasMore ? (
+        <div className="flex flex-col items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={paging.isLoading}
+            onClick={() => void onLoadOlder()}
+          >
+            {paging.isLoading
+              ? t("remote.loadingOlder")
+              : paging.error
+                ? t("remote.loadOlderRetry")
+                : t("remote.loadOlder")}
+          </Button>
+          {paging.error ? <p className="text-xs text-destructive">{paging.error}</p> : null}
+        </div>
+      ) : null}
       {history.map((entry) => (
         <TranscriptEntry
           key={entry.id}
@@ -535,6 +584,31 @@ function TranscriptEntry({
           {JSON.stringify(entry.output ?? entry.input ?? {}, null, 2)}
         </pre>
       </details>
+    );
+  if (entry.kind === "interrupt_decision")
+    return (
+      <div className="rounded-md border bg-muted/30 p-3 text-sm">
+        <div className="font-medium">
+          {entry.decision.cancelled
+            ? t("remote.interruptDecisionCancelled")
+            : t("remote.interruptDecisionAnswered")}
+        </div>
+        <div className="mt-1 text-xs text-muted-foreground">
+          {entry.decision.permission
+            ? t("remote.interruptDecisionPermission")
+            : t("remote.interruptDecisionQuestion")}
+        </div>
+        {entry.decision.lines.length ? (
+          <dl className="mt-3 space-y-2">
+            {entry.decision.lines.map((line, index) => (
+              <div key={`${line.prompt}:${index}`}>
+                <dt className="text-xs text-muted-foreground">{line.prompt}</dt>
+                <dd className="whitespace-pre-wrap">{line.answer}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
+      </div>
     );
   if (entry.kind === "interrupt") {
     return (

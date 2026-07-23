@@ -6,6 +6,7 @@ import type {
   FsWriteResult,
   GitDiffFileResult,
   GitStatusResult,
+  HistoryPageResult,
   InterruptQuestion,
   ResolveResponse,
   HistoryEntry as WireHistoryEntry,
@@ -81,12 +82,30 @@ export type WebHistoryEntry =
     }
   | { id: string; seq: number; ts?: number; kind: "boundary"; label: string }
   | { id: string; seq: number; ts?: number; kind: "subagent_report"; title: string; body: string }
-  | { id: string; seq: number; ts?: number; kind: "interrupt"; interrupt: WebInterrupt };
+  | { id: string; seq: number; ts?: number; kind: "interrupt"; interrupt: WebInterrupt }
+  | {
+      id: string;
+      seq: number;
+      ts?: number;
+      kind: "interrupt_decision";
+      decision: {
+        permission: boolean;
+        cancelled: boolean;
+        lines: { prompt: string; answer: string }[];
+      };
+    };
 
 export type WebUsage = {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+};
+
+export type SessionPagingState = {
+  oldestSeq: number | null;
+  hasMore: boolean;
+  isLoading: boolean;
+  error: string | null;
 };
 
 const webInterruptResolutionValues = ["approve", "deny", "answer"] as const;
@@ -98,6 +117,7 @@ export type SessionDetail = {
   schedules: unknown[];
   nextSeq: number;
   usage: WebUsage | null;
+  paging: SessionPagingState;
 };
 
 type InstanceRemoteState = {
@@ -121,6 +141,7 @@ type RemoteSessionState = {
   loadSessions: (instanceId: string, projectRoot: string) => Promise<void>;
   loadStatsRollup: (instanceId: string, projectId: string) => Promise<void>;
   attach: (instanceId: string, sessionId: string) => Promise<void>;
+  loadOlderHistory: (instanceId: string, sessionId: string) => Promise<void>;
   createSession: (
     instanceId: string,
     input: { projectRoot: string; title?: string; agent?: string; model?: string },
@@ -175,6 +196,8 @@ const pendingReasoningSeq = Number.MAX_SAFE_INTEGER - 2;
 const pendingAssistantSeq = Number.MAX_SAFE_INTEGER - 1;
 const pendingInterruptSeq = Number.MAX_SAFE_INTEGER;
 const warnedEventKinds = new Set<string>();
+const historyPageInFlight = new Set<string>();
+const historyPageLimit = 100;
 
 const emptyInstance = (): InstanceRemoteState => ({
   status: "idle",
@@ -197,6 +220,10 @@ function numberField(record: Record<string, unknown>, key: string) {
 function booleanField(record: Record<string, unknown>, key: string) {
   const value = record[key];
   return typeof value === "boolean" ? value : undefined;
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : "Could not load older history.";
 }
 
 function recordField(record: Record<string, unknown>, key: string) {
@@ -225,8 +252,106 @@ function nextLocalSeq(history: WebHistoryEntry[]) {
   return maxSeq + 1;
 }
 
+function oldestSeqFromHistory(history: WebHistoryEntry[]) {
+  const oldest = history.reduce<number | null>((min, entry) => {
+    if (entry.seq >= pendingUserSeq) return min;
+    return min === null ? entry.seq : Math.min(min, entry.seq);
+  }, null);
+  return oldest;
+}
+
+function pagingFromHistory(
+  history: WebHistoryEntry[],
+  current?: SessionPagingState,
+): SessionPagingState {
+  const oldestSeq = oldestSeqFromHistory(history);
+  return {
+    oldestSeq,
+    hasMore: current?.hasMore ?? oldestSeq !== null,
+    isLoading: current?.isLoading ?? false,
+    error: null,
+  };
+}
+
+function historyPageOldestSeq(page: HistoryPageResult) {
+  const raw = page as HistoryPageResult & { oldest_seq?: unknown };
+  return typeof raw.oldest_seq === "number" ? raw.oldest_seq : null;
+}
+
+function historyMergeKey(entry: WebHistoryEntry) {
+  if (
+    entry.seq >= pendingUserSeq ||
+    entry.id === pendingAssistantId ||
+    entry.id === pendingReasoningId ||
+    entry.id.startsWith(pendingUserPrefix) ||
+    (entry.kind === "tool_call" && entry.status === "running")
+  ) {
+    return `id:${entry.id}`;
+  }
+  return `seq:${entry.seq}`;
+}
+
+function mergeHistoryEntries(history: WebHistoryEntry[], entries: WebHistoryEntry[]) {
+  const byKey = new Map<string, WebHistoryEntry>();
+  for (const entry of entries) byKey.set(historyMergeKey(entry), entry);
+  for (const entry of history) byKey.set(historyMergeKey(entry), entry);
+  return sortHistory([...byKey.values()]);
+}
+
+function mergeHistorySnapshot(current: WebHistoryEntry[], snapshot: WebHistoryEntry[]) {
+  if (!snapshot.length) return sortHistory(current);
+  const nextSeq = nextSeqFromHistory(snapshot);
+  const oldestSnapshotSeq = oldestSeqFromHistory(snapshot);
+  const snapshotIds = new Set(snapshot.map((entry) => entry.id));
+  const preserved = current.filter(
+    (entry) =>
+      !snapshotIds.has(entry.id) &&
+      ((oldestSnapshotSeq !== null && entry.seq < oldestSnapshotSeq) || entry.seq >= nextSeq),
+  );
+  return mergeHistoryEntries(snapshot, preserved);
+}
+
+export function mergeHistoryPage(detail: SessionDetail, page: HistoryPageResult): SessionDetail {
+  const pageEntries = page.entries.map((entry, index) => toWebHistoryEntry(entry, index));
+  const history = mergeHistoryEntries(detail.history, pageEntries);
+  return {
+    ...detail,
+    history,
+    nextSeq: nextSeqFromHistory(history),
+    paging: {
+      oldestSeq: historyPageOldestSeq(page) ?? oldestSeqFromHistory(history),
+      hasMore: page.has_more,
+      isLoading: false,
+      error: null,
+    },
+  };
+}
+
+export function markHistoryPageLoading(detail: SessionDetail): SessionDetail {
+  return { ...detail, paging: { ...detail.paging, isLoading: true, error: null } };
+}
+
+export function markHistoryPageError(detail: SessionDetail, error: string): SessionDetail {
+  return { ...detail, paging: { ...detail.paging, isLoading: false, error } };
+}
+
 function projectDisplayName(projectRoot: string) {
   return projectRoot.split("/").filter(Boolean).at(-1) ?? projectRoot;
+}
+
+export function interruptDecisionView(entry: WebHistoryEntry): {
+  interactive: false;
+  permission: boolean;
+  cancelled: boolean;
+  lines: { prompt: string; answer: string }[];
+} | null {
+  if (entry.kind !== "interrupt_decision") return null;
+  return {
+    interactive: false,
+    permission: entry.decision.permission,
+    cancelled: entry.decision.cancelled,
+    lines: entry.decision.lines,
+  };
 }
 
 export function toWebSessionSummary(session: WireSessionSummary): WebSessionSummary {
@@ -339,8 +464,12 @@ function toWebHistoryEntry(entry: WireHistoryEntry, fallbackSeq = 0): WebHistory
   return {
     id: "interrupt-decision:" + seq,
     seq,
-    kind: "assistant_reasoning",
-    text: entry.decision.cancelled ? "Interrupt cancelled" : "Interrupt resolved",
+    kind: "interrupt_decision",
+    decision: {
+      permission: entry.decision.permission,
+      cancelled: entry.decision.cancelled,
+      lines: entry.decision.lines,
+    },
   };
 }
 
@@ -378,11 +507,7 @@ export function mergeAttach(
 ): InstanceRemoteState {
   const current = existing.detailsBySession[attach.session_id];
   const mappedHistory = attach.history.map((entry, index) => toWebHistoryEntry(entry, index));
-  const nextSeq = nextSeqFromHistory(mappedHistory);
-  const mergedHistory = sortHistory([
-    ...(current?.history ?? []).filter((entry) => entry.seq >= nextSeq),
-    ...mappedHistory,
-  ]);
+  const mergedHistory = mergeHistorySnapshot(current?.history ?? [], mappedHistory);
   const summary = attachSummary(attach, current?.summary);
   return {
     ...existing,
@@ -401,6 +526,7 @@ export function mergeAttach(
         schedules: current?.schedules ?? [],
         nextSeq: nextSeqFromHistory(mergedHistory),
         usage: current?.usage ?? null,
+        paging: pagingFromHistory(mergedHistory, current?.paging),
       },
     },
   };
@@ -601,10 +727,16 @@ export function reduceRemoteSessionEvent(
     if (!sessionId || !Array.isArray(entries)) return { state: existing, warningKind: event.event };
     return {
       state: updateDetail(existing, sessionId, (detail) => {
-        const history = sortHistory(
+        const replayedHistory = sortHistory(
           entries.map((entry, index) => toWebHistoryEntry(entry as WireHistoryEntry, index)),
         );
-        return { ...detail, history, nextSeq: nextSeqFromHistory(history) };
+        const history = mergeHistorySnapshot(detail.history, replayedHistory);
+        return {
+          ...detail,
+          history,
+          nextSeq: nextSeqFromHistory(history),
+          paging: pagingFromHistory(history, detail.paging),
+        };
       }),
     };
   }
@@ -740,6 +872,7 @@ export function warnUnhandledRemoteSessionEvent(
 
 export function resetRemoteSessionEventWarningsForTests() {
   warnedEventKinds.clear();
+  historyPageInFlight.clear();
 }
 
 export function addOptimisticUserMessage(
@@ -911,6 +1044,50 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
         mergeAttach(current, result),
       ),
     }));
+  },
+  loadOlderHistory: async (instanceId, sessionId) => {
+    const client = get().clients[instanceId];
+    const detail = get().instances[instanceId]?.detailsBySession[sessionId];
+    const inFlightKey = `${instanceId}:${sessionId}`;
+    if (
+      !client ||
+      !detail ||
+      detail.paging.isLoading ||
+      !detail.paging.hasMore ||
+      historyPageInFlight.has(inFlightKey)
+    ) {
+      return;
+    }
+
+    historyPageInFlight.add(inFlightKey);
+    set((state) => ({
+      instances: setInstance(state.instances, instanceId, (current) =>
+        updateDetail(current, sessionId, markHistoryPageLoading),
+      ),
+    }));
+
+    try {
+      const page = await client.readHistoryPage({
+        session_id: sessionId,
+        before_seq: detail.paging.oldestSeq,
+        limit: historyPageLimit,
+      });
+      set((state) => ({
+        instances: setInstance(state.instances, instanceId, (current) =>
+          updateDetail(current, sessionId, (detail) => mergeHistoryPage(detail, page)),
+        ),
+      }));
+    } catch (error) {
+      set((state) => ({
+        instances: setInstance(state.instances, instanceId, (current) =>
+          updateDetail(current, sessionId, (detail) =>
+            markHistoryPageError(detail, errorMessage(error)),
+          ),
+        ),
+      }));
+    } finally {
+      historyPageInFlight.delete(inFlightKey);
+    }
   },
   createSession: async (instanceId, input) => {
     const result = await get().clients[instanceId]?.attach({

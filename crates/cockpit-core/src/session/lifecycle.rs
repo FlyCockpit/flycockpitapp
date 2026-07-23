@@ -191,6 +191,7 @@ impl Session {
             user_content_turns: AtomicUsize::new(user_content_turns),
             title_stage: AtomicU8::new(normalize_title_slot(row.title_stage)),
             title_nudge_slot_pending: AtomicU8::new(0),
+            compact_self_nudge_stage: AtomicU8::new(0),
             title_failure_noticed: std::sync::atomic::AtomicBool::new(false),
             last_usage: Mutex::new(None),
             last_send_at: Mutex::new(None),

@@ -105,6 +105,7 @@ pub(super) enum ProviderSettingId {
     CapabilityContextTokens,
     CapabilityMaxOutputTokens,
     AutoCompactPct,
+    CompactNudgePct,
     CompactShadow,
     CompactShadowMarginPct,
     /// Auto-prune master switch (on | off | inherit). `off` disables the
@@ -156,6 +157,7 @@ const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
     ProviderSettingId::CapabilityContextTokens,
     ProviderSettingId::CapabilityMaxOutputTokens,
     ProviderSettingId::AutoCompactPct,
+    ProviderSettingId::CompactNudgePct,
     ProviderSettingId::CompactShadow,
     ProviderSettingId::CompactShadowMarginPct,
     ProviderSettingId::AutoPruneEnabled,
@@ -174,6 +176,9 @@ const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
     ProviderSettingId::HintToolCallCorrections,
     ProviderSettingId::XaiMultiAgentToolsBeta,
 ];
+
+const AUTO_COMPACT_FLOOR_PCT: u8 = 60;
+const AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT: u8 = 80;
 
 impl ProviderSettingId {
     pub(super) fn descriptor(self) -> SettingDescriptor {
@@ -210,6 +215,7 @@ impl ProviderSettingId {
             Self::CapabilityContextTokens => "Context tokens",
             Self::CapabilityMaxOutputTokens => "Max output tokens",
             Self::AutoCompactPct => "Auto-compact ctx %",
+            Self::CompactNudgePct => "Compact-nudge ctx %",
             Self::CompactShadow => "Compaction shadow brief",
             Self::CompactShadowMarginPct => "Shadow margin %",
             Self::AutoPruneEnabled => "Auto-prune",
@@ -235,6 +241,7 @@ impl ProviderSettingId {
         matches!(
             self,
             Self::AutoCompactPct
+                | Self::CompactNudgePct
                 | Self::CompactShadowMarginPct
                 | Self::AutoPrunePct
                 | Self::AutoPrunePrunablePct
@@ -286,7 +293,10 @@ impl ProviderSettingId {
                 "auto uses fetched/default max-output metadata. Enter an explicit completion limit only when detection is wrong.",
             ),
             Self::AutoCompactPct => Some(
-                "At or above this % of the context window (60% by default), the conversation is auto-compacted. The most recent compact_keep_recent_turns complete exchanges (4 by default; 0 disables the tail) survive verbatim, subject to the context budget. Unrelated to the prune thresholds below.",
+                "At or above this % of the context window, the conversation is auto-compacted. auto uses the mode/toolbox-aware default: 80% for normal/frontier agents that can self-compact, otherwise 60%. The most recent compact_keep_recent_turns complete exchanges (4 by default; 0 disables the tail) survive verbatim, subject to the context budget. Unrelated to the prune thresholds below.",
+            ),
+            Self::CompactNudgePct => Some(
+                "At or above this % of the context window (60% by default), the root agent is nudged to call request_compact when that MCP tool is available.",
             ),
             Self::CompactShadow => Some(
                 "Pre-draft a compaction brief in the background near the automatic threshold. User turns pre-empt unfinished drafts; off restores synchronous compaction drafting.",
@@ -369,6 +379,10 @@ pub(super) struct SettingsEditor {
     /// `None` = mode undefined (inherit). Cycles
     /// undefined→defensive→normal→frontier→undefined.
     mode: Option<LlmMode>,
+    /// Effective mode after inheritance. This leaves `mode` free to track
+    /// override state while giving unset auto-compact previews a mode default.
+    effective_mode: LlmMode,
+    mode_inherit_value: LlmMode,
     /// Per-model/provider legacy thinking-mode default. Active `/model`
     /// choices still win. `None` inherits.
     default_thinking_mode: Option<ThinkingMode>,
@@ -448,6 +462,8 @@ impl SettingsEditor {
             wire_api: entry.wire_api,
             backup: entry.backup.clone(),
             mode: entry.mode,
+            effective_mode: entry.mode.unwrap_or_default(),
+            mode_inherit_value: LlmMode::default(),
             default_thinking_mode: entry.default_thinking_mode,
             // Provider-tier inline-`<think>` override (tri-state: inherit
             // global / on / off), mirroring the `mode` tri-state.
@@ -516,6 +532,8 @@ impl SettingsEditor {
             .or_else(|| (!entry.wire_api.is_auto()).then_some(entry.wire_api))
             .unwrap_or(WireApi::Auto);
         let mode = model.and_then(|m| m.mode);
+        let mode_inherit_value = entry.mode.unwrap_or_default();
+        let effective_mode = mode.unwrap_or(mode_inherit_value);
         let model_client_side_tools = model.map(|m| &m.capabilities.client_side_tools);
         let xai_multi_agent_tools_beta_present =
             model_client_side_tools.is_some_and(|capability| !capability.is_empty());
@@ -547,6 +565,8 @@ impl SettingsEditor {
             // value, so an unset model shows "inherit".
             backup: model.and_then(|m| m.backup.clone()),
             mode,
+            effective_mode,
+            mode_inherit_value,
             default_thinking_mode: model.and_then(|m| m.default_thinking_mode),
             inline_think: model.and_then(|m| m.inline_think),
             hint_tool_call_corrections: model.and_then(|m| m.hint_tool_call_corrections),
@@ -639,6 +659,7 @@ impl SettingsEditor {
         }
         fields.extend([
             AutoCompactPct,
+            CompactNudgePct,
             CompactShadow,
             CompactShadowMarginPct,
             AutoPruneEnabled,
@@ -719,6 +740,7 @@ impl SettingsEditor {
                 self.capability_max_output_tokens.is_some()
             }
             ProviderSettingId::AutoCompactPct
+            | ProviderSettingId::CompactNudgePct
             | ProviderSettingId::CompactShadow
             | ProviderSettingId::CompactShadowMarginPct
             | ProviderSettingId::AutoPrunePct
@@ -814,7 +836,14 @@ impl SettingsEditor {
                 self.capability_max_output_tokens,
                 self.detected_capabilities.max_output_tokens,
             ),
-            ProviderSettingId::AutoCompactPct => format!("{}%", self.context.auto_compact_pct),
+            ProviderSettingId::AutoCompactPct => self
+                .context
+                .auto_compact_pct
+                .map(|pct| format!("{pct}%"))
+                .unwrap_or_else(|| "auto".to_string()),
+            ProviderSettingId::CompactNudgePct => {
+                format!("{}%", self.context.compact_nudge_pct)
+            }
             ProviderSettingId::CompactShadow => {
                 if self.context.compact_shadow {
                     "on".to_string()
@@ -899,6 +928,7 @@ impl SettingsEditor {
     fn mark_present(&mut self, field: ProviderSettingId) {
         match field {
             ProviderSettingId::AutoCompactPct
+            | ProviderSettingId::CompactNudgePct
             | ProviderSettingId::CompactShadow
             | ProviderSettingId::CompactShadowMarginPct
             | ProviderSettingId::AutoPrunePct
@@ -974,6 +1004,7 @@ impl SettingsEditor {
                 self.capability_max_output_tokens = None
             }
             ProviderSettingId::AutoCompactPct
+            | ProviderSettingId::CompactNudgePct
             | ProviderSettingId::CompactShadow
             | ProviderSettingId::CompactShadowMarginPct
             | ProviderSettingId::AutoPrunePct
@@ -990,7 +1021,10 @@ impl SettingsEditor {
                 self.wire_api = WireApi::Auto;
             }
             ProviderSettingId::Backup => self.backup = None,
-            ProviderSettingId::Mode => self.mode = None,
+            ProviderSettingId::Mode => {
+                self.mode = None;
+                self.refresh_effective_mode();
+            }
             ProviderSettingId::DefaultThinkingMode => self.default_thinking_mode = None,
             ProviderSettingId::AutoPruneEnabled => self.auto_prune = None,
             ProviderSettingId::InlineThink => self.inline_think = None,
@@ -1167,6 +1201,7 @@ impl SettingsEditor {
                     Some(LlmMode::Frontier) => None,
                     None => Some(LlmMode::Defensive),
                 };
+                self.refresh_effective_mode();
             }
             ProviderSettingId::DefaultThinkingMode => {
                 // inherit → off → low → medium → high → inherit
@@ -1218,7 +1253,12 @@ impl SettingsEditor {
                 .or(self.detected_capabilities.max_output_tokens)
                 .unwrap_or(0)
                 .to_string(),
-            ProviderSettingId::AutoCompactPct => self.context.auto_compact_pct.to_string(),
+            ProviderSettingId::AutoCompactPct => self
+                .context
+                .auto_compact_pct
+                .unwrap_or_else(|| self.auto_compact_auto_value())
+                .to_string(),
+            ProviderSettingId::CompactNudgePct => self.context.compact_nudge_pct.to_string(),
             ProviderSettingId::CompactShadowMarginPct => {
                 self.context.compact_shadow_margin_pct.to_string()
             }
@@ -1350,7 +1390,11 @@ impl SettingsEditor {
                 self.capability_max_output_tokens = u32::try_from(parsed).ok();
             }
             ProviderSettingId::AutoCompactPct => {
-                self.context.auto_compact_pct = parsed.min(100) as u8;
+                self.context.auto_compact_pct = Some(parsed.min(100) as u8);
+                self.mark_present(field);
+            }
+            ProviderSettingId::CompactNudgePct => {
+                self.context.compact_nudge_pct = parsed.min(100) as u8;
                 self.mark_present(field);
             }
             ProviderSettingId::CompactShadowMarginPct => {
@@ -1388,7 +1432,11 @@ impl SettingsEditor {
         if matches!(
             field,
             ProviderSettingId::AutoPrunePct | ProviderSettingId::AutoCompactPct
-        ) && self.context.auto_prune_pct >= self.context.auto_compact_pct
+        ) && self.context.auto_prune_pct
+            >= self
+                .context
+                .auto_compact_pct
+                .unwrap_or_else(|| self.auto_compact_auto_value())
         {
             self.status = Some(
                 "note: auto-prune ctx % ≥ auto-compact ctx % — compaction will trigger first"
@@ -1398,6 +1446,17 @@ impl SettingsEditor {
             self.status = None;
         }
         Ok(())
+    }
+
+    fn auto_compact_auto_value(&self) -> u8 {
+        match self.effective_mode {
+            LlmMode::Defensive => AUTO_COMPACT_FLOOR_PCT,
+            LlmMode::Normal | LlmMode::Frontier => AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT,
+        }
+    }
+
+    fn refresh_effective_mode(&mut self) {
+        self.effective_mode = self.mode.unwrap_or(self.mode_inherit_value);
     }
 
     pub(super) fn commit_text(
@@ -1788,7 +1847,8 @@ mod tests {
         let mut entry = ProviderEntry {
             url: "https://x".into(),
             context: ContextConfig {
-                auto_compact_pct: 85,
+                auto_compact_pct: Some(85),
+                compact_nudge_pct: 60,
                 compact_keep_recent_turns: 4,
                 compact_shadow: true,
                 compact_shadow_margin_pct: 10,
@@ -1926,7 +1986,7 @@ mod tests {
         let mut entry2 = entry.clone();
         e.write_into(&mut entry2);
         let m = entry2.models.iter().find(|m| m.id == "m1").unwrap();
-        assert_eq!(m.context.as_ref().unwrap().auto_compact_pct, 70);
+        assert_eq!(m.context.as_ref().unwrap().auto_compact_pct, Some(70));
     }
 
     #[test]
@@ -2015,6 +2075,33 @@ mod tests {
         let mut entry2 = entry.clone();
         e.write_into(&mut entry2);
         assert!(entry2.mode.is_none());
+    }
+
+    #[test]
+    fn unset_auto_compact_edit_seed_uses_effective_mode_default() {
+        let mut entry = provider_with_model();
+        entry.context.auto_compact_pct = None;
+        entry.mode = Some(LlmMode::Normal);
+
+        let mut provider = SettingsEditor::for_provider("p", &entry);
+        provider.begin_numeric_edit(ProviderSettingId::AutoCompactPct);
+        assert_eq!(provider.buf.text(), "80");
+
+        let mut model = SettingsEditor::for_model("p", &entry, "m1");
+        assert_eq!(model.value_str(ProviderSettingId::Mode), "inherit");
+        model.begin_numeric_edit(ProviderSettingId::AutoCompactPct);
+        assert_eq!(model.buf.text(), "80");
+
+        model.editing = None;
+        model.cursor = model
+            .fields()
+            .iter()
+            .position(|f| *f == ProviderSettingId::Mode)
+            .unwrap();
+        model.handle_key(press(KeyCode::Enter));
+        assert_eq!(model.value_str(ProviderSettingId::Mode), "defensive");
+        model.begin_numeric_edit(ProviderSettingId::AutoCompactPct);
+        assert_eq!(model.buf.text(), "60");
     }
 
     /// Auto-prune master-switch row: tri-state at both scopes, tracked via
@@ -2125,7 +2212,7 @@ mod tests {
 
         // Model scope: the row is present as the last field.
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
-        assert_eq!(e.field_count(), 29);
+        assert_eq!(e.field_count(), 30);
         assert_eq!(
             *e.fields().last().unwrap(),
             ProviderSettingId::HintToolCallCorrections
@@ -2175,7 +2262,7 @@ mod tests {
         // mirroring the `mode` tri-state.
         let mut prov = SettingsEditor::for_provider("p", &entry);
         assert!(prov.fields().contains(&ProviderSettingId::InlineThink));
-        assert_eq!(prov.field_count(), 23);
+        assert_eq!(prov.field_count(), 24);
         // Seeded from the provider's (unset) override → inherit default.
         assert_eq!(
             prov.value_str(ProviderSettingId::InlineThink),
@@ -2713,6 +2800,7 @@ mod tests {
             (CapabilityContextTokens, false, true, false, false),
             (CapabilityMaxOutputTokens, false, true, false, false),
             (AutoCompactPct, false, false, false, false),
+            (CompactNudgePct, false, false, false, false),
             (CompactShadow, false, false, false, false),
             (CompactShadowMarginPct, false, false, false, false),
             (AutoPruneEnabled, false, false, false, false),

@@ -460,9 +460,10 @@ fn cache_ttl_selects_one_hour_mode_at_or_above_3600() {
 }
 
 #[test]
-fn context_defaults_include_shadow_brief_policy() {
+fn context_config_defaults_nudge_60_auto_compact_unset() {
     let c = ContextConfig::default();
-    assert_eq!(c.auto_compact_pct, 60);
+    assert_eq!(c.auto_compact_pct, None);
+    assert_eq!(c.compact_nudge_pct, 60);
     assert_eq!(c.compact_keep_recent_turns, 4);
     assert!(c.compact_shadow);
     assert_eq!(c.compact_shadow_margin_pct, 10);
@@ -472,16 +473,24 @@ fn context_defaults_include_shadow_brief_policy() {
     let entry = ProviderEntry::default();
     assert_eq!(entry.context, ContextConfig::default());
     assert!(entry.mode.is_none());
+    let missing_json: ContextConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(missing_json.auto_compact_pct, None);
+    assert_eq!(missing_json.compact_nudge_pct, 60);
+
     let legacy: ContextConfig = serde_json::from_value(serde_json::json!({
         "auto_compact_pct": 77,
+        "compact_nudge_pct": 58,
         "auto_prune_pct": 44,
         "auto_prune_prunable_pct": 22
     }))
     .unwrap();
-    assert_eq!(legacy.auto_compact_pct, 77);
+    assert_eq!(legacy.auto_compact_pct, Some(77));
+    assert_eq!(legacy.compact_nudge_pct, 58);
     assert_eq!(legacy.compact_keep_recent_turns, 4);
     assert!(legacy.compact_shadow);
     assert_eq!(legacy.compact_shadow_margin_pct, 10);
+    let encoded = serde_json::to_value(&legacy).unwrap();
+    assert_eq!(encoded["auto_compact_pct"], 77);
 }
 
 #[test]
@@ -490,7 +499,8 @@ fn resolve_context_prefers_model_then_provider_then_default() {
     let mut entry = ProviderEntry {
         url: "https://x".into(),
         context: ContextConfig {
-            auto_compact_pct: 90,
+            auto_compact_pct: Some(90),
+            compact_nudge_pct: 60,
             compact_keep_recent_turns: 2,
             compact_shadow: true,
             compact_shadow_margin_pct: 10,
@@ -501,7 +511,8 @@ fn resolve_context_prefers_model_then_provider_then_default() {
     };
     let mut pinned = model("pinned", false);
     pinned.context = Some(ContextConfig {
-        auto_compact_pct: 70,
+        auto_compact_pct: Some(70),
+        compact_nudge_pct: 55,
         compact_keep_recent_turns: 1,
         compact_shadow: false,
         compact_shadow_margin_pct: 12,
@@ -513,9 +524,14 @@ fn resolve_context_prefers_model_then_provider_then_default() {
     cfg.providers.insert("p".into(), entry);
 
     // Model override wins.
-    assert_eq!(cfg.resolve_context("p", "pinned").auto_compact_pct, 70);
+    assert_eq!(
+        cfg.resolve_context("p", "pinned").auto_compact_pct,
+        Some(70)
+    );
+    assert_eq!(cfg.resolve_context("p", "pinned").compact_nudge_pct, 55);
     // No model override → provider value.
-    assert_eq!(cfg.resolve_context("p", "bare").auto_compact_pct, 90);
+    assert_eq!(cfg.resolve_context("p", "bare").auto_compact_pct, Some(90));
+    assert_eq!(cfg.resolve_context("p", "bare").compact_nudge_pct, 60);
     assert_eq!(cfg.resolve_context("p", "bare").auto_prune_pct, 60);
     // Unknown provider → built-in default.
     assert_eq!(cfg.resolve_context("nope", "x"), ContextConfig::default());

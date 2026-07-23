@@ -563,6 +563,7 @@ pub struct ContextUsageSnapshot {
     pub ctx_pct: Option<f64>,
     pub used_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    pub compact_nudge_pct: u8,
     pub auto_compact_pct: u8,
 }
 
@@ -572,7 +573,8 @@ impl ContextUsageSnapshot {
             ctx_pct: None,
             used_tokens: None,
             total_tokens: None,
-            auto_compact_pct: crate::config::providers::ContextConfig::default().auto_compact_pct,
+            compact_nudge_pct: crate::config::providers::ContextConfig::default().compact_nudge_pct,
+            auto_compact_pct: 60,
         }
     }
 }

@@ -1638,6 +1638,172 @@ async fn auto_compact_fires_at_threshold_once() {
     );
 }
 
+#[test]
+fn effective_auto_compact_pct_mode_defaults_when_unset() {
+    use crate::config::extended::LlmMode;
+    use crate::config::providers::ContextConfig;
+    let (driver, _tmp) = test_driver_without_network(8);
+    let cfg = ContextConfig::default();
+
+    assert_eq!(
+        driver.effective_auto_compact_pct(&cfg, LlmMode::Defensive, true),
+        60
+    );
+    assert_eq!(
+        driver.effective_auto_compact_pct(&cfg, LlmMode::Normal, true),
+        80
+    );
+    assert_eq!(
+        driver.effective_auto_compact_pct(&cfg, LlmMode::Frontier, true),
+        80
+    );
+}
+
+#[test]
+fn effective_auto_compact_pct_stays_60_without_mcp() {
+    use crate::config::extended::LlmMode;
+    use crate::config::providers::ContextConfig;
+    let (driver, _tmp) = test_driver_without_network(8);
+    let cfg = ContextConfig::default();
+
+    for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
+        assert_eq!(driver.effective_auto_compact_pct(&cfg, mode, false), 60);
+    }
+}
+
+#[test]
+fn effective_auto_compact_pct_explicit_override_wins() {
+    use crate::config::extended::LlmMode;
+    use crate::config::providers::ContextConfig;
+    let (driver, _tmp) = test_driver_without_network(8);
+    let cfg = ContextConfig {
+        auto_compact_pct: Some(50),
+        ..ContextConfig::default()
+    };
+
+    for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
+        assert_eq!(driver.effective_auto_compact_pct(&cfg, mode, false), 50);
+        assert_eq!(driver.effective_auto_compact_pct(&cfg, mode, true), 50);
+    }
+}
+
+#[tokio::test]
+async fn auto_compact_fires_at_mode_resolved_line() {
+    use crate::config::extended::LlmMode;
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut capable, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    install_test_providers(
+        &mut capable,
+        CacheMode::None,
+        ContextConfig::default(),
+        100_000,
+    );
+    let mut agent = (*capable.stack[0].agent).clone();
+    agent.llm_mode = LlmMode::Normal;
+    capable.stack[0].agent = Arc::new(agent);
+    capable.session.set_active_tool_names(["mcp"], false);
+
+    record_test_context_tokens(&capable, 70_000);
+    assert!(
+        !capable.maybe_auto_compact(&tx).await,
+        "normal+mcp stays below the resolved 80% line at 70%"
+    );
+    record_test_context_tokens(&capable, 82_000);
+    assert!(
+        capable.maybe_auto_compact(&tx).await,
+        "normal+mcp compacts at the resolved 80% line"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+
+    let (mut no_mcp, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    install_test_providers(
+        &mut no_mcp,
+        CacheMode::None,
+        ContextConfig::default(),
+        100_000,
+    );
+    let mut agent = (*no_mcp.stack[0].agent).clone();
+    agent.llm_mode = LlmMode::Normal;
+    no_mcp.stack[0].agent = Arc::new(agent);
+    no_mcp.session.set_active_tool_names([], false);
+    record_test_context_tokens(&no_mcp, 65_000);
+    assert!(
+        no_mcp.maybe_auto_compact(&tx).await,
+        "normal without mcp keeps the 60% forced line"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn auto_compact_defers_equal_line_until_compact_nudge_fires() {
+    use crate::config::extended::LlmMode;
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        100_000,
+    );
+    let mut agent = (*driver.stack[0].agent).clone();
+    agent.llm_mode = LlmMode::Defensive;
+    driver.stack[0].agent = Arc::new(agent);
+    driver.session.set_active_tool_names(["mcp"], false);
+    record_test_context_tokens(&driver, 65_000);
+
+    assert!(
+        !driver.maybe_auto_compact(&tx).await,
+        "defensive+mcp gives the equal-line compact nudge one turn to reach the model"
+    );
+    assert!(
+        driver
+            .session
+            .compact_self_nudge(Some(65.0), 60, 60, true, true)
+            .is_some(),
+        "turn-start injection records that the model received the warning"
+    );
+    assert!(
+        driver.maybe_auto_compact(&tx).await,
+        "after the warning has fired, the 60% forced line compacts"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[test]
+fn context_usage_reports_nudge_and_resolved_forced_pct() {
+    use crate::config::extended::LlmMode;
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        100_000,
+    );
+    let mut agent = (*driver.stack[0].agent).clone();
+    agent.llm_mode = LlmMode::Normal;
+    driver.stack[0].agent = Arc::new(agent);
+    driver.session.set_active_tool_names(["mcp"], false);
+    record_test_context_tokens(&driver, 62_000);
+
+    let snapshot = driver.context_usage_snapshot();
+
+    assert_eq!(snapshot.ctx_pct, Some(62.0));
+    assert_eq!(snapshot.used_tokens, Some(62_000));
+    assert_eq!(snapshot.total_tokens, Some(100_000));
+    assert_eq!(snapshot.compact_nudge_pct, 60);
+    assert_eq!(snapshot.auto_compact_pct, 80);
+}
+
 #[tokio::test]
 async fn oversized_compact_handoff_leaves_history_unchanged() {
     use crate::config::providers::{CacheMode, ContextConfig};

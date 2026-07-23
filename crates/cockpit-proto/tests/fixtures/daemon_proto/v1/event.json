@@ -255,6 +255,7 @@
                   "auto_prune_pct": 50,
                   "auto_prune_prunable_pct": 30,
                   "compact_keep_recent_turns": 4,
+                  "compact_nudge_pct": 60,
                   "compact_shadow": true,
                   "compact_shadow_margin_pct": 10
                 },

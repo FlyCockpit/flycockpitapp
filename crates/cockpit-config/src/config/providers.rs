@@ -609,11 +609,15 @@ impl ThinkingParams {
 /// fires). The shadow margin is also expressed in percentage points.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextConfig {
-    /// At or above this ctx% the foreground context is compacted
+    /// Explicit ctx% line where the foreground context is compacted
     /// automatically (the `/compact` machinery runs without a prompt).
-    /// Default 60.
-    #[serde(default = "default_auto_compact_pct")]
-    pub auto_compact_pct: u8,
+    /// When unset, the driver resolves a mode/toolbox-aware default.
+    #[serde(default)]
+    pub auto_compact_pct: Option<u8>,
+    /// At or above this ctx% the root agent is nudged to request its own
+    /// compaction when the self-compaction tool is available. Default 60.
+    #[serde(default = "default_compact_nudge_pct")]
+    pub compact_nudge_pct: u8,
     /// Number of most-recent complete user/assistant exchanges retained
     /// verbatim after compaction. `0` keeps only the handoff. Default 4.
     #[serde(default = "default_compact_keep_recent_turns")]
@@ -640,7 +644,8 @@ pub struct ContextConfig {
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            auto_compact_pct: default_auto_compact_pct(),
+            auto_compact_pct: None,
+            compact_nudge_pct: default_compact_nudge_pct(),
             compact_keep_recent_turns: default_compact_keep_recent_turns(),
             compact_shadow: default_compact_shadow(),
             compact_shadow_margin_pct: default_compact_shadow_margin_pct(),
@@ -650,7 +655,7 @@ impl Default for ContextConfig {
     }
 }
 
-default_const!(default_auto_compact_pct, u8, 60);
+default_const!(default_compact_nudge_pct, u8, 60);
 
 default_const!(default_compact_keep_recent_turns, usize, 4);
 

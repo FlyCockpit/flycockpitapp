@@ -1164,7 +1164,8 @@ fn merge_preserves_model_override_fields_on_matching_fetched_id() {
         ttl_secs: 3600,
     });
     existing.context = Some(ContextConfig {
-        auto_compact_pct: 70,
+        auto_compact_pct: Some(70),
+        compact_nudge_pct: 60,
         compact_keep_recent_turns: 3,
         compact_shadow: true,
         compact_shadow_margin_pct: 10,

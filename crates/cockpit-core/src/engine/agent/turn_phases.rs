@@ -650,7 +650,7 @@ pub(crate) async fn run_turn(
     let active_tools = turn_toolbox(agent, &session, &cwd, &config);
     let tools = active_tools.definitions(agent.llm_mode);
 
-    inject_turn_start_system_messages(&session, &active_tools, is_root, history);
+    inject_turn_start_system_messages(&session, &active_tools, is_root, context_usage, history);
     let active_tool_names = active_tools.names();
     super::inject_available_skills_catalog(history, &cwd, &config, &active_tool_names);
 
@@ -1459,6 +1459,7 @@ fn inject_turn_start_system_messages(
     session: &Session,
     active_tools: &ToolBox,
     is_root: bool,
+    context_usage: crate::engine::tool::ContextUsageSnapshot,
     history: &mut Vec<Message>,
 ) {
     let active_tool_names = active_tools.names();
@@ -1471,6 +1472,18 @@ fn inject_turn_start_system_messages(
         && !history
             .iter()
             .any(|message| matches!(message, Message::System { content } if content == &nudge))
+    {
+        history.push(Message::System { content: nudge });
+    }
+    if let Some(nudge) = session.compact_self_nudge(
+        context_usage.ctx_pct,
+        context_usage.compact_nudge_pct,
+        context_usage.auto_compact_pct,
+        active_tool_names.contains(&"mcp"),
+        is_root,
+    ) && !history
+        .iter()
+        .any(|message| matches!(message, Message::System { content } if content == &nudge))
     {
         history.push(Message::System { content: nudge });
     }
@@ -1556,7 +1569,13 @@ mod tests {
         let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
         let mut history = Vec::new();
 
-        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+        inject_turn_start_system_messages(
+            &session,
+            &toolbox,
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        );
 
         let nudges: Vec<_> = history
             .iter()
@@ -1568,7 +1587,13 @@ mod tests {
         assert_eq!(nudges.len(), 1);
         assert!(nudges[0].contains("after 8 user turns"));
 
-        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+        inject_turn_start_system_messages(
+            &session,
+            &toolbox,
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        );
         let nudge_count = history
             .iter()
             .filter(|message| {
@@ -1588,13 +1613,85 @@ mod tests {
         let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
         let mut history = Vec::new();
 
-        inject_turn_start_system_messages(&session, &toolbox, false, &mut history);
+        inject_turn_start_system_messages(
+            &session,
+            &toolbox,
+            false,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        );
 
         assert!(
             history.iter().all(
                 |message| !matches!(message, Message::System { content } if content.contains("rename_session"))
             ),
             "{history:?}"
+        );
+    }
+
+    #[test]
+    fn compact_nudge_injected_as_system_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        for turn in 1..=8 {
+            let _ = session.note_user_content(&format!("turn {turn}"));
+        }
+        let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
+        let context_usage = crate::engine::tool::ContextUsageSnapshot {
+            ctx_pct: Some(62.0),
+            used_tokens: Some(62_000),
+            total_tokens: Some(100_000),
+            compact_nudge_pct: 60,
+            auto_compact_pct: 80,
+        };
+        let mut history = Vec::new();
+
+        inject_turn_start_system_messages(&session, &toolbox, true, context_usage, &mut history);
+
+        let compact_nudges: Vec<_> = history
+            .iter()
+            .filter_map(|message| match message {
+                Message::System { content } if content.contains("request_compact") => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(compact_nudges.len(), 1, "{history:?}");
+        assert!(compact_nudges[0].contains("62%"));
+        assert!(compact_nudges[0].contains("80%"));
+        assert!(
+            history.iter().any(
+                |message| matches!(message, Message::System { content } if content.contains("rename_session"))
+            ),
+            "title nudge should coexist when simultaneously eligible"
+        );
+
+        inject_turn_start_system_messages(&session, &toolbox, true, context_usage, &mut history);
+        let compact_nudge_count = history
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::System { content } if content.contains("request_compact"))
+            })
+            .count();
+        assert_eq!(compact_nudge_count, 1, "same nudge should not duplicate");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let inactive = test_session(tmp.path());
+        let mut inactive_history = Vec::new();
+        inject_turn_start_system_messages(
+            &inactive,
+            &toolbox,
+            true,
+            crate::engine::tool::ContextUsageSnapshot {
+                ctx_pct: Some(59.0),
+                ..context_usage
+            },
+            &mut inactive_history,
+        );
+        assert!(
+            inactive_history.iter().all(
+                |message| !matches!(message, Message::System { content } if content.contains("request_compact"))
+            ),
+            "{inactive_history:?}"
         );
     }
 
@@ -1608,7 +1705,13 @@ mod tests {
         let toolbox = ToolBox::new();
         let mut history = Vec::new();
 
-        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+        inject_turn_start_system_messages(
+            &session,
+            &toolbox,
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        );
 
         assert!(
             history.iter().all(
@@ -1617,7 +1720,13 @@ mod tests {
             "{history:?}"
         );
         let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
-        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+        inject_turn_start_system_messages(
+            &session,
+            &toolbox,
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        );
         assert!(
             history.iter().all(
                 |message| !matches!(message, Message::System { content } if content.contains("rename_session"))
@@ -1635,7 +1744,13 @@ mod tests {
             .with_discoverable_mcp(Arc::new(crate::tools::intel::WordTool));
         let mut history = Vec::new();
 
-        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+        inject_turn_start_system_messages(
+            &session,
+            &toolbox,
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        );
 
         let adverts: Vec<_> = history
             .iter()
@@ -1657,7 +1772,13 @@ mod tests {
             adverts[0]
         );
 
-        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+        inject_turn_start_system_messages(
+            &session,
+            &toolbox,
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        );
         let advert_count = history
             .iter()
             .filter(|message| {
@@ -1678,7 +1799,13 @@ mod tests {
         let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
         let mut history = Vec::new();
 
-        inject_turn_start_system_messages(&session, &toolbox, true, &mut history);
+        inject_turn_start_system_messages(
+            &session,
+            &toolbox,
+            true,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            &mut history,
+        );
 
         assert!(
             history.iter().all(

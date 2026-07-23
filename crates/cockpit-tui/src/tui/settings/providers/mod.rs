@@ -148,9 +148,13 @@ fn provider_settings_summary(entry: &ProviderEntry) -> String {
     } else {
         "shadow off".to_string()
     };
+    let compact = ctx
+        .auto_compact_pct
+        .map(|pct| format!("{pct}%"))
+        .unwrap_or_else(|| "auto".to_string());
     let mut summary = format!(
-        "compact {}% ({shadow}) · {prune} · cache {}s · ttft {}s · idle {}s · mode {mode}",
-        ctx.auto_compact_pct,
+        "compact {compact} ({shadow}) · nudge {}% · {prune} · cache {}s · ttft {}s · idle {}s · mode {mode}",
+        ctx.compact_nudge_pct,
         entry.cache.ttl_secs,
         entry.timeout.ttft_secs,
         entry.timeout.idle_secs,

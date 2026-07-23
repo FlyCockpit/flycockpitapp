@@ -725,12 +725,11 @@ impl Driver {
             return false;
         };
         let margin = ctx_cfg.compact_shadow_margin_pct.min(100);
-        let start = ctx_cfg.auto_compact_pct.saturating_sub(margin);
-        let late_start = ctx_cfg
-            .auto_compact_pct
-            .saturating_sub(margin.saturating_add(1) / 2);
+        let auto_compact_pct = self.effective_root_auto_compact_pct(&ctx_cfg);
+        let start = auto_compact_pct.saturating_sub(margin);
+        let late_start = auto_compact_pct.saturating_sub(margin.saturating_add(1) / 2);
         if metrics.ctx_pct < f64::from(start)
-            || metrics.ctx_pct >= f64::from(ctx_cfg.auto_compact_pct)
+            || metrics.ctx_pct >= f64::from(auto_compact_pct)
             || (!self.prune_is_ineffective() && metrics.ctx_pct < f64::from(late_start))
         {
             return false;
@@ -843,9 +842,17 @@ impl Driver {
         //      kept climbing (implementation note Part B) —
         //      tiny snapshot prunes aren't keeping context in budget, so stop
         //      churning them and compact now, below the hard line.
-        let over_compact_line = metrics.ctx_pct >= f64::from(ctx_cfg.auto_compact_pct);
+        let auto_compact_pct = self.effective_root_auto_compact_pct(&ctx_cfg);
+        let over_compact_line = metrics.ctx_pct >= f64::from(auto_compact_pct);
         let escalate = self.prune_is_ineffective();
         if !over_compact_line && !escalate {
+            return false;
+        }
+        if over_compact_line
+            && auto_compact_pct == ctx_cfg.compact_nudge_pct
+            && self.root_can_self_compact()
+            && !self.session.compact_self_nudge_has_fired()
+        {
             return false;
         }
         self.auto_compacted = true;
@@ -1020,7 +1027,7 @@ impl Driver {
                 &handoff,
                 keep,
                 context_window,
-                ctx_cfg.auto_compact_pct,
+                self.effective_root_auto_compact_pct(&ctx_cfg),
             ) {
                 Ok(plan) => plan,
                 Err(error) => return Err(error),
@@ -1150,6 +1157,7 @@ impl Driver {
             self.trace_compaction_apply("timeline_recorded");
         }
 
+        self.session.reset_compact_self_nudge_latch();
         self.run_seed_tools(&prepared.seed_tools, tx).await;
         #[cfg(test)]
         self.trace_compaction_apply("seed_tools_ran");

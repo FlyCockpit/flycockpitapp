@@ -49,6 +49,7 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Sleep};
 
+use crate::config::extended::LlmMode;
 use crate::engine::agent::{
     Agent, BackupTurnMetadata, TaskControlAction, TurnEvent, TurnOutcome, turn_with_backup,
 };
@@ -58,6 +59,9 @@ use crate::engine::message::{
 use crate::engine::prune;
 use crate::engine::schedule::{ScheduleAuthority, ScheduleCommand, ScheduleEvent};
 use crate::redact::RedactionTable;
+
+const AUTO_COMPACT_FLOOR_PCT: u8 = 60;
+const AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT: u8 = 80;
 use crate::session::Session;
 
 /// Out-of-band control requests routed to the driver from the daemon
@@ -2537,6 +2541,7 @@ impl Driver {
             let backup_model = self.resolve_backup_model(&agent.model);
             let fallback_models = self.resolve_failover_models(&agent.model);
             let call_id = uuid::Uuid::new_v4();
+            self.publish_active_tool_names();
             let context_usage = self.context_usage_snapshot();
             let tandem = self
                 .tandem_set
@@ -4401,6 +4406,43 @@ impl Driver {
         Self::context_config_from(self.active_providers_config().as_ref())
     }
 
+    fn root_can_self_compact(&self) -> bool {
+        self.session
+            .active_tool_names()
+            .iter()
+            .any(|name| name == "mcp")
+    }
+
+    fn effective_auto_compact_pct(
+        &self,
+        ctx_cfg: &crate::config::providers::ContextConfig,
+        mode: LlmMode,
+        can_self_compact: bool,
+    ) -> u8 {
+        if let Some(explicit) = ctx_cfg.auto_compact_pct {
+            return explicit;
+        }
+        if !can_self_compact {
+            return AUTO_COMPACT_FLOOR_PCT;
+        }
+        match mode {
+            LlmMode::Defensive => AUTO_COMPACT_FLOOR_PCT,
+            LlmMode::Normal | LlmMode::Frontier => AUTO_COMPACT_CAPABLE_MODE_DEFAULT_PCT,
+        }
+    }
+
+    fn effective_root_auto_compact_pct(
+        &self,
+        ctx_cfg: &crate::config::providers::ContextConfig,
+    ) -> u8 {
+        let mode = self
+            .stack
+            .first()
+            .map(|frame| frame.agent.llm_mode)
+            .unwrap_or_default();
+        self.effective_auto_compact_pct(ctx_cfg, mode, self.root_can_self_compact())
+    }
+
     /// Last provider-reported input usage, with a debug-build-only threshold
     /// forcing seam for deterministic manual compaction verification.
     fn context_input_tokens(&self, _context_length: Option<u32>) -> Option<u64> {
@@ -4429,7 +4471,8 @@ impl Driver {
             ctx_pct,
             used_tokens,
             total_tokens,
-            auto_compact_pct: ctx_cfg.auto_compact_pct,
+            compact_nudge_pct: ctx_cfg.compact_nudge_pct,
+            auto_compact_pct: self.effective_root_auto_compact_pct(&ctx_cfg),
         }
     }
 
@@ -5448,7 +5491,6 @@ impl Driver {
                 .then(|| self.tandem_set.clone());
 
             let attempted_prompt = next_prompt.clone();
-            self.publish_active_tool_names();
             self.emit_command_capability_notice_if_new(tx).await;
             let mut turn_metadata = BackupTurnMetadata::default();
             let fallback_models = self.resolve_failover_models(&agent.model);

@@ -163,6 +163,45 @@ impl Session {
         .then_some(slot)
     }
 
+    pub(crate) fn compact_self_nudge(
+        &self,
+        ctx_pct: Option<f64>,
+        nudge_pct: u8,
+        forced_pct: u8,
+        mcp_present: bool,
+        root_agent_frame: bool,
+    ) -> Option<String> {
+        if !root_agent_frame || !mcp_present {
+            return None;
+        }
+        let ctx_pct = ctx_pct?;
+        if !ctx_pct.is_finite() || ctx_pct < f64::from(nudge_pct) {
+            return None;
+        }
+        let stage = self.compact_self_nudge_stage.load(Ordering::Relaxed);
+        let next_stage = if stage < 1 {
+            1
+        } else if stage < 2 && ctx_pct >= f64::from(nudge_pct.saturating_add(10)) {
+            2
+        } else {
+            return None;
+        };
+        self.compact_self_nudge_stage
+            .store(next_stage, Ordering::Relaxed);
+        Some(format!(
+            "Context is at {}% of this model's window. Compact now to control the handoff: call mcp.invoke(\"cockpit\", \"request_compact\", {{}}). If you don't, the host will auto-compact this session for you at {forced_pct}%.",
+            ctx_pct.round() as u64
+        ))
+    }
+
+    pub(crate) fn reset_compact_self_nudge_latch(&self) {
+        self.compact_self_nudge_stage.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn compact_self_nudge_has_fired(&self) -> bool {
+        self.compact_self_nudge_stage.load(Ordering::Relaxed) > 0
+    }
+
     /// Compatibility hook retained for older call sites/tests. The schedule is
     /// consumed before the detached utility call starts, so a successful eager
     /// write normally has no progress work left to do.

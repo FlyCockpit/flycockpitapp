@@ -1117,6 +1117,7 @@ fn context_usage<'a>(
                 "ctx_pct": null,
                 "used_tokens": null,
                 "total_tokens": null,
+                "compact_nudge_pct": null,
                 "auto_compact_pct": null,
                 "snapshot": "unavailable"
             }));
@@ -1125,6 +1126,7 @@ fn context_usage<'a>(
             "ctx_pct": snapshot.ctx_pct,
             "used_tokens": snapshot.used_tokens,
             "total_tokens": snapshot.total_tokens,
+            "compact_nudge_pct": snapshot.compact_nudge_pct,
             "auto_compact_pct": snapshot.auto_compact_pct,
             "snapshot": "turn_start"
         }))
@@ -2496,13 +2498,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_usage_reports_snapshot() {
+    async fn context_usage_reports_nudge_and_resolved_forced_pct() {
         let tmp = tempfile::tempdir().unwrap();
         let mut host = host(tmp.path());
         host.context_usage = Some(ContextUsageSnapshot {
             ctx_pct: Some(42.5),
             used_tokens: Some(425),
             total_tokens: Some(1000),
+            compact_nudge_pct: 60,
             auto_compact_pct: 80,
         });
 
@@ -2512,7 +2515,15 @@ mod tests {
         assert_eq!(out["ctx_pct"], 42.5);
         assert_eq!(out["used_tokens"], 425);
         assert_eq!(out["total_tokens"], 1000);
+        assert_eq!(out["compact_nudge_pct"], 60);
         assert_eq!(out["auto_compact_pct"], 80);
         assert_eq!(out["snapshot"], "turn_start");
+
+        host.context_usage = None;
+        let unavailable = invoke(&host, "context_usage", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(unavailable["compact_nudge_pct"].is_null());
+        assert!(unavailable["auto_compact_pct"].is_null());
     }
 }

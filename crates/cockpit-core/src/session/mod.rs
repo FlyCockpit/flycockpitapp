@@ -221,6 +221,10 @@ pub struct Session {
     /// resumed session has already passed any previous slot and must not
     /// re-nudge it.
     title_nudge_slot_pending: AtomicU8,
+    /// In-memory two-shot latch for compact self-nudges (`0`, `1`, `2`).
+    /// Reset only by successful compaction; prunes deliberately do not re-arm
+    /// it because ctx% can oscillate around the threshold.
+    compact_self_nudge_stage: AtomicU8,
     /// Latches once a genuine auto-title failure has surfaced a user
     /// `Notice` (§17d / implementation note), so
     /// a broken/unset utility model is reported once per session rather
@@ -1259,6 +1263,86 @@ mod tests {
                 .unnamed_session_title_nudge(true, true)
                 .unwrap()
                 .contains("after 16 user turns")
+        );
+    }
+
+    #[test]
+    fn compact_self_nudge_two_shot_latch() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+
+        let first = s
+            .compact_self_nudge(Some(62.0), 60, 80, true, true)
+            .expect("first nudge fires at nudge threshold");
+        assert!(first.contains("mcp.invoke(\"cockpit\", \"request_compact\", {})"));
+        assert!(first.contains("62%"));
+        assert!(first.contains("80%"));
+        assert!(
+            s.compact_self_nudge(Some(62.0), 60, 80, true, true)
+                .is_none()
+        );
+        assert!(
+            s.compact_self_nudge(Some(69.0), 60, 80, true, true)
+                .is_none()
+        );
+
+        let second = s
+            .compact_self_nudge(Some(71.0), 60, 80, true, true)
+            .expect("second nudge fires at nudge + 10");
+        assert!(second.contains("71%"));
+        assert!(
+            s.compact_self_nudge(Some(71.0), 60, 80, true, true)
+                .is_none()
+        );
+
+        s.reset_compact_self_nudge_latch();
+        assert!(
+            s.compact_self_nudge(Some(62.0), 60, 80, true, true)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn compact_self_nudge_suppressed_when_unactionable() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+
+        assert!(
+            s.compact_self_nudge(Some(62.0), 60, 80, true, false)
+                .is_none()
+        );
+        assert!(
+            s.compact_self_nudge(Some(62.0), 60, 80, false, true)
+                .is_none()
+        );
+        assert!(s.compact_self_nudge(None, 60, 80, true, true).is_none());
+        assert!(
+            s.compact_self_nudge(Some(59.0), 60, 80, true, true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compact_self_nudge_latch_reset_only_on_compaction() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+
+        assert!(
+            s.compact_self_nudge(Some(62.0), 60, 80, true, true)
+                .is_some()
+        );
+        assert!(
+            s.compact_self_nudge(Some(50.0), 60, 80, true, true)
+                .is_none()
+        );
+        assert!(
+            s.compact_self_nudge(Some(62.0), 60, 80, true, true)
+                .is_none()
+        );
+        s.reset_compact_self_nudge_latch();
+        assert!(
+            s.compact_self_nudge(Some(62.0), 60, 80, true, true)
+                .is_some()
         );
     }
 

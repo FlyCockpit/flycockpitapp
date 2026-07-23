@@ -138,7 +138,10 @@ fn inference_error_collapsed_and_expanded_render_clickable_rows() {
     assert_eq!(r.lines.len(), 1);
     assert_eq!(
         line_text(&r.lines[0]),
-        "Inference failed (p/m): network: first line"
+        format!(
+            "{}Inference failed (p/m): network: first line",
+            " ".repeat(AGENT_INDENT)
+        )
     );
     assert_eq!(r.chip_row, Some(0));
     assert!(
@@ -168,6 +171,100 @@ fn inference_error_collapsed_and_expanded_render_clickable_rows() {
     let text = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
     assert!(text.contains("Inference failed (p/m)"));
     assert!(text.contains("second line"));
+}
+
+#[test]
+fn inference_error_collapsed_row_is_indented_and_width_bounded() {
+    let width = 80;
+    let summary = format!(
+        "Inference failed (openai/gpt): http_400: ProviderError {{ {} }}",
+        "x".repeat(150)
+    );
+    let entry = HistoryEntry::InferenceError {
+        summary,
+        detail: "full provider error body".to_string(),
+        expanded: false,
+    };
+    let r = render_entry(
+        &entry,
+        width,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        &no_elided(),
+        0,
+        None,
+    );
+
+    assert_eq!(r.lines.len(), 1);
+    assert_eq!(r.chip_row, Some(0));
+    let text = line_text(&r.lines[0]);
+    assert!(text.starts_with(&" ".repeat(AGENT_INDENT)));
+    assert!(text.ends_with('…'));
+    assert!(line_width(&r.lines[0]) <= width as usize - AGENT_INDENT);
+}
+
+#[test]
+fn command_error_row_shares_transcript_indent() {
+    let entry = HistoryEntry::CommandError {
+        line: "bad command".to_string(),
+    };
+    let r = render_entry(
+        &entry,
+        80,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        &no_elided(),
+        0,
+        None,
+    );
+
+    assert_eq!(r.lines.len(), 1);
+    assert_eq!(r.chip_row, None);
+    assert!(line_text(&r.lines[0]).starts_with(&" ".repeat(AGENT_INDENT)));
+    assert!(
+        r.lines[0]
+            .spans
+            .iter()
+            .any(|span| !span.content.trim().is_empty() && span.style.fg == Some(ERROR_TEXT))
+    );
+}
+
+#[test]
+fn inference_error_expanded_detail_rows_use_agent_indent() {
+    let summary_tail_marker = "summary-tail-kept";
+    let tail_marker = "tail-marker-kept";
+    let entry = HistoryEntry::InferenceError {
+        summary: format!(
+            "Inference failed (p/m): provider {} {summary_tail_marker}",
+            "x".repeat(150)
+        ),
+        detail: format!("first detail line\nsecond detail line with {tail_marker}"),
+        expanded: true,
+    };
+    let r = render_entry(
+        &entry,
+        80,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        &no_elided(),
+        0,
+        None,
+    );
+
+    assert_eq!(r.chip_row, Some(0));
+    assert_eq!(r.lines.len(), 3);
+    for line in &r.lines[1..] {
+        assert!(line_text(line).starts_with(&" ".repeat(AGENT_INDENT)));
+    }
+    let text = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+    assert!(text.contains(summary_tail_marker));
+    assert!(text.contains(tail_marker));
 }
 
 #[test]

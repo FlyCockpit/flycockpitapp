@@ -783,10 +783,10 @@ pub fn render_entry(
             pin_region: None,
         },
         HistoryEntry::CommandError { line } => Rendered {
-            lines: vec![Line::from(Span::styled(
-                line.clone(),
-                Style::default().fg(ERROR_TEXT),
-            ))],
+            lines: vec![Line::from(vec![
+                Span::styled(" ".repeat(AGENT_INDENT), Style::default().fg(ERROR_TEXT)),
+                Span::styled(line.clone(), Style::default().fg(ERROR_TEXT)),
+            ])],
             chip_row: None,
             continuations: vec![false],
             tool_call_rows: Vec::new(),
@@ -853,10 +853,16 @@ pub fn render_entry(
         } => {
             // Red, mirroring a failed tool call's treatment. The first row is
             // the click target; expanded rows reveal persisted provider detail.
-            let mut lines = vec![Line::from(Span::styled(
-                summary.clone(),
-                Style::default().fg(ERROR_TEXT),
-            ))];
+            let avail = (width as usize).saturating_sub(2 * AGENT_INDENT);
+            let summary = if *expanded {
+                summary.clone()
+            } else {
+                truncate(summary, avail)
+            };
+            let mut lines = vec![Line::from(vec![
+                Span::styled(" ".repeat(AGENT_INDENT), Style::default().fg(ERROR_TEXT)),
+                Span::styled(summary, Style::default().fg(ERROR_TEXT)),
+            ])];
             if *expanded {
                 let body = if detail.trim().is_empty() {
                     "No additional inference detail was recorded.".to_string()
@@ -865,7 +871,7 @@ pub fn render_entry(
                 };
                 for raw in body.lines() {
                     lines.push(Line::from(vec![
-                        Span::raw("  ".to_string()),
+                        Span::raw(" ".repeat(AGENT_INDENT)),
                         Span::styled(raw.to_string(), Style::default().fg(ERROR_TEXT).dim()),
                     ]));
                 }

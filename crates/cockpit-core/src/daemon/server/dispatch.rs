@@ -1160,6 +1160,10 @@ pub(super) async fn handle_serialized_request(
             effects.shutdown_after_response = true;
             Ok(Response::Ack)
         }
+        Request::Unknown => Err(proto::unsupported_request_error(
+            proto::PROTOCOL_VERSION,
+            None,
+        )),
     }
 }
 

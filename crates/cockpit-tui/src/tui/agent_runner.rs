@@ -1604,7 +1604,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | TerminalViewers { .. }
         | TerminalClosed { .. }
         | LspNotice { .. }
-        | EnvDriftWarning { .. } => return None,
+        | EnvDriftWarning { .. }
+        | Unknown => return None,
     })
 }
 
@@ -2314,7 +2315,8 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         | TerminalOutput { .. }
         | TerminalClipboard { .. }
         | TerminalViewers { .. }
-        | TerminalClosed { .. } => return None,
+        | TerminalClosed { .. }
+        | Unknown => return None,
         // The chrome's active-agent slot is updated directly in
         // `update_active_agent`; the swap needs no history-stream entry.
         PrimarySwapped { .. } => return None,
@@ -2439,6 +2441,7 @@ mod tests {
             let mut proto = ProtoStream::new(stream);
             let env = match proto.recv().await.unwrap().unwrap() {
                 RecvFrame::Envelope(env) => env,
+                RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),
                 RecvFrame::VersionMismatch { .. } => panic!("unexpected version mismatch"),
             };
             let Body::Request { id, request } = env.body else {

@@ -930,6 +930,7 @@ mod tests {
             let mut proto = ProtoStream::new(stream);
             let env = match proto.recv().await.unwrap().unwrap() {
                 RecvFrame::Envelope(env) => env,
+                RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),
                 RecvFrame::VersionMismatch { .. } => panic!("unexpected version mismatch"),
             };
             let Body::Request { id, request } = env.body else {

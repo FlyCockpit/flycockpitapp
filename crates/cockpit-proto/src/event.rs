@@ -808,6 +808,9 @@ pub enum Event {
         holder_agent: String,
         waiting: bool,
     },
+
+    #[serde(other)]
+    Unknown,
 }
 
 fn default_idle_reason() -> IdleReason {

@@ -406,6 +406,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             message,
         } => scrub_string(message, redact),
         proto::Response::PausedWork { items } => scrub_paused_work(items, redact),
+        proto::Response::Unknown => {}
     }
 }
 
@@ -871,6 +872,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             holder_agent: _,
             waiting: _,
         } => scrub_string(path, redact),
+        proto::Event::Unknown => {}
     }
 }
 
@@ -2991,6 +2993,26 @@ async fn handle_client_frame(
             }
             false
         }
+        RecvFrame::Unknown { v, kind, tag, id } => {
+            if kind == "req"
+                && let Some(id) = id
+            {
+                let envelope = Envelope::error(
+                    Some(id),
+                    proto::unsupported_request_error(v, tag.as_deref()),
+                );
+                let _ = send_writer_envelope_with_ack(writer_tx, envelope).await;
+            } else {
+                tracing::debug!(
+                    version = v,
+                    kind,
+                    ?tag,
+                    ?id,
+                    "dropping unknown protocol frame"
+                );
+            }
+            true
+        }
     }
 }
 
@@ -3080,6 +3102,9 @@ async fn handle_envelope(
         }
         Body::Error { id, error } => {
             tracing::warn!(?id, ?error, "client sent an error envelope; ignoring");
+        }
+        Body::Unknown => {
+            tracing::debug!("dropping unknown client protocol body");
         }
     }
     Ok(())
@@ -3216,6 +3241,7 @@ fn envelope_kind(envelope: &Envelope) -> &'static str {
         Body::Error { .. } => "error",
         Body::Request { .. } => "request",
         Body::Event { .. } => "event",
+        Body::Unknown => "unknown",
     }
 }
 

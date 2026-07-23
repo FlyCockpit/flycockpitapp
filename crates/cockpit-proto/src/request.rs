@@ -747,6 +747,9 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grace_secs: Option<u64>,
     },
+
+    #[serde(other)]
+    Unknown,
 }
 
 // Keep daemon command metadata centralized. Callers provide a local callback
@@ -846,6 +849,7 @@ macro_rules! command {
             (Request::StatsRollup { .. }, "stats_rollup", owner_only, none, false, concurrent, none);
             (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, concurrent, none);
             (Request::StopDaemon { .. }, "stop_daemon", owner_only, none, true, serialized, none);
+            (Request::Unknown, "unknown", owner_only, none, false, serialized, none);
         ] }
     };
 }

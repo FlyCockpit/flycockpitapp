@@ -302,6 +302,9 @@ async fn run_io(
                             Body::Request { id, request } => {
                                 tracing::warn!(id = %id, ?request, "daemon sent a request to a client; ignoring");
                             }
+                            Body::Unknown => {
+                                tracing::debug!("dropping unknown daemon protocol body");
+                            }
                         }
                     }
                     Ok(Some(RecvFrame::VersionMismatch { v, id, .. })) => {
@@ -314,6 +317,22 @@ async fn run_io(
                             }));
                         }
                         break;
+                    }
+                    Ok(Some(RecvFrame::Unknown { v, kind, tag, id })) => {
+                        if matches!(kind.as_str(), "res" | "err")
+                            && let Some(id) = id
+                            && let Some(tx) = pending.remove(&id)
+                        {
+                            let _ = tx.send(Err(proto::unsupported_request_error(v, tag.as_deref())));
+                        } else {
+                            tracing::debug!(
+                                version = v,
+                                kind,
+                                ?tag,
+                                ?id,
+                                "dropping unknown daemon protocol frame"
+                            );
+                        }
                     }
                     Err(e) => {
                         tracing::debug!(error = ?e, "daemon read failed; closing");
@@ -726,6 +745,183 @@ mod tests {
             .expect_err("attach should receive typed protocol error");
         assert_eq!(err.code, proto::ErrorCode::ProtocolVersion);
         assert!(err.message.contains("wire protocol version mismatch"));
+    }
+
+    #[tokio::test]
+    async fn unknown_frame_response_resolves_pending_request_with_error() {
+        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+
+        let daemon_reply = tokio::spawn(async move {
+            let id = match daemon.recv().await.unwrap().unwrap() {
+                proto::RecvFrame::Envelope(env) => match env.body {
+                    Body::Request { id, .. } => id,
+                    other => panic!("expected request body, got {other:?}"),
+                },
+                other => panic!("expected request envelope, got {other:?}"),
+            };
+            daemon
+                .send_raw_line(
+                    serde_json::json!({
+                        "v": proto::PROTOCOL_VERSION,
+                        "kind": "res",
+                        "id": id,
+                        "response": "future_response",
+                        "data": { "future": true }
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            let id = match daemon.recv().await.unwrap().unwrap() {
+                proto::RecvFrame::Envelope(env) => match env.body {
+                    Body::Request { id, .. } => id,
+                    other => panic!("expected request body, got {other:?}"),
+                },
+                other => panic!("expected request envelope, got {other:?}"),
+            };
+            daemon
+                .send(&Envelope::response(
+                    id,
+                    Response::DaemonStatus {
+                        pid: 1,
+                        uptime_secs: 2,
+                        active_sessions: 0,
+                        socket_path: "/tmp/cockpit.sock".to_string(),
+                        daemon_version: proto::DAEMON_VERSION.to_string(),
+                        protocol_version: proto::PROTOCOL_VERSION,
+                        paused_sessions: 0,
+                        database_path: ":memory:".to_string(),
+                        schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+                    },
+                ))
+                .await
+                .unwrap();
+        });
+
+        let err = client
+            .request(Request::DaemonStatus)
+            .await
+            .unwrap()
+            .expect_err("unknown response should resolve pending request with error");
+        assert_eq!(err.code, proto::ErrorCode::UnsupportedRequest);
+        assert_eq!(
+            err.message,
+            format!(
+                "unsupported request \"future_response\" in protocol v{}; this daemon speaks v{}",
+                proto::PROTOCOL_VERSION,
+                proto::PROTOCOL_VERSION
+            )
+        );
+
+        let response = client
+            .request(Request::DaemonStatus)
+            .await
+            .unwrap()
+            .expect("unknown response must not close client IO loop");
+        assert!(matches!(response, Response::DaemonStatus { .. }));
+        daemon_reply.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_frame_error_resolves_pending_request_with_error() {
+        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+
+        let request = client.request(Request::DaemonStatus);
+        let daemon_reply = async {
+            let id = match daemon.recv().await.unwrap().unwrap() {
+                proto::RecvFrame::Envelope(env) => match env.body {
+                    Body::Request { id, .. } => id,
+                    other => panic!("expected request body, got {other:?}"),
+                },
+                other => panic!("expected request envelope, got {other:?}"),
+            };
+            daemon
+                .send_raw_line(
+                    serde_json::json!({
+                        "v": proto::PROTOCOL_VERSION,
+                        "kind": "err",
+                        "id": id,
+                        "error": {
+                            "code": "future_error",
+                            "message": "future error shape"
+                        }
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+        };
+
+        let (result, _) = tokio::join!(request, daemon_reply);
+        let err = result
+            .unwrap()
+            .expect_err("unknown error should resolve pending request with error");
+        assert_eq!(err.code, proto::ErrorCode::UnsupportedRequest);
+        assert_eq!(
+            err.message,
+            format!(
+                "unsupported request \"future_error\" in protocol v{}; this daemon speaks v{}",
+                proto::PROTOCOL_VERSION,
+                proto::PROTOCOL_VERSION
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_frame_event_does_not_close_client_io_loop() {
+        let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+
+        let request = client.request(Request::DaemonStatus);
+        let daemon_reply = async {
+            let id = match daemon.recv().await.unwrap().unwrap() {
+                proto::RecvFrame::Envelope(env) => match env.body {
+                    Body::Request { id, .. } => id,
+                    other => panic!("expected request body, got {other:?}"),
+                },
+                other => panic!("expected request envelope, got {other:?}"),
+            };
+            daemon
+                .send_raw_line(
+                    serde_json::json!({
+                        "v": proto::PROTOCOL_VERSION,
+                        "kind": "evt",
+                        "event": "future_event",
+                        "data": { "future": true }
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            daemon
+                .send(&Envelope::response(
+                    id,
+                    Response::DaemonStatus {
+                        pid: 1,
+                        uptime_secs: 2,
+                        active_sessions: 0,
+                        socket_path: "/tmp/cockpit.sock".to_string(),
+                        daemon_version: proto::DAEMON_VERSION.to_string(),
+                        protocol_version: proto::PROTOCOL_VERSION,
+                        paused_sessions: 0,
+                        database_path: ":memory:".to_string(),
+                        schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+                    },
+                ))
+                .await
+                .unwrap();
+        };
+
+        let (result, _) = tokio::join!(request, daemon_reply);
+        let response = result
+            .unwrap()
+            .expect("unknown event must not close client IO loop");
+        assert!(matches!(response, Response::DaemonStatus { .. }));
     }
 
     /// Daemonless = own ephemeral daemon (`daemonless-tui-ephemeral-lifecycle.md`

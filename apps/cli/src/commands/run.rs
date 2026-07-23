@@ -1375,7 +1375,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | TerminalViewers { .. }
         | TerminalClosed { .. }
         | LspNotice { .. }
-        | EnvDriftWarning { .. } => {
+        | EnvDriftWarning { .. }
+        | Unknown => {
             return None;
         }
     })

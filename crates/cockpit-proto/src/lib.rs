@@ -31,7 +31,7 @@ use std::io;
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio_util::codec::{Framed, FramedRead, FramedWrite, LinesCodec, LinesCodecError};
@@ -453,8 +453,14 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. Bumped only with a written migration
-/// note in `the design notes`.
+/// Current wire schema version.
+///
+/// Additive wire changes, including new request/response/event variants and
+/// new fields carrying `#[serde(default)]`, bump only this value: older peers
+/// keep the connection open and degrade feature-by-feature. Breaking changes
+/// such as removals, renames, and type changes bump
+/// [`MIN_SUPPORTED_PROTOCOL_VERSION`] and are the only class that narrows the
+/// compatibility window.
 pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Oldest wire schema version this binary accepts.
@@ -504,6 +510,12 @@ pub struct Envelope {
 #[derive(Debug, Clone)]
 pub enum RecvFrame {
     Envelope(Box<Envelope>),
+    Unknown {
+        v: u32,
+        kind: String,
+        tag: Option<String>,
+        id: Option<Uuid>,
+    },
     VersionMismatch {
         v: u32,
         kind: String,
@@ -572,6 +584,8 @@ pub enum Body {
         id: Option<Uuid>,
         error: ErrorPayload,
     },
+    #[serde(other)]
+    Unknown,
 }
 
 // ---- Requests --------------------------------------------------------------
@@ -806,6 +820,8 @@ pub enum ErrorCode {
     BadRequest,
     /// Daemon doesn't speak this protocol version.
     ProtocolVersion,
+    /// Peer sent a request variant this daemon does not know.
+    UnsupportedRequest,
     /// No active session — `Attach` first.
     NotAttached,
     /// Session id unknown.
@@ -830,6 +846,8 @@ pub enum ErrorCode {
     WorkspaceTrust,
     /// Anything else.
     Internal,
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for ErrorCode {
@@ -837,6 +855,7 @@ impl std::fmt::Display for ErrorCode {
         let s = match self {
             Self::BadRequest => "bad_request",
             Self::ProtocolVersion => "protocol_version",
+            Self::UnsupportedRequest => "unsupported_request",
             Self::NotAttached => "not_attached",
             Self::UnknownSession => "unknown_session",
             Self::UnknownInterrupt => "unknown_interrupt",
@@ -849,8 +868,19 @@ impl std::fmt::Display for ErrorCode {
             Self::LockConflict => "lock_conflict",
             Self::WorkspaceTrust => "workspace_trust",
             Self::Internal => "internal",
+            Self::Unknown => "unknown",
         };
         f.write_str(s)
+    }
+}
+
+pub fn unsupported_request_error(v: u32, tag: Option<&str>) -> ErrorPayload {
+    let tag = tag.unwrap_or("unknown");
+    ErrorPayload {
+        code: ErrorCode::UnsupportedRequest,
+        message: format!(
+            "unsupported request \"{tag}\" in protocol v{v}; this daemon speaks v{PROTOCOL_VERSION}"
+        ),
     }
 }
 
@@ -1425,9 +1455,68 @@ where
                     .and_then(|raw| Uuid::parse_str(raw).ok());
                 return Ok(Some(RecvFrame::VersionMismatch { v, kind, id }));
             }
+            let kind = value
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let tag = unknown_variant_tag(&value);
+            let id = value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|raw| Uuid::parse_str(raw).ok());
+            if payload_tag_is_unknown(&kind, tag.as_deref()) {
+                return Ok(Some(RecvFrame::Unknown { v, kind, tag, id }));
+            }
             let env: Envelope = serde_json::from_value(value).context("deserializing envelope")?;
+            if envelope_contains_unknown(&env) {
+                return Ok(Some(RecvFrame::Unknown { v, kind, tag, id }));
+            }
             Ok(Some(RecvFrame::Envelope(Box::new(env))))
         }
+    }
+}
+
+fn unknown_variant_tag(value: &serde_json::Value) -> Option<String> {
+    for key in ["request", "response", "event"] {
+        if let Some(tag) = value.get(key).and_then(serde_json::Value::as_str) {
+            return Some(tag.to_string());
+        }
+    }
+    if let Some(tag) = value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(tag.to_string());
+    }
+    None
+}
+
+fn payload_tag_is_unknown(kind: &str, tag: Option<&str>) -> bool {
+    let Some(tag) = tag else {
+        return false;
+    };
+    match kind {
+        "req" => serde_json::from_value::<Request>(json!({ "request": tag }))
+            .is_ok_and(|request| matches!(request, Request::Unknown)),
+        "res" => serde_json::from_value::<Response>(json!({ "response": tag }))
+            .is_ok_and(|response| matches!(response, Response::Unknown)),
+        "evt" => serde_json::from_value::<Event>(json!({ "event": tag }))
+            .is_ok_and(|event| matches!(event, Event::Unknown)),
+        "err" => serde_json::from_value::<ErrorCode>(json!(tag))
+            .is_ok_and(|code| matches!(code, ErrorCode::Unknown)),
+        _ => false,
+    }
+}
+
+fn envelope_contains_unknown(env: &Envelope) -> bool {
+    match &env.body {
+        Body::Request { request, .. } => matches!(request, Request::Unknown),
+        Body::Response { response, .. } => matches!(**response, Response::Unknown),
+        Body::Event { event } => matches!(event, Event::Unknown),
+        Body::Error { error, .. } => matches!(error.code, ErrorCode::Unknown),
+        Body::Unknown => true,
     }
 }
 
@@ -1539,6 +1628,9 @@ mod proto_fixture_tests {
                 && first.is_ascii_uppercase()
             {
                 let name = trimmed.split([' ', '{', ',']).next().expect("variant name");
+                if name == "Unknown" {
+                    continue;
+                }
                 out.push(to_snake_case(name));
             }
 
@@ -2183,6 +2275,155 @@ mod tests {
                 request: Request::DaemonStatus,
             } => assert_eq!(got_id, id),
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_variant_request_tag_deserializes_to_catch_all() {
+        let request: Request = serde_json::from_value(json!({
+            "request": "definitely_not_a_real_request",
+        }))
+        .unwrap();
+        assert!(matches!(request, Request::Unknown));
+    }
+
+    #[test]
+    fn unknown_variant_event_tag_deserializes_to_catch_all() {
+        let event: Event = serde_json::from_value(json!({
+            "event": "future_event",
+        }))
+        .unwrap();
+        assert!(matches!(event, Event::Unknown));
+    }
+
+    #[test]
+    fn unknown_variant_body_kind_deserializes_to_catch_all() {
+        let env: Envelope = serde_json::from_value(json!({
+            "v": PROTOCOL_VERSION,
+            "kind": "future_kind",
+            "id": Uuid::new_v4(),
+        }))
+        .unwrap();
+        assert!(matches!(env.body, Body::Unknown));
+    }
+
+    #[tokio::test]
+    async fn unknown_variant_recv_yields_unknown_frame_with_tag_and_id() {
+        let (a, b) = duplex(4096);
+        let mut left = ProtoStream::new(a);
+        let mut right = ProtoStream::new(b);
+        let id = Uuid::new_v4();
+        left.send_raw_line(
+            serde_json::to_string(&json!({
+                "v": PROTOCOL_VERSION,
+                "kind": "req",
+                "id": id,
+                "request": "definitely_not_a_real_request",
+                "params": { "future": true },
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        match right.recv().await.unwrap().expect("frame") {
+            RecvFrame::Unknown {
+                v,
+                kind,
+                tag,
+                id: got_id,
+            } => {
+                assert_eq!(v, PROTOCOL_VERSION);
+                assert_eq!(kind, "req");
+                assert_eq!(tag.as_deref(), Some("definitely_not_a_real_request"));
+                assert_eq!(got_id, Some(id));
+            }
+            other => panic!("expected unknown frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_variant_recv_still_errors_on_malformed_json() {
+        let (a, b) = duplex(4096);
+        let mut left = ProtoStream::new(a);
+        let mut right = ProtoStream::new(b);
+        left.send_raw_line("{not json".to_string()).await.unwrap();
+
+        let error = right
+            .recv()
+            .await
+            .expect_err("malformed JSON remains fatal");
+        assert!(
+            error.to_string().contains("deserializing envelope"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_variant_recv_still_errors_on_known_variant_with_bad_params() {
+        let (a, b) = duplex(4096);
+        let mut left = ProtoStream::new(a);
+        let mut right = ProtoStream::new(b);
+        left.send_raw_line(
+            serde_json::to_string(&json!({
+                "v": PROTOCOL_VERSION,
+                "kind": "req",
+                "id": Uuid::new_v4(),
+                "request": "read_history_page",
+                "params": {
+                    "session_id": 7,
+                    "limit": 25,
+                },
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let error = right
+            .recv()
+            .await
+            .expect_err("known bad params remain fatal");
+        assert!(
+            error.to_string().contains("deserializing envelope"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_variant_recv_yields_unknown_frame_for_unknown_error_code() {
+        let (a, b) = duplex(4096);
+        let mut left = ProtoStream::new(a);
+        let mut right = ProtoStream::new(b);
+        let id = Uuid::new_v4();
+        left.send_raw_line(
+            serde_json::to_string(&json!({
+                "v": PROTOCOL_VERSION,
+                "kind": "err",
+                "id": id,
+                "error": {
+                    "code": "future_error",
+                    "message": "future error shape"
+                },
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        match right.recv().await.unwrap().expect("frame") {
+            RecvFrame::Unknown {
+                v,
+                kind,
+                tag,
+                id: got_id,
+            } => {
+                assert_eq!(v, PROTOCOL_VERSION);
+                assert_eq!(kind, "err");
+                assert_eq!(tag.as_deref(), Some("future_error"));
+                assert_eq!(got_id, Some(id));
+            }
+            other => panic!("expected unknown frame, got {other:?}"),
         }
     }
 

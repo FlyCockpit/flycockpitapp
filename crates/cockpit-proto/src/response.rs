@@ -381,6 +381,9 @@ pub enum Response {
     PausedWork {
         items: Vec<PausedWorkSummary>,
     },
+
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

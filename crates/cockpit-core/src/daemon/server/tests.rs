@@ -2239,6 +2239,7 @@ enum DispatchMatrixClass {
     Readonly,
     Mutating,
     AccessControlled,
+    NonDispatchable,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2273,6 +2274,7 @@ fn dispatch_matrix_class_for_command(
     mutating: bool,
 ) -> DispatchMatrixClass {
     match (kind, authz, mutating) {
+        ("unknown", "owner_only", false) => DispatchMatrixClass::NonDispatchable,
         ("fs_list", "project_files", false)
         | ("fs_stat", "project_files", false)
         | ("fs_read", "project_files", false)
@@ -3299,6 +3301,10 @@ where
 {
     match proto.recv().await {
         Ok(Some(RecvFrame::Envelope(env))) => Ok(env.body),
+        Ok(Some(RecvFrame::Unknown { v, kind, tag, id })) => Err(ErrorPayload {
+            code: ErrorCode::UnsupportedRequest,
+            message: format!("unexpected unknown frame v{v} kind={kind} tag={tag:?} id={id:?}"),
+        }),
         Ok(Some(RecvFrame::VersionMismatch { v, .. })) => Err(ErrorPayload {
             code: ErrorCode::ProtocolVersion,
             message: proto::version_mismatch_message(v),
@@ -3327,7 +3333,9 @@ fn assert_dispatch_matrix_coverage_complete() {
         .collect();
     let controlled: BTreeSet<_> = dispatch_matrix_rows()
         .into_iter()
-        .filter(|row| row.authz != "public_read")
+        .filter(|row| {
+            row.authz != "public_read" && row.class != DispatchMatrixClass::NonDispatchable
+        })
         .map(|row| row.kind)
         .collect();
     let happy: BTreeSet<_> = readonly_dispatch_happy_cases()
@@ -7775,6 +7783,13 @@ fn command_table_metadata_is_exhaustive_and_stable() {
             audit_path: None,
             mutating: true,
         },
+        CommandMetadataCase {
+            request: Request::Unknown,
+            kind: "unknown",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
     ];
 
     // Drift-proof exhaustiveness (`daemon-trust-test-isolation.md`): the
@@ -7788,9 +7803,10 @@ fn command_table_metadata_is_exhaustive_and_stable() {
                 fn request_variant_name(request: &Request) -> &'static str {
                     match request {
                         $(Request::$variant { .. } => stringify!($variant),)*
+                        Request::Unknown => "Unknown",
                     }
                 }
-                const REQUEST_VARIANT_NAMES: &[&str] = &[$(stringify!($variant)),*];
+                const REQUEST_VARIANT_NAMES: &[&str] = &[$(stringify!($variant)),*, "Unknown"];
             };
         }
     request_variants!(
@@ -8444,6 +8460,9 @@ where
 {
     match proto.recv().await.unwrap().unwrap() {
         RecvFrame::Envelope(env) => env.body,
+        RecvFrame::Unknown { v, kind, tag, id } => {
+            panic!("expected envelope, got unknown frame v{v} kind={kind} tag={tag:?} id={id:?}")
+        }
         other => panic!("expected envelope, got {other:?}"),
     }
 }
@@ -10977,6 +10996,109 @@ async fn server_answers_too_new_request_with_protocol_version_error() {
         other => panic!("expected protocol version error, got {other:?}"),
     }
     assert!(client.recv().await.unwrap().is_none());
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn unknown_frame_request_gets_unsupported_error_and_connection_survives() {
+    let ctx = test_ctx();
+    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let server = tokio::spawn(handle_client(server_stream, ctx));
+    let mut client = ProtoStream::new(client_stream);
+
+    // Initial hello + caffeinate snapshot.
+    let _ = recv_body(&mut client).await;
+    let _ = recv_body(&mut client).await;
+
+    let id = Uuid::new_v4();
+    client
+        .send_raw_line(
+            serde_json::json!({
+                "v": proto::PROTOCOL_VERSION,
+                "kind": "req",
+                "id": id,
+                "request": "definitely_not_a_real_request",
+                "params": { "future": true },
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    match recv_body(&mut client).await {
+        Body::Error {
+            id: Some(got_id),
+            error,
+        } => {
+            assert_eq!(got_id, id);
+            assert_eq!(error.code, ErrorCode::UnsupportedRequest);
+            assert_eq!(
+                error.message,
+                format!(
+                    "unsupported request \"definitely_not_a_real_request\" in protocol v{}; this daemon speaks v{}",
+                    proto::PROTOCOL_VERSION,
+                    proto::PROTOCOL_VERSION
+                )
+            );
+        }
+        other => panic!("expected unsupported request error, got {other:?}"),
+    }
+
+    let status_id = Uuid::new_v4();
+    client
+        .send(&Envelope::request(status_id, Request::DaemonStatus))
+        .await
+        .unwrap();
+    match recv_body(&mut client).await {
+        Body::Response { id, response } => {
+            assert_eq!(id, status_id);
+            assert!(matches!(*response, Response::DaemonStatus { .. }));
+        }
+        other => panic!("expected daemon status response, got {other:?}"),
+    }
+
+    drop(client);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn unknown_frame_event_is_dropped_and_connection_survives() {
+    let ctx = test_ctx();
+    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let server = tokio::spawn(handle_client(server_stream, ctx));
+    let mut client = ProtoStream::new(client_stream);
+
+    // Initial hello + caffeinate snapshot.
+    let _ = recv_body(&mut client).await;
+    let _ = recv_body(&mut client).await;
+
+    client
+        .send_raw_line(
+            serde_json::json!({
+                "v": proto::PROTOCOL_VERSION,
+                "kind": "evt",
+                "event": "future_event",
+                "data": { "future": true },
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    let status_id = Uuid::new_v4();
+    client
+        .send(&Envelope::request(status_id, Request::DaemonStatus))
+        .await
+        .unwrap();
+    match recv_body(&mut client).await {
+        Body::Response { id, response } => {
+            assert_eq!(id, status_id);
+            assert!(matches!(*response, Response::DaemonStatus { .. }));
+        }
+        other => panic!("expected daemon status response, got {other:?}"),
+    }
+
+    drop(client);
     server.await.unwrap().unwrap();
 }
 

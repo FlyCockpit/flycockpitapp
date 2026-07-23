@@ -1,0 +1,1194 @@
+{
+  "active_model_state": {
+    "data": {
+      "config_model": "gpt-5",
+      "config_provider": "openai",
+      "diverged": false,
+      "generation": 3,
+      "model": "gpt-5",
+      "provider": "openai",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "active_model_state",
+    "kind": "evt",
+    "v": 1
+  },
+  "agent_idle": {
+    "data": {
+      "reason": {
+        "code": "approval_required",
+        "kind": "needs_intervention"
+      },
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "turn_id": "turn_id-fixture"
+    },
+    "event": "agent_idle",
+    "kind": "evt",
+    "v": 1
+  },
+  "approval_mode_state": {
+    "data": {
+      "mode": "auto",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "approval_mode_state",
+    "kind": "evt",
+    "v": 1
+  },
+  "assistant_text": {
+    "data": {
+      "agent": "agent-fixture",
+      "reasoning": "reasoning-fixture",
+      "seq": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "text": "text-fixture"
+    },
+    "event": "assistant_text",
+    "kind": "evt",
+    "v": 1
+  },
+  "assistant_text_delta": {
+    "data": {
+      "agent": "agent-fixture",
+      "delta": "delta-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "assistant_text_delta",
+    "kind": "evt",
+    "v": 1
+  },
+  "backup_used": {
+    "data": {
+      "agent": "agent-fixture",
+      "backup_model": "backup_model-fixture",
+      "error_class": "error_class-fixture",
+      "primary_model": "primary_model-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "backup_used",
+    "kind": "evt",
+    "v": 1
+  },
+  "caffeinate_state": {
+    "data": {
+      "active": true,
+      "lid_close_guaranteed": true,
+      "message": "message-fixture"
+    },
+    "event": "caffeinate_state",
+    "kind": "evt",
+    "v": 1
+  },
+  "command_capability_unavailable": {
+    "data": {
+      "fix_command": "fix_command-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "text": "text-fixture"
+    },
+    "event": "command_capability_unavailable",
+    "kind": "evt",
+    "v": 1
+  },
+  "compact_ready": {
+    "data": {
+      "brief": "brief-fixture",
+      "handoff": "handoff-fixture",
+      "new_session_id": "11111111-1111-4111-8111-111111111111",
+      "seed_tool_count": 7,
+      "seed_tool_tokens": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "source": "manual",
+      "tail_kept": 4,
+      "tail_trimmed": 1,
+      "tokens_after": 40,
+      "tokens_before": 100,
+      "trigger_ctx_pct": 61.5,
+      "turns_summarized": 5
+    },
+    "event": "compact_ready",
+    "kind": "evt",
+    "v": 1
+  },
+  "config_snapshot": {
+    "data": {
+      "snapshot": {
+        "extended": {
+          "agent_chooses_subagent_model": false,
+          "agent_dirs": [],
+          "agent_guidance_files": ["AGENTS.md"],
+          "allow_remote_config": false,
+          "approvalPolicy": {
+            "dangerousFlags": {},
+            "keyMaxScope": {},
+            "programMaxScope": {},
+            "riskMaxScope": {}
+          },
+          "concurrency": "subagents",
+          "daemon": {
+            "autostart": "shared",
+            "uploads": {
+              "global_bytes": 268435456,
+              "global_uploads": 32,
+              "per_client_uploads": 4,
+              "per_upload_bytes": 4194304
+            }
+          },
+          "data_syntax": {
+            "enabled": true,
+            "max_bytes": 10485760
+          },
+          "deepthink": {
+            "enabled": false
+          },
+          "defaultApprovalMode": "manual",
+          "defaultPrimaryAgent": "build",
+          "delegation": {
+            "defaultRecursionDepth": 0,
+            "maxParallel": 4,
+            "recursionEnabled": true
+          },
+          "dialog": {
+            "lockout_ms": 1500
+          },
+          "gitignore_allow": [],
+          "harnesses": {},
+          "hintToolCallCorrections": false,
+          "inlineThink": true,
+          "intelCentralityRanking": true,
+          "knowledge_inject_max_tokens": 2048,
+          "llm_mode": "defensive",
+          "loop_guard": {
+            "repeat_threshold": 2
+          },
+          "lsp": {
+            "auto_install": "ask",
+            "diagnostics": {
+              "debounce_ms": 150,
+              "document_timeout_ms": 5000,
+              "enabled": true,
+              "other_files_limit": 5,
+              "per_file_limit": 20,
+              "severity": "error",
+              "workspace_timeout_ms": 10000
+            },
+            "enabled": true,
+            "idle_ttl_secs": 1800,
+            "max_cached_clients": 16
+          },
+          "maxPrimaryRounds": 0,
+          "predictNextMessage": "short",
+          "preflight": {
+            "enabled": false
+          },
+          "project_knowledge": false,
+          "prompt_injection_guard": {
+            "resultAction": "block",
+            "threshold": "off"
+          },
+          "redact": {
+            "allowlist": [],
+            "denylist": [],
+            "dotenv_patterns": [".env", ".env.local"],
+            "enabled": true,
+            "extra_dotenv_paths": [],
+            "min_secret_length": 8,
+            "placeholder": "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**",
+            "scan_dotenv": true,
+            "scan_environment": true,
+            "scan_ssh_keys": true,
+            "ssh_key_dir": null
+          },
+          "resourceScheduler": {
+            "enabled": true,
+            "limits": {
+              "maxQueued": 128
+            },
+            "pools": {
+              "cpu": {
+                "capacity": 1
+              },
+              "memory": {
+                "capacity": 1
+              }
+            }
+          },
+          "retention": {
+            "payload_window_days": 30,
+            "session_window_days": 0,
+            "sweep_interval_hours": 6,
+            "vacuum_interval_days": 7,
+            "vacuum_min_deletions": 1000
+          },
+          "review": {},
+          "sandbox_escalation_enabled": true,
+          "schedule": {
+            "allowUnboundedLoops": false,
+            "max_concurrent": 8
+          },
+          "shellCompression": "enabled",
+          "skills": {
+            "ancestor_walk": false,
+            "auto_bang_commands": false,
+            "consolidate": false,
+            "external_dirs": [],
+            "prune_builtins": false,
+            "scan_dirs": [],
+            "write_approval": false
+          },
+          "swarm": {
+            "maxConcurrency": 8,
+            "maxDepth": 3
+          },
+          "system_prompt": {
+            "time_injection_interval_minutes": 5
+          },
+          "textEmbeddedRecovery": "available",
+          "translation": {
+            "model_language": "",
+            "user_language": ""
+          },
+          "trustedOnly": false,
+          "tui": {
+            "attention": {
+              "bell": false,
+              "desktop": false,
+              "enabled": true,
+              "title": true
+            },
+            "banner": {
+              "enabled": true
+            },
+            "caffeinate_display_awake": false,
+            "diff_style": "side-by-side",
+            "exit_tail_lines": 100,
+            "hyperlinks": true,
+            "mouse_capture": true,
+            "render_agent_markdown": true,
+            "render_user_markdown": false,
+            "rich_text_copy": true,
+            "show_branch": true,
+            "show_cwd": true,
+            "thinking": "condensed",
+            "use_emojis": false,
+            "vim_mode": "hint"
+          }
+        },
+        "generation": 4,
+        "providers": {
+          "active_model": {
+            "model": "gpt-5",
+            "provider": "openai"
+          },
+          "category_defaults": {
+            "smart_code": {
+              "model": "gpt-5",
+              "provider": "openai"
+            }
+          },
+          "on_unlisted_models_fetch": "ask",
+          "providers": {
+            "openai": {
+              "credential_configured": true,
+              "entry": {
+                "cache": {
+                  "mode": "none",
+                  "ttl_secs": 300
+                },
+                "context": {
+                  "auto_compact_pct": 60,
+                  "auto_prune_pct": 50,
+                  "auto_prune_prunable_pct": 30,
+                  "compact_keep_recent_turns": 4,
+                  "compact_shadow": true,
+                  "compact_shadow_margin_pct": 10
+                },
+                "headers": [],
+                "models": [
+                  {
+                    "id": "gpt-5"
+                  }
+                ],
+                "shrink": {
+                  "margin_secs": 30,
+                  "strategy": "prune"
+                },
+                "timeout": {
+                  "idle_secs": 90,
+                  "ttft_secs": 120
+                },
+                "url": "https://api.openai.com/v1"
+              },
+              "headers": [
+                {
+                  "name": "Authorization",
+                  "redacted": true,
+                  "value": "[redacted]"
+                }
+              ]
+            }
+          }
+        },
+        "session_id": "11111111-1111-4111-8111-111111111111"
+      }
+    },
+    "event": "config_snapshot",
+    "kind": "evt",
+    "v": 1
+  },
+  "connector_status": {
+    "data": {
+      "enabled": true,
+      "last_error": "last_error-fixture",
+      "relay_id": "relay_id-fixture",
+      "relay_region": "relay_region-fixture",
+      "relay_url": "relay_url-fixture",
+      "status": "status-fixture"
+    },
+    "event": "connector_status",
+    "kind": "evt",
+    "v": 1
+  },
+  "context_projection": {
+    "data": {
+      "cache_cold": true,
+      "prunable_tokens": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "context_projection",
+    "kind": "evt",
+    "v": 1
+  },
+  "daemon_draining": {
+    "data": {
+      "forced": true
+    },
+    "event": "daemon_draining",
+    "kind": "evt",
+    "v": 1
+  },
+  "delegation_recursion_state": {
+    "data": {
+      "default_depth": 7,
+      "enabled": true,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "delegation_recursion_state",
+    "kind": "evt",
+    "v": 1
+  },
+  "env_drift_warning": {
+    "data": {
+      "baseline": {
+        "digest": "digest-fixture",
+        "key_count": 2,
+        "path_entry_count": 1,
+        "source": "explicit_cli"
+      },
+      "candidate": {
+        "digest": "digest-fixture",
+        "key_count": 2,
+        "path_entry_count": 1,
+        "source": "explicit_cli"
+      },
+      "diff": {
+        "added_keys": 1,
+        "baseline_digest": "base",
+        "candidate_digest": "cand",
+        "changed_keys": 3,
+        "changed_secret_keys": ["TOKEN"],
+        "path_added": ["/opt/bin"],
+        "path_removed": ["/bin"],
+        "removed_keys": 2
+      },
+      "policy": "update-daemon"
+    },
+    "event": "env_drift_warning",
+    "kind": "evt",
+    "v": 1
+  },
+  "foreground_input_target": {
+    "data": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "target": {
+        "agent": "Build",
+        "depth": 1,
+        "id": "root",
+        "task_call_id": "task-parent"
+      }
+    },
+    "event": "foreground_input_target",
+    "kind": "evt",
+    "v": 1
+  },
+  "gitignore_allow": {
+    "data": {
+      "allow": ["allow-fixture"],
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "gitignore_allow",
+    "kind": "evt",
+    "v": 1
+  },
+  "history_replay": {
+    "data": {
+      "entries": [
+        {
+          "display_text": "hello @history",
+          "origin_principal": "flycockpit:user",
+          "role": "user",
+          "seq": 7,
+          "tag_expansions": [
+            {
+              "detail": "142 lines",
+              "ok": true,
+              "path": "src/lib.rs",
+              "tool": "read"
+            }
+          ],
+          "text": "hello history",
+          "ts_ms": 1700000000000
+        }
+      ],
+      "max_seq": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "history_replay",
+    "kind": "evt",
+    "v": 1
+  },
+  "inference_failed": {
+    "data": {
+      "agent": "agent-fixture",
+      "auth_failure": {
+        "kind": "credentials_rejected",
+        "status": 401
+      },
+      "detail": "detail-fixture",
+      "error_class": "error_class-fixture",
+      "model": "model-fixture",
+      "provider": "provider-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "inference_failed",
+    "kind": "evt",
+    "v": 1
+  },
+  "inference_succeeded": {
+    "data": {
+      "model": "model-fixture",
+      "provider": "provider-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "inference_succeeded",
+    "kind": "evt",
+    "v": 1
+  },
+  "inference_warning": {
+    "data": {
+      "agent": "agent-fixture",
+      "model": "model-fixture",
+      "phase": "phase-fixture",
+      "provider": "provider-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "waited_secs": 7
+    },
+    "event": "inference_warning",
+    "kind": "evt",
+    "v": 1
+  },
+  "interrupt_queue_changed": {
+    "data": {
+      "active_interrupt_id": "11111111-1111-4111-8111-111111111111",
+      "pending_count": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_queue_changed",
+    "kind": "evt",
+    "v": 1
+  },
+  "interrupt_raised": {
+    "data": {
+      "agent": "agent-fixture",
+      "description": "description-fixture",
+      "interrupt_id": "11111111-1111-4111-8111-111111111111",
+      "pending_count": 7,
+      "question": {
+        "data": {
+          "allow_freetext": false,
+          "command_detail": {
+            "affected_targets": ["/tmp/project/file"],
+            "cwd": "/tmp/project",
+            "full_command": "echo hi && rm x",
+            "highlight": {
+              "end": 7,
+              "start": 0
+            },
+            "native_tool_hints": ["use writeunlock"],
+            "offered_scopes": ["once", "session"],
+            "policy_cap": "session",
+            "remembered_key": "echo",
+            "risk_reasons": ["writes file"],
+            "risk_tier": "mutating",
+            "step": 1,
+            "step_count": 2,
+            "write_content": {
+              "content": "hello",
+              "dynamic": true
+            }
+          },
+          "options": [
+            {
+              "description": "approve only this call",
+              "id": "approve_once",
+              "label": "Approve once",
+              "secondary": true
+            }
+          ],
+          "permission": true,
+          "prompt": "Approve command?",
+          "sandbox_escalation": {
+            "confined_exit": 13,
+            "confined_stderr": "denied"
+          }
+        },
+        "kind": "single"
+      },
+      "questions": {
+        "questions": [
+          {
+            "data": {
+              "allow_freetext": false,
+              "command_detail": {
+                "affected_targets": ["/tmp/project/file"],
+                "cwd": "/tmp/project",
+                "full_command": "echo hi && rm x",
+                "highlight": {
+                  "end": 7,
+                  "start": 0
+                },
+                "native_tool_hints": ["use writeunlock"],
+                "offered_scopes": ["once", "session"],
+                "policy_cap": "session",
+                "remembered_key": "echo",
+                "risk_reasons": ["writes file"],
+                "risk_tier": "mutating",
+                "step": 1,
+                "step_count": 2,
+                "write_content": {
+                  "content": "hello",
+                  "dynamic": true
+                }
+              },
+              "options": [
+                {
+                  "description": "approve only this call",
+                  "id": "approve_once",
+                  "label": "Approve once",
+                  "secondary": true
+                }
+              ],
+              "permission": true,
+              "prompt": "Approve command?",
+              "sandbox_escalation": {
+                "confined_exit": 13,
+                "confined_stderr": "denied"
+              }
+            },
+            "kind": "single"
+          },
+          {
+            "data": {
+              "masked": true,
+              "prompt": "Why?"
+            },
+            "kind": "freetext"
+          }
+        ]
+      },
+      "reason": "rehydration",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_raised",
+    "kind": "evt",
+    "v": 1
+  },
+  "interrupt_resolved": {
+    "data": {
+      "decision": {
+        "cancelled": false,
+        "lines": [
+          {
+            "answer": "Yes",
+            "prompt": "Approve?"
+          }
+        ],
+        "permission": true
+      },
+      "interrupt_id": "11111111-1111-4111-8111-111111111111",
+      "seq": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_resolved",
+    "kind": "evt",
+    "v": 1
+  },
+  "llm_mode_changed": {
+    "data": {
+      "mode": "normal",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "llm_mode_changed",
+    "kind": "evt",
+    "v": 1
+  },
+  "lsp_notice": {
+    "data": {
+      "text": "text-fixture"
+    },
+    "event": "lsp_notice",
+    "kind": "evt",
+    "v": 1
+  },
+  "nested_turn": {
+    "data": {
+      "inner": {
+        "data": {
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "text": "nested notice"
+        },
+        "event": "notice"
+      },
+      "label": "label-fixture",
+      "parent_task_call_id": "parent_task_call_id-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "task_call_id": "task_call_id-fixture"
+    },
+    "event": "nested_turn",
+    "kind": "evt",
+    "v": 1
+  },
+  "notice": {
+    "data": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "text": "text-fixture"
+    },
+    "event": "notice",
+    "kind": "evt",
+    "v": 1
+  },
+  "paused_work_available": {
+    "data": {
+      "items": [
+        {
+          "active_agent": "Build",
+          "client_version": "0.1.0",
+          "daemon_version": "0.1.0",
+          "pending_tool_count": 1,
+          "project_root": "/tmp/project",
+          "reason": "daemon_shutdown",
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "updated_at": 1700000000
+        }
+      ],
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "paused_work_available",
+    "kind": "evt",
+    "v": 1
+  },
+  "preflight_started": {
+    "data": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "preflight_started",
+    "kind": "evt",
+    "v": 1
+  },
+  "preflight_state": {
+    "data": {
+      "enabled": true,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "preflight_state",
+    "kind": "evt",
+    "v": 1
+  },
+  "primary_swapped": {
+    "data": {
+      "name": "name-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "primary_swapped",
+    "kind": "evt",
+    "v": 1
+  },
+  "pruned": {
+    "data": {
+      "auto": true,
+      "bodies": 7,
+      "cache_break": true,
+      "elided": ["elided-fixture"],
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "tokens_saved": 7,
+      "trigger_reason": "trigger_reason-fixture"
+    },
+    "event": "pruned",
+    "kind": "evt",
+    "v": 1
+  },
+  "queue_updated": {
+    "data": {
+      "queue": [
+        {
+          "display_text": "queued @src/lib.rs",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "status": "queued",
+          "target": {
+            "agent": "Build",
+            "depth": 1,
+            "id": "root",
+            "task_call_id": "task-parent"
+          },
+          "text": "queued text"
+        }
+      ],
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "queue_updated",
+    "kind": "evt",
+    "v": 1
+  },
+  "queued_user_messages_folded": {
+    "data": {
+      "display_text": "queued @src/lib.rs",
+      "preflight_cleaned": "preflight_cleaned-fixture",
+      "queue_item_ids": ["11111111-1111-4111-8111-111111111111"],
+      "seq": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "tag_expansions": [
+        {
+          "detail": "142 lines",
+          "ok": true,
+          "path": "src/lib.rs",
+          "tool": "read"
+        }
+      ],
+      "target": {
+        "agent": "Build",
+        "depth": 1,
+        "id": "root",
+        "task_call_id": "task-parent"
+      },
+      "text": "text-fixture"
+    },
+    "event": "queued_user_messages_folded",
+    "kind": "evt",
+    "v": 1
+  },
+  "reasoning_delta": {
+    "data": {
+      "agent": "agent-fixture",
+      "delta": "delta-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "reasoning_delta",
+    "kind": "evt",
+    "v": 1
+  },
+  "reconnecting": {
+    "data": {
+      "agent": "agent-fixture",
+      "attempt": 7,
+      "model": "model-fixture",
+      "provider": "provider-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "url": "url-fixture"
+    },
+    "event": "reconnecting",
+    "kind": "evt",
+    "v": 1
+  },
+  "redaction_state": {
+    "data": {
+      "scan_dotenv": true,
+      "scan_environment": true,
+      "scan_ssh_keys": true,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "redaction_state",
+    "kind": "evt",
+    "v": 1
+  },
+  "resource_clear": {
+    "data": {
+      "agent": "agent-fixture",
+      "command_label": "command_label-fixture",
+      "display_id": "display_id-fixture",
+      "request_id": "11111111-1111-4111-8111-111111111111",
+      "resources": {
+        "cpu": 1,
+        "network": 2
+      },
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "resource_clear",
+    "kind": "evt",
+    "v": 1
+  },
+  "resource_start": {
+    "data": {
+      "agent": "agent-fixture",
+      "command_label": "command_label-fixture",
+      "display_id": "display_id-fixture",
+      "request_id": "11111111-1111-4111-8111-111111111111",
+      "resources": {
+        "cpu": 1,
+        "network": 2
+      },
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "wait_ms": 7
+    },
+    "event": "resource_start",
+    "kind": "evt",
+    "v": 1
+  },
+  "resource_wait": {
+    "data": {
+      "agent": "agent-fixture",
+      "command_label": "command_label-fixture",
+      "display_id": "display_id-fixture",
+      "queue_position": 7,
+      "request_id": "11111111-1111-4111-8111-111111111111",
+      "resources": {
+        "cpu": 1,
+        "network": 2
+      },
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "resource_wait",
+    "kind": "evt",
+    "v": 1
+  },
+  "sandbox_escalation_state": {
+    "data": {
+      "enabled": true,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "sandbox_escalation_state",
+    "kind": "evt",
+    "v": 1
+  },
+  "sandbox_state": {
+    "data": {
+      "container_availability": {
+        "available": true,
+        "harness_in_container": false,
+        "reason": null,
+        "runtime": "docker"
+      },
+      "container_network_enabled": true,
+      "enabled": true,
+      "mode": "container",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "sandbox_state",
+    "kind": "evt",
+    "v": 1
+  },
+  "sandbox_unavailable": {
+    "data": {
+      "fix_command": "fix_command-fixture",
+      "remedy": "remedy-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "sandbox_unavailable",
+    "kind": "evt",
+    "v": 1
+  },
+  "schedule_completed": {
+    "data": {
+      "failed": true,
+      "job_id": "job_id-fixture",
+      "kind": "kind-fixture",
+      "label": "label-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "schedule_completed",
+    "kind": "evt",
+    "v": 1
+  },
+  "schedule_note": {
+    "data": {
+      "job_id": "job_id-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "text": "text-fixture"
+    },
+    "event": "schedule_note",
+    "kind": "evt",
+    "v": 1
+  },
+  "schedule_progress": {
+    "data": {
+      "job_id": "job_id-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "schedule_progress",
+    "kind": "evt",
+    "v": 1
+  },
+  "schedule_started": {
+    "data": {
+      "job_id": "job_id-fixture",
+      "kind": "kind-fixture",
+      "label": "label-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "schedule_started",
+    "kind": "evt",
+    "v": 1
+  },
+  "session_driver_failed": {
+    "data": {
+      "error": "error-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "session_driver_failed",
+    "kind": "evt",
+    "v": 1
+  },
+  "session_ended": {
+    "data": {
+      "reason": "reason-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "session_ended",
+    "kind": "evt",
+    "v": 1
+  },
+  "session_persist_failed": {
+    "data": {
+      "error": "error-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "session_persist_failed",
+    "kind": "evt",
+    "v": 1
+  },
+  "skill_auto_injected": {
+    "data": {
+      "name": "name-fixture",
+      "reason": "reason-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "skill_auto_injected",
+    "kind": "evt",
+    "v": 1
+  },
+  "subagent_report": {
+    "data": {
+      "agent": "agent-fixture",
+      "failed": false,
+      "label": "label-fixture",
+      "model_trusted": true,
+      "report": "report-fixture",
+      "routing": {
+        "fixture": "routing"
+      },
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "task_call_id": "task_call_id-fixture",
+      "trusted_only": true
+    },
+    "event": "subagent_report",
+    "kind": "evt",
+    "v": 1
+  },
+  "subagent_routing": {
+    "data": {
+      "child": "child-fixture",
+      "label": "label-fixture",
+      "model": "model-fixture",
+      "model_trusted": true,
+      "provider": "provider-fixture",
+      "routing": {
+        "fixture": "routing"
+      },
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "task_call_id": "task_call_id-fixture",
+      "trusted_only": true
+    },
+    "event": "subagent_routing",
+    "kind": "evt",
+    "v": 1
+  },
+  "subagent_spawned": {
+    "data": {
+      "child": "child-fixture",
+      "label": "label-fixture",
+      "model_trusted": true,
+      "parent": "parent-fixture",
+      "prompt": "prompt-fixture",
+      "requested_cwd": "requested_cwd-fixture",
+      "resolved_cwd": "resolved_cwd-fixture",
+      "routing": {
+        "fixture": "routing"
+      },
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "task_call_id": "task_call_id-fixture",
+      "trusted_only": true
+    },
+    "event": "subagent_spawned",
+    "kind": "evt",
+    "v": 1
+  },
+  "tandem_state": {
+    "data": {
+      "models": ["model-fixture"],
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "warning": "warning-fixture"
+    },
+    "event": "tandem_state",
+    "kind": "evt",
+    "v": 1
+  },
+  "terminal_clipboard": {
+    "data": {
+      "terminal_id": "11111111-1111-4111-8111-111111111111",
+      "text": "text-fixture"
+    },
+    "event": "terminal_clipboard",
+    "kind": "evt",
+    "v": 1
+  },
+  "terminal_closed": {
+    "data": {
+      "exit_code": 7,
+      "reason": "reason-fixture",
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "terminal_closed",
+    "kind": "evt",
+    "v": 1
+  },
+  "terminal_output": {
+    "data": {
+      "bytes": [65, 66, 67],
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "terminal_output",
+    "kind": "evt",
+    "v": 1
+  },
+  "terminal_viewers": {
+    "data": {
+      "count": 7,
+      "terminal_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "terminal_viewers",
+    "kind": "evt",
+    "v": 1
+  },
+  "thinking_started": {
+    "data": {
+      "agent": "agent-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "turn_id": "turn_id-fixture"
+    },
+    "event": "thinking_started",
+    "kind": "evt",
+    "v": 1
+  },
+  "tool_end": {
+    "data": {
+      "agent": "agent-fixture",
+      "call_id": "call_id-fixture",
+      "hint": "hint-fixture",
+      "output": "output-fixture",
+      "seq": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "tool": "tool-fixture",
+      "truncated": true
+    },
+    "event": "tool_end",
+    "kind": "evt",
+    "v": 1
+  },
+  "tool_error": {
+    "data": {
+      "agent": "agent-fixture",
+      "call_id": "call_id-fixture",
+      "error": "error-fixture",
+      "kind": "invocation",
+      "seq": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "tool": "tool-fixture"
+    },
+    "event": "tool_error",
+    "kind": "evt",
+    "v": 1
+  },
+  "tool_start": {
+    "data": {
+      "agent": "agent-fixture",
+      "args": {
+        "fixture": "args"
+      },
+      "call_id": "call_id-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "tool": "tool-fixture"
+    },
+    "event": "tool_start",
+    "kind": "evt",
+    "v": 1
+  },
+  "trusted_only_state": {
+    "data": {
+      "enabled": true,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "trusted_only_state",
+    "kind": "evt",
+    "v": 1
+  },
+  "usage": {
+    "data": {
+      "agent": "agent-fixture",
+      "cache_creation_input_tokens": 7,
+      "cached_input_tokens": 7,
+      "input_tokens": 7,
+      "output_tokens": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "usage",
+    "kind": "evt",
+    "v": 1
+  },
+  "user_message_recorded": {
+    "data": {
+      "preflight_cleaned": "preflight_cleaned-fixture",
+      "seq": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "user_message_recorded",
+    "kind": "evt",
+    "v": 1
+  },
+  "user_message_retracted": {
+    "data": {
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "user_message_retracted",
+    "kind": "evt",
+    "v": 1
+  },
+  "waiting_for_lock": {
+    "data": {
+      "holder_agent": "holder_agent-fixture",
+      "path": "path-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "waiting": true
+    },
+    "event": "waiting_for_lock",
+    "kind": "evt",
+    "v": 1
+  }
+}

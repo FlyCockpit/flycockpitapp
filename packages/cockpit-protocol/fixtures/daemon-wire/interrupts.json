@@ -1,0 +1,432 @@
+{
+  "event_freetext_masked_false": {
+    "data": {
+      "agent": "builder",
+      "description": "Fixture interrupt",
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "pending_count": 1,
+      "question": {
+        "data": {
+          "prompt": "Explain the decision"
+        },
+        "kind": "freetext"
+      },
+      "questions": null,
+      "reason": "initial",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_raised",
+    "kind": "evt",
+    "v": 1
+  },
+  "event_freetext_masked_true": {
+    "data": {
+      "agent": "builder",
+      "description": "Fixture interrupt",
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "pending_count": 1,
+      "question": {
+        "data": {
+          "masked": true,
+          "prompt": "Enter token"
+        },
+        "kind": "freetext"
+      },
+      "questions": null,
+      "reason": "initial",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_raised",
+    "kind": "evt",
+    "v": 1
+  },
+  "event_multi": {
+    "data": {
+      "agent": "builder",
+      "description": "Fixture interrupt",
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "pending_count": 1,
+      "question": {
+        "data": {
+          "allow_freetext": false,
+          "options": [
+            {
+              "description": "Format for this fixture",
+              "id": "fmt",
+              "label": "Format"
+            },
+            {
+              "description": "Test for this fixture",
+              "id": "test",
+              "label": "Test"
+            }
+          ],
+          "prompt": "Select checks to run"
+        },
+        "kind": "multi"
+      },
+      "questions": null,
+      "reason": "initial",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_raised",
+    "kind": "evt",
+    "v": 1
+  },
+  "event_single_command_detail_absent": {
+    "data": {
+      "agent": "builder",
+      "description": "Fixture interrupt",
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "pending_count": 1,
+      "question": {
+        "data": {
+          "allow_freetext": false,
+          "approval_class": "command",
+          "options": [
+            {
+              "description": "Approve once for this fixture",
+              "id": "approve_once",
+              "label": "Approve once"
+            }
+          ],
+          "permission": true,
+          "prompt": "Run `cargo fmt --check`?"
+        },
+        "kind": "single"
+      },
+      "questions": null,
+      "reason": "initial",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_raised",
+    "kind": "evt",
+    "v": 1
+  },
+  "event_single_command_detail_present": {
+    "data": {
+      "agent": "builder",
+      "description": "Fixture interrupt",
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "pending_count": 1,
+      "question": {
+        "data": {
+          "allow_freetext": false,
+          "approval_class": "command",
+          "command_detail": {
+            "affected_targets": ["crates/cockpit-proto/src/lib.rs"],
+            "cwd": "/workspace/flycockpitapp",
+            "full_command": "cargo test --locked",
+            "highlight": {
+              "end": 5,
+              "start": 0
+            },
+            "native_tool_hints": ["cargo"],
+            "offered_scopes": ["session"],
+            "policy_cap": "ask",
+            "remembered_key": "cargo-test",
+            "risk_reasons": ["runs tests"],
+            "risk_tier": "medium",
+            "step": 1,
+            "step_count": 2,
+            "write_content": {
+              "content": "fixture body",
+              "dynamic": true
+            }
+          },
+          "options": [
+            {
+              "description": "Approve once for this fixture",
+              "id": "approve_once",
+              "label": "Approve once"
+            }
+          ],
+          "permission": true,
+          "prompt": "Run `cargo test --locked`?",
+          "sandbox_escalation": {
+            "confined_exit": 13,
+            "confined_stderr": "Permission denied",
+            "denial": {
+              "confidence": "high",
+              "evidence": [
+                {
+                  "data": {
+                    "path": "/workspace/flycockpitapp/target"
+                  },
+                  "kind": "write_outside_allowlist"
+                },
+                {
+                  "kind": "stderr_permission_marker"
+                }
+              ]
+            },
+            "suggested_access": "write",
+            "suggested_paths": ["/workspace/flycockpitapp/target"]
+          }
+        },
+        "kind": "single"
+      },
+      "questions": null,
+      "reason": "initial",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_raised",
+    "kind": "evt",
+    "v": 1
+  },
+  "event_single_grant_command": {
+    "data": {
+      "agent": "builder",
+      "description": "Fixture interrupt",
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "pending_count": 1,
+      "question": {
+        "data": {
+          "allow_freetext": false,
+          "approval_class": "command",
+          "options": [
+            {
+              "description": "Approve once for this fixture",
+              "id": "approve_once",
+              "label": "Approve once"
+            }
+          ],
+          "permission": true,
+          "prompt": "Approve command?"
+        },
+        "kind": "single"
+      },
+      "questions": null,
+      "reason": "initial",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_raised",
+    "kind": "evt",
+    "v": 1
+  },
+  "event_single_grant_mcp_tool": {
+    "data": {
+      "agent": "builder",
+      "description": "Fixture interrupt",
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "pending_count": 1,
+      "question": {
+        "data": {
+          "allow_freetext": false,
+          "approval_class": "mcp_tool",
+          "options": [
+            {
+              "description": "Approve once for this fixture",
+              "id": "approve_once",
+              "label": "Approve once"
+            }
+          ],
+          "permission": true,
+          "prompt": "Approve MCP tool?"
+        },
+        "kind": "single"
+      },
+      "questions": null,
+      "reason": "initial",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_raised",
+    "kind": "evt",
+    "v": 1
+  },
+  "event_single_grant_path": {
+    "data": {
+      "agent": "builder",
+      "description": "Fixture interrupt",
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "pending_count": 1,
+      "question": {
+        "data": {
+          "allow_freetext": false,
+          "approval_class": "path",
+          "options": [
+            {
+              "description": "Approve once for this fixture",
+              "id": "approve_once",
+              "label": "Approve once"
+            }
+          ],
+          "permission": true,
+          "prompt": "Approve path?"
+        },
+        "kind": "single"
+      },
+      "questions": null,
+      "reason": "initial",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_raised",
+    "kind": "evt",
+    "v": 1
+  },
+  "event_single_sandbox_denial_absent": {
+    "data": {
+      "agent": "builder",
+      "description": "Fixture interrupt",
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "pending_count": 1,
+      "question": {
+        "data": {
+          "allow_freetext": false,
+          "approval_class": "path",
+          "options": [
+            {
+              "description": "Approve once for this fixture",
+              "id": "approve_once",
+              "label": "Approve once"
+            }
+          ],
+          "permission": true,
+          "prompt": "Retry with broader access?",
+          "sandbox_escalation": {
+            "confined_exit": 13,
+            "confined_stderr": "Permission denied",
+            "suggested_access": "write",
+            "suggested_paths": ["/workspace/flycockpitapp/target"]
+          }
+        },
+        "kind": "single"
+      },
+      "questions": null,
+      "reason": "initial",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_raised",
+    "kind": "evt",
+    "v": 1
+  },
+  "event_single_sandbox_denial_present": {
+    "data": {
+      "agent": "builder",
+      "description": "Fixture interrupt",
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "pending_count": 1,
+      "question": {
+        "data": {
+          "allow_freetext": false,
+          "approval_class": "path",
+          "options": [
+            {
+              "description": "Approve once for this fixture",
+              "id": "approve_once",
+              "label": "Approve once"
+            }
+          ],
+          "permission": true,
+          "prompt": "Retry outside the sandbox?",
+          "sandbox_escalation": {
+            "confined_exit": 13,
+            "confined_stderr": "Permission denied",
+            "denial": {
+              "confidence": "high",
+              "evidence": [
+                {
+                  "data": {
+                    "path": "/workspace/flycockpitapp/target"
+                  },
+                  "kind": "write_outside_allowlist"
+                },
+                {
+                  "kind": "stderr_permission_marker"
+                }
+              ]
+            },
+            "suggested_access": "write",
+            "suggested_paths": ["/workspace/flycockpitapp/target"]
+          }
+        },
+        "kind": "single"
+      },
+      "questions": null,
+      "reason": "initial",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_raised",
+    "kind": "evt",
+    "v": 1
+  },
+  "request_resolve_batch": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "response": {
+        "data": {
+          "responses": [
+            {
+              "data": {
+                "selected_id": "approve_once"
+              },
+              "kind": "single"
+            }
+          ]
+        },
+        "kind": "batch"
+      }
+    },
+    "request": "resolve_interrupt",
+    "v": 1
+  },
+  "request_resolve_cancel": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "response": {
+        "kind": "cancel"
+      }
+    },
+    "request": "resolve_interrupt",
+    "v": 1
+  },
+  "request_resolve_freetext": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "response": {
+        "data": {
+          "text": "Use the existing design"
+        },
+        "kind": "freetext"
+      }
+    },
+    "request": "resolve_interrupt",
+    "v": 1
+  },
+  "request_resolve_multi": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "response": {
+        "data": {
+          "selected_ids": ["fmt", "test"]
+        },
+        "kind": "multi"
+      }
+    },
+    "request": "resolve_interrupt",
+    "v": 1
+  },
+  "request_resolve_single": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "interrupt_id": "22222222-2222-4222-8222-222222222222",
+      "response": {
+        "data": {
+          "selected_id": "approve_once"
+        },
+        "kind": "single"
+      }
+    },
+    "request": "resolve_interrupt",
+    "v": 1
+  }
+}

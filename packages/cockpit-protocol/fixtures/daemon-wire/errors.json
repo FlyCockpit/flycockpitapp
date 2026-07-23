@@ -1,0 +1,28 @@
+{
+  "authorization_paired": {
+    "error": {
+      "code": "authorization",
+      "message": "principal cannot access this session"
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "err",
+    "v": 1
+  },
+  "bad_request_out_of_band": {
+    "error": {
+      "code": "bad_request",
+      "message": "malformed daemon frame"
+    },
+    "kind": "err",
+    "v": 1
+  },
+  "protocol_version_paired": {
+    "error": {
+      "code": "protocol_version",
+      "message": "wire protocol version mismatch"
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "err",
+    "v": 1
+  }
+}

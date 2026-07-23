@@ -1,9 +1,4 @@
-import {
-  type HistoryEntry,
-  type LiveEvent,
-  liveEventSchema,
-  type SessionSummary,
-} from "@flycockpit/cockpit-protocol";
+import type { HistoryEntry, SessionSummary } from "@flycockpit/cockpit-protocol";
 import * as Clipboard from "expo-clipboard";
 import * as ImagePicker from "expo-image-picker";
 import { useLocalSearchParams } from "expo-router";
@@ -12,44 +7,33 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Text, View } from "react-native";
 import { Container } from "@/components/container";
 import { useNativeRemoteClient } from "@/hooks/use-native-remote-client";
+import {
+  appendOptimisticUserMessage,
+  type InterruptResolutionAction,
+  type NativeHistoryEntry,
+  reduceNativeSessionEvent,
+  removeOptimisticUserMessage,
+  resolveResponseForInterrupt,
+  toNativeHistoryEntry,
+  warnNativeSessionEvent,
+} from "@/utils/session-events";
 
 function formatSessionTitle(session: SessionSummary) {
-  return session.title || session.shortId || session.sessionId;
+  return session.title || session.short_id || session.session_id;
 }
 
-function sortHistory(history: HistoryEntry[]) {
-  return [...history].sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
+function sessionActivityLabel(session: SessionSummary) {
+  const activityState = (session as { activity_state?: unknown }).activity_state;
+  return typeof activityState === "string" ? activityState.replaceAll("_", " ") : "idle";
 }
 
-function upsertHistory(history: HistoryEntry[], entry: HistoryEntry) {
-  return sortHistory([entry, ...history.filter((item) => item.id !== entry.id)]);
-}
-
-function applySessionEvent(history: HistoryEntry[], event: LiveEvent) {
-  if (event.type === "history_entry") return upsertHistory(history, event.entry);
-  if (event.type === "assistant_delta") {
-    return history.map((entry) =>
-      entry.id === event.entryId && entry.kind === "assistant_text"
-        ? { ...entry, text: entry.text + event.delta }
-        : entry,
-    );
-  }
-  if (event.type === "interrupt_resolved") {
-    return history.map((entry) =>
-      entry.kind === "interrupt" && entry.interrupt.interruptId === event.interruptId
-        ? { ...entry, interrupt: { ...entry.interrupt, resolved: true } }
-        : entry,
-    );
-  }
-  return history;
-}
-
-function historyText(entry: HistoryEntry) {
+function historyText(entry: NativeHistoryEntry) {
   if (entry.kind === "user_message") return entry.text;
+  if (entry.kind === "user_note") return entry.text;
   if (entry.kind === "assistant_text") return entry.text;
   if (entry.kind === "assistant_reasoning") return entry.text;
   if (entry.kind === "tool_call") return entry.name + " " + entry.status;
-  if (entry.kind === "inference_error") return entry.message;
+  if (entry.kind === "inference_error") return entry.text;
   if (entry.kind === "boundary") return entry.label;
   if (entry.kind === "subagent_report") return entry.title + "\n" + entry.body;
   if (entry.kind === "interrupt") return entry.interrupt.title;
@@ -72,36 +56,31 @@ export default function ProjectSessions() {
   const projectRoot = projectRootParam
     ? String(projectRootParam)
     : decodeURIComponent(String(params.projectId ?? ""));
+  const projectId = decodeURIComponent(String(params.projectId ?? projectRoot));
   const initialSession = Array.isArray(params.session) ? params.session[0] : params.session;
   const projectName = Array.isArray(params.name) ? params.name[0] : params.name;
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(initialSession ?? null);
-  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [history, setHistory] = useState<NativeHistoryEntry[]>([]);
   const [message, setMessage] = useState("");
   const [answer, setAnswer] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const selectedSessionRef = useRef<string | null>(initialSession ?? null);
+  const historyRef = useRef<NativeHistoryEntry[]>([]);
+  const optimisticMessageCounterRef = useRef(0);
 
-  const handleLiveEvent = useCallback((raw: unknown) => {
-    const parsed = liveEventSchema.safeParse(raw);
-    if (!parsed.success) return;
-    const event = parsed.data;
-    if (event.type === "session_updated") {
-      setSessions((current) =>
-        [
-          event.summary,
-          ...current.filter((session) => session.sessionId !== event.summary.sessionId),
-        ].sort((a, b) => b.updatedAt - a.updatedAt),
-      );
-      return;
-    }
-    const sessionId = "sessionId" in event ? event.sessionId : null;
-    if (!sessionId || sessionId !== selectedSessionRef.current) return;
-    setHistory((current) => applySessionEvent(current, event));
+  const handleSessionEvent = useCallback((raw: unknown) => {
+    const result = reduceNativeSessionEvent(
+      { history: historyRef.current, selectedSessionId: selectedSessionRef.current },
+      raw,
+    );
+    warnNativeSessionEvent(result);
+    historyRef.current = result.state.history;
+    setHistory(result.state.history);
   }, []);
 
-  const { client, status, tokenQuery } = useNativeRemoteClient(instanceId, handleLiveEvent);
+  const { client, status, tokenQuery } = useNativeRemoteClient(instanceId, handleSessionEvent);
 
   useEffect(() => {
     selectedSessionRef.current = selectedSessionId;
@@ -117,9 +96,9 @@ export default function ProjectSessions() {
     setBusy(true);
     setError(null);
     try {
-      const result = await client.listSessions(projectRoot);
+      const result = await client.listSessions({ project_id: projectId });
       setSessions(result.sessions);
-      const nextSession = selectedSessionId ?? result.sessions[0]?.sessionId ?? null;
+      const nextSession = selectedSessionId ?? result.sessions[0]?.session_id ?? null;
       setSelectedSessionId(nextSession);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Could not load sessions.");
@@ -133,9 +112,13 @@ export default function ProjectSessions() {
     setBusy(true);
     setError(null);
     try {
-      const result = await client.attach(sessionId);
+      const result = await client.attach({ session_id: sessionId, interactive: true });
       setSelectedSessionId(sessionId);
-      setHistory(result.history);
+      const nextHistory = result.history.map((entry: HistoryEntry, index: number) =>
+        toNativeHistoryEntry(entry, index),
+      );
+      historyRef.current = nextHistory;
+      setHistory(nextHistory);
     } catch (attachError) {
       setError(attachError instanceof Error ? attachError.message : "Could not attach session.");
     } finally {
@@ -147,11 +130,22 @@ export default function ProjectSessions() {
     if (!client || !selectedSessionId || !message.trim()) return;
     const text = message.trim();
     setMessage("");
+    optimisticMessageCounterRef.current += 1;
+    const optimisticId = String(optimisticMessageCounterRef.current);
+    const nextHistory = appendOptimisticUserMessage(historyRef.current, text, optimisticId);
+    historyRef.current = nextHistory;
+    setHistory(nextHistory);
     try {
-      await client.sendUserMessage(selectedSessionId, text, "native-" + Date.now());
+      await client.sendUserMessage({ text });
     } catch (sendError) {
       setError(sendError instanceof Error ? sendError.message : "Could not send message.");
       setMessage(text);
+      const historyWithoutOptimistic = removeOptimisticUserMessage(
+        historyRef.current,
+        optimisticId,
+      );
+      historyRef.current = historyWithoutOptimistic;
+      setHistory(historyWithoutOptimistic);
     }
   };
 
@@ -171,20 +165,19 @@ export default function ProjectSessions() {
     if (text) setMessage((current) => (current ? current + "\n" : "") + text);
   };
 
-  const resolveInterrupt = async (
-    interruptId: string,
-    resolution: "approve" | "deny" | "answer",
-  ) => {
+  const resolveInterrupt = async (interruptId: string, resolution: InterruptResolutionAction) => {
     if (!client || !selectedSessionId) return;
+    const interrupt = unresolvedInterrupts.find(
+      (entry) => entry.kind === "interrupt" && entry.interrupt.interruptId === interruptId,
+    );
+    if (interrupt?.kind !== "interrupt") return;
     setBusy(true);
     setError(null);
     try {
-      await client.resolveInterrupt({
-        sessionId: selectedSessionId,
+      await client.resolveInterrupt(
         interruptId,
-        resolution,
-        answer: resolution === "answer" ? answer : undefined,
-      });
+        resolveResponseForInterrupt(interrupt.interrupt.question, resolution, answer),
+      );
       setAnswer("");
     } catch (resolveError) {
       setError(
@@ -236,11 +229,11 @@ export default function ProjectSessions() {
           </Button>
         </View>
         {sessions.map((session) => (
-          <Card key={session.sessionId} variant="secondary" className="p-4">
-            <Button onPress={() => attach(session.sessionId)}>
+          <Card key={session.session_id} variant="secondary" className="p-4">
+            <Button onPress={() => attach(session.session_id)}>
               <Button.Label>{formatSessionTitle(session)}</Button.Label>
             </Button>
-            <Text className="text-muted text-sm mt-2">{session.status.replaceAll("_", " ")}</Text>
+            <Text className="text-muted text-sm mt-2">{sessionActivityLabel(session)}</Text>
           </Card>
         ))}
       </View>

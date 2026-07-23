@@ -1,4 +1,4 @@
-import type { ProjectSummary } from "@flycockpit/cockpit-protocol";
+import type { SessionSummary } from "@flycockpit/cockpit-protocol";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { Button, Card, Chip, Spinner, Surface } from "heroui-native";
 import { useEffect, useState } from "react";
@@ -7,7 +7,15 @@ import { Pressable, Text, View } from "react-native";
 import { Container } from "@/components/container";
 import { useNativeRemoteClient } from "@/hooks/use-native-remote-client";
 
-function projectLabel(project: ProjectSummary) {
+type NativeProjectRow = {
+  projectId: string;
+  projectRoot: string;
+  displayName?: string;
+  sessionCount: number;
+  attentionCount: number;
+};
+
+function projectLabel(project: NativeProjectRow) {
   return (
     project.displayName ||
     project.projectRoot.split("/").filter(Boolean).at(-1) ||
@@ -15,12 +23,31 @@ function projectLabel(project: ProjectSummary) {
   );
 }
 
+function projectsFromSessions(sessions: SessionSummary[]): NativeProjectRow[] {
+  const projects = new Map<string, NativeProjectRow>();
+  for (const session of sessions) {
+    const existing = projects.get(session.project_id);
+    if (existing) {
+      existing.sessionCount += 1;
+      continue;
+    }
+    projects.set(session.project_id, {
+      projectId: session.project_id,
+      projectRoot: session.project_root,
+      displayName: session.project_root.split("/").filter(Boolean).at(-1),
+      sessionCount: 1,
+      attentionCount: 0,
+    });
+  }
+  return [...projects.values()].sort((a, b) => a.projectRoot.localeCompare(b.projectRoot));
+}
+
 export default function InstanceProjects() {
   const router = useRouter();
   const params = useLocalSearchParams<{ instanceId?: string }>();
   const instanceId = Array.isArray(params.instanceId) ? params.instanceId[0] : params.instanceId;
   const { client, status, statusDetail, tokenQuery } = useNativeRemoteClient(instanceId);
-  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [projects, setProjects] = useState<NativeProjectRow[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isLoadingProjects, setIsLoadingProjects] = useState(false);
 
@@ -29,8 +56,8 @@ export default function InstanceProjects() {
     setIsLoadingProjects(true);
     setLoadError(null);
     try {
-      const result = await client.listProjects();
-      setProjects(result.projects);
+      const result = await client.listSessions({});
+      setProjects(projectsFromSessions(result.sessions));
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : "Could not load projects.");
     } finally {

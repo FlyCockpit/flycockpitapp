@@ -1,5 +1,6 @@
 import {
-  type RemoteSessionClient,
+  RemoteSessionClient,
+  type RemoteSessionClientOptions,
   type RemoteSessionStatus,
 } from "@flycockpit/cockpit-protocol/client";
 import { useQuery } from "@tanstack/react-query";
@@ -7,9 +8,28 @@ import * as Network from "expo-network";
 import { useEffect, useState } from "react";
 import { AppState } from "react-native";
 import { orpc } from "@/utils/orpc";
-import { createNativeRemoteSessionClient } from "@/utils/remote-session-client";
 
 export type NativeConnectionStatus = RemoteSessionStatus;
+
+export type NativeRemoteClientInput = {
+  instanceId: string;
+  token: string;
+  relayUrl: string;
+  onStatus: RemoteSessionClientOptions["onStatus"];
+  onEvent?: RemoteSessionClientOptions["onEvent"];
+};
+
+export function nativeRemoteClientOptions(
+  input: NativeRemoteClientInput,
+): RemoteSessionClientOptions {
+  return {
+    instanceId: input.instanceId,
+    token: input.token,
+    relayUrl: input.relayUrl,
+    onStatus: input.onStatus,
+    onEvent: input.onEvent,
+  };
+}
 
 export function useNativeRemoteClient(
   instanceId: string | undefined,
@@ -25,16 +45,18 @@ export function useNativeRemoteClient(
 
   useEffect(() => {
     if (!instanceId || !tokenQuery.data) return;
-    const nextClient = createNativeRemoteSessionClient({
-      instanceId,
-      token: tokenQuery.data.token,
-      relayUrl: tokenQuery.data.relayUrl,
-      onStatus: (nextStatus, detail) => {
-        setStatus(nextStatus);
-        setStatusDetail(detail);
-      },
-      onEvent,
-    });
+    const nextClient = new RemoteSessionClient(
+      nativeRemoteClientOptions({
+        instanceId,
+        token: tokenQuery.data.token,
+        relayUrl: tokenQuery.data.relayUrl,
+        onStatus: (nextStatus, detail) => {
+          setStatus(nextStatus);
+          setStatusDetail(detail);
+        },
+        onEvent,
+      }),
+    );
     setClient(nextClient);
     Network.getNetworkStateAsync().then((network) => {
       if (network.isInternetReachable === false) {

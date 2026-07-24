@@ -556,7 +556,7 @@ impl BackgroundCommandConfig {
 }
 
 /// Same env-injection scrub as the `bash` tool: strip injection-vector
-/// vars + `*_KEY`/`*_SECRET`/`*_TOKEN`.
+/// vars and secret-shaped keys.
 fn scrub_env(cmd: &mut Command) {
     const FIXED_REMOVE: &[&str] = &[
         "BASH_ENV",
@@ -572,8 +572,7 @@ fn scrub_env(cmd: &mut Command) {
         cmd.env_remove(var);
     }
     for (k, _v) in std::env::vars() {
-        let upper = k.to_uppercase();
-        if upper.ends_with("_KEY") || upper.ends_with("_SECRET") || upper.ends_with("_TOKEN") {
+        if crate::redact::env_scrub_patterns(&k) {
             cmd.env_remove(&k);
         }
     }

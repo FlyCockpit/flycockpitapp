@@ -177,6 +177,23 @@ fn bash_description_mentions_cap_and_tmpdir_redirection() {
 }
 
 #[test]
+fn bash_scrub_overrides_matches_bare_and_camel_secret_names() {
+    let env = std::collections::HashMap::from([
+        ("PASSWORD".to_string(), "bare-password-value".to_string()),
+        ("apiKey".to_string(), "camel-api-key-value".to_string()),
+        ("REGION".to_string(), "us-east-1".to_string()),
+    ]);
+    let scrubbed: std::collections::BTreeSet<_> = scrub_overrides(&env)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+
+    assert!(scrubbed.contains("PASSWORD"));
+    assert!(scrubbed.contains("apiKey"));
+    assert!(!scrubbed.contains("REGION"));
+}
+
+#[test]
 fn jq_shim_is_skipped_only_for_actual_container_runs() {
     use crate::tools::sandbox_mode::SandboxMode;
 

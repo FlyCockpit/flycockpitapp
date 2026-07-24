@@ -139,29 +139,23 @@ const PEM_PRIVATE_KEY_HEADERS: &[&str] = &[
 /// sensitive by default. Bash uses the same predicate to remove inherited
 /// keys from child environments, while redaction uses it as an env-name
 /// signal before value pruning.
+const FIXED_SHELL_INJECTION_NAMES: &[&str] = &[
+    "BASH_ENV",
+    "ENV",
+    "PROMPT_COMMAND",
+    "NODE_OPTIONS",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "GREP_OPTIONS",
+    "GREP_COLORS",
+];
+
 pub(crate) fn env_scrub_patterns(name: &str) -> bool {
-    const FIXED: &[&str] = &[
-        "BASH_ENV",
-        "ENV",
-        "PROMPT_COMMAND",
-        "NODE_OPTIONS",
-        "SHELLOPTS",
-        "BASHOPTS",
-        "GREP_OPTIONS",
-        "GREP_COLORS",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-    ];
     let upper = name.to_ascii_uppercase();
-    FIXED.iter().any(|fixed| upper == *fixed)
-        || upper.ends_with("_KEY")
-        || upper.ends_with("_SECRET")
-        || upper.ends_with("_TOKEN")
-        || upper.ends_with("_PASSWORD")
-        || upper.ends_with("_PASSWD")
-        || upper.ends_with("_PIN")
-        || upper.ends_with("_PAT")
-        || upper.ends_with("_CREDENTIALS")
+    FIXED_SHELL_INJECTION_NAMES
+        .iter()
+        .any(|fixed| upper == *fixed)
+        || is_secret_shaped_key(name)
 }
 
 /// Broad inclusion predicate for key names whose values are likely secrets.
@@ -972,6 +966,85 @@ mod scrub_fast_path_tests {
         ] {
             assert!(!is_secret_shaped_key(key), "expected `{key}` to reject");
         }
+    }
+
+    #[test]
+    fn env_scrub_secret_arm_is_superset_of_old_suffixes() {
+        for suffix in [
+            "_KEY",
+            "_SECRET",
+            "_TOKEN",
+            "_PASSWORD",
+            "_PASSWD",
+            "_PIN",
+            "_PAT",
+            "_CREDENTIALS",
+        ] {
+            let name = format!("SERVICE{suffix}");
+            assert!(env_scrub_patterns(&name), "expected `{name}` to match");
+        }
+
+        for old_fixed_secret in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] {
+            assert!(
+                env_scrub_patterns(old_fixed_secret),
+                "expected `{old_fixed_secret}` to keep matching"
+            );
+            assert!(
+                is_secret_shaped_key(old_fixed_secret),
+                "expected `{old_fixed_secret}` to match via the unified secret arm"
+            );
+        }
+    }
+
+    #[test]
+    fn env_scrub_matches_bare_and_camel_secret_names() {
+        for name in [
+            "PASSWORD",
+            "TOKEN",
+            "SECRET",
+            "PASSPHRASE",
+            "APIKEY",
+            "apiKey",
+        ] {
+            assert!(env_scrub_patterns(name), "expected `{name}` to match");
+        }
+
+        let mut cfg = RedactConfig {
+            enabled: true,
+            scan_environment: true,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            min_secret_length: 1,
+            allowlist: vec!["PASSWORD".to_string(), "apiKey".to_string()],
+            placeholder: "[redacted]".to_string(),
+            ..RedactConfig::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = HashMap::from([
+            ("PASSWORD".to_string(), "bare-password-value".to_string()),
+            ("apiKey".to_string(), "camel-api-key-value".to_string()),
+        ]);
+        let table = RedactionTable::build_with_env(&cfg, dir.path(), &env).unwrap();
+
+        assert_eq!(table.scrub("bare-password-value"), cfg.placeholder);
+        assert_eq!(table.scrub("camel-api-key-value"), cfg.placeholder);
+
+        cfg.allowlist.clear();
+        let table_without_allowlist =
+            RedactionTable::build_with_env(&cfg, dir.path(), &env).unwrap();
+        assert_eq!(
+            table.entries_for_debug(),
+            table_without_allowlist.entries_for_debug()
+        );
+    }
+
+    #[test]
+    fn env_scrub_shell_injection_names_unchanged() {
+        for name in FIXED_SHELL_INJECTION_NAMES {
+            assert!(env_scrub_patterns(name), "expected `{name}` to match");
+        }
+        assert!(env_scrub_patterns("prompt_command"));
+        assert!(!is_secret_shaped_key("PROMPT_COMMAND"));
     }
 
     #[test]

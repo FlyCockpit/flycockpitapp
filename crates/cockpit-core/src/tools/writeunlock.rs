@@ -349,14 +349,17 @@ mod tests {
     }
 
     fn skill_test_ctx(root: &Path) -> ToolCtx {
-        let cockpit = root.join(".cockpit");
-        std::fs::create_dir_all(&cockpit).unwrap();
-        std::fs::write(
-            cockpit.join("config.json"),
-            r#"{"skills":{"scan_dirs":[".agents/skills"]}}"#,
-        )
-        .unwrap();
-        test_ctx(root)
+        let mut ctx = test_ctx(root);
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.skills.scan_dirs = vec![".agents/skills".to_string()];
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+        ctx
     }
 
     fn note_read(ctx: &ToolCtx, path: &Path) {

@@ -1899,12 +1899,28 @@ mod llm_mode_tests {
     #[test]
     fn sibling_disambiguation_normal_descriptions_name_siblings() {
         let cases: &[(&str, &[&str])] = &[
-            ("search", &["grep", "code"]),
+            ("search", &["grep", "code", "context_pack"]),
             ("grep", &["search", "code"]),
-            ("code", &["search", "grep", "context_pack", "read", "graph"]),
-            ("graph", &["search", "code", "change_impact"]),
-            ("context_pack", &["read"]),
-            ("change_impact", &["graph"]),
+            (
+                "code",
+                &[
+                    "search",
+                    "grep",
+                    "context_pack",
+                    "read",
+                    "graph",
+                    "change_impact",
+                ],
+            ),
+            (
+                "graph",
+                &["search", "code", "change_impact", "context_pack"],
+            ),
+            (
+                "context_pack",
+                &["search", "code", "graph", "change_impact", "read"],
+            ),
+            ("change_impact", &["graph", "code", "search"]),
             ("read", &["readlock", "writeunlock", "editunlock"]),
             ("readlock", &["writeunlock", "editunlock", "unlock"]),
             ("writeunlock", &["readlock", "editunlock"]),
@@ -1924,6 +1940,53 @@ mod llm_mode_tests {
                     "`{name}` normal description must name sibling `{sibling}`; got: {description}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn intel_tool_surface_is_five_tools() {
+        let expected: std::collections::BTreeSet<_> =
+            ["search", "code", "graph", "context_pack", "change_impact"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        let builtin_names: std::collections::BTreeSet<_> = all_builtin_tools()
+            .into_iter()
+            .filter(|tool| {
+                crate::engine::builtin::builtin_tool_inventory()
+                    .iter()
+                    .any(|item| item.family == "Intel" && item.name == tool.name())
+            })
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let inventory_names: std::collections::BTreeSet<_> =
+            crate::engine::builtin::builtin_tool_inventory()
+                .iter()
+                .filter(|item| item.family == "Intel")
+                .map(|item| item.name.to_string())
+                .collect();
+
+        assert_eq!(builtin_names, expected);
+        assert_eq!(inventory_names, expected);
+
+        let registered_names: std::collections::BTreeSet<_> = all_builtin_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        for removed in [
+            "tree",
+            "outline",
+            "symbol_find",
+            "word",
+            "deps",
+            "hot",
+            "circular",
+            "impact",
+        ] {
+            assert!(
+                !registered_names.contains(removed),
+                "{removed}: {registered_names:?}"
+            );
         }
     }
 

@@ -1,15 +1,15 @@
 //! Codebase-intelligence tools (GOALS §21, Phase 1).
 //!
-//! Five tools backed by the on-demand [`crate::intel::Index`]: `code`,
-//! `graph`, `search`, `change_impact`, and `context_pack`. Each
-//! index-backed tool calls
+//! Five codebase-intelligence tools: `search`, `code`, `graph`,
+//! `context_pack`, and `change_impact`. Each index-backed path calls
 //! [`crate::intel::Index::ensure_fresh`] first so it never answers from stale data.
 //! `graph {kind:"recent"}` is pure-FS (no index). `search` uses the shared in-process text
 //! walker, honors gitignore, searches hidden files that gitignore permits, and
 //! prunes `.git/` directories. `search` and `code {kind:"symbol_find"}` additionally
 //! apply call-graph centrality ranking (additive, default-on,
 //! config-gated via `extended.intelCentralityRanking`); `graph {kind:"callers"|"calls"}`
-//! reports a symbol's high-precision-resolved callers and calls.
+//! reports a symbol's high-precision-resolved callers and calls, while
+//! `change_impact` summarizes impacted symbols and files for local changes.
 //! `search` emits `path:line[:column]: text` matches and `path:line- text`
 //! context lines, then budget-caps its output via
 //! [`crate::intel::budget::BudgetedWriter`].

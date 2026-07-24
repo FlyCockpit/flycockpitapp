@@ -576,7 +576,7 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         BuiltinToolInventoryItem {
             family: "Intel",
             name: "search",
-            summary: "Search project code using Cockpit intelligence.",
+            summary: "Search project text with budgeted regular expressions.",
             condition: None,
         },
         BuiltinToolInventoryItem {
@@ -4112,18 +4112,39 @@ mod tests {
     }
 
     #[test]
-    fn graph_inventory_summary_is_accurate() {
-        let graph = builtin_tool_inventory()
+    fn intel_inventory_summaries_are_accurate() {
+        let intel: std::collections::BTreeMap<_, _> = builtin_tool_inventory()
             .iter()
-            .find(|tool| tool.name == "graph")
-            .expect("graph inventory item");
-        let summary = graph.summary.to_ascii_lowercase();
-
-        assert!(
-            summary.contains("mtime") || summary.contains("recent"),
-            "{summary}"
+            .filter(|tool| tool.family == "Intel")
+            .map(|tool| (tool.name, tool.summary.to_ascii_lowercase()))
+            .collect();
+        assert_eq!(
+            intel.keys().copied().collect::<Vec<_>>(),
+            ["change_impact", "code", "context_pack", "graph", "search"]
         );
-        assert!(!summary.contains("centrality"), "{summary}");
+
+        let search = intel.get("search").expect("search summary");
+        assert!(search.contains("search"), "{search}");
+        assert!(search.contains("regular expression"), "{search}");
+
+        let code = intel.get("code").expect("code summary");
+        assert!(code.contains("structure"), "{code}");
+        assert!(code.contains("symbols"), "{code}");
+
+        let context_pack = intel.get("context_pack").expect("context_pack summary");
+        assert!(context_pack.contains("context"), "{context_pack}");
+        assert!(context_pack.contains("bundle"), "{context_pack}");
+
+        let graph = intel.get("graph").expect("graph summary");
+        assert!(
+            graph.contains("mtime") || graph.contains("recent"),
+            "{graph}"
+        );
+        assert!(!graph.contains("centrality"), "{graph}");
+
+        let change_impact = intel.get("change_impact").expect("change_impact summary");
+        assert!(change_impact.contains("impact"), "{change_impact}");
+        assert!(change_impact.contains("local changes"), "{change_impact}");
     }
 
     #[test]

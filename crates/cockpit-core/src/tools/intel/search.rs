@@ -15,7 +15,7 @@ impl Tool for SearchTool {
         "search"
     }
     fn description(&self) -> &str {
-        "Budgeted repo-wide regex text search; use `grep` for root-confined regex and `code` for identifiers/definitions"
+        "Budgeted repo-wide regex text search; use `grep` for root-confined regex, `code` for identifiers/definitions, and `context_pack` for orientation bundles"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(
@@ -35,7 +35,7 @@ impl Tool for SearchTool {
             "properties": {
                 "pattern":          { "type": "string", "x-cockpit-aliases": ["query", "regex", "search", "q", "expression"], "description": "Regex to search for" },
                 "path":             { "type": "string", "x-cockpit-kind": "path", "description": "`path` filter relative to project root" },
-                "ignore_case":      { "type": "boolean", "description": "Case-insensitive match toggle" },
+                "case_insensitive": { "type": "boolean", "description": "Case-insensitive match toggle" },
                 "context":          { "type": "integer", "description": "Context lines around each match" },
                 "glob":             { "type": "string", "description": "`glob` include filter (e.g. `*.rs`)" }
             },
@@ -49,7 +49,7 @@ impl Tool for SearchTool {
             "properties": {
                 "pattern":          { "type": "string", "x-cockpit-aliases": ["query", "regex", "search", "q", "expression"], "description": "The regular expression to search for across file contents" },
                 "path":             { "type": "string", "x-cockpit-kind": "path", "description": "Optional path to restrict the search to, relative to the project root; omit to search the whole repo" },
-                "ignore_case":      { "type": "boolean", "description": "When true, match case-insensitively; defaults to case-sensitive" },
+                "case_insensitive": { "type": "boolean", "description": "When true, match case-insensitively; defaults to case-sensitive" },
                 "context":          { "type": "integer", "description": "Number of lines of surrounding context to include around each match; defaults to none" },
                 "glob":             { "type": "string", "description": "Optional glob to include only matching files, e.g. `*.rs` or `src/**`" }
             },
@@ -63,8 +63,8 @@ impl Tool for SearchTool {
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_input("`pattern` is required"))?;
         let path = args.get("path").and_then(Value::as_str);
-        let ignore_case = args
-            .get("ignore_case")
+        let case_insensitive = args
+            .get("case_insensitive")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let context = args
@@ -111,7 +111,7 @@ impl Tool for SearchTool {
         let guard_root = search_root.clone();
         let options = SearchOptions {
             pattern: pattern.to_string(),
-            case_insensitive: ignore_case,
+            case_insensitive,
             columns: true,
             context: context.map(|n| n as usize),
             glob: glob.map(ToString::to_string),

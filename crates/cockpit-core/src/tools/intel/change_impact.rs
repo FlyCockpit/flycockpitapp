@@ -51,7 +51,7 @@ impl Tool for ChangeImpactTool {
         "change_impact"
     }
     fn description(&self) -> &str {
-        "Summarize current diff/ref-range blast-radius hints; for one symbol's call graph, use `graph`"
+        "Summarize current diff/ref-range blast-radius hints; use `graph` for relationships, `code` for structure, and `search` for text"
     }
     fn defensive_description(&self) -> Option<String> {
         Some("Read-only impact hints for current git changes or a ref range. Combines changed files/hunks with indexed symbols, import reverse-deps, call graph, and centrality. Heuristic, not a proof; never stages, writes, or runs tests.".to_string())

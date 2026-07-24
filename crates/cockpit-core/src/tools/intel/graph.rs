@@ -65,7 +65,7 @@ impl Tool for GraphTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect dependency and call relationships: imports, importers, cycles, callers, calls, or recent files; use `change_impact` for current diff risk and `search`/`code` for text and structure"
+        "Inspect imports, importers, cycles, callers, calls, or recent files; use `change_impact` diffs, `search` text, `code` structure, `context_pack` bundles"
     }
 
     fn defensive_description(&self) -> Option<String> {

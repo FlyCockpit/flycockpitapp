@@ -41,7 +41,7 @@ impl Tool for ContextPackTool {
     }
 
     fn description(&self) -> &str {
-        "First move in an unfamiliar repo: one compact packet combining files, symbols, imports, deps, and recency for an overview/file/symbol/query; never prints file contents; follow with ranged `read`"
+        "First move: overview/file/symbol/query packet; use `search` text, `code` structure, `graph` relationships, `change_impact` diffs; never prints file contents; follow with ranged `read`"
     }
 
     fn defensive_description(&self) -> Option<String> {
@@ -56,7 +56,11 @@ impl Tool for ContextPackTool {
             "type": "object",
             "properties": {
                 "target": { "type": "string", "description": "Optional path, symbol name, or search text to focus the packet" },
-                "kind": { "type": "string", "description": "auto, overview, path, symbol, or query. Defaults to auto" },
+                "kind": {
+                    "type": "string",
+                    "enum": ["auto", "overview", "path", "symbol", "query"],
+                    "description": "Optional packet kind: auto, overview, path, symbol, or query. Omit, null, or pass an empty string for auto."
+                },
                 "depth": { "type": "integer", "description": "Relationship depth for dependency/call context, 1-3. Defaults to 1" },
                 "limit": { "type": "integer", "description": "Maximum primary items per section, 1-50. Defaults to 12" }
             }

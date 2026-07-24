@@ -64,7 +64,7 @@ impl Tool for CodeTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect code structure: tree, outline, definitions, or token uses; use `search`/`grep` for text, `graph` for relationships, `context_pack` for bundles, `read` for contents"
+        "Inspect code structure: tree, outline, defs, token uses; use `search`/`grep` text, `graph` relationships, `context_pack` bundles, `change_impact` diffs, `read` contents"
     }
 
     fn defensive_description(&self) -> Option<String> {

@@ -1004,7 +1004,50 @@ async fn search_matches_files_under_dot_github() {
 }
 
 #[tokio::test]
-async fn search_in_process_preserves_columns_context_glob_and_ignore_case() {
+async fn search_case_insensitive_flag_is_unified() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/lib.rs", "pub fn AlphaNeedle() {}\n");
+    let ctx = test_ctx(tmp.path());
+
+    let out = SearchTool
+        .call(
+            serde_json::json!({
+                "pattern": "alphaneedle",
+                "case_insensitive": true
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(out.content.contains("AlphaNeedle"), "{}", out.content);
+
+    let old_case_key = ["ignore", "case"].join("_");
+    let old_arg_out = SearchTool
+        .call(
+            serde_json::json!({
+                "pattern": "alphaneedle",
+                old_case_key.clone(): true
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        old_arg_out.content.contains("No matches"),
+        "{}",
+        old_arg_out.content
+    );
+
+    let params = SearchTool.parameters().to_string();
+    let defensive = SearchTool.defensive_parameters().unwrap().to_string();
+    assert!(params.contains("case_insensitive"), "{params}");
+    assert!(defensive.contains("case_insensitive"), "{defensive}");
+    assert!(!params.contains(&old_case_key), "{params}");
+    assert!(!defensive.contains(&old_case_key), "{defensive}");
+}
+
+#[tokio::test]
+async fn search_in_process_preserves_columns_context_glob_and_case_insensitive() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/a.rs", "first\n  Alpha target\nthird\n");
     write(
@@ -1019,7 +1062,7 @@ async fn search_in_process_preserves_columns_context_glob_and_ignore_case() {
             serde_json::json!({
                 "path": "src",
                 "pattern": "alpha",
-                "ignore_case": true,
+                "case_insensitive": true,
                 "context": 1,
                 "glob": "*.rs"
             }),
@@ -1102,6 +1145,53 @@ async fn search_thins_large_line_results_before_budgeting() {
         "got: {}",
         out.content
     );
+}
+
+#[tokio::test]
+async fn context_pack_rejects_unknown_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/lib.rs", "pub fn helper() {}\n");
+    let ctx = test_ctx(tmp.path());
+
+    for args in [
+        serde_json::json!({}),
+        serde_json::json!({ "kind": null }),
+        serde_json::json!({ "kind": "" }),
+    ] {
+        let out = ContextPackTool.call(args, &ctx).await.unwrap();
+        assert!(
+            out.content.contains("context_pack: overview"),
+            "{}",
+            out.content
+        );
+    }
+
+    let err = ContextPackTool
+        .call(serde_json::json!({ "kind": "imports" }), &ctx)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid `kind` `imports`"), "{err}");
+    for legal in ["auto", "overview", "path", "symbol", "query"] {
+        assert!(err.contains(legal), "{err}");
+    }
+
+    let params = ContextPackTool.parameters();
+    let defensive = ContextPackTool.defensive_parameters().unwrap();
+    for schema in [&params, &defensive] {
+        let enum_values = schema
+            .pointer("/properties/kind/enum")
+            .and_then(serde_json::Value::as_array)
+            .expect("kind enum");
+        let enum_strings: Vec<_> = enum_values
+            .iter()
+            .map(|value| value.as_str().expect("string enum"))
+            .collect();
+        assert_eq!(
+            enum_strings,
+            ["auto", "overview", "path", "symbol", "query"]
+        );
+    }
 }
 
 #[tokio::test]

@@ -203,7 +203,7 @@ impl Driver {
                     .collect(),
             ),
             mcp_builtin_registry: agent.tools.mcp_builtin_registry(),
-            has_tree: agent.tools.get("tree").is_some(),
+            has_tree: agent.tools.get("code").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
             // run's turn-event stream (`readlock-wait-and-lock-expiry.md`).
@@ -509,7 +509,7 @@ impl Driver {
                     .collect(),
             ),
             mcp_builtin_registry: child.tools.mcp_builtin_registry(),
-            has_tree: child.tools.get("tree").is_some(),
+            has_tree: child.tools.get("code").is_some(),
             has_bash: child.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
             // run's turn-event stream (`readlock-wait-and-lock-expiry.md`).
@@ -591,7 +591,7 @@ impl Driver {
                     .collect(),
             ),
             mcp_builtin_registry: agent.tools.mcp_builtin_registry(),
-            has_tree: agent.tools.get("tree").is_some(),
+            has_tree: agent.tools.get("code").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
             // run's turn-event stream (`readlock-wait-and-lock-expiry.md`).
@@ -792,7 +792,7 @@ impl Driver {
                     .collect(),
             ),
             mcp_builtin_registry: agent.tools.mcp_builtin_registry(),
-            has_tree: agent.tools.get("tree").is_some(),
+            has_tree: agent.tools.get("code").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
             // Route a blocked `readlock`'s waiting indicator through this
             // run's turn-event stream (`readlock-wait-and-lock-expiry.md`).

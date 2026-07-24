@@ -192,8 +192,8 @@ pub fn tool_surface_catalog() -> Vec<ToolSurfaceItem> {
 fn tool_family(name: &str) -> &'static str {
     match name {
         "read" | "readlock" | "writeunlock" | "editunlock" | "unlock" => "files",
-        "context_pack" | "tree" | "outline" | "symbol_find" | "word" | "deps" | "hot"
-        | "circular" | "search" | "impact" | "change_impact" | "lsp" => "code intel",
+        "context_pack" | "code" | "deps" | "hot" | "circular" | "search" | "impact"
+        | "change_impact" | "lsp" => "code intel",
         "bash" | "escalate" | "harness_list" | "harness_invoke" => "execution",
         "task"
         | "spawn"

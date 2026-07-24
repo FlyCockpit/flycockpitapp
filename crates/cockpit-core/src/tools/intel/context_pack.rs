@@ -84,7 +84,7 @@ impl Tool for ContextPackTool {
         let fs_files = list_file_metas(&ctx.session.project_root);
         if file_rows.is_empty() && fs_files.is_empty() {
             return Ok(ToolOutput::text(format!(
-                "context_pack: no indexed files\nproject_root: {}\ncwd: {}\nhint: verify the project root/cwd; try `context_pack` again after files exist, or use `tree`/`rg --files` to diagnose discovery.",
+                "context_pack: no indexed files\nproject_root: {}\ncwd: {}\nhint: verify the project root/cwd; try `context_pack` again after files exist, or use `code` kind `tree`/`rg --files` to diagnose discovery.",
                 ctx.session.project_root.display(),
                 ctx.cwd.display()
             )));
@@ -113,7 +113,7 @@ impl Tool for ContextPackTool {
                 };
                 let Some(rel) = resolve_context_path(target, ctx, &files) else {
                     return Err(invalid_input(format!(
-                        "path target `{target}` was not found; try `context_pack` without `target` or run `tree`"
+                        "path target `{target}` was not found; try `context_pack` without `target` or run `code` with kind `tree`"
                     )));
                 };
                 context_pack_path(&index, &files, &rel, depth, limit)
@@ -354,7 +354,7 @@ fn context_pack_overview(
             return Ok(finish(writer, "\n... [truncated; use `circular`]\n"));
         }
     }
-    writer.writeln(&format!("next: context_pack {{target:<path|symbol>, depth:{depth}}}; outline <path>; deps <path>; symbol_find <name>"));
+    writer.writeln(&format!("next: context_pack {{target:<path|symbol>, depth:{depth}}}; code kind=outline path=<path>; deps <path>; code kind=symbol_find name=<name>"));
     Ok(finish(
         writer,
         "\n... [truncated; target a path, symbol, or query]\n",
@@ -426,7 +426,10 @@ fn context_pack_path(
     } else {
         for s in symbols.iter().take(limit) {
             if !write_retained_line(&mut writer, &format!("  {}", format_symbol_line(s))) {
-                return Ok(finish(writer, "\n... [truncated; use `outline`]\n"));
+                return Ok(finish(
+                    writer,
+                    "\n... [truncated; use `code` kind `outline`]\n",
+                ));
             }
         }
         write_omitted(&mut writer, symbols.len(), limit, "symbols");
@@ -482,11 +485,11 @@ fn context_pack_path(
         }
     }
     writer.writeln(&format!(
-        "next: outline {rel}; deps {rel} direction=reverse hops={depth}; read narrow ranges above"
+        "next: code kind=outline path={rel}; deps {rel} direction=reverse hops={depth}; read narrow ranges above"
     ));
     Ok(finish(
         writer,
-        "\n... [truncated; use `outline` or `deps`]\n",
+        "\n... [truncated; use `code` kind `outline` or `deps`]\n",
     ))
 }
 
@@ -578,7 +581,7 @@ fn context_pack_symbol(
         }
     }
     writer.writeln(&format!(
-        "next: impact name={target:?}; read suggested ranges; word token={target:?}"
+        "next: impact name={target:?}; read suggested ranges; code kind=word token={target:?}"
     ));
     Ok(finish(
         writer,
@@ -631,7 +634,10 @@ async fn context_pack_query(
                 .collect::<Vec<_>>()
                 .join(",");
             if !write_retained_line(&mut writer, &format!("  {path}: {joined}")) {
-                return Ok(finish(writer, "\n... [truncated; use `word`]\n"));
+                return Ok(finish(
+                    writer,
+                    "\n... [truncated; use `code` kind `word`]\n",
+                ));
             }
         }
     }
@@ -648,7 +654,7 @@ async fn context_pack_query(
         }
     }
 
-    writer.writeln(&format!("next: search pattern={target:?}; symbol_find name={target:?}; word token={target:?}; read promising anchors"));
+    writer.writeln(&format!("next: search pattern={target:?}; code kind=symbol_find name={target:?}; code kind=word token={target:?}; read promising anchors"));
     Ok(finish(
         writer,
         "\n... [truncated; narrow query or use `search`]\n",

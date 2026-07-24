@@ -38,17 +38,7 @@ use crate::engine::message::Message;
 /// in the new thread. Never `bash`, `write`, `edit` (GOALS §10). `read`
 /// and the read-only intel tools reconstruct the working set; `ls` /
 /// `git status` are surfaced through dedicated seed entries below.
-const SEED_TOOLS: &[&str] = &[
-    "read",
-    "outline",
-    "symbol_find",
-    "word",
-    "deps",
-    "circular",
-    "tree",
-    "search",
-    "impact",
-];
+const SEED_TOOLS: &[&str] = &["read", "code", "deps", "circular", "search", "impact"];
 
 pub fn read_only_seed_tool_names() -> Vec<&'static str> {
     SEED_TOOLS.iter().copied().chain(["grep", "glob"]).collect()
@@ -742,15 +732,21 @@ mod tests {
             call("read", json!({"path": "/a.rs"}), Some("/a.rs"), "x", false),
             call("bash", json!({"command": "ls"}), None, "x", false),
             call("write", json!({"path": "/b.rs"}), Some("/b.rs"), "x", false),
-            call("outline", json!({"path": "/a.rs"}), None, "x", false),
+            call(
+                "code",
+                json!({"kind": "outline", "path": "/a.rs"}),
+                None,
+                "x",
+                false,
+            ),
             // A failed read is not a trustworthy seed.
             call("read", json!({"path": "/c.rs"}), Some("/c.rs"), "err", true),
         ];
         let seeds = derive_seed_tools(&calls);
-        // read /a.rs (deduped) + outline /a.rs — bash, write, failed read excluded.
+        // read /a.rs (deduped) + code outline /a.rs — bash, write, failed read excluded.
         assert_eq!(seeds.len(), 2);
         assert!(seeds.iter().any(|s| s.tool == "read"));
-        assert!(seeds.iter().any(|s| s.tool == "outline"));
+        assert!(seeds.iter().any(|s| s.tool == "code"));
         assert!(!seeds.iter().any(|s| s.tool == "bash" || s.tool == "write"));
     }
 

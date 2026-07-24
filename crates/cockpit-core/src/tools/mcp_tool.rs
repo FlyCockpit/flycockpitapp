@@ -225,7 +225,7 @@ mod tests {
         let disabled = ToolBox::new().with(Arc::new(McpTool));
         let discoverable = ToolBox::new()
             .with(Arc::new(McpTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::intel::WordTool));
+            .with_discoverable_mcp(Arc::new(crate::tools::intel::CodeTool));
 
         assert_eq!(
             mcp_description(&disabled, LlmMode::Normal),
@@ -241,7 +241,7 @@ mod tests {
     fn mcp_description_has_no_advert_suffix() {
         let toolbox = ToolBox::new()
             .with(Arc::new(McpTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::intel::WordTool));
+            .with_discoverable_mcp(Arc::new(crate::tools::intel::CodeTool));
 
         let normal = mcp_description(&toolbox, LlmMode::Normal);
         let defensive = mcp_description(&toolbox, LlmMode::Defensive);

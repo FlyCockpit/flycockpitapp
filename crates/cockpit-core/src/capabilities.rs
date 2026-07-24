@@ -450,7 +450,7 @@ pub fn common_remedy(binary: &str) -> CapabilityRemedy {
             "sudo apt-get install ripgrep",
         ),
         "fd" => CapabilityRemedy::with_unix_command(
-            "Install fd-find or use `tree`/`glob` tools instead.",
+            "Install fd-find or use `code` with kind `tree`, or use `glob`, instead.",
             "sudo apt-get install fd-find",
         ),
         "gsed" => CapabilityRemedy::with_unix_command(

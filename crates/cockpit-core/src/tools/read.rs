@@ -34,15 +34,15 @@ impl Tool for ReadTool {
 
     fn defensive_description(&self) -> Option<String> {
         Some(
-            "After `tree`/`search` shows a file exists, `read` it — do NOT `cat`/`head`/`tail` \
+            "After `code` kind `tree` or `search` shows a file exists, `read` it — do NOT `cat`/`head`/`tail` \
              it; `read` returns line-numbered, budgeted output (it does NOT lock — to edit, \
              `readlock` first). Before calling this, be sure the path is REAL: only read a file \
-             you have already seen in a `tree`, `search`, or bash result. Do NOT guess \
+             you have already seen in a `code` tree, `search`, or bash result. Do NOT guess \
              conventional names like `README`, `LICENSE`, `CONTRIBUTING`, `CODE_OF_CONDUCT` — \
              many repos don't have them, and a read on a path that doesn't exist burns a whole \
-             turn. When unsure, run `tree` first and read what's actually listed. Give exactly \
+             turn. When unsure, run `code` with kind `tree` first and read what's actually listed. Give exactly \
              one concrete file path — not a directory, glob, or list. For a large file don't \
-             re-read the whole thing: page with `offset`+`limit`, or `outline` it to find the \
+             re-read the whole thing: page with `offset`+`limit`, or `code` kind `outline` it to find the \
              right lines and read just that span with `start_line`+`end_line`."
                 .to_string(),
         )
@@ -179,7 +179,7 @@ pub(crate) fn read_impl_outcome_with_path(
     }
 
     // A path that does not exist is the weak-model path-hallucination case
-    // (guessed conventional filenames like `CONTRIBUTING.md`). Steer to `tree`
+    // (guessed conventional filenames like `CONTRIBUTING.md`). Steer to code/tree
     // so the lesson — list before you read — lands at the moment the model
     // errs, matching the recovery-hint convention. Other read errors keep the
     // raw cause.
@@ -267,7 +267,7 @@ pub(crate) fn read_impl_outcome_with_path(
 
 fn directory_recovery(path: &Path, ctx: &ToolCtx) -> ToolOutput {
     let alt = if ctx.has_tree {
-        "; use `tree` to list it"
+        "; use `code` with kind `tree` to list it"
     } else if ctx.has_bash {
         "; use `bash` (e.g. `ls`) to list it"
     } else {
@@ -281,7 +281,7 @@ fn directory_recovery(path: &Path, ctx: &ToolCtx) -> ToolOutput {
 
 fn missing_path_recovery(path: &Path, ctx: &ToolCtx) -> ToolOutput {
     let alt = if ctx.has_tree {
-        "; run `tree` to see existing files before reading"
+        "; run `code` with kind `tree` to see existing files before reading"
     } else if ctx.has_bash {
         "; use `bash` (e.g. `ls`) to see existing files before reading"
     } else {
@@ -447,7 +447,7 @@ mod tests {
         );
     }
 
-    /// Steering variant (a): an agent holding `tree` is pointed at `tree`.
+    /// Steering variant (a): an agent holding `code` is pointed at code/tree.
     #[test]
     fn directory_message_suggests_tree_when_available() {
         let tmp = tempfile::tempdir().unwrap();
@@ -458,11 +458,12 @@ mod tests {
         ctx.has_bash = true; // tree wins even when bash is also present
         let args = serde_json::json!({ "path": dir.to_string_lossy() });
         let out = read_impl(args, &ctx, false).unwrap();
-        assert!(out.content.contains("`tree`"), "got: {}", out.content);
+        assert!(out.content.contains("`code`"), "got: {}", out.content);
+        assert!(out.content.contains("kind `tree`"), "got: {}", out.content);
         assert!(!out.content.contains("`bash`"), "got: {}", out.content);
     }
 
-    /// Steering variant (b): no `tree` but `bash` → suggest `bash`.
+    /// Steering variant (b): no `code` but `bash` → suggest `bash`.
     #[test]
     fn directory_message_suggests_bash_when_no_tree() {
         let tmp = tempfile::tempdir().unwrap();
@@ -474,10 +475,10 @@ mod tests {
         let args = serde_json::json!({ "path": dir.to_string_lossy() });
         let out = read_impl(args, &ctx, false).unwrap();
         assert!(out.content.contains("`bash`"), "got: {}", out.content);
-        assert!(!out.content.contains("`tree`"), "got: {}", out.content);
+        assert!(!out.content.contains("kind `tree`"), "got: {}", out.content);
     }
 
-    /// Steering variant (c): neither `tree` nor `bash` (e.g. the `docs`
+    /// Steering variant (c): neither `code` nor `bash` (e.g. the `docs`
     /// answerer) → no alternative tool is named.
     #[test]
     fn directory_message_suggests_nothing_without_tree_or_bash() {
@@ -494,12 +495,12 @@ mod tests {
             "got: {}",
             out.content
         );
-        assert!(!out.content.contains("`tree`"), "got: {}", out.content);
+        assert!(!out.content.contains("kind `tree`"), "got: {}", out.content);
         assert!(!out.content.contains("`bash`"), "got: {}", out.content);
     }
 
     /// A nonexistent path (the weak-model path-hallucination case) returns a
-    /// non-`Err` recovery message that steers to `tree`, never a raw OS error.
+    /// non-`Err` recovery message that steers to code/tree, never a raw OS error.
     #[test]
     fn nonexistent_path_steers_to_tree_when_available() {
         let tmp = tempfile::tempdir().unwrap();
@@ -514,7 +515,8 @@ mod tests {
             "got: {}",
             out.content
         );
-        assert!(out.content.contains("`tree`"), "got: {}", out.content);
+        assert!(out.content.contains("`code`"), "got: {}", out.content);
+        assert!(out.content.contains("kind `tree`"), "got: {}", out.content);
         assert!(
             !out.content.contains("os error") && !out.content.contains("No such file"),
             "must not leak raw OS error: {}",
@@ -522,7 +524,7 @@ mod tests {
         );
     }
 
-    /// No `tree` but `bash` present → steer to `bash` instead.
+    /// No `code` but `bash` present → steer to `bash` instead.
     #[test]
     fn nonexistent_path_steers_to_bash_when_no_tree() {
         let tmp = tempfile::tempdir().unwrap();
@@ -538,7 +540,7 @@ mod tests {
             out.content
         );
         assert!(out.content.contains("`bash`"), "got: {}", out.content);
-        assert!(!out.content.contains("`tree`"), "got: {}", out.content);
+        assert!(!out.content.contains("kind `tree`"), "got: {}", out.content);
     }
 
     #[test]
@@ -569,7 +571,7 @@ mod tests {
         );
         assert!(
             out.content
-                .contains("; run `tree` to see existing files before reading"),
+                .contains("; run `code` with kind `tree` to see existing files before reading"),
             "got: {}",
             out.content
         );

@@ -447,8 +447,8 @@ mod grant_tests {
     fn discoverable_without_mcp_grant_is_rejected() {
         let def = tiered_def(
             "custom-discoverable",
-            &["read", "word"],
-            "word",
+            &["read", "code"],
+            "code",
             ToolTier::Discoverable,
         );
 
@@ -457,7 +457,7 @@ mod grant_tests {
             .to_string();
 
         assert!(err.contains("custom-discoverable"), "{err}");
-        assert!(err.contains("word"), "{err}");
+        assert!(err.contains("code"), "{err}");
         assert!(err.contains("mcp"), "{err}");
     }
 
@@ -465,20 +465,20 @@ mod grant_tests {
     fn discoverable_with_mcp_grant_is_accepted() {
         let with_mcp = tiered_def(
             "custom-discoverable",
-            &["read", "word", "mcp"],
-            "word",
+            &["read", "code", "mcp"],
+            "code",
             ToolTier::Discoverable,
         );
         let builtin = tiered_def(
             "custom-builtin",
-            &["read", "word"],
-            "word",
+            &["read", "code"],
+            "code",
             ToolTier::Builtin,
         );
         let disabled = tiered_def(
             "custom-disabled",
-            &["read", "word"],
-            "word",
+            &["read", "code"],
+            "code",
             ToolTier::Disabled,
         );
 

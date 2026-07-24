@@ -124,12 +124,9 @@ pub(crate) fn seed_args_schema() -> Value {
 fn read_only_seed_tool_schemas() -> Vec<(&'static str, Value)> {
     let mut schemas = vec![
         crate::tools::read::ReadTool.parameters(),
-        crate::tools::intel::OutlineTool.parameters(),
-        crate::tools::intel::SymbolFindTool.parameters(),
-        crate::tools::intel::WordTool.parameters(),
+        crate::tools::intel::CodeTool.parameters(),
         crate::tools::intel::DepsTool.parameters(),
         crate::tools::intel::CircularTool.parameters(),
-        crate::tools::intel::TreeTool.parameters(),
         crate::tools::intel::SearchTool.parameters(),
         crate::tools::intel::ImpactTool.parameters(),
         crate::tools::grep::GrepTool.parameters(),

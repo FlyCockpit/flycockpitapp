@@ -400,9 +400,9 @@ pub fn first_program(command: &str) -> Option<String> {
 pub enum BashTip {
     /// `cat`/`head`/`tail`/`less`/`more` → `read`.
     Read,
-    /// `grep`/`rg`/`egrep` → `search` (or `word`/`symbol_find`).
+    /// `grep`/`rg`/`egrep` → `search` (or code symbol/word kinds).
     Search,
-    /// `find`/`ls` → `tree`.
+    /// `find`/`ls` → code tree kind.
     Tree,
 }
 
@@ -413,37 +413,37 @@ impl BashTip {
         match self {
             BashTip::Read => "tip: use `read <file>` for line-numbered, budgeted output",
             BashTip::Search => {
-                "tip: use `search` (or `word`/`symbol_find`) — budgeted, won't flood context"
+                "tip: use `search` (or `code` with kind `word`/`symbol_find`) — budgeted, won't flood context"
             }
-            BashTip::Tree => "tip: use `tree` to list indexed files",
+            BashTip::Tree => "tip: use `code` with kind `tree` to list indexed files",
         }
     }
 
     /// The dedicated-tool key that, once successfully used in a session,
-    /// self-suppresses this tip. `read` suppresses the read tip; `search`,
-    /// `word`, and `symbol_find` each suppress the search tip; `tree`
-    /// suppresses the tree tip. Mirrors the `tool → BashTip` map a successful
+    /// self-suppresses this tip. `read` suppresses the read tip; `search`
+    /// suppresses the search tip; `code` suppresses structure tips. Mirrors the
+    /// `tool → BashTip` map a successful
     /// dispatch records.
     pub fn suppressed_by(self) -> &'static [&'static str] {
         match self {
             BashTip::Read => &["read"],
-            BashTip::Search => &["search", "word", "symbol_find"],
-            BashTip::Tree => &["tree"],
+            BashTip::Search => &["search", "code"],
+            BashTip::Tree => &["code"],
         }
     }
 }
 
 /// Which dedicated tool a successfully-run tool name marks as adopted, for the
 /// self-suppression seam — the inverse of [`BashTip::suppressed_by`]. A
-/// successful `read`/`search`/`word`/`symbol_find`/`tree` call stops the
+/// successful `read`/`search`/`code` call stops the
 /// corresponding tip; every other tool returns `None`. Centralized here so the
 /// record site (a successful dispatch) and the emit site (a `bash` run) agree
 /// on the mapping.
 pub fn tip_adopted_by(tool: &str) -> Option<BashTip> {
     match tool {
         "read" => Some(BashTip::Read),
-        "search" | "word" | "symbol_find" => Some(BashTip::Search),
-        "tree" => Some(BashTip::Tree),
+        "search" => Some(BashTip::Search),
+        "code" => Some(BashTip::Tree),
         _ => None,
     }
 }
@@ -1287,9 +1287,7 @@ LastError: boom";
     fn tip_adopted_by_maps_dedicated_tools() {
         assert_eq!(tip_adopted_by("read"), Some(BashTip::Read));
         assert_eq!(tip_adopted_by("search"), Some(BashTip::Search));
-        assert_eq!(tip_adopted_by("word"), Some(BashTip::Search));
-        assert_eq!(tip_adopted_by("symbol_find"), Some(BashTip::Search));
-        assert_eq!(tip_adopted_by("tree"), Some(BashTip::Tree));
+        assert_eq!(tip_adopted_by("code"), Some(BashTip::Tree));
         assert_eq!(tip_adopted_by("bash"), None);
         assert_eq!(tip_adopted_by("outline"), None);
     }

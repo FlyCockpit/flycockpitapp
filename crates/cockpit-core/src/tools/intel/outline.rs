@@ -2,7 +2,7 @@ use super::common::*;
 
 // ---- outline ---------------------------------------------------------------
 
-pub struct OutlineTool;
+pub(in crate::tools::intel) struct OutlineTool;
 
 #[async_trait]
 impl Tool for OutlineTool {
@@ -10,7 +10,7 @@ impl Tool for OutlineTool {
         "outline"
     }
     fn description(&self) -> &str {
-        "Show one file's symbols/imports in line order; use `tree` for file lists, `context_pack` for overview, `read` for contents"
+        "Show one file's symbols/imports in line order; use `code` kind `tree` for file lists, `context_pack` for overview, `read` for contents"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(

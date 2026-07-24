@@ -1,12 +1,12 @@
 //! Codebase-intelligence tools (GOALS §21, Phase 1).
 //!
-//! Eleven tools backed by the on-demand [`crate::intel::Index`]: `tree`,
-//! `outline`, `symbol_find`, `word`, `deps`, `hot`, `circular`,
-//! `search`, `impact`, `change_impact`, and `context_pack`. Each index-backed tool calls
+//! Eight tools backed by the on-demand [`crate::intel::Index`]: `code`,
+//! `deps`, `hot`, `circular`, `search`, `impact`, `change_impact`, and
+//! `context_pack`. Each index-backed tool calls
 //! [`crate::intel::Index::ensure_fresh`] first so it never answers from stale data.
 //! `hot` is pure-FS (no index). `search` uses the shared in-process text
 //! walker, honors gitignore, searches hidden files that gitignore permits, and
-//! prunes `.git/` directories. `search` and `symbol_find` additionally
+//! prunes `.git/` directories. `search` and `code {kind:"symbol_find"}` additionally
 //! apply call-graph centrality ranking (additive, default-on,
 //! config-gated via `extended.intelCentralityRanking`); `impact` reports
 //! a symbol's high-precision-resolved callers and calls.
@@ -19,6 +19,7 @@
 
 mod change_impact;
 mod circular;
+mod code;
 mod common;
 mod context_pack;
 mod deps;
@@ -32,15 +33,12 @@ mod word;
 
 pub use change_impact::ChangeImpactTool;
 pub use circular::CircularTool;
+pub use code::CodeTool;
 pub use context_pack::ContextPackTool;
 pub use deps::DepsTool;
 pub use hot::HotTool;
 pub use impact::ImpactTool;
-pub use outline::OutlineTool;
 pub use search::SearchTool;
-pub use symbol_find::SymbolFindTool;
-pub use tree::TreeTool;
-pub use word::WordTool;
 
 #[cfg(test)]
 use common::bfs;

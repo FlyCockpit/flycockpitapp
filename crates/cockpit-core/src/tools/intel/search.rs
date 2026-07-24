@@ -15,7 +15,7 @@ impl Tool for SearchTool {
         "search"
     }
     fn description(&self) -> &str {
-        "Budgeted repo-wide regex text search; use `grep` for root-confined regex, `word` for identifier uses, `symbol_find` for definitions"
+        "Budgeted repo-wide regex text search; use `grep` for root-confined regex and `code` for identifiers/definitions"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(
@@ -23,8 +23,8 @@ impl Tool for SearchTool {
              power, but budget-capped so it won't flood your context. It returns `file:line` \
              matches for a regular expression. Use it for any text/pattern/comment/string. \
              Narrow with `path`/`glob`, add `context` for surrounding lines. For one specific \
-             identifier the precise tools are better and cheaper: `symbol_find` for where it is \
-             DEFINED, `word` for every USE."
+             identifier, `code {kind:\"symbol_find\"}` finds where it is DEFINED and \
+             `code {kind:\"word\"}` finds every USE."
                 .to_string(),
         )
     }

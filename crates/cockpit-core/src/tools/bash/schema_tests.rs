@@ -15,7 +15,7 @@ fn bash_terse_description_is_within_the_raised_budget() {
 #[test]
 fn bash_terse_description_routes_to_native_tools() {
     let description = BashTool::new().description().to_string();
-    for term in ["read", "search", "tree", "cat", "grep", "ls", "find"] {
+    for term in ["read", "search", "code", "cat", "grep", "ls", "find"] {
         assert!(description.contains(term), "missing {term}: {description}");
     }
 }

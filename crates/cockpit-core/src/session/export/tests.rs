@@ -2457,7 +2457,7 @@ async fn export_truncate_only_result_omits_compressed_byte_len() {
         crate::db::compressed_results::NewCompressedToolResult {
             session_id: sid,
             agent_id: "Build",
-            tool: "tree",
+            tool: "code",
             call_id: "tc-truncated",
             original_byte_len: 128,
             compressed_byte_len: None,
@@ -3053,15 +3053,15 @@ async fn export_sanitizes_tandem_parent_call_id_filename_segment() {
 }
 
 #[tokio::test]
-async fn tandem_validation_marks_valid_read_tree_search_calls() {
+async fn tandem_validation_marks_valid_read_code_search_calls() {
     let request = request_with_tools(vec![
         tool_def("read", crate::tools::read::ReadTool.parameters()),
-        tool_def("tree", crate::tools::intel::TreeTool.parameters()),
+        tool_def("code", crate::tools::intel::CodeTool.parameters()),
         tool_def("search", crate::tools::intel::SearchTool.parameters()),
     ]);
     let response = json!([
         {"type": "tool_use", "name": "read", "input": {"path": "src/main.rs"}},
-        {"type": "tool_use", "name": "tree", "input": {"path": "src"}},
+        {"type": "tool_use", "name": "code", "input": {"kind": "tree", "path": "src"}},
         {"type": "tool_use", "name": "search", "input": {"pattern": "tandem"}},
     ]);
 

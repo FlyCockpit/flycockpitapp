@@ -1387,7 +1387,7 @@ pub(crate) async fn run_turn(
                 .collect(),
         ),
         mcp_builtin_registry: active_tools.mcp_builtin_registry(),
-        has_tree: agent.tools.get("tree").is_some(),
+        has_tree: agent.tools.get("code").is_some(),
         has_bash: agent.tools.get("bash").is_some(),
         // The blocked-`readlock` waiting indicator routes its
         // `WaitingForLock` start/clear pair back through this same turn
@@ -1750,7 +1750,7 @@ mod tests {
         let session = test_session(tmp.path());
         let toolbox = ToolBox::new()
             .with(Arc::new(crate::tools::mcp_tool::McpTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::intel::WordTool));
+            .with_discoverable_mcp(Arc::new(crate::tools::intel::CodeTool));
         let mut history = Vec::new();
 
         inject_turn_start_system_messages(

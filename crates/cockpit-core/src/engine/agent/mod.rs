@@ -1248,7 +1248,7 @@ mod compressed_tool_result_tests {
             partial: false,
         };
 
-        let hash = store_truncated_tool_result(&session, "Build", "tree", "call-1", &retained)
+        let hash = store_truncated_tool_result(&session, "Build", "code", "call-1", &retained)
             .await
             .unwrap();
         let row = session
@@ -1280,7 +1280,7 @@ mod compressed_tool_result_tests {
         let stored = maybe_store_retrievable_truncated_tool_result(
             &session,
             "Build",
-            "tree",
+            "code",
             "call-1",
             &mut delivered,
             Some(&retained),

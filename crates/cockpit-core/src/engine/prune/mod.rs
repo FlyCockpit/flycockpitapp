@@ -54,16 +54,7 @@ pub use overlap::OVERLAP_REASON;
 /// Tools whose repeated identical calls produce a redundant snapshot
 /// body. `read` plus the non-mutating intel tools. `hot`, `bash`,
 /// `edit`, `write` are intentionally absent (see module docs).
-pub const SNAPSHOT_TOOLS: &[&str] = &[
-    "read",
-    "outline",
-    "symbol_find",
-    "word",
-    "deps",
-    "circular",
-    "tree",
-    "search",
-];
+pub const SNAPSHOT_TOOLS: &[&str] = &["read", "code", "deps", "circular", "search"];
 
 pub const COMPRESSED_RESULT_MARKER_PREFIX: &str = "[compressed tool result:";
 pub const REASON_TOOL_RESULT_CONDENSED: &str = "tool result condensed";

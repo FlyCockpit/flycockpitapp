@@ -450,7 +450,7 @@ pub struct ExtendedConfig {
     #[serde(rename = "textEmbeddedRecovery", default)]
     pub text_embedded_recovery: TextEmbeddedRecovery,
 
-    /// Call-graph centrality ranking for the `search` and `symbol_find`
+    /// Call-graph centrality ranking for `search` and `code {kind:"symbol_find"}`
     /// intel tools (GOALS §21, prompt `code-graph-centrality-and-context.md`).
     /// `true` (the default) reorders their results by how central the
     /// matched code is in the call graph — an **additive** signal that
@@ -466,8 +466,8 @@ pub struct ExtendedConfig {
 /// layered — each `config.json` on the walk overlays the previous, so a
 /// project layer's setting overrides a home/global one (same precedence
 /// as [`resolve_preflight`]). A layer that omits the key leaves the
-/// inherited value intact. When off, `search` and `symbol_find` revert to
-/// today's exact ordering.
+/// inherited value intact. When off, `search` and `code {kind:"symbol_find"}`
+/// revert to today's exact ordering.
 pub fn resolve_centrality_ranking(cwd: &Path) -> bool {
     let paths = config_file_paths_for_load(cwd);
     resolve_centrality_ranking_from_paths(&paths)

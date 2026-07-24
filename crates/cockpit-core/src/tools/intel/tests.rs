@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::tool::Tool;
+use crate::engine::tool::{Tool, ToolFailKind, classify_failure};
 use crate::intel::{
     clear_freshness_cache, set_test_recompute_counter, set_test_walk_counter,
     test_recompute_counter_guard,
@@ -21,6 +21,117 @@ fn write(root: &Path, rel: &str, body: &str) {
     std::fs::write(p, body).unwrap();
 }
 
+fn code_args(kind: &str, args: serde_json::Value) -> serde_json::Value {
+    let mut map = match args {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    map.insert(
+        "kind".to_string(),
+        serde_json::Value::String(kind.to_string()),
+    );
+    serde_json::Value::Object(map)
+}
+
+#[tokio::test]
+async fn code_tool_rejects_unknown_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = test_ctx(tmp.path());
+
+    for args in [
+        serde_json::json!({}),
+        serde_json::json!({"kind": ""}),
+        serde_json::json!({"kind": "nope"}),
+    ] {
+        let err = CodeTool.call(args, &ctx).await.unwrap_err();
+        assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
+        let msg = err.to_string();
+        for kind in ["tree", "outline", "symbol_find", "word"] {
+            assert!(msg.contains(kind), "{msg}");
+        }
+    }
+
+    let schema = CodeTool.parameters();
+    assert_eq!(
+        schema["properties"]["kind"]["enum"],
+        serde_json::json!(["tree", "outline", "symbol_find", "word"])
+    );
+    let defensive = CodeTool.defensive_parameters().unwrap();
+    assert_eq!(
+        defensive["properties"]["kind"]["enum"],
+        serde_json::json!(["tree", "outline", "symbol_find", "word"])
+    );
+}
+
+#[tokio::test]
+async fn code_arms_require_their_arguments() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/lib.rs", "pub fn target() {}\n");
+    let ctx = test_ctx(tmp.path());
+
+    let tree = CodeTool
+        .call(serde_json::json!({"kind": "tree"}), &ctx)
+        .await
+        .unwrap();
+    assert!(tree.content.contains("src/lib.rs"), "{}", tree.content);
+
+    for (kind, field) in [
+        ("outline", "path"),
+        ("symbol_find", "name"),
+        ("word", "token"),
+    ] {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::Value::String(String::new()),
+        ] {
+            let mut args = serde_json::Map::new();
+            args.insert(
+                "kind".to_string(),
+                serde_json::Value::String(kind.to_string()),
+            );
+            args.insert(field.to_string(), value);
+            let err = CodeTool
+                .call(serde_json::Value::Object(args), &ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{msg}");
+            assert!(msg.contains(kind), "{msg}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn code_symbol_find_filters_by_symbol_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/lib.rs",
+        "pub fn widget() {}\npub struct Widget;\n",
+    );
+    let ctx = test_ctx(tmp.path());
+
+    let out = CodeTool
+        .call(
+            serde_json::json!({
+                "kind": "symbol_find",
+                "name": "widget",
+                "symbol_kind": "function"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("function widget"), "{}", out.content);
+    assert!(!out.content.contains("struct Widget"), "{}", out.content);
+
+    let schema = CodeTool.parameters();
+    assert!(schema["properties"].get("symbol_kind").is_some());
+    assert!(schema["properties"].get("kind").is_some());
+}
+
 #[tokio::test]
 async fn outline_unknown_language_uses_regex_fallback_without_erroring() {
     let tmp = tempfile::tempdir().unwrap();
@@ -32,7 +143,10 @@ async fn outline_unknown_language_uses_regex_fallback_without_erroring() {
     );
     let ctx = test_ctx(tmp.path());
     let args = serde_json::json!({ "path": "weird.foo" });
-    let out = OutlineTool.call(args, &ctx).await.unwrap();
+    let out = CodeTool
+        .call(code_args("outline", args), &ctx)
+        .await
+        .unwrap();
     assert!(
         out.content.contains("unknown language"),
         "got: {}",
@@ -48,8 +162,11 @@ async fn outline_grammarless_classified_language_uses_regex_fallback() {
     write(tmp.path(), "README.md", "# Notes\n\nplain text\n");
     let ctx = test_ctx(tmp.path());
 
-    let out = OutlineTool
-        .call(serde_json::json!({ "path": "README.md" }), &ctx)
+    let out = CodeTool
+        .call(
+            code_args("outline", serde_json::json!({ "path": "README.md" })),
+            &ctx,
+        )
         .await
         .unwrap();
 
@@ -72,7 +189,10 @@ async fn tree_and_hot_list_unknown_language_files() {
     write(tmp.path(), "notes.foo", "anything\n");
     let ctx = test_ctx(tmp.path());
 
-    let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
+    let tree = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
     assert!(tree.content.contains("src/lib.rs"));
     assert!(tree.content.contains("notes.foo"));
     // The unknown file is visible but flagged as grammarless data.
@@ -117,7 +237,10 @@ async fn tree_lists_files_including_unknown_language_files() {
     write(tmp.path(), "scratch.unknownext", "notes\n");
     let ctx = test_ctx(tmp.path());
 
-    let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
+    let tree = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
 
     assert!(
         tree.content.contains("src/lib.rs  rust"),
@@ -140,7 +263,10 @@ async fn tree_marks_grammarless_data_and_parsed_symbol_counts() {
     write(tmp.path(), "Dockerfile", "FROM scratch\n");
     let ctx = test_ctx(tmp.path());
 
-    let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
+    let tree = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
 
     assert!(
         tree.content.contains("Cargo.toml  toml"),
@@ -185,7 +311,10 @@ async fn tree_uses_stored_lines_and_marks_large_indexed_files() {
         .unwrap();
     let ctx = test_ctx(tmp.path());
 
-    let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
+    let tree = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
 
     assert!(
         tree.content.contains("src/lib.rs  rust 34b 3L"),
@@ -215,9 +344,12 @@ async fn tree_filter_rows_match_unfiltered_subtree_rows() {
     write(tmp.path(), "notes.foo", "notes\n");
     let ctx = test_ctx(tmp.path());
 
-    let unfiltered = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
-    let filtered = TreeTool
-        .call(serde_json::json!({"path": "src"}), &ctx)
+    let unfiltered = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
+    let filtered = CodeTool
+        .call(code_args("tree", serde_json::json!({"path": "src"})), &ctx)
         .await
         .unwrap();
 
@@ -247,8 +379,11 @@ async fn tree_filter_with_no_matches_reports_files_filter_and_hint() {
     write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
     let ctx = test_ctx(tmp.path());
 
-    let tree = TreeTool
-        .call(serde_json::json!({"path": "src/nope"}), &ctx)
+    let tree = CodeTool
+        .call(
+            code_args("tree", serde_json::json!({"path": "src/nope"})),
+            &ctx,
+        )
         .await
         .unwrap();
 
@@ -270,7 +405,8 @@ async fn tree_filter_with_no_matches_reports_files_filter_and_hint() {
         tree.content
     );
     assert!(
-        tree.content.contains("hint: run `tree` without `path`"),
+        tree.content
+            .contains("hint: run `code` with kind `tree` without `path`"),
         "{}",
         tree.content
     );
@@ -292,7 +428,7 @@ async fn tree_root_like_paths_normalize_to_repo_root_listing() {
         serde_json::json!({"path": "/"}),
         serde_json::json!({"path": tmp.path()}),
     ] {
-        let tree = TreeTool.call(args, &ctx).await.unwrap();
+        let tree = CodeTool.call(code_args("tree", args), &ctx).await.unwrap();
         assert!(tree.content.contains("src/lib.rs"), "{}", tree.content);
         assert!(tree.content.contains("README.md"), "{}", tree.content);
         assert!(
@@ -321,13 +457,16 @@ async fn unscoped_tree_call_walks_the_filesystem_once() {
     set_test_index_allowlist(Some(root_key.clone()), Some(Vec::new()));
     set_test_walk_counter(Some(root_key), Some(walks.clone()));
 
-    let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
+    let tree = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
 
     assert!(tree.content.contains("src/lib.rs"), "{}", tree.content);
     assert_eq!(
         walks.load(Ordering::SeqCst),
         1,
-        "warm unscoped TreeTool::call should do exactly one filesystem traversal"
+        "warm unscoped code tree call should do exactly one filesystem traversal"
     );
     set_test_walk_counter(None, None);
     set_test_index_allowlist(None, None);
@@ -346,7 +485,10 @@ async fn tree_call_does_not_recompute_centrality_inline() {
         Some(recomputes.clone()),
     );
 
-    let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
+    let tree = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
 
     assert!(tree.content.contains("src/lib.rs"), "{}", tree.content);
     assert_eq!(
@@ -408,8 +550,14 @@ async fn intel_tools_in_one_turn_recompute_centrality_once() {
         .await
         .unwrap();
     assert!(search.content.contains("src/lib.rs"), "{}", search.content);
-    let symbols = SymbolFindTool
-        .call(serde_json::json!({ "name": "target", "exact": true }), &ctx)
+    let symbols = CodeTool
+        .call(
+            code_args(
+                "symbol_find",
+                serde_json::json!({ "name": "target", "exact": true }),
+            ),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -438,14 +586,14 @@ async fn intel_tools_in_one_turn_recompute_centrality_once() {
 
 #[test]
 fn tree_defensive_description_does_not_mandate_first_call() {
-    let description = TreeTool.defensive_description().unwrap();
+    let description = CodeTool.defensive_description().unwrap();
 
     assert!(!description.contains("FIRST move"), "{description}");
     assert!(
         !description.contains("call it before reading or searching anything"),
         "{description}"
     );
-    assert!(description.contains("Prefer it early"), "{description}");
+    assert!(description.contains("tree"), "{description}");
 }
 
 #[tokio::test]
@@ -453,7 +601,10 @@ async fn tree_empty_project_reports_root_cwd_counts_and_hint() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = test_ctx(tmp.path());
 
-    let tree = TreeTool.call(serde_json::json!({}), &ctx).await.unwrap();
+    let tree = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
 
     assert!(tree.content.contains("project_root:"), "{}", tree.content);
     assert!(tree.content.contains("cwd:"), "{}", tree.content);
@@ -478,9 +629,12 @@ async fn symbol_find_and_word_round_trip_through_call() {
     );
     let ctx = test_ctx(tmp.path());
 
-    let sf = SymbolFindTool
+    let sf = CodeTool
         .call(
-            serde_json::json!({ "name": "target_fn", "exact": true }),
+            code_args(
+                "symbol_find",
+                serde_json::json!({ "name": "target_fn", "exact": true }),
+            ),
             &ctx,
         )
         .await
@@ -488,8 +642,11 @@ async fn symbol_find_and_word_round_trip_through_call() {
     assert!(sf.content.contains("m.rs"));
     assert!(sf.content.contains("target_fn"));
 
-    let w = WordTool
-        .call(serde_json::json!({ "token": "target_fn" }), &ctx)
+    let w = CodeTool
+        .call(
+            code_args("word", serde_json::json!({ "token": "target_fn" })),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(w.content.contains("m.rs"));
@@ -966,8 +1123,14 @@ async fn symbol_find_ranks_central_file_first_and_reverts_when_disabled() {
     // the rarely-called `util.rs` one.
     set_centrality(tmp.path(), true);
     let ctx = test_ctx(tmp.path());
-    let out = SymbolFindTool
-        .call(serde_json::json!({ "name": "widget", "exact": true }), &ctx)
+    let out = CodeTool
+        .call(
+            code_args(
+                "symbol_find",
+                serde_json::json!({ "name": "widget", "exact": true }),
+            ),
+            &ctx,
+        )
         .await
         .unwrap();
     let core_at = out.content.find("core.rs").expect("core.rs present");
@@ -983,9 +1146,12 @@ async fn symbol_find_ranks_central_file_first_and_reverts_when_disabled() {
     // where disabling flips the order to prove the switch bites.
     set_centrality(tmp.path(), false);
     let ctx2 = test_ctx(tmp.path());
-    let off = SymbolFindTool
+    let off = CodeTool
         .call(
-            serde_json::json!({ "name": "widget", "exact": true }),
+            code_args(
+                "symbol_find",
+                serde_json::json!({ "name": "widget", "exact": true }),
+            ),
             &ctx2,
         )
         .await
@@ -1020,8 +1186,14 @@ async fn symbol_find_ranking_flips_order_vs_disabled() {
     // ON: central `zcore.rs` ranked first despite sorting last.
     set_centrality(tmp.path(), true);
     let ctx = test_ctx(tmp.path());
-    let on = SymbolFindTool
-        .call(serde_json::json!({ "name": "gadget", "exact": true }), &ctx)
+    let on = CodeTool
+        .call(
+            code_args(
+                "symbol_find",
+                serde_json::json!({ "name": "gadget", "exact": true }),
+            ),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -1033,9 +1205,12 @@ async fn symbol_find_ranking_flips_order_vs_disabled() {
     // OFF: alphabetical → `acold.rs` first.
     set_centrality(tmp.path(), false);
     let ctx2 = test_ctx(tmp.path());
-    let off = SymbolFindTool
+    let off = CodeTool
         .call(
-            serde_json::json!({ "name": "gadget", "exact": true }),
+            code_args(
+                "symbol_find",
+                serde_json::json!({ "name": "gadget", "exact": true }),
+            ),
             &ctx2,
         )
         .await

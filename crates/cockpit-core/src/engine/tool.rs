@@ -785,14 +785,14 @@ pub struct ToolCtx {
     /// the host control functions plus native tools made scriptable for the
     /// session's tool tier placement.
     pub mcp_builtin_registry: Arc<crate::mcp::builtin::BuiltinRegistry>,
-    /// Whether the calling agent holds the `tree` tool. Lets a tool steer a
+    /// Whether the calling agent holds the `code` tool. Lets a tool steer a
     /// recovery hint to the caller's actual surface (e.g. `read` on a
-    /// directory suggests `tree` only when the agent can use it) rather than
+    /// directory suggests code/tree only when the agent can use it) rather than
     /// name-guessing capabilities. Populated from the agent's `ToolBox` at the
     /// live dispatch site; `false` in test/seed-tool contexts with no toolbox.
     pub has_tree: bool,
     /// Whether the calling agent holds the `bash` tool. The `bash` fallback for
-    /// the same surface-aware recovery hints (used when `tree` is absent).
+    /// the same surface-aware recovery hints (used when `code` is absent).
     pub has_bash: bool,
     /// The per-turn event stream (`engine::agent::TurnEvent`), so a tool that
     /// blocks can surface a transient client indicator without inventing a
@@ -1899,12 +1899,9 @@ mod llm_mode_tests {
     #[test]
     fn sibling_disambiguation_normal_descriptions_name_siblings() {
         let cases: &[(&str, &[&str])] = &[
-            ("search", &["grep", "word", "symbol_find"]),
-            ("grep", &["search", "word", "symbol_find"]),
-            ("word", &["search", "grep", "symbol_find"]),
-            ("symbol_find", &["search", "grep", "word"]),
-            ("outline", &["tree", "context_pack", "read"]),
-            ("tree", &["outline", "context_pack"]),
+            ("search", &["grep", "code"]),
+            ("grep", &["search", "code"]),
+            ("code", &["search", "grep", "context_pack", "read"]),
             ("deps", &["impact", "change_impact"]),
             ("context_pack", &["read"]),
             ("impact", &["change_impact"]),
@@ -1928,6 +1925,58 @@ mod llm_mode_tests {
                     "`{name}` normal description must name sibling `{sibling}`; got: {description}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn code_replaces_removed_structure_tool_names() {
+        let builtin_names: std::collections::BTreeSet<_> = all_builtin_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let inventory_names: std::collections::BTreeSet<_> =
+            crate::engine::builtin::builtin_tool_inventory()
+                .iter()
+                .filter(|item| item.family == "Intel")
+                .map(|item| item.name)
+                .collect();
+        let grant_names: std::collections::BTreeSet<_> =
+            crate::engine::builtin::known_agent_tool_names()
+                .iter()
+                .copied()
+                .collect();
+
+        assert!(builtin_names.contains("code"), "{builtin_names:?}");
+        assert!(inventory_names.contains("code"), "{inventory_names:?}");
+        assert!(grant_names.contains("code"), "{grant_names:?}");
+        for removed in ["tree", "outline", "symbol_find", "word"] {
+            assert!(
+                !builtin_names.contains(removed),
+                "{removed}: {builtin_names:?}"
+            );
+            assert!(
+                !inventory_names.contains(removed),
+                "{removed}: {inventory_names:?}"
+            );
+            assert!(!grant_names.contains(removed), "{removed}: {grant_names:?}");
+        }
+    }
+
+    #[test]
+    fn prune_and_compact_seed_lists_name_registered_tools() {
+        let builtin_names: std::collections::BTreeSet<_> = all_builtin_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        for name in crate::engine::prune::SNAPSHOT_TOOLS
+            .iter()
+            .copied()
+            .chain(crate::engine::compact::read_only_seed_tool_names())
+        {
+            assert!(
+                builtin_names.contains(name),
+                "seed/prune tool `{name}` is not registered: {builtin_names:?}"
+            );
         }
     }
 
@@ -1998,17 +2047,11 @@ mod llm_mode_tests {
     fn definition_of_intel_tools_steer_in_defensive_mode() {
         // (tool, distinctive defensive-only substring from its spec'd prose).
         let cases: Vec<(Arc<dyn Tool>, &str)> = vec![
-            (Arc::new(tools::intel::TreeTool), "Prefer it early"),
+            (Arc::new(tools::intel::CodeTool), "one closed `kind`"),
             (
                 Arc::new(tools::intel::SearchTool),
                 "When you would reach for `rg`/`grep`",
             ),
-            (
-                Arc::new(tools::intel::SymbolFindTool),
-                "is DEFINED — function",
-            ),
-            (Arc::new(tools::intel::WordTool), "identifier TOKEN"),
-            (Arc::new(tools::intel::OutlineTool), "structural outline"),
             (Arc::new(tools::intel::DepsTool), "files that depend on it"),
         ];
         for (tool, needle) in cases {
@@ -2314,6 +2357,7 @@ mod llm_mode_tests {
             ("add-package", ToolEffect::Dynamic),
             ("change_impact", ToolEffect::ReadOnly),
             ("circular", ToolEffect::ReadOnly),
+            ("code", ToolEffect::Dynamic),
             ("context_pack", ToolEffect::Dynamic),
             ("defer_to_orchestrator", ToolEffect::Dynamic),
             ("delegation_payload_retrieve", ToolEffect::Dynamic),
@@ -2332,7 +2376,6 @@ mod llm_mode_tests {
             ("lsp", ToolEffect::ReadOnly),
             ("mcp", ToolEffect::Dynamic),
             ("note", ToolEffect::Dynamic),
-            ("outline", ToolEffect::Dynamic),
             ("plan_edit", ToolEffect::Dynamic),
             ("plan_read", ToolEffect::Dynamic),
             ("plan_write", ToolEffect::Dynamic),
@@ -2349,15 +2392,12 @@ mod llm_mode_tests {
             ("skill_manage", ToolEffect::Dynamic),
             ("spawn", ToolEffect::Dynamic),
             ("start_build", ToolEffect::Dynamic),
-            ("symbol_find", ToolEffect::Dynamic),
             ("task", ToolEffect::Dynamic),
             ("todo", ToolEffect::Dynamic),
             ("tool_result_retrieve", ToolEffect::Dynamic),
-            ("tree", ToolEffect::Dynamic),
             ("unlock", ToolEffect::Dynamic),
             ("webfetch", ToolEffect::Dynamic),
             ("websearch", ToolEffect::Dynamic),
-            ("word", ToolEffect::ReadOnly),
             ("writeunlock", ToolEffect::Dynamic),
         ];
         let expected: BTreeMap<String, _> = expected

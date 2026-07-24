@@ -154,12 +154,12 @@ pub(crate) async fn execute_ordinary_call(
             repair_outcome.valid = false;
             path_not_found = norm.not_found;
             // Steer mid-turn: a nonexistent path is best recovered by
-            // listing what actually exists. Point at `tree` when the agent
+            // listing what actually exists. Point at `code {kind:"tree"}` when the agent
             // holds it (every file-capable primary/subagent does); fall
             // back to the generic repair-layer diagnostic otherwise.
             repair_outcome.error = Some(if path_not_found && env.ctx.has_tree {
                 format!(
-                    "Error: `{}` does not exist; run `tree` to see existing files before reading.",
+                    "Error: `{}` does not exist; run `code` with kind `tree` to see existing files before reading.",
                     args.get("path").and_then(Value::as_str).unwrap_or_default()
                 )
             } else {
@@ -477,8 +477,8 @@ pub(crate) async fn execute_ordinary_call(
 
     // Defensive bash-routing nudge self-suppression
     // (implementation note): a SUCCESSFUL
-    // call to a dedicated file/search tool (`read`/`search`/`word`/
-    // `symbol_find`/`tree`) marks that tip as adopted for the session, so a
+    // call to a dedicated file/search tool (`read`/`search`/`code`) marks that
+    // tip as adopted for the session, so a
     // later `bash` file/search command stops appending the corresponding
     // tip. Recorded once here at the single dispatch chokepoint; the `bash`
     // result-assembly site reads it. Non-tip tools record nothing.
@@ -3027,7 +3027,7 @@ mod tests {
         let stored = maybe_store_retrievable_truncated_tool_result(
             &session,
             "Build",
-            "tree",
+            "code",
             "call-1",
             &mut delivered,
             Some(&retained),

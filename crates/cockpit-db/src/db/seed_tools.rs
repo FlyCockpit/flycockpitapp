@@ -188,13 +188,13 @@ mod tests {
     async fn set_take_round_trip_and_clears() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
-        let seeds = vec![seed("read", "/a.rs"), seed("outline", "/b.rs")];
+        let seeds = vec![seed("read", "/a.rs"), seed("code", "/b.rs")];
         db.set_seed_tools(s.session_id, &seeds).unwrap();
 
         let taken = db.take_seed_tools(s.session_id).unwrap();
         assert_eq!(taken.len(), 2);
         assert_eq!(taken[0].tool, "read");
-        assert_eq!(taken[1].tool, "outline");
+        assert_eq!(taken[1].tool, "code");
 
         // Draining deletes — a second take is empty.
         let again = db.take_seed_tools(s.session_id).unwrap();
@@ -205,12 +205,12 @@ mod tests {
     async fn failed_replacement_rolls_back_prior_plan() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
-        let original = vec![seed("read", "/a.rs"), seed("outline", "/b.rs")];
+        let original = vec![seed("read", "/a.rs"), seed("code", "/b.rs")];
         db.set_seed_tools(s.session_id, &original).unwrap();
 
         let replacement = vec![
             seed("read", "/new-a.rs"),
-            seed("outline", "/new-b.rs"),
+            seed("code", "/new-b.rs"),
             seed("grep", "/new-c.rs"),
         ];
         let err = db
@@ -236,7 +236,7 @@ mod tests {
     async fn failed_drain_rolls_back_delete_for_retry() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
-        let seeds = vec![seed("read", "/a.rs"), seed("outline", "/b.rs")];
+        let seeds = vec![seed("read", "/a.rs"), seed("code", "/b.rs")];
         db.set_seed_tools(s.session_id, &seeds).unwrap();
 
         let err = db
@@ -249,7 +249,7 @@ mod tests {
         let retry = db.take_seed_tools(s.session_id).unwrap();
         assert_eq!(retry.len(), 2);
         assert_eq!(retry[0].tool, "read");
-        assert_eq!(retry[1].tool, "outline");
+        assert_eq!(retry[1].tool, "code");
         assert!(db.take_seed_tools(s.session_id).unwrap().is_empty());
     }
 

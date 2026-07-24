@@ -2,7 +2,7 @@ use super::common::*;
 
 // ---- symbol_find -----------------------------------------------------------
 
-pub struct SymbolFindTool;
+pub(in crate::tools::intel) struct SymbolFindTool;
 
 #[async_trait]
 impl Tool for SymbolFindTool {
@@ -10,7 +10,7 @@ impl Tool for SymbolFindTool {
         "symbol_find"
     }
     fn description(&self) -> &str {
-        "Find symbol definitions by name; use `word` for uses and `search`/`grep` for general text"
+        "Find symbol definitions by name; use `code` kind `word` for uses and `search`/`grep` for general text"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(
@@ -18,7 +18,7 @@ impl Tool for SymbolFindTool {
              the indexed codebase, returning the file + line of each definition. Use this to \
              answer \"where is X defined?\" instead of `bash`/`grep`: it returns definitions only, \
              not every mention. Matches `name` as a prefix by default; set `exact` for an exact \
-             name and `kind` to narrow. To find every USE of a name instead, use `word`."
+             name and `kind` to narrow. To find every USE of a name instead, use `code` kind `word`."
                 .to_string(),
         )
     }

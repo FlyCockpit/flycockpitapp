@@ -1162,13 +1162,13 @@ fn seed_batch_task_delegation(driver: &Driver, task_call_id: &str, labels: &[&st
 // `inject_seeds`: re-execute read-only seeds in the CHILD's cwd and
 // prepend native tool-call/result pairs to the child's initial history.
 
-/// A child agent holding `read` + `outline` (read-only) and `writeunlock`
+/// A child agent holding `read` + `code` (read-only) and `writeunlock`
 /// (write) — enough to assert read-only seeds execute, a write seed is
 /// never executed, and a failed read is surfaced (not aborted).
 fn child_with_read_write_tools(agent: &Arc<Agent>) -> Agent {
     let tools = crate::engine::tool::ToolBox::new()
         .with(std::sync::Arc::new(crate::tools::read::ReadTool))
-        .with(std::sync::Arc::new(crate::tools::intel::OutlineTool))
+        .with(std::sync::Arc::new(crate::tools::intel::CodeTool))
         .with(std::sync::Arc::new(
             crate::tools::writeunlock::WriteunlockTool,
         ));

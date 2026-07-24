@@ -38,7 +38,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Regex content search confined to the current root; use `search` for indexed repo-wide regex, `word` for identifier uses, `symbol_find` for definitions"
+        "Regex content search confined to the current root; use `search` for indexed repo-wide regex and `code` for identifiers/definitions"
     }
 
     fn effect(&self) -> ToolEffect {

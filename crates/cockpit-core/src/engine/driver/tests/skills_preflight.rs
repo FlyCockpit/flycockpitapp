@@ -166,11 +166,11 @@ async fn inject_seeds_skips_tools_the_caller_lacks() {
     let (mut driver, _t) = driver_with_read_caller();
     let task_call_id = "task-1";
     driver.stack[0].history = vec![assistant_with_task_call(task_call_id)];
-    // `outline` is read-only but the caller (read-only `read` toolbox)
+    // `code` is read-only but the caller (read-only `read` toolbox)
     // doesn't hold it → skipped; nothing is folded in.
     let seeds = vec![SeedTool {
-        tool: "outline".into(),
-        args: serde_json::json!({ "path": "/x.rs" }),
+        tool: "code".into(),
+        args: serde_json::json!({ "kind": "outline", "path": "/x.rs" }),
     }];
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let _ = driver.inject_seeds(&seeds, task_call_id, &tx).await;

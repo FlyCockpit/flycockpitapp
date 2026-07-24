@@ -2,7 +2,7 @@ use super::common::*;
 
 // ---- word ------------------------------------------------------------------
 
-pub struct WordTool;
+pub(in crate::tools::intel) struct WordTool;
 
 #[async_trait]
 impl Tool for WordTool {
@@ -10,7 +10,7 @@ impl Tool for WordTool {
         "word"
     }
     fn description(&self) -> &str {
-        "List whole-token identifier uses from the index; use `symbol_find` for definitions and `search`/`grep` for regex text"
+        "List whole-token identifier uses from the index; use `code` kind `symbol_find` for definitions and `search`/`grep` for regex text"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(
@@ -18,7 +18,7 @@ impl Tool for WordTool {
              just the definition — returning the file + line of each. Use this to trace where a \
              function/variable/type is referenced before you change it, instead of `bash`/`grep`. \
              Whole-token matches from the index, not substrings or regex; for general-text/regex \
-             use `search`, for the definition only use `symbol_find`. Set `case_insensitive` to \
+             use `search`, for the definition only use `code` kind `symbol_find`. Set `case_insensitive` to \
              ignore case."
                 .to_string(),
         )

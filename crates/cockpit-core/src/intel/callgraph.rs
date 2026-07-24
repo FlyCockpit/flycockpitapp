@@ -4,7 +4,7 @@
 //! No LLM, no new extraction: this is pure SQL over `intel_callsites`
 //! (already populated, previously write-only) joined against
 //! `intel_symbols`, plus a ranking multiply. It powers two surfaces —
-//! centrality ranking for `search`/`symbol_find` and the standalone
+//! centrality ranking for `search`/code symbol finding and the standalone
 //! `impact` tool — sharing one **name-based, high-precision** edge
 //! resolver.
 //!

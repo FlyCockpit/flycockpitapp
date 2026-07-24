@@ -335,10 +335,7 @@ fn computer_subagent_reachable(
 /// definition of "full intel" rather than each re-spelling the intel tools.
 fn with_full_intel(tb: ToolBox) -> ToolBox {
     tb.with(Arc::new(crate::tools::intel::ContextPackTool))
-        .with(Arc::new(crate::tools::intel::TreeTool))
-        .with(Arc::new(crate::tools::intel::OutlineTool))
-        .with(Arc::new(crate::tools::intel::SymbolFindTool))
-        .with(Arc::new(crate::tools::intel::WordTool))
+        .with(Arc::new(crate::tools::intel::CodeTool))
         .with(Arc::new(crate::tools::intel::DepsTool))
         .with(Arc::new(crate::tools::intel::HotTool))
         .with(Arc::new(crate::tools::intel::CircularTool))
@@ -447,10 +444,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "bash",
         "escalate",
         "context_pack",
-        "tree",
-        "outline",
-        "symbol_find",
-        "word",
+        "code",
         "deps",
         "hot",
         "circular",
@@ -566,26 +560,8 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Intel",
-            name: "tree",
-            summary: "Inspect the project tree with pruning.",
-            condition: None,
-        },
-        BuiltinToolInventoryItem {
-            family: "Intel",
-            name: "outline",
-            summary: "Summarize symbols in source files.",
-            condition: None,
-        },
-        BuiltinToolInventoryItem {
-            family: "Intel",
-            name: "symbol_find",
-            summary: "Find symbols across indexed code.",
-            condition: None,
-        },
-        BuiltinToolInventoryItem {
-            family: "Intel",
-            name: "word",
-            summary: "Search indexed identifiers and words.",
+            name: "code",
+            summary: "Inspect code structure, symbols, and identifier uses.",
             condition: None,
         },
         BuiltinToolInventoryItem {
@@ -814,10 +790,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::bash::BashTool::new()),
         Arc::new(tools::escalate::EscalateTool),
         Arc::new(tools::intel::ContextPackTool),
-        Arc::new(tools::intel::TreeTool),
-        Arc::new(tools::intel::OutlineTool),
-        Arc::new(tools::intel::SymbolFindTool),
-        Arc::new(tools::intel::WordTool),
+        Arc::new(tools::intel::CodeTool),
         Arc::new(tools::intel::DepsTool),
         Arc::new(tools::intel::HotTool),
         Arc::new(tools::intel::CircularTool),
@@ -889,10 +862,7 @@ fn materialize_tool_by_name(
         "editunlock" => tb.with(Arc::new(tools::editunlock::EditunlockTool)),
         "unlock" => tb.with(Arc::new(tools::unlock::UnlockTool)),
         "context_pack" => tb.with(Arc::new(tools::intel::ContextPackTool)),
-        "tree" => tb.with(Arc::new(tools::intel::TreeTool)),
-        "outline" => tb.with(Arc::new(tools::intel::OutlineTool)),
-        "symbol_find" => tb.with(Arc::new(tools::intel::SymbolFindTool)),
-        "word" => tb.with(Arc::new(tools::intel::WordTool)),
+        "code" => tb.with(Arc::new(tools::intel::CodeTool)),
         "deps" => tb.with(Arc::new(tools::intel::DepsTool)),
         "hot" => tb.with(Arc::new(tools::intel::HotTool)),
         "circular" => tb.with(Arc::new(tools::intel::CircularTool)),
@@ -1258,7 +1228,6 @@ fn disabled_tier_names(def: &crate::agents::AgentDef) -> std::collections::BTree
 pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static str] {
     match name {
         "Build" | "builder" | "Plan" => &[
-            "word",
             "hot",
             "circular",
             "impact",
@@ -1697,21 +1666,10 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
 /// read-only investigator surface (`explore`'s grant). Conservative:
 /// never includes write/lock or structural-delegation tools.
 fn default_custom_tools() -> Vec<String> {
-    [
-        "read",
-        "bash",
-        "tree",
-        "outline",
-        "symbol_find",
-        "word",
-        "deps",
-        "hot",
-        "circular",
-        "search",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    ["read", "bash", "code", "deps", "hot", "circular", "search"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn default_assistant_tools() -> Vec<String> {
@@ -2634,7 +2592,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         let mut tool_tiers = std::collections::BTreeMap::new();
-        tool_tiers.insert("word".to_string(), ToolTier::Discoverable);
+        tool_tiers.insert("code".to_string(), ToolTier::Discoverable);
         tool_tiers.insert("search".to_string(), ToolTier::Disabled);
         let def = AgentDef {
             name: "custom-tiered".to_string(),
@@ -2644,7 +2602,7 @@ mod tests {
             temperature: None,
             tools: Some(vec![
                 "read".to_string(),
-                "word".to_string(),
+                "code".to_string(),
                 "search".to_string(),
                 "mcp".to_string(),
             ]),
@@ -2659,7 +2617,7 @@ mod tests {
         let agent = agent_from_def(&def, &args).unwrap();
         let names = agent.tools.names();
         assert!(names.contains(&"read"), "{names:?}");
-        assert!(!names.contains(&"word"), "{names:?}");
+        assert!(!names.contains(&"code"), "{names:?}");
         assert!(!names.contains(&"search"), "{names:?}");
 
         let host = host_for_agent(&agent, tmp.path());
@@ -2670,16 +2628,16 @@ mod tests {
                 .contains("direct builtin tool")
         );
         assert!(
-            !crate::mcp::builtin::describe(&host, "word")
+            !crate::mcp::builtin::describe(&host, "code")
                 .unwrap()
                 .description
                 .contains("direct builtin tool")
         );
         assert!(crate::mcp::builtin::describe(&host, "search").is_err());
         assert!(
-            crate::mcp::builtin::search(&host, "word")
+            crate::mcp::builtin::search(&host, "code")
                 .iter()
-                .any(|hit| hit.tool == "word")
+                .any(|hit| hit.tool == "code")
         );
         assert!(
             crate::mcp::builtin::search(&host, "search")
@@ -2775,7 +2733,6 @@ mod tests {
         let host = host_for_agent(&agent, tmp.path());
 
         for tool in [
-            "word",
             "hot",
             "circular",
             "impact",
@@ -2804,9 +2761,7 @@ mod tests {
             "editunlock",
             "unlock",
             "search",
-            "tree",
-            "outline",
-            "symbol_find",
+            "code",
             "deps",
             "context_pack",
             "todo",
@@ -2992,7 +2947,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         let mut tool_tiers = std::collections::BTreeMap::new();
-        tool_tiers.insert("word".to_string(), ToolTier::Discoverable);
+        tool_tiers.insert("code".to_string(), ToolTier::Discoverable);
         let mut def = AgentDef {
             name: "custom-tiered".to_string(),
             description: "custom".to_string(),
@@ -3001,7 +2956,7 @@ mod tests {
             temperature: None,
             tools: Some(vec![
                 "read".to_string(),
-                "word".to_string(),
+                "code".to_string(),
                 "mcp".to_string(),
             ]),
             tool_tiers,
@@ -3013,10 +2968,10 @@ mod tests {
             source: tmp.path().join("custom-tiered.md"),
         };
         let agent = agent_from_def(&def, &args).unwrap();
-        def.tool_tiers.insert("word".to_string(), ToolTier::Builtin);
+        def.tool_tiers.insert("code".to_string(), ToolTier::Builtin);
 
-        assert!(!agent.tools.names().contains(&"word"));
-        assert!(crate::mcp::builtin::describe(&host_for_agent(&agent, tmp.path()), "word").is_ok());
+        assert!(!agent.tools.names().contains(&"code"));
+        assert!(crate::mcp::builtin::describe(&host_for_agent(&agent, tmp.path()), "code").is_ok());
     }
 
     #[test]
@@ -3151,7 +3106,7 @@ mod tests {
             let discoverable = agent.tools.discoverable_mcp_tool_names();
 
             assert!(discoverable.is_empty(), "`{name}`: {discoverable:?}");
-            for tool in ["word", "hot", "circular", "impact", "change_impact"] {
+            for tool in ["code", "hot", "circular", "impact", "change_impact"] {
                 assert!(
                     names.contains(&tool),
                     "`{name}` missing `{tool}`: {names:?}"
@@ -4216,14 +4171,7 @@ mod tests {
             ("explore", EXPLORE_PROMPT),
             ("explore.normal", EXPLORE_PROMPT_NORMAL),
         ] {
-            for tool in [
-                "context_pack",
-                "tree",
-                "symbol_find",
-                "search",
-                "impact",
-                "bash",
-            ] {
+            for tool in ["context_pack", "code", "search", "impact", "bash"] {
                 assert!(
                     prompt.contains(tool),
                     "`{name}` prompt must mention `{tool}`"
@@ -4816,7 +4764,7 @@ mod tests {
             "writeunlock",
             "editunlock",
             "unlock",
-            "tree",
+            "code",
             "search",
             "skill",
             "task",

@@ -353,10 +353,10 @@ mod tests {
 
     #[test]
     fn single_bare_object_no_fence() {
-        let content = "{\"name\":\"tree\",\"arguments\":{}}";
+        let content = "{\"name\":\"code\",\"arguments\":{\"kind\":\"tree\"}}";
         let e = extract_candidate(content).expect("recovers");
-        assert_eq!(e.candidate_name, "tree");
-        assert_eq!(e.raw_args, json!({}));
+        assert_eq!(e.candidate_name, "code");
+        assert_eq!(e.raw_args, json!({"kind": "tree"}));
     }
 
     #[test]
@@ -373,10 +373,9 @@ mod tests {
     fn think_block_stripped_before_gate() {
         // A leading `<think>` is reasoning, not prose: stripping it leaves a
         // sole bare-JSON payload, which recovers.
-        let content =
-            "<think>I should review the code</think>\n{\"name\":\"tree\",\"arguments\":{}}";
+        let content = "<think>I should review the code</think>\n{\"name\":\"code\",\"arguments\":{\"kind\":\"tree\"}}";
         let e = extract_candidate(content).expect("recovers after think-strip");
-        assert_eq!(e.candidate_name, "tree");
+        assert_eq!(e.candidate_name, "code");
     }
 
     #[test]

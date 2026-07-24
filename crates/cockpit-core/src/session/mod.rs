@@ -290,7 +290,7 @@ pub struct Session {
     /// Dedicated tools the model has SUCCESSFULLY used this session, for the
     /// defensive-mode bash-routing nudge's self-suppression
     /// (implementation note). Keyed by the
-    /// tip-target tool name (`read`/`search`/`word`/`symbol_find`/`tree`): once
+    /// tip-target tool name (`read`/`search`/`code`): once
     /// a name is present, the bash tip pointing to it stops being appended.
     /// In-memory only — a fresh attach starts the nudges over, which is correct
     /// (the nudge is a within-run teaching aid). Recorded at the dispatch site
@@ -355,7 +355,7 @@ impl Session {
     /// Record that the model successfully used the dedicated tool `tool` this
     /// session, for the defensive bash-routing nudge's self-suppression
     /// (implementation note). Only the
-    /// tip-target names (`read`/`search`/`word`/`symbol_find`/`tree`) carry
+    /// tip-target names (`read`/`search`/`code`) carry
     /// meaning; other names are stored inertly. Idempotent. Called at the
     /// dispatch site on a successful call.
     pub fn record_tip_tool_used(&self, tool: &str) {

@@ -72,7 +72,7 @@ impl Default for BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        let description = "Run one shell command. Fresh shell each call: cd/env do NOT persist; use cwd or &&. Prefer read/search/tree over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers, editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources for expensive builds/tests; log verbose output to $TMPDIR."
+        let description = "Run one shell command. Fresh shell each call: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers, editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources for expensive builds/tests; log verbose output to $TMPDIR."
             .to_string();
 
         // The defensive, explicitly-steering form (`llm-modes-
@@ -83,9 +83,9 @@ impl BashTool {
              Use `bash` ONLY to *run* things. For working with files the dedicated tools are \
              faster, budget-capped, and index-backed — reach for them instead: read a file → \
              `read` (NOT `cat`/`head`/`tail`/`less`); see what files exist or lay out a repo → \
-             `tree` (NOT `ls`/`find`); search text or a pattern → `search` (NOT `rg`/`grep`); \
-             find where a name is defined or used → `symbol_find` / `word` (NOT `grep`); see a \
-             file's functions/types without reading it → `outline`. If you are about to pipe \
+             `code` kind `tree` (NOT `ls`/`find`); search text or a pattern → `search` (NOT `rg`/`grep`); \
+             find where a name is defined or used → `code` kind `symbol_find` / `code` kind `word` (NOT `grep`); see a \
+             file's functions/types without reading it → `code` kind `outline`. If you are about to pipe \
              `cat`, `rg`, `grep`, `ls`, or `find` through bash, stop and use the tool above \
              instead. Each call is its own shell: `cd`/env changes do NOT persist — chain with \
              `&&` or set `cwd`. This is non-interactive: stdin is /dev/null, so pagers, \

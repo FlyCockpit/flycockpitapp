@@ -366,8 +366,8 @@ mod loop_collapse_tests {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session =
             crate::session::Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
-        let args = serde_json::json!({"path": "src/nope"});
-        let signature = crate::approval::store::GrantStore::loop_signature("tree", &args);
+        let args = serde_json::json!({"kind": "tree", "path": "src/nope"});
+        let signature = crate::approval::store::GrantStore::loop_signature("code", &args);
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let first_result = if let Some(msg) =
@@ -376,7 +376,7 @@ mod loop_collapse_tests {
             Err(invalid_input(msg))
         } else {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(ToolOutput::text("No files match filter `src/nope`.\nempty_reason: `path` filter excluded all discovered files\nhint: run `tree` without `path` or use a different subtree.").with_repeat_guard("Previous `tree` call with the same `path` already returned no matches. Do not repeat it. Run `tree` without `path` to list the repo root, or choose a different subtree."))
+            Ok(ToolOutput::text("No files match filter `src/nope`.\nempty_reason: `path` filter excluded all discovered files\nhint: run `code` with kind `tree` without `path` or use a different subtree.").with_repeat_guard("Previous `code` call with kind `tree` and the same `path` already returned no matches. Do not repeat it. Run `code` with kind `tree` without `path` to list the repo root, or choose a different subtree."))
         };
         let first_guard = match &first_result {
             Ok(out) => out.repeat_guard.clone(),
@@ -398,7 +398,8 @@ mod loop_collapse_tests {
         let err = second_result.expect_err("second identical call should short-circuit");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(
-            err.to_string().contains("Run `tree` without `path`"),
+            err.to_string()
+                .contains("Run `code` with kind `tree` without `path`"),
             "{err}"
         );
     }

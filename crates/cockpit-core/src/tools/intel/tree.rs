@@ -28,12 +28,12 @@ fn tree_filter_path(args: &Value, ctx: &ToolCtx) -> (Option<String>, Option<Valu
 }
 
 fn tree_repeat_guard_message() -> &'static str {
-    "Previous `tree` call with the same `path` already returned no matches. Do not repeat it. Run `tree` without `path` to list the repo root, or choose a different subtree."
+    "Previous `code` call with kind `tree` and the same `path` already returned no matches. Do not repeat it. Run `code` with kind `tree` without `path` to list the repo root, or choose a different subtree."
 }
 
 // ---- tree ------------------------------------------------------------------
 
-pub struct TreeTool;
+pub(in crate::tools::intel) struct TreeTool;
 
 #[async_trait]
 impl Tool for TreeTool {
@@ -41,7 +41,7 @@ impl Tool for TreeTool {
         "tree"
     }
     fn description(&self) -> &str {
-        "List indexed files with metadata; use `outline` for one file's shape and `context_pack` for a broader codebase packet"
+        "List indexed files with metadata; use `code` kind `outline` for one file's shape and `context_pack` for a broader codebase packet"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(
@@ -50,7 +50,7 @@ impl Tool for TreeTool {
              already know to choose precise files before reading or searching. It lists discovered \
              files; if the result is empty, treat the diagnostic as a project-root/cwd or `path` \
              filter problem and recover with its hint. Use it instead of `ls`/`find` in `bash`. After it: \
-             `read` a specific file, or `outline` it for its shape."
+             `read` a specific file, or `code` kind `outline` it for its shape."
                 .to_string(),
         )
     }
@@ -166,7 +166,9 @@ fn tree_empty_diagnostic(
     out.push_str(&format!("indexed_files: {indexed_files}\n"));
     if filter.is_some() {
         out.push_str("empty_reason: `path` filter excluded all discovered files\n");
-        out.push_str("hint: run `tree` without `path` or use a different subtree.");
+        out.push_str(
+            "hint: run `code` with kind `tree` without `path` or use a different subtree.",
+        );
     } else if fs_files == 0 {
         out.push_str("empty_reason: zero discovered files\n");
         out.push_str(

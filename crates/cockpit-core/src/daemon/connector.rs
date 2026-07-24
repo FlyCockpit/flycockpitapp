@@ -704,6 +704,9 @@ async fn run_socket(
                             channels.remove(&frame.channel_id);
                         }
                     }
+                    IncomingRelayFrame::Unknown { v, kind } => {
+                        tracing::warn!(version = v, kind = %kind, "unknown relay frame skipped");
+                    }
                 }
             }
         }

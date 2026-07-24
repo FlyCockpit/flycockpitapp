@@ -199,6 +199,7 @@ pub struct DaemonControlRelayFrame {
 pub enum DaemonRelayFrame {
     Client(DaemonClientRelayFrame),
     Control(DaemonControlRelayFrame),
+    Unknown { v: u32, kind: String },
 }
 
 impl<'de> Deserialize<'de> for DaemonRelayFrame {
@@ -210,6 +211,21 @@ impl<'de> Deserialize<'de> for DaemonRelayFrame {
         let object = value
             .as_object()
             .ok_or_else(|| serde::de::Error::custom("expected relay frame object"))?;
+        let unknown_kind = object
+            .get("type")
+            .or_else(|| object.get("kind"))
+            .map(|value| match value {
+                Value::String(kind) if !kind.is_empty() => Ok(kind.clone()),
+                _ => Err("expected non-empty daemon relay frame kind"),
+            })
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        if let Some(kind) = unknown_kind {
+            let v = serde_json::from_value::<RelayEnvelopeVersionProbe>(value)
+                .map_err(serde::de::Error::custom)?
+                .v;
+            return Ok(Self::Unknown { v, kind });
+        }
         if object.contains_key("to") {
             return serde_json::from_value::<DaemonControlRelayFrame>(value)
                 .map(Self::Control)
@@ -331,6 +347,7 @@ pub enum SystemFrameType {
 pub enum IncomingRelayFrame {
     Client(StampedClientRelayFrame),
     System(SystemRelayFrame),
+    Unknown { v: u32, kind: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -359,6 +376,8 @@ pub enum RelayControlMessage {
         user_id: String,
         notification: RelayNotification,
     },
+    #[serde(other)]
+    Unknown,
 }
 
 pub fn parse_incoming(value: &str) -> serde_json::Result<IncomingRelayFrame> {
@@ -367,7 +386,13 @@ pub fn parse_incoming(value: &str) -> serde_json::Result<IncomingRelayFrame> {
         .as_object()
         .is_some_and(|object| object.contains_key("type"))
     {
-        return serde_json::from_value::<SystemRelayFrame>(parsed).map(IncomingRelayFrame::System);
+        let kind = serde_json::from_value::<RelayFrameKindProbe>(parsed.clone())?.kind;
+        if kind == "system" {
+            return serde_json::from_value::<SystemRelayFrame>(parsed)
+                .map(IncomingRelayFrame::System);
+        }
+        let v = serde_json::from_value::<RelayEnvelopeVersionProbe>(parsed)?.v;
+        return Ok(IncomingRelayFrame::Unknown { v, kind });
     }
     serde_json::from_value::<StampedClientRelayFrame>(parsed).map(IncomingRelayFrame::Client)
 }
@@ -415,6 +440,19 @@ where
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayEnvelopeVersionProbe {
+    #[serde(deserialize_with = "relay_envelope_version")]
+    v: u32,
+}
+
+#[derive(Deserialize)]
+struct RelayFrameKindProbe {
+    #[serde(rename = "type", deserialize_with = "non_empty_string")]
+    kind: String,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -447,6 +485,7 @@ mod tests {
                 assert_eq!(frame.payload, json!({"kind": "req"}));
             }
             IncomingRelayFrame::System(_) => panic!("expected client frame"),
+            IncomingRelayFrame::Unknown { .. } => panic!("expected client frame"),
         }
     }
 
@@ -544,24 +583,60 @@ mod tests {
                 assert_eq!(frame.payload, json!({"kind": "notice"}));
             }
             DaemonRelayFrame::Client(_) => panic!("control frame routed as client frame"),
+            DaemonRelayFrame::Unknown { .. } => panic!("control frame routed as unknown frame"),
         }
     }
 
     #[test]
-    fn forward_compat_unknown_incoming_frame_kind_is_not_ignored() {
-        let raw = r#"{
-          "v": 1,
-          "type": "mystery",
-          "channelId": "ch-1",
-          "from": "client",
-          "principal": {
-            "userId": "user-1",
-            "grants": [{ "scope": "terminal", "projectRoot": null }]
-          },
-          "payload": { "kind": "req" }
-        }"#;
+    fn frame_kind_unknown_is_tolerated() {
+        let raw = fs::read_to_string(
+            fixture_root()
+                .join("forward-compat")
+                .join("unknown-frame-kind.json"),
+        )
+        .unwrap();
 
-        assert!(parse_incoming(raw).is_err());
+        let frame = parse_incoming(&raw).unwrap();
+
+        assert_eq!(
+            frame,
+            IncomingRelayFrame::Unknown {
+                v: RELAY_ENVELOPE_VERSION,
+                kind: "mystery".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn frame_kind_unknown_with_bad_version_still_rejected() {
+        let raw = json!({
+            "v": RELAY_ENVELOPE_VERSION + 1,
+            "type": "mystery",
+            "payload": {}
+        })
+        .to_string();
+
+        assert!(parse_incoming(&raw).is_err());
+    }
+
+    #[test]
+    fn daemon_unknown_frame_kind_takes_precedence_over_known_shape_fields() {
+        let raw = json!({
+            "v": RELAY_ENVELOPE_VERSION,
+            "type": "future_daemon_frame",
+            "channelId": "future-channel",
+            "payload": {}
+        });
+
+        let frame = serde_json::from_value::<DaemonRelayFrame>(raw).unwrap();
+
+        assert_eq!(
+            frame,
+            DaemonRelayFrame::Unknown {
+                v: RELAY_ENVELOPE_VERSION,
+                kind: "future_daemon_frame".to_string()
+            }
+        );
     }
 
     #[test]

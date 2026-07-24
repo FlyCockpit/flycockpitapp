@@ -1024,6 +1024,12 @@ impl RelayState {
                     client.tx.send_bytes_deferred(data);
                 }
             }
+            DaemonFrameRoute::Unknown { kind } => {
+                log_warn(format_args!(
+                    "unknown daemon relay frame skipped instance={} connection={} kind={}",
+                    daemon.instance_id, daemon.connection_id, kind
+                ));
+            }
         }
         Ok(())
     }
@@ -1267,6 +1273,9 @@ impl RelayState {
                     user.tx.send_system("forced_disconnect", None);
                     user.tx.close_code(CLOSE_FORCED);
                 }
+            }
+            RelayControlMessage::Unknown => {
+                log_warn(format_args!("unknown relay control message skipped"));
             }
         }
     }
@@ -1680,6 +1689,10 @@ async fn control(
             .into_response();
     }
     match serde_json::from_slice::<RelayControlMessage>(&body) {
+        Ok(RelayControlMessage::Unknown) => {
+            log_warn(format_args!("unknown relay control ingest skipped"));
+            (StatusCode::OK, Json(serde_json::json!({"ok":true}))).into_response()
+        }
         Ok(message) => {
             state.handle_control(message.clone()).await;
             state.presence.publish_control(message).await;
@@ -1970,62 +1983,38 @@ enum PresenceType {
     Presence,
 }
 
-struct RawDaemonFrameRouteProbe {
-    to: bool,
-    channel_id: bool,
-}
-
-impl<'de> Deserialize<'de> for RawDaemonFrameRouteProbe {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct ProbeVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for ProbeVisitor {
-            type Value = RawDaemonFrameRouteProbe;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("daemon relay frame object")
-            }
-
-            fn visit_map<A>(
-                self,
-                mut map: A,
-            ) -> std::result::Result<RawDaemonFrameRouteProbe, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                let mut to = false;
-                let mut channel_id = false;
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "to" => to = true,
-                        "channelId" => channel_id = true,
-                        _ => {}
-                    }
-                    let _ = map.next_value::<serde::de::IgnoredAny>()?;
-                }
-                Ok(RawDaemonFrameRouteProbe { to, channel_id })
-            }
-        }
-
-        deserializer.deserialize_map(ProbeVisitor)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DaemonFrameRoute {
     Client,
     Control,
+    Unknown { kind: String },
 }
 
 fn daemon_frame_route(data: &[u8]) -> Result<DaemonFrameRoute> {
-    let probe = serde_json::from_slice::<RawDaemonFrameRouteProbe>(data)?;
-    if probe.to {
+    let value = serde_json::from_slice::<serde_json::Value>(data)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("expected daemon relay frame object"))?;
+    if let Some(kind) = object.get("type").or_else(|| object.get("kind")) {
+        let Some(kind) = kind.as_str().filter(|kind| !kind.is_empty()) else {
+            return Err(anyhow!("expected non-empty daemon relay frame kind"));
+        };
+        let Some(raw_version) = object.get("v").and_then(serde_json::Value::as_u64) else {
+            return Err(anyhow!("missing relay envelope version"));
+        };
+        let version = u32::try_from(raw_version)
+            .map_err(|_| anyhow!("unsupported relay envelope version"))?;
+        if !is_relay_envelope_version_supported(version) {
+            return Err(anyhow!("unsupported relay envelope version"));
+        }
+        return Ok(DaemonFrameRoute::Unknown {
+            kind: kind.to_string(),
+        });
+    }
+    if object.contains_key("to") {
         return Ok(DaemonFrameRoute::Control);
     }
-    if probe.channel_id {
+    if object.contains_key("channelId") {
         return Ok(DaemonFrameRoute::Client);
     }
     Err(anyhow!("unknown daemon relay frame shape"))
@@ -2316,10 +2305,23 @@ impl RedisPresenceStore {
             let mut stream = pubsub.on_message();
             while let Some(message) = stream.next().await {
                 let raw: redis::RedisResult<String> = message.get_payload();
-                if let Ok(raw) = raw
-                    && let Ok(message) = serde_json::from_str::<RelayControlMessage>(&raw)
-                {
-                    let _ = tx.send(message);
+                match raw {
+                    Ok(raw) => match serde_json::from_str::<RelayControlMessage>(&raw) {
+                        Ok(RelayControlMessage::Unknown) => {
+                            log_warn(format_args!("unknown redis relay control message skipped"));
+                        }
+                        Ok(message) => {
+                            let _ = tx.send(message);
+                        }
+                        Err(err) => {
+                            log_warn(format_args!("malformed redis relay control message: {err}"));
+                        }
+                    },
+                    Err(err) => {
+                        log_warn(format_args!(
+                            "redis relay control payload read failed: {err}"
+                        ));
+                    }
                 }
             }
         });
@@ -2622,6 +2624,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_ingest_unknown_type_is_accepted_and_ignored() {
+        let store = MemoryPresenceStore::default();
+        let mut control_rx = store.subscribe_control();
+        let state = Arc::new(RelayState::new(
+            test_config_with_control_secret("secret"),
+            PresenceStore::Memory(store),
+            test_verifier(),
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+
+        let response = control(
+            AxumState(state.clone()),
+            headers.clone(),
+            Bytes::from_static(br#"{"type":"future_control","payload":{}}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(control_rx.try_recv().is_err());
+
+        let malformed = control(
+            AxumState(state),
+            headers,
+            Bytes::from_static(br#"{"type":"notify_user"}"#),
+        )
+        .await;
+
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn daemon_unknown_frame_kind_is_skipped_not_fatal() {
+        let state = RelayState::new(
+            test_config(),
+            PresenceStore::Memory(MemoryPresenceStore::default()),
+            test_verifier(),
+        );
+        let (tx, mut rx) = test_connection_tx();
+        let daemon = test_daemon_connection(tx);
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "v": flycockpit_relay_protocol::RELAY_ENVELOPE_VERSION,
+            "type": "future_daemon_frame",
+            "channelId": "future-channel",
+            "payload": {}
+        }))
+        .unwrap();
+
+        state.handle_daemon_frame(&daemon, raw).await.unwrap();
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn daemon_malformed_frame_still_closes() {
+        let state = RelayState::new(
+            test_config(),
+            PresenceStore::Memory(MemoryPresenceStore::default()),
+            test_verifier(),
+        );
+        let (tx, _rx) = test_connection_tx();
+        let daemon = test_daemon_connection(tx);
+        let malformed = serde_json::to_vec(&serde_json::json!({
+            "v": flycockpit_relay_protocol::RELAY_ENVELOPE_VERSION,
+            "payload": {}
+        }))
+        .unwrap();
+        let unsupported_version = serde_json::to_vec(&serde_json::json!({
+            "v": flycockpit_relay_protocol::RELAY_ENVELOPE_VERSION + 1,
+            "type": "future_daemon_frame",
+            "payload": {}
+        }))
+        .unwrap();
+
+        assert!(state.handle_daemon_frame(&daemon, malformed).await.is_err());
+        assert!(
+            state
+                .handle_daemon_frame(&daemon, unsupported_version)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn notify_user_with_unknown_attention_type_is_forwarded_not_dropped() {
         let raw = serde_json::json!({
             "type": "notify_user",
@@ -2792,7 +2878,17 @@ mod tests {
     }
 
     fn test_config() -> Arc<Config> {
-        Arc::new(Config {
+        Arc::new(test_config_value())
+    }
+
+    fn test_config_with_control_secret(secret: &str) -> Arc<Config> {
+        let mut config = test_config_value();
+        config.control_secret = Some(secret.to_string());
+        Arc::new(config)
+    }
+
+    fn test_config_value() -> Config {
+        Config {
             relay_id: "relay-test".to_string(),
             token_issuer: "https://example.test".to_string(),
             jwks_url: "https://example.test/jwks.json".to_string(),
@@ -2809,7 +2905,25 @@ mod tests {
             mode: RelayMode::Embedded,
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             fleet: None,
-        })
+        }
+    }
+
+    fn test_verifier() -> JwtVerifier {
+        JwtVerifier::new(
+            "https://example.test/jwks.json".to_string(),
+            "https://example.test".to_string(),
+            "flycockpit-relay".to_string(),
+        )
+    }
+
+    fn test_daemon_connection(tx: ConnectionTx) -> DaemonConnection {
+        DaemonConnection {
+            tx,
+            connection_id: "daemon-connection-1".to_string(),
+            instance_id: "instance-1".to_string(),
+            frame_count: 0,
+            byte_count: 0,
+        }
     }
 
     fn test_connection_tx() -> (ConnectionTx, mpsc::Receiver<Outbound>) {

@@ -693,7 +693,7 @@ impl App {
         !self.at_dismissed && self.composer.at_query().is_some()
     }
 
-    pub(super) fn at_suggestions(&self) -> Vec<crate::tui::file_tag::Suggestion> {
+    pub(super) fn at_suggestions(&self) -> Vec<cockpit_core::tags::Suggestion> {
         let Some(q) = self.composer.at_query() else {
             self.at_cache.borrow_mut().take();
             return Vec::new();
@@ -713,8 +713,7 @@ impl App {
         // entries render exactly like persisted ones (dimmed, `gitignored`).
         let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
         allow.extend(self.gitignore_session_allow.clone());
-        let walked =
-            crate::tui::file_tag::suggestions(&self.launch.cwd, q, &self.usage_tags, &allow);
+        let walked = cockpit_core::tags::suggestions(&self.launch.cwd, q, &self.usage_tags, &allow);
         *self.at_cache.borrow_mut() = Some((q.to_string(), walked.clone()));
         walked
     }

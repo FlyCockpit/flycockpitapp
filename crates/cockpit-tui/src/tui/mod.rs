@@ -29,7 +29,6 @@ pub mod dialog;
 pub mod diff;
 pub mod diff_pane;
 pub mod dir_suggest;
-pub mod file_tag;
 pub mod geometry;
 pub mod history;
 pub mod input_source;

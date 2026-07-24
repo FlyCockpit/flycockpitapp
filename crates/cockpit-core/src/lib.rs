@@ -51,6 +51,7 @@ pub mod skills;
 pub mod startup;
 pub mod sync;
 pub mod sysinfo;
+pub mod tags;
 #[cfg(test)]
 pub mod test_env;
 pub mod text;

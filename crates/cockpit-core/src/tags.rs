@@ -11,10 +11,10 @@ use std::path::{Component, Path, PathBuf};
 
 use ignore::WalkBuilder;
 
-use cockpit_config::extended::LlmMode;
-use cockpit_core::tools::common::{
+use crate::tools::common::{
     OUTPUT_BYTE_CAP, READ_LINE_CAP, looks_binary, read_slice_with_byte_cap, truncation_marker,
 };
+use cockpit_config::extended::LlmMode;
 
 /// Maximum number of file suggestions returned to the TUI. The renderer
 /// shows a six-row window and scrolls within this bounded candidate list.
@@ -107,8 +107,7 @@ pub fn suggestions(
 ) -> Vec<Suggestion> {
     // The allowlist anchors at the enclosing worktree root, identical to the
     // read gate's matching root.
-    let allow_root =
-        cockpit_core::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let allow_root = crate::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
     let query = query.trim_start_matches('@');
     let (dir_part, name_part) = split_query(query);
     let search_root = if dir_part.is_empty() {
@@ -236,7 +235,7 @@ fn level_entries(dir: &Path, allow_root: &Path, allow: &[String]) -> Vec<(PathBu
     // Re-include allowlisted-but-gitignored immediate children: a depth-1
     // gitignore-off walk, keeping only entries the allowlist re-permits.
     if !allow.is_empty() {
-        let matcher = cockpit_core::gitignore::build_allowlist_matcher(allow_root, allow);
+        let matcher = crate::gitignore::build_allowlist_matcher(allow_root, allow);
         if !matcher.is_empty() {
             let mut wide = WalkBuilder::new(dir);
             wide.hidden(false)
@@ -256,7 +255,7 @@ fn level_entries(dir: &Path, allow_root: &Path, allow: &[String]) -> Vec<(PathBu
                 if seen.contains(&path) {
                     continue;
                 }
-                if !cockpit_core::gitignore::allowlist_matches(&path, allow_root, allow) {
+                if !crate::gitignore::allowlist_matches(&path, allow_root, allow) {
                     continue;
                 }
                 let is_dir = dent.file_type().is_some_and(|t| t.is_dir());
@@ -302,8 +301,15 @@ fn parse_tag_body(body: &str) -> (&str, Option<(usize, usize)>) {
 
 fn parse_range(s: &str) -> Option<(usize, usize)> {
     if let Some((a, b)) = s.split_once('-') {
-        let start: usize = a.parse().ok()?;
-        let end: usize = b.parse().ok()?;
+        if a.is_empty() && b.is_empty() {
+            return None;
+        }
+        let start: usize = if a.is_empty() { 1 } else { a.parse().ok()? };
+        let end: usize = if b.is_empty() {
+            usize::MAX
+        } else {
+            b.parse().ok()?
+        };
         if start == 0 || end < start {
             return None;
         }
@@ -331,7 +337,7 @@ pub struct TagExpansion {
     pub ok: bool,
 }
 
-impl From<TagExpansion> for cockpit_core::daemon::proto::TagExpansionMeta {
+impl From<TagExpansion> for crate::daemon::proto::TagExpansionMeta {
     fn from(expansion: TagExpansion) -> Self {
         Self {
             tool: expansion.tool.to_string(),
@@ -371,8 +377,7 @@ impl TagPolicy {
 
     pub fn new_for_mode(cwd: &Path, allow: Vec<String>, mode: LlmMode) -> Self {
         let cwd_resolved = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        let allow_root =
-            cockpit_core::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+        let allow_root = crate::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
         Self {
             cwd: cwd.to_path_buf(),
             cwd_resolved,
@@ -727,7 +732,7 @@ fn check_policy(
         ));
     }
 
-    if !cockpit_core::gitignore::is_permitted(&target, &policy.allow_root, policy.allow()) {
+    if !crate::gitignore::is_permitted(&target, &policy.allow_root, policy.allow()) {
         return Some(skip(
             policy_tool_for(resolved),
             path_part,
@@ -787,6 +792,7 @@ fn render_file(
     caps: TagInlineCaps,
 ) -> (String, usize) {
     let (offset, limit) = match range {
+        Some((start, usize::MAX)) => (start, caps.max_lines),
         Some((start, end)) => (start, end - start + 1),
         None => (1, caps.max_lines),
     };
@@ -1077,6 +1083,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_range_open_ended() {
+        assert_eq!(parse_range("10-"), Some((10, usize::MAX)));
+        assert_eq!(parse_range("-50"), Some((1, 50)));
+        assert_eq!(parse_range("0"), None);
+        assert_eq!(parse_range("-0"), None);
+        assert_eq!(parse_range("0-"), None);
+        assert_eq!(parse_range("10-5"), None);
+        assert_eq!(parse_range("-"), None);
+        assert_eq!(parse_range("nope"), None);
+    }
+
+    #[test]
     fn parse_tag_body_splits_path_and_range() {
         assert_eq!(parse_tag_body("foo.rs"), ("foo.rs", None));
         assert_eq!(parse_tag_body("foo.rs:42"), ("foo.rs", Some((42, 42))));
@@ -1141,6 +1159,22 @@ mod tests {
     }
 
     #[test]
+    fn open_ended_over_cap_range_truncates_not_references() {
+        let root = tmp_root();
+        let mut big = String::new();
+        for i in 0..3000 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        fs::write(root.path().join("big.rs"), big).unwrap();
+        let res = expand_tags("@big.rs:10-", root.path());
+        assert!(res.wire.contains("<file"), "wire: {}", res.wire);
+        assert!(res.wire.contains("[truncated"), "wire: {}", res.wire);
+        assert!(!res.wire.contains("not inlined"), "wire: {}", res.wire);
+        assert_eq!(res.expansions.len(), 1);
+        assert!(res.expansions[0].ok);
+    }
+
+    #[test]
     fn needs_quoting_flags_spaces_only() {
         assert!(needs_quoting("src/my file.rs"));
         assert!(!needs_quoting("src/plain.rs"));
@@ -1191,6 +1225,37 @@ mod tests {
         assert!(out.contains("line6"));
         assert!(out.contains("line7"));
         assert!(!out.contains("line8"));
+    }
+
+    #[test]
+    fn expand_tags_open_ended_range_from_start() {
+        let root = tmp_root();
+        let p = root.path().join("nums.txt");
+        let mut f = fs::File::create(&p).unwrap();
+        for i in 1..=12 {
+            writeln!(f, "line{i}").unwrap();
+        }
+        let out = expand_tags("@nums.txt:10-", root.path()).wire;
+        assert!(out.contains("<file path=\"nums.txt\">"));
+        assert!(out.contains("10|line10"));
+        assert!(out.contains("11|line11"));
+        assert!(out.contains("12|line12"));
+        assert!(!out.contains("9|line9"));
+    }
+
+    #[test]
+    fn expand_tags_open_ended_range_to_line() {
+        let root = tmp_root();
+        let p = root.path().join("nums.txt");
+        let mut f = fs::File::create(&p).unwrap();
+        for i in 1..=60 {
+            writeln!(f, "line{i}").unwrap();
+        }
+        let out = expand_tags("@nums.txt:-50", root.path()).wire;
+        assert!(out.contains("<file path=\"nums.txt\">"));
+        assert!(out.contains("1|line1"));
+        assert!(out.contains("50|line50"));
+        assert!(!out.contains("51|line51"));
     }
 
     #[test]
@@ -1404,6 +1469,23 @@ mod tests {
             "wire: {}",
             missing_inside.wire
         );
+    }
+
+    #[test]
+    fn open_ended_range_still_obeys_containment() {
+        let tmp = tmp_root();
+        let cwd = tmp.path().join("project");
+        fs::create_dir(&cwd).unwrap();
+        fs::write(tmp.path().join("outside.txt"), "outside\n").unwrap();
+
+        let policy = TagPolicy::new(&cwd, Vec::new());
+        let escape = expand_tags_with_policy("@../outside.txt:10-", &policy);
+        assert!(
+            escape.wire.contains("path escapes the project"),
+            "wire: {}",
+            escape.wire
+        );
+        assert!(!escape.wire.contains("outside\n"), "wire: {}", escape.wire);
     }
 
     #[cfg(unix)]

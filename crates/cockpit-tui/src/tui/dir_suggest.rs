@@ -9,8 +9,8 @@
 //! - Hidden (dotfile) directories are included (`~/.config` is reachable).
 //! - No gitignore filtering: a system path is routinely outside any git
 //!   repo, so this uses a plain [`std::fs::read_dir`], **not** the
-//!   gitignore-aware `ignore` walker that `file_tag.rs` uses. The
-//!   ranking/formatting shape is borrowed from `file_tag.rs`; the walk is
+//!   gitignore-aware `ignore` walker that `cockpit_core::tags` uses. The
+//!   ranking/formatting shape is borrowed from `cockpit_core::tags`; the walk is
 //!   not.
 //!
 //! Autosuggest is purely additive: a non-existent / unreadable parent

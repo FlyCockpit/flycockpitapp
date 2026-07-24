@@ -1429,7 +1429,7 @@ impl App {
         let finalize = enter || !sug.is_dir;
         if finalize {
             // Record spaced/special paths so the submit-time quoting
-            // pass (file_tag) can wrap them — keeps the display clean
+            // tag expansion can wrap them — keeps the display clean
             // while the wire payload stays unambiguous.
             self.note_accepted_tag(&sug.replacement);
             // Tally the committed tag (per-project) for frequency-ranked
@@ -1469,7 +1469,7 @@ impl App {
     /// shell-special character, so the submit-time pass can quote it.
     /// Plain paths need no tracking and are skipped.
     pub(super) fn note_accepted_tag(&mut self, path: &str) {
-        if crate::tui::file_tag::needs_quoting(path)
+        if cockpit_core::tags::needs_quoting(path)
             && !self.accepted_tags.contains(&path.to_string())
         {
             self.accepted_tags.push(path.to_string());
@@ -2054,12 +2054,12 @@ impl App {
         // the scanner reads them as one token (the composer stays clean).
         // Tag expansion runs over the paste-expanded wire so a tag and a
         // pasted block can coexist in one message.
-        let quoted = crate::tui::file_tag::quote_tracked_tags(&paste_wire, &self.accepted_tags);
+        let quoted = cockpit_core::tags::quote_tracked_tags(&paste_wire, &self.accepted_tags);
         let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
         allow.extend(self.gitignore_session_allow.clone());
         let tag_policy =
-            crate::tui::file_tag::TagPolicy::new_for_mode(&self.launch.cwd, allow, self.llm_mode);
-        let expanded = crate::tui::file_tag::expand_tags_with_policy(&quoted, &tag_policy);
+            cockpit_core::tags::TagPolicy::new_for_mode(&self.launch.cwd, allow, self.llm_mode);
+        let expanded = cockpit_core::tags::expand_tags_with_policy(&quoted, &tag_policy);
         // Attach any buffered `/git` blocks to this message's wire text
         // (GOALS §1l). The displayed user message keeps the original
         // text (wire/user split); only the agent-bound wire carries the

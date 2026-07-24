@@ -1698,8 +1698,7 @@ pub struct App {
     /// re-walked on every render / arrow keypress. Keyed by the exact
     /// `@`-query string; recomputed when the query changes. `RefCell`
     /// because `at_suggestions` is called from `&self` render paths.
-    pub(super) at_cache:
-        std::cell::RefCell<Option<(String, Vec<crate::tui::file_tag::Suggestion>)>>,
+    pub(super) at_cache: std::cell::RefCell<Option<(String, Vec<cockpit_core::tags::Suggestion>)>>,
     /// Accepted `@`-tag paths that contain a space / shell-special char.
     /// Tracked so the submit-time pass can wrap them in quotes (the
     /// composer shows them unquoted; the wire payload needs the quotes

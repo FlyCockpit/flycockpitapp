@@ -119,8 +119,9 @@ impl LockManager {
         canon: &Path,
         agent: &str,
         session: Uuid,
+        record_read: bool,
     ) -> Result<Option<(Uuid, AgentId)>> {
-        let read_hash = file_hash(canon);
+        let read_hash = record_read.then(|| file_hash(canon));
         let mut state = crate::sync::lock_or_recover(&self.inner);
         match state.held.get(canon) {
             Some((s, a)) if *s == session && a == agent => return Ok(None),
@@ -131,21 +132,31 @@ impl LockManager {
             .held
             .insert(canon.to_path_buf(), (session, agent.to_string()));
         state.touched.insert(canon.to_path_buf(), now_secs());
-        state
-            .read_tracker
-            .entry((session, agent.to_string()))
-            .or_default()
-            .insert(canon.to_path_buf(), read_hash);
+        if record_read {
+            state
+                .read_tracker
+                .entry((session, agent.to_string()))
+                .or_default()
+                .insert(canon.to_path_buf(), read_hash.flatten());
+        }
         let was_forced_released = state.forced_released.contains(canon);
         drop(state);
-        let acquire_result = if was_forced_released {
+        let acquire_result = if record_read && was_forced_released {
             self.db
-                .lock_force_acquire_with_read(canon, agent, session, read_hash)
+                .lock_force_acquire_with_read(canon, agent, session, read_hash.flatten())
                 .context("persisting forced lock_acquire/read")
+        } else if was_forced_released {
+            self.db
+                .lock_force_acquire(canon, agent, session)
+                .context("persisting forced lock_acquire")
+        } else if record_read {
+            self.db
+                .lock_acquire_with_read(canon, agent, session, read_hash.flatten())
+                .context("persisting lock_acquire/read")
         } else {
             self.db
-                .lock_acquire_with_read(canon, agent, session, read_hash)
-                .context("persisting lock_acquire/read")
+                .lock_acquire(canon, agent, session)
+                .context("persisting lock_acquire")
         };
         if let Err(error) = acquire_result {
             let mut state = crate::sync::lock_or_recover(&self.inner);
@@ -153,7 +164,9 @@ impl LockManager {
                 state.held.remove(canon);
                 state.touched.remove(canon);
             }
-            if let Some(reads) = state.read_tracker.get_mut(&(session, agent.to_string())) {
+            if record_read
+                && let Some(reads) = state.read_tracker.get_mut(&(session, agent.to_string()))
+            {
                 reads.remove(canon);
                 if reads.is_empty() {
                     state.read_tracker.remove(&(session, agent.to_string()));
@@ -192,7 +205,42 @@ impl LockManager {
         agent: &str,
         session: Uuid,
         cancel: &tokio_util::sync::CancellationToken,
+        on_wait: F,
+    ) -> Result<AcquireWait>
+    where
+        F: FnMut(&(Uuid, AgentId)),
+    {
+        self.acquire_wait_inner(path, agent, session, cancel, on_wait, true)
+            .await
+    }
+
+    /// Waiting acquire for write tools. It uses the same waiter/cancel/timeout
+    /// machinery as [`Self::acquire_wait`] but deliberately does not refresh
+    /// the caller's read record; the write guard must validate the read hash
+    /// captured by an earlier `read`/`readlock`.
+    pub async fn acquire_wait_without_read<F>(
+        &self,
+        path: &Path,
+        agent: &str,
+        session: Uuid,
+        cancel: &tokio_util::sync::CancellationToken,
+        on_wait: F,
+    ) -> Result<AcquireWait>
+    where
+        F: FnMut(&(Uuid, AgentId)),
+    {
+        self.acquire_wait_inner(path, agent, session, cancel, on_wait, false)
+            .await
+    }
+
+    async fn acquire_wait_inner<F>(
+        &self,
+        path: &Path,
+        agent: &str,
+        session: Uuid,
+        cancel: &tokio_util::sync::CancellationToken,
         mut on_wait: F,
+        record_read: bool,
     ) -> Result<AcquireWait>
     where
         F: FnMut(&(Uuid, AgentId)),
@@ -200,7 +248,10 @@ impl LockManager {
         let canon = canonicalize(path);
         let waiter_key = (session, agent.to_string());
         // Fast path: acquire immediately if free / already ours.
-        if self.try_acquire(&canon, agent, session)?.is_none() {
+        if self
+            .try_acquire(&canon, agent, session, record_read)?
+            .is_none()
+        {
             self.clear_waiter(&waiter_key);
             return Ok(AcquireWait::Acquired);
         }
@@ -218,7 +269,7 @@ impl LockManager {
 
             // Re-check under the lock: a release may have landed since the
             // last attempt (or since `enable()`). If acquired, we're done.
-            match self.try_acquire(&canon, agent, session)? {
+            match self.try_acquire(&canon, agent, session, record_read)? {
                 None => {
                     self.clear_waiter(&waiter_key);
                     return Ok(AcquireWait::Acquired);
@@ -597,6 +648,72 @@ impl LockManager {
             agent: agent_id,
             session,
             acquired_by_guard,
+            active: true,
+        })
+    }
+
+    /// Finish write-guard setup after a caller has already acquired the lock
+    /// through the waiting path. `acquired_by_wait` means this call owns the
+    /// hold and should release it on success/drop; `require_fresh_read` keeps
+    /// the §3c stale-content guard load-bearing for existing-file writes.
+    pub fn begin_write_after_wait<'a>(
+        &'a self,
+        path: &Path,
+        agent: &str,
+        session: Uuid,
+        tool_name: &str,
+        acquired_by_wait: bool,
+        require_fresh_read: bool,
+    ) -> Result<WriteGuard<'a>> {
+        let canon = canonicalize(path);
+        let agent_id = agent.to_string();
+        let result = {
+            let state = crate::sync::lock_or_recover(&self.inner);
+            match state.held.get(&canon) {
+                Some((s, a)) if *s == session && a == agent => {
+                    if require_fresh_read {
+                        let read_hash = state
+                            .read_tracker
+                            .get(&(session, agent_id.clone()))
+                            .and_then(|s| s.get(&canon).copied());
+                        match read_hash {
+                            None => Err(crate::engine::tool::invalid_input(
+                                ValidationCorrection::write_requires_readlock(&canon, tool_name)
+                                    .model_message(),
+                            )),
+                            Some(Some(expected)) if file_hash(&canon) == Some(expected) => Ok(()),
+                            Some(_) => Err(crate::engine::tool::invalid_input(stale_read_message(
+                                &canon,
+                            ))),
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }
+                Some((s, a)) => Err(crate::engine::tool::invalid_input(format!(
+                    "cannot write `{}` — `{a}` holds the lock in session {s}; wait for it to release or pick a different file",
+                    canon.display()
+                ))),
+                None => Err(crate::engine::tool::invalid_input(format!(
+                    "cannot write `{}` — lock was not acquired for this write; retry the tool call",
+                    canon.display()
+                ))),
+            }
+        };
+
+        if let Err(error) = result {
+            if acquired_by_wait {
+                let _ = self.release_force_memory(&canon, agent, session);
+            }
+            return Err(error);
+        }
+
+        Ok(WriteGuard {
+            locks: self,
+            path: canon,
+            agent: agent_id,
+            session,
+            acquired_by_guard: acquired_by_wait,
             active: true,
         })
     }

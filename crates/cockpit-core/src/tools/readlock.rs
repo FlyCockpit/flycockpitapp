@@ -8,9 +8,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::engine::agent::TurnEvent;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args};
-use crate::locks::AcquireWait;
 use crate::tools::common::resolve;
 use crate::tools::read::ReadOutcome;
 
@@ -93,60 +91,8 @@ impl Tool for ReadlockTool {
         if let Some(refusal) = crate::tools::sandbox::check_gitignore_read(ctx, &path).await? {
             return Ok(refusal);
         }
-        // Waiting acquire (`readlock-wait-and-lock-expiry.md`): a busy path
-        // is intentional turn-taking, not a failure — block until the holder
-        // releases, then read. While blocked we emit a transient
-        // `WaitingForLock` start (naming the holder) and always clear it on
-        // exit, so the TUI shows the indicator alongside the fixed chrome and
-        // never strands it. The wait races the per-turn cancel token, so
-        // ctrl+C aborts promptly via the normal turn-cancel path.
-        let events = ctx.events.clone();
-        let waiting_path = path.display().to_string();
-        let did_wait = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let outcome = ctx
-            .locks
-            .acquire_wait(&path, &ctx.agent_id, ctx.session.id, &ctx.cancel, {
-                let events = events.clone();
-                let waiting_path = waiting_path.clone();
-                let did_wait = did_wait.clone();
-                move |(_, holder_agent)| {
-                    did_wait.store(true, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(tx) = events.as_ref() {
-                        let _ = tx.try_send(TurnEvent::WaitingForLock {
-                            path: waiting_path.clone(),
-                            holder_agent: holder_agent.clone(),
-                            waiting: true,
-                        });
-                    }
-                }
-            })
-            .await?;
-
-        // Clear the transient indicator on every exit path (acquired or
-        // cancelled) — but only if a wait actually started, so the
-        // immediate-acquire fast path emits nothing. `holder_agent` is
-        // irrelevant on a clear; the client keys it on `path` +
-        // `waiting == false`.
-        if did_wait.load(std::sync::atomic::Ordering::Relaxed)
-            && let Some(tx) = events.as_ref()
-        {
-            let _ = tx
-                .send(TurnEvent::WaitingForLock {
-                    path: waiting_path,
-                    holder_agent: String::new(),
-                    waiting: false,
-                })
-                .await;
-        }
-
-        match outcome {
-            AcquireWait::Acquired => {
-                finish_acquired_readlock(args, ctx, path, |path| std::fs::read(path))
-            }
-            // Cancelled mid-wait: surface the normal turn-cancel error so the
-            // turn unwinds (no lock acquired, no read).
-            AcquireWait::Cancelled => Err(anyhow::anyhow!("readlock cancelled")),
-        }
+        crate::tools::lock_wait::acquire_waiting(ctx, &path, self.name(), true).await?;
+        finish_acquired_readlock(args, ctx, path, |path| std::fs::read(path))
     }
 }
 

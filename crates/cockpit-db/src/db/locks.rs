@@ -211,6 +211,32 @@ impl Db {
         })
     }
 
+    /// Acquire a lock after the in-memory manager already forced a release
+    /// because deleting the stale `lock_state` row failed, without changing
+    /// the caller's read-record state.
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
+    )]
+    pub fn lock_force_acquire(&self, path: &Path, agent_id: &str, session_id: Uuid) -> Result<()> {
+        let now = Utc::now().timestamp();
+        let p = path_string(path);
+        let agent_id = agent_id.to_owned();
+        self.write_blocking(move |conn| {
+            conn.execute(
+                "INSERT INTO lock_state (path, agent_id, session_id, acquired_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(path) DO UPDATE SET
+                     agent_id = excluded.agent_id,
+                     session_id = excluded.session_id,
+                     acquired_at = excluded.acquired_at",
+                params![p, agent_id, session_id.to_string(), now],
+            )
+            .context("forcing lock_state acquire")?;
+            Ok(())
+        })
+    }
+
     /// Delete a read record that has been invalidated by lock expiry or
     /// failed drift/taken resume. No-op when the row is already gone.
     #[expect(
@@ -631,6 +657,29 @@ mod tests {
         assert_eq!(reads[0].read_hash, Some(u64::MAX - 3));
         assert_eq!(reads[1].path, "/x/without.rs");
         assert_eq!(reads[1].read_hash, None);
+    }
+
+    #[tokio::test]
+    async fn lock_force_acquire_replaces_stale_row_without_read() {
+        let db = Db::open_in_memory().unwrap();
+        let s_a = db.create_session("p", "/x", "a").await.unwrap();
+        let s_b = db.create_session("p", "/x", "b").await.unwrap();
+        let p = std::path::PathBuf::from("/x/forced.rs");
+
+        db.lock_acquire_with_read(&p, "writer-a", s_a.session_id, Some(7))
+            .unwrap();
+        db.lock_force_acquire(&p, "writer-b", s_b.session_id)
+            .unwrap();
+
+        let locks = db.list_held_locks().unwrap();
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].agent_id, "writer-b");
+        assert_eq!(locks[0].session_id, s_b.session_id);
+        let reads = db.list_lock_reads().unwrap();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].agent_id, "writer-a");
+        assert_eq!(reads[0].session_id, s_a.session_id);
+        assert_eq!(reads[0].read_hash, Some(7));
     }
 
     #[expect(

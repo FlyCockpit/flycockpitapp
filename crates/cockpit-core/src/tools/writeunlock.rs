@@ -23,12 +23,13 @@ impl Tool for WriteunlockTool {
     }
 
     fn description(&self) -> &str {
-        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted) and release the lock; new files or full rewrites only; prior read/readlock required for existing files; prefer `editunlock` for small changes"
+        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted); locking is automatic, so no separate lock call is needed before writing; existing files require prior read/readlock; prefer `editunlock` for small changes"
     }
 
     fn defensive_description(&self) -> Option<String> {
         Some(
-            "Replace a file's ENTIRE contents with the text you supply, then release the lock. \
+            "Replace a file's ENTIRE contents with the text you supply. Locking is automatic: \
+             do not call a separate lock tool before writing. \
              `content` must be the complete new file from first line to last — anything you omit \
              is deleted, so include every line you want to keep, not just your changes. Use \
              `writeunlock` for new files or full rewrites; existing files require prior \
@@ -96,14 +97,16 @@ impl Tool for WriteunlockTool {
             };
 
         let exists = path.exists();
-        let write_guard = if exists {
-            Some(
-                ctx.locks
-                    .begin_write(&path, &ctx.agent_id, ctx.session.id, self.name())?,
-            )
-        } else {
-            None
-        };
+        let acquire =
+            crate::tools::lock_wait::acquire_waiting(ctx, &path, self.name(), false).await?;
+        let write_guard = ctx.locks.begin_write_after_wait(
+            &path,
+            &ctx.agent_id,
+            ctx.session.id,
+            self.name(),
+            !acquire.preexisting_hold,
+            exists,
+        )?;
 
         // Decide line-ending mode based on the existing file (when
         // present). For new files default to LF on every platform —
@@ -119,9 +122,9 @@ impl Tool for WriteunlockTool {
         let normalized = normalize_line_endings(content, want_crlf);
 
         let outcome = if exists {
-            write_and_release(ctx, &path, normalized.as_bytes(), write_guard.unwrap())?
+            write_and_release(ctx, &path, normalized.as_bytes(), write_guard)?
         } else {
-            create_new_and_release(ctx, &path, normalized.as_bytes(), create_new_file)?
+            create_new_and_release(&path, normalized.as_bytes(), write_guard, create_new_file)?
         };
         crate::assistants::identity::record_identity_write(ctx, &path)?;
 
@@ -152,9 +155,9 @@ impl Tool for WriteunlockTool {
 }
 
 fn create_new_and_release(
-    ctx: &ToolCtx,
     path: &std::path::Path,
     bytes: &[u8],
+    guard: crate::locks::WriteGuard<'_>,
     create_file: impl FnOnce(&std::path::Path, &[u8]) -> std::io::Result<()>,
 ) -> Result<crate::tools::common::WriteReleaseOutcome> {
     ensure_parent_dirs(path)?;
@@ -168,9 +171,7 @@ fn create_new_and_release(
             anyhow::anyhow!("create `{}`: {err}", path.display())
         }
     })?;
-    let persist_ok = ctx
-        .locks
-        .release_force_memory(path, &ctx.agent_id, ctx.session.id);
+    let persist_ok = guard.release_after_write();
     Ok(crate::tools::common::WriteReleaseOutcome { persist_ok })
 }
 
@@ -207,8 +208,11 @@ fn create_new_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> 
 mod tests {
     use super::*;
     use crate::db::Db;
+    use crate::engine::agent::TurnEvent;
+    use crate::engine::tool::{ToolFailKind, classify_failure};
     use crate::tools::common::{LOCK_BOOKKEEPING_ADVISORY, test_ctx, test_ctx_with_db};
     use crate::tools::readlock::ReadlockTool;
+    use std::sync::Arc;
 
     #[expect(
         deprecated,
@@ -228,6 +232,92 @@ mod tests {
         .unwrap();
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
+    )]
+    fn identity_refusal_ctx(home: &std::path::Path) -> ToolCtx {
+        crate::assistants::identity::seed_identity_files(home).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let cfg = crate::assistants::AssistantConfig {
+            agent_source: home.join("assistant.md").display().to_string(),
+            soul_edit_mode: crate::assistants::identity::SoulEditMode::HumanOnly,
+            soul_hash: crate::assistants::identity::hash_optional_file(
+                &crate::assistants::identity::soul_path(home),
+            )
+            .unwrap(),
+            user_hash: crate::assistants::identity::hash_optional_file(
+                &crate::assistants::identity::user_path(home),
+            )
+            .unwrap(),
+            ..crate::assistants::AssistantConfig::default()
+        };
+        db.upsert_assistant(
+            "helper",
+            &home.display().to_string(),
+            &serde_json::to_string(&cfg).unwrap(),
+            "hash",
+        )
+        .unwrap();
+        let project_id = crate::session::project_id_for(&home.to_path_buf());
+        let project_root = home.display().to_string();
+        let session_row = db
+            .write_blocking(move |conn| {
+                crate::db::Db::insert_session_row_conn(
+                    conn,
+                    &crate::db::Db::build_new_assistant_session_row_conn(
+                        conn,
+                        &project_id,
+                        &project_root,
+                        "helper",
+                        "helper",
+                    )?,
+                )
+            })
+            .unwrap();
+        let session = crate::session::Session::resume(db.clone(), session_row.session_id)
+            .unwrap()
+            .unwrap();
+        let locks = Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap());
+        let redact = Arc::new(
+            crate::redact::RedactionTable::build(
+                &crate::config::extended::RedactConfig::default(),
+                home,
+            )
+            .unwrap(),
+        );
+        ToolCtx {
+            agent_id: "helper".to_string(),
+            current_tool_call_id: None,
+            llm_mode: crate::config::extended::LlmMode::Normal,
+            locks,
+            session: Arc::new(session),
+            cwd: home.to_path_buf(),
+            redact,
+            interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
+            approver: None,
+            deferred_log: crate::engine::deferred::DeferredLog::new(),
+            seeds: crate::engine::seed_collector::SeedCollector::new(),
+            root_agent_frame: true,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
+            context_usage: None,
+            available_tools: Arc::new(std::collections::HashSet::new()),
+            mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
+                Vec::new(),
+            )),
+            has_tree: false,
+            has_bash: false,
+            events: None,
+            lsp: None,
+            resource_scheduler: None,
+            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(home),
+            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
     #[tokio::test]
     async fn writeunlock_creates_new_file_without_prior_read() {
         let tmp = tempfile::tempdir().unwrap();
@@ -245,6 +335,25 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("created.md")).unwrap(),
             "hello\n"
         );
+    }
+
+    #[tokio::test]
+    async fn write_creating_new_file_needs_no_read_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let file = tmp.path().join("created.md");
+
+        WriteunlockTool
+            .call(
+                serde_json::json!({"path": "created.md", "content": "hello\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\n");
+        assert!(ctx.locks.holder(&file).is_none());
+        assert!(!ctx.locks.has_read(&file, &ctx.agent_id, ctx.session.id));
     }
 
     #[tokio::test]
@@ -347,7 +456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_file_with_prior_read_uses_temporary_write_guard() {
+    async fn write_acquires_and_releases_implicitly() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
         let file = tmp.path().join("existing.md");
@@ -368,13 +477,78 @@ mod tests {
         assert!(ctx.locks.has_read(&file, &ctx.agent_id, ctx.session.id));
     }
 
+    #[tokio::test]
+    async fn write_does_not_release_a_preexisting_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let file = tmp.path().join("existing.md");
+        std::fs::write(&file, "old\n").unwrap();
+        ctx.locks
+            .acquire(&file, &ctx.agent_id, ctx.session.id)
+            .unwrap();
+
+        WriteunlockTool
+            .call(
+                serde_json::json!({"path": "existing.md", "content": "new\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+        assert_eq!(
+            ctx.locks.holder(&file),
+            Some((ctx.session.id, ctx.agent_id.clone()))
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_read_record_rejects_implicit_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let file = tmp.path().join("existing.md");
+        std::fs::write(&file, "old\n").unwrap();
+        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+        std::fs::write(&file, "changed\n").unwrap();
+
+        let err = WriteunlockTool
+            .call(
+                serde_json::json!({"path": "existing.md", "content": "new\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("changed on disk since you read it"), "{msg}");
+        assert!(msg.contains("readlock it again"), "{msg}");
+        assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "changed\n");
+        assert!(ctx.locks.holder(&file).is_none());
+    }
+
     #[test]
     fn create_new_race_reports_file_now_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
         let path = tmp.path().join("raced.md");
 
-        let err = create_new_and_release(&ctx, &path, b"new\n", |path, _| {
+        ctx.locks
+            .acquire(&path, &ctx.agent_id, ctx.session.id)
+            .unwrap();
+        let guard = ctx
+            .locks
+            .begin_write_after_wait(
+                &path,
+                &ctx.agent_id,
+                ctx.session.id,
+                "writeunlock",
+                true,
+                false,
+            )
+            .unwrap();
+
+        let err = create_new_and_release(&path, b"new\n", guard, |path, _| {
             std::fs::write(path, "raced\n")?;
             std::fs::OpenOptions::new()
                 .write(true)
@@ -389,7 +563,81 @@ mod tests {
                 .contains("file now exists; readlock it before overwriting"),
             "{err}"
         );
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "raced\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "raced\n");
+        assert!(ctx.locks.holder(&path).is_none());
+    }
+
+    #[tokio::test]
+    async fn write_releases_lock_on_every_failure_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+
+        let stale = tmp.path().join("stale.md");
+        std::fs::write(&stale, "old\n").unwrap();
+        ctx.locks.note_read(&stale, &ctx.agent_id, ctx.session.id);
+        std::fs::write(&stale, "changed\n").unwrap();
+        let err = WriteunlockTool
+            .call(
+                serde_json::json!({"path": "stale.md", "content": "new\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("changed on disk since you read it")
+        );
+        assert!(ctx.locks.holder(&stale).is_none());
+
+        let outside = tmp.path().parent().unwrap().join("outside-write-denied.md");
+        let err = WriteunlockTool
+            .call(
+                serde_json::json!({
+                    "path": outside.display().to_string(),
+                    "content": "new\n"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outside the session boundary and cannot be approved"),
+            "{err}"
+        );
+        assert!(ctx.locks.holder(&outside).is_none());
+
+        let identity_home = tempfile::tempdir().unwrap();
+        let identity_ctx = identity_refusal_ctx(identity_home.path());
+        let soul = crate::assistants::identity::soul_path(identity_home.path());
+        let out = WriteunlockTool
+            .call(
+                serde_json::json!({
+                    "path": soul.display().to_string(),
+                    "content": "model rewrite\n"
+                }),
+                &identity_ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("soul_edit_mode=human_only"), "{out:?}");
+        assert!(identity_ctx.locks.holder(&soul).is_none());
+
+        let blocked_parent = tmp.path().join("not-a-dir");
+        std::fs::write(&blocked_parent, "file blocks directory creation").unwrap();
+        let target = blocked_parent.join("child.txt");
+        let err = WriteunlockTool
+            .call(
+                serde_json::json!({
+                    "path": "not-a-dir/child.txt",
+                    "content": "new\n"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        assert!(ctx.locks.holder(&target).is_none());
     }
 
     #[tokio::test]
@@ -416,9 +664,6 @@ mod tests {
         let file = tmp.path().join("existing.json");
         std::fs::write(&file, "{}\n").unwrap();
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
-        ctx.locks
-            .acquire(&file, &ctx.agent_id, ctx.session.id)
-            .unwrap();
         fail_lock_state_deletes(&db);
 
         let out = WriteunlockTool
@@ -449,6 +694,172 @@ mod tests {
         ctx.locks
             .check_write_permitted(&file, &ctx.agent_id, ctx.session.id)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_after_forced_release_reaches_staleness_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx_a, db) = test_ctx_with_db(tmp.path());
+        let file = tmp.path().join("shared.md");
+        std::fs::write(&file, "base\n").unwrap();
+        let s_b = db
+            .create_session("p", &tmp.path().display().to_string(), "writer-b")
+            .await
+            .unwrap();
+        let mut ctx_b = ctx_a.clone();
+        ctx_b.agent_id = "writer-b".to_string();
+        ctx_b.session = Arc::new(
+            crate::session::Session::resume(db.clone(), s_b.session_id)
+                .unwrap()
+                .unwrap(),
+        );
+
+        ctx_a
+            .locks
+            .note_read(&file, &ctx_a.agent_id, ctx_a.session.id);
+        ctx_b
+            .locks
+            .note_read(&file, &ctx_b.agent_id, ctx_b.session.id);
+        fail_lock_state_deletes(&db);
+
+        let out = WriteunlockTool
+            .call(
+                serde_json::json!({"path": "shared.md", "content": "writer a\n"}),
+                &ctx_a,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("lock bookkeeping did not persist"),
+            "{out:?}"
+        );
+        assert!(ctx_a.locks.holder(&file).is_none());
+
+        let err = WriteunlockTool
+            .call(
+                serde_json::json!({"path": "shared.md", "content": "writer b\n"}),
+                &ctx_b,
+            )
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("changed on disk since you read it"), "{msg}");
+        assert!(!msg.contains("lock_state acquire conflict"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "writer a\n");
+        assert!(ctx_b.locks.holder(&file).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_waits_for_busy_path_and_emits_waiting_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let file = tmp.path().join("busy.md");
+        std::fs::write(&file, "old\n").unwrap();
+        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+        ctx.locks.acquire(&file, "holder", ctx.session.id).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        ctx.events = Some(tx);
+        let locks = ctx.locks.clone();
+        let sid = ctx.session.id;
+        let file_for_release = file.clone();
+
+        let handle = tokio::spawn(async move {
+            WriteunlockTool
+                .call(
+                    serde_json::json!({"path": "busy.md", "content": "new\n"}),
+                    &ctx,
+                )
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let start = rx.recv().await.expect("waiting start event");
+        assert!(matches!(
+            start,
+            TurnEvent::WaitingForLock {
+                ref path,
+                ref holder_agent,
+                waiting: true
+            } if path == &file.display().to_string() && holder_agent == "holder"
+        ));
+
+        locks.release(&file_for_release, "holder", sid).unwrap();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("write resolves after release")
+            .expect("join")
+            .unwrap();
+        assert!(out.content.contains("wrote `"), "{}", out.content);
+
+        let clear = rx.recv().await.expect("waiting clear event");
+        assert!(matches!(
+            clear,
+            TurnEvent::WaitingForLock {
+                ref path,
+                waiting: false,
+                ..
+            } if path == &file.display().to_string()
+        ));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+        assert!(locks.holder(&file).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_wait_cancels_on_turn_cancel_without_leaving_waiter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let file = tmp.path().join("busy.md");
+        std::fs::write(&file, "old\n").unwrap();
+        ctx.locks.acquire(&file, "holder", ctx.session.id).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        ctx.events = Some(tx);
+        let locks = ctx.locks.clone();
+        let cancel = ctx.cancel.clone();
+        let sid = ctx.session.id;
+        let file_for_release = file.clone();
+
+        let handle = tokio::spawn(async move {
+            WriteunlockTool
+                .call(
+                    serde_json::json!({"path": "busy.md", "content": "new\n"}),
+                    &ctx,
+                )
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let start = rx.recv().await.expect("waiting start event");
+        assert!(matches!(
+            start,
+            TurnEvent::WaitingForLock { waiting: true, .. }
+        ));
+
+        cancel.cancel();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("cancel resolves promptly")
+            .expect("join")
+            .unwrap_err();
+        assert!(err.to_string().contains("writeunlock cancelled"), "{err}");
+
+        let clear = rx.recv().await.expect("waiting clear event");
+        assert!(matches!(
+            clear,
+            TurnEvent::WaitingForLock { waiting: false, .. }
+        ));
+        assert_eq!(
+            locks.holder(&file).map(|(_, agent)| agent),
+            Some("holder".to_string())
+        );
+        locks.release(&file_for_release, "holder", sid).unwrap();
+        assert!(locks.holder(&file).is_none());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
     }
 
     #[tokio::test]

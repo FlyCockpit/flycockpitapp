@@ -33,6 +33,7 @@ pub mod handoff;
 pub mod harness;
 pub mod intel;
 pub mod jq_shim;
+mod lock_wait;
 pub mod lsp;
 pub mod mcp_tool;
 pub mod plan_doc;

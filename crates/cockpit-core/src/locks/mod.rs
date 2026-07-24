@@ -14,7 +14,8 @@
 //!   2. The agent that holds the lock can write to it.
 //!   3. Writing a file the agent has never `read[lock]`ed in this
 //!      session fails loudly — the §3c write-existing-file guard.
-//!   4. Release on `unlock` / `writeunlock` / `editunlock`.
+//!   4. Tool-acquired write locks release when `writeunlock` / `editunlock`
+//!      exits; pre-existing holds release on `unlock`.
 //!
 //! Contention + liveness (implementation note):
 //!
@@ -241,8 +242,12 @@ pub struct WriteGuard<'a> {
 impl WriteGuard<'_> {
     pub fn release_after_write(mut self) -> bool {
         self.active = false;
-        self.locks
-            .release_force_memory(&self.path, &self.agent, self.session)
+        if self.acquired_by_guard {
+            self.locks
+                .release_force_memory(&self.path, &self.agent, self.session)
+        } else {
+            true
+        }
     }
 }
 

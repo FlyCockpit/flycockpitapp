@@ -43,19 +43,21 @@ impl Tool for EditunlockTool {
     }
 
     fn description(&self) -> &str {
-        "Replace `old_string` with `new_string` in a locked file and release; use `writeunlock` for full rewrites or `unlock` to abandon"
+        "Replace `old_string` with `new_string`; locking is automatic, so no separate lock call is needed before writing; use `writeunlock` for full rewrites"
     }
 
     fn defensive_description(&self) -> Option<String> {
         Some(
-            "Make a targeted change to a locked file: find `old_string` and replace it with \
-             `new_string`, then release the lock. This is the preferred way to edit — you only \
+            "Make a targeted change to a file: find `old_string` and replace it with \
+             `new_string`. Locking is automatic: do not call a separate lock tool before writing. \
+             This is the preferred way to edit — you only \
              state the snippet that changes, not the whole file. `old_string` must match the \
              current file text closely (the tool tolerates minor whitespace differences via a \
              match cascade); copy it verbatim from a recent read, and include enough surrounding \
              context that it appears EXACTLY once, or the edit is rejected as ambiguous. To \
-             change every occurrence on purpose, set `replace_all`. You must have locked the \
-             file (`readlock`) first. To delete text, make `new_string` empty."
+             change every occurrence on purpose, set `replace_all`. Existing files still require \
+             a prior read/readlock so the tool can reject stale edits. To delete text, make \
+             `new_string` empty."
                 .to_string(),
         )
     }
@@ -130,9 +132,16 @@ impl Tool for EditunlockTool {
                     return Ok(crate::assistants::identity::tool_refusal(message));
                 }
             };
-        let write_guard =
-            ctx.locks
-                .begin_write(&path, &ctx.agent_id, ctx.session.id, self.name())?;
+        let acquire =
+            crate::tools::lock_wait::acquire_waiting(ctx, &path, self.name(), false).await?;
+        let write_guard = ctx.locks.begin_write_after_wait(
+            &path,
+            &ctx.agent_id,
+            ctx.session.id,
+            self.name(),
+            !acquire.preexisting_hold,
+            true,
+        )?;
 
         let existing =
             std::fs::read(&path).map_err(|e| anyhow::anyhow!("read `{}`: {e}", path.display()))?;
@@ -655,6 +664,66 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
     }
 
+    #[tokio::test]
+    async fn edit_acquires_and_releases_implicitly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("edit.txt");
+        std::fs::write(&file, "alpha beta gamma\n").unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+        assert!(ctx.locks.holder(&file).is_none());
+
+        EditunlockTool
+            .call(
+                serde_json::json!({
+                    "path": "edit.txt",
+                    "old_string": "beta",
+                    "new_string": "delta",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha delta gamma\n"
+        );
+        assert!(ctx.locks.holder(&file).is_none());
+        assert!(ctx.locks.has_read(&file, &ctx.agent_id, ctx.session.id));
+    }
+
+    #[tokio::test]
+    async fn edit_releases_lock_when_match_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("edit.txt");
+        std::fs::write(&file, "alpha beta gamma\n").unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+
+        let err = EditunlockTool
+            .call(
+                serde_json::json!({
+                    "path": "edit.txt",
+                    "old_string": "missing",
+                    "new_string": "delta",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("no match for `old_string`"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha beta gamma\n"
+        );
+        assert!(ctx.locks.holder(&file).is_none());
+    }
+
     #[test]
     fn exact_match() {
         let res = find_match("hello world\n", "hello", false)
@@ -797,9 +866,6 @@ mod tests {
         std::fs::write(&file, "alpha beta gamma\n").unwrap();
         let (ctx, db) = test_ctx_with_db(tmp.path());
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
-        ctx.locks
-            .acquire(&file, &ctx.agent_id, ctx.session.id)
-            .unwrap();
         fail_lock_state_deletes(&db);
 
         let out = EditunlockTool

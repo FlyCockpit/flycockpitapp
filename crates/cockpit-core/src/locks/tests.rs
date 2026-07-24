@@ -612,6 +612,97 @@ async fn write_guard_serializes_two_read_but_unlocked_writers() {
     assert!(lm.holder(&p).is_none());
 }
 
+#[tokio::test(start_paused = true)]
+async fn concurrent_writers_on_same_path_serialize_under_implicit_locking() {
+    let tmp = TempDir::new().unwrap();
+    let a = tmp.path().join("a.rs");
+    let b = tmp.path().join("b.rs");
+    let shared = tmp.path().join("shared.rs");
+    fs::write(&a, "a").unwrap();
+    fs::write(&b, "b").unwrap();
+    fs::write(&shared, "base").unwrap();
+    let (db, sid_a) = setup();
+    let sid_b = db
+        .create_session("p", "/b", "builder")
+        .await
+        .unwrap()
+        .session_id;
+    let lm = Arc::new(LockManager::in_memory(db));
+    let cancel = CancellationToken::new();
+
+    lm.note_read(&a, "writer-a", sid_a);
+    lm.note_read(&b, "writer-b", sid_b);
+    assert_eq!(
+        lm.acquire_wait_without_read(&a, "writer-a", sid_a, &cancel, noop_on_wait)
+            .await
+            .unwrap(),
+        AcquireWait::Acquired
+    );
+    let guard_a = lm
+        .begin_write_after_wait(&a, "writer-a", sid_a, "writeunlock", true, true)
+        .unwrap();
+    assert_eq!(
+        lm.acquire_wait_without_read(&b, "writer-b", sid_b, &cancel, noop_on_wait)
+            .await
+            .unwrap(),
+        AcquireWait::Acquired
+    );
+    let guard_b = lm
+        .begin_write_after_wait(&b, "writer-b", sid_b, "writeunlock", true, true)
+        .unwrap();
+    assert_eq!(lm.holder(&a), Some((sid_a, "writer-a".to_string())));
+    assert_eq!(lm.holder(&b), Some((sid_b, "writer-b".to_string())));
+    assert!(guard_a.release_after_write());
+    assert!(guard_b.release_after_write());
+
+    lm.note_read(&shared, "writer-a", sid_a);
+    lm.note_read(&shared, "writer-b", sid_b);
+    assert_eq!(
+        lm.acquire_wait_without_read(&shared, "writer-a", sid_a, &cancel, noop_on_wait)
+            .await
+            .unwrap(),
+        AcquireWait::Acquired
+    );
+    let guard_a = lm
+        .begin_write_after_wait(&shared, "writer-a", sid_a, "writeunlock", true, true)
+        .unwrap();
+
+    let lm_b = lm.clone();
+    let shared_b = shared.clone();
+    let cancel_b = cancel.clone();
+    let handle = tokio::spawn(async move {
+        lm_b.acquire_wait_without_read(&shared_b, "writer-b", sid_b, &cancel_b, noop_on_wait)
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !handle.is_finished(),
+        "same-path writer must wait for the first guard"
+    );
+
+    fs::write(&shared, "writer-a landed").unwrap();
+    assert!(guard_a.release_after_write());
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("writer-b wakes after release")
+            .expect("join")
+            .unwrap(),
+        AcquireWait::Acquired
+    );
+    let err = lm
+        .begin_write_after_wait(&shared, "writer-b", sid_b, "writeunlock", true, true)
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("changed on disk since you read it"),
+        "{err}"
+    );
+    assert!(lm.holder(&shared).is_none());
+}
+
 #[tokio::test]
 async fn sequential_read_record_writers_second_write_rejected_as_stale() {
     let tmp = TempDir::new().unwrap();

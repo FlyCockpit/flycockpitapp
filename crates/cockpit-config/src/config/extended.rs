@@ -459,7 +459,45 @@ pub struct ExtendedConfig {
     /// order. Resolved by [`resolve_centrality_ranking`].
     #[serde(rename = "intelCentralityRanking", default = "default_true")]
     pub intel_centrality_ranking: bool,
+
+    /// Directory names pruned from intel index walks at every depth. When
+    /// unset, Cockpit uses [`DEFAULT_INTEL_EXCLUDE_DIRS`]. When set,
+    /// `intel.exclude_dirs` replaces the defaults so users can extend or
+    /// un-exclude names. `intel.max_cold_index_files` caps one cold freshen.
+    #[serde(default, skip_serializing_if = "IntelConfig::is_default")]
+    pub intel: IntelConfig,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct IntelConfig {
+    /// Directory names pruned from intel index walks at every depth. When set,
+    /// this replaces the built-in default list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_dirs: Option<Vec<String>>,
+
+    /// Maximum number of files parsed by one cold intel freshen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cold_index_files: Option<usize>,
+}
+
+impl IntelConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+pub const DEFAULT_INTEL_EXCLUDE_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "vendor",
+    "__pycache__",
+    ".venv",
+    "venv",
+];
+
+pub const DEFAULT_INTEL_MAX_COLD_INDEX_FILES: usize = 25_000;
 
 /// Whether call-graph centrality ranking is enabled for `cwd` (the
 /// `extended.intelCentralityRanking` config gate, default on). Resolved
@@ -471,6 +509,78 @@ pub struct ExtendedConfig {
 pub fn resolve_centrality_ranking(cwd: &Path) -> bool {
     let paths = config_file_paths_for_load(cwd);
     resolve_centrality_ranking_from_paths(&paths)
+}
+
+/// Resolve intel directory-name exclusions for `cwd`. A layer that sets
+/// `intel.exclude_dirs` replaces the inherited list; omitted layers leave it
+/// unchanged.
+pub fn resolve_intel_exclude_dirs(cwd: &Path) -> Vec<String> {
+    let paths = config_file_paths_for_load(cwd);
+    resolve_intel_exclude_dirs_from_paths(&paths)
+}
+
+fn resolve_intel_exclude_dirs_from_paths(paths: &[PathBuf]) -> Vec<String> {
+    let mut dirs = default_intel_exclude_dirs();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let Ok(doc) = ExtendedConfigDoc::load(path) else {
+            continue;
+        };
+        if let Some(intel) = doc.raw_field("intel").and_then(Value::as_object)
+            && intel.contains_key("exclude_dirs")
+        {
+            dirs =
+                normalize_intel_exclude_dirs(doc.config().intel.exclude_dirs.unwrap_or_default());
+        }
+    }
+    dirs
+}
+
+/// Resolve the cold-index file cap for `cwd`. More-specific layers replace
+/// earlier values; zero is treated as the default to avoid a footgun where
+/// every cold index is immediately truncated to nothing.
+pub fn resolve_intel_max_cold_index_files(cwd: &Path) -> usize {
+    let paths = config_file_paths_for_load(cwd);
+    resolve_intel_max_cold_index_files_from_paths(&paths)
+}
+
+fn resolve_intel_max_cold_index_files_from_paths(paths: &[PathBuf]) -> usize {
+    let mut max = DEFAULT_INTEL_MAX_COLD_INDEX_FILES;
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let Ok(doc) = ExtendedConfigDoc::load(path) else {
+            continue;
+        };
+        if let Some(intel) = doc.raw_field("intel").and_then(Value::as_object)
+            && intel.contains_key("max_cold_index_files")
+            && let Some(configured) = doc.config().intel.max_cold_index_files
+        {
+            max = configured.max(1);
+        }
+    }
+    max
+}
+
+pub fn default_intel_exclude_dirs() -> Vec<String> {
+    DEFAULT_INTEL_EXCLUDE_DIRS
+        .iter()
+        .map(|dir| (*dir).to_string())
+        .collect()
+}
+
+fn normalize_intel_exclude_dirs(dirs: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in dirs {
+        let dir = dir.trim().trim_matches('/').to_string();
+        if !dir.is_empty() && !out.contains(&dir) {
+            out.push(dir);
+        }
+    }
+    out
 }
 
 /// Layering core for [`resolve_centrality_ranking`]: overlay each
@@ -1472,6 +1582,7 @@ impl Default for ExtendedConfig {
             hint_tool_call_corrections: false,
             text_embedded_recovery: TextEmbeddedRecovery::default(),
             intel_centrality_ranking: default_true(),
+            intel: IntelConfig::default(),
         }
     }
 }
@@ -1777,6 +1888,7 @@ impl ExtendedConfigDoc {
         parse_field!("hintToolCallCorrections", hint_tool_call_corrections);
         parse_field!("textEmbeddedRecovery", text_embedded_recovery);
         parse_field!("intelCentralityRanking", intel_centrality_ranking);
+        parse_field!("intel", intel);
 
         migrate_legacy_web_tool_templates(&mut cfg);
 
@@ -1900,6 +2012,7 @@ impl ExtendedConfigDoc {
             "compact_model",
             "embedding_model",
             "commandResourceProfiles",
+            "intel",
             "sandbox",
             "tools",
             "web",

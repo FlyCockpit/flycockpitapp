@@ -14,7 +14,10 @@ pub(in crate::tools::intel) async fn call_impact_section(
 ) -> Result<ToolOutput> {
     let path = path.map(|p| rel_path(p, ctx));
     let index = index_of(ctx);
-    index.ensure_fresh().await?;
+    let freshen = index
+        .ensure_fresh_scoped(freshen_options(ctx, path.clone()))
+        .await?;
+    let freshen_report = freshen.report().clone();
 
     let targets = index.impact_targets(name, path.as_deref(), kind)?;
     if targets.is_empty() {
@@ -57,10 +60,12 @@ pub(in crate::tools::intel) async fn call_impact_section(
                         .map(|s| format!(" in {s}"))
                         .unwrap_or_default();
                     if !write_retained_line(&mut writer, &format!("  {cf}:{cl}{sym}")) {
-                        return Ok(finish(
+                        let mut out = finish(
                             writer,
                             "\n... [truncated; narrow the query with `path`/`symbol_kind`]\n",
-                        ));
+                        );
+                        append_freshen_note(&mut out, &freshen_report);
+                        return Ok(out);
                     }
                 }
             }
@@ -73,17 +78,21 @@ pub(in crate::tools::intel) async fn call_impact_section(
                 writer.writeln(&format!("Calls ({}):", calls.len()));
                 for (callee, df, dl) in &calls {
                     if !write_retained_line(&mut writer, &format!("  {callee} -> {df}:{dl}")) {
-                        return Ok(finish(
+                        let mut out = finish(
                             writer,
                             "\n... [truncated; narrow the query with `path`/`symbol_kind`]\n",
-                        ));
+                        );
+                        append_freshen_note(&mut out, &freshen_report);
+                        return Ok(out);
                     }
                 }
             }
         }
     }
-    Ok(finish(
+    let mut out = finish(
         writer,
         "\n... [truncated; narrow the query with `path`/`symbol_kind`]\n",
-    ))
+    );
+    append_freshen_note(&mut out, &freshen_report);
+    Ok(out)
 }

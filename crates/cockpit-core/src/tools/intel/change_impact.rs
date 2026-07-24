@@ -75,6 +75,10 @@ impl Tool for ChangeImpactTool {
         Some(self.parameters())
     }
 
+    fn honors_dispatch_cancel(&self) -> bool {
+        true
+    }
+
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let Some(git_root) = crate::git::find_worktree_root(&ctx.cwd) else {
             return Ok(ToolOutput::text(format!(
@@ -127,7 +131,13 @@ impl Tool for ChangeImpactTool {
         }
 
         let index = index_of(ctx);
-        index.ensure_fresh().await?;
+        let freshen_scope = path_filter
+            .clone()
+            .or_else(|| common_changed_scope(&changed));
+        let freshen = index
+            .ensure_fresh_scoped(freshen_options(ctx, freshen_scope))
+            .await?;
+        let freshen_report = freshen.report().clone();
         let dep_edges = index.dep_edges()?;
         // Build import adjacency maps once; each changed file only runs BFS over these maps.
         let (forward_deps, reverse_deps) = dependency_adjacencies(&dep_edges);
@@ -217,7 +227,7 @@ impl Tool for ChangeImpactTool {
                     suffix
                 ),
             ) {
-                return Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"));
+                return Ok(finish_change_impact(writer, &freshen_report));
             }
             for symbol in overlapping {
                 let sc = centrality.get(&symbol.path).copied().unwrap_or(0.0);
@@ -267,7 +277,7 @@ impl Tool for ChangeImpactTool {
                         calls
                     ),
                 ) {
-                    return Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"));
+                    return Ok(finish_change_impact(writer, &freshen_report));
                 }
             }
             if changed_symbols.len() > 80 {
@@ -288,7 +298,7 @@ impl Tool for ChangeImpactTool {
             {
                 any_reverse = true;
                 if !write_retained_line(&mut writer, &format!("  {} <- {}", file.path, dep)) {
-                    return Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"));
+                    return Ok(finish_change_impact(writer, &freshen_report));
                 }
             }
         }
@@ -320,7 +330,7 @@ impl Tool for ChangeImpactTool {
                         caller_file, caller_line, in_sym, sym.path, sym.line, sym.name
                     ),
                 ) {
-                    return Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"));
+                    return Ok(finish_change_impact(writer, &freshen_report));
                 }
             }
             for (callee, def_file, def_line) in
@@ -341,7 +351,7 @@ impl Tool for ChangeImpactTool {
                         sym.path, sym.line, callee, def_file, def_line
                     ),
                 ) {
-                    return Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"));
+                    return Ok(finish_change_impact(writer, &freshen_report));
                 }
             }
         }
@@ -349,7 +359,39 @@ impl Tool for ChangeImpactTool {
             writer.writeln("  none");
         }
         writer.writeln(&format!("next: read narrow changed ranges; run `graph` callers/calls for high-risk symbols; run `graph` importers on high-risk files{}", path_filter.as_ref().map(|p| format!(" under `{p}`")).unwrap_or_default()));
-        Ok(finish(writer, "\n... [truncated; narrow with `path`]\n"))
+        Ok(finish_change_impact(writer, &freshen_report))
+    }
+}
+
+fn finish_change_impact(writer: BudgetedWriter, report: &FreshenReport) -> ToolOutput {
+    let mut out = finish(writer, "\n... [truncated; narrow with `path`]\n");
+    append_freshen_note(&mut out, report);
+    out
+}
+
+fn common_changed_scope(changed: &[ChangedFile]) -> Option<String> {
+    let first = changed.first()?.path.as_str();
+    let mut prefix: Vec<&str> = first.split('/').filter(|part| !part.is_empty()).collect();
+    for file in &changed[1..] {
+        let parts: Vec<&str> = file
+            .path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        let common = prefix
+            .iter()
+            .zip(parts.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix.truncate(common);
+        if prefix.is_empty() {
+            return None;
+        }
+    }
+    if changed.len() == 1 {
+        Some(first.to_string())
+    } else {
+        Some(prefix.join("/")).filter(|scope| !scope.is_empty())
     }
 }
 

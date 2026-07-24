@@ -34,7 +34,10 @@ impl Tool for CircularTool {
 
     async fn call(&self, _args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let index = index_of(ctx);
-        index.ensure_fresh().await?;
+        let freshen = index
+            .ensure_fresh_scoped(freshen_options(ctx, None))
+            .await?;
+        let freshen_report = freshen.report().clone();
         let edges = index.dep_edges()?;
 
         // Build the resolved graph (importee NOT NULL).
@@ -79,6 +82,8 @@ impl Tool for CircularTool {
                 break;
             }
         }
-        Ok(finish(writer, "\n... [truncated]\n"))
+        let mut out = finish(writer, "\n... [truncated]\n");
+        append_freshen_note(&mut out, &freshen_report);
+        Ok(out)
     }
 }

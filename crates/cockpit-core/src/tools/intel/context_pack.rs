@@ -71,6 +71,10 @@ impl Tool for ContextPackTool {
         Some(self.parameters())
     }
 
+    fn honors_dispatch_cancel(&self) -> bool {
+        true
+    }
+
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let args: ContextPackArgs = typed_args(args)?;
         let target = args
@@ -83,10 +87,33 @@ impl Tool for ContextPackTool {
         let limit = args.limit.map(|l| l.clamp(1, 50) as usize).unwrap_or(12);
 
         let index = index_of(ctx);
-        index.ensure_fresh().await?;
-        let file_rows = index.context_file_rows()?;
-        let fs_files = list_file_metas(&ctx.session.project_root);
+        let path_scope =
+            target.and_then(|target| context_pack_target_scope(target, ctx, requested));
+        let freshen_scope = match requested {
+            ContextPackKind::Path | ContextPackKind::Auto => path_scope.clone(),
+            ContextPackKind::Overview | ContextPackKind::Symbol | ContextPackKind::Query => None,
+        };
+        let freshen = index
+            .ensure_fresh_scoped(freshen_options(ctx, freshen_scope.clone()))
+            .await?;
+        let freshen_report = freshen.report().clone();
+        let mut file_rows = index.context_file_rows()?;
+        if let Some(scope) = freshen_scope.as_deref() {
+            file_rows.retain(|row| path_matches_filter(&row.path, scope));
+        }
+        let fs_files = list_file_metas(
+            &ctx.session.project_root,
+            index.exclude_dirs(),
+            freshen_scope.as_deref(),
+        );
         if file_rows.is_empty() && fs_files.is_empty() {
+            if requested == ContextPackKind::Path
+                && let Some(target) = target
+            {
+                return Ok(ToolOutput::text(format!(
+                    "path target `{target}` was not found; try `context_pack` without `target` or run `code` with kind `tree`"
+                )));
+            }
             return Ok(ToolOutput::text(format!(
                 "context_pack: no indexed files\nproject_root: {}\ncwd: {}\nhint: verify the project root/cwd; try `context_pack` again after files exist, or use `code` kind `tree`/`rg --files` to diagnose discovery.",
                 ctx.session.project_root.display(),
@@ -110,7 +137,11 @@ impl Tool for ContextPackTool {
 
         match kind {
             ContextPackKind::Auto => unreachable!("auto is resolved above"),
-            ContextPackKind::Overview => context_pack_overview(&index, &files, depth, limit),
+            ContextPackKind::Overview => {
+                let mut out = context_pack_overview(&index, &files, depth, limit)?;
+                append_freshen_note(&mut out, &freshen_report);
+                Ok(out)
+            }
             ContextPackKind::Path => {
                 let Some(target) = target else {
                     return Err(invalid_input("`target` is required for kind=path"));
@@ -120,22 +151,49 @@ impl Tool for ContextPackTool {
                         "path target `{target}` was not found; try `context_pack` without `target` or run `code` with kind `tree`"
                     )));
                 };
-                context_pack_path(&index, &files, &rel, depth, limit)
+                let mut out = context_pack_path(&index, &files, &rel, depth, limit)?;
+                append_freshen_note(&mut out, &freshen_report);
+                Ok(out)
             }
             ContextPackKind::Symbol => {
                 let Some(target) = target else {
                     return Err(invalid_input("`target` is required for kind=symbol"));
                 };
-                context_pack_symbol(&index, &files, target, depth, limit)
+                let mut out = context_pack_symbol(&index, &files, target, depth, limit)?;
+                append_freshen_note(&mut out, &freshen_report);
+                Ok(out)
             }
             ContextPackKind::Query => {
                 let Some(target) = target else {
                     return Err(invalid_input("`target` is required for kind=query"));
                 };
-                context_pack_query(&index, &files, target, ctx, limit).await
+                let mut out = context_pack_query(&index, &files, target, ctx, limit).await?;
+                append_freshen_note(&mut out, &freshen_report);
+                Ok(out)
             }
         }
     }
+}
+
+fn context_pack_target_scope(
+    target: &str,
+    ctx: &ToolCtx,
+    requested: ContextPackKind,
+) -> Option<String> {
+    let abs = crate::tools::common::resolve(target, &ctx.cwd);
+    if abs.exists() {
+        return abs
+            .strip_prefix(&ctx.session.project_root)
+            .ok()
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            .map(|rel| parent_scope_for_file(&rel, ctx))
+            .filter(|rel| !rel.is_empty());
+    }
+
+    (requested == ContextPackKind::Path)
+        .then(|| rel_path(target, ctx))
+        .filter(|rel| !rel.is_empty())
+        .filter(|rel| !crate::intel::invalid_intel_scope(rel))
 }
 
 fn parse_context_pack_kind(raw: Option<&str>) -> Result<ContextPackKind> {
@@ -218,7 +276,10 @@ fn line_count_value(lines: Option<usize>) -> String {
 
 fn resolve_context_path(target: &str, ctx: &ToolCtx, files: &[ContextFileMeta]) -> Option<String> {
     let rel = rel_path(target, ctx);
-    if files.iter().any(|f| f.path == rel) {
+    if files
+        .iter()
+        .any(|f| f.path == rel || f.path.starts_with(&format!("{rel}/")))
+    {
         return Some(rel);
     }
     let abs = crate::tools::common::resolve(target, &ctx.cwd);
@@ -226,7 +287,10 @@ fn resolve_context_path(target: &str, ctx: &ToolCtx, files: &[ContextFileMeta]) 
         && let Ok(rel) = abs.strip_prefix(&ctx.session.project_root)
     {
         let rel = rel.to_string_lossy().replace('\\', "/");
-        if files.iter().any(|f| f.path == rel) {
+        if files
+            .iter()
+            .any(|f| f.path == rel || f.path.starts_with(&format!("{rel}/")))
+        {
             return Some(rel);
         }
     }

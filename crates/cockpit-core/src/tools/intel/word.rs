@@ -57,7 +57,10 @@ impl Tool for WordTool {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let index = index_of(ctx);
-        index.ensure_fresh().await?;
+        let freshen = index
+            .ensure_fresh_scoped(freshen_options(ctx, None))
+            .await?;
+        let freshen_report = freshen.report().clone();
 
         let grouped = index.word_hits(token, ci)?;
         if grouped.is_empty() {
@@ -76,6 +79,8 @@ impl Tool for WordTool {
                 break;
             }
         }
-        Ok(finish(writer, "\n... [truncated]\n"))
+        let mut out = finish(writer, "\n... [truncated]\n");
+        append_freshen_note(&mut out, &freshen_report);
+        Ok(out)
     }
 }

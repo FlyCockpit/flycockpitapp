@@ -53,7 +53,10 @@ impl Tool for SymbolFindTool {
         let exact = args.get("exact").and_then(Value::as_bool).unwrap_or(false);
         let kind = args.get("kind").and_then(Value::as_str);
         let index = index_of(ctx);
-        index.ensure_fresh().await?;
+        let freshen = index
+            .ensure_fresh_scoped(freshen_options(ctx, None))
+            .await?;
+        let freshen_report = freshen.report().clone();
 
         let mut hits = index.symbol_find(name, exact, kind)?;
         if hits.is_empty() {
@@ -80,9 +83,8 @@ impl Tool for SymbolFindTool {
                 break;
             }
         }
-        Ok(finish(
-            writer,
-            "\n... [truncated; narrow with `exact` or `kind`]\n",
-        ))
+        let mut out = finish(writer, "\n... [truncated; narrow with `exact` or `kind`]\n");
+        append_freshen_note(&mut out, &freshen_report);
+        Ok(out)
     }
 }

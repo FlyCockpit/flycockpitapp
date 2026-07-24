@@ -74,7 +74,11 @@ impl Tool for TreeTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let (filter, canonical_args) = tree_filter_path(&args, ctx);
         let index = index_of(ctx);
-        let mut entries = index.ensure_fresh_scoped(filter.as_deref()).await?;
+        let freshen = index
+            .ensure_fresh_scoped(freshen_options(ctx, filter.clone()))
+            .await?;
+        let freshen_report = freshen.report().clone();
+        let mut entries = freshen.into_rows();
 
         // Indexed files (with symbol counts) keyed by path.
         let indexed: HashMap<String, (String, i64, Option<i64>, i64)> = index
@@ -134,6 +138,7 @@ impl Tool for TreeTool {
             writer,
             "\n... [truncated; pass `path` to scope to a subtree]\n",
         );
+        append_freshen_note(&mut out, &freshen_report);
         if let Some(canonical) = canonical_args {
             out.canonical_args = Some(canonical);
         }

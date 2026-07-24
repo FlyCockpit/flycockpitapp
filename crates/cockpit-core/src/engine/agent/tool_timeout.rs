@@ -316,7 +316,7 @@ async fn dispatch_tool_with_policy(
                         tokio::pin!(cancel_grace);
                         tokio::select! {
                             biased;
-                            result = &mut call => result,
+                            result = &mut call => cancelled_error_as_output(result, &ctx, name),
                             _ = &mut cancel_grace => {
                                 drop(call);
                                 run_abandon_hook(tool, &ctx, name).await;
@@ -349,7 +349,7 @@ async fn dispatch_tool_with_policy(
                         tokio::pin!(cancel_grace);
                         tokio::select! {
                             biased;
-                            result = &mut call => result,
+                            result = &mut call => cancelled_error_as_output(result, &ctx, name),
                             _ = &mut cancel_grace => {
                                 drop(call);
                                 run_abandon_hook(tool, &ctx, name).await;
@@ -366,6 +366,20 @@ async fn dispatch_tool_with_policy(
             }
         }
     }
+}
+
+fn cancelled_error_as_output(
+    result: Result<ToolOutput>,
+    ctx: &ToolCtx,
+    name: &str,
+) -> Result<ToolOutput> {
+    if ctx.cancel.is_cancelled() && result.is_err() {
+        return Ok(ToolCancelled {
+            tool: name.to_string(),
+        }
+        .output());
+    }
+    result
 }
 
 async fn run_abandon_hook(tool: Arc<dyn crate::engine::tool::Tool>, ctx: &ToolCtx, name: &str) {
@@ -414,6 +428,7 @@ mod tests {
         abandon_count: Arc<AtomicUsize>,
         abandon_mode: AbandonMode,
         honors_cancel: bool,
+        fail_after_sleep: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -437,6 +452,7 @@ mod tests {
                 abandon_count,
                 abandon_mode: AbandonMode::Ok,
                 honors_cancel: false,
+                fail_after_sleep: false,
             }
         }
 
@@ -452,6 +468,11 @@ mod tests {
 
         fn with_honors_cancel(mut self) -> Self {
             self.honors_cancel = true;
+            self
+        }
+
+        fn with_error_result(mut self) -> Self {
+            self.fail_after_sleep = true;
             self
         }
     }
@@ -475,6 +496,9 @@ mod tests {
             match self.sleep {
                 Some(duration) => tokio::time::sleep(duration).await,
                 None => std::future::pending::<()>().await,
+            }
+            if self.fail_after_sleep {
+                anyhow::bail!("tool observed cancellation");
             }
             Ok(ToolOutput::text("finished"))
         }
@@ -683,6 +707,39 @@ mod tests {
         let output = dispatch.await.expect("dispatch join").expect("tool result");
 
         assert_eq!(output.content, "finished");
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_timeout_cancel_aware_error_during_grace_is_cancelled_output() {
+        let (_dir, ctx) = test_ctx();
+        let count = Arc::new(AtomicUsize::new(0));
+        let policy = ToolTimeoutPolicy::default();
+        let dispatch = tokio::spawn({
+            let ctx = ctx.clone();
+            let policy = policy.clone();
+            let count = count.clone();
+            async move {
+                run_test_tool(
+                    TimedTestTool::new("code", Some(Duration::from_secs(1)), count)
+                        .with_honors_cancel()
+                        .with_error_result(),
+                    &ctx,
+                    &policy,
+                )
+                .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        ctx.cancel.cancel();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let output = dispatch.await.expect("dispatch join").expect("tool result");
+
+        assert_eq!(
+            output.content,
+            "tool `code` was cancelled by the user and abandoned"
+        );
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 

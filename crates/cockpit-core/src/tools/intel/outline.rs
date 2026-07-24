@@ -56,7 +56,10 @@ impl Tool for OutlineTool {
         .await?;
         let rel = rel_path(path_arg, ctx);
         let index = index_of(ctx);
-        index.ensure_fresh().await?;
+        let freshen = index
+            .ensure_fresh_scoped(freshen_options(ctx, Some(rel.clone())))
+            .await?;
+        let freshen_report = freshen.report().clone();
 
         let (symbols, imports, language) = index.outline_rows(&rel)?;
         let mut writer = BudgetedWriter::new(STRUCT_TOKEN_CAP);
@@ -82,7 +85,9 @@ impl Tool for OutlineTool {
                     break;
                 }
             }
-            return Ok(finish(writer, "\n... [truncated]\n"));
+            let mut out = finish(writer, "\n... [truncated]\n");
+            append_freshen_note(&mut out, &freshen_report);
+            return Ok(out);
         }
 
         writer.writeln(&format!("{rel} ({language})"));
@@ -90,7 +95,9 @@ impl Tool for OutlineTool {
             writer.writeln("imports:");
             for (target, line) in &imports {
                 if !write_retained_line(&mut writer, &format!("  {line}: {target}")) {
-                    return Ok(finish(writer, "\n... [truncated]\n"));
+                    let mut out = finish(writer, "\n... [truncated]\n");
+                    append_freshen_note(&mut out, &freshen_report);
+                    return Ok(out);
                 }
             }
         }
@@ -128,6 +135,8 @@ impl Tool for OutlineTool {
         if symbols.is_empty() && imports.is_empty() {
             writer.writeln("  (no symbols or imports)");
         }
-        Ok(finish(writer, "\n... [truncated]\n"))
+        let mut out = finish(writer, "\n... [truncated]\n");
+        append_freshen_note(&mut out, &freshen_report);
+        Ok(out)
     }
 }

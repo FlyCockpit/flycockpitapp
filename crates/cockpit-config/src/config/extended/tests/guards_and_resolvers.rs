@@ -764,6 +764,87 @@ fn intel_centrality_ranking_defaults_on_and_renames() {
 }
 
 #[test]
+fn intel_walk_config_defaults_and_nested_keys() {
+    let cfg: ExtendedConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(cfg.intel, IntelConfig::default());
+    assert_eq!(
+        default_intel_exclude_dirs(),
+        DEFAULT_INTEL_EXCLUDE_DIRS
+            .iter()
+            .map(|dir| (*dir).to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(DEFAULT_INTEL_MAX_COLD_INDEX_FILES, 25_000);
+
+    let cfg: ExtendedConfig =
+        serde_json::from_str(r#"{"intel":{"exclude_dirs":["weird"],"max_cold_index_files":10}}"#)
+            .unwrap();
+    assert_eq!(cfg.intel.exclude_dirs, Some(vec!["weird".to_string()]));
+    assert_eq!(cfg.intel.max_cold_index_files, Some(10));
+    let json = serde_json::to_string(&cfg).unwrap();
+    assert!(json.contains("\"intel\""));
+    assert!(json.contains("\"exclude_dirs\""));
+    assert!(json.contains("\"max_cold_index_files\""));
+}
+
+#[test]
+fn intel_walk_config_resolves_replacement_semantics() {
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let home_cfg = home.path().join("config.json");
+    let proj_cfg = proj.path().join("config.json");
+
+    assert_eq!(
+        resolve_intel_exclude_dirs_from_paths(&[]),
+        default_intel_exclude_dirs()
+    );
+    assert_eq!(
+        resolve_intel_max_cold_index_files_from_paths(&[]),
+        DEFAULT_INTEL_MAX_COLD_INDEX_FILES
+    );
+
+    std::fs::write(
+        &home_cfg,
+        r#"{"intel":{"exclude_dirs":["node_modules","vendor"],"max_cold_index_files":5}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_intel_exclude_dirs_from_paths(std::slice::from_ref(&home_cfg)),
+        vec!["node_modules", "vendor"]
+    );
+    assert_eq!(
+        resolve_intel_max_cold_index_files_from_paths(std::slice::from_ref(&home_cfg)),
+        5
+    );
+
+    std::fs::write(
+        &proj_cfg,
+        r#"{"intel":{"exclude_dirs":["weird"],"max_cold_index_files":10}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_intel_exclude_dirs_from_paths(&[home_cfg.clone(), proj_cfg.clone()]),
+        vec!["weird"],
+        "project exclude_dirs replaces inherited/default list"
+    );
+    assert_eq!(
+        resolve_intel_max_cold_index_files_from_paths(&[home_cfg.clone(), proj_cfg.clone()]),
+        10
+    );
+
+    std::fs::write(&proj_cfg, r#"{"intel":{}}"#).unwrap();
+    assert_eq!(
+        resolve_intel_exclude_dirs_from_paths(&[home_cfg.clone(), proj_cfg.clone()]),
+        vec!["node_modules", "vendor"],
+        "omitted nested fields leave inherited values intact"
+    );
+    assert_eq!(
+        resolve_intel_max_cold_index_files_from_paths(&[home_cfg, proj_cfg]),
+        5
+    );
+}
+
+#[test]
 fn centrality_ranking_resolves_layered_project_wins() {
     let home = TempDir::new().unwrap();
     let proj = TempDir::new().unwrap();

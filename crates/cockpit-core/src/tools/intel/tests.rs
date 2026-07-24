@@ -1,11 +1,11 @@
 use super::*;
 use crate::engine::tool::{Tool, ToolFailKind, classify_failure};
 use crate::intel::{
-    clear_freshness_cache, set_test_recompute_counter, set_test_walk_counter,
-    test_recompute_counter_guard,
+    clear_freshness_cache, set_test_recompute_counter, set_test_visited_paths,
+    set_test_walk_counter, test_recompute_counter_guard,
 };
-use crate::tools::common::test_ctx;
-use crate::tools::intel::common::set_test_index_allowlist;
+use crate::tools::common::{test_ctx, test_ctx_with_db};
+use crate::tools::intel::common::{list_file_metas, set_test_index_allowlist};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
@@ -43,6 +43,30 @@ fn graph_args(kind: &str, args: serde_json::Value) -> serde_json::Value {
         serde_json::Value::String(kind.to_string()),
     );
     serde_json::Value::Object(map)
+}
+
+fn assert_only_visited(paths: &Arc<std::sync::Mutex<Vec<String>>>, allowed_prefix: &str) {
+    let paths = paths.lock().unwrap().clone();
+    assert!(
+        !paths.is_empty(),
+        "test must observe at least one visited path"
+    );
+    assert!(
+        paths
+            .iter()
+            .all(|path| path == allowed_prefix || path.starts_with(&format!("{allowed_prefix}/"))),
+        "visited paths should stay under {allowed_prefix}, got {paths:?}"
+    );
+}
+
+fn assert_not_visited(paths: &Arc<std::sync::Mutex<Vec<String>>>, blocked_prefix: &str) {
+    let paths = paths.lock().unwrap().clone();
+    assert!(
+        paths
+            .iter()
+            .all(|path| path != blocked_prefix && !path.starts_with(&format!("{blocked_prefix}/"))),
+        "visited paths should not include {blocked_prefix}, got {paths:?}"
+    );
 }
 
 #[tokio::test]
@@ -683,6 +707,254 @@ async fn unscoped_tree_call_walks_the_filesystem_once() {
 }
 
 #[tokio::test]
+async fn intel_walk_shared_walker_filters_consistent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), ".gitignore", "generated/\nnode_modules/\n");
+    write(tmp.path(), ".hidden.rs", "pub fn hidden() {}\n");
+    write(tmp.path(), "node_modules/x.js", "export const x = 1;\n");
+    write(tmp.path(), "generated/keep.rs", "pub fn keep() {}\n");
+    write(tmp.path(), "src/z.rs", "pub fn z() {}\n");
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    let index = crate::intel::Index::with_allowlist(
+        db.clone(),
+        root.clone(),
+        vec!["generated/".to_string(), "node_modules/".to_string()],
+    );
+    index.ensure_fresh().await.unwrap();
+    let tree_paths = index
+        .tree_rows()
+        .unwrap()
+        .into_iter()
+        .map(|(path, _, _, _, _)| path)
+        .collect::<Vec<_>>();
+    assert!(tree_paths.contains(&"generated/keep.rs".to_string()));
+    assert!(tree_paths.contains(&"src/z.rs".to_string()));
+    assert!(!tree_paths.iter().any(|path| path.starts_with(".hidden")));
+    assert!(
+        !tree_paths
+            .iter()
+            .any(|path| path.starts_with("node_modules/"))
+    );
+
+    let fs_paths = list_file_metas(
+        &root,
+        crate::config::extended::DEFAULT_INTEL_EXCLUDE_DIRS
+            .iter()
+            .map(|dir| (*dir).to_string())
+            .collect::<Vec<_>>()
+            .as_slice(),
+        None,
+    )
+    .into_iter()
+    .map(|meta| meta.rel)
+    .collect::<Vec<_>>();
+    assert!(fs_paths.contains(&"src/z.rs".to_string()));
+    assert!(!fs_paths.iter().any(|path| path.starts_with(".hidden")));
+    assert!(
+        !fs_paths
+            .iter()
+            .any(|path| path.starts_with("node_modules/"))
+    );
+}
+
+#[test]
+fn intel_walk_top_level_tools_advertise_dispatch_cancel() {
+    assert!(CodeTool.honors_dispatch_cancel());
+    assert!(ContextPackTool.honors_dispatch_cancel());
+    assert!(GraphTool.honors_dispatch_cancel());
+    assert!(ChangeImpactTool.honors_dispatch_cancel());
+}
+
+#[tokio::test]
+async fn intel_walk_context_pack_path_scopes_freshen() {
+    let _guard = test_recompute_counter_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "a/b/mod.rs", "pub fn scoped() {}\n");
+    write(tmp.path(), "c/sibling.rs", "pub fn sibling() {}\n");
+    let ctx = test_ctx(tmp.path());
+    let root_key = ctx.session.project_root.to_string_lossy().into_owned();
+    let visited = Arc::new(std::sync::Mutex::new(Vec::new()));
+    set_test_visited_paths(Some(root_key), Some(visited.clone()));
+    clear_freshness_cache();
+
+    let out = ContextPackTool
+        .call(
+            serde_json::json!({"kind": "path", "target": "a/b", "limit": 5}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("path: a/b"), "{}", out.content);
+    assert_only_visited(&visited, "a/b");
+    set_test_visited_paths(None, None);
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn intel_walk_context_pack_missing_path_does_not_freshen_siblings() {
+    let _guard = test_recompute_counter_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "a/existing.rs", "pub fn scoped() {}\n");
+    write(tmp.path(), "c/sibling.rs", "pub fn sibling() {}\n");
+    let ctx = test_ctx(tmp.path());
+    let root_key = ctx.session.project_root.to_string_lossy().into_owned();
+    let visited = Arc::new(std::sync::Mutex::new(Vec::new()));
+    set_test_visited_paths(Some(root_key), Some(visited.clone()));
+    clear_freshness_cache();
+
+    let out = ContextPackTool
+        .call(
+            serde_json::json!({"kind": "path", "target": "a/missing", "limit": 5}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        out.content
+            .contains("path target `a/missing` was not found")
+    );
+    assert_not_visited(&visited, "c");
+    set_test_visited_paths(None, None);
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn intel_walk_tool_output_contains_truncation_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+    write(
+        tmp.path(),
+        ".cockpit/config.json",
+        r#"{"intel":{"max_cold_index_files":1}}"#,
+    );
+    write(tmp.path(), "a.rs", "pub fn a() {}\n");
+    write(tmp.path(), "b.rs", "pub fn b() {}\n");
+    let ctx = test_ctx(tmp.path());
+    clear_freshness_cache();
+
+    let out = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
+
+    assert!(
+        out.content
+            .contains("note: intel index bounded to 1 of 2 discovered files"),
+        "{}",
+        out.content
+    );
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn intel_walk_targeted_tools_scope_freshen() {
+    let _guard = test_recompute_counter_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "a/target.ts",
+        "export function target() {\n  return 1;\n}\n",
+    );
+    write(tmp.path(), "c/sibling.ts", "export function sibling() {}\n");
+    let (ctx, _db) = test_ctx_with_db(tmp.path());
+    let root_key = ctx.session.project_root.to_string_lossy().into_owned();
+
+    for (label, expected_scope, fut) in [
+        (
+            "outline",
+            "a/target.ts",
+            CodeTool.call(
+                code_args("outline", serde_json::json!({"path": "a/target.ts"})),
+                &ctx,
+            ),
+        ),
+        (
+            "deps",
+            "a",
+            GraphTool.call(
+                graph_args("deps", serde_json::json!({"path": "a/target.ts"})),
+                &ctx,
+            ),
+        ),
+        (
+            "callers",
+            "a/target.ts",
+            GraphTool.call(
+                graph_args(
+                    "callers",
+                    serde_json::json!({"name": "target", "path": "a/target.ts"}),
+                ),
+                &ctx,
+            ),
+        ),
+        (
+            "calls",
+            "a/target.ts",
+            GraphTool.call(
+                graph_args(
+                    "calls",
+                    serde_json::json!({"name": "target", "path": "a/target.ts"}),
+                ),
+                &ctx,
+            ),
+        ),
+    ] {
+        let visited = Arc::new(std::sync::Mutex::new(Vec::new()));
+        set_test_visited_paths(Some(root_key.clone()), Some(visited.clone()));
+        clear_freshness_cache();
+        let out = fut.await.unwrap();
+        assert!(
+            !out.content.is_empty(),
+            "{label} output should not be empty"
+        );
+        assert_only_visited(&visited, expected_scope);
+    }
+    set_test_visited_paths(None, None);
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn intel_walk_change_impact_scopes_freshen() {
+    let _guard = test_recompute_counter_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "a/target.rs",
+        "pub fn target() -> i32 {\n    1\n}\n",
+    );
+    write(
+        tmp.path(),
+        "c/sibling.rs",
+        "pub fn sibling() -> i32 { 1 }\n",
+    );
+    init_git(tmp.path());
+    write(
+        tmp.path(),
+        "a/target.rs",
+        "pub fn target() -> i32 {\n    2\n}\n",
+    );
+    let ctx = test_ctx(tmp.path());
+    let root_key = ctx.session.project_root.to_string_lossy().into_owned();
+    let visited = Arc::new(std::sync::Mutex::new(Vec::new()));
+    set_test_visited_paths(Some(root_key), Some(visited.clone()));
+    clear_freshness_cache();
+
+    let out = ChangeImpactTool
+        .call(serde_json::json!({}), &ctx)
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("a/target.rs"), "{}", out.content);
+    assert_only_visited(&visited, "a/target.rs");
+    set_test_visited_paths(None, None);
+    clear_freshness_cache();
+}
+
+#[tokio::test]
 async fn tree_call_does_not_recompute_centrality_inline() {
     let _guard = test_recompute_counter_guard().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1229,7 +1501,7 @@ async fn context_pack_overview_on_multifile_fixture() {
 }
 
 #[tokio::test]
-async fn context_pack_overview_lists_hidden_files() {
+async fn context_pack_overview_skips_hidden_files() {
     clear_freshness_cache();
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
@@ -1242,11 +1514,7 @@ async fn context_pack_overview_lists_hidden_files() {
         .await
         .unwrap();
 
-    assert!(
-        out.content.contains(".github/workflows/ci.yml"),
-        "{}",
-        out.content
-    );
+    assert!(!out.content.contains(".github/"), "{}", out.content);
     assert!(
         !out.content.contains(".git/COMMIT_EDITMSG"),
         "{}",

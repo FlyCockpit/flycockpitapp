@@ -20,13 +20,14 @@ pub mod thin;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use crate::db::Db;
 use crate::intel::lang::{Extraction, Language};
@@ -62,6 +63,8 @@ pub struct Index {
     /// paths the freshness walk re-includes so `search`/`tree`/`outline`/
     /// `symbol_find` surface them. Empty for the default constructor.
     gitignore_allow: Vec<String>,
+    exclude_dirs: Vec<String>,
+    max_cold_index_files: usize,
 }
 
 /// A file as found on disk during the freshness scan.
@@ -82,11 +85,112 @@ pub struct DiskMetaRow {
     pub size: i64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FreshenReport {
+    pub indexed: usize,
+    pub discovered: usize,
+    pub truncated: bool,
+    pub max_files: usize,
+}
+
+impl FreshenReport {
+    pub fn truncation_note(&self) -> Option<String> {
+        self.truncated.then(|| {
+            format!(
+                "note: intel index bounded to {} of {} discovered files — narrow your target for full coverage",
+                self.indexed, self.discovered
+            )
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreshenOutcome {
+    rows: Vec<DiskMetaRow>,
+    report: FreshenReport,
+}
+
+impl FreshenOutcome {
+    pub fn rows(&self) -> &[DiskMetaRow] {
+        &self.rows
+    }
+
+    pub fn into_rows(self) -> Vec<DiskMetaRow> {
+        self.rows
+    }
+
+    pub fn report(&self) -> &FreshenReport {
+        &self.report
+    }
+}
+
+impl std::ops::Deref for FreshenOutcome {
+    type Target = [DiskMetaRow];
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreshenProgress {
+    pub done: usize,
+    pub total: usize,
+}
+
+type FreshenObserver = Arc<dyn Fn(FreshenProgress) + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct FreshenOptions {
+    scope: Option<String>,
+    cancel: Option<CancellationToken>,
+    observer: Option<FreshenObserver>,
+}
+
+impl FreshenOptions {
+    pub fn scoped(scope: impl Into<String>) -> Self {
+        Self {
+            scope: Some(scope.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_scope(mut self, scope: Option<impl Into<String>>) -> Self {
+        self.scope = scope.map(Into::into);
+        self
+    }
+
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    pub fn with_observer(
+        mut self,
+        observer: impl Fn(FreshenProgress) + Send + Sync + 'static,
+    ) -> Self {
+        self.observer = Some(Arc::new(observer));
+        self
+    }
+}
+
+#[derive(Debug)]
+pub struct IntelFreshenCancelled;
+
+impl std::fmt::Display for IntelFreshenCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("intel index freshen cancelled")
+    }
+}
+
+impl std::error::Error for IntelFreshenCancelled {}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct FreshnessCacheKey {
     db_key: String,
     root_key: String,
     allow_key: String,
+    exclude_key: String,
     scope: Option<String>,
 }
 
@@ -106,9 +210,13 @@ fn freshness_cache() -> &'static Mutex<HashMap<FreshnessCacheKey, FreshnessCache
 #[cfg(test)]
 type TestCountCell = Mutex<Option<(String, std::sync::Arc<std::sync::atomic::AtomicUsize>)>>;
 #[cfg(test)]
+type TestVisitedPathsCell = Mutex<Option<(String, std::sync::Arc<Mutex<Vec<String>>>)>>;
+#[cfg(test)]
 static TEST_WALK_COUNT: OnceLock<TestCountCell> = OnceLock::new();
 #[cfg(test)]
 static TEST_RECOMPUTE_COUNT: OnceLock<TestCountCell> = OnceLock::new();
+#[cfg(test)]
+static TEST_VISITED_PATHS: OnceLock<TestVisitedPathsCell> = OnceLock::new();
 #[cfg(test)]
 static TEST_RECOMPUTE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 #[cfg(test)]
@@ -123,7 +231,7 @@ fn normalize_scope(scope: Option<&str>) -> Option<String> {
     Some(scope.replace('\\', "/").trim_end_matches('/').to_string())
 }
 
-fn invalid_scope(scope: &str) -> bool {
+pub(crate) fn invalid_intel_scope(scope: &str) -> bool {
     Path::new(scope).components().any(|component| {
         matches!(
             component,
@@ -157,11 +265,41 @@ fn allow_key(allow: &[String]) -> String {
     allow.join("\n")
 }
 
+fn exclude_key(exclude_dirs: &[String]) -> String {
+    let mut dirs = exclude_dirs.to_vec();
+    dirs.sort();
+    dirs.join("\n")
+}
+
+fn normalized_exclude_dirs(exclude_dirs: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in exclude_dirs {
+        let dir = dir.trim().trim_matches('/').to_string();
+        if !dir.is_empty() && !out.contains(&dir) {
+            out.push(dir);
+        }
+    }
+    out
+}
+
+fn idx_normalize_exclude_dirs(target: &mut Vec<String>, exclude_dirs: Vec<String>) {
+    *target = normalized_exclude_dirs(exclude_dirs);
+}
+
+fn scope_contains_excluded_dir(scope: &str, exclude_dirs: &[String]) -> bool {
+    scope
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .any(|part| exclude_dirs.iter().any(|dir| dir == part))
+}
+
 fn freshness_cache_get(
     db_key: &str,
     root_key: &str,
     allow_key: &str,
+    exclude_key: &str,
     scope: Option<&str>,
+    scope_overrides_exclusion: bool,
     now: i64,
 ) -> Option<Vec<DiskMetaRow>> {
     let cache = freshness_cache().lock().ok()?;
@@ -169,6 +307,7 @@ fn freshness_cache_get(
         db_key: db_key.to_string(),
         root_key: root_key.to_string(),
         allow_key: allow_key.to_string(),
+        exclude_key: exclude_key.to_string(),
         scope: scope.map(str::to_string),
     };
     if let Some(entry) = cache.get(&exact)
@@ -176,11 +315,12 @@ fn freshness_cache_get(
     {
         return Some(entry.disk.clone());
     }
-    if scope.is_some() {
+    if scope.is_some() && !scope_overrides_exclusion {
         let unscoped = FreshnessCacheKey {
             db_key: db_key.to_string(),
             root_key: root_key.to_string(),
             allow_key: allow_key.to_string(),
+            exclude_key: exclude_key.to_string(),
             scope: None,
         };
         if let Some(entry) = cache.get(&unscoped)
@@ -203,6 +343,7 @@ fn freshness_cache_store(
     db_key: &str,
     root_key: &str,
     allow_key: &str,
+    exclude_key: &str,
     scope: Option<&str>,
     now: i64,
     disk: Vec<DiskMetaRow>,
@@ -215,6 +356,7 @@ fn freshness_cache_store(
             db_key: db_key.to_string(),
             root_key: root_key.to_string(),
             allow_key: allow_key.to_string(),
+            exclude_key: exclude_key.to_string(),
             scope: scope.map(str::to_string),
         },
         FreshnessCacheEntry {
@@ -254,6 +396,17 @@ pub(crate) fn set_test_recompute_counter(
 }
 
 #[cfg(test)]
+pub(crate) fn set_test_visited_paths(
+    root_key: Option<String>,
+    paths: Option<std::sync::Arc<Mutex<Vec<String>>>>,
+) {
+    *TEST_VISITED_PATHS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = root_key.zip(paths);
+}
+
+#[cfg(test)]
 pub(crate) async fn test_recompute_counter_guard() -> tokio::sync::MutexGuard<'static, ()> {
     TEST_RECOMPUTE_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
@@ -283,6 +436,22 @@ fn record_disk_walk(root: &Path) {
         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
+
+#[cfg(test)]
+fn record_visited_path(root: &Path, rel: &str) {
+    if let Some((expected, paths)) = TEST_VISITED_PATHS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .as_ref()
+        && root.to_string_lossy().as_ref() == expected
+    {
+        paths.lock().unwrap().push(rel.to_string());
+    }
+}
+
+#[cfg(not(test))]
+fn record_visited_path(_root: &Path, _rel: &str) {}
 
 fn record_recompute_centrality(root_key: &str) {
     #[cfg(not(test))]
@@ -361,6 +530,8 @@ impl Index {
             db_key,
             root_key,
             gitignore_allow: Vec::new(),
+            exclude_dirs: crate::config::extended::default_intel_exclude_dirs(),
+            max_cold_index_files: crate::config::extended::DEFAULT_INTEL_MAX_COLD_INDEX_FILES,
         }
     }
 
@@ -373,38 +544,75 @@ impl Index {
         idx
     }
 
+    pub fn with_exclude_dirs(mut self, exclude_dirs: Vec<String>) -> Self {
+        idx_normalize_exclude_dirs(&mut self.exclude_dirs, exclude_dirs);
+        self
+    }
+
+    pub fn with_max_cold_index_files(mut self, max_cold_index_files: usize) -> Self {
+        self.max_cold_index_files = max_cold_index_files.max(1);
+        self
+    }
+
+    pub fn exclude_dirs(&self) -> &[String] {
+        &self.exclude_dirs
+    }
+
     /// The single on-demand chokepoint. Re-stats the gitignore-walked
     /// file set, deletes removed files in one writer transaction, then
     /// re-indexes new/stale files. Disk walking, hashing, and parsing run
     /// off the DB writer; the writer only owns short metadata/chunk writes.
-    pub async fn ensure_fresh(&self) -> Result<()> {
-        self.ensure_fresh_scoped(None).await.map(|_| ())
+    pub async fn ensure_fresh(&self) -> Result<FreshenReport> {
+        self.ensure_fresh_scoped(FreshenOptions::default())
+            .await
+            .map(|outcome| outcome.report)
     }
 
-    pub async fn ensure_fresh_scoped(&self, scope: Option<&str>) -> Result<Vec<DiskMetaRow>> {
-        let scope = normalize_scope(scope);
+    pub async fn ensure_fresh_scoped(&self, options: FreshenOptions) -> Result<FreshenOutcome> {
+        let FreshenOptions {
+            scope,
+            cancel,
+            observer,
+        } = options;
+        let scope = normalize_scope(scope.as_deref());
+        check_cancelled(cancel.as_ref())?;
         let now = now_secs();
         let allow_key = allow_key(&self.gitignore_allow);
+        let exclude_key = exclude_key(&self.exclude_dirs);
+        let scope_overrides_exclusion = scope
+            .as_deref()
+            .is_some_and(|scope| scope_contains_excluded_dir(scope, &self.exclude_dirs));
         if let Some(cached) = freshness_cache_get(
             &self.db_key,
             &self.root_key,
             &allow_key,
+            &exclude_key,
             scope.as_deref(),
+            scope_overrides_exclusion,
             now,
         ) {
-            return Ok(cached);
+            return Ok(FreshenOutcome {
+                rows: cached,
+                report: FreshenReport {
+                    max_files: self.max_cold_index_files,
+                    ..FreshenReport::default()
+                },
+            });
         }
 
         let root = self.root.clone();
         let root_key = self.root_key.clone();
         let allow = self.gitignore_allow.clone();
         let scan_scope = scope.clone();
-        let disk =
-            tokio::task::spawn_blocking(move || scan_disk(&root, &allow, scan_scope.as_deref()))
-                .await
-                .context("intel scan worker joined")??;
+        let exclude_dirs = self.exclude_dirs.clone();
+        let disk = tokio::task::spawn_blocking(move || {
+            scan_disk(&root, &allow, &exclude_dirs, scan_scope.as_deref())
+        })
+        .await
+        .context("intel scan worker joined")??;
+        check_cancelled(cancel.as_ref())?;
         let disk_paths: HashSet<String> = disk.iter().map(|d| d.rel.clone()).collect();
-        let disk_meta = disk_meta_rows(&disk);
+        let full_disk_meta = disk_meta_rows(&disk);
 
         let read_root_key = root_key.clone();
         let read_scope = scope.clone();
@@ -438,6 +646,22 @@ impl Index {
         })
         .await
         .context("intel planning worker joined")??;
+        check_cancelled(cancel.as_ref())?;
+        let mut work = work;
+        let discovered = work.to_index.len();
+        let truncated = apply_cold_index_cap(&mut work.to_index, self.max_cold_index_files);
+        let indexed_count = work.to_index.len();
+        let disk_meta = if truncated {
+            disk_meta_rows(&work.to_index)
+        } else {
+            full_disk_meta
+        };
+        let report = FreshenReport {
+            indexed: indexed_count,
+            discovered,
+            truncated,
+            max_files: self.max_cold_index_files,
+        };
         let removed_any = !work.removed.is_empty();
 
         if removed_any || !work.stat_updates.is_empty() {
@@ -452,7 +676,7 @@ impl Index {
         }
 
         if work.to_index.is_empty() {
-            let write_version = !logic_version_current;
+            let write_version = !logic_version_current && !truncated;
             let module_prefix = if removed_any {
                 let module_root = self.root.clone();
                 Some(
@@ -477,15 +701,21 @@ impl Index {
                     })
                     .await?;
             }
-            freshness_cache_store(
-                &self.db_key,
-                &self.root_key,
-                &allow_key,
-                scope.as_deref(),
-                now,
-                disk_meta.clone(),
-            );
-            return Ok(disk_meta);
+            if !truncated {
+                freshness_cache_store(
+                    &self.db_key,
+                    &self.root_key,
+                    &allow_key,
+                    &exclude_key,
+                    scope.as_deref(),
+                    now,
+                    disk_meta.clone(),
+                );
+            }
+            return Ok(FreshenOutcome {
+                rows: disk_meta,
+                report,
+            });
         }
         if work.to_index.len() >= COLD_THRESHOLD {
             tracing::info!(files = work.to_index.len(), "intel: cold-indexing");
@@ -495,11 +725,16 @@ impl Index {
         let module_prefix = tokio::task::spawn_blocking(move || go_module_prefix(&module_root))
             .await
             .context("intel module-prefix worker joined")?;
+        let total = work.to_index.len();
+        let mut done = 0usize;
         for chunk in work.to_index.chunks(CHUNK) {
+            check_cancelled(cancel.as_ref())?;
+            let chunk_len = chunk.len();
             let chunk = chunk.to_vec();
             let parsed = tokio::task::spawn_blocking(move || parse_files_capped(chunk))
                 .await
                 .context("intel parse worker joined")??;
+            check_cancelled(cancel.as_ref())?;
             let write_root_key = root_key.clone();
             let write_resolution_paths = resolution_paths.clone();
             let write_module_prefix = module_prefix.clone();
@@ -515,10 +750,14 @@ impl Index {
                     )
                 })
                 .await?;
+            done = (done + chunk_len).min(total);
+            if let Some(observer) = &observer {
+                observer(FreshenProgress { done, total });
+            }
         }
 
         let write_root_key = root_key.clone();
-        let write_version = !logic_version_current;
+        let write_version = !logic_version_current && !truncated;
         self.db
             .write(move |conn| {
                 refresh_dep_resolutions(conn, &write_root_key, &module_prefix)?;
@@ -528,15 +767,21 @@ impl Index {
                 Ok(())
             })
             .await?;
-        freshness_cache_store(
-            &self.db_key,
-            &self.root_key,
-            &allow_key,
-            scope.as_deref(),
-            now,
-            disk_meta.clone(),
-        );
-        Ok(disk_meta)
+        if !truncated {
+            freshness_cache_store(
+                &self.db_key,
+                &self.root_key,
+                &allow_key,
+                &exclude_key,
+                scope.as_deref(),
+                now,
+                disk_meta.clone(),
+            );
+        }
+        Ok(FreshenOutcome {
+            rows: disk_meta,
+            report,
+        })
     }
 
     // ---- query methods (each assumes ensure_fresh already ran) --------
@@ -1068,6 +1313,30 @@ fn plan_fresh_work(
     })
 }
 
+fn apply_cold_index_cap(to_index: &mut Vec<DiskFile>, max_files: usize) -> bool {
+    if to_index.len() <= max_files {
+        return false;
+    }
+    to_index.sort_by(|a, b| {
+        path_depth(&a.rel)
+            .cmp(&path_depth(&b.rel))
+            .then_with(|| a.rel.cmp(&b.rel))
+    });
+    to_index.truncate(max_files);
+    true
+}
+
+fn path_depth(path: &str) -> usize {
+    path.split('/').filter(|part| !part.is_empty()).count()
+}
+
+fn check_cancelled(cancel: Option<&CancellationToken>) -> Result<()> {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err(IntelFreshenCancelled.into());
+    }
+    Ok(())
+}
+
 fn apply_fresh_metadata(
     conn: &Connection,
     root_key: &str,
@@ -1128,24 +1397,26 @@ fn parse_files_capped(files: Vec<DiskFile>) -> Result<Vec<ParsedFile>> {
 fn scan_disk(
     root: &Path,
     gitignore_allow: &[String],
+    exclude_dirs: &[String],
     scope: Option<&str>,
 ) -> Result<Vec<DiskFile>> {
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    if scope.is_some_and(invalid_scope) {
+    if scope.is_some_and(invalid_intel_scope) {
         return Ok(out);
     }
     let walk_root = scope.map_or_else(|| root.to_path_buf(), |scope| root.join(scope));
 
-    let mut walker = WalkBuilder::new(&walk_root);
-    walker
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .parents(true)
-        .require_git(false)
-        .follow_links(false);
+    let walker = intel_walk_builder(
+        root,
+        &walk_root,
+        exclude_dirs,
+        IntelWalkMode {
+            gitignore: true,
+            hidden: true,
+            explicit_scope: scope.is_some(),
+        },
+    );
     record_disk_walk(root);
     for dent in walker.build().flatten() {
         if !dent.file_type().is_some_and(|t| t.is_file()) {
@@ -1164,16 +1435,16 @@ fn scan_disk(
     if !gitignore_allow.is_empty() {
         let matcher = crate::gitignore::build_allowlist_matcher(root, gitignore_allow);
         if !matcher.is_empty() {
-            let mut wide = WalkBuilder::new(&walk_root);
-            wide.hidden(false)
-                .git_ignore(false)
-                .git_global(false)
-                .git_exclude(false)
-                .parents(false)
-                .require_git(false)
-                .follow_links(false);
-            // Skip the `.git` dir explicitly (gitignore-off walks descend it).
-            wide.filter_entry(|dent| dent.file_name() != ".git");
+            let wide = intel_walk_builder(
+                root,
+                &walk_root,
+                exclude_dirs,
+                IntelWalkMode {
+                    gitignore: false,
+                    hidden: false,
+                    explicit_scope: scope.is_some(),
+                },
+            );
             record_disk_walk(root);
             for dent in wide.build().flatten() {
                 if !dent.file_type().is_some_and(|t| t.is_file()) {
@@ -1194,11 +1465,55 @@ fn scan_disk(
     Ok(out)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct IntelWalkMode {
+    pub gitignore: bool,
+    pub hidden: bool,
+    pub explicit_scope: bool,
+}
+
+pub(crate) fn intel_walk_builder(
+    root: &Path,
+    walk_root: &Path,
+    exclude_dirs: &[String],
+    mode: IntelWalkMode,
+) -> WalkBuilder {
+    let mut walker = WalkBuilder::new(walk_root);
+    walker
+        .hidden(mode.hidden)
+        .git_ignore(mode.gitignore)
+        .git_global(mode.gitignore)
+        .git_exclude(mode.gitignore)
+        .parents(mode.gitignore)
+        .require_git(false)
+        .follow_links(false);
+    let exclude_dirs: HashSet<String> = exclude_dirs.iter().cloned().collect();
+    let walk_root = walk_root.to_path_buf();
+    let root = root.to_path_buf();
+    walker.filter_entry(move |dent| {
+        if dent.path() == walk_root && mode.explicit_scope {
+            return true;
+        }
+        if dent.file_name() == ".git" {
+            return false;
+        }
+        if dent.file_type().is_some_and(|t| t.is_dir()) {
+            let name = dent.file_name().to_string_lossy();
+            if exclude_dirs.contains(name.as_ref()) {
+                return false;
+            }
+        }
+        dent.path() == root || dent.path().starts_with(&root)
+    });
+    walker
+}
+
 /// Build a [`DiskFile`] for `abs` relative to `root`, or `None` when it can't
 /// be related to `root` / stat'd.
 fn disk_file_for(abs: &Path, root: &Path) -> Option<DiskFile> {
     let rel = abs.strip_prefix(root).ok()?;
     let rel = rel.to_string_lossy().replace('\\', "/");
+    record_visited_path(root, &rel);
     let meta = std::fs::metadata(abs).ok()?;
     Some(DiskFile {
         rel,
@@ -1735,6 +2050,24 @@ mod tests {
         .unwrap()
     }
 
+    #[expect(
+        deprecated,
+        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
+    )]
+    fn indexed_paths(db: &Db, root_key: &str) -> Vec<String> {
+        let mut paths = db
+            .read_blocking(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT path FROM intel_files WHERE root = ?1 ORDER BY path")?;
+                Ok(stmt
+                    .query_map([root_key], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap();
+        paths.sort();
+        paths
+    }
+
     #[tokio::test]
     async fn indexes_two_languages() {
         let db = Db::open_in_memory().unwrap();
@@ -1770,7 +2103,10 @@ mod tests {
         write_file(&root, "b/two.rs", "pub fn two() {}\n");
 
         let index = Index::new(db, root);
-        let disk = index.ensure_fresh_scoped(Some("a")).await.unwrap();
+        let disk = index
+            .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("a"))
+            .await
+            .unwrap();
 
         assert_eq!(
             disk.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
@@ -1781,6 +2117,302 @@ mod tests {
             index.symbol_find("two", true, None).unwrap().is_empty(),
             "scoped refresh must not index files outside the scoped subtree"
         );
+    }
+
+    #[tokio::test]
+    async fn intel_walk_default_exclusions_apply() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(&root, "node_modules/x.js", "export const x = 1;\n");
+        write_file(&root, "target/y.rs", "pub fn y() {}\n");
+        write_file(&root, "src/z.rs", "pub fn z() {}\n");
+
+        let index = Index::new(db.clone(), root.clone());
+        index.ensure_fresh().await.unwrap();
+
+        assert_eq!(
+            indexed_paths(&db, &root.to_string_lossy()),
+            vec!["src/z.rs"],
+            "built-in exclusions should prune node_modules and target"
+        );
+    }
+
+    #[tokio::test]
+    async fn intel_walk_exclude_dirs_override_replaces_defaults() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(&root, "node_modules/x.js", "export const x = 1;\n");
+        write_file(&root, "weird/y.rs", "pub fn y() {}\n");
+        write_file(&root, "src/z.rs", "pub fn z() {}\n");
+
+        let index =
+            Index::new(db.clone(), root.clone()).with_exclude_dirs(vec!["weird".to_string()]);
+        index.ensure_fresh().await.unwrap();
+
+        assert_eq!(
+            indexed_paths(&db, &root.to_string_lossy()),
+            vec!["node_modules/x.js", "src/z.rs"],
+            "configured exclude_dirs replaces the built-in list"
+        );
+    }
+
+    #[tokio::test]
+    async fn intel_walk_explicit_scope_overrides_exclusion() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(
+            &root,
+            "node_modules/pkg/index.js",
+            "export const pkg = 1;\n",
+        );
+        write_file(
+            &root,
+            "node_modules/pkg/node_modules/nested.js",
+            "export const nested = 1;\n",
+        );
+
+        let index = Index::new(db.clone(), root.clone());
+        let rows = index
+            .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("node_modules/pkg"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            vec!["node_modules/pkg/index.js"]
+        );
+        assert_eq!(
+            indexed_paths(&db, &root.to_string_lossy()),
+            vec!["node_modules/pkg/index.js"],
+            "explicit scope root inside an excluded dir is walked, nested excluded dirs are pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn intel_walk_unscoped_cache_does_not_hide_explicit_excluded_scope() {
+        let _guard = test_recompute_counter_guard().await;
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(&root, "src/z.rs", "pub fn z() {}\n");
+        write_file(
+            &root,
+            "node_modules/pkg/index.js",
+            "export const pkg = 1;\n",
+        );
+        let root_key = root.to_string_lossy().into_owned();
+        let walks = Arc::new(AtomicUsize::new(0));
+        set_test_walk_counter(Some(root_key.clone()), Some(walks.clone()));
+        let index = Index::new(db.clone(), root.clone());
+
+        index.ensure_fresh().await.unwrap();
+        assert_eq!(indexed_paths(&db, &root_key), vec!["src/z.rs"]);
+        assert_eq!(walks.load(Ordering::SeqCst), 1);
+
+        index
+            .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("node_modules/pkg"))
+            .await
+            .unwrap();
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            2,
+            "an unscoped cache pruned by exclusions must not satisfy an explicit excluded scope"
+        );
+        assert_eq!(
+            indexed_paths(&db, &root_key),
+            vec!["node_modules/pkg/index.js", "src/z.rs"]
+        );
+
+        set_test_walk_counter(None, None);
+        clear_freshness_cache();
+    }
+
+    #[tokio::test]
+    async fn intel_walk_cache_key_includes_exclude_policy() {
+        let _guard = test_recompute_counter_guard().await;
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(
+            &root,
+            "node_modules/pkg/index.js",
+            "export const pkg = 1;\n",
+        );
+        write_file(&root, "src/z.rs", "pub fn z() {}\n");
+        let root_key = root.to_string_lossy().into_owned();
+        let walks = Arc::new(AtomicUsize::new(0));
+        set_test_walk_counter(Some(root_key.clone()), Some(walks.clone()));
+
+        Index::new(db.clone(), root.clone())
+            .ensure_fresh()
+            .await
+            .unwrap();
+        assert_eq!(indexed_paths(&db, &root_key), vec!["src/z.rs"]);
+
+        Index::new(db.clone(), root)
+            .with_exclude_dirs(vec![])
+            .ensure_fresh()
+            .await
+            .unwrap();
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            2,
+            "changing exclude_dirs must not reuse the previous policy's cache"
+        );
+        assert_eq!(
+            indexed_paths(&db, &root_key),
+            vec!["node_modules/pkg/index.js", "src/z.rs"]
+        );
+
+        set_test_walk_counter(None, None);
+        clear_freshness_cache();
+    }
+
+    #[tokio::test]
+    async fn intel_walk_cold_cap_truncates_breadth_first() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        for i in 0..15 {
+            write_file(&root, &format!("top_{i:02}.rs"), "pub fn top() {}\n");
+            write_file(
+                &root,
+                &format!("deep/nested_{i:02}.rs"),
+                "pub fn deep() {}\n",
+            );
+        }
+
+        let index = Index::new(db.clone(), root.clone()).with_max_cold_index_files(10);
+        let report = index.ensure_fresh().await.unwrap();
+
+        assert_eq!(report.indexed, 10);
+        assert_eq!(report.discovered, 30);
+        assert!(report.truncated);
+        assert_eq!(
+            indexed_paths(&db, &root.to_string_lossy()),
+            (0..10)
+                .map(|i| format!("top_{i:02}.rs"))
+                .collect::<Vec<_>>(),
+            "cold cap should index the shallowest paths first, then path order"
+        );
+        assert!(
+            report
+                .truncation_note()
+                .unwrap()
+                .contains("intel index bounded to 10 of 30 discovered files")
+        );
+    }
+
+    #[tokio::test]
+    async fn intel_walk_truncated_freshen_does_not_poison_cache() {
+        let _guard = test_recompute_counter_guard().await;
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(&root, "a.rs", "pub fn a() {}\n");
+        write_file(&root, "deep/b.rs", "pub fn b() {}\n");
+        let root_key = root.to_string_lossy().into_owned();
+        let walks = Arc::new(AtomicUsize::new(0));
+        set_test_walk_counter(Some(root_key.clone()), Some(walks.clone()));
+
+        let capped = Index::new(db.clone(), root.clone()).with_max_cold_index_files(1);
+        let report = capped.ensure_fresh().await.unwrap();
+        assert!(report.truncated);
+        assert_eq!(walks.load(Ordering::SeqCst), 1);
+        assert_eq!(indexed_paths(&db, &root_key), vec!["a.rs"]);
+
+        capped
+            .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("deep"))
+            .await
+            .unwrap();
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            2,
+            "truncated unscoped freshen must not satisfy later scoped freshen from cache"
+        );
+        assert_eq!(indexed_paths(&db, &root_key), vec!["a.rs", "deep/b.rs"]);
+
+        set_test_walk_counter(None, None);
+        clear_freshness_cache();
+    }
+
+    #[tokio::test]
+    async fn intel_walk_cancel_stops_between_chunks() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        for i in 0..(CHUNK + 5) {
+            write_file(&root, &format!("src/file_{i:03}.rs"), "pub fn item() {}\n");
+        }
+        let root_key = root.to_string_lossy().into_owned();
+        let precancel = CancellationToken::new();
+        precancel.cancel();
+        let index = Index::new(db.clone(), root.clone());
+        let err = index
+            .ensure_fresh_scoped(FreshenOptions::default().with_cancel(precancel))
+            .await
+            .unwrap_err();
+        assert!(err.is::<IntelFreshenCancelled>());
+        assert!(indexed_paths(&db, &root_key).is_empty());
+
+        let cancel = CancellationToken::new();
+        let cancel_after_first = cancel.clone();
+        let err = index
+            .ensure_fresh_scoped(FreshenOptions::default().with_cancel(cancel).with_observer(
+                move |progress| {
+                    if progress.done >= CHUNK {
+                        cancel_after_first.cancel();
+                    }
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert!(err.is::<IntelFreshenCancelled>());
+        let indexed = indexed_paths(&db, &root_key);
+        assert_eq!(
+            indexed.len(),
+            CHUNK,
+            "already-written chunk remains queryable after mid-run cancel"
+        );
+        clear_freshness_cache();
+    }
+
+    #[tokio::test]
+    async fn intel_walk_observer_reports_chunk_progress() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        for i in 0..(CHUNK + 1) {
+            write_file(&root, &format!("src/file_{i:03}.rs"), "pub fn item() {}\n");
+        }
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let seen = progress.clone();
+        let index = Index::new(db, root);
+
+        index
+            .ensure_fresh_scoped(FreshenOptions::default().with_observer(move |event| {
+                seen.lock().unwrap().push((event.done, event.total));
+            }))
+            .await
+            .unwrap();
+
+        let progress = progress.lock().unwrap().clone();
+        assert_eq!(progress.len(), 2, "observer should fire once per chunk");
+        assert_eq!(progress[0], (CHUNK, CHUNK + 1));
+        assert_eq!(progress[1], (CHUNK + 1, CHUNK + 1));
+        assert!(progress.windows(2).all(|w| w[0].0 <= w[1].0));
     }
 
     #[tokio::test]
@@ -1797,7 +2429,10 @@ mod tests {
         clear_freshness_cache();
 
         std::fs::remove_file(root.join("a/one.rs")).unwrap();
-        index.ensure_fresh_scoped(Some("a")).await.unwrap();
+        index
+            .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("a"))
+            .await
+            .unwrap();
 
         assert!(
             index.symbol_find("one", true, None).unwrap().is_empty(),
@@ -1841,7 +2476,10 @@ mod tests {
             "src/app.ts",
             "import { helper } from '../shared/util';\nexport function main() {\n  helper();\n}\nexport const changed = true;\n",
         );
-        index.ensure_fresh_scoped(Some("src")).await.unwrap();
+        index
+            .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("src"))
+            .await
+            .unwrap();
 
         assert!(
             index
@@ -1868,7 +2506,10 @@ mod tests {
         write_file(&root, "shared/util.ts", "export function helper() {}\n");
 
         let index = Index::new(db, root);
-        index.ensure_fresh_scoped(Some("src")).await.unwrap();
+        index
+            .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("src"))
+            .await
+            .unwrap();
         assert!(
             index.dep_edges().unwrap().iter().any(|edge| {
                 edge.importer == "src/app.ts"
@@ -1935,16 +2576,25 @@ mod tests {
         set_test_walk_counter(Some(root_key), Some(walks.clone()));
         let index = Index::new(db, root);
 
-        index.ensure_fresh_scoped(Some("a")).await.unwrap();
+        index
+            .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("a"))
+            .await
+            .unwrap();
         assert_eq!(walks.load(Ordering::SeqCst), 1);
-        index.ensure_fresh_scoped(Some("a")).await.unwrap();
+        index
+            .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("a"))
+            .await
+            .unwrap();
         assert_eq!(
             walks.load(Ordering::SeqCst),
             1,
             "same-scope refresh within the TTL should use the cached disk snapshot"
         );
         now.store(106, Ordering::SeqCst);
-        index.ensure_fresh_scoped(Some("a")).await.unwrap();
+        index
+            .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("a"))
+            .await
+            .unwrap();
         assert_eq!(walks.load(Ordering::SeqCst), 2);
 
         set_test_now(None);
@@ -1967,7 +2617,10 @@ mod tests {
         set_test_walk_counter(Some(root_key), Some(walks.clone()));
         let index = Index::new(db, root);
 
-        index.ensure_fresh_scoped(Some("a")).await.unwrap();
+        index
+            .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("a"))
+            .await
+            .unwrap();
         assert_eq!(walks.load(Ordering::SeqCst), 1);
         index.ensure_fresh().await.unwrap();
         assert_eq!(
@@ -2382,7 +3035,10 @@ mod tests {
 
         write_file(&root, "src/c.rs", "pub fn c() { a(); }\n");
         clear_freshness_cache();
-        index.ensure_fresh_scoped(Some("src")).await.unwrap();
+        index
+            .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("src"))
+            .await
+            .unwrap();
 
         assert_eq!(stored_content_generation(&db, &root_key), Some(before + 1));
     }

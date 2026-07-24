@@ -86,6 +86,10 @@ impl Tool for CodeTool {
         Some(code_schema(true))
     }
 
+    fn honors_dispatch_cancel(&self) -> bool {
+        true
+    }
+
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let Some(kind) = non_empty_str(&args, "kind") else {
             return Err(code_kind_error());

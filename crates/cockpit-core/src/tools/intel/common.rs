@@ -15,7 +15,9 @@ pub(super) use crate::engine::tool::{
 pub(super) use crate::intel::budget::{BudgetedWriter, retained_truncated_body};
 pub(super) use crate::intel::lang::{Language, regex_outline};
 pub(super) use crate::intel::thin::{ThinLimits, thin_line_output};
-pub(super) use crate::intel::{DepEdge, FileMetaRow, Index, SymbolRow};
+pub(super) use crate::intel::{
+    DepEdge, FileMetaRow, FreshenOptions, FreshenReport, Index, SymbolRow,
+};
 
 /// Token cap shared by the index tools. `search` uses a larger default
 /// per the spec (4000); structural tools are terser so a tighter cap
@@ -61,6 +63,12 @@ pub(super) fn index_of(ctx: &ToolCtx) -> Index {
         ctx.session.project_root.clone(),
         allow,
     )
+    .with_exclude_dirs(crate::config::extended::resolve_intel_exclude_dirs(
+        &ctx.cwd,
+    ))
+    .with_max_cold_index_files(crate::config::extended::resolve_intel_max_cold_index_files(
+        &ctx.cwd,
+    ))
 }
 
 /// Normalize a path arg to a relative forward-slash path against the
@@ -86,6 +94,35 @@ pub(super) fn finish(writer: BudgetedWriter, note: &str) -> ToolOutput {
     } else {
         ToolOutput::text(writer.into_string())
     }
+}
+
+pub(super) fn append_freshen_note(out: &mut ToolOutput, report: &FreshenReport) {
+    if let Some(note) = report.truncation_note() {
+        if !out.content.ends_with('\n') {
+            out.content.push('\n');
+        }
+        out.content.push_str(&note);
+        out.content.push('\n');
+    }
+}
+
+pub(super) fn freshen_options(ctx: &ToolCtx, scope: Option<String>) -> FreshenOptions {
+    FreshenOptions::default()
+        .with_scope(scope)
+        .with_cancel(ctx.cancel.clone())
+}
+
+pub(super) fn parent_scope_for_file(rel: &str, ctx: &ToolCtx) -> String {
+    let abs = ctx.session.project_root.join(rel);
+    if abs.is_file()
+        && let Some(parent) = Path::new(rel).parent()
+    {
+        let parent = parent.to_string_lossy().replace('\\', "/");
+        if !parent.is_empty() {
+            return parent;
+        }
+    }
+    rel.to_string()
 }
 
 pub(super) fn write_retained_line(writer: &mut BudgetedWriter, line: &str) -> bool {
@@ -289,29 +326,33 @@ pub(super) fn forward_deps(
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct FsFileMeta {
+pub(crate) struct FsFileMeta {
     pub rel: String,
     pub size: u64,
     pub mtime: Option<std::time::SystemTime>,
 }
 
 /// Gitignore-aware list of file metadata for every tracked file.
-pub(super) fn list_file_metas(root: &Path) -> Vec<FsFileMeta> {
-    list_file_metas_from(root, root)
-}
-
-fn list_file_metas_from(root: &Path, walk_root: &Path) -> Vec<FsFileMeta> {
+pub(crate) fn list_file_metas(
+    root: &Path,
+    exclude_dirs: &[String],
+    scope: Option<&str>,
+) -> Vec<FsFileMeta> {
     let mut out = Vec::new();
-    let mut walker = WalkBuilder::new(walk_root);
-    walker
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .parents(true)
-        .require_git(false)
-        .follow_links(false)
-        .filter_entry(crate::tools::text_search::is_not_dot_git_dir);
+    if scope.is_some_and(crate::intel::invalid_intel_scope) {
+        return out;
+    }
+    let walk_root = scope.map_or_else(|| root.to_path_buf(), |scope| root.join(scope));
+    let walker = crate::intel::intel_walk_builder(
+        root,
+        &walk_root,
+        exclude_dirs,
+        crate::intel::IntelWalkMode {
+            gitignore: true,
+            hidden: true,
+            explicit_scope: scope.is_some(),
+        },
+    );
     for dent in walker.build().flatten() {
         if !dent.file_type().is_some_and(|t| t.is_file()) {
             continue;

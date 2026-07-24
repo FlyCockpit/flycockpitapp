@@ -61,7 +61,11 @@ impl Tool for DepsTool {
             .map(|h| h.clamp(1, 10) as usize)
             .unwrap_or(1);
         let index = index_of(ctx);
-        index.ensure_fresh().await?;
+        let scope = parent_scope_for_file(&rel, ctx);
+        let freshen = index
+            .ensure_fresh_scoped(freshen_options(ctx, Some(scope)))
+            .await?;
+        let freshen_report = freshen.report().clone();
 
         let edges = index.dep_edges()?;
         // forward: importer → importee; reverse: importee → importer.
@@ -87,7 +91,9 @@ impl Tool for DepsTool {
             writer.writeln(&format!("forward ({}):", reached.len()));
             for (dist, p) in &reached {
                 if !write_retained_line(&mut writer, &format!("  [{dist}] {p}")) {
-                    return Ok(finish(writer, "\n... [truncated]\n"));
+                    let mut out = finish(writer, "\n... [truncated]\n");
+                    append_freshen_note(&mut out, &freshen_report);
+                    return Ok(out);
                 }
             }
         }
@@ -96,7 +102,9 @@ impl Tool for DepsTool {
             writer.writeln(&format!("reverse ({}):", reached.len()));
             for (dist, p) in &reached {
                 if !write_retained_line(&mut writer, &format!("  [{dist}] {p}")) {
-                    return Ok(finish(writer, "\n... [truncated]\n"));
+                    let mut out = finish(writer, "\n... [truncated]\n");
+                    append_freshen_note(&mut out, &freshen_report);
+                    return Ok(out);
                 }
             }
         }
@@ -108,6 +116,8 @@ impl Tool for DepsTool {
                 }
             }
         }
-        Ok(finish(writer, "\n... [truncated]\n"))
+        let mut out = finish(writer, "\n... [truncated]\n");
+        append_freshen_note(&mut out, &freshen_report);
+        Ok(out)
     }
 }

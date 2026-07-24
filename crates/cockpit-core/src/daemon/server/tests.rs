@@ -2844,6 +2844,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             effect_class: InMemory,
             observation: "shutdown context enters draining phase",
         },
+        MutatingDispatchCase {
+            kind: "restart_if_idle",
+            effect_class: InMemory,
+            observation: "restart decision enters drain only while daemon is idle",
+        },
     ]
 }
 
@@ -3023,6 +3028,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "get_usage_counts"
         | "stats_rollup"
         | "guidance_estimate"
+        | "restart_if_idle"
         | "stop_daemon" => AuthzAllowedOutcome::Response,
         "begin_attachment_upload"
         | "upload_attachment_chunk"
@@ -3167,6 +3173,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("stats_rollup"),
         authz_project_read("guidance_estimate"),
         authz_owner_only("stop_daemon"),
+        authz_owner_only("restart_if_idle"),
     ]
 }
 
@@ -4166,6 +4173,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "stop_daemon" => Request::StopDaemon {
             grace_secs: Some(1),
         },
+        "restart_if_idle" => Request::RestartIfIdle,
         other => panic!("unhandled authz matrix request kind {other}"),
     }
 }
@@ -4842,6 +4850,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "record_usage"
         | "store_flycockpit_credential"
         | "clear_flycockpit_credential"
+        | "restart_if_idle"
         | "stop_daemon"
         | "lsp_control" => assert_in_memory_or_global_mutating_happy(case.kind).await,
         "send_user_message"
@@ -5080,6 +5089,21 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             .expect("second stop forces drain");
             assert!(matches!(response, Response::Ack));
             wait_for_shutdown_phase(&ctx, ShutdownPhase::Forced).await;
+        }
+        "restart_if_idle" => {
+            let ctx = test_ctx();
+            insert_busy_test_worker(&ctx).await;
+            let response = dispatch_matrix_request(&ctx, Request::RestartIfIdle)
+                .await
+                .expect("busy daemon returns restart decision");
+            assert!(matches!(
+                response,
+                Response::RestartDecision {
+                    will_restart: false,
+                    reason: Some(reason)
+                } if reason == "a session is busy"
+            ));
+            assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Running);
         }
         other => panic!("unhandled mutating malformed case {other}"),
     }
@@ -6786,6 +6810,20 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
             assert!(matches!(response, Response::Ack));
             wait_for_shutdown_phase(&ctx, ShutdownPhase::Draining).await;
         }
+        "restart_if_idle" => {
+            let ctx = test_ctx();
+            let response = dispatch_matrix_request(&ctx, Request::RestartIfIdle)
+                .await
+                .expect("restart if idle");
+            assert!(matches!(
+                response,
+                Response::RestartDecision {
+                    will_restart: true,
+                    reason: None
+                }
+            ));
+            wait_for_shutdown_phase(&ctx, ShutdownPhase::Draining).await;
+        }
         "lsp_control" => {
             let ctx = test_ctx();
             let tmp = tempfile::tempdir().unwrap();
@@ -7967,6 +8005,13 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::RestartIfIdle,
+            kind: "restart_if_idle",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::Unknown,
             kind: "unknown",
             session_id: None,
@@ -8082,6 +8127,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         GetUsageCounts,
         StatsRollup,
         GuidanceEstimate,
+        RestartIfIdle,
         StopDaemon,
     );
 
@@ -9393,6 +9439,9 @@ async fn wait_for_shutdown_phase(ctx: &Arc<DaemonContext>, expected: ShutdownPha
         return;
     }
     let mut phase_rx = ctx.shutdown.subscribe();
+    if *phase_rx.borrow() == expected {
+        return;
+    }
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             phase_rx.changed().await.expect("shutdown signal open");
@@ -10298,6 +10347,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         terminal_host: base.terminal_host.clone(),
         client_count: base.client_count.clone(),
         shutdown: base.shutdown.clone(),
+        restart_decision: StdMutex::new(()),
         shutdown_grace_override: StdMutex::new(None),
         env_baseline: base.env_baseline.clone(),
         upload_accounting: base.upload_accounting.clone(),
@@ -10357,6 +10407,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         terminal_host: base.terminal_host.clone(),
         client_count: base.client_count.clone(),
         shutdown: base.shutdown.clone(),
+        restart_decision: StdMutex::new(()),
         shutdown_grace_override: StdMutex::new(None),
         env_baseline: base.env_baseline.clone(),
         upload_accounting: base.upload_accounting.clone(),
@@ -10871,6 +10922,94 @@ async fn stop_daemon_grace_override_reaches_shutdown_context() {
         ctx.take_shutdown_grace_override(),
         Some(std::time::Duration::from_secs(7))
     );
+    assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Draining);
+}
+
+async fn insert_busy_test_worker(ctx: &Arc<DaemonContext>) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    ctx.db
+        .set_workspace_trust(
+            tmp.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .expect("trust workspace");
+    let session = ctx
+        .db
+        .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .await
+        .expect("create session");
+    let live_session = Arc::new(
+        Session::resume(ctx.db.clone(), session.session_id)
+            .expect("resume session")
+            .expect("session exists"),
+    );
+    let (handle, _work_rx) =
+        SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
+    handle.set_test_live_status(false, true, false);
+    let join = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+    });
+    ctx.registry.insert_test_worker(handle, join);
+}
+
+#[tokio::test]
+async fn restart_if_idle_restarts_when_no_agent_running() {
+    let ctx = test_ctx();
+    let mut state = MutableClientState::detached_for_test();
+
+    let response = handle_request(Request::RestartIfIdle, &mut state, &ctx)
+        .await
+        .expect("restart decision");
+
+    assert!(matches!(
+        response,
+        Response::RestartDecision {
+            will_restart: true,
+            reason: None
+        }
+    ));
+    assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Draining);
+}
+
+#[tokio::test]
+async fn restart_if_idle_refused_when_agent_running() {
+    let ctx = test_ctx();
+    insert_busy_test_worker(&ctx).await;
+    assert!(ctx.registry.any_agent_running());
+    let mut state = MutableClientState::detached_for_test();
+
+    let response = handle_request(Request::RestartIfIdle, &mut state, &ctx)
+        .await
+        .expect("restart decision");
+
+    assert!(matches!(
+        response,
+        Response::RestartDecision {
+            will_restart: false,
+            reason: Some(reason)
+        } if reason == "a session is busy"
+    ));
+    assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Running);
+}
+
+#[tokio::test]
+async fn restart_if_idle_refused_when_already_draining() {
+    let ctx = test_ctx();
+    assert!(ctx.shutdown.begin_drain());
+    let mut state = MutableClientState::detached_for_test();
+
+    let response = handle_request(Request::RestartIfIdle, &mut state, &ctx)
+        .await
+        .expect("restart decision");
+
+    assert!(matches!(
+        response,
+        Response::RestartDecision {
+            will_restart: false,
+            reason: Some(reason)
+        } if reason == "already shutting down"
+    ));
     assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Draining);
 }
 

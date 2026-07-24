@@ -3,7 +3,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "ack",
-    "v": 1
+    "v": 2
   },
   "attached": {
     "data": {
@@ -104,7 +104,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "attached",
-    "v": 1
+    "v": 2
   },
   "forked": {
     "data": {
@@ -116,7 +116,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "forked",
-    "v": 1
+    "v": 2
   },
   "fs_list": {
     "data": {
@@ -137,7 +137,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_list",
-    "v": 1
+    "v": 2
   },
   "fs_read": {
     "data": {
@@ -149,7 +149,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_read",
-    "v": 1
+    "v": 2
   },
   "fs_stat": {
     "data": {
@@ -167,7 +167,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_stat",
-    "v": 1
+    "v": 2
   },
   "fs_write": {
     "data": {
@@ -176,7 +176,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_write",
-    "v": 1
+    "v": 2
   },
   "git_diff_file": {
     "data": {
@@ -186,7 +186,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_diff_file",
-    "v": 1
+    "v": 2
   },
   "git_status": {
     "data": {
@@ -199,7 +199,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_status",
-    "v": 1
+    "v": 2
   },
   "history_page": {
     "data": {
@@ -218,7 +218,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "history_page",
-    "v": 1
+    "v": 2
   },
   "models": {
     "data": {
@@ -234,7 +234,17 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "models",
-    "v": 1
+    "v": 2
+  },
+  "restart_decision": {
+    "data": {
+      "reason": "a session is busy",
+      "will_restart": false
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "restart_decision",
+    "v": 2
   },
   "session_messages": {
     "data": {
@@ -252,7 +262,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "session_messages",
-    "v": 1
+    "v": 2
   },
   "sessions": {
     "data": {
@@ -284,7 +294,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "sessions",
-    "v": 1
+    "v": 2
   },
   "stats_rollup": {
     "data": {
@@ -390,6 +400,6 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "stats_rollup",
-    "v": 1
+    "v": 2
   }
 }

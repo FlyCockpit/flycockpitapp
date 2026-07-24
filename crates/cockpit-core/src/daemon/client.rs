@@ -525,6 +525,7 @@ pub struct ConnectedDaemon {
     pub client: DaemonClient,
     pub owns_daemon: bool,
     pub socket: PathBuf,
+    pub startup_notice: Option<String>,
 }
 
 /// Find the daemon socket, optionally spawn the daemon, return a
@@ -538,11 +539,79 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
         LifecycleMode::AttachOrAutoPromote | LifecycleMode::AttachOrEphemeral => {
             let discovered = discover().await;
             if matches!(discovered.status, DaemonStatus::Running) {
+                if matches!(mode, LifecycleMode::AttachOrAutoPromote) {
+                    match crate::daemon::skew_restart::restart_skewed_daemon_if_idle(
+                        &discovered.paths,
+                    )
+                    .await
+                    {
+                        Ok(crate::daemon::skew_restart::SkewRestartOutcome::Restarted {
+                            pid,
+                            reason,
+                        }) => {
+                            tracing::info!(pid, "daemon version skew auto-restart completed");
+                            let client = wait_for_daemon(&discovered.paths.socket).await?;
+                            return Ok(ConnectedDaemon {
+                                client,
+                                owns_daemon: false,
+                                socket: discovered.paths.socket,
+                                startup_notice: Some(match reason {
+                                    Some(reason) => {
+                                        format!("daemon version skew resolved: {reason}")
+                                    }
+                                    None => "daemon version skew resolved by restarting the daemon"
+                                        .to_string(),
+                                }),
+                            });
+                        }
+                        Ok(crate::daemon::skew_restart::SkewRestartOutcome::Refused {
+                            reason,
+                            skew_reason,
+                        }) => {
+                            tracing::info!(
+                                reason = reason.as_deref().unwrap_or("unknown"),
+                                "daemon version skew auto-restart deferred"
+                            );
+                            let startup_notice = format_skew_restart_notice(
+                                skew_reason.as_deref(),
+                                reason.as_deref(),
+                            );
+                            let client = DaemonClient::connect(&discovered.paths.socket).await?;
+                            return Ok(ConnectedDaemon {
+                                client,
+                                owns_daemon: false,
+                                socket: discovered.paths.socket,
+                                startup_notice,
+                            });
+                        }
+                        Ok(crate::daemon::skew_restart::SkewRestartOutcome::NoticeOnly {
+                            reason,
+                        }) => {
+                            tracing::info!("daemon version skew surfaced without auto-restart");
+                            let client = DaemonClient::connect(&discovered.paths.socket).await?;
+                            return Ok(ConnectedDaemon {
+                                client,
+                                owns_daemon: false,
+                                socket: discovered.paths.socket,
+                                startup_notice: reason
+                                    .map(|reason| format!("daemon version skew: {reason}")),
+                            });
+                        }
+                        Ok(
+                            crate::daemon::skew_restart::SkewRestartOutcome::NoSkew
+                            | crate::daemon::skew_restart::SkewRestartOutcome::InProcess,
+                        ) => {}
+                        Err(error) => {
+                            tracing::debug!(error = %error, "daemon version skew auto-restart check failed");
+                        }
+                    }
+                }
                 let client = DaemonClient::connect(&discovered.paths.socket).await?;
                 return Ok(ConnectedDaemon {
                     client,
                     owns_daemon: false,
                     socket: discovered.paths.socket,
+                    startup_notice: None,
                 });
             }
             if matches!(
@@ -569,6 +638,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                 client: DaemonClient::from_in_process(ctx),
                 owns_daemon: false,
                 socket: own.socket,
+                startup_notice: None,
             });
         }
         LifecycleMode::AlwaysEphemeral => {
@@ -621,6 +691,20 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
         client,
         owns_daemon: ephemeral,
         socket: paths.socket,
+        startup_notice: None,
+    })
+}
+
+fn format_skew_restart_notice(
+    skew_reason: Option<&str>,
+    deferred_reason: Option<&str>,
+) -> Option<String> {
+    let skew_reason = skew_reason?;
+    Some(match deferred_reason {
+        Some(deferred_reason) => {
+            format!("daemon version skew: {skew_reason}; auto-restart deferred: {deferred_reason}")
+        }
+        None => format!("daemon version skew: {skew_reason}"),
     })
 }
 

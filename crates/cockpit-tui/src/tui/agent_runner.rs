@@ -807,6 +807,7 @@ fn try_spawn_inner(
             timer.phase("probe_or_spawn");
             let owns_daemon = daemon.owns_daemon;
             let socket = daemon.socket.clone();
+            let startup_notice = daemon.startup_notice.clone();
             let project_root = cwd.to_string_lossy().into_owned();
             let (env_snapshot, _env_diagnostic) =
                 cockpit_core::env_snapshot::capture_tui_shell_env();
@@ -936,6 +937,7 @@ fn try_spawn_inner(
                 skill_inventory_names,
                 owns_daemon,
                 socket,
+                startup_notice,
                 history,
                 paused_work,
                 repair_required,
@@ -958,6 +960,7 @@ fn try_spawn_inner(
         initial_skill_names,
         owns_daemon,
         socket,
+        startup_notice,
         history,
         paused_work,
         repair_required,
@@ -972,6 +975,9 @@ fn try_spawn_inner(
     let (control_tx, mut control_rx) = mpsc::channel::<ControlRequest>(32);
     let (attached_request_tx, mut attached_request_rx) = mpsc::channel::<AttachedRequest>(32);
     let events = Arc::new(Mutex::new(Vec::new()));
+    if let Some(text) = startup_notice {
+        events.lock().unwrap().push(TurnEvent::Notice { text });
+    }
     let event_notify = Arc::new(Notify::new());
     let initial_active_agent_path = if active_agent_path.is_empty() {
         vec![initial_active_agent.clone()]

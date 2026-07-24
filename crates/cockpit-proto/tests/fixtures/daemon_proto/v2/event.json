@@ -9,9 +9,7 @@
       "provider": "openai",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "active_model_state",
-    "kind": "evt",
-    "v": 2
+    "event": "active_model_state"
   },
   "agent_idle": {
     "data": {
@@ -22,18 +20,14 @@
       "session_id": "11111111-1111-4111-8111-111111111111",
       "turn_id": "turn_id-fixture"
     },
-    "event": "agent_idle",
-    "kind": "evt",
-    "v": 2
+    "event": "agent_idle"
   },
   "approval_mode_state": {
     "data": {
       "mode": "auto",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "approval_mode_state",
-    "kind": "evt",
-    "v": 2
+    "event": "approval_mode_state"
   },
   "assistant_text": {
     "data": {
@@ -43,9 +37,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111",
       "text": "text-fixture"
     },
-    "event": "assistant_text",
-    "kind": "evt",
-    "v": 2
+    "event": "assistant_text"
   },
   "assistant_text_delta": {
     "data": {
@@ -53,9 +45,7 @@
       "delta": "delta-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "assistant_text_delta",
-    "kind": "evt",
-    "v": 2
+    "event": "assistant_text_delta"
   },
   "backup_used": {
     "data": {
@@ -65,9 +55,7 @@
       "primary_model": "primary_model-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "backup_used",
-    "kind": "evt",
-    "v": 2
+    "event": "backup_used"
   },
   "caffeinate_state": {
     "data": {
@@ -75,39 +63,7 @@
       "lid_close_guaranteed": true,
       "message": "message-fixture"
     },
-    "event": "caffeinate_state",
-    "kind": "evt",
-    "v": 2
-  },
-  "command_capability_unavailable": {
-    "data": {
-      "fix_command": "fix_command-fixture",
-      "session_id": "11111111-1111-4111-8111-111111111111",
-      "text": "text-fixture"
-    },
-    "event": "command_capability_unavailable",
-    "kind": "evt",
-    "v": 2
-  },
-  "compact_ready": {
-    "data": {
-      "brief": "brief-fixture",
-      "handoff": "handoff-fixture",
-      "new_session_id": "11111111-1111-4111-8111-111111111111",
-      "seed_tool_count": 7,
-      "seed_tool_tokens": 7,
-      "session_id": "11111111-1111-4111-8111-111111111111",
-      "source": "manual",
-      "tail_kept": 4,
-      "tail_trimmed": 1,
-      "tokens_after": 40,
-      "tokens_before": 100,
-      "trigger_ctx_pct": 61.5,
-      "turns_summarized": 5
-    },
-    "event": "compact_ready",
-    "kind": "evt",
-    "v": 2
+    "event": "caffeinate_state"
   },
   "config_snapshot": {
     "data": {
@@ -332,9 +288,25 @@
         "session_id": "11111111-1111-4111-8111-111111111111"
       }
     },
-    "event": "config_snapshot",
-    "kind": "evt",
-    "v": 2
+    "event": "config_snapshot"
+  },
+  "compact_ready": {
+    "data": {
+      "brief": "brief-fixture",
+      "handoff": "handoff-fixture",
+      "new_session_id": "11111111-1111-4111-8111-111111111111",
+      "seed_tool_count": 7,
+      "seed_tool_tokens": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "source": "manual",
+      "tail_kept": 4,
+      "tail_trimmed": 1,
+      "tokens_after": 40,
+      "tokens_before": 100,
+      "trigger_ctx_pct": 61.5,
+      "turns_summarized": 5
+    },
+    "event": "compact_ready"
   },
   "connector_status": {
     "data": {
@@ -345,9 +317,7 @@
       "relay_url": "relay_url-fixture",
       "status": "status-fixture"
     },
-    "event": "connector_status",
-    "kind": "evt",
-    "v": 2
+    "event": "connector_status"
   },
   "context_projection": {
     "data": {
@@ -355,17 +325,13 @@
       "prunable_tokens": 7,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "context_projection",
-    "kind": "evt",
-    "v": 2
+    "event": "context_projection"
   },
   "daemon_draining": {
     "data": {
       "forced": true
     },
-    "event": "daemon_draining",
-    "kind": "evt",
-    "v": 2
+    "event": "daemon_draining"
   },
   "delegation_recursion_state": {
     "data": {
@@ -373,9 +339,7 @@
       "enabled": true,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "delegation_recursion_state",
-    "kind": "evt",
-    "v": 2
+    "event": "delegation_recursion_state"
   },
   "env_drift_warning": {
     "data": {
@@ -403,18 +367,14 @@
       },
       "policy": "update-daemon"
     },
-    "event": "env_drift_warning",
-    "kind": "evt",
-    "v": 2
+    "event": "env_drift_warning"
   },
   "event_stream_lagged": {
     "data": {
       "dropped": 7,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "event_stream_lagged",
-    "kind": "evt",
-    "v": 2
+    "event": "event_stream_lagged"
   },
   "foreground_input_target": {
     "data": {
@@ -426,18 +386,14 @@
         "task_call_id": "task-parent"
       }
     },
-    "event": "foreground_input_target",
-    "kind": "evt",
-    "v": 2
+    "event": "foreground_input_target"
   },
   "gitignore_allow": {
     "data": {
       "allow": ["allow-fixture"],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "gitignore_allow",
-    "kind": "evt",
-    "v": 2
+    "event": "gitignore_allow"
   },
   "history_replay": {
     "data": {
@@ -462,9 +418,7 @@
       "max_seq": 7,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "history_replay",
-    "kind": "evt",
-    "v": 2
+    "event": "history_replay"
   },
   "inference_failed": {
     "data": {
@@ -479,9 +433,7 @@
       "provider": "provider-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "inference_failed",
-    "kind": "evt",
-    "v": 2
+    "event": "inference_failed"
   },
   "inference_succeeded": {
     "data": {
@@ -489,9 +441,7 @@
       "provider": "provider-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "inference_succeeded",
-    "kind": "evt",
-    "v": 2
+    "event": "inference_succeeded"
   },
   "inference_warning": {
     "data": {
@@ -502,9 +452,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111",
       "waited_secs": 7
     },
-    "event": "inference_warning",
-    "kind": "evt",
-    "v": 2
+    "event": "inference_warning"
   },
   "interrupt_queue_changed": {
     "data": {
@@ -512,9 +460,7 @@
       "pending_count": 7,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "interrupt_queue_changed",
-    "kind": "evt",
-    "v": 2
+    "event": "interrupt_queue_changed"
   },
   "interrupt_raised": {
     "data": {
@@ -618,9 +564,7 @@
       "reason": "rehydration",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "interrupt_raised",
-    "kind": "evt",
-    "v": 2
+    "event": "interrupt_raised"
   },
   "interrupt_resolved": {
     "data": {
@@ -638,26 +582,20 @@
       "seq": 7,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "interrupt_resolved",
-    "kind": "evt",
-    "v": 2
+    "event": "interrupt_resolved"
   },
   "llm_mode_changed": {
     "data": {
       "mode": "normal",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "llm_mode_changed",
-    "kind": "evt",
-    "v": 2
+    "event": "llm_mode_changed"
   },
   "lsp_notice": {
     "data": {
       "text": "text-fixture"
     },
-    "event": "lsp_notice",
-    "kind": "evt",
-    "v": 2
+    "event": "lsp_notice"
   },
   "nested_turn": {
     "data": {
@@ -673,18 +611,14 @@
       "session_id": "11111111-1111-4111-8111-111111111111",
       "task_call_id": "task_call_id-fixture"
     },
-    "event": "nested_turn",
-    "kind": "evt",
-    "v": 2
+    "event": "nested_turn"
   },
   "notice": {
     "data": {
       "session_id": "11111111-1111-4111-8111-111111111111",
       "text": "text-fixture"
     },
-    "event": "notice",
-    "kind": "evt",
-    "v": 2
+    "event": "notice"
   },
   "paused_work_available": {
     "data": {
@@ -702,35 +636,27 @@
       ],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "paused_work_available",
-    "kind": "evt",
-    "v": 2
+    "event": "paused_work_available"
   },
   "preflight_started": {
     "data": {
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "preflight_started",
-    "kind": "evt",
-    "v": 2
+    "event": "preflight_started"
   },
   "preflight_state": {
     "data": {
       "enabled": true,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "preflight_state",
-    "kind": "evt",
-    "v": 2
+    "event": "preflight_state"
   },
   "primary_swapped": {
     "data": {
       "name": "name-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "primary_swapped",
-    "kind": "evt",
-    "v": 2
+    "event": "primary_swapped"
   },
   "pruned": {
     "data": {
@@ -742,9 +668,7 @@
       "tokens_saved": 7,
       "trigger_reason": "trigger_reason-fixture"
     },
-    "event": "pruned",
-    "kind": "evt",
-    "v": 2
+    "event": "pruned"
   },
   "queue_updated": {
     "data": {
@@ -764,9 +688,7 @@
       ],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "queue_updated",
-    "kind": "evt",
-    "v": 2
+    "event": "queue_updated"
   },
   "queued_user_messages_folded": {
     "data": {
@@ -791,9 +713,7 @@
       },
       "text": "text-fixture"
     },
-    "event": "queued_user_messages_folded",
-    "kind": "evt",
-    "v": 2
+    "event": "queued_user_messages_folded"
   },
   "reasoning_delta": {
     "data": {
@@ -801,9 +721,7 @@
       "delta": "delta-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "reasoning_delta",
-    "kind": "evt",
-    "v": 2
+    "event": "reasoning_delta"
   },
   "reconnecting": {
     "data": {
@@ -814,9 +732,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111",
       "url": "url-fixture"
     },
-    "event": "reconnecting",
-    "kind": "evt",
-    "v": 2
+    "event": "reconnecting"
   },
   "redaction_state": {
     "data": {
@@ -825,9 +741,7 @@
       "scan_ssh_keys": true,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "redaction_state",
-    "kind": "evt",
-    "v": 2
+    "event": "redaction_state"
   },
   "resource_clear": {
     "data": {
@@ -841,9 +755,7 @@
       },
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "resource_clear",
-    "kind": "evt",
-    "v": 2
+    "event": "resource_clear"
   },
   "resource_start": {
     "data": {
@@ -858,9 +770,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111",
       "wait_ms": 7
     },
-    "event": "resource_start",
-    "kind": "evt",
-    "v": 2
+    "event": "resource_start"
   },
   "resource_wait": {
     "data": {
@@ -875,18 +785,14 @@
       },
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "resource_wait",
-    "kind": "evt",
-    "v": 2
+    "event": "resource_wait"
   },
   "sandbox_escalation_state": {
     "data": {
       "enabled": true,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "sandbox_escalation_state",
-    "kind": "evt",
-    "v": 2
+    "event": "sandbox_escalation_state"
   },
   "sandbox_state": {
     "data": {
@@ -901,9 +807,7 @@
       "mode": "container",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "sandbox_state",
-    "kind": "evt",
-    "v": 2
+    "event": "sandbox_state"
   },
   "sandbox_unavailable": {
     "data": {
@@ -911,9 +815,15 @@
       "remedy": "remedy-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "sandbox_unavailable",
-    "kind": "evt",
-    "v": 2
+    "event": "sandbox_unavailable"
+  },
+  "command_capability_unavailable": {
+    "data": {
+      "fix_command": "fix_command-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "text": "text-fixture"
+    },
+    "event": "command_capability_unavailable"
   },
   "schedule_completed": {
     "data": {
@@ -923,9 +833,7 @@
       "label": "label-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "schedule_completed",
-    "kind": "evt",
-    "v": 2
+    "event": "schedule_completed"
   },
   "schedule_note": {
     "data": {
@@ -933,18 +841,14 @@
       "session_id": "11111111-1111-4111-8111-111111111111",
       "text": "text-fixture"
     },
-    "event": "schedule_note",
-    "kind": "evt",
-    "v": 2
+    "event": "schedule_note"
   },
   "schedule_progress": {
     "data": {
       "job_id": "job_id-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "schedule_progress",
-    "kind": "evt",
-    "v": 2
+    "event": "schedule_progress"
   },
   "schedule_started": {
     "data": {
@@ -953,36 +857,28 @@
       "label": "label-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "schedule_started",
-    "kind": "evt",
-    "v": 2
+    "event": "schedule_started"
   },
   "session_driver_failed": {
     "data": {
       "error": "error-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "session_driver_failed",
-    "kind": "evt",
-    "v": 2
+    "event": "session_driver_failed"
   },
   "session_ended": {
     "data": {
       "reason": "reason-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "session_ended",
-    "kind": "evt",
-    "v": 2
+    "event": "session_ended"
   },
   "session_persist_failed": {
     "data": {
       "error": "error-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "session_persist_failed",
-    "kind": "evt",
-    "v": 2
+    "event": "session_persist_failed"
   },
   "skill_auto_injected": {
     "data": {
@@ -990,9 +886,7 @@
       "reason": "reason-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "skill_auto_injected",
-    "kind": "evt",
-    "v": 2
+    "event": "skill_auto_injected"
   },
   "subagent_report": {
     "data": {
@@ -1008,9 +902,7 @@
       "task_call_id": "task_call_id-fixture",
       "trusted_only": true
     },
-    "event": "subagent_report",
-    "kind": "evt",
-    "v": 2
+    "event": "subagent_report"
   },
   "subagent_routing": {
     "data": {
@@ -1026,9 +918,7 @@
       "task_call_id": "task_call_id-fixture",
       "trusted_only": true
     },
-    "event": "subagent_routing",
-    "kind": "evt",
-    "v": 2
+    "event": "subagent_routing"
   },
   "subagent_spawned": {
     "data": {
@@ -1046,9 +936,7 @@
       "task_call_id": "task_call_id-fixture",
       "trusted_only": true
     },
-    "event": "subagent_spawned",
-    "kind": "evt",
-    "v": 2
+    "event": "subagent_spawned"
   },
   "tandem_state": {
     "data": {
@@ -1056,18 +944,14 @@
       "session_id": "11111111-1111-4111-8111-111111111111",
       "warning": "warning-fixture"
     },
-    "event": "tandem_state",
-    "kind": "evt",
-    "v": 2
+    "event": "tandem_state"
   },
   "terminal_clipboard": {
     "data": {
       "terminal_id": "11111111-1111-4111-8111-111111111111",
       "text": "text-fixture"
     },
-    "event": "terminal_clipboard",
-    "kind": "evt",
-    "v": 2
+    "event": "terminal_clipboard"
   },
   "terminal_closed": {
     "data": {
@@ -1075,27 +959,21 @@
       "reason": "reason-fixture",
       "terminal_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "terminal_closed",
-    "kind": "evt",
-    "v": 2
+    "event": "terminal_closed"
   },
   "terminal_output": {
     "data": {
       "bytes": [65, 66, 67],
       "terminal_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "terminal_output",
-    "kind": "evt",
-    "v": 2
+    "event": "terminal_output"
   },
   "terminal_viewers": {
     "data": {
       "count": 7,
       "terminal_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "terminal_viewers",
-    "kind": "evt",
-    "v": 2
+    "event": "terminal_viewers"
   },
   "thinking_started": {
     "data": {
@@ -1103,9 +981,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111",
       "turn_id": "turn_id-fixture"
     },
-    "event": "thinking_started",
-    "kind": "evt",
-    "v": 2
+    "event": "thinking_started"
   },
   "tool_end": {
     "data": {
@@ -1118,9 +994,7 @@
       "tool": "tool-fixture",
       "truncated": true
     },
-    "event": "tool_end",
-    "kind": "evt",
-    "v": 2
+    "event": "tool_end"
   },
   "tool_error": {
     "data": {
@@ -1132,9 +1006,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111",
       "tool": "tool-fixture"
     },
-    "event": "tool_error",
-    "kind": "evt",
-    "v": 2
+    "event": "tool_error"
   },
   "tool_start": {
     "data": {
@@ -1146,18 +1018,14 @@
       "session_id": "11111111-1111-4111-8111-111111111111",
       "tool": "tool-fixture"
     },
-    "event": "tool_start",
-    "kind": "evt",
-    "v": 2
+    "event": "tool_start"
   },
   "trusted_only_state": {
     "data": {
       "enabled": true,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "trusted_only_state",
-    "kind": "evt",
-    "v": 2
+    "event": "trusted_only_state"
   },
   "usage": {
     "data": {
@@ -1168,9 +1036,7 @@
       "output_tokens": 7,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "usage",
-    "kind": "evt",
-    "v": 2
+    "event": "usage"
   },
   "user_message_recorded": {
     "data": {
@@ -1178,17 +1044,13 @@
       "seq": 7,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "user_message_recorded",
-    "kind": "evt",
-    "v": 2
+    "event": "user_message_recorded"
   },
   "user_message_retracted": {
     "data": {
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
-    "event": "user_message_retracted",
-    "kind": "evt",
-    "v": 2
+    "event": "user_message_retracted"
   },
   "waiting_for_lock": {
     "data": {
@@ -1197,8 +1059,6 @@
       "session_id": "11111111-1111-4111-8111-111111111111",
       "waiting": true
     },
-    "event": "waiting_for_lock",
-    "kind": "evt",
-    "v": 2
+    "event": "waiting_for_lock"
   }
 }

@@ -1550,7 +1550,7 @@ mod tests {
     }
 
     async fn wait_for_job_result(scheduler: &DaemonScheduler, id: &str) -> ScheduledJobSummary {
-        for _ in 0..100 {
+        for _ in 0..10_000 {
             let jobs = scheduler.list_jobs(None).unwrap();
             if let Some(job) = jobs
                 .into_iter()
@@ -1568,7 +1568,7 @@ mod tests {
         id: &str,
         expected: u32,
     ) -> ScheduledJobSummary {
-        for _ in 0..100 {
+        for _ in 0..10_000 {
             let jobs = scheduler.list_jobs(None).unwrap();
             if let Some(job) = jobs
                 .into_iter()

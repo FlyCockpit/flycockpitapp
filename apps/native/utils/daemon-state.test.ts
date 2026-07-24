@@ -1,4 +1,4 @@
-import type { EventEnvelope } from "@flycockpit/cockpit-protocol";
+import { type EventEnvelope, PROTOCOL_VERSION } from "@flycockpit/cockpit-protocol";
 import { describe, expect, it, vi } from "vitest";
 import {
   cancelPausedWorkAction,
@@ -11,7 +11,7 @@ import {
 const sessionId = "11111111-1111-4111-8111-111111111111";
 
 function event(event: string, data: Record<string, unknown>): EventEnvelope {
-  return { v: 1, kind: "evt", event, data } as EventEnvelope;
+  return { v: PROTOCOL_VERSION, kind: "evt", event, data } as EventEnvelope;
 }
 
 describe("daemonStateReducer", () => {

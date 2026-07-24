@@ -1,3 +1,4 @@
+import { PROTOCOL_VERSION } from "@flycockpit/cockpit-protocol";
 import { describe, expect, it, vi } from "vitest";
 import { emptyNativeDaemonState } from "./daemon-state";
 import {
@@ -23,7 +24,7 @@ describe("native session event helpers", () => {
   it("drops unknown events with exactly one warning", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const result = reduceNativeSessionEvent(initialState, {
-      v: 1,
+      v: PROTOCOL_VERSION,
       kind: "evt",
       event: "future_native_event",
       data: { session_id: sessionId },
@@ -40,7 +41,7 @@ describe("native session event helpers", () => {
 
   it("drops known unhandled events without a warning", () => {
     const result = reduceNativeSessionEvent(initialState, {
-      v: 1,
+      v: PROTOCOL_VERSION,
       kind: "evt",
       event: "usage",
       data: {
@@ -60,7 +61,7 @@ describe("native session event helpers", () => {
   it("drops malformed known handled events with one warning", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const result = reduceNativeSessionEvent(initialState, {
-      v: 1,
+      v: PROTOCOL_VERSION,
       kind: "evt",
       event: "assistant_text_delta",
       data: { session_id: sessionId },
@@ -77,7 +78,7 @@ describe("native session event helpers", () => {
 
   it("applies handled history replay events", () => {
     const result = reduceNativeSessionEvent(initialState, {
-      v: 1,
+      v: PROTOCOL_VERSION,
       kind: "evt",
       event: "history_replay",
       data: {
@@ -95,7 +96,7 @@ describe("native session event helpers", () => {
 
   it("turns live inference failures into structured transcript surfaces", () => {
     const result = reduceNativeSessionEvent(initialState, {
-      v: 1,
+      v: PROTOCOL_VERSION,
       kind: "evt",
       event: "inference_failed",
       data: {
@@ -179,7 +180,7 @@ describe("native session event helpers", () => {
 
   it("streams assistant deltas into a pending row and replaces it with final text", () => {
     const delta = reduceNativeSessionEvent(initialState, {
-      v: 1,
+      v: PROTOCOL_VERSION,
       kind: "evt",
       event: "assistant_text_delta",
       data: { session_id: sessionId, agent: "Build", delta: "hel" },
@@ -195,7 +196,7 @@ describe("native session event helpers", () => {
     ]);
 
     const nextDelta = reduceNativeSessionEvent(delta.state, {
-      v: 1,
+      v: PROTOCOL_VERSION,
       kind: "evt",
       event: "assistant_text_delta",
       data: { session_id: sessionId, agent: "Build", delta: "lo" },
@@ -203,7 +204,7 @@ describe("native session event helpers", () => {
     expect(nextDelta.state.history[0]).toMatchObject({ text: "hello" });
 
     const final = reduceNativeSessionEvent(nextDelta.state, {
-      v: 1,
+      v: PROTOCOL_VERSION,
       kind: "evt",
       event: "assistant_text",
       data: {
@@ -228,7 +229,7 @@ describe("native session event helpers", () => {
         ],
       },
       {
-        v: 1,
+        v: PROTOCOL_VERSION,
         kind: "evt",
         event: "assistant_text",
         data: { session_id: sessionId, agent: "Build", text: "fallback seq" },
@@ -325,7 +326,7 @@ describe("native session event helpers", () => {
 
   it("adds and resolves interrupt events", () => {
     const raised = reduceNativeSessionEvent(initialState, {
-      v: 1,
+      v: PROTOCOL_VERSION,
       kind: "evt",
       event: "interrupt_raised",
       data: {
@@ -351,7 +352,7 @@ describe("native session event helpers", () => {
     });
 
     const resolved = reduceNativeSessionEvent(raised.state, {
-      v: 1,
+      v: PROTOCOL_VERSION,
       kind: "evt",
       event: "interrupt_resolved",
       data: { session_id: sessionId, interrupt_id: interruptId },

@@ -1,4 +1,4 @@
-import type { HistoryPageResult } from "@flycockpit/cockpit-protocol";
+import { type HistoryPageResult, PROTOCOL_VERSION } from "@flycockpit/cockpit-protocol";
 import { describe, expect, it, vi } from "vitest";
 import {
   addOptimisticUserMessage,
@@ -42,7 +42,7 @@ function withDetail() {
 }
 
 function event(event: string, data: Record<string, unknown>) {
-  return { v: 1, kind: "evt", event, data } as const;
+  return { v: PROTOCOL_VERSION, kind: "evt", event, data } as const;
 }
 
 describe("remote session reducers", () => {

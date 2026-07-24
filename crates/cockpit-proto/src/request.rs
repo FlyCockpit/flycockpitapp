@@ -748,6 +748,9 @@ pub enum Request {
         grace_secs: Option<u64>,
     },
 
+    /// Atomically request daemon restart only if no session worker is busy.
+    RestartIfIdle,
+
     #[serde(other)]
     Unknown,
 }
@@ -845,6 +848,7 @@ macro_rules! request_variants {
             (Request::StatsRollup { .. }, "stats_rollup");
             (Request::GuidanceEstimate { .. }, "guidance_estimate");
             (Request::StopDaemon { .. }, "stop_daemon");
+            (Request::RestartIfIdle, "restart_if_idle");
             (Request::Unknown, "__unknown");
         ] }
     };
@@ -960,6 +964,7 @@ macro_rules! command {
             (Request::StatsRollup { .. }, "stats_rollup", owner_only, none, false, concurrent, none);
             (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, concurrent, none);
             (Request::StopDaemon { .. }, "stop_daemon", owner_only, none, true, serialized, none);
+            (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, serialized, none);
             (Request::Unknown, "unknown", owner_only, none, false, serialized, none);
         ] }
     };

@@ -13,6 +13,13 @@ pub enum Response {
     /// `CancelTurn`, `ResolveInterrupt`, …).
     Ack,
 
+    /// Result of [`Request::RestartIfIdle`].
+    RestartDecision {
+        will_restart: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// A user message was accepted by the session worker. `status = queued`
     /// means it is still removable; `status = folding` means it has already
     /// crossed the driver boundary and remove requests will not apply.
@@ -390,6 +397,7 @@ macro_rules! response_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
+            (Response::RestartDecision { .. }, "restart_decision");
             (Response::UserMessageQueued { .. }, "user_message_queued");
             (Response::DelegationSteer { .. }, "delegation_steer");
             (Response::AttachmentUploadStarted { .. }, "attachment_upload_started");

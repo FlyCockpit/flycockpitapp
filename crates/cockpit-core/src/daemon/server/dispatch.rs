@@ -1169,6 +1169,27 @@ pub(super) async fn handle_serialized_request(
             effects.shutdown_after_response = true;
             Ok(Response::Ack)
         }
+        Request::RestartIfIdle => {
+            tracing::info!("RestartIfIdle requested via client");
+            let _decision = crate::sync::lock_or_recover(&ctx.restart_decision);
+            if ctx.shutdown.is_draining() {
+                return Ok(Response::RestartDecision {
+                    will_restart: false,
+                    reason: Some("already shutting down".to_string()),
+                });
+            }
+            if ctx.registry.any_agent_running() {
+                return Ok(Response::RestartDecision {
+                    will_restart: false,
+                    reason: Some("a session is busy".to_string()),
+                });
+            }
+            request_shutdown(ctx);
+            Ok(Response::RestartDecision {
+                will_restart: true,
+                reason: None,
+            })
+        }
         Request::Unknown => Err(proto::unsupported_request_error(
             proto::PROTOCOL_VERSION,
             None,

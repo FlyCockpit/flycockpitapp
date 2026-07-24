@@ -400,6 +400,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             model_instruction_tokens: _,
         } => scrub_option_string(file, redact),
         proto::Response::StatsRollup { rollup } => scrub_stats_rollup(rollup, redact),
+        proto::Response::RestartDecision {
+            will_restart: _,
+            reason: _,
+        } => {}
         proto::Response::CaffeinateState {
             active: _,
             lid_close_guaranteed: _,
@@ -1611,6 +1615,9 @@ pub struct DaemonContext {
     /// (installed into worker models). New `SendUserMessage` requests are
     /// refused while it reports draining.
     shutdown: crate::daemon::shutdown::ShutdownSignal,
+    /// Serializes idle restart decisions so exactly one client can pair
+    /// "daemon is idle" with the monotonic shutdown-gate transition.
+    pub(crate) restart_decision: StdMutex<()>,
     shutdown_grace_override: StdMutex<Option<Duration>>,
     env_baseline: Arc<std::sync::RwLock<EnvSnapshot>>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
@@ -1716,6 +1723,7 @@ impl DaemonContext {
             terminal_host,
             client_count,
             shutdown,
+            restart_decision: StdMutex::new(()),
             shutdown_grace_override: StdMutex::new(None),
             env_baseline: Arc::new(std::sync::RwLock::new(EnvSnapshot::from_process(
                 EnvSnapshotSource::DaemonStart,

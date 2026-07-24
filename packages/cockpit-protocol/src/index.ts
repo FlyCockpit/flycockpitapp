@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 1 as const;
+export const PROTOCOL_VERSION = 2 as const;
 
 export const uuidSchema = z.string().uuid();
 export const requestIdSchema = uuidSchema;
@@ -215,6 +215,7 @@ const requestParamSchemas = {
   resolve_interrupt: z
     .object({ interrupt_id: uuidSchema, response: resolveResponseSchema })
     .strict(),
+  restart_if_idle: z.undefined(),
   resume_paused_work: z.object({ session_id: uuidSchema }).strict(),
   send_user_message: z
     .object({
@@ -248,10 +249,13 @@ const requestParamSchemas = {
 } as const;
 
 type RequestParamSchemas = typeof requestParamSchemas;
-type RequestVariant<Name extends keyof RequestParamSchemas> = {
-  request: Name;
-  params: z.infer<RequestParamSchemas[Name]>;
-};
+type RequestVariant<Name extends keyof RequestParamSchemas> =
+  z.infer<RequestParamSchemas[Name]> extends undefined
+    ? { request: Name; params?: undefined }
+    : {
+        request: Name;
+        params: z.infer<RequestParamSchemas[Name]>;
+      };
 
 export type RequestName = keyof RequestParamSchemas;
 export type ClientRequest = {
@@ -263,6 +267,10 @@ function requestVariant<Name extends RequestName>(
   params: RequestParamSchemas[Name],
 ) {
   return z.object({ request: z.literal(request), params }).strict();
+}
+
+function requestVariantNoParams<Name extends RequestName>(request: Name) {
+  return z.object({ request: z.literal(request) }).strict();
 }
 
 export const clientRequestSchema: z.ZodType<ClientRequest> = z.discriminatedUnion("request", [
@@ -285,6 +293,7 @@ export const clientRequestSchema: z.ZodType<ClientRequest> = z.discriminatedUnio
   requestVariant("read_session_messages", requestParamSchemas.read_session_messages),
   requestVariant("rename_session", requestParamSchemas.rename_session),
   requestVariant("resolve_interrupt", requestParamSchemas.resolve_interrupt),
+  requestVariantNoParams("restart_if_idle"),
   requestVariant("resume_paused_work", requestParamSchemas.resume_paused_work),
   requestVariant("send_user_message", requestParamSchemas.send_user_message),
   requestVariant("session_live_status", requestParamSchemas.session_live_status),
@@ -315,6 +324,7 @@ export const responseNameSchema = z.enum([
   "git_status",
   "history_page",
   "models",
+  "restart_decision",
   "session_messages",
   "session_live_status",
   "sessions",
@@ -551,6 +561,10 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
       .passthrough(),
   ),
   responseVariant("stats_rollup", z.object({ rollup: statsRollupWireSchema }).passthrough()),
+  responseVariant(
+    "restart_decision",
+    z.object({ will_restart: z.boolean(), reason: z.string().optional() }).passthrough(),
+  ),
   responseVariant(
     "fs_list",
     z.object({ entries: z.array(fsEntryWireSchema), truncated: z.boolean() }).passthrough(),

@@ -42,6 +42,7 @@ pub mod scheduler;
 pub mod server;
 pub mod session_worker;
 pub mod shutdown;
+pub mod skew_restart;
 pub mod terminal;
 #[cfg(test)]
 pub(crate) mod test_harness;
@@ -798,17 +799,17 @@ pub async fn wait_for_restart_release(
     paths: &DaemonPaths,
     expected_pid: Option<u32>,
     timeout: Duration,
-) {
+) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if restart_metadata_released(paths, expected_pid) {
-            return;
+            return true;
         }
         if tokio::time::Instant::now() >= deadline {
             if let Some(pid) = expected_pid {
                 remove_metadata_if_pid_matches(paths, pid);
             }
-            return;
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

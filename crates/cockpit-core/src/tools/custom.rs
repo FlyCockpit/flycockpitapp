@@ -22,6 +22,7 @@ use serde_json::Value;
 
 use crate::config::extended::ToolCommandTemplate;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolOutputSidecar};
+use crate::intel::budget::retained_truncated_body;
 use crate::process::{CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES};
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
@@ -254,6 +255,7 @@ impl Tool for CustomBashTool {
             // multibyte boundary. Head+tail keeps any appended stderr.
             return Ok(
                 ToolOutput::truncated_text(truncate_head_tail(&combined, OUTPUT_BYTE_CAP))
+                    .with_truncated_retention(retained_truncated_body(&combined))
                     .with_output_sidecar(self.provenance_sidecar(
                         &selected,
                         status.code(),
@@ -658,5 +660,63 @@ mod tests {
         assert!(out.truncated);
         assert!(out.content.len() <= OUTPUT_BYTE_CAP);
         assert_eq!(out.output_sidecar.unwrap().payload["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn custom_tool_over_cap_output_carries_retention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let ctx = crate::tools::common::test_ctx(cwd);
+        let tpl = ToolCommandTemplate {
+            enabled: true,
+            command: "yes 0123456789 | head -c 1000000".into(),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            "large",
+            &tpl,
+            ToolTemplateProvenance::Configured {
+                source: "test".to_string(),
+            },
+        );
+
+        let out = tool.call(serde_json::json!({}), &ctx).await.unwrap();
+
+        assert!(out.truncated);
+        let retained = out
+            .truncated_retention
+            .as_ref()
+            .expect("retention for over-cap custom output");
+        assert!(retained.original_byte_len > out.content.len());
+        assert_eq!(retained.original_byte_len, retained.content.len());
+        assert!(retained.content.starts_with("0123456789"));
+    }
+
+    #[tokio::test]
+    async fn custom_tool_under_cap_output_has_no_retention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let ctx = crate::tools::common::test_ctx(cwd);
+        let tpl = ToolCommandTemplate {
+            enabled: true,
+            command: "printf small".into(),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            "small",
+            &tpl,
+            ToolTemplateProvenance::Configured {
+                source: "test".to_string(),
+            },
+        );
+
+        let out = tool.call(serde_json::json!({}), &ctx).await.unwrap();
+
+        assert!(!out.truncated);
+        assert!(out.truncated_retention.is_none());
+        let sidecar = out.output_sidecar.expect("sidecar").payload;
+        assert_eq!(sidecar["provenance"], "configured");
+        assert_eq!(sidecar["source"], "test");
+        assert_eq!(sidecar["exit_code"], 0);
     }
 }

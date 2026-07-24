@@ -1211,6 +1211,37 @@ mod tests {
         }
     }
 
+    struct NamedRetainedTruncatedTool {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for NamedRetainedTruncatedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Return retained truncated output for marker retrieval tests."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            let retained = format!("head line\n{}tail line\n", "retained line\n".repeat(700));
+            Ok(
+                ToolOutput::truncated_text("head line\n... [truncated]\ntail line\n")
+                    .with_truncated_retention(crate::engine::tool::RetainedTruncatedOutput {
+                        original_byte_len: retained.len(),
+                        content: retained,
+                        partial: false,
+                    }),
+            )
+        }
+    }
+
     struct PartialRetainedTruncatedTool;
 
     #[async_trait]
@@ -2835,6 +2866,64 @@ mod tests {
 
         assert!(retrieved.content.starts_with("head line\n"));
         assert!(retrieved.content.len() > "head line\n... [truncated]\ntail line\n".len());
+    }
+
+    async fn assert_named_truncated_marker_is_retrievable(tool_name: &'static str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(NamedRetainedTruncatedTool { name: tool_name }));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call(tool_name, serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, tool_name, Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        let wire = last_tool_result_text(&history);
+        let marker_count = wire
+            .lines()
+            .filter(|line| line.starts_with("[truncated tool result:"))
+            .count();
+        assert_eq!(marker_count, 1, "{wire}");
+        assert!(wire.contains(&format!("tool={tool_name}")), "{wire}");
+        let hash = wire
+            .split("hash=")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .expect("truncated marker hash");
+        let retrieved = crate::tools::tool_result_retrieve::ToolResultRetrieveTool
+            .call(serde_json::json!({ "hash": hash }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(retrieved.content.starts_with("head line\n"));
+        assert!(retrieved.content.len() > "head line\n... [truncated]\ntail line\n".len());
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_truncated_marker_is_retrievable() {
+        assert_named_truncated_marker_is_retrievable("mcp").await;
+    }
+
+    #[tokio::test]
+    async fn custom_tool_truncated_marker_is_retrievable() {
+        assert_named_truncated_marker_is_retrievable("custom_large").await;
     }
 
     #[tokio::test]

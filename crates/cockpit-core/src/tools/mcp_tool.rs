@@ -14,6 +14,8 @@ use serde_json::Value;
 
 use crate::engine::agent::TurnEvent;
 use crate::engine::tool::{Tool, ToolBox, ToolCtx, ToolOutput, invalid_input};
+use crate::intel::budget::retained_truncated_body;
+use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 pub struct McpTool;
 
@@ -161,7 +163,7 @@ impl Tool for McpTool {
         }
         let host = crate::mcp::builtin::HostContext::from_tool_ctx(ctx);
         match crate::mcp::sandbox::run_with_host(script, &cfg, &host).await {
-            Ok(out) => Ok(ToolOutput::text(out)),
+            Ok(out) => Ok(rendered_result_output(out)),
             // A sandbox error (compile error, denied OS access, mcp.invoke
             // failure surfaced as a Python exception, etc.) is an execution
             // outcome the model should see and react to, not an invocation
@@ -177,6 +179,15 @@ impl Tool for McpTool {
         };
         crate::mcp::transport::stdio::poison_active_for_scope(&scope, "MCP tool abandon").await;
         Ok(())
+    }
+}
+
+fn rendered_result_output(out: String) -> ToolOutput {
+    if out.len() > OUTPUT_BYTE_CAP {
+        ToolOutput::truncated_text(truncate_head_tail(&out, OUTPUT_BYTE_CAP))
+            .with_truncated_retention(retained_truncated_body(&out))
+    } else {
+        ToolOutput::text(out)
     }
 }
 
@@ -210,6 +221,29 @@ mod tests {
         let p = McpTool.parameters();
         assert_eq!(p["required"], serde_json::json!(["script"]));
         assert_eq!(p["properties"]["script"]["type"], "string");
+    }
+
+    #[test]
+    fn mcp_tool_over_cap_result_carries_retention() {
+        let body = "m".repeat(OUTPUT_BYTE_CAP + 32);
+
+        let output = rendered_result_output(body.clone());
+
+        assert!(output.truncated);
+        let retained = output
+            .truncated_retention
+            .as_ref()
+            .expect("retention for over-cap mcp result");
+        assert_eq!(retained.original_byte_len, body.len());
+        assert_eq!(retained.content, body);
+    }
+
+    #[test]
+    fn mcp_tool_under_cap_result_has_no_retention() {
+        let output = rendered_result_output("small result".to_string());
+
+        assert!(!output.truncated);
+        assert!(output.truncated_retention.is_none());
     }
 
     #[test]
@@ -366,10 +400,18 @@ mod tests {
 
         let tool = McpTool;
         let output = tool
-            .call(serde_json::json!({ "script": "mcp.search('')" }), &ctx)
+            .call(
+                serde_json::json!({ "script": "mcp.search('context_usage')" }),
+                &ctx,
+            )
             .await
             .unwrap();
-        let hits: Value = serde_json::from_str(&output.content).unwrap();
+        let hits: Value = serde_json::from_str(&output.content).unwrap_or_else(|error| {
+            panic!(
+                "mcp.search output should be JSON: {error}; output bytes: {:?}",
+                output.content.as_bytes()
+            )
+        });
         assert_no_configured_cockpit_hits(&hits, &output.content);
         let notice = rx.try_recv().expect("expected reserved-id notice");
         assert!(
@@ -378,10 +420,18 @@ mod tests {
         );
 
         let output = tool
-            .call(serde_json::json!({ "script": "mcp.search('')" }), &ctx)
+            .call(
+                serde_json::json!({ "script": "mcp.search('context_usage')" }),
+                &ctx,
+            )
             .await
             .unwrap();
-        let hits: Value = serde_json::from_str(&output.content).unwrap();
+        let hits: Value = serde_json::from_str(&output.content).unwrap_or_else(|error| {
+            panic!(
+                "mcp.search output should be JSON: {error}; output bytes: {:?}",
+                output.content.as_bytes()
+            )
+        });
         assert_no_configured_cockpit_hits(&hits, &output.content);
         assert!(rx.try_recv().is_err(), "notice should be once per session");
     }

@@ -96,6 +96,7 @@ impl Tool for ToolResultRetrieveTool {
             start.unwrap_or(1),
             end.unwrap_or(usize::MAX),
             OUTPUT_BYTE_CAP,
+            self.name(),
             hash,
         ))
     }
@@ -108,7 +109,7 @@ pub(crate) fn valid_short_hash(hash: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-fn optional_line(value: Option<&Value>, name: &str) -> Result<Option<usize>> {
+pub(crate) fn optional_line(value: Option<&Value>, name: &str) -> Result<Option<usize>> {
     match value.and_then(Value::as_u64) {
         Some(0) => Err(invalid_input(format!("`{name}` must be >= 1"))),
         Some(n) => Ok(Some(n as usize)),
@@ -117,11 +118,12 @@ fn optional_line(value: Option<&Value>, name: &str) -> Result<Option<usize>> {
     }
 }
 
-fn render_capped_line_range(
+pub(crate) fn render_capped_line_range(
     content: &str,
     start: usize,
     end: usize,
     cap: usize,
+    retrieve_tool: &str,
     hash: &str,
 ) -> ToolOutput {
     let selected: Vec<(usize, &str)> = content
@@ -141,14 +143,15 @@ fn render_capped_line_range(
     for (idx, (line_no, line)) in selected.iter().copied().enumerate() {
         let line_len = line.len() + 1;
         let has_more = idx + 1 < selected.len();
-        let marker = has_more.then(|| continuation_marker(line_no, line_no + 1, hash));
+        let marker =
+            has_more.then(|| continuation_marker(retrieve_tool, line_no, line_no + 1, hash));
         let required = out
             .len()
             .saturating_add(line_len)
             .saturating_add(marker.as_ref().map_or(0, String::len));
         if !out.is_empty() && required > cap {
             let last = selected[idx - 1].0;
-            out.push_str(&continuation_marker(last, line_no, hash));
+            out.push_str(&continuation_marker(retrieve_tool, last, line_no, hash));
             truncated = true;
             break;
         }
@@ -167,9 +170,9 @@ fn render_capped_line_range(
     }
 }
 
-fn continuation_marker(last: usize, next: usize, hash: &str) -> String {
+fn continuation_marker(retrieve_tool: &str, last: usize, next: usize, hash: &str) -> String {
     format!(
-        "... [truncated at line {last}; ask tool_result_retrieve with hash={hash} start_line={next} to see more]\n"
+        "... [truncated at line {last}; ask {retrieve_tool} with hash={hash} start_line={next} to see more]\n"
     )
 }
 
@@ -225,7 +228,14 @@ mod tests {
 
     #[tokio::test]
     async fn renders_line_range() {
-        let output = render_capped_line_range("a\nb\nc\n", 2, 3, OUTPUT_BYTE_CAP, "h");
+        let output = render_capped_line_range(
+            "a\nb\nc\n",
+            2,
+            3,
+            OUTPUT_BYTE_CAP,
+            "tool_result_retrieve",
+            "h",
+        );
         assert_eq!(output.content, "b\nc\n");
         assert!(!output.truncated);
     }

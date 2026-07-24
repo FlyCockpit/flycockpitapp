@@ -141,6 +141,7 @@ impl App {
                 saved_history_render_versions: self.history_render_versions.clone(),
                 saved_history_render_fingerprints: self.history_render_fingerprints.clone(),
                 saved_history_render_cache: self.history_render_cache.clone(),
+                saved_history_render_cache_rows: self.history_render_cache_rows,
                 saved_queue: std::mem::take(&mut self.queue),
                 saved_pending: self.pending.take(),
                 saved_prunable_tokens: self.prunable_tokens,
@@ -201,7 +202,10 @@ impl App {
         self.history = side.saved_history;
         self.history_render_versions = side.saved_history_render_versions;
         self.history_render_fingerprints = side.saved_history_render_fingerprints;
-        self.history_render_cache = side.saved_history_render_cache;
+        self.restore_history_render_cache(
+            side.saved_history_render_cache,
+            side.saved_history_render_cache_rows,
+        );
         self.queue = side.saved_queue;
         self.pending = side.saved_pending;
         self.mark_chat_geometry_dirty_from(0);

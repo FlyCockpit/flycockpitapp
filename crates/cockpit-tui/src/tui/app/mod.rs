@@ -1075,6 +1075,7 @@ pub(super) struct SideConversation {
     saved_history_render_versions: HashMap<HistoryEntryId, u64>,
     saved_history_render_fingerprints: HashMap<HistoryEntryId, u64>,
     saved_history_render_cache: HashMap<HistoryEntryId, HistoryRenderCacheEntry>,
+    saved_history_render_cache_rows: usize,
     saved_queue: Vec<QueuedUserMessage>,
     saved_pending: Option<PendingMsg>,
     saved_prunable_tokens: u64,
@@ -1784,10 +1785,13 @@ pub struct App {
     pub(super) history_render_versions: HashMap<HistoryEntryId, u64>,
     pub(super) history_render_fingerprints: HashMap<HistoryEntryId, u64>,
     pub(super) next_history_render_version: u64,
-    /// Per-history-index render cache for stable transcript entries. The
+    /// Per-history-id render cache for stable transcript entries. The
     /// signature includes the entry content plus render-affecting settings and
-    /// chrome state; stale indices are evicted at the end of `render_history`.
+    /// chrome state; stale ids and over-budget rows are evicted through
+    /// helper methods that keep `history_render_cache_rows` in sync.
     pub(super) history_render_cache: HashMap<HistoryEntryId, HistoryRenderCacheEntry>,
+    pub(super) history_render_cache_rows: usize,
+    pub(super) history_render_cache_max_rows: usize,
     /// Cached render output for the live pending assistant message. The
     /// signature is based on pending text/reasoning/width, so unrelated frame
     /// ticks do not reparse the same markdown buffer.
@@ -2593,6 +2597,7 @@ pub(super) struct StoredTranscriptView {
     pub(super) history_render_versions: HashMap<HistoryEntryId, u64>,
     pub(super) history_render_fingerprints: HashMap<HistoryEntryId, u64>,
     pub(super) history_render_cache: HashMap<HistoryEntryId, HistoryRenderCacheEntry>,
+    pub(super) history_render_cache_rows: usize,
     pub(super) pending_render_cache: Option<PendingRenderCacheEntry>,
     pub(super) chat_scroll_offset: usize,
 }
@@ -2953,6 +2958,8 @@ impl App {
             history_render_fingerprints: HashMap::new(),
             next_history_render_version: 1,
             history_render_cache: HashMap::new(),
+            history_render_cache_rows: 0,
+            history_render_cache_max_rows: render::HISTORY_RENDER_CACHE_MAX_ROWS,
             pending_render_cache: None,
             usage_models: HashMap::new(),
             usage_slash: HashMap::new(),

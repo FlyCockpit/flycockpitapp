@@ -38,9 +38,9 @@ use crate::tui::theme::{
 };
 
 use super::{
-    AUTOCOMPLETE_ROWS, AffordanceTarget, App, HistoryRenderCacheEntry, PaneSide, PrewrappedEntry,
-    Selection, SuggestionBoxKind, SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind,
-    TranscriptFind, WORKING_MESSAGES,
+    AUTOCOMPLETE_ROWS, AffordanceTarget, App, HistoryEntryId, HistoryRenderCacheEntry, PaneSide,
+    PrewrappedEntry, Selection, SuggestionBoxKind, SuggestionBoxRowHit, SuggestionBoxTarget, Toast,
+    ToastKind, TranscriptFind, WORKING_MESSAGES,
 };
 
 /// Startup grace before the working indicator first appears — prevents
@@ -50,6 +50,9 @@ const STATUS_GRACE: Duration = Duration::from_secs(2);
 /// flips from the working line to the yellow `Thinking` override.
 const THINKING_FLIP_AFTER: Duration = Duration::from_secs(2);
 const COMPOSER_PLACEHOLDER: &str = "Message FlyCockpit — / commands · Ctrl+K keys · /setup";
+/// Maximum total wrapped visual rows retained across all cached history
+/// entries. Sized above normal viewports while bounding worst-case sessions.
+pub(super) const HISTORY_RENDER_CACHE_MAX_ROWS: usize = 20_000;
 
 /// The per-row render slices computed by the chat-layout pass: visible
 /// lines plus one authoritative metadata record per visible row.
@@ -1744,8 +1747,7 @@ impl App {
             .retain(|id, _| live_ids.contains(id));
         self.history_render_fingerprints
             .retain(|id, _| live_ids.contains(id));
-        self.history_render_cache
-            .retain(|id, _| live_ids.contains(id));
+        self.history_render_cache_retain_live_ids(&live_ids);
         if previous_geometry_entries != self.history.len() {
             dirty_from = Some(dirty_from.unwrap_or(0).min(self.history.len()));
         }
@@ -1765,6 +1767,152 @@ impl App {
                 .map_or(idx, |dirty| dirty.min(idx)),
         );
         self.chat_find_lines_dirty = true;
+    }
+
+    pub(super) fn history_render_cache_clear(&mut self) {
+        self.history_render_cache.clear();
+        self.history_render_cache_rows = 0;
+    }
+
+    pub(super) fn take_history_render_cache(
+        &mut self,
+    ) -> std::collections::HashMap<HistoryEntryId, HistoryRenderCacheEntry> {
+        self.history_render_cache_rows = 0;
+        std::mem::take(&mut self.history_render_cache)
+    }
+
+    pub(super) fn restore_history_render_cache(
+        &mut self,
+        cache: std::collections::HashMap<HistoryEntryId, HistoryRenderCacheEntry>,
+        rows: usize,
+    ) {
+        self.history_render_cache = cache;
+        self.history_render_cache_rows = rows;
+    }
+
+    fn history_render_cache_entry_rows(entry: &HistoryRenderCacheEntry) -> usize {
+        entry.prewrapped.height
+    }
+
+    fn history_render_cache_recomputed_rows(&self) -> usize {
+        self.history_render_cache
+            .values()
+            .map(Self::history_render_cache_entry_rows)
+            .sum()
+    }
+
+    fn history_render_cache_insert(&mut self, id: HistoryEntryId, entry: HistoryRenderCacheEntry) {
+        if let Some(old) = self.history_render_cache.insert(id, entry) {
+            self.history_render_cache_rows = self
+                .history_render_cache_rows
+                .saturating_sub(Self::history_render_cache_entry_rows(&old));
+        }
+        let inserted = self
+            .history_render_cache
+            .get(&id)
+            .expect("inserted cache entry is present");
+        self.history_render_cache_rows += Self::history_render_cache_entry_rows(inserted);
+    }
+
+    fn history_render_cache_remove(
+        &mut self,
+        id: &HistoryEntryId,
+    ) -> Option<HistoryRenderCacheEntry> {
+        let removed = self.history_render_cache.remove(id)?;
+        self.history_render_cache_rows = self
+            .history_render_cache_rows
+            .saturating_sub(Self::history_render_cache_entry_rows(&removed));
+        Some(removed)
+    }
+
+    fn history_render_cache_retain_live_ids(
+        &mut self,
+        live_ids: &std::collections::HashSet<HistoryEntryId>,
+    ) {
+        let mut removed_rows = 0usize;
+        self.history_render_cache.retain(|id, entry| {
+            let keep = live_ids.contains(id);
+            if !keep {
+                removed_rows += Self::history_render_cache_entry_rows(entry);
+            }
+            keep
+        });
+        self.history_render_cache_rows =
+            self.history_render_cache_rows.saturating_sub(removed_rows);
+    }
+
+    fn evict_history_render_cache_to_budget(
+        &mut self,
+        visible_full_start: usize,
+        visible_height: usize,
+        banner_rows: usize,
+    ) {
+        if self.history_render_cache_rows <= self.history_render_cache_max_rows {
+            return;
+        }
+
+        let geometry = self.chat_geometry().clone();
+        let history_total = geometry.total_rows();
+        let visible_history_start = visible_full_start
+            .saturating_sub(banner_rows)
+            .min(history_total);
+        let visible_history_end = visible_full_start
+            .saturating_add(visible_height)
+            .saturating_sub(banner_rows)
+            .min(history_total);
+        let visible_entry_range = if visible_history_start < visible_history_end {
+            let history_visible_height = visible_history_end - visible_history_start;
+            let history_visible_offset = history_total.saturating_sub(visible_history_end);
+            geometry.visible_entry_range(history_visible_offset, history_visible_height)
+        } else {
+            0..0
+        };
+        let anchor_idx = if visible_history_start < history_total {
+            geometry
+                .entry_at_row(visible_history_start)
+                .map(|(idx, _)| idx)
+                .unwrap_or(visible_entry_range.start)
+        } else {
+            geometry
+                .entry_at_row(history_total.saturating_sub(1))
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        };
+        let positions = self
+            .history
+            .ids()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(pos, id)| (id, pos))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut candidates = self
+            .history_render_cache
+            .keys()
+            .filter_map(|id| {
+                let pos = *positions.get(id)?;
+                (!visible_entry_range.contains(&pos)).then_some((
+                    *id,
+                    pos,
+                    pos.abs_diff(anchor_idx),
+                ))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|(_, pos_a, dist_a), (_, pos_b, dist_b)| {
+            dist_b.cmp(dist_a).then_with(|| pos_a.cmp(pos_b))
+        });
+
+        for (id, _, _) in candidates {
+            if self.history_render_cache_rows <= self.history_render_cache_max_rows {
+                break;
+            }
+            let _ = self.history_render_cache_remove(&id);
+        }
+
+        debug_assert_eq!(
+            self.history_render_cache_rows,
+            self.history_render_cache_recomputed_rows()
+        );
     }
 
     fn recompute_chat_geometry_if_dirty(&mut self) {
@@ -2025,93 +2173,97 @@ impl App {
         };
 
         let mut recached_from: Option<usize> = None;
-        for (idx, entry) in self.history.iter().enumerate() {
+        for idx in 0..self.history.len() {
             let entry_id = self
                 .history
                 .id_at(idx)
                 .expect("history entry ids stay in lockstep");
-            // Pinned-message chrome (`pinned-messages`): the pick-mode arrow
-            // (when this entry is the pick selection) and/or the clickable
-            // mouse controls (`[fork]` + `[pin]`/`[unpin]`, only when mouse
-            // mode is on) ride the message itself — inline left of the
-            // timestamp for an agent reply, in the top-right border corner
-            // for a user bubble. They cost no separate vertical space.
-            let pin = Self::entry_pin_seq(entry).and_then(|seq| {
-                let is_pick = self
-                    .pin_pick
-                    .as_ref()
-                    .is_some_and(|p| p.selected_history_index() == idx)
-                    || self
-                        .fork_pick
+            let (prewrapped, cache_entry) = {
+                let entry = &self.history[idx];
+                // Pinned-message chrome (`pinned-messages`): the pick-mode arrow
+                // (when this entry is the pick selection) and/or the clickable
+                // mouse controls (`[fork]` + `[pin]`/`[unpin]`, only when mouse
+                // mode is on) ride the message itself — inline left of the
+                // timestamp for an agent reply, in the top-right border corner
+                // for a user bubble. They cost no separate vertical space.
+                let pin = Self::entry_pin_seq(entry).and_then(|seq| {
+                    let is_pick = self
+                        .pin_pick
                         .as_ref()
                         .is_some_and(|p| p.selected_history_index() == idx)
-                    || self
-                        .copy_pick_selected_history_index()
-                        .is_some_and(|selected| selected == idx);
-                let show_control = self.mouse_capture;
-                (is_pick || show_control).then_some(crate::tui::history::PinControl {
-                    seq,
-                    pinned: self.is_seq_pinned_for_render(seq),
-                    show_control,
-                    is_pick,
-                })
-            });
-            let preflight_dots_ms = self.started_at.elapsed().as_millis();
-            let version = *self
-                .history_render_versions
-                .get(&entry_id)
-                .expect("history render version is synced before render");
-            let sig = history_render_signature(
-                entry,
-                version,
-                area.width,
-                self.thinking_setting,
-                self.markdown_opts,
-                self.diff_style,
-                self.use_emojis,
-                &self.elided_event_ids,
-                preflight_dots_ms,
-                pin,
-            );
-            let prewrapped = match self.history_render_cache.get(&entry_id) {
-                Some(cached) if cached.sig == sig => {
-                    let _ = cached.rendered.lines.len();
-                    Rc::clone(&cached.prewrapped)
-                }
-                _ => {
-                    recached_from = Some(recached_from.map_or(idx, |dirty| dirty.min(idx)));
-                    let rendered = Rc::new(render_entry(
-                        entry,
-                        area.width,
-                        self.thinking_setting,
-                        self.markdown_opts,
-                        self.diff_style,
-                        self.use_emojis,
-                        &self.elided_event_ids,
-                        // Same continuously-advancing clock the busy/Thinking spinner
-                        // reads, so a preflight-pending row's `Preflight...` dots animate
-                        // each 100ms tick (implementation note).
-                        preflight_dots_ms,
-                        pin,
-                    ));
-                    let entry_row_meta = Self::row_meta_for_rendered_entry(entry, idx, &rendered);
-                    let prewrapped = Rc::new(prewrap_entry_rows(
-                        &rendered.lines,
-                        &entry_row_meta,
-                        Some(0),
-                        area.width as usize,
-                    ));
-                    self.history_render_cache.insert(
-                        entry_id,
-                        HistoryRenderCacheEntry {
+                        || self
+                            .fork_pick
+                            .as_ref()
+                            .is_some_and(|p| p.selected_history_index() == idx)
+                        || self
+                            .copy_pick_selected_history_index()
+                            .is_some_and(|selected| selected == idx);
+                    let show_control = self.mouse_capture;
+                    (is_pick || show_control).then_some(crate::tui::history::PinControl {
+                        seq,
+                        pinned: self.is_seq_pinned_for_render(seq),
+                        show_control,
+                        is_pick,
+                    })
+                });
+                let preflight_dots_ms = self.started_at.elapsed().as_millis();
+                let version = *self
+                    .history_render_versions
+                    .get(&entry_id)
+                    .expect("history render version is synced before render");
+                let sig = history_render_signature(
+                    entry,
+                    version,
+                    area.width,
+                    self.thinking_setting,
+                    self.markdown_opts,
+                    self.diff_style,
+                    self.use_emojis,
+                    &self.elided_event_ids,
+                    preflight_dots_ms,
+                    pin,
+                );
+                match self.history_render_cache.get(&entry_id) {
+                    Some(cached) if cached.sig == sig => {
+                        let _ = cached.rendered.lines.len();
+                        (Rc::clone(&cached.prewrapped), None)
+                    }
+                    _ => {
+                        recached_from = Some(recached_from.map_or(idx, |dirty| dirty.min(idx)));
+                        let rendered = Rc::new(render_entry(
+                            entry,
+                            area.width,
+                            self.thinking_setting,
+                            self.markdown_opts,
+                            self.diff_style,
+                            self.use_emojis,
+                            &self.elided_event_ids,
+                            // Same continuously-advancing clock the busy/Thinking spinner
+                            // reads, so a preflight-pending row's `Preflight...` dots animate
+                            // each 100ms tick (implementation note).
+                            preflight_dots_ms,
+                            pin,
+                        ));
+                        let entry_row_meta =
+                            Self::row_meta_for_rendered_entry(entry, idx, &rendered);
+                        let prewrapped = Rc::new(prewrap_entry_rows(
+                            &rendered.lines,
+                            &entry_row_meta,
+                            Some(0),
+                            area.width as usize,
+                        ));
+                        let cache_entry = HistoryRenderCacheEntry {
                             sig,
                             rendered: Rc::clone(&rendered),
                             prewrapped: Rc::clone(&prewrapped),
-                        },
-                    );
-                    prewrapped
+                        };
+                        (prewrapped, Some(cache_entry))
+                    }
                 }
             };
+            if let Some(cache_entry) = cache_entry {
+                self.history_render_cache_insert(entry_id, cache_entry);
+            }
             debug_assert_eq!(prewrapped.height, prewrapped.rows.len());
             debug_assert_eq!(prewrapped.find_text.len(), prewrapped.rows.len());
             debug_assert_eq!(prewrapped.row_meta.len(), prewrapped.rows.len());
@@ -2311,6 +2463,13 @@ impl App {
                 (v, meta)
             }
         };
+        let visible_full_start = chat_visible_top(
+            self.chat_total_lines,
+            area_h.max(1),
+            self.chat_scroll_offset,
+        );
+        self.evict_history_render_cache_to_budget(visible_full_start, area_h, b);
+
         self.chat_row_meta = visible_meta;
         self.clickable_rows = self.chat_row_meta.iter().map(|m| m.chip_target).collect();
         self.box_rows = self
@@ -4902,14 +5061,17 @@ mod slash_popup_full_list_tests {
 #[cfg(test)]
 mod render_history_spacing_tests {
     use super::{
-        App, ChatCopyTarget, ChatRowKind, ChatRowMeta, ControlChip, PinHit, Selection,
-        TranscriptFind, affordance_target_for_row, chat_visible_top, extract_selection_plaintext,
-        find_lines_rebuild_count, geometry_recompute_count, materialized_row_count,
-        pin_hit_for_visual_row, prewrap_call_count, prewrap_entry_rows, prewrap_row_count,
-        rendered_line_text, reset_find_lines_rebuild_count, reset_geometry_recompute_count,
+        App, ChatCopyTarget, ChatRowKind, ChatRowMeta, ControlChip, HISTORY_RENDER_CACHE_MAX_ROWS,
+        HistoryRenderCacheEntry, PinHit, Selection, TranscriptFind, affordance_target_for_row,
+        chat_visible_top, extract_selection_plaintext, find_lines_rebuild_count,
+        geometry_recompute_count, materialized_row_count, pin_hit_for_visual_row,
+        prewrap_call_count, prewrap_entry_rows, prewrap_row_count, rendered_line_text,
+        reset_find_lines_rebuild_count, reset_geometry_recompute_count,
         reset_materialized_row_count, reset_prewrap_counters, wrap_line_to_visual_rows,
     };
-    use crate::tui::app::{AffordanceTarget, HistoryLog, SandboxDownNotice, SideConversation};
+    use crate::tui::app::{
+        AffordanceTarget, HistoryEntryId, HistoryLog, SandboxDownNotice, SideConversation,
+    };
     use crate::tui::composer::VimMode;
     use crate::tui::history::{
         HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, SubagentRoutingChips, ToolCall,
@@ -5742,6 +5904,30 @@ mod render_history_spacing_tests {
         app
     }
 
+    fn plain_history_app(root: &std::path::Path, entries: usize) -> App {
+        let mut app = App::new(Some(root), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = (0..entries)
+            .map(|idx| HistoryEntry::Plain {
+                line: format!("plain cache row {idx}"),
+            })
+            .collect::<Vec<_>>()
+            .into();
+        app
+    }
+
+    fn cached_positions(app: &App) -> Vec<usize> {
+        app.history
+            .ids()
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, id)| app.history_render_cache.contains_key(id).then_some(pos))
+            .collect()
+    }
+
+    fn assert_cache_key_type(_: &HashMap<HistoryEntryId, HistoryRenderCacheEntry>) {}
+
     fn visible_reference_range(
         reference: &FullWrapReference,
         offset: usize,
@@ -6547,6 +6733,199 @@ mod render_history_spacing_tests {
     }
 
     #[test]
+    fn history_render_cache_row_counter_matches_recomputed_sum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 8);
+
+        render_history_no_selection(&mut app, 80, 4);
+        assert_eq!(
+            app.history_render_cache_rows,
+            app.history_render_cache_recomputed_rows()
+        );
+
+        app.history[3] = HistoryEntry::Plain {
+            line: "plain cache row 3 changed".to_string(),
+        };
+        render_history_no_selection(&mut app, 80, 4);
+        assert_eq!(
+            app.history_render_cache_rows,
+            app.history_render_cache_recomputed_rows()
+        );
+
+        app.history.remove(0);
+        render_history_no_selection(&mut app, 80, 4);
+        assert_eq!(
+            app.history_render_cache_rows,
+            app.history_render_cache_recomputed_rows()
+        );
+
+        app.history_render_cache_clear();
+        assert_eq!(app.history_render_cache_rows, 0);
+        assert_eq!(app.history_render_cache_recomputed_rows(), 0);
+    }
+
+    #[test]
+    fn history_render_cache_evicts_furthest_from_viewport_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 10);
+        app.history_render_cache_max_rows = 6;
+
+        render_history_no_selection(&mut app, 80, 3);
+        assert_eq!(cached_positions(&app), vec![4, 5, 6, 7, 8, 9]);
+
+        let mut middle = plain_history_app(tmp.path(), 9);
+        render_history_no_selection(&mut middle, 80, 1);
+        middle.history_render_cache_max_rows = 8;
+        middle.chat_scroll_offset = 4;
+        render_history_no_selection(&mut middle, 80, 1);
+
+        assert!(
+            !middle
+                .history_render_cache
+                .contains_key(&middle.history.id_at(0).unwrap())
+        );
+        assert!(
+            middle
+                .history_render_cache
+                .contains_key(&middle.history.id_at(8).unwrap())
+        );
+    }
+
+    #[test]
+    fn history_render_cache_never_evicts_visible_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 8);
+        app.history_render_cache_max_rows = 1;
+
+        render_history_no_selection(&mut app, 80, 4);
+
+        assert_eq!(app.history_render_cache_rows, 4);
+        assert_eq!(cached_positions(&app), vec![4, 5, 6, 7]);
+        assert!(app.history_render_cache_rows > app.history_render_cache_max_rows);
+    }
+
+    #[test]
+    fn history_render_cache_eviction_leaves_scroll_state_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 12);
+        app.history_render_cache_max_rows = 5;
+        app.selection = Some(Selection {
+            anchor: (1, 1),
+            focus: (2, 2),
+            active: true,
+        });
+        app.chat_scroll_offset = 3;
+
+        let history_ids = app.history.ids().to_vec();
+        render_history_no_selection(&mut app, 80, 4);
+        let versions = app.history_render_versions.clone();
+        let fingerprints = app.history_render_fingerprints.clone();
+        let offset = app.chat_scroll_offset;
+        let selection = app.selection.unwrap();
+
+        assert_eq!(app.history.ids(), history_ids.as_slice());
+        assert_eq!(app.history_render_versions, versions);
+        assert_eq!(app.history_render_fingerprints, fingerprints);
+        assert_eq!(app.chat_scroll_offset, offset);
+        let after_selection = app.selection.unwrap();
+        assert_eq!(after_selection.anchor, selection.anchor);
+        assert_eq!(after_selection.focus, selection.focus);
+        assert_eq!(after_selection.active, selection.active);
+    }
+
+    #[test]
+    fn history_render_cache_reevaluation_after_eviction_is_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 12);
+
+        render_history_no_selection(&mut app, 80, 4);
+        let evicted_id = app.history.id_at(0).unwrap();
+        let before = app
+            .history_render_cache
+            .get(&evicted_id)
+            .unwrap()
+            .rendered
+            .lines
+            .clone();
+
+        app.history_render_cache_max_rows = 4;
+        render_history_no_selection(&mut app, 80, 4);
+        assert!(!app.history_render_cache.contains_key(&evicted_id));
+
+        app.history_render_cache_max_rows = HISTORY_RENDER_CACHE_MAX_ROWS;
+        app.chat_scroll_offset = app.chat_total_lines.saturating_sub(app.chat_visible_lines);
+        render_history_no_selection(&mut app, 80, 4);
+        let after = app
+            .history_render_cache
+            .get(&evicted_id)
+            .unwrap()
+            .rendered
+            .lines
+            .clone();
+
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn history_render_cache_clear_resets_row_counter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 6);
+
+        render_history_no_selection(&mut app, 80, 4);
+        assert!(app.history_render_cache_rows > 0);
+
+        app.history_render_cache_clear();
+
+        assert!(app.history_render_cache.is_empty());
+        assert_eq!(app.history_render_cache_rows, 0);
+    }
+
+    #[test]
+    fn history_render_cache_stays_within_budget_across_full_scroll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 80);
+        app.history_render_cache_max_rows = 20;
+
+        render_history_no_selection(&mut app, 80, 5);
+        let max_offset = app.chat_total_lines.saturating_sub(app.chat_visible_lines);
+        for offset in (0..=max_offset).chain((0..=max_offset).rev()) {
+            app.chat_scroll_offset = offset;
+            render_history_no_selection(&mut app, 80, 5);
+            assert!(
+                app.history_render_cache_rows <= app.history_render_cache_max_rows + 5,
+                "offset {offset}, rows {}",
+                app.history_render_cache_rows
+            );
+        }
+    }
+
+    #[test]
+    fn history_render_cache_uses_published_geometry_and_entry_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 9);
+        render_history_no_selection(&mut app, 80, 1);
+        app.history_render_cache_max_rows = 8;
+        app.chat_scroll_offset = 4;
+
+        assert_cache_key_type(&app.history_render_cache);
+        render_history_no_selection(&mut app, 80, 1);
+
+        let first_visible_row = chat_visible_top(
+            app.chat_total_lines,
+            app.chat_visible_lines.max(1),
+            app.chat_scroll_offset,
+        )
+        .saturating_sub(app.chat_banner_lines);
+        let geometry_anchor = app
+            .chat_geometry()
+            .entry_at_row(first_visible_row)
+            .map(|(idx, _)| idx);
+
+        assert_eq!(geometry_anchor, Some(4));
+        assert_eq!(cached_positions(&app), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
     fn mid_list_insert_preserves_render_cache_for_following_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
@@ -6607,6 +6986,7 @@ mod render_history_spacing_tests {
             saved_history_render_versions: app.history_render_versions.clone(),
             saved_history_render_fingerprints: app.history_render_fingerprints.clone(),
             saved_history_render_cache: app.history_render_cache.clone(),
+            saved_history_render_cache_rows: app.history_render_cache_rows,
             saved_queue: Vec::new(),
             saved_pending: None,
             saved_prunable_tokens: 0,
@@ -6624,7 +7004,7 @@ mod render_history_spacing_tests {
         app.history = vec![agent("side root"), agent("colliding cached text")].into();
         app.history_render_versions.clear();
         app.history_render_fingerprints.clear();
-        app.history_render_cache.clear();
+        app.history_render_cache_clear();
         render_history_no_selection(&mut app, 80, 10);
         let side_collision_id = app.history.id_at(1).unwrap();
         let side_cached = Rc::clone(

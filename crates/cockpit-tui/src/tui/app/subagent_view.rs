@@ -2,13 +2,16 @@ use super::*;
 
 impl App {
     fn capture_transcript_view(&mut self) -> StoredTranscriptView {
+        let history_render_cache_rows = self.history_render_cache_rows;
+        let history_render_cache = self.take_history_render_cache();
         StoredTranscriptView {
             meta: std::mem::take(&mut self.transcript_view),
             history: std::mem::take(&mut self.history),
             pending: self.pending.take(),
             history_render_versions: std::mem::take(&mut self.history_render_versions),
             history_render_fingerprints: std::mem::take(&mut self.history_render_fingerprints),
-            history_render_cache: std::mem::take(&mut self.history_render_cache),
+            history_render_cache,
+            history_render_cache_rows,
             pending_render_cache: self.pending_render_cache.take(),
             chat_scroll_offset: self.chat_scroll_offset,
         }
@@ -20,7 +23,10 @@ impl App {
         self.pending = view.pending.take();
         self.history_render_versions = std::mem::take(&mut view.history_render_versions);
         self.history_render_fingerprints = std::mem::take(&mut view.history_render_fingerprints);
-        self.history_render_cache = std::mem::take(&mut view.history_render_cache);
+        self.restore_history_render_cache(
+            std::mem::take(&mut view.history_render_cache),
+            view.history_render_cache_rows,
+        );
         self.pending_render_cache = view.pending_render_cache.take();
         self.chat_scroll_offset = view.chat_scroll_offset;
         self.mark_chat_geometry_dirty_from(0);
@@ -87,7 +93,7 @@ impl App {
         self.pending = None;
         self.history_render_versions = std::collections::HashMap::new();
         self.history_render_fingerprints = std::collections::HashMap::new();
-        self.history_render_cache.clear();
+        self.history_render_cache_clear();
         self.pending_render_cache = None;
         self.chat_scroll_offset = 0;
         self.mark_chat_geometry_dirty_from(0);

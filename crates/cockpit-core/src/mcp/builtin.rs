@@ -57,6 +57,8 @@ pub struct HostContext {
     test_builtin_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
     test_external_invoke: Option<TestExternalInvoke>,
+    #[cfg(test)]
+    test_external_approval_entered: Option<TestExternalApprovalEntered>,
 }
 
 impl HostContext {
@@ -88,6 +90,8 @@ impl HostContext {
             test_builtin_gate: None,
             #[cfg(test)]
             test_external_invoke: None,
+            #[cfg(test)]
+            test_external_approval_entered: None,
         }
     }
 
@@ -110,6 +114,8 @@ impl HostContext {
             test_builtin_gate: None,
             #[cfg(test)]
             test_external_invoke: None,
+            #[cfg(test)]
+            test_external_approval_entered: None,
         }
     }
 
@@ -147,6 +153,15 @@ impl HostContext {
         self
     }
 
+    #[cfg(test)]
+    pub fn with_test_external_approval_entered<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str, &str) + Send + Sync + 'static,
+    {
+        self.test_external_approval_entered = Some(Arc::new(f));
+        self
+    }
+
     pub fn with_builtin_registry(mut self, registry: Arc<BuiltinRegistry>) -> Self {
         self.builtin_registry = registry;
         self
@@ -180,10 +195,19 @@ impl HostContext {
     pub fn has_test_external_invoke(&self) -> bool {
         self.test_external_invoke.is_some()
     }
+
+    #[cfg(test)]
+    pub fn test_external_approval_entered(&self, server: &str, tool: &str) {
+        if let Some(hook) = &self.test_external_approval_entered {
+            hook(server, tool);
+        }
+    }
 }
 
 #[cfg(test)]
 type TestExternalInvoke = Arc<dyn Fn(&str, &str, Value) -> Result<Value> + Send + Sync>;
+#[cfg(test)]
+type TestExternalApprovalEntered = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct McpChildDispatch {
@@ -723,6 +747,19 @@ pub fn describe(ctx: &HostContext, tool: &str) -> Result<ToolDescriptor> {
 
 pub async fn invoke(ctx: &HostContext, tool: &str, args: Value) -> Result<Value> {
     let Some(func) = ctx.builtin_registry.get(tool) else {
+        let descriptors = available_descriptors(ctx);
+        if let Some(suggestion) = crate::mcp::suggest::closest_tool(
+            tool,
+            descriptors
+                .iter()
+                .map(|desc| (desc.name.clone(), first_line(&desc.description))),
+        ) {
+            bail!(
+                "unknown MCP tool `{BUILTIN_SERVER_ID}.{tool}` — did you mean `{}`: {}?",
+                suggestion.name,
+                suggestion.description
+            );
+        }
         bail!("unknown MCP tool `{BUILTIN_SERVER_ID}.{tool}`");
     };
     if func.check_availability_on_invoke {
@@ -2028,6 +2065,10 @@ mod tests {
 
     #[tokio::test]
     async fn monty_adapter_availability_denial_is_hidden_and_not_invocable() {
+        assert_gated_builtin_returns_availability_reason_not_suggestion().await;
+    }
+
+    async fn assert_gated_builtin_returns_availability_reason_not_suggestion() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = Arc::new(MontyAdapterTool::new("closed_tool", "never"));
         let func = ToolOutputBuiltinAdapter::new(tool)
@@ -2046,6 +2087,12 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("not available"), "{err}");
         assert!(err.to_string().contains("closed for test"), "{err}");
+        assert!(!err.to_string().contains("did you mean"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn invoke_gated_builtin_returns_availability_reason_not_suggestion() {
+        assert_gated_builtin_returns_availability_reason_not_suggestion().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -2318,6 +2365,35 @@ mod tests {
         assert!(Arc::ptr_eq(&host.builtin_registry, &registry));
     }
 
+    #[tokio::test]
+    async fn invoke_unknown_builtin_suggests_closest_with_one_liner() {
+        let func = BuiltinFunction::new(
+            "rename_session",
+            "Set an auto-generated session title when this session needs one",
+            BuiltinPresentation {
+                glyph: "r",
+                label: "rename_session".to_string(),
+            },
+            Arc::new(empty_object_schema),
+            Arc::new(|_ctx| Availability::available()),
+            true,
+            Arc::new(|_ctx, _args| Box::pin(async { Ok(Value::Null) })),
+        );
+        let host = HostContext::empty_for_tests()
+            .with_builtin_registry(Arc::new(BuiltinRegistry::from_functions(vec![func])));
+
+        let err = invoke(&host, "rename_sesion", serde_json::json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("rename_session"), "{err}");
+        assert!(
+            err.contains("Set an auto-generated session title when this session needs one"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn search_short_query_does_not_dump_whole_builtin_catalog() {
         let funcs = vec![
@@ -2494,6 +2570,7 @@ mod tests {
             scan_tool_results: false,
             test_builtin_gate: None,
             test_external_invoke: None,
+            test_external_approval_entered: None,
         };
         let err = rename_session(&host, serde_json::json!({ "name": "agent" }))
             .await
@@ -2582,6 +2659,7 @@ mod tests {
             scan_tool_results: false,
             test_builtin_gate: None,
             test_external_invoke: None,
+            test_external_approval_entered: None,
         };
         advance_title_turns(host.session.as_ref().unwrap(), 8);
 

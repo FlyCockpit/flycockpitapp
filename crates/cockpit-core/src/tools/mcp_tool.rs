@@ -20,7 +20,7 @@ use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 pub struct McpTool;
 
-const NORMAL_DESCRIPTION: &str = "Run Python in a sandbox exposing mcp.search, cheap mcp.grep_tool_names, heavier mcp.grep_tool_definitions, mcp.describe, and mcp.invoke.";
+const NORMAL_DESCRIPTION: &str = "Run Python in a sandbox exposing mcp.search, cheap mcp.grep_tool_names, heavier mcp.grep_tool_definitions, mcp.describe, and mcp.invoke. Use try/except around invoke loops.";
 const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sandbox to reach MCP tools. Inside the \
      script call `mcp.search(query)` for cheap discovery (returns dicts with server, tool, \
      and description), `mcp.grep_tool_names(regex)` for cheap name-only regex discovery, \
@@ -29,7 +29,8 @@ const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sand
      input schema, and `mcp.invoke(server, tool, args)` to call one. Search or grep before \
      concluding a capability is missing. Process intermediate results in Python and use a final \
      expression for the value you want back, for example `hits = mcp.search(\"calendar\")` then \
-     `hits`. If the script returns `None`, \
+     `hits`. For batch invokes, wrap each `mcp.invoke` in try/except and collect per-item \
+     `{ok|err}` results so one failure does not abort the loop. If the script returns `None`, \
      printed output is captured and returned as a fallback. The sandbox has no filesystem, \
      network, or environment access.";
 
@@ -265,6 +266,14 @@ mod tests {
                 .contains("Search or grep before concluding a capability is missing"),
             "{DEFENSIVE_DESCRIPTION}"
         );
+    }
+
+    #[test]
+    fn mcp_descriptions_teach_batch_isolation() {
+        for description in [NORMAL_DESCRIPTION, DEFENSIVE_DESCRIPTION] {
+            assert!(description.contains("try/except"), "{description}");
+            assert!(description.contains("invoke"), "{description}");
+        }
     }
 
     #[tokio::test]

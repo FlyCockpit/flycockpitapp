@@ -117,6 +117,7 @@ const WRAP_ROOT_STRING_AS_OBJECT: &str = "wrap_root_string_as_object";
 const PARSE_ROOT_STRING_AS_OBJECT: &str = "parse_root_string_as_object";
 const REPAIR_NOTE_MAX_CHARS: usize = 1024;
 const REPAIR_NOTE_TRUNCATED_SUFFIX: &str = "... [truncated]";
+const EXPECTED_SCHEMA_MAX_CHARS: usize = 360;
 const SALVAGE_TAIL_MAX_COMPONENTS: usize = 256;
 
 /// Fallback name for a sanitized tool name that coerces to the empty string
@@ -539,7 +540,7 @@ pub fn repair(args: &mut Value, schema: &Value, tool: &str) -> RepairOutcome {
     // stage that did mutate the call before validation still failed, so
     // telemetry distinguishes "no stage claimed it" from "a rewrite fired
     // but could not make the call valid".
-    let msg = model_readable_error(&validator, args, tool);
+    let msg = model_readable_error(&validator, args, schema, tool);
     let rules_fired: Vec<String> = fired.iter().map(|s| s.to_string()).collect();
     RepairOutcome {
         recovery: Recovery::Clean,
@@ -1017,7 +1018,12 @@ fn unwrap_degenerate_autolink(s: &str) -> Option<String> {
 /// prefix is correct here — this is a genuine invocation failure (distinct
 /// from the soft, un-reddened relational-default Note the `read` tool
 /// emits). The dispatcher wraps this in `invalid_input`.
-fn model_readable_error(validator: &jsonschema::Validator, args: &Value, tool: &str) -> String {
+fn model_readable_error(
+    validator: &jsonschema::Validator,
+    args: &Value,
+    schema: &Value,
+    tool: &str,
+) -> String {
     let first = validator.iter_errors(args).next();
     match first {
         Some(err) => {
@@ -1045,14 +1051,82 @@ fn model_readable_error(validator: &jsonschema::Validator, args: &Value, tool: &
             } else {
                 format!(" at `{loc}`")
             };
+            let expected = compact_expected_schema(schema, err.instance_path())
+                .map(|schema| format!(" Expected schema{where_}: {schema}."))
+                .unwrap_or_default();
             format!(
-                "`{tool}` arguments failed schema validation{where_}: {err}. Re-emit the call with arguments matching the tool's schema."
+                "`{tool}` arguments failed schema validation{where_}: {err}.{expected} Re-emit the call with arguments matching the tool's schema."
             )
         }
         None => format!(
             "`{tool}` arguments failed schema validation. Re-emit the call with arguments matching the tool's schema."
         ),
     }
+}
+
+fn compact_expected_schema(schema: &Value, loc: &jsonschema::paths::Location) -> Option<String> {
+    let subschema = schema_at_instance_path(schema, loc)?;
+    let compact = compact_schema_value(subschema);
+    let rendered = serde_json::to_string(&compact).ok()?;
+    Some(truncate_chars(&rendered, EXPECTED_SCHEMA_MAX_CHARS))
+}
+
+fn schema_at_instance_path<'a>(
+    schema: &'a Value,
+    loc: &jsonschema::paths::Location,
+) -> Option<&'a Value> {
+    let mut cur = schema;
+    for seg in loc.iter() {
+        match seg {
+            jsonschema::paths::LocationSegment::Property(p) => {
+                cur = cur.get("properties")?.get(p.as_ref())?;
+            }
+            jsonschema::paths::LocationSegment::Index(_) => {
+                cur = cur.get("items")?;
+            }
+        }
+    }
+    Some(cur)
+}
+
+fn compact_schema_value(schema: &Value) -> Value {
+    let Some(obj) = schema.as_object() else {
+        return schema.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for key in ["type", "enum", "const", "format"] {
+        if let Some(value) = obj.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(properties) = obj.get("properties").and_then(Value::as_object) {
+        let mut keys = properties.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        out.insert(
+            "properties".to_string(),
+            Value::Array(keys.into_iter().map(Value::String).collect()),
+        );
+    }
+    if let Some(required) = obj.get("required") {
+        out.insert("required".to_string(), required.clone());
+    }
+    if let Some(items) = obj.get("items") {
+        out.insert("items".to_string(), compact_schema_value(items));
+    }
+    if out.is_empty() {
+        schema.clone()
+    } else {
+        Value::Object(out)
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
 }
 
 /// Whether the model sent effectively no arguments — `{}`, `null`, or a
@@ -1790,6 +1864,50 @@ mod tests {
             msg.contains("empty arguments"),
             "must flag the empty-args case, got: {msg}"
         );
+    }
+
+    #[test]
+    fn schema_mismatch_error_echoes_compact_expected_schema() {
+        let mode_schema = json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["fast", "slow"]
+                }
+            },
+            "required": ["mode"]
+        });
+        let mut v = json!({ "mode": 3 });
+        let out = repair(&mut v, &mode_schema, "set_mode");
+
+        assert!(!out.valid);
+        let msg = out.error.expect("expected hard-fail message");
+        assert!(msg.contains("Expected schema at `/mode`"), "{msg}");
+        assert!(msg.contains(r#""type":"string""#), "{msg}");
+        assert!(msg.contains(r#""enum":["fast","slow"]"#), "{msg}");
+        assert!(
+            msg.chars().count() <= EXPECTED_SCHEMA_MAX_CHARS + 240,
+            "schema echo should be bounded, got {} chars: {msg}",
+            msg.chars().count()
+        );
+    }
+
+    #[test]
+    fn missing_required_error_names_field_without_schema_dump() {
+        let bash_schema = json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        });
+        let mut v = json!({});
+        let out = repair(&mut v, &bash_schema, "bash");
+
+        assert!(!out.valid);
+        let msg = out.error.expect("expected hard-fail message");
+        assert!(msg.contains("`command`"), "{msg}");
+        assert!(!msg.contains("Expected schema"), "{msg}");
+        assert!(!msg.contains(r#""type":"string""#), "{msg}");
     }
 
     #[test]

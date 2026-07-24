@@ -265,10 +265,25 @@ pub async fn invoke(
     if builtin::is_builtin_server(server) {
         return builtin::invoke(host, tool, args).await;
     }
+    let Some(server_cfg) = cfg.servers.get(server) else {
+        if let Some(suggestion) = crate::mcp::suggest::closest_server(
+            server,
+            cfg.enabled_servers()
+                .into_iter()
+                .map(|(name, _)| name)
+                .chain(std::iter::once(builtin::BUILTIN_SERVER_ID)),
+        ) {
+            bail!("unknown MCP server `{server}` — did you mean `{suggestion}`?");
+        }
+        bail!("unknown MCP server `{server}`");
+    };
+    if !server_cfg.enabled {
+        bail!("MCP server `{server}` is disabled");
+    }
     // External MCP tools are third-party code and use their own exact
     // `(server, tool)` grant-or-ask seam. This sits after the builtin early
-    // return so cockpit's own Monty tools are not double-gated, and before
-    // the test hook so stubbed external invocations validate the same path.
+    // return and server validation so cockpit's own Monty tools are not
+    // double-gated and typo'd servers never raise phantom approvals.
     match approve_external_mcp_tool(host, server, tool).await? {
         crate::approval::Decision::Allow { .. } => {}
         crate::approval::Decision::Deny => return Ok(mcp_tool_denial(server, tool, false)),
@@ -283,11 +298,21 @@ pub async fn invoke(
     if let Some(result) = host.test_external_invoke(server, tool, args.clone()) {
         return result;
     }
-    let Some(server_cfg) = cfg.servers.get(server) else {
-        bail!("unknown MCP server `{server}`");
-    };
-    if !server_cfg.enabled {
-        bail!("MCP server `{server}` is disabled");
+    let tools = list_tools_cached_with_context(server, server_cfg, connect_context(host)).await?;
+    if !tools.iter().any(|desc| desc.name == tool) {
+        if let Some(suggestion) = crate::mcp::suggest::closest_tool(
+            tool,
+            tools
+                .iter()
+                .map(|desc| (desc.name.clone(), first_line(&desc.description))),
+        ) {
+            bail!(
+                "unknown MCP tool `{server}.{tool}` — did you mean `{}`: {}?",
+                suggestion.name,
+                suggestion.description
+            );
+        }
+        bail!("unknown MCP tool `{server}.{tool}`");
     }
     let mut conn = client::connect_with_context(server, server_cfg, connect_context(host)).await?;
     conn.call_tool(tool, args).await
@@ -305,6 +330,8 @@ async fn approve_external_mcp_tool(
     server: &str,
     tool: &str,
 ) -> Result<crate::approval::Decision> {
+    #[cfg(test)]
+    host.test_external_approval_entered(server, tool);
     let Some(tool_ctx) = host.native_tool_ctx.as_ref() else {
         return Ok(crate::approval::Decision::NoninteractiveDeny);
     };
@@ -364,6 +391,7 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn server(mode: DisclosureMode) -> ServerConfig {
         ServerConfig {
@@ -460,13 +488,35 @@ for line in sys.stdin:
         }
     }
 
+    fn host_with_mcp_grant(root: &std::path::Path, server: &str, tool: &str) -> HostContext {
+        let (mut ctx, db) = crate::tools::common::test_ctx_with_db(root);
+        let store = crate::approval::store::GrantStore::new(
+            db.clone(),
+            ctx.session.id,
+            root.to_path_buf(),
+            ctx.config.clone(),
+        );
+        store
+            .record_mcp_tool(server, tool, crate::approval::store::Scope::Session)
+            .unwrap();
+        ctx.approver = Some(Arc::new(crate::approval::Approver::new(
+            store,
+            db,
+            ctx.session.id,
+            ctx.agent_id.clone(),
+            ctx.interrupts.clone(),
+        )));
+        HostContext::from_tool_ctx(&ctx)
+    }
+
     #[tokio::test]
     async fn invoke_rejects_unknown_and_disabled_servers() {
         let mut cfg = McpConfig::default();
         let host = HostContext::empty_for_tests();
-        let out = invoke(&cfg, &host, "nope", "t", Value::Null).await.unwrap();
-        assert_eq!(out["denied"], true);
-        assert_eq!(out["kind"], "approval_noninteractive_denied");
+        let err = invoke(&cfg, &host, "nope", "t", Value::Null)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown MCP server"), "{err}");
 
         let mut s = server(DisclosureMode::Monty);
         s.enabled = false;
@@ -494,6 +544,53 @@ for line in sys.stdin:
             .await
             .unwrap_err();
         assert!(err.to_string().contains("disabled"));
+    }
+
+    #[tokio::test]
+    async fn invoke_unknown_external_suggests_closest_tool() {
+        let tmp = fake_stdio_server();
+        let script = tmp.path().join("fake-mcp.py");
+        let mut cfg = McpConfig::default();
+        cfg.servers.insert("fake".into(), stdio_cfg(&script));
+        let grant_root = tempfile::tempdir().unwrap();
+        let host = host_with_mcp_grant(grant_root.path(), "fake", "count2");
+
+        let err = invoke(&cfg, &host, "fake", "count2", Value::Null)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("unknown MCP tool `fake.count2`"), "{err}");
+        assert!(err.contains("did you mean `count`: Count numbers"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn invoke_unknown_server_rejected_before_approval() {
+        let mut cfg = McpConfig::default();
+        cfg.servers
+            .insert("github".into(), server(DisclosureMode::Monty));
+        let tmp = tempfile::tempdir().unwrap();
+        let approvals = Arc::new(AtomicUsize::new(0));
+        let host = host_with_mcp_grant(tmp.path(), "githb", "count")
+            .with_test_external_approval_entered({
+                let approvals = approvals.clone();
+                move |_server, _tool| {
+                    approvals.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+        let err = invoke(&cfg, &host, "githb", "count", Value::Null)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("unknown MCP server `githb`"), "{err}");
+        assert!(err.contains("did you mean `github`"), "{err}");
+        assert_eq!(
+            approvals.load(Ordering::SeqCst),
+            0,
+            "approval should not be reached for an unknown server"
+        );
     }
 
     #[tokio::test]

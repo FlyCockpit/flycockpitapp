@@ -18,4 +18,5 @@ pub mod config;
 pub mod invoke_prep;
 pub mod protocol;
 pub mod sandbox;
+mod suggest;
 pub mod transport;

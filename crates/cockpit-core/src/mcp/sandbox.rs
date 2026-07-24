@@ -1460,6 +1460,25 @@ r";
     }
 
     #[tokio::test]
+    async fn monty_try_except_catches_invoke_value_error() {
+        let cfg = McpConfig::default();
+        let script = "\
+caught = False
+continued = False
+try:
+    mcp.invoke('cockpit', 'does_not_exist', {})
+except Exception:
+    caught = True
+continued = True
+{'caught': caught, 'continued': continued}";
+        let out = run(script, &cfg).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            serde_json::json!({"caught": true, "continued": true})
+        );
+    }
+
+    #[tokio::test]
     async fn sandbox_denies_env_access() {
         let cfg = McpConfig::default();
         // `os.getenv` surfaces as an OsCall the runner refuses.

@@ -327,11 +327,8 @@ fn known_tool_schemas() -> BTreeMap<String, Value> {
         Box::new(tools::editunlock::EditunlockTool),
         Box::new(tools::bash::BashTool::new()),
         Box::new(tools::intel::CodeTool),
-        Box::new(tools::intel::DepsTool),
-        Box::new(tools::intel::HotTool),
-        Box::new(tools::intel::CircularTool),
+        Box::new(tools::intel::GraphTool),
         Box::new(tools::intel::SearchTool),
-        Box::new(tools::intel::ImpactTool),
         Box::new(tools::task::TaskTool::with_subagents(&[
             "builder", "explore",
         ])),
@@ -347,9 +344,7 @@ fn known_tool_schemas() -> BTreeMap<String, Value> {
 
 fn classify_tool(name: &str) -> ToolCategory {
     match name {
-        "read" | "code" | "deps" | "hot" | "circular" | "search" | "impact" => {
-            ToolCategory::ReadOnly
-        }
+        "read" | "code" | "graph" | "search" => ToolCategory::ReadOnly,
         "bash" => ToolCategory::Shell,
         "task" | "spawn" | "handoff" => ToolCategory::Delegation,
         "question" | "mcp" => ToolCategory::ApprovalRequiring,

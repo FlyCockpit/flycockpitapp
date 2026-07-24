@@ -33,6 +33,18 @@ fn code_args(kind: &str, args: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+fn graph_args(kind: &str, args: serde_json::Value) -> serde_json::Value {
+    let mut map = match args {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    map.insert(
+        "kind".to_string(),
+        serde_json::Value::String(kind.to_string()),
+    );
+    serde_json::Value::Object(map)
+}
+
 #[tokio::test]
 async fn code_tool_rejects_unknown_kind() {
     let tmp = tempfile::tempdir().unwrap();
@@ -133,6 +145,197 @@ async fn code_symbol_find_filters_by_symbol_kind() {
 }
 
 #[tokio::test]
+async fn graph_tool_rejects_unknown_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = test_ctx(tmp.path());
+
+    for args in [
+        serde_json::json!({}),
+        serde_json::json!({"kind": ""}),
+        serde_json::json!({"kind": "nope"}),
+        serde_json::json!({"kind": "forward"}),
+        serde_json::json!({"kind": "reverse"}),
+        serde_json::json!({"kind": "both"}),
+    ] {
+        let err = GraphTool.call(args, &ctx).await.unwrap_err();
+        assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
+        let msg = err.to_string();
+        for kind in ["deps", "importers", "cycles", "callers", "calls", "recent"] {
+            assert!(msg.contains(kind), "{msg}");
+        }
+    }
+
+    let schema = GraphTool.parameters();
+    assert_eq!(
+        schema["properties"]["kind"]["enum"],
+        serde_json::json!(["deps", "importers", "cycles", "callers", "calls", "recent"])
+    );
+    let defensive = GraphTool.defensive_parameters().unwrap();
+    assert_eq!(
+        defensive["properties"]["kind"]["enum"],
+        serde_json::json!(["deps", "importers", "cycles", "callers", "calls", "recent"])
+    );
+}
+
+#[tokio::test]
+async fn graph_arms_require_their_arguments() {
+    clear_freshness_cache();
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/lib.rs", "pub fn target() {}\n");
+    let ctx = test_ctx(tmp.path());
+
+    for (kind, field) in [
+        ("deps", "path"),
+        ("importers", "path"),
+        ("callers", "name"),
+        ("calls", "name"),
+    ] {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::Value::String(String::new()),
+        ] {
+            let mut args = serde_json::Map::new();
+            args.insert(
+                "kind".to_string(),
+                serde_json::Value::String(kind.to_string()),
+            );
+            args.insert(field.to_string(), value);
+            let err = GraphTool
+                .call(serde_json::Value::Object(args), &ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{msg}");
+            assert!(msg.contains(kind), "{msg}");
+        }
+    }
+
+    let cycles = GraphTool
+        .call(graph_args("cycles", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        cycles.content.contains("No import cycles found") || cycles.content.contains("cycle(s):"),
+        "{}",
+        cycles.content
+    );
+
+    let recent = GraphTool
+        .call(graph_args("recent", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
+    assert!(recent.content.contains("src/lib.rs"), "{}", recent.content);
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn graph_deps_lists_forward_imports() {
+    clear_freshness_cache();
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/app.ts",
+        "import { helper } from './util';\nexport function main() {\n    helper();\n}\n",
+    );
+    write(tmp.path(), "src/util.ts", "export function helper() {}\n");
+    let ctx = test_ctx(tmp.path());
+
+    let out = GraphTool
+        .call(
+            graph_args("deps", serde_json::json!({ "path": "src/app.ts" })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("forward"), "{}", out.content);
+    assert!(out.content.contains("src/util.ts"), "{}", out.content);
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn graph_importers_lists_reverse_imports() {
+    clear_freshness_cache();
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/app.ts",
+        "import { helper } from './util';\nexport function main() {\n    helper();\n}\n",
+    );
+    write(tmp.path(), "src/util.ts", "export function helper() {}\n");
+    let ctx = test_ctx(tmp.path());
+
+    let out = GraphTool
+        .call(
+            graph_args("importers", serde_json::json!({ "path": "src/util.ts" })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("reverse"), "{}", out.content);
+    assert!(out.content.contains("src/app.ts"), "{}", out.content);
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn graph_cycles_reports_import_cycle() {
+    clear_freshness_cache();
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/a.ts",
+        "import { b } from './b';\nexport function a() { b(); }\n",
+    );
+    write(
+        tmp.path(),
+        "src/b.ts",
+        "import { a } from './a';\nexport function b() { a(); }\n",
+    );
+    let ctx = test_ctx(tmp.path());
+
+    let out = GraphTool
+        .call(graph_args("cycles", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("src/a.ts"), "{}", out.content);
+    assert!(out.content.contains("src/b.ts"), "{}", out.content);
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn graph_callers_filters_by_symbol_kind() {
+    clear_freshness_cache();
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/lib.ts",
+        "export function widget() {}\nexport class widget {}\nexport function caller() {\n    widget();\n}\n",
+    );
+    let ctx = test_ctx(tmp.path());
+
+    let out = GraphTool
+        .call(
+            graph_args(
+                "callers",
+                serde_json::json!({ "name": "widget", "symbol_kind": "function" }),
+            ),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert!(out.content.contains("function"), "{}", out.content);
+    assert!(out.content.contains("caller"), "{}", out.content);
+    assert!(!out.content.contains("class"), "{}", out.content);
+    let schema = GraphTool.parameters();
+    assert!(schema["properties"].get("symbol_kind").is_some());
+    clear_freshness_cache();
+}
+
+#[tokio::test]
 async fn outline_unknown_language_uses_regex_fallback_without_erroring() {
     let tmp = tempfile::tempdir().unwrap();
     // `.foo` is an unknown extension; give it def-like lines.
@@ -198,7 +401,10 @@ async fn tree_and_hot_list_unknown_language_files() {
     // The unknown file is visible but flagged as grammarless data.
     assert!(tree.content.contains("notes.foo  unknown 9b 1L [data]"));
 
-    let hot = HotTool.call(serde_json::json!({}), &ctx).await.unwrap();
+    let hot = GraphTool
+        .call(graph_args("recent", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
     assert!(hot.content.contains("notes.foo"));
     assert!(hot.content.contains("src/lib.rs"));
 }
@@ -212,8 +418,11 @@ async fn hot_lists_recently_modified_hidden_files() {
     write(tmp.path(), ".git/COMMIT_EDITMSG", "hidden git noise\n");
     let ctx = test_ctx(tmp.path());
 
-    let hot = HotTool
-        .call(serde_json::json!({ "limit": 20 }), &ctx)
+    let hot = GraphTool
+        .call(
+            graph_args("recent", serde_json::json!({ "limit": 20 })),
+            &ctx,
+        )
         .await
         .unwrap();
 
@@ -565,8 +774,11 @@ async fn intel_tools_in_one_turn_recompute_centrality_once() {
         "{}",
         symbols.content
     );
-    let impact = ImpactTool
-        .call(serde_json::json!({ "name": "target" }), &ctx)
+    let impact = GraphTool
+        .call(
+            graph_args("callers", serde_json::json!({ "name": "target" })),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(impact.content.contains("caller"), "{}", impact.content);
@@ -1289,8 +1501,11 @@ async fn impact_reports_caller_to_callee_in_both_directions() {
     let ctx = test_ctx(tmp.path());
 
     // Direction 1: callers of `helper` includes `driver`.
-    let callers = ImpactTool
-        .call(serde_json::json!({ "name": "helper" }), &ctx)
+    let callers = GraphTool
+        .call(
+            graph_args("callers", serde_json::json!({ "name": "helper" })),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -1305,8 +1520,11 @@ async fn impact_reports_caller_to_callee_in_both_directions() {
     );
 
     // Direction 2: calls inside `driver` include `helper -> lib.rs`.
-    let calls = ImpactTool
-        .call(serde_json::json!({ "name": "driver" }), &ctx)
+    let calls = GraphTool
+        .call(
+            graph_args("calls", serde_json::json!({ "name": "driver" })),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(calls.content.contains("Calls"), "got:\n{}", calls.content);
@@ -1327,8 +1545,11 @@ async fn impact_omits_ambiguous_callee() {
     let ctx = test_ctx(tmp.path());
 
     // `caller`'s outgoing call to `dup` resolves to 2 defs → omitted.
-    let calls = ImpactTool
-        .call(serde_json::json!({ "name": "caller" }), &ctx)
+    let calls = GraphTool
+        .call(
+            graph_args("calls", serde_json::json!({ "name": "caller" })),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -1338,8 +1559,14 @@ async fn impact_omits_ambiguous_callee() {
     );
 
     // And `dup` reports no callers (the edge is ambiguous either way).
-    let callers = ImpactTool
-        .call(serde_json::json!({ "name": "dup", "path": "a.rs" }), &ctx)
+    let callers = GraphTool
+        .call(
+            graph_args(
+                "callers",
+                serde_json::json!({ "name": "dup", "path": "a.rs" }),
+            ),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -1360,8 +1587,11 @@ async fn impact_filters_ubiquitous_name() {
     );
     let ctx = test_ctx(tmp.path());
 
-    let calls = ImpactTool
-        .call(serde_json::json!({ "name": "user" }), &ctx)
+    let calls = GraphTool
+        .call(
+            graph_args("calls", serde_json::json!({ "name": "user" })),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -1369,8 +1599,11 @@ async fn impact_filters_ubiquitous_name() {
         "denylisted `get` must be filtered from edges; got:\n{}",
         calls.content
     );
-    let callers = ImpactTool
-        .call(serde_json::json!({ "name": "get" }), &ctx)
+    let callers = GraphTool
+        .call(
+            graph_args("callers", serde_json::json!({ "name": "get" })),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -1386,8 +1619,11 @@ async fn impact_renders_empty_sections_cleanly() {
     // `lonely` has no callers and an empty body (no calls).
     write(tmp.path(), "lib.rs", "pub fn lonely() {}\n");
     let ctx = test_ctx(tmp.path());
-    let out = ImpactTool
-        .call(serde_json::json!({ "name": "lonely" }), &ctx)
+    let out = GraphTool
+        .call(
+            graph_args("callers", serde_json::json!({ "name": "lonely" })),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -1395,6 +1631,13 @@ async fn impact_renders_empty_sections_cleanly() {
         "got:\n{}",
         out.content
     );
+    let out = GraphTool
+        .call(
+            graph_args("calls", serde_json::json!({ "name": "lonely" })),
+            &ctx,
+        )
+        .await
+        .unwrap();
     assert!(out.content.contains("Calls: none"), "got:\n{}", out.content);
 }
 
@@ -1403,8 +1646,11 @@ async fn impact_unknown_symbol_reports_no_match() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "lib.rs", "pub fn known() {}\n");
     let ctx = test_ctx(tmp.path());
-    let out = ImpactTool
-        .call(serde_json::json!({ "name": "nope" }), &ctx)
+    let out = GraphTool
+        .call(
+            graph_args("callers", serde_json::json!({ "name": "nope" })),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(

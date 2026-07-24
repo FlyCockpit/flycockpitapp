@@ -329,19 +329,25 @@ fn computer_subagent_reachable(
     computer_subagent_candidate(&providers, cwd).is_some()
 }
 
-/// Append the full codebase-intelligence tool set (GOALS §21) to `tb`.
-/// Centralized so the write-capable agents (`Build`/`builder`/`Swarm`/`bee`)
-/// and the deep-investigation primaries (`Plan`/`explore`) share one
-/// definition of "full intel" rather than each re-spelling the intel tools.
+/// Append the direct full codebase-intelligence tool set (GOALS §21) to `tb`.
+/// Used by read-worker surfaces whose current tier defaults keep the graph
+/// tail directly callable.
 fn with_full_intel(tb: ToolBox) -> ToolBox {
+    with_core_intel(tb)
+        .with(Arc::new(crate::tools::intel::GraphTool))
+        .with(Arc::new(crate::tools::intel::ChangeImpactTool))
+}
+
+fn with_core_intel(tb: ToolBox) -> ToolBox {
     tb.with(Arc::new(crate::tools::intel::ContextPackTool))
         .with(Arc::new(crate::tools::intel::CodeTool))
-        .with(Arc::new(crate::tools::intel::DepsTool))
-        .with(Arc::new(crate::tools::intel::HotTool))
-        .with(Arc::new(crate::tools::intel::CircularTool))
         .with(Arc::new(crate::tools::intel::SearchTool))
-        .with(Arc::new(crate::tools::intel::ImpactTool))
-        .with(Arc::new(crate::tools::intel::ChangeImpactTool))
+}
+
+fn with_build_family_intel(tb: ToolBox) -> ToolBox {
+    with_core_intel(tb)
+        .with_discoverable_mcp(Arc::new(crate::tools::intel::GraphTool))
+        .with_discoverable_mcp(Arc::new(crate::tools::intel::ChangeImpactTool))
 }
 
 fn with_lsp_nav(tb: ToolBox) -> ToolBox {
@@ -445,11 +451,8 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "escalate",
         "context_pack",
         "code",
-        "deps",
-        "hot",
-        "circular",
+        "graph",
         "search",
-        "impact",
         "change_impact",
         "task",
         "skill",
@@ -566,32 +569,14 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Intel",
-            name: "deps",
-            summary: "Inspect package and dependency information.",
-            condition: None,
-        },
-        BuiltinToolInventoryItem {
-            family: "Intel",
-            name: "hot",
-            summary: "Surface high-centrality code paths.",
-            condition: None,
-        },
-        BuiltinToolInventoryItem {
-            family: "Intel",
-            name: "circular",
-            summary: "Find circular dependencies.",
+            name: "graph",
+            summary: "Inspect imports, importers, cycles, callers, calls, and most-recently-modified files by mtime.",
             condition: None,
         },
         BuiltinToolInventoryItem {
             family: "Intel",
             name: "search",
             summary: "Search project code using Cockpit intelligence.",
-            condition: None,
-        },
-        BuiltinToolInventoryItem {
-            family: "Intel",
-            name: "impact",
-            summary: "Estimate impact for symbols or files.",
             condition: None,
         },
         BuiltinToolInventoryItem {
@@ -791,11 +776,8 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::escalate::EscalateTool),
         Arc::new(tools::intel::ContextPackTool),
         Arc::new(tools::intel::CodeTool),
-        Arc::new(tools::intel::DepsTool),
-        Arc::new(tools::intel::HotTool),
-        Arc::new(tools::intel::CircularTool),
+        Arc::new(tools::intel::GraphTool),
         Arc::new(tools::intel::SearchTool),
-        Arc::new(tools::intel::ImpactTool),
         Arc::new(tools::intel::ChangeImpactTool),
         Arc::new(tools::skill::SkillTool),
         Arc::new(tools::skill_manage::SkillManageTool),
@@ -863,11 +845,8 @@ fn materialize_tool_by_name(
         "unlock" => tb.with(Arc::new(tools::unlock::UnlockTool)),
         "context_pack" => tb.with(Arc::new(tools::intel::ContextPackTool)),
         "code" => tb.with(Arc::new(tools::intel::CodeTool)),
-        "deps" => tb.with(Arc::new(tools::intel::DepsTool)),
-        "hot" => tb.with(Arc::new(tools::intel::HotTool)),
-        "circular" => tb.with(Arc::new(tools::intel::CircularTool)),
+        "graph" => tb.with(Arc::new(tools::intel::GraphTool)),
         "search" => tb.with(Arc::new(tools::intel::SearchTool)),
-        "impact" => tb.with(Arc::new(tools::intel::ImpactTool)),
         "change_impact" => tb.with(Arc::new(tools::intel::ChangeImpactTool)),
         "skill" => tb.with(Arc::new(tools::skill::SkillTool)),
         "skill_manage" => tb.with(Arc::new(tools::skill_manage::SkillManageTool)),
@@ -1228,9 +1207,7 @@ fn disabled_tier_names(def: &crate::agents::AgentDef) -> std::collections::BTree
 pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static str] {
     match name {
         "Build" | "builder" | "Plan" => &[
-            "hot",
-            "circular",
-            "impact",
+            "graph",
             "change_impact",
             "harness_list",
             "harness_invoke",
@@ -1666,7 +1643,7 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
 /// read-only investigator surface (`explore`'s grant). Conservative:
 /// never includes write/lock or structural-delegation tools.
 fn default_custom_tools() -> Vec<String> {
-    ["read", "bash", "code", "deps", "hot", "circular", "search"]
+    ["read", "bash", "code", "graph", "search"]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -1891,7 +1868,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
     // user has added (implementation note discoverability).
     let subs = build_subagents(&args.config, &args.cwd);
     let sub_refs: Vec<&str> = subs.iter().map(String::as_str).collect();
-    let base_tools = with_write_tools(with_full_intel(
+    let base_tools = with_write_tools(with_build_family_intel(
         ToolBox::new()
             .with(Arc::new(crate::tools::read::ReadTool))
             .with(Arc::new(crate::tools::bash::BashTool::new())),
@@ -2130,7 +2107,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
 /// standalone plan to a fresh `Build` session when the user agrees. It holds no
 /// filesystem write or lock tools.
 pub fn plan(args: &SpawnArgs) -> Agent {
-    let base_tools = with_lsp_nav(with_full_intel(
+    let base_tools = with_lsp_nav(with_build_family_intel(
         ToolBox::new()
             .with(Arc::new(crate::tools::read::ReadTool))
             .with(Arc::new(crate::tools::bash::BashTool::new())),
@@ -2554,33 +2531,33 @@ mod tests {
     }
 
     #[test]
-    fn builtin_agent_grant_impact_is_grantable_and_on_explore() {
+    fn builtin_agent_grant_graph_is_grantable_and_on_explore() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         let def = crate::agents::AgentDef {
-            name: "impact-user".to_string(),
+            name: "graph-user".to_string(),
             description: "custom".to_string(),
             mode: crate::agents::AgentMode::Subagent,
             model: None,
             temperature: None,
-            tools: Some(vec!["impact".to_string()]),
+            tools: Some(vec!["graph".to_string()]),
             tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: None,
             permission: None,
             prompt: "body".to_string(),
             prompt_variants: std::collections::HashMap::new(),
-            source: tmp.path().join("impact-user.md"),
+            source: tmp.path().join("graph-user.md"),
         };
 
-        crate::agents::validate_invariants(&def).expect("impact is a known grantable tool");
-        let agent = agent_from_def(&def, &args).expect("impact materializes");
+        crate::agents::validate_invariants(&def).expect("graph is a known grantable tool");
+        let agent = agent_from_def(&def, &args).expect("graph materializes");
 
-        assert!(agent.tools.names().contains(&"impact"));
+        assert!(agent.tools.names().contains(&"graph"));
         assert!(
             crate::mcp::builtin::describe(
                 &host_for_agent(&load("explore", &args).unwrap(), tmp.path()),
-                "impact"
+                "graph"
             )
             .is_ok()
         );
@@ -2733,9 +2710,7 @@ mod tests {
         let host = host_for_agent(&agent, tmp.path());
 
         for tool in [
-            "hot",
-            "circular",
-            "impact",
+            "graph",
             "change_impact",
             "harness_list",
             "harness_invoke",
@@ -2762,11 +2737,76 @@ mod tests {
             "unlock",
             "search",
             "code",
-            "deps",
             "context_pack",
             "todo",
         ] {
             assert!(names.contains(&tool), "{tool} should be directly injected");
+        }
+    }
+
+    #[test]
+    fn hardcoded_build_family_factories_keep_graph_tail_discoverable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+
+        for (name, agent) in [("Build", build(&args)), ("Plan", plan(&args))] {
+            let names = agent.tools.names();
+            let host = host_for_agent(&agent, tmp.path());
+
+            for tool in ["graph", "change_impact"] {
+                assert!(
+                    !names.contains(&tool),
+                    "`{name}` should not directly inject `{tool}`"
+                );
+                assert!(
+                    crate::mcp::builtin::describe(&host, tool).is_ok(),
+                    "`{name}` should expose `{tool}` through monty"
+                );
+            }
+            for tool in ["context_pack", "code", "search"] {
+                assert!(
+                    names.contains(&tool),
+                    "`{name}` should directly inject `{tool}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn intel_default_tiers_are_graph_and_change_impact() {
+        use crate::agents::{AgentDef, AgentMode, ToolTier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let def = AgentDef {
+            name: "Build".to_string(),
+            description: "build".to_string(),
+            mode: AgentMode::Primary,
+            model: None,
+            temperature: None,
+            tools: None,
+            tool_tiers: std::collections::BTreeMap::new(),
+            tool_descriptions: std::collections::BTreeMap::new(),
+            scan_tool_results: None,
+            permission: None,
+            prompt: "body".to_string(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: tmp.path().join("Build.md"),
+        };
+
+        for tool in ["graph", "change_impact"] {
+            assert_eq!(
+                effective_tool_tier(&def, tool, false),
+                ToolTier::Discoverable
+            );
+        }
+        for tool in ["search", "code", "context_pack"] {
+            assert_eq!(effective_tool_tier(&def, tool, false), ToolTier::Builtin);
+        }
+        for removed in ["deps", "circular", "impact", "hot"] {
+            assert!(
+                !default_discoverable_tools_for("Build").contains(&removed),
+                "{removed} should not be a default discoverable tool"
+            );
         }
     }
 
@@ -3100,13 +3140,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
 
+        // These read workers do not grant `mcp`, so the discoverable-tail
+        // invariant would make `graph`/`change_impact` unreachable if they
+        // were tiered behind monty here. Keep them direct until their grant
+        // model changes.
         for name in ["explore", "scout", "bee"] {
             let agent = load(name, &args).unwrap();
             let names = agent.tools.names();
             let discoverable = agent.tools.discoverable_mcp_tool_names();
 
             assert!(discoverable.is_empty(), "`{name}`: {discoverable:?}");
-            for tool in ["code", "hot", "circular", "impact", "change_impact"] {
+            for tool in ["code", "graph", "change_impact"] {
                 assert!(
                     names.contains(&tool),
                     "`{name}` missing `{tool}`: {names:?}"
@@ -4068,6 +4112,21 @@ mod tests {
     }
 
     #[test]
+    fn graph_inventory_summary_is_accurate() {
+        let graph = builtin_tool_inventory()
+            .iter()
+            .find(|tool| tool.name == "graph")
+            .expect("graph inventory item");
+        let summary = graph.summary.to_ascii_lowercase();
+
+        assert!(
+            summary.contains("mtime") || summary.contains("recent"),
+            "{summary}"
+        );
+        assert!(!summary.contains("centrality"), "{summary}");
+    }
+
+    #[test]
     fn known_agent_tool_names_matches_materialize_tool_by_name() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
@@ -4171,7 +4230,7 @@ mod tests {
             ("explore", EXPLORE_PROMPT),
             ("explore.normal", EXPLORE_PROMPT_NORMAL),
         ] {
-            for tool in ["context_pack", "code", "search", "impact", "bash"] {
+            for tool in ["context_pack", "code", "search", "graph", "bash"] {
                 assert!(
                     prompt.contains(tool),
                     "`{name}` prompt must mention `{tool}`"

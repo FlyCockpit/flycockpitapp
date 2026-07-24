@@ -2,15 +2,15 @@ use super::common::*;
 
 // ---- deps ------------------------------------------------------------------
 
-pub struct DepsTool;
+pub(in crate::tools::intel) struct DepsTool;
 
 #[async_trait]
 impl Tool for DepsTool {
     fn name(&self) -> &str {
-        "deps"
+        "graph"
     }
     fn description(&self) -> &str {
-        "Show one file's import dependency graph; use `impact` for one symbol's calls and `change_impact` for current diff risk"
+        "Show one file's import dependency graph; use `graph` callers/calls for one symbol's calls and `change_impact` for current diff risk"
     }
     fn defensive_description(&self) -> Option<String> {
         Some(

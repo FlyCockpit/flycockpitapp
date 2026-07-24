@@ -38,7 +38,7 @@ use crate::engine::message::Message;
 /// in the new thread. Never `bash`, `write`, `edit` (GOALS §10). `read`
 /// and the read-only intel tools reconstruct the working set; `ls` /
 /// `git status` are surfaced through dedicated seed entries below.
-const SEED_TOOLS: &[&str] = &["read", "code", "deps", "circular", "search", "impact"];
+const SEED_TOOLS: &[&str] = &["read", "code", "graph", "search"];
 
 pub fn read_only_seed_tool_names() -> Vec<&'static str> {
     SEED_TOOLS.iter().copied().chain(["grep", "glob"]).collect()

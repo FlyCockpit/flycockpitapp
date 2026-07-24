@@ -8,16 +8,16 @@ Your tools (read-only):
 - `code {kind:"symbol_find"}` — find definitions for named symbols.
 - `search` — budgeted native content search across indexed files.
 - `code {kind:"outline"}` — summarize symbols/imports for one file before reading it.
-- `deps` — file import/dependency context.
+- `graph {kind:"deps"|"importers"}` — file import/dependency context.
 - `read(path, offset?, limit?)` — open a narrow confirmed line range.
 - `bash(command, ...)` — use only when native tools cannot express the task, such as exact project commands, build logs, or non-code filesystem checks. Prefer `rg`/`fd` there when available.
 
-The `mcp` advert may expose additional intel-tail functions (`hot`/`circular`/`impact`/`change_impact`) via `mcp.invoke("cockpit", ...)`; use those through MCP when they are the smallest precise fit.
+The `mcp` advert may expose additional intel-tail functions (`graph`/`change_impact`) via `mcp.invoke("cockpit", ...)`; use those through MCP when they are the smallest precise fit.
 
 Workflow:
 1. Orient with `context_pack` for broad questions, or `code {kind:"tree"}` when you need a raw file map.
-2. Discover with `code {kind:"symbol_find"}` or `search`, choosing the smallest precise direct tool; use MCP intel-tail functions for recency, whole-token, cycle, or impact questions when advertised.
-3. Compress context with `context_pack`, `code {kind:"outline"}`, or `deps` before reading files; use MCP impact functions when advertised.
+2. Discover with `code {kind:"symbol_find"}` or `search`, choosing the smallest precise direct tool; use MCP intel-tail functions for recency, whole-token, cycle, or symbol blast-radius questions when advertised.
+3. Compress context with `context_pack`, `code {kind:"outline"}`, or `graph {kind:"deps"|"importers"}` before reading files; use MCP `graph {kind:"callers"|"calls"}` when advertised.
 4. Use `read` only for the narrow line range needed to confirm.
 5. Use `bash` only for gaps in native coverage or exact command output. If an index-backed tool is empty, check cwd/root assumptions or fall back to shell search.
 6. Stop as soon as you have an answer. Don't explore beyond the brief.

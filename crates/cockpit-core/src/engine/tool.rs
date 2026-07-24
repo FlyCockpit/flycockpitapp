@@ -1855,12 +1855,12 @@ mod llm_mode_tests {
         assert!(writeunlock.contains("omitted lines are deleted"));
         assert!(writeunlock.contains("editunlock"));
 
-        let impact = tool_by_name("impact").description().to_ascii_lowercase();
+        let graph = tool_by_name("graph").description().to_ascii_lowercase();
         let change_impact = tool_by_name("change_impact")
             .description()
             .to_ascii_lowercase();
-        assert!(impact.contains("change_impact"));
-        assert!(change_impact.contains("impact"));
+        assert!(graph.contains("change_impact"));
+        assert!(change_impact.contains("graph"));
 
         let context_pack = tool_by_name("context_pack")
             .description()
@@ -1901,11 +1901,10 @@ mod llm_mode_tests {
         let cases: &[(&str, &[&str])] = &[
             ("search", &["grep", "code"]),
             ("grep", &["search", "code"]),
-            ("code", &["search", "grep", "context_pack", "read"]),
-            ("deps", &["impact", "change_impact"]),
+            ("code", &["search", "grep", "context_pack", "read", "graph"]),
+            ("graph", &["search", "code", "change_impact"]),
             ("context_pack", &["read"]),
-            ("impact", &["change_impact"]),
-            ("change_impact", &["impact"]),
+            ("change_impact", &["graph"]),
             ("read", &["readlock", "writeunlock", "editunlock"]),
             ("readlock", &["writeunlock", "editunlock", "unlock"]),
             ("writeunlock", &["readlock", "editunlock"]),
@@ -1950,6 +1949,40 @@ mod llm_mode_tests {
         assert!(inventory_names.contains("code"), "{inventory_names:?}");
         assert!(grant_names.contains("code"), "{grant_names:?}");
         for removed in ["tree", "outline", "symbol_find", "word"] {
+            assert!(
+                !builtin_names.contains(removed),
+                "{removed}: {builtin_names:?}"
+            );
+            assert!(
+                !inventory_names.contains(removed),
+                "{removed}: {inventory_names:?}"
+            );
+            assert!(!grant_names.contains(removed), "{removed}: {grant_names:?}");
+        }
+    }
+
+    #[test]
+    fn graph_replaces_removed_relationship_tool_names() {
+        let builtin_names: std::collections::BTreeSet<_> = all_builtin_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let inventory_names: std::collections::BTreeSet<_> =
+            crate::engine::builtin::builtin_tool_inventory()
+                .iter()
+                .filter(|item| item.family == "Intel")
+                .map(|item| item.name)
+                .collect();
+        let grant_names: std::collections::BTreeSet<_> =
+            crate::engine::builtin::known_agent_tool_names()
+                .iter()
+                .copied()
+                .collect();
+
+        assert!(builtin_names.contains("graph"), "{builtin_names:?}");
+        assert!(inventory_names.contains("graph"), "{inventory_names:?}");
+        assert!(grant_names.contains("graph"), "{grant_names:?}");
+        for removed in ["deps", "circular", "impact", "hot"] {
             assert!(
                 !builtin_names.contains(removed),
                 "{removed}: {builtin_names:?}"
@@ -2038,7 +2071,7 @@ mod llm_mode_tests {
     }
 
     /// DEFENSIVE-ROUTING STEER (`defensive-tool-descriptions-weak-
-    /// model-routing.md`): the six search/navigation intel tools each render a
+    /// model-routing.md`): the search/navigation intel tools each render a
     /// verbose, bash-redirecting defensive description in `Defensive` (never
     /// the terse fallback), and the terse `description()` in `Normal`. Anchored
     /// on a distinctive phrase from each tool's spec'd prose so a regression
@@ -2052,7 +2085,7 @@ mod llm_mode_tests {
                 Arc::new(tools::intel::SearchTool),
                 "When you would reach for `rg`/`grep`",
             ),
-            (Arc::new(tools::intel::DepsTool), "files that depend on it"),
+            (Arc::new(tools::intel::GraphTool), "indexed graph"),
         ];
         for (tool, needle) in cases {
             let normal = definition_of(&*tool, LlmMode::Normal, None);
@@ -2356,22 +2389,19 @@ mod llm_mode_tests {
             ("bash", ToolEffect::Dynamic),
             ("add-package", ToolEffect::Dynamic),
             ("change_impact", ToolEffect::ReadOnly),
-            ("circular", ToolEffect::ReadOnly),
             ("code", ToolEffect::Dynamic),
             ("context_pack", ToolEffect::Dynamic),
             ("defer_to_orchestrator", ToolEffect::Dynamic),
             ("delegation_payload_retrieve", ToolEffect::Dynamic),
-            ("deps", ToolEffect::Dynamic),
             ("editunlock", ToolEffect::Dynamic),
             ("escalate", ToolEffect::Dynamic),
             ("goal", ToolEffect::Dynamic),
+            ("graph", ToolEffect::ReadOnly),
             ("glob", ToolEffect::ReadOnly),
             ("grep", ToolEffect::ReadOnly),
             ("handoff", ToolEffect::Dynamic),
             ("harness_invoke", ToolEffect::Dynamic),
             ("harness_list", ToolEffect::Dynamic),
-            ("hot", ToolEffect::ReadOnly),
-            ("impact", ToolEffect::ReadOnly),
             ("list-packages", ToolEffect::Dynamic),
             ("lsp", ToolEffect::ReadOnly),
             ("mcp", ToolEffect::Dynamic),

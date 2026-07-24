@@ -2,12 +2,12 @@ use super::common::*;
 
 // ---- hot -------------------------------------------------------------------
 
-pub struct HotTool;
+pub(in crate::tools::intel) struct HotTool;
 
 #[async_trait]
 impl Tool for HotTool {
     fn name(&self) -> &str {
-        "hot"
+        "graph"
     }
     fn description(&self) -> &str {
         "List the most recently modified tracked files by mtime"

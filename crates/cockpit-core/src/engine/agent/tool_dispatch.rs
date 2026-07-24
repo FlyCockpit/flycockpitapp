@@ -1976,7 +1976,7 @@ mod tests {
     #[tokio::test]
     async fn btw_fork_does_not_prompt_for_readonly_intel_tools() {
         let tmp = tempfile::tempdir().unwrap();
-        let read_only_tools = ToolBox::new().with(Arc::new(crate::tools::intel::HotTool));
+        let read_only_tools = ToolBox::new().with(Arc::new(crate::tools::intel::GraphTool));
         let agent = test_agent(read_only_tools.clone());
         let session = test_btw_session(tmp.path()).await;
         session.set_approval_mode(ApprovalMode::Yolo);
@@ -1994,11 +1994,11 @@ mod tests {
             loop_guard_threshold: 10,
             cwd: tmp.path(),
         };
-        let call = tool_call("hot", serde_json::json!({ "limit": 1 }));
+        let call = tool_call("graph", serde_json::json!({ "kind": "recent", "limit": 1 }));
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
 
-        execute_ordinary_call(&env, &mut history, &call, "hot", Recovery::Clean, None)
+        execute_ordinary_call(&env, &mut history, &call, "graph", Recovery::Clean, None)
             .await
             .expect("read-only intel tools intentionally do not prompt in /btw forks");
 

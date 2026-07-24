@@ -1,15 +1,15 @@
 //! Codebase-intelligence tools (GOALS §21, Phase 1).
 //!
-//! Eight tools backed by the on-demand [`crate::intel::Index`]: `code`,
-//! `deps`, `hot`, `circular`, `search`, `impact`, `change_impact`, and
-//! `context_pack`. Each index-backed tool calls
+//! Five tools backed by the on-demand [`crate::intel::Index`]: `code`,
+//! `graph`, `search`, `change_impact`, and `context_pack`. Each
+//! index-backed tool calls
 //! [`crate::intel::Index::ensure_fresh`] first so it never answers from stale data.
-//! `hot` is pure-FS (no index). `search` uses the shared in-process text
+//! `graph {kind:"recent"}` is pure-FS (no index). `search` uses the shared in-process text
 //! walker, honors gitignore, searches hidden files that gitignore permits, and
 //! prunes `.git/` directories. `search` and `code {kind:"symbol_find"}` additionally
 //! apply call-graph centrality ranking (additive, default-on,
-//! config-gated via `extended.intelCentralityRanking`); `impact` reports
-//! a symbol's high-precision-resolved callers and calls.
+//! config-gated via `extended.intelCentralityRanking`); `graph {kind:"callers"|"calls"}`
+//! reports a symbol's high-precision-resolved callers and calls.
 //! `search` emits `path:line[:column]: text` matches and `path:line- text`
 //! context lines, then budget-caps its output via
 //! [`crate::intel::budget::BudgetedWriter`].
@@ -23,6 +23,7 @@ mod code;
 mod common;
 mod context_pack;
 mod deps;
+mod graph;
 mod hot;
 mod impact;
 mod outline;
@@ -32,12 +33,9 @@ mod tree;
 mod word;
 
 pub use change_impact::ChangeImpactTool;
-pub use circular::CircularTool;
 pub use code::CodeTool;
 pub use context_pack::ContextPackTool;
-pub use deps::DepsTool;
-pub use hot::HotTool;
-pub use impact::ImpactTool;
+pub use graph::GraphTool;
 pub use search::SearchTool;
 
 #[cfg(test)]

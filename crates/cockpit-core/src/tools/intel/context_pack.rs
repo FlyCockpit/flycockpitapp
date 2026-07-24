@@ -351,10 +351,13 @@ fn context_pack_overview(
     writer.writeln(&format!("import cycles: {}", cycles.len()));
     for cycle in cycles.into_iter().take(limit.min(5)) {
         if !write_retained_line(&mut writer, &format!("  {}", cycle.join(" -> "))) {
-            return Ok(finish(writer, "\n... [truncated; use `circular`]\n"));
+            return Ok(finish(
+                writer,
+                "\n... [truncated; use `graph` kind `cycles`]\n",
+            ));
         }
     }
-    writer.writeln(&format!("next: context_pack {{target:<path|symbol>, depth:{depth}}}; code kind=outline path=<path>; deps <path>; code kind=symbol_find name=<name>"));
+    writer.writeln(&format!("next: context_pack {{target:<path|symbol>, depth:{depth}}}; code kind=outline path=<path>; graph kind=deps path=<path>; code kind=symbol_find name=<name>"));
     Ok(finish(
         writer,
         "\n... [truncated; target a path, symbol, or query]\n",
@@ -441,7 +444,7 @@ fn context_pack_path(
         return Ok(finish(
             writer,
             "
-... [truncated; use `deps`]
+... [truncated; use `graph` kind `deps`]
 ",
         ));
     }
@@ -450,7 +453,7 @@ fn context_pack_path(
         return Ok(finish(
             writer,
             "
-... [truncated; use `deps`]
+... [truncated; use `graph` kind `importers`]
 ",
         ));
     }
@@ -461,7 +464,10 @@ fn context_pack_path(
                 &mut writer,
                 &format!("    {}: {}", edge.line, edge.raw_target),
             ) {
-                return Ok(finish(writer, "\n... [truncated; use `deps`]\n"));
+                return Ok(finish(
+                    writer,
+                    "\n... [truncated; use `graph` kind `importers`]\n",
+                ));
             }
         }
     }
@@ -485,11 +491,11 @@ fn context_pack_path(
         }
     }
     writer.writeln(&format!(
-        "next: code kind=outline path={rel}; deps {rel} direction=reverse hops={depth}; read narrow ranges above"
+        "next: code kind=outline path={rel}; graph kind=importers path={rel} hops={depth}; read narrow ranges above"
     ));
     Ok(finish(
         writer,
-        "\n... [truncated; use `code` kind `outline` or `deps`]\n",
+        "\n... [truncated; use `code` kind `outline` or `graph` kind `deps`]\n",
     ))
 }
 
@@ -551,7 +557,10 @@ fn context_pack_symbol(
                 &mut writer,
                 &format!("    caller {caller_file}:{caller_line}{in_sym}"),
             ) {
-                return Ok(finish(writer, "\n... [truncated; use `impact`]\n"));
+                return Ok(finish(
+                    writer,
+                    "\n... [truncated; use `graph` kind `callers`]\n",
+                ));
             }
         }
         for (callee, def_file, def_line) in calls.into_iter().take(limit) {
@@ -559,7 +568,10 @@ fn context_pack_symbol(
                 &mut writer,
                 &format!("    calls {callee} -> {def_file}:{def_line}"),
             ) {
-                return Ok(finish(writer, "\n... [truncated; use `impact`]\n"));
+                return Ok(finish(
+                    writer,
+                    "\n... [truncated; use `graph` kind `calls`]\n",
+                ));
             }
         }
     }
@@ -581,11 +593,11 @@ fn context_pack_symbol(
         }
     }
     writer.writeln(&format!(
-        "next: impact name={target:?}; read suggested ranges; code kind=word token={target:?}"
+        "next: graph kind=callers/calls name={target:?}; read suggested ranges; code kind=word token={target:?}"
     ));
     Ok(finish(
         writer,
-        "\n... [truncated; narrow target or use `impact`]\n",
+        "\n... [truncated; narrow target or use `graph` kind `callers`/`calls`]\n",
     ))
 }
 

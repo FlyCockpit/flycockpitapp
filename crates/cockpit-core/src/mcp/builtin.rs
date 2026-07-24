@@ -1927,9 +1927,9 @@ mod tests {
                 "LSP is unavailable",
             ),
             (
-                Arc::new(crate::tools::intel::HotTool),
-                "hot",
-                serde_json::json!({"limit": 1}),
+                Arc::new(crate::tools::intel::GraphTool),
+                "graph",
+                serde_json::json!({"kind": "recent", "limit": 1}),
                 "",
             ),
         ];

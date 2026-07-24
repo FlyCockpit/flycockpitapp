@@ -2,12 +2,12 @@ use super::common::*;
 
 // ---- circular --------------------------------------------------------------
 
-pub struct CircularTool;
+pub(in crate::tools::intel) struct CircularTool;
 
 #[async_trait]
 impl Tool for CircularTool {
     fn name(&self) -> &str {
-        "circular"
+        "graph"
     }
     fn description(&self) -> &str {
         "Detect import cycles via strongly-connected components of the dependency graph"

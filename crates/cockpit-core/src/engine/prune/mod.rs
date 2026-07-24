@@ -33,12 +33,10 @@
 //! ## Snapshot-class tools
 //!
 //! `read` and the non-mutating codebase-intelligence tools
-//! (`outline`, `symbol_find`, `word`, `deps`, `circular`, `tree`,
-//! `search`). Deliberately excluded this pass (see `plan.md` T6.d):
-//! `bash` (the command is interpretive context; classifying which
-//! commands are snapshots is the hard problem), `edit`/`write` (their
-//! args carry semantic content), and `hot` (a ranking, not a snapshot
-//! of a single addressable resource).
+//! (`code`, `graph`, `search`). Deliberately excluded this pass (see
+//! `plan.md` T6.d): `bash` (the command is interpretive context;
+//! classifying which commands are snapshots is the hard problem) and
+//! `edit`/`write` (their args carry semantic content).
 
 pub use crate::db::prune_ledger::{LedgerEntry, PruneLedger};
 
@@ -52,9 +50,9 @@ mod overlap;
 pub use overlap::OVERLAP_REASON;
 
 /// Tools whose repeated identical calls produce a redundant snapshot
-/// body. `read` plus the non-mutating intel tools. `hot`, `bash`,
-/// `edit`, `write` are intentionally absent (see module docs).
-pub const SNAPSHOT_TOOLS: &[&str] = &["read", "code", "deps", "circular", "search"];
+/// body. `read` plus the non-mutating intel tools. `bash`, `edit`, and
+/// `write` are intentionally absent (see module docs).
+pub const SNAPSHOT_TOOLS: &[&str] = &["read", "code", "graph", "search"];
 
 pub const COMPRESSED_RESULT_MARKER_PREFIX: &str = "[compressed tool result:";
 pub const REASON_TOOL_RESULT_CONDENSED: &str = "tool result condensed";

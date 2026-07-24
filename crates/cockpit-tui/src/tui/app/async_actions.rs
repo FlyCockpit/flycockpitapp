@@ -354,7 +354,7 @@ impl App {
                         text,
                         timestamp: chrono::Local::now(),
                     });
-                    self.chat_scroll_offset = 0;
+                    self.pin_chat_to_tail();
                 }
                 Ok(_) => self.history.push(HistoryEntry::CommandError {
                     line: "/note: unexpected daemon response".to_string(),

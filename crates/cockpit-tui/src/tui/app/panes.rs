@@ -313,7 +313,7 @@ impl App {
         self.push_plain(format!(
             "{label}: running (local command; cancellation unavailable)"
         ));
-        self.chat_scroll_offset = 0;
+        self.pin_chat_to_tail();
         self.async_actions.start_blocking(
             AsyncActionKind::Blocking("local.command"),
             AsyncActionPolicy::AllowConcurrent,

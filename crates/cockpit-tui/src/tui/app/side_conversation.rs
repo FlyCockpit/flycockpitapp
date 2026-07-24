@@ -150,6 +150,8 @@ impl App {
                 saved_active_schedules: std::mem::take(&mut self.active_schedules),
                 saved_pending_stop_confirm: self.pending_stop_confirm.take(),
                 saved_chat_scroll_offset: self.chat_scroll_offset,
+                saved_chat_scroll_anchor: self.chat_scroll_anchor,
+                saved_chat_pinned_to_tail: self.chat_pinned_to_tail,
                 saved_project_id: self.project_id.clone(),
                 saved_session_id: self.launch.session_id,
                 saved_session_short_id: self.launch.session_short_id.clone(),
@@ -164,7 +166,7 @@ impl App {
             self.elided_event_ids.clear();
             self.active_schedules.clear();
             self.pending_stop_confirm = None;
-            self.chat_scroll_offset = 0;
+            self.pin_chat_to_tail();
             self.side_conversation = Some(side);
 
             self.async_actions.start(
@@ -216,7 +218,11 @@ impl App {
         self.elided_event_ids = side.saved_elided_event_ids;
         self.active_schedules = side.saved_active_schedules;
         self.pending_stop_confirm = side.saved_pending_stop_confirm;
-        self.chat_scroll_offset = side.saved_chat_scroll_offset;
+        self.restore_chat_scroll_state(
+            side.saved_chat_scroll_offset,
+            side.saved_chat_scroll_anchor,
+            side.saved_chat_pinned_to_tail,
+        );
         self.project_id = side.saved_project_id;
         self.launch.session_id = side.saved_session_id;
         self.launch.session_short_id = side.saved_session_short_id;

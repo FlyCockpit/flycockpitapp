@@ -1056,6 +1056,16 @@ pub(super) enum LocalChoiceSelection {
     Multi(Option<Vec<String>>),
 }
 
+/// Where the chat viewport is pinned when the user has scrolled away from the
+/// live tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ScrollAnchor {
+    pub(super) entry: HistoryEntryId,
+    pub(super) entry_position: usize,
+    pub(super) row_within_entry: u16,
+    pub(super) screen_row: u16,
+}
+
 /// An open `/side` side conversation. Created when `/side` forks the main
 /// session into an ephemeral throwaway and switches the TUI onto it; the
 /// snapshot is everything needed to restore the **main** session exactly
@@ -1084,6 +1094,8 @@ pub(super) struct SideConversation {
     saved_active_schedules: std::collections::BTreeMap<String, ActiveSchedule>,
     saved_pending_stop_confirm: Option<Vec<String>>,
     saved_chat_scroll_offset: usize,
+    saved_chat_scroll_anchor: Option<ScrollAnchor>,
+    saved_chat_pinned_to_tail: bool,
     saved_project_id: Option<String>,
     saved_session_id: Option<uuid::Uuid>,
     saved_session_short_id: Option<String>,
@@ -1629,6 +1641,8 @@ pub struct App {
     /// time. Bumped by mouse wheel when capture is on; clamped by
     /// `render_history` so we never scroll past the top.
     pub(super) chat_scroll_offset: usize,
+    pub(super) chat_scroll_anchor: Option<ScrollAnchor>,
+    pub(super) chat_pinned_to_tail: bool,
     /// How tall (logical lines) the full chat content was at the last
     /// render. Updated each `render_history` and consulted by the
     /// mouse-wheel handler to clamp scroll-back to a valid maximum.
@@ -2600,6 +2614,8 @@ pub(super) struct StoredTranscriptView {
     pub(super) history_render_cache_rows: usize,
     pub(super) pending_render_cache: Option<PendingRenderCacheEntry>,
     pub(super) chat_scroll_offset: usize,
+    pub(super) chat_scroll_anchor: Option<ScrollAnchor>,
+    pub(super) chat_pinned_to_tail: bool,
 }
 
 async fn wait_optional_notify(notify: Option<Arc<tokio::sync::Notify>>) {
@@ -2919,6 +2935,8 @@ impl App {
             suggestion_row_hits: Vec::new(),
             hovered_suggestion: None,
             chat_scroll_offset: 0,
+            chat_scroll_anchor: None,
+            chat_pinned_to_tail: true,
             chat_total_lines: 0,
             chat_visible_lines: 0,
             chat_geometry: render::ChatGeometry::default(),

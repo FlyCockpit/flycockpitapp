@@ -784,13 +784,13 @@ impl App {
         let max_offset = self
             .chat_total_lines
             .saturating_sub(self.chat_visible_lines);
-        self.chat_scroll_offset = (self.chat_scroll_offset + n).min(max_offset);
+        self.set_chat_scroll_offset_from_interaction((self.chat_scroll_offset + n).min(max_offset));
     }
 
     /// Scroll the chat history down (toward the live tail) by `n`
     /// logical lines. Saturates at 0 (pinned to bottom = live).
     pub(super) fn scroll_chat_down(&mut self, n: usize) {
-        self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(n);
+        self.set_chat_scroll_offset_from_interaction(self.chat_scroll_offset.saturating_sub(n));
     }
 
     pub(super) fn build_affordance_scroll_regions(&self) -> Vec<AffordanceScrollRegion> {

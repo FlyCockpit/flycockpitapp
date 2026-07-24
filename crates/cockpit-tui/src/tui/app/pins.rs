@@ -666,7 +666,7 @@ impl App {
         let total = self.chat_total_lines;
         let visible = self.chat_visible_lines.max(1);
         if total <= visible {
-            self.chat_scroll_offset = 0;
+            self.pin_chat_to_tail();
             return;
         }
         // Top of the visible window (counted from the top) we want, so the
@@ -683,7 +683,7 @@ impl App {
             .saturating_sub(desired_top)
             .min(max_offset);
         // Clamp so the target is not below the window either.
-        self.chat_scroll_offset = offset;
+        self.set_chat_scroll_offset_from_interaction(offset);
     }
 
     /// True when any modal overlay/pane currently owns the screen — pin

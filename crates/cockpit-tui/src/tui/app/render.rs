@@ -39,8 +39,8 @@ use crate::tui::theme::{
 
 use super::{
     AUTOCOMPLETE_ROWS, AffordanceTarget, App, HistoryEntryId, HistoryRenderCacheEntry, PaneSide,
-    PrewrappedEntry, Selection, SuggestionBoxKind, SuggestionBoxRowHit, SuggestionBoxTarget, Toast,
-    ToastKind, TranscriptFind, WORKING_MESSAGES,
+    PrewrappedEntry, ScrollAnchor, Selection, SuggestionBoxKind, SuggestionBoxRowHit,
+    SuggestionBoxTarget, Toast, ToastKind, TranscriptFind, WORKING_MESSAGES,
 };
 
 /// Startup grace before the working indicator first appears — prevents
@@ -1915,6 +1915,168 @@ impl App {
         );
     }
 
+    pub(super) fn pin_chat_to_tail(&mut self) {
+        self.chat_pinned_to_tail = true;
+        self.chat_scroll_anchor = None;
+        self.chat_scroll_offset = 0;
+    }
+
+    pub(super) fn set_chat_scroll_offset_from_interaction(&mut self, offset: usize) {
+        let max_offset = self
+            .chat_total_lines
+            .saturating_sub(self.chat_visible_lines.max(1));
+        self.chat_scroll_offset = offset.min(max_offset);
+        if self.chat_scroll_offset == 0 {
+            self.pin_chat_to_tail();
+        } else {
+            self.chat_pinned_to_tail = false;
+            self.capture_chat_scroll_anchor_from_current_offset();
+        }
+    }
+
+    pub(super) fn restore_chat_scroll_state(
+        &mut self,
+        offset: usize,
+        anchor: Option<ScrollAnchor>,
+        pinned_to_tail: bool,
+    ) {
+        self.chat_scroll_offset = offset;
+        self.chat_scroll_anchor = anchor;
+        self.chat_pinned_to_tail = pinned_to_tail;
+        if self.chat_pinned_to_tail {
+            self.chat_scroll_anchor = None;
+            self.chat_scroll_offset = 0;
+        }
+    }
+
+    fn history_position_for_id(&self, target: HistoryEntryId) -> Option<usize> {
+        self.history.ids().iter().position(|id| *id == target)
+    }
+
+    fn cached_history_entry_rows_at(&self, idx: usize) -> usize {
+        self.history
+            .id_at(idx)
+            .and_then(|id| self.history_render_cache.get(&id))
+            .map(|entry| entry.prewrapped.height)
+            .unwrap_or_else(|| self.chat_geometry.entry_height(idx))
+    }
+
+    fn anchor_for_visible_top(
+        &self,
+        geometry: &ChatGeometry,
+        visible_full_start: usize,
+        banner_rows: usize,
+    ) -> Option<ScrollAnchor> {
+        let history_total = geometry.total_rows();
+        if history_total == 0 {
+            return None;
+        }
+        let visible_history_start = visible_full_start.saturating_sub(banner_rows);
+        let anchor_history_row = visible_history_start.min(history_total.saturating_sub(1));
+        let (mut entry_position, mut row_within_entry) =
+            geometry.entry_at_row(anchor_history_row)?;
+        let entry_height = self.cached_history_entry_rows_at(entry_position);
+        if row_within_entry >= entry_height {
+            if entry_position + 1 < geometry.entry_count() {
+                entry_position += 1;
+                row_within_entry = 0;
+            } else {
+                row_within_entry = entry_height.saturating_sub(1);
+            }
+        }
+        let entry = self.history.id_at(entry_position)?;
+        let full_anchor_row =
+            banner_rows + geometry.entry_start_row(entry_position) + row_within_entry;
+        let screen_row = full_anchor_row.saturating_sub(visible_full_start);
+        Some(ScrollAnchor {
+            entry,
+            entry_position,
+            row_within_entry: row_within_entry.min(u16::MAX as usize) as u16,
+            screen_row: screen_row.min(u16::MAX as usize) as u16,
+        })
+    }
+
+    fn capture_chat_scroll_anchor_from_current_offset(&mut self) {
+        if self.chat_scroll_offset == 0 {
+            self.pin_chat_to_tail();
+            return;
+        }
+        let visible_full_start = chat_visible_top(
+            self.chat_total_lines,
+            self.chat_visible_lines.max(1),
+            self.chat_scroll_offset,
+        );
+        let geometry = self.chat_geometry().clone();
+        self.chat_scroll_anchor =
+            self.anchor_for_visible_top(&geometry, visible_full_start, self.chat_banner_lines);
+    }
+
+    fn derive_chat_scroll_offset(
+        &mut self,
+        area_h: usize,
+        banner_rows: usize,
+        message_rows: usize,
+    ) {
+        let total = banner_rows + message_rows;
+        let visible = area_h.max(1);
+        if total <= visible {
+            self.pin_chat_to_tail();
+            return;
+        }
+        if self.chat_pinned_to_tail && self.chat_scroll_offset > 0 {
+            self.chat_pinned_to_tail = false;
+            self.capture_chat_scroll_anchor_from_current_offset();
+        }
+        if self.chat_pinned_to_tail {
+            self.chat_scroll_offset = 0;
+            self.chat_scroll_anchor = None;
+            return;
+        }
+        if self.chat_scroll_anchor.is_none() && self.chat_scroll_offset > 0 {
+            self.capture_chat_scroll_anchor_from_current_offset();
+        }
+        let Some(mut anchor) = self.chat_scroll_anchor else {
+            self.pin_chat_to_tail();
+            return;
+        };
+        let geometry = self.chat_geometry().clone();
+        let Some(entry_idx) = self.history_position_for_id(anchor.entry).or_else(|| {
+            (anchor.entry_position < self.history.len()).then_some(anchor.entry_position)
+        }) else {
+            self.pin_chat_to_tail();
+            return;
+        };
+        let Some(entry_id) = self.history.id_at(entry_idx) else {
+            self.pin_chat_to_tail();
+            return;
+        };
+        let max_row = geometry.entry_height(entry_idx).saturating_sub(1);
+        let row_within_entry = (anchor.row_within_entry as usize).min(max_row);
+        anchor.entry = entry_id;
+        anchor.entry_position = entry_idx;
+        anchor.row_within_entry = row_within_entry.min(u16::MAX as usize) as u16;
+        self.chat_scroll_anchor = Some(anchor);
+
+        let anchor_full_row = banner_rows + geometry.entry_start_row(entry_idx) + row_within_entry;
+        let desired_top = anchor_full_row.saturating_sub(anchor.screen_row as usize);
+        self.chat_scroll_offset = chat_offset_for_top(total, visible, desired_top);
+    }
+
+    fn capture_chat_scroll_anchor_after_render(&mut self, visible_full_start: usize) {
+        if self.chat_scroll_offset == 0 {
+            self.pin_chat_to_tail();
+            return;
+        }
+        let geometry = self.chat_geometry().clone();
+        self.chat_scroll_anchor =
+            self.anchor_for_visible_top(&geometry, visible_full_start, self.chat_banner_lines);
+        if self.chat_scroll_anchor.is_none() {
+            self.pin_chat_to_tail();
+        } else {
+            self.chat_pinned_to_tail = false;
+        }
+    }
+
     fn recompute_chat_geometry_if_dirty(&mut self) {
         let Some(dirty_from) = self.chat_geometry_dirty_from.take() else {
             return;
@@ -1997,7 +2159,10 @@ impl App {
                         let row = abs_row - entry_start;
                         record_materialized_row();
                         rows.push(cached.prewrapped.rows[row].as_ref().clone());
-                        meta.push(cached.prewrapped.row_meta[row].clone());
+                        meta.push(Self::row_meta_for_current_history_index(
+                            &cached.prewrapped.row_meta[row],
+                            idx,
+                        ));
                     } else {
                         rows.push(Line::default());
                         meta.push(ChatRowMeta::gap());
@@ -2022,6 +2187,38 @@ impl App {
         }
 
         (rows, meta)
+    }
+
+    fn row_meta_for_current_history_index(meta: &ChatRowMeta, idx: usize) -> ChatRowMeta {
+        let mut meta = meta.clone();
+        if meta.history_index.is_some() {
+            meta.history_index = Some(idx);
+        }
+        if let Some(ChatCopyTarget::Message { history_index }) = &mut meta.copy_target {
+            *history_index = idx;
+        }
+        if meta.chip_target.is_some() {
+            meta.chip_target = Some(idx);
+        }
+        if meta.subagent_target.is_some() {
+            meta.subagent_target = Some(idx);
+        }
+        if meta.tool_box_target.is_some() {
+            meta.tool_box_target = Some(idx);
+        }
+        if let Some((history_index, _)) = &mut meta.tool_call_target {
+            *history_index = idx;
+        }
+        if let Some(scroll) = &mut meta.tool_result_scroll {
+            scroll.history_index = idx;
+        }
+        if let Some(scroll) = &mut meta.reasoning_window_scroll {
+            scroll.history_index = idx;
+        }
+        if meta.reasoning_window_target.is_some() {
+            meta.reasoning_window_target = Some(idx);
+        }
+        meta
     }
 
     fn rebuild_chat_find_lines(&mut self, box_lines: &[Line<'static>], tail_find_lines: &[String]) {
@@ -2162,15 +2359,6 @@ impl App {
         self.chat_area = Some(area);
         let area_h = area.height as usize;
         self.sync_history_render_versions();
-        let previous_top = if self.chat_scroll_offset > 0 {
-            Some(chat_visible_top(
-                self.chat_total_lines,
-                self.chat_visible_lines.max(1),
-                self.chat_scroll_offset,
-            ))
-        } else {
-            None
-        };
 
         let mut recached_from: Option<usize> = None;
         for idx in 0..self.history.len() {
@@ -2376,12 +2564,14 @@ impl App {
             self.chat_find_lines_query = None;
         }
 
+        self.derive_chat_scroll_offset(area_h, b, m);
+
         let (visible, visible_meta): VisibleRows = if b > 0 && b + m <= area_h {
             // Fits with room to spare: messages stay bottom-aligned and
             // the box floats at the vertical center, sliding up to sit
             // directly above the messages once they'd reach it. Content
             // fits, so there's no scrollback.
-            self.chat_scroll_offset = 0;
+            self.pin_chat_to_tail();
             let centered_top = if m == 0 {
                 let baseline_h = PaneGeometry::baseline_body_height(frame.area().height) as usize;
                 baseline_h.saturating_sub(b) / 2
@@ -2414,13 +2604,10 @@ impl App {
             // exactly the previous behavior over the message buffer.
             let total = b + m;
             let max_offset = total.saturating_sub(area_h);
-            if let Some(top) = previous_top {
-                self.chat_scroll_offset = chat_offset_for_top(total, area_h, top);
-            } else if self.chat_scroll_offset > max_offset {
-                self.chat_scroll_offset = max_offset;
-            }
+            self.chat_scroll_offset = self.chat_scroll_offset.min(max_offset);
 
             if total < area_h {
+                self.pin_chat_to_tail();
                 let pad = area_h - total;
                 let mut v: Vec<Line<'static>> = (0..pad).map(|_| Line::default()).collect();
                 let mut meta: Vec<ChatRowMeta> = vec![ChatRowMeta::padding(); pad];
@@ -2469,6 +2656,7 @@ impl App {
             self.chat_scroll_offset,
         );
         self.evict_history_render_cache_to_budget(visible_full_start, area_h, b);
+        self.capture_chat_scroll_anchor_after_render(visible_full_start);
 
         self.chat_row_meta = visible_meta;
         self.clickable_rows = self.chat_row_meta.iter().map(|m| m.chip_target).collect();
@@ -5062,11 +5250,11 @@ mod slash_popup_full_list_tests {
 mod render_history_spacing_tests {
     use super::{
         App, ChatCopyTarget, ChatRowKind, ChatRowMeta, ControlChip, HISTORY_RENDER_CACHE_MAX_ROWS,
-        HistoryRenderCacheEntry, PinHit, Selection, TranscriptFind, affordance_target_for_row,
-        chat_visible_top, extract_selection_plaintext, find_lines_rebuild_count,
-        geometry_recompute_count, materialized_row_count, pin_hit_for_visual_row,
-        prewrap_call_count, prewrap_entry_rows, prewrap_row_count, rendered_line_text,
-        reset_find_lines_rebuild_count, reset_geometry_recompute_count,
+        HistoryRenderCacheEntry, PinHit, ScrollAnchor, Selection, TranscriptFind,
+        affordance_target_for_row, chat_visible_top, extract_selection_plaintext,
+        find_lines_rebuild_count, geometry_recompute_count, materialized_row_count,
+        pin_hit_for_visual_row, prewrap_call_count, prewrap_entry_rows, prewrap_row_count,
+        rendered_line_text, reset_find_lines_rebuild_count, reset_geometry_recompute_count,
         reset_materialized_row_count, reset_prewrap_counters, wrap_line_to_visual_rows,
     };
     use crate::tui::app::{
@@ -5928,6 +6116,21 @@ mod render_history_spacing_tests {
 
     fn assert_cache_key_type(_: &HashMap<HistoryEntryId, HistoryRenderCacheEntry>) {}
 
+    fn visible_buffer_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        buffer_rows(&render_history_buffer(app, width, height), width, height)
+    }
+
+    fn screen_row_for_history_id(app: &App, id: HistoryEntryId) -> Option<usize> {
+        let pos = app
+            .history
+            .ids()
+            .iter()
+            .position(|entry_id| *entry_id == id)?;
+        app.chat_row_meta
+            .iter()
+            .position(|meta| meta.history_index == Some(pos))
+    }
+
     fn visible_reference_range(
         reference: &FullWrapReference,
         offset: usize,
@@ -6256,7 +6459,7 @@ mod render_history_spacing_tests {
         let mut app = long_history_app(tmp.path(), 80);
 
         render_history_no_selection(&mut app, 80, 10);
-        app.chat_scroll_offset = 17;
+        app.set_chat_scroll_offset_from_interaction(17);
         let before_top = chat_visible_top(
             app.chat_total_lines,
             app.chat_visible_lines.max(1),
@@ -6770,7 +6973,7 @@ mod render_history_spacing_tests {
         let mut app = plain_history_app(tmp.path(), 10);
         app.history_render_cache_max_rows = 6;
 
-        render_history_no_selection(&mut app, 80, 3);
+        render_history_no_selection(&mut app, 80, 2);
         assert_eq!(cached_positions(&app), vec![4, 5, 6, 7, 8, 9]);
 
         let mut middle = plain_history_app(tmp.path(), 9);
@@ -6926,6 +7129,163 @@ mod render_history_spacing_tests {
     }
 
     #[test]
+    fn scroll_anchor_survives_front_prepend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 24);
+
+        render_history_no_selection(&mut app, 80, 4);
+        app.set_chat_scroll_offset_from_interaction(9);
+        let before = visible_buffer_rows(&mut app, 80, 4);
+
+        for idx in 0..5 {
+            app.history.insert(
+                idx,
+                HistoryEntry::Plain {
+                    line: format!("prepended row {idx}"),
+                },
+            );
+        }
+        let after = visible_buffer_rows(&mut app, 80, 4);
+
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn scroll_anchor_survives_mid_list_insert_above_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 20);
+
+        render_history_no_selection(&mut app, 80, 4);
+        app.set_chat_scroll_offset_from_interaction(7);
+        render_history_no_selection(&mut app, 80, 4);
+        let anchor = app.chat_scroll_anchor.expect("scroll anchor");
+        let before_screen_row =
+            screen_row_for_history_id(&app, anchor.entry).expect("anchored row visible");
+
+        app.history.insert(
+            anchor.entry_position,
+            HistoryEntry::Plain {
+                line: "inserted above anchor".to_string(),
+            },
+        );
+        render_history_no_selection(&mut app, 80, 4);
+
+        assert_eq!(
+            screen_row_for_history_id(&app, anchor.entry),
+            Some(before_screen_row)
+        );
+    }
+
+    #[test]
+    fn scroll_anchor_falls_back_when_anchored_entry_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 12);
+
+        render_history_no_selection(&mut app, 80, 4);
+        app.set_chat_scroll_offset_from_interaction(5);
+        render_history_no_selection(&mut app, 80, 4);
+        let anchor = app.chat_scroll_anchor.expect("scroll anchor");
+
+        app.history.remove(anchor.entry_position);
+        render_history_no_selection(&mut app, 80, 4);
+
+        let max_offset = app
+            .chat_total_lines
+            .saturating_sub(app.chat_visible_lines.max(1));
+        assert!(app.chat_scroll_offset <= max_offset);
+        if let Some(anchor) = app.chat_scroll_anchor {
+            assert!(app.history.ids().contains(&anchor.entry));
+        } else {
+            assert!(app.chat_pinned_to_tail);
+        }
+    }
+
+    #[test]
+    fn scroll_anchor_clamps_row_within_entry_on_resize() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        let mut entries = vec![
+            HistoryEntry::Plain {
+                line: "before".to_string(),
+            },
+            HistoryEntry::Plain {
+                line: "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
+                    .to_string(),
+            },
+            HistoryEntry::Plain {
+                line: "after".to_string(),
+            },
+        ];
+        entries.extend((0..8).map(|idx| HistoryEntry::Plain {
+            line: format!("below anchor {idx}"),
+        }));
+        app.history = entries.into();
+
+        render_history_no_selection(&mut app, 24, 3);
+        let entry = app.history.id_at(1).unwrap();
+        app.chat_pinned_to_tail = false;
+        app.chat_scroll_anchor = Some(ScrollAnchor {
+            entry,
+            entry_position: 1,
+            row_within_entry: 99,
+            screen_row: 0,
+        });
+        render_history_no_selection(&mut app, 80, 3);
+
+        let anchor = app.chat_scroll_anchor.expect("anchor remains present");
+        let height = app.chat_geometry().entry_height(1);
+        assert!((anchor.row_within_entry as usize) < height);
+        assert!(screen_row_for_history_id(&app, entry).is_some());
+    }
+
+    #[test]
+    fn scroll_anchor_survives_subagent_view_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 14);
+        app.daemon_prompt = None;
+        app.history.push(running_subagent());
+
+        render_history_no_selection(&mut app, 80, 4);
+        app.set_chat_scroll_offset_from_interaction(6);
+        render_history_no_selection(&mut app, 80, 4);
+        let saved_offset = app.chat_scroll_offset;
+        let saved_anchor = app.chat_scroll_anchor;
+        let saved_tail = app.chat_pinned_to_tail;
+
+        assert!(app.open_subagent_view_for_history_index(14));
+        assert!(app.return_from_subagent_view());
+
+        assert_eq!(app.chat_scroll_offset, saved_offset);
+        assert_eq!(app.chat_scroll_anchor, saved_anchor);
+        assert_eq!(app.chat_pinned_to_tail, saved_tail);
+    }
+
+    #[test]
+    fn tail_pin_follows_appends_and_releases_on_scroll_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = plain_history_app(tmp.path(), 8);
+
+        render_history_no_selection(&mut app, 80, 4);
+        assert!(app.chat_pinned_to_tail);
+        app.history.push(HistoryEntry::Plain {
+            line: "newest tail row".to_string(),
+        });
+        let rows = visible_buffer_rows(&mut app, 80, 4);
+        assert!(rows.iter().any(|row| row.contains("newest tail row")));
+
+        app.scroll_chat_up(2);
+        assert!(!app.chat_pinned_to_tail);
+        assert!(app.chat_scroll_anchor.is_some());
+
+        app.scroll_chat_down(app.chat_scroll_offset);
+        assert!(app.chat_pinned_to_tail);
+        assert!(app.chat_scroll_anchor.is_none());
+        assert_eq!(app.chat_scroll_offset, 0);
+    }
+
+    #[test]
     fn mid_list_insert_preserves_render_cache_for_following_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
@@ -6995,6 +7355,8 @@ mod render_history_spacing_tests {
             saved_active_schedules: std::collections::BTreeMap::new(),
             saved_pending_stop_confirm: None,
             saved_chat_scroll_offset: 0,
+            saved_chat_scroll_anchor: None,
+            saved_chat_pinned_to_tail: true,
             saved_project_id: None,
             saved_session_id: None,
             saved_session_short_id: None,
@@ -7755,12 +8117,12 @@ mod render_history_spacing_tests {
         let rows = buffer_rows(&buffer, 24, 4);
         assert!(rows.iter().all(|row| !row.contains('↓')));
 
-        app.chat_scroll_offset = 3;
+        app.set_chat_scroll_offset_from_interaction(3);
         let buffer = render_history_buffer(&mut app, 24, 4);
         let rows = buffer_rows(&buffer, 24, 4);
         assert!(rows.iter().any(|row| row.contains("↓ 3 more")));
 
-        app.chat_scroll_offset = 0;
+        app.set_chat_scroll_offset_from_interaction(0);
         let buffer = render_history_buffer(&mut app, 24, 4);
         let rows = buffer_rows(&buffer, 24, 4);
         assert!(rows.iter().all(|row| !row.contains('↓')));

@@ -14,6 +14,8 @@ impl App {
             history_render_cache_rows,
             pending_render_cache: self.pending_render_cache.take(),
             chat_scroll_offset: self.chat_scroll_offset,
+            chat_scroll_anchor: self.chat_scroll_anchor,
+            chat_pinned_to_tail: self.chat_pinned_to_tail,
         }
     }
 
@@ -28,7 +30,11 @@ impl App {
             view.history_render_cache_rows,
         );
         self.pending_render_cache = view.pending_render_cache.take();
-        self.chat_scroll_offset = view.chat_scroll_offset;
+        self.restore_chat_scroll_state(
+            view.chat_scroll_offset,
+            view.chat_scroll_anchor,
+            view.chat_pinned_to_tail,
+        );
         self.mark_chat_geometry_dirty_from(0);
         self.chat_find_lines.clear();
         self.chat_find_lines_query = None;
@@ -95,7 +101,7 @@ impl App {
         self.history_render_fingerprints = std::collections::HashMap::new();
         self.history_render_cache_clear();
         self.pending_render_cache = None;
-        self.chat_scroll_offset = 0;
+        self.pin_chat_to_tail();
         self.mark_chat_geometry_dirty_from(0);
         self.chat_find_lines.clear();
         self.chat_find_lines_query = None;
@@ -132,7 +138,6 @@ impl App {
             return false;
         };
         self.restore_transcript_view(previous);
-        self.chat_scroll_offset = 0;
         true
     }
 

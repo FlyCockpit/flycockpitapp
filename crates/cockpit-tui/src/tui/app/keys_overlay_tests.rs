@@ -100,6 +100,8 @@ fn fake_side_conversation(tmp: &std::path::Path) -> SideConversation {
         saved_active_schedules: std::collections::BTreeMap::new(),
         saved_pending_stop_confirm: Some(vec!["stop-me".to_string()]),
         saved_chat_scroll_offset: 7,
+        saved_chat_scroll_anchor: None,
+        saved_chat_pinned_to_tail: false,
         saved_project_id: Some("project-main".to_string()),
         saved_session_id: Some(Uuid::new_v4()),
         saved_session_short_id: Some("main123".to_string()),

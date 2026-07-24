@@ -14,7 +14,7 @@ impl App {
             output: cap_display_lines(&clean),
             failed,
         });
-        self.chat_scroll_offset = 0;
+        self.pin_chat_to_tail();
         if let Some(args) = git_args {
             let capped = cap_tokens(&clean, GIT_AGENT_TOKEN_CAP);
             self.pending_git_blocks.push(format!(
@@ -203,7 +203,7 @@ impl App {
     /// working-span bookkeeping so an orphaned dispatch never hangs the
     /// indicator.
     pub(super) fn dispatch_init_turn(&mut self, display: &str, wire: String) {
-        self.chat_scroll_offset = 0;
+        self.pin_chat_to_tail();
         self.begin_working_span();
         let submission = cockpit_core::engine::message::UserSubmission::text(wire);
         self.dispatch_optimistic_user_submission(
@@ -393,7 +393,7 @@ impl App {
     }
 
     pub(super) fn dispatch_goal_turn(&mut self, display: &str, wire: String) {
-        self.chat_scroll_offset = 0;
+        self.pin_chat_to_tail();
         self.begin_working_span();
         let submission = cockpit_core::engine::message::UserSubmission::text(wire);
         self.dispatch_optimistic_user_submission(
@@ -416,7 +416,7 @@ impl App {
     /// loads the skill body (priority #1). Reuses the runner-input dispatch
     /// `dispatch_init_turn` uses, including the working-span bookkeeping.
     pub(super) fn dispatch_skill_invocation(&mut self, display: String, name: &str, args: &str) {
-        self.chat_scroll_offset = 0;
+        self.pin_chat_to_tail();
         self.begin_working_span();
         let submission = cockpit_core::engine::message::UserSubmission {
             kind: cockpit_core::engine::message::UserSubmissionKind::User,

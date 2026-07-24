@@ -9,7 +9,7 @@ impl App {
         self.elided_event_ids.clear();
         self.active_schedules.clear();
         self.pending_stop_confirm = None;
-        self.chat_scroll_offset = 0;
+        self.pin_chat_to_tail();
         self.end_working_span();
         self.prediction_state.begin_turn();
         // prompt_history is shell-style across sessions; only the active

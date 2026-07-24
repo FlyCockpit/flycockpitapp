@@ -2045,7 +2045,7 @@ impl App {
 
         // Submitting a new turn implies the user has finished reading
         // history — jump back to the live tail so they see the reply.
-        self.chat_scroll_offset = 0;
+        self.pin_chat_to_tail();
 
         // Expand any `@path[:range]` tags into fenced file/dir blocks
         // before dispatch (GOALS §1e). The displayed user message keeps
@@ -2289,7 +2289,7 @@ impl App {
 
     fn close_transcript_find_restore(&mut self) {
         if let Some(find) = self.transcript_find.take() {
-            self.chat_scroll_offset = find.saved_offset;
+            self.set_chat_scroll_offset_from_interaction(find.saved_offset);
         }
     }
 

@@ -1279,7 +1279,7 @@ impl App {
         }
         let subject = cockpit_core::skills::subject_from_parts(&[args.to_string()]);
         let prompt = cockpit_core::skills::build_learn_prompt(&subject);
-        self.chat_scroll_offset = 0;
+        self.pin_chat_to_tail();
         self.begin_working_span();
         self.dispatch_optimistic_user_submission(
             if args.trim().is_empty() {

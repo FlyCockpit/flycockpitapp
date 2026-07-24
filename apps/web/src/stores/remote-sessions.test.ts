@@ -376,6 +376,177 @@ describe("remote session reducers", () => {
     expect(updated.detailsBySession[sessionId].summary.status).toBe("needs_intervention");
   });
 
+  it("applies authoritative model state only when generation advances", () => {
+    const first = applyLiveEvent(
+      withDetail(),
+      event("active_model_state", {
+        session_id: sessionId,
+        provider: "openai",
+        model: "gpt-5",
+        config_provider: "openai",
+        config_model: "gpt-5-pro",
+        diverged: true,
+        generation: 7,
+      }),
+    );
+    const stale = applyLiveEvent(
+      first,
+      event("active_model_state", {
+        session_id: sessionId,
+        provider: "anthropic",
+        model: "claude",
+        diverged: false,
+        generation: 6,
+      }),
+    );
+    const next = applyLiveEvent(
+      stale,
+      event("active_model_state", {
+        session_id: sessionId,
+        provider: "openai",
+        model: "gpt-5-mini",
+        diverged: false,
+        generation: 8,
+      }),
+    );
+
+    expect(first.detailsBySession[sessionId].activeModel).toMatchObject({
+      provider: "openai",
+      model: "gpt-5",
+      configProvider: "openai",
+      configModel: "gpt-5-pro",
+      diverged: true,
+      generation: 7,
+    });
+    expect(stale.detailsBySession[sessionId].activeModel).toBe(
+      first.detailsBySession[sessionId].activeModel,
+    );
+    expect(next.detailsBySession[sessionId].activeModel).toMatchObject({
+      model: "gpt-5-mini",
+      generation: 8,
+    });
+  });
+
+  it("tracks llm mode changes and inference failures", () => {
+    const withMode = applyLiveEvent(
+      withDetail(),
+      event("llm_mode_changed", { session_id: sessionId, mode: "frontier" }),
+    );
+    const withFailure = applyLiveEvent(
+      withMode,
+      event("inference_failed", {
+        session_id: sessionId,
+        agent: "Build",
+        provider: "openai",
+        model: "gpt-5",
+        error_class: { kind: "http", status: 401 },
+        detail: "provider rejected credentials",
+        auth_failure: { kind: "credentials_rejected", status: 401 },
+      }),
+    );
+    const failure = withFailure.detailsBySession[sessionId].history.at(-1);
+
+    expect(withFailure.detailsBySession[sessionId].llmMode).toBe("frontier");
+    expect(failure).toMatchObject({
+      kind: "inference_failure",
+      failure: {
+        provider: "openai",
+        model: "gpt-5",
+        errorClass: "http 401",
+        recovery: { kind: "credentials_rejected", status: 401 },
+      },
+    });
+  });
+
+  it("keeps sandbox unavailable sticky until sandboxing is disabled", () => {
+    const unavailable = applyLiveEvent(
+      withDetail(),
+      event("sandbox_unavailable", {
+        session_id: sessionId,
+        remedy: "Enable unprivileged user namespaces.",
+        fix_command: "sysctl -w kernel.unprivileged_userns_clone=1",
+      }),
+    );
+    const stillSticky = applyLiveEvent(
+      unavailable,
+      event("sandbox_state", {
+        session_id: sessionId,
+        mode: "workspace_write",
+        enabled: true,
+        container_availability: "available",
+      }),
+    );
+    const cleared = applyLiveEvent(
+      stillSticky,
+      event("sandbox_state", {
+        session_id: sessionId,
+        mode: "read_only",
+        enabled: false,
+        container_availability: "available",
+      }),
+    );
+
+    expect(unavailable.detailsBySession[sessionId].sandboxUnavailable).toEqual({
+      remedy: "Enable unprivileged user namespaces.",
+      fixCommand: "sysctl -w kernel.unprivileged_userns_clone=1",
+    });
+    expect(stillSticky.detailsBySession[sessionId].sandboxUnavailable).toEqual(
+      unavailable.detailsBySession[sessionId].sandboxUnavailable,
+    );
+    expect(cleared.detailsBySession[sessionId].sandboxUnavailable).toBeUndefined();
+  });
+
+  it("tracks daemon draining and waiting locks", () => {
+    const draining = applyLiveEvent(withDetail(), event("daemon_draining", { forced: false }));
+    const forced = applyLiveEvent(draining, event("daemon_draining", { forced: true }));
+    const waiting = applyLiveEvent(
+      forced,
+      event("waiting_for_lock", {
+        session_id: sessionId,
+        path: "src/main.ts",
+        holder_agent: "Review",
+        waiting: true,
+      }),
+    );
+    const cleared = applyLiveEvent(
+      waiting,
+      event("waiting_for_lock", {
+        session_id: sessionId,
+        path: "src/main.ts",
+        holder_agent: "Review",
+        waiting: false,
+      }),
+    );
+
+    expect(draining.draining).toEqual({ forced: false });
+    expect(forced.draining).toEqual({ forced: true });
+    expect(waiting.detailsBySession[sessionId].waitingLocks).toEqual({
+      "src/main.ts": { path: "src/main.ts", holderAgent: "Review" },
+    });
+    expect(cleared.detailsBySession[sessionId].waitingLocks).toEqual({});
+  });
+
+  it("surfaces and clears paused work from daemon events", () => {
+    const available = applyLiveEvent(
+      withDetail(),
+      event("paused_work_available", {
+        session_id: sessionId,
+        items: [{ id: "work1", agent: "Build" }],
+      }),
+    );
+    const cleared = applyLiveEvent(
+      available,
+      event("paused_work_available", { session_id: sessionId, items: [] }),
+    );
+
+    expect(available.detailsBySession[sessionId].pausedWork?.items).toHaveLength(1);
+    expect(available.detailsBySession[sessionId].summary.attention).toEqual({
+      kind: "paused_work",
+    });
+    expect(cleared.detailsBySession[sessionId].pausedWork).toBeUndefined();
+    expect(cleared.detailsBySession[sessionId].summary.attention).toBeNull();
+  });
+
   it("tolerates and warns once for unknown event kinds", () => {
     resetRemoteSessionEventWarningsForTests();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -456,6 +627,31 @@ describe("remote session reducers", () => {
     const state = useRemoteSessionsStore.getState().instances.i1;
     expect(state.detailsBySession[sessionId].summary.sharedWithCollaborators).toBe(false);
     expect(state.sessionsByProject["/work/app"][0]?.sharedWithCollaborators).toBe(false);
+  });
+
+  it("sends paused-work actions without optimistically clearing daemon state", async () => {
+    const base = applyLiveEvent(
+      withDetail(),
+      event("paused_work_available", {
+        session_id: sessionId,
+        items: [{ id: "work1", agent: "Build" }],
+      }),
+    );
+    const resumePausedWork = vi.fn().mockResolvedValue(undefined);
+    const cancelPausedWork = vi.fn().mockResolvedValue(undefined);
+    useRemoteSessionsStore.setState({
+      instances: { i1: base },
+      clients: { i1: { resumePausedWork, cancelPausedWork } as never },
+    });
+
+    await useRemoteSessionsStore.getState().resumePausedWork("i1", sessionId);
+    await useRemoteSessionsStore.getState().cancelPausedWork("i1", sessionId);
+
+    expect(resumePausedWork).toHaveBeenCalledWith(sessionId);
+    expect(cancelPausedWork).toHaveBeenCalledWith(sessionId);
+    expect(
+      useRemoteSessionsStore.getState().instances.i1.detailsBySession[sessionId].pausedWork?.items,
+    ).toHaveLength(1);
   });
 
   it("allows only one older-history request in flight and stops when exhausted", async () => {

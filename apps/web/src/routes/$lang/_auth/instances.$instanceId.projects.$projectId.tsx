@@ -17,11 +17,15 @@ import { Textarea } from "@flycockpit/ui/components/textarea";
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import {
+  AlertTriangle,
   Archive,
   ArrowLeft,
+  Clipboard,
   FileCode,
   GitFork,
+  LoaderCircle,
   MessageSquarePlus,
+  PauseCircle,
   Send,
   ShieldAlert,
   WifiOff,
@@ -34,6 +38,7 @@ import { InlineRetry } from "@/components/inline-retry";
 import { useRemoteInstanceConnection } from "@/hooks/use-remote-instance-connection";
 import { useRemoteProjectSessions } from "@/hooks/use-remote-project-sessions";
 import { useTranscriptHistoryPaging } from "@/hooks/use-transcript-history-paging";
+import { llmModeView } from "@/lib/inference-failure-view";
 import {
   canMutateSessions,
   resolveSessionViewerMode,
@@ -43,6 +48,7 @@ import {
 } from "@/lib/session-visibility";
 import { statsRollupToView } from "@/lib/stats-rollup-view";
 import {
+  type SessionDetail,
   type SessionPagingState,
   useRemoteSessionsStore,
   type WebHistoryEntry,
@@ -84,6 +90,8 @@ function ProjectSessionPage() {
     archiveSession,
     forkSession,
     loadOlderHistory,
+    resumePausedWork,
+    cancelPausedWork,
   } = useRemoteSessionsStore(
     useShallow((state) => ({
       remote: state.instances[instanceId],
@@ -93,6 +101,8 @@ function ProjectSessionPage() {
       archiveSession: state.archiveSession,
       forkSession: state.forkSession,
       loadOlderHistory: state.loadOlderHistory,
+      resumePausedWork: state.resumePausedWork,
+      cancelPausedWork: state.cancelPausedWork,
     })),
   );
   const project = remote?.projects.find((item) => item.projectId === projectId);
@@ -140,10 +150,12 @@ function ProjectSessionPage() {
   const canShareSessions = viewerMode === "owner";
   const readOnly = viewerMode === "agent_readonly";
   const offline = remote?.status !== "connected";
+  const draining = remote?.draining ?? null;
+  const composerDisabled = offline || !!draining || !canWriteSessions;
 
   async function submitMessage() {
     const text = message.trim();
-    if (!selectedSessionId || !text || !canWriteSessions) return;
+    if (!selectedSessionId || !text || composerDisabled) return;
     setMessage("");
     try {
       await sendMessage(instanceId, selectedSessionId, text);
@@ -211,11 +223,15 @@ function ProjectSessionPage() {
         </div>
       </div>
 
-      {offline ? (
+      {offline || draining ? (
         <div className="border-b bg-muted/40 px-4 py-2 text-sm text-muted-foreground">
           <div className="mx-auto flex max-w-7xl items-center gap-2">
-            <WifiOff className="size-4" />
-            {t("instances:remote.offlineBanner")}
+            {draining ? <LoaderCircle className="size-4" /> : <WifiOff className="size-4" />}
+            {draining
+              ? draining.forced
+                ? t("instances:remote.daemonDrainingForced")
+                : t("instances:remote.daemonDrainingGraceful")
+              : t("instances:remote.offlineBanner")}
           </div>
         </div>
       ) : null}
@@ -254,7 +270,12 @@ function ProjectSessionPage() {
               <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
                 <div className="min-w-0">
                   <h2 className="truncate font-medium">{detail.summary.title}</h2>
-                  <SessionStatsSummary turns={detail.summary.turnCount} statsView={statsView} />
+                  <SessionStatsSummary
+                    turns={detail.summary.turnCount}
+                    statsView={statsView}
+                    llmMode={detail.llmMode}
+                    activeModel={detail.activeModel}
+                  />
                 </div>
                 <div className="flex flex-wrap gap-2">
                   {canShareSessions ? (
@@ -345,18 +366,26 @@ function ProjectSessionPage() {
                     {t("instances:remote.readOnlyNotice")}
                   </p>
                 ) : null}
+                <SessionStateNotices
+                  detail={detail}
+                  actionsDisabled={composerDisabled}
+                  onResume={() => resumePausedWork(instanceId, detail.summary.sessionId)}
+                  onCancel={() => cancelPausedWork(instanceId, detail.summary.sessionId)}
+                />
                 <div className="flex gap-2">
                   <Textarea
                     className="min-h-[52px] flex-1 text-base"
                     value={message}
-                    disabled={offline || !canWriteSessions}
+                    disabled={composerDisabled}
                     onChange={(event) => setMessage(event.target.value)}
                     placeholder={
                       offline
                         ? t("instances:remote.composerOffline")
-                        : readOnly
-                          ? t("instances:remote.composerReadOnly")
-                          : t("instances:remote.composerPlaceholder")
+                        : draining
+                          ? t("instances:remote.composerDraining")
+                          : readOnly
+                            ? t("instances:remote.composerReadOnly")
+                            : t("instances:remote.composerPlaceholder")
                     }
                     onKeyDown={(event) => {
                       if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
@@ -368,7 +397,7 @@ function ProjectSessionPage() {
                   <Button
                     type="button"
                     className="min-h-[52px]"
-                    disabled={offline || !canWriteSessions || !message.trim()}
+                    disabled={composerDisabled || !message.trim()}
                     onClick={() => void submitMessage()}
                   >
                     <Send className="size-4" />
@@ -393,16 +422,45 @@ function ProjectSessionPage() {
 function SessionStatsSummary({
   turns,
   statsView,
+  llmMode,
+  activeModel,
 }: {
   turns: number;
   statsView: ReturnType<typeof statsRollupToView>;
+  llmMode: SessionDetail["llmMode"];
+  activeModel: SessionDetail["activeModel"];
 }) {
   const { t } = useTranslation("instances");
   const tokenRows = statsView.tokenRows.slice(0, 2);
   const modeRows = statsView.recoveryModeRows.slice(0, 2);
+  const activeModelLabel = activeModel ? `${activeModel.provider}/${activeModel.model}` : undefined;
+  const requestedModelLabel =
+    activeModel?.configProvider && activeModel.configModel
+      ? `${activeModel.configProvider}/${activeModel.configModel}`
+      : undefined;
   return (
     <div className="text-xs text-muted-foreground">
       <span>{t("instances:remote.turns", { count: turns })}</span>
+      {llmMode ? (
+        <span>
+          {" · "}
+          {t("instances:remote.llmModeLabel")}: {t(llmModeView(llmMode).labelKey)}
+        </span>
+      ) : null}
+      {activeModelLabel ? (
+        <span>
+          {" · "}
+          {t("instances:remote.activeModelLabel")}: {activeModelLabel}
+        </span>
+      ) : null}
+      {activeModel?.diverged ? (
+        <span className="text-amber-700 dark:text-amber-300">
+          {" · "}
+          {t("instances:remote.activeModelDiverged", {
+            model: requestedModelLabel ?? t("instances:remote.configuredModel"),
+          })}
+        </span>
+      ) : null}
       {statsView.fallbackTotal ? (
         <span>
           {" · "}
@@ -422,6 +480,116 @@ function SessionStatsSummary({
           {t("instances:remote.statsModes")}:{" "}
           {modeRows.map((row) => `${row.label} ${row.detail ?? row.value}`).join(", ")}
         </span>
+      ) : null}
+    </div>
+  );
+}
+
+function SessionStateNotices({
+  detail,
+  actionsDisabled,
+  onResume,
+  onCancel,
+}: {
+  detail: SessionDetail;
+  actionsDisabled: boolean;
+  onResume: () => Promise<void>;
+  onCancel: () => Promise<void>;
+}) {
+  const { t } = useTranslation("instances");
+  const waitingLocks = Object.values(detail.waitingLocks);
+  const pausedItems = detail.pausedWork?.items ?? [];
+  const hasNotices = detail.sandboxUnavailable || waitingLocks.length || pausedItems.length;
+  if (!hasNotices) return null;
+
+  async function copyFixCommand(command: string) {
+    try {
+      await navigator.clipboard.writeText(command);
+      toast.success(t("remote.fixCommandCopied"));
+    } catch {
+      toast.error(t("remote.fixCommandCopyFailed"));
+    }
+  }
+
+  async function runPausedAction(action: () => Promise<void>) {
+    try {
+      await action();
+    } catch {
+      toast.error(t("remote.pausedWorkActionFailed"));
+    }
+  }
+
+  return (
+    <div className="mb-2 space-y-2">
+      {detail.sandboxUnavailable ? (
+        <div className="rounded-md border bg-muted/40 px-3 py-2 text-sm">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
+            <div className="min-w-0 flex-1">
+              <div className="font-medium">{t("remote.sandboxUnavailableTitle")}</div>
+              <p className="text-muted-foreground">{detail.sandboxUnavailable.remedy}</p>
+              {detail.sandboxUnavailable.fixCommand ? (
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <code className="max-w-full overflow-x-auto rounded border bg-background px-2 py-1 text-xs">
+                    {detail.sandboxUnavailable.fixCommand}
+                  </code>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void copyFixCommand(detail.sandboxUnavailable?.fixCommand ?? "")}
+                  >
+                    <Clipboard className="size-4" />
+                    {t("remote.copyFixCommand")}
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {waitingLocks.map((lock) => (
+        <div
+          key={lock.path}
+          className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2 text-sm text-muted-foreground"
+        >
+          <LoaderCircle className="size-4 shrink-0" />
+          <span>{t("remote.waitingForLock", { path: lock.path, holder: lock.holderAgent })}</span>
+        </div>
+      ))}
+      {pausedItems.length ? (
+        <div className="rounded-md border bg-muted/40 px-3 py-2 text-sm">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex min-w-0 items-center gap-2">
+              <PauseCircle className="size-4 shrink-0 text-primary" />
+              <div>
+                <div className="font-medium">{t("remote.pausedWorkTitle")}</div>
+                <div className="text-muted-foreground">
+                  {t("remote.pausedWorkDescription", { count: pausedItems.length })}
+                </div>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                size="sm"
+                disabled={actionsDisabled}
+                onClick={() => void runPausedAction(onResume)}
+              >
+                {t("remote.pausedWorkResume")}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={actionsDisabled}
+                onClick={() => void runPausedAction(onCancel)}
+              >
+                {t("remote.pausedWorkCancel")}
+              </Button>
+            </div>
+          </div>
+        </div>
       ) : null}
     </div>
   );
@@ -573,6 +741,31 @@ function TranscriptEntry({
         <summary>{t("remote.reasoning")}</summary>
         <ReactMarkdown>{entry.text}</ReactMarkdown>
       </details>
+    );
+  if (entry.kind === "inference_failure")
+    return (
+      <div className="max-w-3xl rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">
+        <div className="flex items-start gap-2">
+          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
+          <div className="min-w-0 flex-1">
+            <div className="font-medium">{t("remote.inferenceFailureTitle")}</div>
+            <p className="mt-1 text-muted-foreground">
+              {t(entry.failure.recovery.messageKey, {
+                status: entry.failure.recovery.status,
+                feature: entry.failure.recovery.feature,
+                provider: entry.failure.recovery.provider,
+              })}
+            </p>
+            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+              <span>
+                {entry.failure.provider}/{entry.failure.model}
+              </span>
+              <span>{entry.failure.errorClass}</span>
+            </div>
+            <p className="mt-2 whitespace-pre-wrap">{entry.failure.detail}</p>
+          </div>
+        </div>
+      </div>
     );
   if (entry.kind === "tool_call")
     return (

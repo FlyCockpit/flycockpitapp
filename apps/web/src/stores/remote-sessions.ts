@@ -15,6 +15,13 @@ import type {
 import { eventEnvelopeSchema } from "@flycockpit/cockpit-protocol";
 import { RemoteSessionClient } from "@flycockpit/cockpit-protocol/client";
 import { create } from "zustand";
+import {
+  type AuthRecoveryView,
+  authRecoveryView,
+  errorClassLabel,
+  type LlmMode,
+  llmModeView,
+} from "@/lib/inference-failure-view";
 
 type ConnectionStatus = "idle" | "connecting" | "connected" | "offline" | "error";
 
@@ -38,7 +45,7 @@ export type WebSessionSummary = {
   pinned: boolean;
   forkCount: number;
   turnCount: number;
-  attention: { kind: "approval"; interruptId: string } | null;
+  attention: { kind: "approval"; interruptId: string } | { kind: "paused_work" } | null;
   updatedAt: number;
   createdBy: { userId: string; displayName?: string; origin?: string } | null;
   agent: string;
@@ -60,12 +67,7 @@ export type WebHistoryEntry =
       id: string;
       seq: number;
       ts?: number;
-      kind:
-        | "user_message"
-        | "user_note"
-        | "assistant_text"
-        | "assistant_reasoning"
-        | "inference_error";
+      kind: "user_message" | "user_note" | "assistant_text" | "assistant_reasoning";
       text: string;
       actor?: { userId?: string; displayName?: string; origin?: string };
     }
@@ -93,7 +95,46 @@ export type WebHistoryEntry =
         cancelled: boolean;
         lines: { prompt: string; answer: string }[];
       };
+    }
+  | {
+      id: string;
+      seq: number;
+      ts?: number;
+      kind: "inference_failure";
+      failure: WebInferenceFailure;
     };
+
+export type WebActiveModelState = {
+  provider: string;
+  model: string;
+  configProvider?: string;
+  configModel?: string;
+  diverged: boolean;
+  generation: number;
+};
+
+export type WebSandboxUnavailable = {
+  remedy: string;
+  fixCommand?: string;
+};
+
+export type WebWaitingLock = {
+  path: string;
+  holderAgent: string;
+};
+
+export type WebPausedWork = {
+  items: unknown[];
+};
+
+export type WebInferenceFailure = {
+  agent: string;
+  provider: string;
+  model: string;
+  errorClass: string;
+  detail: string;
+  recovery: AuthRecoveryView;
+};
 
 export type WebUsage = {
   inputTokens: number;
@@ -118,11 +159,17 @@ export type SessionDetail = {
   nextSeq: number;
   usage: WebUsage | null;
   paging: SessionPagingState;
+  llmMode?: LlmMode;
+  activeModel?: WebActiveModelState;
+  sandboxUnavailable?: WebSandboxUnavailable;
+  waitingLocks: Record<string, WebWaitingLock>;
+  pausedWork?: WebPausedWork;
 };
 
 type InstanceRemoteState = {
   status: ConnectionStatus;
   statusDetail?: string;
+  draining?: { forced: boolean };
   projects: WebProjectRow[];
   sessionsByProject: Record<string, WebSessionSummary[]>;
   detailsBySession: Record<string, SessionDetail>;
@@ -160,6 +207,8 @@ type RemoteSessionState = {
   archiveSession: (instanceId: string, sessionId: string, archived: boolean) => Promise<void>;
   shareSession: (instanceId: string, sessionId: string, shared: boolean) => Promise<void>;
   forkSession: (instanceId: string, sessionId: string) => Promise<void>;
+  resumePausedWork: (instanceId: string, sessionId: string) => Promise<void>;
+  cancelPausedWork: (instanceId: string, sessionId: string) => Promise<void>;
   listFiles: (
     instanceId: string,
     input: { projectRoot: string; path: string; showHidden: boolean },
@@ -436,14 +485,6 @@ function toWebHistoryEntry(entry: WireHistoryEntry, fallbackSeq = 0): WebHistory
       output: entry.output,
     };
   }
-  if (entry.role === "inference_error") {
-    return {
-      id: "inference:" + seq,
-      seq,
-      kind: "inference_error",
-      text: entry.detail ? `${entry.summary}\n${entry.detail}` : entry.summary,
-    };
-  }
   if (entry.role === "compact_boundary") {
     return {
       id: "boundary:" + seq,
@@ -461,14 +502,35 @@ function toWebHistoryEntry(entry: WireHistoryEntry, fallbackSeq = 0): WebHistory
       body: `${entry.parent} -> ${entry.child}`,
     };
   }
+  if (!("decision" in entry)) {
+    const raw = entry as Record<string, unknown>;
+    const text =
+      stringField(raw, "display_text") ??
+      stringField(raw, "text") ??
+      stringField(raw, "summary") ??
+      stringField(raw, "detail") ??
+      "Unsupported history entry.";
+    return { id: "history:" + seq, seq, kind: "assistant_text", text };
+  }
+  const decision =
+    entry.decision && typeof entry.decision === "object"
+      ? (entry.decision as Record<string, unknown>)
+      : null;
+  const lines = Array.isArray(decision?.lines)
+    ? decision.lines.filter((line): line is { prompt: string; answer: string } => {
+        if (!line || typeof line !== "object") return false;
+        const record = line as Record<string, unknown>;
+        return typeof record.prompt === "string" && typeof record.answer === "string";
+      })
+    : [];
   return {
     id: "interrupt-decision:" + seq,
     seq,
     kind: "interrupt_decision",
     decision: {
-      permission: entry.decision.permission,
-      cancelled: entry.decision.cancelled,
-      lines: entry.decision.lines,
+      permission: booleanField(decision ?? {}, "permission") ?? false,
+      cancelled: booleanField(decision ?? {}, "cancelled") ?? false,
+      lines,
     },
   };
 }
@@ -527,6 +589,11 @@ export function mergeAttach(
         nextSeq: nextSeqFromHistory(mergedHistory),
         usage: current?.usage ?? null,
         paging: pagingFromHistory(mergedHistory, current?.paging),
+        llmMode: current?.llmMode,
+        activeModel: current?.activeModel,
+        sandboxUnavailable: current?.sandboxUnavailable,
+        waitingLocks: current?.waitingLocks ?? {},
+        pausedWork: current?.pausedWork,
       },
     },
   };
@@ -673,6 +740,56 @@ function usageFromData(data: Record<string, unknown>): WebUsage {
     outputTokens,
     totalTokens: inputTokens + outputTokens,
   };
+}
+
+function applyInferenceFailure(history: WebHistoryEntry[], data: Record<string, unknown>) {
+  const agent = stringField(data, "agent");
+  const provider = stringField(data, "provider");
+  const model = stringField(data, "model");
+  const detail = stringField(data, "detail");
+  if (!agent || !provider || !model || !detail) return null;
+  const seq = numberField(data, "seq") ?? nextLocalSeq(history);
+  return upsertHistory(history, {
+    id: "inference-failure:" + seq,
+    seq,
+    kind: "inference_failure",
+    failure: {
+      agent,
+      provider,
+      model,
+      detail,
+      errorClass: errorClassLabel(data.error_class),
+      recovery: authRecoveryView(data.auth_failure),
+    },
+  });
+}
+
+function activeModelFromData(data: Record<string, unknown>): WebActiveModelState | null {
+  const provider = stringField(data, "provider");
+  const model = stringField(data, "model");
+  const generation = numberField(data, "generation") ?? 0;
+  const diverged = booleanField(data, "diverged");
+  if (!provider || !model || diverged === undefined) return null;
+  return {
+    provider,
+    model,
+    configProvider: stringField(data, "config_provider"),
+    configModel: stringField(data, "config_model"),
+    diverged,
+    generation,
+  };
+}
+
+function applyPausedWork(existing: InstanceRemoteState, sessionId: string, items: unknown[]) {
+  const attention = items.length ? ({ kind: "paused_work" } as const) : null;
+  const state = updateDetail(existing, sessionId, (detail) => ({
+    ...detail,
+    pausedWork: items.length ? { items } : undefined,
+  }));
+  const currentAttention = state.detailsBySession[sessionId]?.summary.attention;
+  if (currentAttention?.kind === "approval" && items.length) return state;
+  if (currentAttention?.kind === "approval" && !items.length) return state;
+  return updateSessionSummary(state, sessionId, { attention });
 }
 
 export function reduceRemoteSessionEvent(
@@ -849,6 +966,94 @@ export function reduceRemoteSessionEvent(
     const status = reason ? stringField(reason, "kind") : undefined;
     if (!status) return { state: existing, warningKind: event.event };
     return { state: updateSessionSummary(existing, sessionId, { status }) };
+  }
+
+  if (event.event === "llm_mode_changed") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    const mode = llmModeView(data.mode).mode;
+    if (!mode) return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => ({ ...detail, llmMode: mode })),
+    };
+  }
+
+  if (event.event === "active_model_state") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    const activeModel = activeModelFromData(data);
+    if (!activeModel) return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) =>
+        detail.activeModel && activeModel.generation <= detail.activeModel.generation
+          ? detail
+          : { ...detail, activeModel },
+      ),
+    };
+  }
+
+  if (event.event === "inference_failed") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => {
+        const history = applyInferenceFailure(detail.history, data);
+        return history ? { ...detail, history, nextSeq: nextSeqFromHistory(history) } : detail;
+      }),
+    };
+  }
+
+  if (event.event === "sandbox_unavailable") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    const remedy = stringField(data, "remedy");
+    if (!remedy) return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => ({
+        ...detail,
+        sandboxUnavailable: {
+          remedy,
+          fixCommand: stringField(data, "fix_command"),
+        },
+      })),
+    };
+  }
+
+  if (event.event === "sandbox_state") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    if (booleanField(data, "enabled") !== false) return { state: existing };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => ({
+        ...detail,
+        sandboxUnavailable: undefined,
+      })),
+    };
+  }
+
+  if (event.event === "daemon_draining") {
+    if (!data) return { state: existing, warningKind: event.event };
+    const forced = booleanField(data, "forced");
+    if (forced === undefined) return { state: existing, warningKind: event.event };
+    return { state: { ...existing, draining: { forced } } };
+  }
+
+  if (event.event === "waiting_for_lock") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    const path = stringField(data, "path");
+    const holderAgent = stringField(data, "holder_agent");
+    const waiting = booleanField(data, "waiting");
+    if (!path || !holderAgent || waiting === undefined)
+      return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => {
+        const waitingLocks = { ...detail.waitingLocks };
+        if (waiting) waitingLocks[path] = { path, holderAgent };
+        else delete waitingLocks[path];
+        return { ...detail, waitingLocks };
+      }),
+    };
+  }
+
+  if (event.event === "paused_work_available") {
+    if (!sessionId || !data || !Array.isArray(data.items))
+      return { state: existing, warningKind: event.event };
+    return { state: applyPausedWork(existing, sessionId, data.items) };
   }
 
   return { state: existing, warningKind: event.event };
@@ -1181,6 +1386,16 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
   },
   forkSession: async (instanceId, sessionId) => {
     await get().clients[instanceId]?.forkSession({ parent_session_id: sessionId });
+  },
+  resumePausedWork: async (instanceId, sessionId) => {
+    const client = get().clients[instanceId];
+    if (!client) throw new Error("Instance connection is not open.");
+    await client.resumePausedWork(sessionId);
+  },
+  cancelPausedWork: async (instanceId, sessionId) => {
+    const client = get().clients[instanceId];
+    if (!client) throw new Error("Instance connection is not open.");
+    await client.cancelPausedWork(sessionId);
   },
   listFiles: async (instanceId, input) => {
     const result = await get().clients[instanceId]?.listFiles(

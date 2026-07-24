@@ -1,5 +1,363 @@
 use super::*;
 
+fn set_prompt_cache_retention_capability(
+    cfg: &mut crate::config::providers::ProvidersConfig,
+    provider: &str,
+    model: &str,
+    status: crate::config::providers::CapabilityStatus,
+) {
+    use crate::config::providers::{ModelCapabilities, ModelEntry};
+
+    let entry = cfg
+        .providers
+        .get_mut(provider)
+        .expect("provider exists in model-switch harness");
+    if let Some(model_entry) = entry.models.iter_mut().find(|entry| entry.id == model) {
+        model_entry.capabilities.prompt_cache_retention = status;
+    } else {
+        entry.models.push(ModelEntry {
+            id: model.to_string(),
+            capabilities: ModelCapabilities {
+                prompt_cache_retention: status,
+                ..ModelCapabilities::default()
+            },
+            ..ModelEntry::default()
+        });
+    }
+}
+
+fn edit_model_switch_config(
+    driver: &mut Driver,
+    edit: impl FnOnce(&mut crate::config::providers::ProvidersConfig),
+) {
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_mut()
+        .expect("model switch harness installs provider override");
+    edit(cfg);
+}
+
+#[test]
+fn retention_extended_maps_to_24h_only_when_capability_supported() {
+    use crate::config::providers::{
+        CapabilityStatus, PromptCacheRetention, ProviderEntry, ProvidersConfig,
+    };
+    use std::collections::BTreeMap;
+
+    let mut cfg = ProvidersConfig {
+        providers: BTreeMap::from([("openai".to_string(), ProviderEntry::default())]),
+        ..ProvidersConfig::default()
+    };
+    set_prompt_cache_retention_capability(
+        &mut cfg,
+        "openai",
+        "supported",
+        CapabilityStatus::Supported,
+    );
+    set_prompt_cache_retention_capability(
+        &mut cfg,
+        "openai",
+        "unsupported",
+        CapabilityStatus::Unsupported,
+    );
+
+    assert_eq!(
+        cfg.resolve_prompt_cache_retention(
+            "openai",
+            "supported",
+            Some(PromptCacheRetention::Extended),
+        ),
+        Some(PromptCacheRetention::EXTENDED_WIRE_VALUE)
+    );
+    assert_eq!(
+        cfg.resolve_prompt_cache_retention(
+            "openai",
+            "supported",
+            Some(PromptCacheRetention::Default),
+        ),
+        None
+    );
+    assert_eq!(
+        cfg.resolve_prompt_cache_retention(
+            "openai",
+            "unsupported",
+            Some(PromptCacheRetention::Extended),
+        ),
+        None
+    );
+    assert_eq!(
+        cfg.resolve_prompt_cache_retention(
+            "openai",
+            "unknown",
+            Some(PromptCacheRetention::Extended),
+        ),
+        None
+    );
+}
+
+#[tokio::test]
+async fn session_override_wins_over_persisted_retention_preference() {
+    use crate::config::providers::{CapabilityStatus, PromptCacheRetention};
+
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    edit_model_switch_config(&mut driver, |cfg| {
+        set_prompt_cache_retention_capability(
+            cfg,
+            "provider-a",
+            "model-a",
+            CapabilityStatus::Supported,
+        );
+        cfg.active_model
+            .as_mut()
+            .expect("active model exists")
+            .prompt_cache_retention = Some(PromptCacheRetention::Extended);
+    });
+    driver
+        .run_control(DriverControl::RefreshPromptCacheRetention, &tx)
+        .await;
+    assert_eq!(
+        driver.stack[0]
+            .agent
+            .params
+            .prompt_cache_retention
+            .as_deref(),
+        Some(PromptCacheRetention::EXTENDED_WIRE_VALUE),
+        "persisted extended preference applies when no session override is set"
+    );
+    let background = driver.spawn_args(false);
+    assert_eq!(
+        background.params.prompt_cache_retention, None,
+        "background/utility spawns must not inherit prompt cache retention"
+    );
+    assert_eq!(
+        background.params.prompt_cache_key, None,
+        "background/utility spawns must not inherit the foreground cache key"
+    );
+
+    edit_model_switch_config(&mut driver, |cfg| {
+        cfg.active_model
+            .as_mut()
+            .expect("active model exists")
+            .prompt_cache_retention = Some(PromptCacheRetention::Default);
+    });
+    driver
+        .run_control(DriverControl::RefreshPromptCacheRetention, &tx)
+        .await;
+    assert_eq!(
+        driver.stack[0].agent.params.prompt_cache_retention, None,
+        "persisted default omits the wire key"
+    );
+
+    driver
+        .run_control(
+            DriverControl::SetLongcache {
+                enabled: Some(true),
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(
+        driver.stack[0]
+            .agent
+            .params
+            .prompt_cache_retention
+            .as_deref(),
+        Some(PromptCacheRetention::EXTENDED_WIRE_VALUE)
+    );
+    match rx.try_recv().expect("longcache emits state") {
+        TurnEvent::LongcacheState { enabled, supported } => {
+            assert!(enabled);
+            assert!(supported);
+        }
+        other => panic!("expected LongcacheState, got {other:?}"),
+    }
+
+    driver
+        .run_control(
+            DriverControl::SetLongcache {
+                enabled: Some(false),
+            },
+            &tx,
+        )
+        .await;
+    assert_eq!(
+        driver.stack[0].agent.params.prompt_cache_retention, None,
+        "clearing the session override returns to the persisted default"
+    );
+    match rx.try_recv().expect("longcache emits off state") {
+        TurnEvent::LongcacheState { enabled, supported } => {
+            assert!(!enabled);
+            assert!(supported);
+        }
+        other => panic!("expected LongcacheState, got {other:?}"),
+    }
+
+    edit_model_switch_config(&mut driver, |cfg| {
+        cfg.active_model
+            .as_mut()
+            .expect("active model exists")
+            .prompt_cache_retention = None;
+    });
+    driver
+        .run_control(DriverControl::RefreshPromptCacheRetention, &tx)
+        .await;
+    assert_eq!(
+        driver.prompt_cache_retention_preference, None,
+        "absent persisted preference is inherited as provider default"
+    );
+    assert_eq!(
+        driver.stack[0].agent.params.prompt_cache_retention, None,
+        "neither override nor persisted preference omits retention"
+    );
+
+    edit_model_switch_config(&mut driver, |cfg| {
+        cfg.active_model
+            .as_mut()
+            .expect("active model exists")
+            .prompt_cache_retention = Some(PromptCacheRetention::Extended);
+        set_prompt_cache_retention_capability(
+            cfg,
+            "provider-a",
+            "model-a",
+            CapabilityStatus::Unknown,
+        );
+    });
+    driver
+        .run_control(DriverControl::RefreshPromptCacheRetention, &tx)
+        .await;
+    assert_eq!(
+        driver.stack[0].agent.params.prompt_cache_retention, None,
+        "unknown capability suppresses persisted extended retention"
+    );
+
+    edit_model_switch_config(&mut driver, |cfg| {
+        set_prompt_cache_retention_capability(
+            cfg,
+            "provider-a",
+            "model-a",
+            CapabilityStatus::Unsupported,
+        );
+    });
+    driver
+        .run_control(DriverControl::RefreshPromptCacheRetention, &tx)
+        .await;
+    assert_eq!(
+        driver.stack[0].agent.params.prompt_cache_retention, None,
+        "unsupported capability suppresses persisted extended retention"
+    );
+}
+
+#[tokio::test]
+async fn config_refresh_gates_retention_on_loaded_foreground_model() {
+    use crate::config::providers::{CapabilityStatus, PromptCacheRetention};
+
+    let (mut driver, _tmp) = model_switch_driver();
+    edit_model_switch_config(&mut driver, |cfg| {
+        set_prompt_cache_retention_capability(
+            cfg,
+            "provider-a",
+            "model-a",
+            CapabilityStatus::Supported,
+        );
+        set_prompt_cache_retention_capability(
+            cfg,
+            "provider-b",
+            "model-b",
+            CapabilityStatus::Unsupported,
+        );
+        cfg.active_model
+            .as_mut()
+            .expect("active model exists")
+            .prompt_cache_retention = Some(PromptCacheRetention::Extended);
+    });
+    let cfg = driver
+        .test_providers_override
+        .as_ref()
+        .expect("model switch harness installs provider override")
+        .0
+        .clone();
+    let model_b = Arc::new(
+        crate::engine::model::Model::for_provider(
+            &cfg,
+            "provider-b",
+            "model-b",
+            Arc::new(crate::redact::RedactionTable::empty()),
+        )
+        .unwrap(),
+    );
+    let mut args = driver.spawn_args(true);
+    args.model = model_b;
+    args.params.prompt_cache_retention = Some(PromptCacheRetention::EXTENDED_WIRE_VALUE.into());
+    driver.stack[0].agent = Arc::new(crate::engine::builtin::load("Build", &args).unwrap());
+
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                1,
+                cfg,
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        ),
+    );
+
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+    assert_eq!(
+        driver.stack[0].agent.params.prompt_cache_retention, None,
+        "config refresh must re-resolve retention against the loaded foreground model"
+    );
+}
+
+#[tokio::test]
+async fn longcache_unsupported_model_surfaces_notice_and_stays_off() {
+    use crate::config::providers::{CapabilityStatus, PromptCacheRetention};
+
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_mut()
+        .expect("model switch harness installs provider override");
+    set_prompt_cache_retention_capability(
+        cfg,
+        "provider-a",
+        "model-a",
+        CapabilityStatus::Unsupported,
+    );
+    driver.prompt_cache_retention_preference = Some(PromptCacheRetention::Extended);
+
+    driver
+        .run_control(
+            DriverControl::SetLongcache {
+                enabled: Some(true),
+            },
+            &tx,
+        )
+        .await;
+
+    assert!(
+        driver.prompt_cache_retention_override.is_none(),
+        "unsupported model must not arm the session override"
+    );
+    assert_eq!(driver.stack[0].agent.params.prompt_cache_retention, None);
+    match rx.try_recv().expect("unsupported toggle emits notice") {
+        TurnEvent::Notice { text } => assert!(
+            text.contains("/longcache") && text.contains("not verified for the active model"),
+            "unexpected notice: {text}"
+        ),
+        other => panic!("expected Notice, got {other:?}"),
+    }
+    match rx.try_recv().expect("unsupported toggle emits off state") {
+        TurnEvent::LongcacheState { enabled, supported } => {
+            assert!(!enabled);
+            assert!(!supported);
+        }
+        other => panic!("expected LongcacheState, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn reasoning_params_prefer_native_capability_over_legacy_thinking_mode() {
     use crate::config::providers::{
@@ -57,6 +415,7 @@ async fn reasoning_params_prefer_native_capability_over_legacy_thinking_mode() {
                 value: "xhigh".into(),
             }),
             thinking_mode: Some(ThinkingMode::High),
+            prompt_cache_retention: None,
         }),
         ..ProvidersConfig::default()
     };
@@ -95,6 +454,7 @@ async fn live_model_switch_routes_next_request_to_new_model() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -136,6 +496,57 @@ async fn live_model_switch_routes_next_request_to_new_model() {
 }
 
 #[tokio::test]
+async fn model_switch_carries_prompt_cache_retention() {
+    use crate::config::providers::{CapabilityStatus, PromptCacheRetention};
+
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_mut()
+        .expect("model switch harness installs provider override");
+    set_prompt_cache_retention_capability(
+        cfg,
+        "provider-b",
+        "model-b",
+        CapabilityStatus::Supported,
+    );
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: Some(PromptCacheRetention::Extended),
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(
+        driver.stack[0]
+            .agent
+            .params
+            .prompt_cache_retention
+            .as_deref(),
+        Some(PromptCacheRetention::EXTENDED_WIRE_VALUE)
+    );
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_ref()
+        .expect("model switch harness installs provider override");
+    assert_eq!(
+        cfg.active_model
+            .as_ref()
+            .and_then(|active| active.prompt_cache_retention),
+        Some(PromptCacheRetention::Extended)
+    );
+}
+
+#[tokio::test]
 async fn llm_mode_reresolved_on_model_switch() {
     use crate::config::extended::LlmMode;
     use crate::config::providers::ModelEntry;
@@ -166,6 +577,7 @@ async fn llm_mode_reresolved_on_model_switch() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -203,6 +615,7 @@ async fn live_model_switch_commits_config_and_session_together() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -236,6 +649,7 @@ async fn live_model_switch_from_subagent_frame_applies_to_active_child() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -268,6 +682,7 @@ async fn live_model_switch_persists_requested_reasoning_options() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: Some("xhigh".into()),
                 thinking_mode: Some("high".into()),
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -308,6 +723,7 @@ async fn live_model_switch_failure_leaves_config_and_session_on_old_model() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -357,6 +773,7 @@ async fn live_model_switch_session_persist_failure_rolls_back() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -391,6 +808,7 @@ async fn live_model_switch_config_write_failure_rolls_back() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -424,6 +842,7 @@ async fn live_model_switch_to_unconfigured_keeps_current_model() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -454,6 +873,7 @@ async fn live_model_switch_same_model_emits_state_without_rebuild() {
             model: "model-b".into(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         });
     }
 
@@ -465,6 +885,7 @@ async fn live_model_switch_same_model_emits_state_without_rebuild() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -490,9 +911,9 @@ async fn live_model_switch_same_model_emits_state_without_rebuild() {
         } => {
             assert_eq!(provider, "provider-a");
             assert_eq!(model, "model-a");
-            assert_eq!(config_provider.as_deref(), Some("provider-b"));
-            assert_eq!(config_model.as_deref(), Some("model-b"));
-            assert!(diverged);
+            assert_eq!(config_provider.as_deref(), Some("provider-a"));
+            assert_eq!(config_model.as_deref(), Some("model-a"));
+            assert!(!diverged);
             assert_eq!(generation, 1);
         }
         other => panic!("expected ActiveModelState, got {other:?}"),
@@ -518,6 +939,7 @@ async fn live_model_switch_same_model_is_noop() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -542,6 +964,7 @@ async fn live_model_switch_emits_active_model_state_event() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -584,6 +1007,7 @@ async fn live_model_switch_audit_record_failure_does_not_roll_back() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -686,6 +1110,7 @@ fn write_two_model_config(root: &std::path::Path, provider: &str, model: &str) {
             model: model.into(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         }))
         .unwrap();
 }
@@ -1031,6 +1456,7 @@ async fn model_switch_inside_subagent_frame_rebuilds_that_frame() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )
@@ -1071,6 +1497,7 @@ async fn model_switch_inside_subagent_frame_rebuild_failure_keeps_child() {
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             &tx,
         )

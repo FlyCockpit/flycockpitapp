@@ -355,6 +355,11 @@ pub enum Response {
         enabled: bool,
     },
 
+    /// The resulting `/longcache` session override state.
+    LongcacheState {
+        enabled: bool,
+    },
+
     /// The resulting trusted-only state after [`Request::SetTrustedOnly`].
     TrustedOnlyState {
         enabled: bool,
@@ -448,6 +453,7 @@ macro_rules! response_variants {
             (Response::SandboxEscalationState { .. }, "sandbox_escalation_state");
             (Response::RedactionState { .. }, "redaction_state");
             (Response::PreflightState { .. }, "preflight_state");
+            (Response::LongcacheState { .. }, "longcache_state");
             (Response::TrustedOnlyState { .. }, "trusted_only_state");
             (Response::ApprovalModeState { .. }, "approval_mode_state");
             (Response::DelegationRecursionState { .. }, "delegation_recursion_state");

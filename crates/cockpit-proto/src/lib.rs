@@ -1166,6 +1166,7 @@ pub struct LiveStatus {
 #[allow(unused_imports)]
 pub use cockpit_config::{
     config::extended::{ApprovalMode, LlmMode},
+    config::providers::PromptCacheRetention,
     config::sandbox_mode::SandboxMode,
 };
 

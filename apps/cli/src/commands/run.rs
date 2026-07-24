@@ -1362,6 +1362,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | CommandCapabilityUnavailable { session_id, .. }
         | RedactionState { session_id, .. }
         | PreflightState { session_id, .. }
+        | LongcacheState { session_id, .. }
         | TrustedOnlyState { session_id, .. }
         | ApprovalModeState { session_id, .. }
         | DelegationRecursionState { session_id, .. }

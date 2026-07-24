@@ -557,6 +557,11 @@ pub enum TurnEvent {
     /// Session-only — not persisted.
     PreflightState { enabled: bool },
 
+    /// Long prompt-cache retention intent was set/toggled for the session.
+    /// UI-only: the TUI mirrors this for `/longcache` status. Request params
+    /// still re-resolve against active-model capability and may omit the key.
+    LongcacheState { enabled: bool, supported: bool },
+
     /// Trusted-only inference mode was set/toggled for the session.
     /// UI-only: the TUI surfaces the resulting state as a toast and updates
     /// the live `/trusted-only` description mirror.

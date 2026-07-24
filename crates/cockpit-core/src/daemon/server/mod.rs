@@ -199,6 +199,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scan_ssh_keys: _,
         }
         | proto::Response::PreflightState { enabled: _ }
+        | proto::Response::LongcacheState { enabled: _ }
         | proto::Response::TrustedOnlyState { enabled: _ }
         | proto::Response::ApprovalModeState { mode: _ }
         | proto::Response::DelegationRecursionState {
@@ -495,6 +496,11 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         | proto::Event::TrustedOnlyState {
             session_id: _,
             enabled: _,
+        }
+        | proto::Event::LongcacheState {
+            session_id: _,
+            enabled: _,
+            supported: _,
         }
         | proto::Event::ApprovalModeState {
             session_id: _,

@@ -367,6 +367,7 @@ mod tests {
                 model: "model".into(),
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             }),
             ..Default::default()
         };

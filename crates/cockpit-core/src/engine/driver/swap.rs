@@ -16,25 +16,12 @@ use super::*;
 impl Driver {
     pub(in crate::engine::driver) async fn set_active_model_live(
         &mut self,
-        provider: &str,
-        model: &str,
+        target: crate::config::providers::ActiveModelRef,
         trigger: crate::session::ModelSwitchTrigger,
-        reasoning_effort: Option<String>,
-        thinking_mode: Option<String>,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
-        let target = crate::config::providers::ActiveModelRef {
-            provider: provider.to_string(),
-            model: model.to_string(),
-            reasoning_effort: reasoning_effort
-                .map(|value| crate::config::providers::ActiveReasoningEffort { value }),
-            thinking_mode: thinking_mode.and_then(|value| {
-                serde_json::from_value::<crate::config::providers::ThinkingMode>(
-                    serde_json::Value::String(value),
-                )
-                .ok()
-            }),
-        };
+        let provider = target.provider.as_str();
+        let model = target.model.as_str();
         let old_session_provider = self.session.active_provider();
         let old_session_model = self.session.active_model();
         let Some(active_idx) = self.active_frame_index() else {
@@ -42,7 +29,27 @@ impl Driver {
         };
         let current = &self.stack[active_idx].agent.model;
         let old_llm_mode = self.stack[active_idx].agent.llm_mode;
+        let old_prompt_cache_retention_preference = self.prompt_cache_retention_preference;
+        self.prompt_cache_retention_preference = target.prompt_cache_retention;
         if current.provider_id() == provider && current.model_id_ref() == model {
+            if self.live_config_active_model().as_ref() != Some(&target) {
+                if let Err(e) = self.write_active_model_config(&target) {
+                    self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: format!("Model settings for `{provider}/{model}` could not be saved — {e:#}."),
+                        })
+                        .await;
+                } else {
+                    for idx in 0..self.stack.len() {
+                        let retention =
+                            self.resolve_prompt_cache_retention_for(&self.stack[idx].agent.model);
+                        Arc::make_mut(&mut self.stack[idx].agent)
+                            .params
+                            .prompt_cache_retention = retention;
+                    }
+                }
+            }
             self.record_model_switch_audit(crate::session::ModelSwitchAudit {
                 from_provider: old_session_provider.as_deref(),
                 from_model: old_session_model.as_deref(),
@@ -54,6 +61,9 @@ impl Driver {
             })
             .await;
             self.emit_active_model_state(tx).await;
+            if self.prompt_cache_retention_override.is_some() {
+                self.emit_longcache_state(tx).await;
+            }
             return;
         }
         // The new model inherits the running model's shutdown gate so a daemon
@@ -73,6 +83,7 @@ impl Driver {
                 })
                 .await;
                 // Fail loudly, keep the current model active.
+                self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
                 let _ = tx
                     .send(TurnEvent::Notice {
                         text: format!(
@@ -104,6 +115,7 @@ impl Driver {
                         error: Some(&error),
                     })
                     .await;
+                    self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
                     let _ = tx
                         .send(TurnEvent::Notice {
                             text: format!(
@@ -118,6 +130,7 @@ impl Driver {
             };
         if let Err(e) = self.persist_active_model_session(provider, model) {
             let error = format!("{e:#}");
+            self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
             self.session
                 .restore_active_model_memory(old_session_provider, old_session_model);
             let restored_provider = self.session.active_provider();
@@ -145,6 +158,7 @@ impl Driver {
         }
         if let Err(e) = self.write_active_model_config(&target) {
             let error = format!("{e:#}");
+            self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
             if let (Some(old_provider), Some(old_model)) = (
                 old_session_provider.as_deref(),
                 old_session_model.as_deref(),
@@ -227,6 +241,9 @@ impl Driver {
         // prunable projection the chrome shows (cache-cold reflects the bust).
         self.emit_context_projection(tx).await;
         self.emit_active_model_state(tx).await;
+        if self.prompt_cache_retention_override.is_some() {
+            self.emit_longcache_state(tx).await;
+        }
     }
 
     /// Build a fresh [`Model`](crate::engine::model::Model) for `(provider,
@@ -260,6 +277,7 @@ impl Driver {
             model: model.to_string(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         };
         self.build_live_model_for_running_with_active(running, &active)
     }

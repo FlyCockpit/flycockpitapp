@@ -1168,6 +1168,14 @@ pub enum Event {
         enabled: bool,
     },
 
+    /// Long prompt-cache retention intent changed for the session
+    /// (`/longcache`). Session-only — reverts on restart.
+    LongcacheState {
+        session_id: Uuid,
+        enabled: bool,
+        supported: bool,
+    },
+
     /// Trusted-only inference mode was set/toggled for the session
     /// (`/trusted-only`). Broadcast to every attached client so they surface
     /// the resulting state and update the live slash-command description.
@@ -1366,6 +1374,7 @@ macro_rules! event_variants {
             (Event::CommandCapabilityUnavailable { .. }, "command_capability_unavailable");
             (Event::RedactionState { .. }, "redaction_state");
             (Event::PreflightState { .. }, "preflight_state");
+            (Event::LongcacheState { .. }, "longcache_state");
             (Event::TrustedOnlyState { .. }, "trusted_only_state");
             (Event::ApprovalModeState { .. }, "approval_mode_state");
             (Event::DelegationRecursionState { .. }, "delegation_recursion_state");

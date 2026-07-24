@@ -315,6 +315,7 @@ mod tests {
             model: "m".into(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         });
         cfg.providers.insert("p".into(), entry);
         sanitize_providers_for_portability(&mut cfg);
@@ -383,6 +384,7 @@ mod tests {
                 model: "old".into(),
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             }),
             ..Default::default()
         };
@@ -396,6 +398,7 @@ mod tests {
                 model: "new".into(),
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             }),
             ..Default::default()
         };

@@ -525,6 +525,8 @@ pub enum Request {
         reasoning_effort: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thinking_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_cache_retention: Option<PromptCacheRetention>,
     },
 
     /// Swap which built-in or user agent owns the conversation.
@@ -591,6 +593,14 @@ pub enum Request {
     /// on restart. Acked with the resulting state via
     /// [`Response::PreflightState`] (and the broadcast [`Event::PreflightState`]).
     SetPreflight {
+        #[serde(default)]
+        enabled: Option<bool>,
+    },
+
+    /// Set (or toggle) extended prompt-cache retention intent for the attached
+    /// session (`/longcache`). Session-only; the driver re-resolves support
+    /// against the active model's curated capability before sending a wire key.
+    SetLongcache {
         #[serde(default)]
         enabled: Option<bool>,
     },
@@ -830,6 +840,7 @@ macro_rules! request_variants {
             (Request::SetSandbox { .. }, "set_sandbox");
             (Request::SetSandboxEscalation { .. }, "set_sandbox_escalation");
             (Request::SetPreflight { .. }, "set_preflight");
+            (Request::SetLongcache { .. }, "set_longcache");
             (Request::SetTrustedOnly { .. }, "set_trusted_only");
             (Request::SetRedaction { .. }, "set_redaction");
             (Request::SetTandemModels { .. }, "set_tandem_models");
@@ -946,6 +957,7 @@ macro_rules! command {
             (Request::SetSandbox { .. }, "set_sandbox", session_writer, attached, true, serialized, none);
             (Request::SetSandboxEscalation { .. }, "set_sandbox_escalation", session_writer, attached, true, serialized, none);
             (Request::SetPreflight { .. }, "set_preflight", session_writer, attached, true, serialized, none);
+            (Request::SetLongcache { .. }, "set_longcache", session_writer, attached, true, serialized, none);
             (Request::SetTrustedOnly { .. }, "set_trusted_only", session_writer, attached, true, serialized, none);
             (Request::SetRedaction { .. }, "set_redaction", session_writer, attached, true, serialized, none);
             (Request::SetTandemModels { .. }, "set_tandem_models", session_writer, attached, true, serialized, none);

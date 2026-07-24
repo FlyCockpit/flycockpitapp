@@ -391,6 +391,24 @@ impl App {
             container_availability: self.container_availability.clone(),
             approval_mode: self.approval_mode,
             active_model: self.launch.active_model.clone(),
+            prompt_cache_retention: self
+                .config_snapshot
+                .providers
+                .active_model
+                .as_ref()
+                .and_then(|active| active.prompt_cache_retention)
+                .unwrap_or_default(),
+            prompt_cache_retention_status: self
+                .launch
+                .active_model
+                .as_ref()
+                .map(|(provider, model)| {
+                    self.config_snapshot
+                        .providers
+                        .resolve_capabilities(provider, model)
+                        .prompt_cache_retention
+                })
+                .unwrap_or_default(),
         };
         self.footer_selection = None;
         self.footer_agent_picker = None;
@@ -442,6 +460,27 @@ impl App {
                 ControlApplied::None,
             );
         }
+        if let Some(retention) = commit.prompt_cache_retention {
+            let Some(mut active) = self.config_snapshot.providers.active_model.clone() else {
+                self.push_plain("/quick: no active model selected".to_string());
+                return;
+            };
+            active.prompt_cache_retention = (!retention.is_default()).then_some(retention);
+            match write_active_model_preference(&self.launch.cwd, &active) {
+                Ok(()) => {
+                    self.config_snapshot.providers.active_model = Some(active.clone());
+                    self.send_daemon_request(
+                        "/quick",
+                        active_model_request(
+                            active,
+                            cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+                        ),
+                        ControlApplied::None,
+                    );
+                }
+                Err(error) => self.push_plain(format!("/quick: {error}")),
+            }
+        }
         if let Some((provider, model)) = commit.active_model {
             self.record_usage(
                 cockpit_core::daemon::proto::UsageKind::Model,
@@ -456,6 +495,7 @@ impl App {
                         model: model.clone(),
                         reasoning_effort: None,
                         thinking_mode: None,
+                        prompt_cache_retention: None,
                     },
                     cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
                 ),
@@ -647,6 +687,19 @@ impl App {
     }
 }
 
+fn write_active_model_preference(
+    cwd: &std::path::Path,
+    active: &cockpit_config::providers::ActiveModelRef,
+) -> anyhow::Result<()> {
+    let path = cockpit_config::dirs::config_write_target_for_provider(cwd, &active.provider)
+        .or_else(|| cockpit_config::dirs::most_specific_config_write_target(cwd))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no cockpit config found - run `/settings` to create one")
+        })?;
+    let mut doc = cockpit_config::providers::ConfigDoc::load(&path)?;
+    doc.write_active_model(Some(active))
+}
+
 fn active_model_request(
     active: cockpit_config::providers::ActiveModelRef,
     trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
@@ -661,5 +714,6 @@ fn active_model_request(
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_string))
         }),
+        prompt_cache_retention: active.prompt_cache_retention,
     }
 }

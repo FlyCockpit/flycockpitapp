@@ -1552,6 +1552,16 @@ impl SettingsCx {
         }
     }
 
+    fn apply_active_prompt_cache_retention_from_editor(&mut self, editor: &SettingsEditor) {
+        let Some(retention) = editor.active_prompt_cache_retention() else {
+            return;
+        };
+        let Some(active) = self.config.active_model.as_mut() else {
+            return;
+        };
+        active.prompt_cache_retention = (!retention.is_default()).then_some(retention);
+    }
+
     fn provider_oauth_logged_in(&self, provider: OAuthProvider) -> bool {
         match provider {
             OAuthProvider::Grok => {
@@ -1995,6 +2005,7 @@ impl SettingsCx {
             tmp.models = models.rows.clone();
             editor.write_into(&mut tmp);
             parent.entry.models = tmp.models;
+            self.apply_active_prompt_cache_retention_from_editor(editor);
             let _ = self.commit_edit_entry(parent);
             return Nav::Close;
         }
@@ -2007,6 +2018,7 @@ impl SettingsCx {
                 tmp.models = models.rows.clone();
                 editor.write_into(&mut tmp);
                 parent.entry.models = tmp.models;
+                self.apply_active_prompt_cache_retention_from_editor(editor);
                 parent.status = self.commit_edit_entry(parent);
                 Nav::Stay
             }
@@ -2026,6 +2038,7 @@ impl SettingsCx {
                 // The model-row edit is a self-contained override write, so
                 // we save rather than wait for the Edit page's `s`.
                 owned.entry.models = tmp.models.clone();
+                self.apply_active_prompt_cache_retention_from_editor(editor);
                 owned.status = self.commit_edit_entry(&owned);
                 let new_models = Box::new(ModelEditor::new(
                     owned
@@ -3729,7 +3742,14 @@ pub(super) fn active_model_settings_page(
             active.provider, active.model
         ));
     }
-    let settings = SettingsEditor::for_model(&active.provider, entry, &active.model);
+    let retention_status = config
+        .resolve_capabilities(&active.provider, &active.model)
+        .prompt_cache_retention;
+    let settings = SettingsEditor::for_model(&active.provider, entry, &active.model)
+        .with_active_prompt_cache_retention(
+            active.prompt_cache_retention.unwrap_or_default(),
+            retention_status,
+        );
     let models = Box::new(ModelEditor::new(
         entry
             .effective_template(&active.provider)

@@ -113,10 +113,145 @@ fn resolve_reasoning_effort_params_uses_native_mapping_and_default() {
             value: "xhigh".into(),
         }),
         thinking_mode: Some(ThinkingMode::High),
+        prompt_cache_retention: None,
     });
     assert_eq!(
         cfg.resolve_active_model_reasoning_params(),
         Some(serde_json::json!({ "reasoning_effort": "xhigh" }))
+    );
+}
+
+#[test]
+fn prompt_cache_retention_defaults_preserve_existing_config() {
+    let cfg: ProvidersConfig =
+        serde_json::from_str(r#"{"active_model":{"provider":"openai","model":"gpt-5.4"}}"#)
+            .unwrap();
+    assert_eq!(
+        cfg.active_model.as_ref().unwrap().prompt_cache_retention,
+        None
+    );
+
+    let value = serde_json::to_value(PromptCacheRetention::Extended).unwrap();
+    assert_eq!(value, serde_json::json!("extended"));
+}
+
+#[test]
+fn prompt_cache_retention_curated_seeds_pin_supported_and_unsupported_openai_families() {
+    for model_id in [
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.3-codex",
+        "gpt-5.2",
+        "gpt-5.1",
+        "gpt-5",
+        "gpt-5-codex",
+        "gpt-4.1",
+    ] {
+        let mut model = model(model_id, false);
+        apply_template_model_defaults(Some("openai"), &mut model);
+        assert_eq!(
+            model.capabilities.prompt_cache_retention,
+            CapabilityStatus::Supported,
+            "{model_id}"
+        );
+    }
+
+    for model_id in ["gpt-5.6", "gpt-5.7", "gpt-5.10"] {
+        let mut latest_default_24h = model(model_id, false);
+        apply_template_model_defaults(Some("openai"), &mut latest_default_24h);
+        assert_eq!(
+            latest_default_24h.capabilities.prompt_cache_retention,
+            CapabilityStatus::Unsupported,
+            "{model_id}"
+        );
+    }
+
+    let mut unknown = model("gpt-4o", false);
+    apply_template_model_defaults(Some("openai"), &mut unknown);
+    assert_eq!(
+        unknown.capabilities.prompt_cache_retention,
+        CapabilityStatus::Unknown
+    );
+}
+
+#[test]
+fn prompt_cache_retention_extended_resolves_only_for_supported_models() {
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "openai".into(),
+        ProviderEntry {
+            models: vec![
+                ModelEntry {
+                    id: "supported".into(),
+                    capabilities: ModelCapabilities {
+                        prompt_cache_retention: CapabilityStatus::Supported,
+                        ..ModelCapabilities::default()
+                    },
+                    ..ModelEntry::default()
+                },
+                ModelEntry {
+                    id: "unsupported".into(),
+                    capabilities: ModelCapabilities {
+                        prompt_cache_retention: CapabilityStatus::Unsupported,
+                        ..ModelCapabilities::default()
+                    },
+                    ..ModelEntry::default()
+                },
+                ModelEntry {
+                    id: "unknown".into(),
+                    ..ModelEntry::default()
+                },
+            ],
+            ..ProviderEntry::default()
+        },
+    );
+    cfg.active_model = Some(ActiveModelRef {
+        provider: "openai".into(),
+        model: "supported".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: Some(PromptCacheRetention::Extended),
+    });
+
+    assert_eq!(
+        cfg.resolve_prompt_cache_retention(
+            "openai",
+            "supported",
+            Some(PromptCacheRetention::Extended),
+        ),
+        Some(PromptCacheRetention::EXTENDED_WIRE_VALUE)
+    );
+    assert_eq!(
+        cfg.resolve_prompt_cache_retention(
+            "openai",
+            "supported",
+            Some(PromptCacheRetention::Default)
+        ),
+        None
+    );
+    assert_eq!(
+        cfg.resolve_prompt_cache_retention(
+            "openai",
+            "unsupported",
+            Some(PromptCacheRetention::Extended),
+        ),
+        None
+    );
+    assert_eq!(
+        cfg.resolve_prompt_cache_retention(
+            "openai",
+            "unknown",
+            Some(PromptCacheRetention::Extended)
+        ),
+        None
+    );
+    assert_eq!(
+        cfg.resolve_active_model_prompt_cache_retention(None),
+        Some(PromptCacheRetention::EXTENDED_WIRE_VALUE)
+    );
+    assert_eq!(
+        cfg.resolve_active_model_prompt_cache_retention(Some(PromptCacheRetention::Default)),
+        None
     );
 }
 

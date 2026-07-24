@@ -772,6 +772,7 @@ fn lmstudio_test_providers() -> crate::config::providers::ProvidersConfig {
             model: "session-model".to_string(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         }),
         ..ProvidersConfig::default()
     }
@@ -1752,6 +1753,7 @@ fn provider_snapshot_config() -> crate::config::providers::ProvidersConfig {
             model: "gpt-test".to_string(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         }),
         ..crate::config::providers::ProvidersConfig::default()
     }

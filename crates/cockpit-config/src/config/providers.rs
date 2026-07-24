@@ -270,6 +270,8 @@ pub struct ActiveModelRef {
     pub reasoning_effort: Option<ActiveReasoningEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_mode: Option<ThinkingMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1059,6 +1061,29 @@ pub enum CapabilityStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheRetention {
+    #[default]
+    Default,
+    Extended,
+}
+
+impl PromptCacheRetention {
+    pub const EXTENDED_WIRE_VALUE: &'static str = "24h";
+
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Extended => "extended",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilityValue {
     pub value: String,
@@ -1181,6 +1206,8 @@ pub struct ModelCapabilities {
     pub reasoning: CapabilityStatus,
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
     pub structured_outputs: CapabilityStatus,
+    #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
+    pub prompt_cache_retention: CapabilityStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffortCapability>,
     #[serde(default, skip_serializing_if = "ClientSideToolsCapability::is_empty")]
@@ -1201,6 +1228,7 @@ impl ModelCapabilities {
             && self.max_output_tokens_source.is_none()
             && self.reasoning.is_unknown()
             && self.structured_outputs.is_unknown()
+            && self.prompt_cache_retention.is_unknown()
             && self
                 .reasoning_effort
                 .as_ref()
@@ -1228,6 +1256,8 @@ pub struct ModelCapabilityOverrides {
     pub reasoning: Option<CapabilityStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_outputs: Option<CapabilityStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<CapabilityStatus>,
 }
 
 impl ModelCapabilityOverrides {
@@ -1240,6 +1270,7 @@ impl ModelCapabilityOverrides {
             && self.max_output_tokens.is_none()
             && self.reasoning.is_none()
             && self.structured_outputs.is_none()
+            && self.prompt_cache_retention.is_none()
     }
 }
 
@@ -1261,6 +1292,8 @@ pub struct ProviderCapabilities {
     pub reasoning: CapabilityStatus,
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
     pub structured_outputs: CapabilityStatus,
+    #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
+    pub prompt_cache_retention: CapabilityStatus,
     #[serde(default, skip_serializing_if = "ClientSideToolsCapability::is_empty")]
     pub client_side_tools: ClientSideToolsCapability,
     #[serde(default, skip_serializing_if = "ComputerUseCapability::is_empty")]
@@ -1277,6 +1310,7 @@ impl ProviderCapabilities {
             && self.max_output_tokens.is_none()
             && self.reasoning.is_unknown()
             && self.structured_outputs.is_unknown()
+            && self.prompt_cache_retention.is_unknown()
             && self.client_side_tools.is_empty()
             && self.computer_use.is_empty()
     }
@@ -2424,6 +2458,29 @@ impl ProvidersConfig {
             .thinking_mode
             .or_else(|| self.resolve_default_thinking_mode(&active.provider, &active.model))?;
         self.resolve_thinking_params(&active.provider, &active.model, mode)
+    }
+
+    pub fn resolve_prompt_cache_retention(
+        &self,
+        provider: &str,
+        model: &str,
+        selected: Option<PromptCacheRetention>,
+    ) -> Option<&'static str> {
+        if !matches!(selected, Some(PromptCacheRetention::Extended)) {
+            return None;
+        }
+        let caps = self.resolve_capabilities(provider, model);
+        matches!(caps.prompt_cache_retention, CapabilityStatus::Supported)
+            .then_some(PromptCacheRetention::EXTENDED_WIRE_VALUE)
+    }
+
+    pub fn resolve_active_model_prompt_cache_retention(
+        &self,
+        override_value: Option<PromptCacheRetention>,
+    ) -> Option<&'static str> {
+        let active = self.active_model.as_ref()?;
+        let selected = override_value.or(active.prompt_cache_retention);
+        self.resolve_prompt_cache_retention(&active.provider, &active.model, selected)
     }
 
     #[allow(dead_code)]

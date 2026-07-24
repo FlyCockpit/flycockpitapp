@@ -1836,6 +1836,63 @@ fn openai_additional_params_carries_prompt_cache_key_and_retention() {
 }
 
 #[test]
+fn retention_extended_maps_to_24h_only_when_capability_supported() {
+    use crate::config::providers::{
+        CapabilityStatus, ModelCapabilities, PromptCacheRetention, ProvidersConfig,
+    };
+    use std::collections::BTreeMap;
+
+    let mut cfg = ProvidersConfig {
+        providers: BTreeMap::from([("openai".to_string(), ProviderEntry::default())]),
+        ..ProvidersConfig::default()
+    };
+    let provider = cfg.providers.get_mut("openai").unwrap();
+    provider.models.push(ModelEntry {
+        id: "supported".to_string(),
+        capabilities: ModelCapabilities {
+            prompt_cache_retention: CapabilityStatus::Supported,
+            ..ModelCapabilities::default()
+        },
+        ..ModelEntry::default()
+    });
+    provider.models.push(ModelEntry {
+        id: "unsupported".to_string(),
+        capabilities: ModelCapabilities {
+            prompt_cache_retention: CapabilityStatus::Unsupported,
+            ..ModelCapabilities::default()
+        },
+        ..ModelEntry::default()
+    });
+
+    let additional_params_for = |model: &str, selected: PromptCacheRetention| {
+        let retention = cfg
+            .resolve_prompt_cache_retention("openai", model, Some(selected))
+            .map(str::to_string);
+        let params = ModelParams {
+            prompt_cache_retention: retention,
+            ..ModelParams::default()
+        };
+        openai_additional_params(&params).unwrap_or(serde_json::Value::Null)
+    };
+
+    let supported = additional_params_for("supported", PromptCacheRetention::Extended);
+    assert_eq!(supported["prompt_cache_retention"], json!("24h"));
+    assert!(
+        !serde_json::to_string(&supported)
+            .unwrap()
+            .contains("in_memory"),
+        "{supported}"
+    );
+
+    let unsupported = additional_params_for("unsupported", PromptCacheRetention::Extended);
+    assert_eq!(unsupported, serde_json::Value::Null);
+    let unknown = additional_params_for("unknown", PromptCacheRetention::Extended);
+    assert_eq!(unknown, serde_json::Value::Null);
+    let default = additional_params_for("supported", PromptCacheRetention::Default);
+    assert_eq!(default, serde_json::Value::Null);
+}
+
+#[test]
 fn openai_additional_params_unchanged_when_retention_unset() {
     let params = ModelParams {
         prompt_cache_key: Some("session-123".into()),
@@ -2649,6 +2706,7 @@ fn trust_test_config(trusted: bool) -> ProvidersConfig {
         model: "m".into(),
         reasoning_effort: None,
         thinking_mode: None,
+        prompt_cache_retention: None,
     });
     providers
 }
@@ -3238,6 +3296,7 @@ async fn capture_openai_body(
                     value: selected.into(),
                 }),
                 thinking_mode: None,
+                prompt_cache_retention: None,
             });
             model
                 .resolve_reasoning_params(&providers)
@@ -3363,6 +3422,7 @@ fn anthropic_unsupported_drops_legacy_thinking() {
             value: "high".into(),
         }),
         thinking_mode: Some(crate::config::providers::ThinkingMode::High),
+        prompt_cache_retention: None,
     });
     assert_eq!(model.resolve_reasoning_params(&providers), None);
 }

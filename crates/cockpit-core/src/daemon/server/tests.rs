@@ -1407,6 +1407,7 @@ fn stub_config_source() -> crate::daemon::config_source::ConfigSource {
                 model: "stub-model".to_string(),
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             }),
             ..crate::config::providers::ProvidersConfig::default()
         },
@@ -2775,6 +2776,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "SessionWork::SetPreflight delivered to attached worker",
         },
         MutatingDispatchCase {
+            kind: "set_longcache",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::SetLongcache delivered to attached worker",
+        },
+        MutatingDispatchCase {
             kind: "set_trusted_only",
             effect_class: DriverForwarded,
             observation: "SessionWork::SetTrustedOnly delivered to attached worker",
@@ -3072,6 +3078,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_session_llm_mode"
         | "set_delegation_recursion"
         | "set_preflight"
+        | "set_longcache"
         | "set_trusted_only"
         | "set_redaction"
         | "set_tandem_models"
@@ -3156,6 +3163,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("set_sandbox"),
         authz_session_writer("set_sandbox_escalation"),
         authz_session_writer("set_preflight"),
+        authz_session_writer("set_longcache"),
         authz_session_writer("set_trusted_only"),
         authz_session_writer("set_redaction"),
         authz_session_writer("set_tandem_models"),
@@ -3862,6 +3870,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "set_sandbox"
             | "set_sandbox_escalation"
             | "set_preflight"
+            | "set_longcache"
             | "set_trusted_only"
             | "set_redaction"
             | "set_tandem_models"
@@ -4107,6 +4116,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             trigger: proto::ActiveModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         },
         "set_agent" => Request::SetAgent {
             name: "Build".into(),
@@ -4128,6 +4138,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "set_sandbox_escalation" => Request::SetSandboxEscalation { enabled: false },
         "set_preflight" => Request::SetPreflight { enabled: None },
+        "set_longcache" => Request::SetLongcache { enabled: None },
         "set_trusted_only" => Request::SetTrustedOnly { enabled: None },
         "set_redaction" => Request::SetRedaction {
             scan_environment: Some(false),
@@ -4867,6 +4878,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "set_session_llm_mode"
         | "set_delegation_recursion"
         | "set_preflight"
+        | "set_longcache"
         | "set_trusted_only"
         | "set_redaction"
         | "set_tandem_models"
@@ -5015,6 +5027,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "set_session_llm_mode"
         | "set_delegation_recursion"
         | "set_preflight"
+        | "set_longcache"
         | "set_trusted_only"
         | "set_redaction"
         | "set_tandem_models"
@@ -5265,6 +5278,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             trigger: proto::ActiveModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         },
         "set_agent" => Request::SetAgent {
             name: "Build".into(),
@@ -5280,6 +5294,9 @@ async fn assert_worker_delivery_happy(kind: &str) {
             default_depth: 3,
         },
         "set_preflight" => Request::SetPreflight {
+            enabled: Some(true),
+        },
+        "set_longcache" => Request::SetLongcache {
             enabled: Some(true),
         },
         "set_trusted_only" => Request::SetTrustedOnly {
@@ -5414,6 +5431,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                         trigger,
                         reasoning_effort,
                         thinking_mode,
+                        prompt_cache_retention,
                     },
                 ) => {
                     assert_eq!(provider, "openai");
@@ -5424,6 +5442,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     ));
                     assert_eq!(reasoning_effort, None);
                     assert_eq!(thinking_mode, None);
+                    assert_eq!(prompt_cache_retention, None);
                 }
                 ("set_agent", SessionWork::SetAgent { name }) => {
                     assert_eq!(name, "Build");
@@ -5445,6 +5464,9 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert_eq!(default_depth, 3);
                 }
                 ("set_preflight", SessionWork::SetPreflight { enabled }) => {
+                    assert_eq!(enabled, Some(true));
+                }
+                ("set_longcache", SessionWork::SetLongcache { enabled }) => {
                     assert_eq!(enabled, Some(true));
                 }
                 ("set_trusted_only", SessionWork::SetTrustedOnly { enabled }) => {
@@ -5546,6 +5568,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             trigger: proto::ActiveModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         },
         "set_agent" => Request::SetAgent {
             name: "Build".into(),
@@ -5567,6 +5590,7 @@ async fn assert_attached_required_malformed(kind: &str) {
         },
         "set_sandbox_escalation" => Request::SetSandboxEscalation { enabled: false },
         "set_preflight" => Request::SetPreflight { enabled: None },
+        "set_longcache" => Request::SetLongcache { enabled: None },
         "set_trusted_only" => Request::SetTrustedOnly { enabled: None },
         "set_redaction" => Request::SetRedaction {
             scan_environment: Some(false),
@@ -6885,6 +6909,7 @@ async fn dispatch_attach_delivers_config_snapshot_event() {
         model: "m".to_string(),
         reasoning_effort: None,
         thinking_mode: None,
+        prompt_cache_retention: None,
     });
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         providers,
@@ -6948,6 +6973,7 @@ async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
                     model: "m".to_string(),
                     reasoning_effort: None,
                     thinking_mode: None,
+                    prompt_cache_retention: None,
                 });
                 Ok((
                     providers,
@@ -7099,6 +7125,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_re
         "set_sandbox",
         "set_sandbox_escalation",
         "set_preflight",
+        "set_longcache",
         "set_trusted_only",
         "set_redaction",
         "set_tandem_models",
@@ -7765,6 +7792,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 trigger: proto::ActiveModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             },
             kind: "set_active_model",
             session_id: Some(attached_session_id),
@@ -7839,6 +7867,15 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 enabled: Some(true),
             },
             kind: "set_preflight",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::SetLongcache {
+                enabled: Some(true),
+            },
+            kind: "set_longcache",
             session_id: Some(attached_session_id),
             audit_path: None,
             mutating: true,
@@ -8107,6 +8144,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SetSandbox,
         SetSandboxEscalation,
         SetPreflight,
+        SetLongcache,
         SetTrustedOnly,
         SetRedaction,
         SetTandemModels,
@@ -9177,6 +9215,7 @@ async fn list_models_returns_resolved_models() {
             model: "gpt-a".to_string(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         }),
         ..crate::config::providers::ProvidersConfig::default()
     };
@@ -9235,6 +9274,7 @@ async fn list_models_response_contains_no_secrets() {
             model: "safe-model".to_string(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         }),
         ..crate::config::providers::ProvidersConfig::default()
     };
@@ -9551,6 +9591,7 @@ async fn serialized_requests_apply_in_receipt_order() {
                     trigger: proto::ActiveModelSwitchTrigger::Daemon,
                     reasoning_effort: None,
                     thinking_mode: None,
+                    prompt_cache_retention: None,
                 },
             ),
         ))))
@@ -9579,6 +9620,7 @@ async fn serialized_requests_apply_in_receipt_order() {
             trigger,
             reasoning_effort,
             thinking_mode,
+            prompt_cache_retention,
         } => {
             assert_eq!(provider, "openai");
             assert_eq!(model, "gpt-5");
@@ -9588,6 +9630,7 @@ async fn serialized_requests_apply_in_receipt_order() {
             ));
             assert_eq!(reasoning_effort, None);
             assert_eq!(thinking_mode, None);
+            assert_eq!(prompt_cache_retention, None);
         }
         other => panic!("expected SetActiveModel before message, got {other:?}"),
     }
@@ -11412,6 +11455,7 @@ async fn attach_resolves_model_from_injected_config_source() {
             model: "injected-model".to_string(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         }),
         ..crate::config::providers::ProvidersConfig::default()
     };

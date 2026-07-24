@@ -155,15 +155,17 @@ pub fn apply_copilot_model_mode_defaults(template: Option<&str>, model: &mut Mod
 }
 
 fn apply_openai_capability_defaults(model: &mut ModelEntry) {
-    // Source: https://platform.openai.com/docs/models
+    // Source: OpenAI/Azure prompt-caching docs, rechecked 2026-07-24.
     let id = model.id.to_ascii_lowercase();
     if id.starts_with("gpt-5") {
         fill_chat_core(model, 400_000, Some(128_000));
         fill_images(model, true);
         fill_reasoning(model, CapabilityStatus::Supported);
+        fill_prompt_cache_retention(model, openai_prompt_cache_retention_status(&id));
     } else if id.starts_with("gpt-4.1") {
         fill_chat_core(model, 1_000_000, Some(32_768));
         fill_images(model, true);
+        fill_prompt_cache_retention(model, CapabilityStatus::Supported);
     } else if id.starts_with("gpt-4o") {
         fill_chat_core(model, 128_000, Some(16_384));
         fill_images(model, true);
@@ -171,6 +173,29 @@ fn apply_openai_capability_defaults(model: &mut ModelEntry) {
         fill_chat_core(model, 200_000, Some(100_000));
         fill_images(model, true);
         fill_reasoning(model, CapabilityStatus::Supported);
+    }
+}
+
+fn openai_prompt_cache_retention_status(id: &str) -> CapabilityStatus {
+    if id == "gpt-5" || id.starts_with("gpt-5-codex") {
+        return CapabilityStatus::Supported;
+    }
+    let Some(rest) = id.strip_prefix("gpt-5.") else {
+        return CapabilityStatus::Unknown;
+    };
+    let minor = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    let Ok(minor) = minor.parse::<u32>() else {
+        return CapabilityStatus::Unknown;
+    };
+    if (1..=5).contains(&minor) {
+        CapabilityStatus::Supported
+    } else if minor >= 6 {
+        CapabilityStatus::Unsupported
+    } else {
+        CapabilityStatus::Unknown
     }
 }
 
@@ -288,6 +313,10 @@ fn fill_images(model: &mut ModelEntry, images: bool) {
 
 fn fill_reasoning(model: &mut ModelEntry, status: CapabilityStatus) {
     fill_status(&mut model.capabilities.reasoning, status);
+}
+
+fn fill_prompt_cache_retention(model: &mut ModelEntry, status: CapabilityStatus) {
+    fill_status(&mut model.capabilities.prompt_cache_retention, status);
 }
 
 fn fill_status(field: &mut CapabilityStatus, status: CapabilityStatus) {

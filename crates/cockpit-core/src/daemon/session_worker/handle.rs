@@ -1232,6 +1232,7 @@ pub enum SessionWork {
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<String>,
+        prompt_cache_retention: Option<crate::config::providers::PromptCacheRetention>,
     },
     SetAgent {
         name: String,
@@ -1267,6 +1268,12 @@ pub enum SessionWork {
     /// resulting state. **Session-only** — no config-file write. `None`
     /// toggles the driver's current effective state.
     SetPreflight {
+        enabled: Option<bool>,
+    },
+    /// Set (or toggle) long prompt-cache retention intent for the running
+    /// session. The driver owns the session-only override and capability
+    /// resolution. **Session-only** — no config-file write.
+    SetLongcache {
         enabled: Option<bool>,
     },
     /// Set (or toggle) trusted-only inference mode for the running session.

@@ -405,6 +405,12 @@
     },
     "response": "guidance_estimate"
   },
+  "longcache_state": {
+    "data": {
+      "enabled": true
+    },
+    "response": "longcache_state"
+  },
   "lsp_control_result": {
     "data": {
       "message": "message-fixture"

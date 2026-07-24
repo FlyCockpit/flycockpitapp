@@ -129,6 +129,13 @@ fn describe_preflight(app: &App, _: &SlashCommand) -> String {
     )
 }
 
+fn describe_longcache(app: &App, _: &SlashCommand) -> String {
+    format!(
+        "{} Keep prompt-cache prefixes under extended retention for this session (arg: on/off; bare = toggle)",
+        on_off(app.longcache_enabled)
+    )
+}
+
 fn describe_trusted_only(app: &App, _: &SlashCommand) -> String {
     format!(
         "{} Require trusted models for every inference (arg: on/off/default on/default off; bare = toggle)",
@@ -481,6 +488,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         run: run_model_settings,
         available: available_always,
         describe: describe_static,
+    },
+    SlashCommand {
+        name: "longcache",
+        description: "Toggle extended prompt-cache retention for this session",
+        takes_args: true,
+        run: run_longcache,
+        available: available_always,
+        describe: describe_longcache,
     },
     SlashCommand {
         name: "mouse",
@@ -988,6 +1003,11 @@ fn run_toggle_redaction(app: &mut App, args: &str) -> bool {
 
 fn run_preflight(app: &mut App, args: &str) -> bool {
     app.handle_preflight_command(args);
+    false
+}
+
+fn run_longcache(app: &mut App, args: &str) -> bool {
+    app.handle_longcache_command(args);
     false
 }
 
@@ -1815,6 +1835,25 @@ impl App {
         self.send_daemon_request(
             "/preflight",
             cockpit_core::daemon::proto::Request::SetPreflight { enabled },
+            ControlApplied::None,
+        );
+    }
+
+    pub(super) fn handle_longcache_command(&mut self, args: &str) {
+        let enabled = match args.trim().to_ascii_lowercase().as_str() {
+            "" => None,
+            "on" | "enable" | "enabled" => Some(true),
+            "off" | "disable" | "disabled" => Some(false),
+            other => {
+                self.push_plain(format!(
+                    "/longcache: unknown arg `{other}` — use `on`, `off`, or no arg to toggle"
+                ));
+                return;
+            }
+        };
+        self.send_daemon_request(
+            "/longcache",
+            cockpit_core::daemon::proto::Request::SetLongcache { enabled },
             ControlApplied::None,
         );
     }

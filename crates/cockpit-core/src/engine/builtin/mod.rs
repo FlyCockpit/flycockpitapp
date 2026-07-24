@@ -2412,6 +2412,7 @@ mod tests {
                 model: "local".into(),
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             }),
             ..ProvidersConfig::default()
         };
@@ -4936,6 +4937,7 @@ mod tests {
                 model: "override".into(),
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             }),
             ..ProvidersConfig::default()
         };

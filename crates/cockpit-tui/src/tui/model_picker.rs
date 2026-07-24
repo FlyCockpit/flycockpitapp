@@ -31,8 +31,8 @@ use cockpit_config::dirs::{
     COCKPIT_CONFIG_ENV, config_file_paths_for_load, config_write_target_for_provider,
 };
 use cockpit_config::providers::{
-    ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ConfigDoc, ModelEntry, ProviderEntry,
-    ProvidersConfig, ReasoningEffortCapability, ThinkingMode,
+    ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ConfigDoc, ModelEntry,
+    PromptCacheRetention, ProviderEntry, ProvidersConfig, ReasoningEffortCapability, ThinkingMode,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -373,6 +373,7 @@ impl ModelPickerDialog {
                         active.model,
                         active.reasoning_effort,
                         active.thinking_mode,
+                        active.prompt_cache_retention,
                     );
                 }
                 let entry_cursor = self.pick.cursor().saturating_sub(drift_offset);
@@ -398,6 +399,7 @@ impl ModelPickerDialog {
                         return self.commit_active_model(
                             entry.provider_id,
                             entry.model_id,
+                            None,
                             None,
                             None,
                         );
@@ -463,7 +465,7 @@ impl ModelPickerDialog {
                 let mode = modes.get(*cursor).copied();
                 let p = provider_id.clone();
                 let m = model_id.clone();
-                return self.commit_active_model(p, m, None, mode);
+                return self.commit_active_model(p, m, None, mode, None);
             }
             _ => {}
         }
@@ -499,7 +501,7 @@ impl ModelPickerDialog {
                     });
                 let p = provider_id.clone();
                 let m = model_id.clone();
-                return self.commit_active_model(p, m, effort, None);
+                return self.commit_active_model(p, m, effort, None, None);
             }
             _ => {}
         }
@@ -512,12 +514,14 @@ impl ModelPickerDialog {
         model_id: String,
         reasoning_effort: Option<ActiveReasoningEffort>,
         thinking_mode: Option<ThinkingMode>,
+        prompt_cache_retention: Option<PromptCacheRetention>,
     ) -> bool {
         self.cfg.active_model = Some(ActiveModelRef {
             provider: provider_id,
             model: model_id,
             reasoning_effort,
             thinking_mode,
+            prompt_cache_retention,
         });
         self.done = true;
         true
@@ -1033,6 +1037,7 @@ pub fn cycle_active_favorite(
         model: target.model_id.clone(),
         reasoning_effort: None,
         thinking_mode: None,
+        prompt_cache_retention: None,
     };
     Ok(Some(active))
 }
@@ -1262,6 +1267,7 @@ mod tests {
                 model: "a".to_string(),
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             }),
         }));
         let rendered = rendered_text(&mut drifted, 100, 20);
@@ -1292,6 +1298,7 @@ mod tests {
                 model: "config".to_string(),
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             }),
         };
         let mut dialog = dialog_with(vec![entry("a"), entry("b")]);
@@ -1499,6 +1506,7 @@ mod tests {
                 model: "a".into(),
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             }))
             .unwrap();
 

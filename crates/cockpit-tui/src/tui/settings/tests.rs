@@ -1347,6 +1347,7 @@ fn save_config_preserves_untouched_provider_file_disk_edits() {
         model: "m1".into(),
         reasoning_effort: None,
         thinking_mode: None,
+        prompt_cache_retention: None,
     });
     d.save_config().unwrap();
 

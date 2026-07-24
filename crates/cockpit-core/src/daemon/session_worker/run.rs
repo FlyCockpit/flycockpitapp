@@ -1453,6 +1453,7 @@ pub(super) async fn run_worker(
                     trigger,
                     reasoning_effort,
                     thinking_mode,
+                    prompt_cache_retention,
                 } => {
                     // Mid-session model switch (implementation note):
                     // route the new `(provider, model)` to the running driver. The
@@ -1470,6 +1471,7 @@ pub(super) async fn run_worker(
                             trigger,
                             reasoning_effort,
                             thinking_mode,
+                            prompt_cache_retention,
                         },
                         &event_tx,
                         &turn_completions,
@@ -1487,6 +1489,7 @@ pub(super) async fn run_worker(
                     respond_to,
                 } => {
                     let result = replace_config_snapshot(&config_snapshot, *snapshot);
+                    let changed = result.changed;
                     let generation = send_config_snapshot_event_if_changed(
                         &event_tx,
                         &redaction,
@@ -1494,6 +1497,20 @@ pub(super) async fn run_worker(
                         session_id,
                         result,
                     );
+                    if changed
+                        && !send_driver_control_or_fail(
+                            &driver_control_tx,
+                            crate::engine::driver::DriverControl::RefreshPromptCacheRetention,
+                            &event_tx,
+                            &turn_completions,
+                            &redaction,
+                            session_id,
+                            &mut driver_failed,
+                        )
+                        .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
                     let _ = respond_to.send(generation);
                 }
                 SessionWork::SetAgent { name } => {
@@ -1702,6 +1719,21 @@ pub(super) async fn run_worker(
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::SetPreflight { enabled },
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
+                SessionWork::SetLongcache { enabled } => {
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::SetLongcache { enabled },
                         &event_tx,
                         &turn_completions,
                         &redaction,

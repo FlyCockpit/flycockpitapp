@@ -1296,6 +1296,17 @@ impl App {
                     ToastKind::Info,
                 );
             }
+            TurnEvent::LongcacheState { enabled, supported } => {
+                let changed = self.longcache_enabled != enabled;
+                self.longcache_enabled = enabled;
+                self.longcache_supported = supported;
+                if changed {
+                    self.show_toast(
+                        format!("longcache {}", if enabled { "on" } else { "off" }),
+                        ToastKind::Info,
+                    );
+                }
+            }
             TurnEvent::TrustedOnlyState { enabled } => {
                 self.trusted_only_enabled = enabled;
                 self.show_toast(

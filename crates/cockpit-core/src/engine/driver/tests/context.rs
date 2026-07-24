@@ -383,6 +383,7 @@ async fn active_context_length_uses_probed_capability() {
                 model: "local".into(),
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             }),
             ..ProvidersConfig::default()
         },
@@ -2289,6 +2290,7 @@ async fn no_context_length_makes_ctx_gated_paths_inert() {
                 model: "local".into(),
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             }),
             ..ProvidersConfig::default()
         },

@@ -808,6 +808,7 @@ pub(super) async fn handle_serialized_request(
             trigger,
             reasoning_effort,
             thinking_mode,
+            prompt_cache_retention,
         } => {
             let att = require_attached(state)?;
             att.handle
@@ -817,6 +818,7 @@ pub(super) async fn handle_serialized_request(
                     trigger: active_model_trigger_from_proto(trigger),
                     reasoning_effort,
                     thinking_mode,
+                    prompt_cache_retention,
                 })
                 .await
                 .map_err(internal)?;
@@ -921,6 +923,15 @@ pub(super) async fn handle_serialized_request(
             let att = require_attached(state)?;
             att.handle
                 .send_work(SessionWork::SetPreflight { enabled })
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
+        Request::SetLongcache { enabled } => {
+            let att = require_attached(state)?;
+            att.handle
+                .send_work(SessionWork::SetLongcache { enabled })
                 .await
                 .map_err(internal)?;
             Ok(Response::Ack)

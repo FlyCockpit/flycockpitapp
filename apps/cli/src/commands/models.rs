@@ -312,6 +312,7 @@ mod tests {
             model: "gpt-5-mini".to_string(),
             reasoning_effort: None,
             thinking_mode: Some(ThinkingMode::High),
+            prompt_cache_retention: None,
         });
 
         let out = render_models(&cfg, Some("openai")).unwrap();

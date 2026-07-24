@@ -151,6 +151,7 @@ impl ConfigDriftState {
             model: model.to_string(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         })
     }
 
@@ -2037,6 +2038,13 @@ pub struct App {
     /// `/preflight` can toggle the right way. Never persisted — the driver's
     /// effective override is also session-only.
     pub(super) preflight_enabled: bool,
+    /// Session-only `/longcache` intent. The daemon driver owns the
+    /// authoritative override; this mirror drives slash descriptions and
+    /// status chrome. Unsupported active models still omit the wire key.
+    pub(super) longcache_enabled: bool,
+    /// Daemon-resolved prompt-cache retention support for the actual foreground
+    /// model. The footer uses this rather than re-inferring from launch config.
+    pub(super) longcache_supported: bool,
     /// Live trusted-only inference state (`/trusted-only`). Seeded from
     /// `trustedOnly` config at launch and kept in sync by daemon broadcasts.
     pub(super) trusted_only_enabled: bool,
@@ -2826,6 +2834,18 @@ impl App {
         let rich_text_copy = tui_cfg.rich_text_copy;
         let use_emojis = tui_cfg.use_emojis;
         let attention = tui_cfg.attention;
+        let longcache_supported = launch
+            .active_model
+            .as_ref()
+            .is_some_and(|(provider, model)| {
+                providers
+                    .resolve_prompt_cache_retention(
+                        provider,
+                        model,
+                        Some(cockpit_config::providers::PromptCacheRetention::Extended),
+                    )
+                    .is_some()
+            });
         let initial_agent_path = vec![launch.agent_name.clone()];
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let mut app = Self {
@@ -3000,6 +3020,8 @@ impl App {
             redact_scan_dotenv,
             redact_scan_ssh_keys,
             preflight_enabled,
+            longcache_enabled: false,
+            longcache_supported,
             trusted_only_enabled,
             sandbox_escalation_enabled,
             approval_mode,

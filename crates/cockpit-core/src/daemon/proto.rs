@@ -555,6 +555,13 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                 enabled,
             }]
         }
+        TurnEvent::LongcacheState { enabled, supported } => {
+            vec![Event::LongcacheState {
+                session_id,
+                enabled,
+                supported,
+            }]
+        }
         TurnEvent::TrustedOnlyState { enabled } => {
             vec![Event::TrustedOnlyState {
                 session_id,

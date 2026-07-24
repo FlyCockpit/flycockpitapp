@@ -319,6 +319,7 @@ pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<Option<PathBuf
             model: model_id.clone(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         });
     let active_changed = next_active
         .as_ref()

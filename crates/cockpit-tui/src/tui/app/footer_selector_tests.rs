@@ -289,6 +289,8 @@ fn config_drift_hover_restyles_span() {
         &app.agent_path,
         app.hovered_footer_control,
         app.sandbox_escalation_enabled,
+        false,
+        true,
     );
     let drift = status
         .spans

@@ -1404,6 +1404,7 @@ mod tests {
                 model: "parent-model".to_string(),
                 reasoning_effort: None,
                 thinking_mode: None,
+                prompt_cache_retention: None,
             }),
             ..ProvidersConfig::default()
         }

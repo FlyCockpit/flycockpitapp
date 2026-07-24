@@ -537,6 +537,12 @@
     },
     "request": "set_llm_mode"
   },
+  "set_longcache": {
+    "params": {
+      "enabled": true
+    },
+    "request": "set_longcache"
+  },
   "set_preflight": {
     "params": {
       "enabled": true

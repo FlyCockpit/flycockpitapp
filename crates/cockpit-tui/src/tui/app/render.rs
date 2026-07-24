@@ -3251,6 +3251,8 @@ impl App {
             &self.agent_path,
             self.hovered_footer_control.or(self.footer_selection),
             self.sandbox_escalation_enabled,
+            self.longcache_enabled,
+            self.longcache_supported,
         );
         let mut left = status.spans;
         // Transient async-schedule strip (GOALS §22): only when ≥1 scheduled

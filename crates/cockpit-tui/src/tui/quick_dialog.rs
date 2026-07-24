@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use cockpit_config::extended::{ApprovalMode, LlmMode};
-use cockpit_config::providers::ModelTrust;
+use cockpit_config::providers::{CapabilityStatus, ModelTrust, PromptCacheRetention};
 use cockpit_core::tools::sandbox_mode::SandboxMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +43,8 @@ pub struct QuickCurrent {
     pub container_availability: cockpit_core::container::ContainerAvailability,
     pub approval_mode: ApprovalMode,
     pub active_model: Option<(String, String)>,
+    pub prompt_cache_retention: PromptCacheRetention,
+    pub prompt_cache_retention_status: CapabilityStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -54,6 +56,7 @@ pub struct QuickCommit {
     pub container_network_enabled: Option<bool>,
     pub approval_mode: Option<ApprovalMode>,
     pub active_model: Option<(String, String)>,
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,15 +72,17 @@ enum Tab {
     Trust,
     Sandbox,
     Permissions,
+    Cache,
     Model,
 }
 
-const TABS: [Tab; 6] = [
+const TABS: [Tab; 7] = [
     Tab::Mode,
     Tab::Recursion,
     Tab::Trust,
     Tab::Sandbox,
     Tab::Permissions,
+    Tab::Cache,
     Tab::Model,
 ];
 
@@ -91,13 +96,14 @@ pub struct QuickDialog {
     current: QuickCurrent,
     models: Vec<QuickModelChoice>,
     tab: usize,
-    cursors: [usize; 6],
+    cursors: [usize; 7],
     staged_llm_mode: Option<LlmMode>,
     staged_recursion: Option<RecursionChoice>,
     staged_trusted_only: Option<bool>,
     staged_sandbox_mode: Option<SandboxMode>,
     staged_container_network_enabled: Option<bool>,
     staged_approval_mode: Option<ApprovalMode>,
+    staged_prompt_cache_retention: Option<PromptCacheRetention>,
     staged_model: Option<usize>,
 }
 
@@ -146,13 +152,14 @@ impl QuickDialog {
             current,
             models,
             tab: 0,
-            cursors: [0; 6],
+            cursors: [0; 7],
             staged_llm_mode: None,
             staged_recursion: None,
             staged_trusted_only: None,
             staged_sandbox_mode: None,
             staged_container_network_enabled: None,
             staged_approval_mode: None,
+            staged_prompt_cache_retention: None,
             staged_model: None,
         };
         dialog.align_cursors_to_current();
@@ -272,7 +279,11 @@ impl QuickDialog {
             .iter()
             .position(|mode| *mode == self.current.approval_mode)
             .unwrap_or(0);
-        self.cursors[5] = self
+        self.cursors[5] = retention_options()
+            .iter()
+            .position(|retention| *retention == self.current.prompt_cache_retention)
+            .unwrap_or(0);
+        self.cursors[6] = self
             .current
             .active_model
             .as_ref()
@@ -304,6 +315,7 @@ impl QuickDialog {
             Tab::Trust => 2,
             Tab::Sandbox => sandbox_mode_options().len() + 1,
             Tab::Permissions => approval_options().len(),
+            Tab::Cache => retention_options().len(),
             Tab::Model => self.models.len().max(1),
         }
     }
@@ -339,6 +351,15 @@ impl QuickDialog {
             }
             Tab::Permissions => {
                 self.staged_approval_mode = Some(approval_options()[self.cursors[self.tab]]);
+            }
+            Tab::Cache => {
+                let retention = retention_options()[self.cursors[self.tab]];
+                if retention == PromptCacheRetention::Extended
+                    && !retention_supported(self.current.prompt_cache_retention_status)
+                {
+                    return;
+                }
+                self.staged_prompt_cache_retention = Some(retention);
             }
             Tab::Model => {
                 if !self.models.is_empty() {
@@ -387,6 +408,11 @@ impl QuickDialog {
             && mode != self.current.approval_mode
         {
             commit.approval_mode = Some(mode);
+        }
+        if let Some(retention) = self.staged_prompt_cache_retention
+            && retention != self.current.prompt_cache_retention
+        {
+            commit.prompt_cache_retention = Some(retention);
         }
         if let Some(index) = self.staged_model
             && let Some(choice) = self.models.get(index)
@@ -518,6 +544,25 @@ impl QuickDialog {
                     )
                 })
                 .collect(),
+            Tab::Cache => retention_options()
+                .iter()
+                .enumerate()
+                .map(|(i, retention)| {
+                    let disabled = *retention == PromptCacheRetention::Extended
+                        && !retention_supported(self.current.prompt_cache_retention_status);
+                    self.option_line(
+                        i,
+                        retention.as_label(),
+                        retention_description(
+                            *retention,
+                            self.current.prompt_cache_retention_status,
+                        ),
+                        self.current.prompt_cache_retention == *retention,
+                        self.staged_prompt_cache_retention == Some(*retention),
+                        disabled,
+                    )
+                })
+                .collect(),
             Tab::Model => {
                 if self.models.is_empty() {
                     vec![self.option_line(
@@ -624,6 +669,7 @@ impl Tab {
             Tab::Trust => "Trust",
             Tab::Sandbox => "Sandbox",
             Tab::Permissions => "Permissions",
+            Tab::Cache => "Cache",
             Tab::Model => "Model",
         }
     }
@@ -644,6 +690,36 @@ fn sandbox_mode_options() -> &'static [SandboxMode] {
         SandboxMode::Container,
         SandboxMode::ContainerReadonly,
     ]
+}
+
+fn retention_options() -> &'static [PromptCacheRetention] {
+    &[
+        PromptCacheRetention::Default,
+        PromptCacheRetention::Extended,
+    ]
+}
+
+fn retention_supported(status: CapabilityStatus) -> bool {
+    matches!(status, CapabilityStatus::Supported)
+}
+
+fn retention_description(
+    retention: PromptCacheRetention,
+    status: CapabilityStatus,
+) -> &'static str {
+    match retention {
+        PromptCacheRetention::Default => "provider default",
+        PromptCacheRetention::Extended if retention_supported(status) => "24h retention",
+        PromptCacheRetention::Extended
+            if matches!(
+                status,
+                CapabilityStatus::Unsupported | CapabilityStatus::RequiresEntitlement
+            ) =>
+        {
+            "unsupported by this model"
+        }
+        PromptCacheRetention::Extended => "not verified for this model",
+    }
 }
 
 fn sandbox_mode_label(mode: SandboxMode) -> &'static str {
@@ -749,6 +825,8 @@ mod tests {
             },
             approval_mode: ApprovalMode::Manual,
             active_model: Some(("p".to_string(), "a".to_string())),
+            prompt_cache_retention: PromptCacheRetention::Default,
+            prompt_cache_retention_status: CapabilityStatus::Supported,
         }
     }
 
@@ -976,7 +1054,7 @@ mod tests {
     #[test]
     fn disabled_empty_favorite_model_tab() {
         let mut dialog = QuickDialog::open(current(), Vec::new());
-        for _ in 0..5 {
+        for _ in 0..6 {
             dialog.handle_key(key(KeyCode::Tab));
         }
         assert_eq!(dialog.active_tab(), Tab::Model);

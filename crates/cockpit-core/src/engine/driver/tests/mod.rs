@@ -78,6 +78,7 @@ fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, 
             model: "local".into(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         }),
         ..ProvidersConfig::default()
     };
@@ -217,6 +218,7 @@ fn learn_driver(
             model: "local".into(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         }),
         ..ProvidersConfig::default()
     };
@@ -918,6 +920,7 @@ fn install_test_providers(
             model: "local".into(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         }),
         ..ProvidersConfig::default()
     };
@@ -1246,6 +1249,7 @@ fn two_model_providers_config() -> crate::config::providers::ProvidersConfig {
             model: "model-a".into(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         }),
         ..ProvidersConfig::default()
     }

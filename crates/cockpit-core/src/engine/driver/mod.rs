@@ -145,6 +145,16 @@ pub enum DriverControl {
     /// emits [`TurnEvent::PreflightState`] with the resulting state. Session-
     /// only — no config write; reverts on restart (mirrors [`Self::SetRedaction`]).
     SetPreflight { enabled: Option<bool> },
+    /// Set (or toggle) the session-only prompt-cache retention override
+    /// (`/longcache`). `Some(true)` arms extended retention intent,
+    /// `Some(false)` clears it, and `None` toggles. The driver re-resolves
+    /// the effective wire key against curated active-model capability.
+    SetLongcache { enabled: Option<bool> },
+    /// Re-read the active-model prompt-cache retention preference from the
+    /// shared session config snapshot and re-resolve current frame params.
+    /// Used after `RefreshConfig` so `/model-settings` edits affect the
+    /// running session without a second model switch.
+    RefreshPromptCacheRetention,
     /// Set a session-only root delegation recursion override (`/quick`).
     /// Root delegation still obeys existing allowed-target and per-agent
     /// max-depth policy; this only overrides the default enabled/depth values.
@@ -171,6 +181,7 @@ pub enum DriverControl {
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<String>,
+        prompt_cache_retention: Option<crate::config::providers::PromptCacheRetention>,
     },
     /// Set the session's model-comparison tandem (shadow) set
     /// (`/model-comparison`, implementation note).
@@ -560,6 +571,13 @@ pub struct Driver {
     /// session. Never persisted — reverts on restart (mirrors the
     /// `SetRedaction` session-only override shape).
     preflight_override: Option<bool>,
+    /// Session-only prompt-cache retention override (`/longcache`). It stores
+    /// user intent only; unsupported active models omit the wire key.
+    prompt_cache_retention_override: Option<crate::config::providers::PromptCacheRetention>,
+    /// Persisted preference for the active model, mirrored in memory so a
+    /// same-model preference write updates request params before the next
+    /// config re-resolution reaches the session handle.
+    prompt_cache_retention_preference: Option<crate::config::providers::PromptCacheRetention>,
     /// Session-only root delegation recursion override (`/quick`). `None`
     /// defers to layered config; `Some` replaces only the root default
     /// enabled/depth values while preserving allowed-target and max-depth
@@ -1181,6 +1199,8 @@ impl Driver {
             skills_no_utility_model_logged: self.skills_no_utility_model_logged,
             injection_no_scan_logged: self.injection_no_scan_logged,
             preflight_override: self.preflight_override,
+            prompt_cache_retention_override: self.prompt_cache_retention_override,
+            prompt_cache_retention_preference: self.prompt_cache_retention_preference,
             delegation_recursion_override: self.delegation_recursion_override,
             preflight_guard_logged: self.preflight_guard_logged,
             active_model_refresh_failure_notice: self.active_model_refresh_failure_notice.clone(),
@@ -1485,6 +1505,8 @@ impl Driver {
             skills_no_utility_model_logged: false,
             injection_no_scan_logged: false,
             preflight_override: None,
+            prompt_cache_retention_override: None,
+            prompt_cache_retention_preference: None,
             delegation_recursion_override: None,
             preflight_guard_logged: false,
             active_model_refresh_failure_notice: None,
@@ -1607,6 +1629,9 @@ impl Driver {
         self.refresh_active_model_for_turn(active_idx, tx).await;
         self.refresh_active_tool_surface_for_turn(active_idx, tx)
             .await;
+        if self.prompt_cache_retention_override.is_some() {
+            self.emit_longcache_state(tx).await;
+        }
     }
 
     async fn refresh_active_model_for_turn(
@@ -1817,6 +1842,7 @@ impl Driver {
     ) {
         self.schedule.set_config_handle(config.clone());
         self.config = config;
+        self.refresh_prompt_cache_retention_from_config();
     }
 
     /// Refresh the driver's config handle from the layered config on disk for
@@ -3166,6 +3192,40 @@ impl Driver {
                 self.preflight_override = Some(target);
                 let _ = tx.send(TurnEvent::PreflightState { enabled: target }).await;
             }
+            DriverControl::SetLongcache { enabled } => {
+                let currently_on = self.prompt_cache_retention_override.is_some();
+                let target = enabled.unwrap_or(!currently_on);
+                if target && !self.active_model_prompt_cache_retention_supported() {
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: "/longcache: extended prompt-cache retention is not verified for the active model".to_string(),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(TurnEvent::LongcacheState {
+                            enabled: currently_on,
+                            supported: false,
+                        })
+                        .await;
+                } else {
+                    self.prompt_cache_retention_override =
+                        target.then_some(crate::config::providers::PromptCacheRetention::Extended);
+                    for idx in 0..self.stack.len() {
+                        let retention =
+                            self.resolve_prompt_cache_retention_for(&self.stack[idx].agent.model);
+                        Arc::make_mut(&mut self.stack[idx].agent)
+                            .params
+                            .prompt_cache_retention = retention;
+                    }
+                    self.emit_longcache_state(tx).await;
+                }
+            }
+            DriverControl::RefreshPromptCacheRetention => {
+                self.refresh_prompt_cache_retention_from_config();
+                if self.prompt_cache_retention_override.is_some() {
+                    self.emit_longcache_state(tx).await;
+                }
+            }
             DriverControl::SetDelegationRecursion {
                 enabled,
                 default_depth,
@@ -3190,16 +3250,22 @@ impl Driver {
                 trigger,
                 reasoning_effort,
                 thinking_mode,
+                prompt_cache_retention,
             } => {
-                self.set_active_model_live(
-                    &provider,
-                    &model,
-                    trigger,
-                    reasoning_effort,
-                    thinking_mode,
-                    tx,
-                )
-                .await;
+                let target = crate::config::providers::ActiveModelRef {
+                    provider,
+                    model,
+                    reasoning_effort: reasoning_effort
+                        .map(|value| crate::config::providers::ActiveReasoningEffort { value }),
+                    thinking_mode: thinking_mode.and_then(|value| {
+                        serde_json::from_value::<crate::config::providers::ThinkingMode>(
+                            serde_json::Value::String(value),
+                        )
+                        .ok()
+                    }),
+                    prompt_cache_retention,
+                };
+                self.set_active_model_live(target, trigger, tx).await;
             }
         }
     }
@@ -4096,6 +4162,61 @@ impl Driver {
         Ok(self.config.providers())
     }
 
+    fn resolve_prompt_cache_retention_for(
+        &self,
+        model: &crate::engine::model::Model,
+    ) -> Option<String> {
+        self.live_providers_config()
+            .ok()?
+            .resolve_prompt_cache_retention(
+                model.provider_id(),
+                model.model_id_ref(),
+                self.prompt_cache_retention_override
+                    .or(self.prompt_cache_retention_preference),
+            )
+            .map(str::to_string)
+    }
+
+    fn active_model_prompt_cache_retention_supported(&self) -> bool {
+        let Some(active_idx) = self.active_frame_index() else {
+            return false;
+        };
+        let model = &self.stack[active_idx].agent.model;
+        self.live_providers_config()
+            .ok()
+            .and_then(|cfg| {
+                cfg.resolve_prompt_cache_retention(
+                    model.provider_id(),
+                    model.model_id_ref(),
+                    Some(crate::config::providers::PromptCacheRetention::Extended),
+                )
+            })
+            .is_some()
+    }
+
+    async fn emit_longcache_state(&self, tx: &mpsc::Sender<TurnEvent>) {
+        let _ = tx
+            .send(TurnEvent::LongcacheState {
+                enabled: self.prompt_cache_retention_override.is_some(),
+                supported: self.active_model_prompt_cache_retention_supported(),
+            })
+            .await;
+    }
+
+    fn refresh_prompt_cache_retention_from_config(&mut self) {
+        self.prompt_cache_retention_preference =
+            self.live_providers_config().ok().and_then(|cfg| {
+                cfg.active_model
+                    .and_then(|active| active.prompt_cache_retention)
+            });
+        for idx in 0..self.stack.len() {
+            let retention = self.resolve_prompt_cache_retention_for(&self.stack[idx].agent.model);
+            Arc::make_mut(&mut self.stack[idx].agent)
+                .params
+                .prompt_cache_retention = retention;
+        }
+    }
+
     /// Re-load a foreground frame under `new_model` (live model switch),
     /// preserving its name and applying the caller's re-resolved LLM mode. The
     /// new model's reasoning params are
@@ -4114,12 +4235,14 @@ impl Driver {
         // config's active-model thinking mode; fall back to none when the config
         // can't be read or no mode is selected.
         let additional_params = self.resolve_thinking_params_for(&new_model);
+        let prompt_cache_retention = self.resolve_prompt_cache_retention_for(&new_model);
         refreshed.model = new_model;
         refreshed.llm_mode = llm_mode;
         refreshed.params = crate::engine::model::ModelParams {
             additional_params,
             // The cache key is the session id — model-agnostic, carried across.
             prompt_cache_key: self.stack[frame_idx].agent.params.prompt_cache_key.clone(),
+            prompt_cache_retention,
             ..crate::engine::model::ModelParams::default()
         };
         refreshed
@@ -4133,6 +4256,7 @@ impl Driver {
     ) -> (String, crate::engine::builtin::SpawnArgs) {
         let name = self.stack[frame_idx].agent.name.clone();
         let additional_params = self.resolve_thinking_params_for(&new_model);
+        let prompt_cache_retention = self.resolve_prompt_cache_retention_for(&new_model);
         // Every frame on `self.stack` is foreground/user-facing: index 0 is the
         // root primary, and deeper frames are interactive subagents. One-shot
         // noninteractive delegations run off-stack, so rebuilding a stack frame
@@ -4146,6 +4270,7 @@ impl Driver {
             additional_params,
             // The cache key is the session id — model-agnostic, carried across.
             prompt_cache_key: self.stack[frame_idx].agent.params.prompt_cache_key.clone(),
+            prompt_cache_retention,
             ..crate::engine::model::ModelParams::default()
         };
         (name, args)
@@ -4956,6 +5081,9 @@ impl Driver {
                 target: self.active_queue_target(),
             })
             .await;
+        if self.prompt_cache_retention_override.is_some() {
+            self.emit_longcache_state(tx).await;
+        }
         // Resolve compact-after-delegation for the now-resumed parent frame.
         let parent_depth = self.stack.len().saturating_sub(1);
         if let Some(pending) = self.deleg_shrinks.remove(&parent_depth) {
@@ -5174,6 +5302,9 @@ impl Driver {
                     parent.history.push(result);
                 }
             }
+        }
+        if self.prompt_cache_retention_override.is_some() {
+            self.emit_longcache_state(tx).await;
         }
     }
 
@@ -6076,6 +6207,9 @@ impl Driver {
                             target: self.active_queue_target(),
                         })
                         .await;
+                    if self.prompt_cache_retention_override.is_some() {
+                        self.emit_longcache_state(tx).await;
+                    }
                     let brief = if seeds_truncated {
                         format!("{brief}{SEED_PREFILL_TRUNCATION_NOTE}")
                     } else {
@@ -6568,9 +6702,14 @@ impl Driver {
     }
 
     fn spawn_args(&self, interactive: bool) -> crate::engine::builtin::SpawnArgs {
+        let mut params = self.stack[0].agent.params.clone();
+        if !interactive {
+            params.prompt_cache_key = None;
+            params.prompt_cache_retention = None;
+        }
         crate::engine::builtin::SpawnArgs {
             model: self.stack[0].agent.model.clone(),
-            params: self.stack[0].agent.params.clone(),
+            params,
             env_overlay: self.stack[0].agent.env_overlay.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),

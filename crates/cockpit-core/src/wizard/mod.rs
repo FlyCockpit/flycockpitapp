@@ -1906,6 +1906,7 @@ mod tests {
             model: "m1".to_string(),
             reasoning_effort: None,
             thinking_mode: None,
+            prompt_cache_retention: None,
         });
         cfg
     }

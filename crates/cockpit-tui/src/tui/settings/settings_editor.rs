@@ -62,9 +62,10 @@ use cockpit_config::extended::LlmMode;
 use cockpit_config::providers::{
     BackupConfig, CacheConfig, CacheMode, CapabilitySource, CapabilityStatus,
     ClientSideToolsCapability, ContextConfig, MODEL_SYSTEM_PROMPT_MAX_BYTES, ModelEntry,
-    ModelLocation, ModelTrust, ProviderEntry, ShrinkConfig, ShrinkStrategy, ThinkingMode,
-    TimeoutConfig, WireApi, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT, is_anthropic_native_base_url,
-    is_xai_grok_provider, model_system_prompt_too_large, normalize_model_system_prompt,
+    ModelLocation, ModelTrust, PromptCacheRetention, ProviderEntry, ShrinkConfig, ShrinkStrategy,
+    ThinkingMode, TimeoutConfig, WireApi, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT,
+    is_anthropic_native_base_url, is_xai_grok_provider, model_system_prompt_too_large,
+    normalize_model_system_prompt,
 };
 
 /// Which scope the editor is bound to.
@@ -116,6 +117,7 @@ pub(super) enum ProviderSettingId {
     AutoPrunePrunablePct,
     CacheTtlSecs,
     CacheMode,
+    PromptCacheRetention,
     ShrinkStrategy,
     /// Inference first-token (TTFT) timeout in seconds
     /// (implementation note).
@@ -165,6 +167,7 @@ const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
     ProviderSettingId::AutoPrunePrunablePct,
     ProviderSettingId::CacheTtlSecs,
     ProviderSettingId::CacheMode,
+    ProviderSettingId::PromptCacheRetention,
     ProviderSettingId::ShrinkStrategy,
     ProviderSettingId::TimeoutTtftSecs,
     ProviderSettingId::TimeoutIdleSecs,
@@ -223,6 +226,7 @@ impl ProviderSettingId {
             Self::AutoPrunePrunablePct => "Auto-prune prunable %",
             Self::CacheTtlSecs => "Cache time (seconds)",
             Self::CacheMode => "Cache mode",
+            Self::PromptCacheRetention => "Prompt cache retention",
             Self::ShrinkStrategy => "Shrink strategy",
             Self::TimeoutTtftSecs => "First-token threshold (s)",
             Self::TimeoutIdleSecs => "Idle threshold (s)",
@@ -315,6 +319,9 @@ impl ProviderSettingId {
             ),
             Self::CacheMode => Some(
                 "Whether this endpoint caches the prompt prefix. none means pruning is treated as always free, so auto-prune may fire at any boundary; ephemeral protects a warm cache (Anthropic, OpenAI/Codex, and z.ai all cache — use ephemeral there).",
+            ),
+            Self::PromptCacheRetention => Some(
+                "Active model preference for OpenAI prompt-cache retention. extended sends 24h only for verified model families; unsupported and unknown models keep the provider default.",
             ),
             Self::ShrinkStrategy => Some(
                 "How the parent context is shrunk while a subagent runs: prune (lossless dedup) or compact (LLM summarization; heavier, saves more). Separate from the Auto-prune/Auto-compact triggers above.",
@@ -426,6 +433,8 @@ pub(super) struct SettingsEditor {
     /// `mode.is_some()` directly, so it has no flag here.
     context_present: bool,
     cache_present: bool,
+    active_prompt_cache_retention: Option<PromptCacheRetention>,
+    active_prompt_cache_retention_status: CapabilityStatus,
     shrink_present: bool,
     timeout_present: bool,
     wire_api_present: bool,
@@ -493,11 +502,18 @@ impl SettingsEditor {
             provider_trust_confirm_lockout: Duration::ZERO,
             context_present: true,
             cache_present: true,
+            active_prompt_cache_retention: None,
+            active_prompt_cache_retention_status: CapabilityStatus::Unknown,
             shrink_present: true,
             timeout_present: true,
             wire_api_present: true,
             show_wire_api,
-            fields: Self::derive_fields(false, show_wire_api, show_xai_multi_agent_tools_beta),
+            fields: Self::derive_fields(
+                false,
+                show_wire_api,
+                show_xai_multi_agent_tools_beta,
+                false,
+            ),
             editing: None,
             buf: TextField::default(),
             status: None,
@@ -594,11 +610,18 @@ impl SettingsEditor {
             provider_trust_confirm_lockout: Duration::ZERO,
             context_present: model.is_some_and(|m| m.context.is_some()),
             cache_present: model.is_some_and(|m| m.cache.is_some()),
+            active_prompt_cache_retention: None,
+            active_prompt_cache_retention_status: CapabilityStatus::Unknown,
             shrink_present: model.is_some_and(|m| m.shrink.is_some()),
             timeout_present: model.is_some_and(|m| m.timeout.is_some()),
             wire_api_present: model.is_some_and(|m| !m.wire_api.is_auto()),
             show_wire_api,
-            fields: Self::derive_fields(true, show_wire_api, show_xai_multi_agent_tools_beta),
+            fields: Self::derive_fields(
+                true,
+                show_wire_api,
+                show_xai_multi_agent_tools_beta,
+                false,
+            ),
             editing: None,
             buf: TextField::default(),
             status: None,
@@ -613,6 +636,26 @@ impl SettingsEditor {
         self.show_xai_multi_agent_tools_beta
     }
 
+    pub(super) fn with_active_prompt_cache_retention(
+        mut self,
+        retention: PromptCacheRetention,
+        status: CapabilityStatus,
+    ) -> Self {
+        self.active_prompt_cache_retention = Some(retention);
+        self.active_prompt_cache_retention_status = status;
+        self.fields = Self::derive_fields(
+            self.is_model_scope(),
+            self.show_wire_api,
+            self.show_xai_multi_agent_tools_beta,
+            true,
+        );
+        self
+    }
+
+    pub(super) fn active_prompt_cache_retention(&self) -> Option<PromptCacheRetention> {
+        self.active_prompt_cache_retention
+    }
+
     /// The ordered field list for this editor. Cached at construction (see
     /// [`Self::derive_fields`]) and borrowed here, since the inputs that shape
     /// it are fixed for the editor's lifetime. Provider scope leads with the
@@ -623,7 +666,7 @@ impl SettingsEditor {
         &self.fields
     }
 
-    /// Build the ordered field list from the three inputs that shape it. Called
+    /// Build the ordered field list from the inputs that shape it. Called
     /// once per constructor; the result is cached in the `fields` field. Keeping
     /// the derivation in one place means a new row is added once, not once per
     /// scope/flag variant.
@@ -631,9 +674,10 @@ impl SettingsEditor {
         is_model_scope: bool,
         show_wire_api: bool,
         show_xai_multi_agent_tools_beta: bool,
+        show_active_retention: bool,
     ) -> Vec<ProviderSettingId> {
         use ProviderSettingId::*;
-        let mut fields = Vec::with_capacity(22);
+        let mut fields = Vec::with_capacity(32);
         // Provider-only transport security opt-in leads the list; model scope
         // cannot override it.
         if !is_model_scope {
@@ -667,10 +711,11 @@ impl SettingsEditor {
             AutoPrunePrunablePct,
             CacheTtlSecs,
             CacheMode,
-            ShrinkStrategy,
-            TimeoutTtftSecs,
-            TimeoutIdleSecs,
         ]);
+        if show_active_retention {
+            fields.push(PromptCacheRetention);
+        }
+        fields.extend([ShrinkStrategy, TimeoutTtftSecs, TimeoutIdleSecs]);
         // Wire API precedes the xAI opt-in; both sit between the timeout rows
         // and the backup/mode tail.
         if show_wire_api {
@@ -747,6 +792,7 @@ impl SettingsEditor {
             | ProviderSettingId::AutoPrunePrunablePct => self.context_present,
             ProviderSettingId::AutoPruneEnabled => self.auto_prune.is_some(),
             ProviderSettingId::CacheTtlSecs | ProviderSettingId::CacheMode => self.cache_present,
+            ProviderSettingId::PromptCacheRetention => self.active_prompt_cache_retention.is_some(),
             ProviderSettingId::ShrinkStrategy => self.shrink_present,
             ProviderSettingId::TimeoutTtftSecs | ProviderSettingId::TimeoutIdleSecs => {
                 self.timeout_present
@@ -869,6 +915,33 @@ impl SettingsEditor {
                 CacheMode::None => "none".to_string(),
                 CacheMode::Ephemeral => "ephemeral".to_string(),
             },
+            ProviderSettingId::PromptCacheRetention => {
+                match self.active_prompt_cache_retention.unwrap_or_default() {
+                    PromptCacheRetention::Default => {
+                        match self.active_prompt_cache_retention_status {
+                            CapabilityStatus::Supported => "default".to_string(),
+                            CapabilityStatus::Unsupported
+                            | CapabilityStatus::RequiresEntitlement => {
+                                "default (extended unsupported)".to_string()
+                            }
+                            CapabilityStatus::Unknown => {
+                                "default (extended not verified)".to_string()
+                            }
+                        }
+                    }
+                    PromptCacheRetention::Extended => match self
+                        .active_prompt_cache_retention_status
+                    {
+                        CapabilityStatus::Supported => "extended (24h)".to_string(),
+                        CapabilityStatus::Unsupported | CapabilityStatus::RequiresEntitlement => {
+                            "extended (unsupported by this model)".to_string()
+                        }
+                        CapabilityStatus::Unknown => {
+                            "extended (not verified for this model)".to_string()
+                        }
+                    },
+                }
+            }
             ProviderSettingId::ShrinkStrategy => match self.shrink.strategy {
                 ShrinkStrategy::Prune => "prune".to_string(),
                 ShrinkStrategy::Compact => "compact".to_string(),
@@ -936,6 +1009,7 @@ impl SettingsEditor {
             ProviderSettingId::CacheTtlSecs | ProviderSettingId::CacheMode => {
                 self.cache_present = true
             }
+            ProviderSettingId::PromptCacheRetention => {}
             ProviderSettingId::ShrinkStrategy => self.shrink_present = true,
             ProviderSettingId::TimeoutTtftSecs | ProviderSettingId::TimeoutIdleSecs => {
                 self.timeout_present = true
@@ -1011,6 +1085,9 @@ impl SettingsEditor {
             | ProviderSettingId::AutoPrunePrunablePct => self.context_present = false,
             ProviderSettingId::CacheTtlSecs | ProviderSettingId::CacheMode => {
                 self.cache_present = false
+            }
+            ProviderSettingId::PromptCacheRetention => {
+                self.active_prompt_cache_retention = Some(PromptCacheRetention::Default);
             }
             ProviderSettingId::ShrinkStrategy => self.shrink_present = false,
             ProviderSettingId::TimeoutTtftSecs | ProviderSettingId::TimeoutIdleSecs => {
@@ -1160,6 +1237,44 @@ impl SettingsEditor {
                     CacheMode::Ephemeral => CacheMode::None,
                 };
                 self.mark_present(field);
+            }
+            ProviderSettingId::PromptCacheRetention => {
+                let current = self.active_prompt_cache_retention.unwrap_or_default();
+                self.active_prompt_cache_retention = Some(match current {
+                    PromptCacheRetention::Default => {
+                        if matches!(
+                            self.active_prompt_cache_retention_status,
+                            CapabilityStatus::Supported
+                        ) {
+                            PromptCacheRetention::Extended
+                        } else {
+                            self.status = Some(match self.active_prompt_cache_retention_status {
+                                CapabilityStatus::Unsupported
+                                | CapabilityStatus::RequiresEntitlement => {
+                                    "prompt cache retention is not supported for this model"
+                                        .to_string()
+                                }
+                                CapabilityStatus::Unknown => {
+                                    "prompt cache retention is not verified for this model"
+                                        .to_string()
+                                }
+                                CapabilityStatus::Supported => unreachable!(),
+                            });
+                            PromptCacheRetention::Default
+                        }
+                    }
+                    PromptCacheRetention::Extended => PromptCacheRetention::Default,
+                });
+                if !matches!(
+                    self.active_prompt_cache_retention,
+                    Some(PromptCacheRetention::Default)
+                ) || matches!(
+                    self.active_prompt_cache_retention_status,
+                    CapabilityStatus::Supported
+                ) {
+                    self.status = None;
+                }
+                return;
             }
             ProviderSettingId::ShrinkStrategy => {
                 self.shrink.strategy = match self.shrink.strategy {
@@ -2774,6 +2889,118 @@ mod tests {
     }
 
     #[test]
+    fn model_settings_and_quick_edit_same_retention_preference() {
+        use crate::tui::quick_dialog::{QuickCurrent, QuickDialog, QuickModelChoice, QuickOutcome};
+        use cockpit_config::extended::{ApprovalMode, LlmMode};
+        use cockpit_core::container::{ContainerAvailability, ContainerRuntimeKind};
+        use cockpit_core::tools::sandbox_mode::SandboxMode;
+
+        let entry = provider_with_model();
+        let mut settings = SettingsEditor::for_model("p", &entry, "m1")
+            .with_active_prompt_cache_retention(
+                PromptCacheRetention::Default,
+                CapabilityStatus::Supported,
+            );
+        settings.cursor = settings
+            .fields()
+            .iter()
+            .position(|field| *field == ProviderSettingId::PromptCacheRetention)
+            .unwrap();
+        settings.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            settings.active_prompt_cache_retention(),
+            Some(PromptCacheRetention::Extended)
+        );
+
+        let current_quick_retention = || QuickCurrent {
+            llm_mode: LlmMode::Defensive,
+            recursion_enabled: true,
+            recursion_depth: 2,
+            trusted_only: false,
+            sandbox_mode: SandboxMode::Sandbox,
+            container_network_enabled: false,
+            container_availability: ContainerAvailability {
+                runtime: Some(ContainerRuntimeKind::Docker),
+                harness_in_container: false,
+                available: true,
+                reason: None,
+            },
+            approval_mode: ApprovalMode::Manual,
+            active_model: Some(("p".to_string(), "m1".to_string())),
+            prompt_cache_retention: PromptCacheRetention::Default,
+            prompt_cache_retention_status: CapabilityStatus::Supported,
+        };
+
+        let mut quick = QuickDialog::open(
+            current_quick_retention(),
+            vec![QuickModelChoice {
+                provider_id: "p".to_string(),
+                model_id: "m1".to_string(),
+                label: "p/m1".to_string(),
+                trust: ModelTrust::Trusted,
+                mode: LlmMode::Normal,
+            }],
+        );
+        for _ in 0..5 {
+            quick.handle_key(press(KeyCode::Tab));
+        }
+        quick.handle_key(press(KeyCode::Down));
+        match quick.handle_key(press(KeyCode::Enter)) {
+            Some(QuickOutcome::Commit(commit)) => assert_eq!(
+                commit.prompt_cache_retention,
+                Some(PromptCacheRetention::Extended)
+            ),
+            other => panic!("expected quick commit, got {other:?}"),
+        }
+
+        let mut unsupported_settings = SettingsEditor::for_model("p", &entry, "m1")
+            .with_active_prompt_cache_retention(
+                PromptCacheRetention::Default,
+                CapabilityStatus::Unsupported,
+            );
+        unsupported_settings.cursor = unsupported_settings
+            .fields()
+            .iter()
+            .position(|field| *field == ProviderSettingId::PromptCacheRetention)
+            .unwrap();
+        unsupported_settings.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            unsupported_settings.active_prompt_cache_retention(),
+            Some(PromptCacheRetention::Default)
+        );
+        assert!(
+            unsupported_settings
+                .value_str(ProviderSettingId::PromptCacheRetention)
+                .contains("unsupported")
+        );
+        assert!(
+            unsupported_settings
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("not supported"))
+        );
+
+        let mut unsupported_current = current_quick_retention();
+        unsupported_current.prompt_cache_retention_status = CapabilityStatus::Unsupported;
+        let mut unsupported_quick = QuickDialog::open(unsupported_current, Vec::new());
+        for _ in 0..5 {
+            unsupported_quick.handle_key(press(KeyCode::Tab));
+        }
+        unsupported_quick.handle_key(press(KeyCode::Down));
+        assert!(
+            unsupported_quick
+                .snapshot()
+                .contains("unsupported by this model")
+        );
+        match unsupported_quick.handle_key(press(KeyCode::Enter)) {
+            Some(QuickOutcome::Commit(commit)) => {
+                assert_eq!(commit.prompt_cache_retention, None)
+            }
+            other => panic!("expected quick commit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn field_lists_match_expected_for_every_scope_and_flag_variant() {
         use ProviderSettingId::*;
         // Independent oracle: the single canonical maximal ordering, each row
@@ -2820,27 +3047,36 @@ mod tests {
             (HintToolCallCorrections, false, false, false, false),
         ];
 
-        // Drive the visibility flags directly so the assertion covers all eight
+        // Drive the visibility flags directly so the assertion covers all
         // combinations regardless of provider detection.
         for is_model in [false, true] {
             for wire in [false, true] {
                 for xai in [false, true] {
-                    let expected: Vec<ProviderSettingId> = canonical
-                        .iter()
-                        .filter(|(_, provider_only, model_only, wire_only, xai_only)| {
-                            (!provider_only || !is_model)
-                                && (!model_only || is_model)
-                                && (!wire_only || wire)
-                                && (!xai_only || xai)
-                        })
-                        .map(|(f, ..)| *f)
-                        .collect();
+                    for active_retention in [false, true] {
+                        let mut expected: Vec<ProviderSettingId> = canonical
+                            .iter()
+                            .filter(|(_, provider_only, model_only, wire_only, xai_only)| {
+                                (!provider_only || !is_model)
+                                    && (!model_only || is_model)
+                                    && (!wire_only || wire)
+                                    && (!xai_only || xai)
+                            })
+                            .map(|(f, ..)| *f)
+                            .collect();
+                        if active_retention {
+                            let cache_mode = expected
+                                .iter()
+                                .position(|field| *field == CacheMode)
+                                .unwrap();
+                            expected.insert(cache_mode + 1, PromptCacheRetention);
+                        }
 
-                    assert_eq!(
-                        SettingsEditor::derive_fields(is_model, wire, xai),
-                        expected,
-                        "mismatch for is_model={is_model} wire={wire} xai={xai}"
-                    );
+                        assert_eq!(
+                            SettingsEditor::derive_fields(is_model, wire, xai, active_retention),
+                            expected,
+                            "mismatch for is_model={is_model} wire={wire} xai={xai} active_retention={active_retention}"
+                        );
+                    }
                 }
             }
         }

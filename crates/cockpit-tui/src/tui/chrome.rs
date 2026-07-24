@@ -78,6 +78,8 @@ pub fn left_status(
     agent_path: &[String],
     selected: Option<FooterControl>,
     sandbox_escalation_enabled: bool,
+    longcache_enabled: bool,
+    longcache_supported: bool,
 ) -> LeftStatus {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -175,6 +177,19 @@ pub fn left_status(
         start,
         end: col,
     });
+
+    if longcache_enabled {
+        push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
+        let (label, style) = if longcache_supported {
+            ("longcache".to_string(), muted)
+        } else {
+            (
+                "longcache unsupported".to_string(),
+                Style::default().fg(Color::Yellow),
+            )
+        };
+        push_span(&mut spans, &mut col, Span::styled(label, style));
+    }
 
     push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
     let escalation_style = if sandbox_escalation_enabled {
@@ -415,6 +430,8 @@ mod tests {
             std::slice::from_ref(&info.agent_name),
             None,
             true,
+            false,
+            true,
         )
         .spans;
         let agent = spans
@@ -438,6 +455,8 @@ mod tests {
             std::slice::from_ref(&info.agent_name),
             None,
             true,
+            false,
+            true,
         )
         .spans;
         let model = spans
@@ -457,6 +476,8 @@ mod tests {
             LlmMode::Defensive,
             std::slice::from_ref(&info.agent_name),
             None,
+            true,
+            false,
             true,
         )
         .spans;
@@ -487,6 +508,8 @@ mod tests {
             std::slice::from_ref(&info.agent_name),
             None,
             true,
+            false,
+            true,
         )
         .spans;
         assert!(!spans.iter().any(|span| span.content == "model ≠ config"));
@@ -505,6 +528,8 @@ mod tests {
             LlmMode::Defensive,
             std::slice::from_ref(&info.agent_name),
             Some(FooterControl::ConfigDrift),
+            true,
+            false,
             true,
         );
         let drift_idx = status
@@ -561,6 +586,8 @@ mod tests {
             &path,
             Some(FooterControl::Mode),
             true,
+            false,
+            true,
         );
         let text = status
             .spans
@@ -593,6 +620,40 @@ mod tests {
             mode.style
                 .add_modifier
                 .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+    }
+
+    #[test]
+    fn longcache_status_indicator_renders_supported_and_unsupported() {
+        let info = launch_info("Build");
+        let path = vec!["Build".to_string()];
+
+        let off = left_status(&info, LlmMode::Normal, &path, None, true, false, true);
+        let off_text = off
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!off_text.contains("longcache"), "{off_text}");
+
+        let supported = left_status(&info, LlmMode::Normal, &path, None, true, true, true);
+        let supported_text = supported
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(supported_text.contains("longcache"), "{supported_text}");
+        assert!(!supported_text.contains("unsupported"), "{supported_text}");
+
+        let unsupported = left_status(&info, LlmMode::Normal, &path, None, true, true, false);
+        let unsupported_text = unsupported
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            unsupported_text.contains("longcache unsupported"),
+            "{unsupported_text}"
         );
     }
 }

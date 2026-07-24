@@ -209,6 +209,79 @@ async fn control_request_ack_reports_applied() {
 }
 
 #[tokio::test]
+async fn longcache_toggles_session_override_and_status_indicator() {
+    let mut app = app();
+    let (record_tx, _record_rx) = mpsc::channel(1);
+    let (control_tx, mut control_rx) = mpsc::channel(1);
+    let events = install_runner(&mut app, record_tx, control_tx);
+
+    app.handle_longcache_command("");
+
+    let control = control_rx.recv().await.expect("longcache control request");
+    assert!(matches!(
+        control.request,
+        Request::SetLongcache { enabled: None }
+    ));
+    events.lock().unwrap().push(TurnEvent::LongcacheState {
+        enabled: true,
+        supported: true,
+    });
+    drain_control_events(&mut app).await;
+
+    assert!(app.longcache_enabled);
+    assert!(app.longcache_supported);
+
+    app.handle_longcache_command("off");
+    let control = control_rx.recv().await.expect("longcache off request");
+    assert!(matches!(
+        control.request,
+        Request::SetLongcache {
+            enabled: Some(false)
+        }
+    ));
+    events.lock().unwrap().push(TurnEvent::LongcacheState {
+        enabled: false,
+        supported: true,
+    });
+    drain_control_events(&mut app).await;
+
+    assert!(!app.longcache_enabled);
+    assert!(app.longcache_supported);
+
+    app.handle_longcache_command("on");
+    let control = control_rx
+        .recv()
+        .await
+        .expect("longcache unsupported control request");
+    assert!(matches!(
+        control.request,
+        Request::SetLongcache {
+            enabled: Some(true)
+        }
+    ));
+    events.lock().unwrap().extend([
+        TurnEvent::Notice {
+            text:
+                "/longcache: extended prompt-cache retention is not verified for the active model"
+                    .to_string(),
+        },
+        TurnEvent::LongcacheState {
+            enabled: false,
+            supported: false,
+        },
+    ]);
+    drain_control_events(&mut app).await;
+
+    assert!(!app.longcache_enabled);
+    assert!(!app.longcache_supported);
+    assert!(
+        history_lines(&app)
+            .iter()
+            .any(|line| line.contains("not verified for the active model"))
+    );
+}
+
+#[tokio::test]
 async fn plan_default_available_everywhere_tui_plan_swap() {
     let mut app = app();
     let (record_tx, _record_rx) = mpsc::channel(1);

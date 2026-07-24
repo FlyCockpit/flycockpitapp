@@ -1802,6 +1802,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | CommandCapabilityUnavailable { session_id, .. }
         | RedactionState { session_id, .. }
         | PreflightState { session_id, .. }
+        | LongcacheState { session_id, .. }
         | TrustedOnlyState { session_id, .. }
         | ApprovalModeState { session_id, .. }
         | DelegationRecursionState { session_id, .. }
@@ -2511,6 +2512,9 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             scan_ssh_keys,
         },
         PreflightState { enabled, .. } => TurnEvent::PreflightState { enabled },
+        LongcacheState {
+            enabled, supported, ..
+        } => TurnEvent::LongcacheState { enabled, supported },
         TrustedOnlyState { enabled, .. } => TurnEvent::TrustedOnlyState { enabled },
         ApprovalModeState { mode, .. } => TurnEvent::ApprovalModeState { mode },
         DelegationRecursionState {

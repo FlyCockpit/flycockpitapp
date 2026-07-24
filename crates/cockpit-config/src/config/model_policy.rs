@@ -200,6 +200,7 @@ pub struct EffectiveModelCapabilities {
     pub max_output_tokens: Option<u32>,
     pub reasoning: CapabilityStatus,
     pub structured_outputs: CapabilityStatus,
+    pub prompt_cache_retention: CapabilityStatus,
     pub embeddings: Option<bool>,
     pub embedding_dimensions: Option<u32>,
     pub computer_use: Option<ComputerUseCapability>,
@@ -330,6 +331,14 @@ impl ProvidersConfig {
                     status(
                         model_caps.map(|c| c.structured_outputs),
                         provider_caps.structured_outputs,
+                    )
+                }),
+            prompt_cache_retention: overrides
+                .and_then(|o| o.prompt_cache_retention)
+                .unwrap_or_else(|| {
+                    status(
+                        model_caps.map(|c| c.prompt_cache_retention),
+                        provider_caps.prompt_cache_retention,
                     )
                 }),
             embeddings: overrides

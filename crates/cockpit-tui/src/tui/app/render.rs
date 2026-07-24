@@ -4,7 +4,7 @@
 //! plumbing instead of paragraph wrangling.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Duration;
@@ -37,9 +37,9 @@ use crate::tui::theme::{
 };
 
 use super::{
-    AUTOCOMPLETE_ROWS, AffordanceTarget, App, HistoryRenderCacheEntry, PaneSide, Selection,
-    SuggestionBoxKind, SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind, TranscriptFind,
-    WORKING_MESSAGES,
+    AUTOCOMPLETE_ROWS, AffordanceTarget, App, HistoryRenderCacheEntry, PaneSide, PrewrappedEntry,
+    Selection, SuggestionBoxKind, SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind,
+    TranscriptFind, WORKING_MESSAGES,
 };
 
 /// Startup grace before the working indicator first appears — prevents
@@ -54,7 +54,27 @@ const COMPOSER_PLACEHOLDER: &str = "Message FlyCockpit — / commands · Ctrl+K 
 /// lines plus one authoritative metadata record per visible row.
 type VisibleRows = (Vec<Line<'static>>, Vec<ChatRowMeta>);
 
-type ChatRows = (Vec<Line<'static>>, Vec<ChatRowMeta>, HashMap<usize, usize>);
+#[cfg(test)]
+thread_local! {
+    static PREWRAP_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREWRAP_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_prewrap_counters() {
+    PREWRAP_ROWS.with(|rows| rows.set(0));
+    PREWRAP_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn prewrap_row_count() -> usize {
+    PREWRAP_ROWS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn prewrap_call_count() -> usize {
+    PREWRAP_CALLS.with(std::cell::Cell::get)
+}
 
 pub(super) fn affordance_target_for_row(meta: &ChatRowMeta) -> Option<AffordanceTarget> {
     if let Some(history_index) = meta.subagent_target {
@@ -1513,7 +1533,7 @@ impl App {
             .chat_find_lines
             .iter()
             .enumerate()
-            .filter_map(|(idx, line)| line.to_lowercase().contains(&query).then_some(idx))
+            .filter_map(|(idx, line)| line.contains(&query).then_some(idx))
             .collect();
         if find.matches.is_empty() {
             return;
@@ -1567,6 +1587,113 @@ impl App {
             .retain(|id, _| live_ids.contains(id));
     }
 
+    fn row_meta_for_rendered_entry(
+        entry: &HistoryEntry,
+        idx: usize,
+        rendered: &Rendered,
+    ) -> Vec<ChatRowMeta> {
+        let Rendered {
+            lines,
+            chip_row,
+            continuations,
+            tool_call_rows,
+            tool_result_scroll_regions,
+            reasoning_scroll_region,
+            pin_region,
+        } = rendered;
+        let is_box = matches!(entry, HistoryEntry::ToolBox { .. });
+        let diff_path = match entry {
+            HistoryEntry::Diff { path, .. } => Some(path.clone()),
+            _ => None,
+        };
+        let base_copy = copy_target_for_entry(entry, idx);
+        let base_kind = row_kind_for_entry(entry);
+        let mut row_meta = Vec::with_capacity(lines.len());
+
+        for i in 0..lines.len() {
+            let chip_target = if Some(i) == *chip_row {
+                Some(idx)
+            } else {
+                None
+            };
+            let subagent_target = if i == 0 && matches!(entry, HistoryEntry::Subagent { .. }) {
+                Some(idx)
+            } else {
+                None
+            };
+            let pin_hit = match pin_region {
+                Some(r) if i == r.row => Some(PinHit {
+                    seq: r.seq,
+                    col_start: r.col_start,
+                    col_end: r.col_end,
+                }),
+                _ => None,
+            };
+            let fork_hit = match pin_region {
+                Some(r) if i == r.row => match (r.fork_col_start, r.fork_col_end) {
+                    (Some(col_start), Some(col_end)) => Some(PinHit {
+                        seq: r.seq,
+                        col_start,
+                        col_end,
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let row_kind = if chip_target.is_some() || subagent_target.is_some() {
+                ChatRowKind::Chip
+            } else {
+                base_kind
+            };
+            row_meta.push(ChatRowMeta {
+                history_index: Some(idx),
+                row_kind,
+                copy_target: if row_kind == ChatRowKind::Chip {
+                    None
+                } else {
+                    base_copy
+                },
+                chip_target,
+                subagent_target,
+                tool_box_target: is_box.then_some(idx),
+                tool_call_target: tool_call_rows
+                    .get(i)
+                    .and_then(|call_index| call_index.map(|call_index| (idx, call_index))),
+                tool_result_scroll: tool_result_scroll_regions
+                    .iter()
+                    .find(|region| i >= region.row_start && i <= region.row_end)
+                    .map(|region| ToolResultScrollMeta {
+                        history_index: idx,
+                        call_index: region.call_index,
+                        offset: region.offset,
+                        max_offset: region.max_offset,
+                    }),
+                reasoning_window_scroll: reasoning_scroll_region
+                    .filter(|region| i >= region.row_start && i <= region.row_end)
+                    .map(|region| ReasoningScrollMeta {
+                        history_index: idx,
+                        offset: region.offset,
+                        max_offset: region.max_offset,
+                    }),
+                reasoning_window_target: reasoning_scroll_region
+                    .filter(|region| i >= region.row_start && i <= region.row_end)
+                    .map(|_| idx),
+                diff_path: diff_path.clone(),
+                pin_hit,
+                fork_hit,
+                continuation: false,
+                selectable: row_kind != ChatRowKind::Chip,
+            });
+        }
+
+        let mut entry_conts = continuations.clone();
+        entry_conts.resize(lines.len(), false);
+        for (meta, continuation) in row_meta.iter_mut().zip(entry_conts) {
+            meta.continuation = continuation;
+        }
+        row_meta
+    }
+
     pub(super) fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.chat_area = Some(area);
         let area_h = area.height as usize;
@@ -1581,7 +1708,8 @@ impl App {
             None
         };
 
-        let mut all: Vec<Line<'static>> = Vec::new();
+        let mut all: Vec<Rc<Line<'static>>> = Vec::new();
+        let mut all_find_lines: Vec<String> = Vec::new();
         let mut row_meta: Vec<ChatRowMeta> = Vec::new();
         // Absolute content line (in `all`) of each pinnable message's first
         // row, by history index — drives the pick arrow + review jump.
@@ -1598,8 +1726,6 @@ impl App {
             // mode is on) ride the message itself — inline left of the
             // timestamp for an agent reply, in the top-right border corner
             // for a user bubble. They cost no separate vertical space.
-            // The entry's first content line is the next row we push.
-            msg_abs_line.insert(idx, all.len());
             let pin = Self::entry_pin_seq(entry).and_then(|seq| {
                 let is_pick = self
                     .pin_pick
@@ -1620,7 +1746,6 @@ impl App {
                     is_pick,
                 })
             });
-            let entry_base = all.len();
             let preflight_dots_ms = self.started_at.elapsed().as_millis();
             let version = *self
                 .history_render_versions
@@ -1638,8 +1763,11 @@ impl App {
                 preflight_dots_ms,
                 pin,
             );
-            let rendered = match self.history_render_cache.get(&entry_id) {
-                Some(cached) if cached.sig == sig => Rc::clone(&cached.rendered),
+            let prewrapped = match self.history_render_cache.get(&entry_id) {
+                Some(cached) if cached.sig == sig => {
+                    let _ = cached.rendered.lines.len();
+                    Rc::clone(&cached.prewrapped)
+                }
                 _ => {
                     let rendered = Rc::new(render_entry(
                         entry,
@@ -1655,122 +1783,34 @@ impl App {
                         preflight_dots_ms,
                         pin,
                     ));
+                    let entry_row_meta = Self::row_meta_for_rendered_entry(entry, idx, &rendered);
+                    let prewrapped = Rc::new(prewrap_entry_rows(
+                        &rendered.lines,
+                        &entry_row_meta,
+                        Some(0),
+                        area.width as usize,
+                    ));
                     self.history_render_cache.insert(
                         entry_id,
                         HistoryRenderCacheEntry {
                             sig,
                             rendered: Rc::clone(&rendered),
+                            prewrapped: Rc::clone(&prewrapped),
                         },
                     );
-                    rendered
+                    prewrapped
                 }
             };
-            let Rendered {
-                lines,
-                chip_row,
-                continuations,
-                tool_call_rows,
-                tool_result_scroll_regions,
-                reasoning_scroll_region,
-                pin_region,
-            } = rendered.as_ref();
-            let chip_abs = chip_row.map(|cr| all.len() + cr);
-            // The clickable pin region (when drawn) lands on `pin_region.row`
-            // within this entry's lines — offset into the `all` buffer.
-            let pin_abs = pin_region.map(|r| entry_base + r.row);
-            let is_box = matches!(entry, HistoryEntry::ToolBox { .. });
-            let diff_path = match entry {
-                HistoryEntry::Diff { path, .. } => Some(path.clone()),
-                _ => None,
-            };
-            let base_copy = copy_target_for_entry(entry, idx);
-            let base_kind = row_kind_for_entry(entry);
-            for i in 0..lines.len() {
-                let chip_target = if Some(all.len() + i) == chip_abs {
-                    Some(idx)
-                } else {
-                    None
-                };
-                let subagent_target = if i == 0 && matches!(entry, HistoryEntry::Subagent { .. }) {
-                    Some(idx)
-                } else {
-                    None
-                };
-                let pin_hit = match pin_region {
-                    Some(r) if Some(all.len() + i) == pin_abs => Some(PinHit {
-                        seq: r.seq,
-                        col_start: r.col_start,
-                        col_end: r.col_end,
-                    }),
-                    _ => None,
-                };
-                let fork_hit = match pin_region {
-                    Some(r) if Some(all.len() + i) == pin_abs => {
-                        match (r.fork_col_start, r.fork_col_end) {
-                            (Some(col_start), Some(col_end)) => Some(PinHit {
-                                seq: r.seq,
-                                col_start,
-                                col_end,
-                            }),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
-                let row_kind = if chip_target.is_some() || subagent_target.is_some() {
-                    ChatRowKind::Chip
-                } else {
-                    base_kind
-                };
-                row_meta.push(ChatRowMeta {
-                    history_index: Some(idx),
-                    row_kind,
-                    copy_target: if row_kind == ChatRowKind::Chip {
-                        None
-                    } else {
-                        base_copy
-                    },
-                    chip_target,
-                    subagent_target,
-                    tool_box_target: is_box.then_some(idx),
-                    tool_call_target: tool_call_rows
-                        .get(i)
-                        .and_then(|call_index| call_index.map(|call_index| (idx, call_index))),
-                    tool_result_scroll: tool_result_scroll_regions
-                        .iter()
-                        .find(|region| i >= region.row_start && i <= region.row_end)
-                        .map(|region| ToolResultScrollMeta {
-                            history_index: idx,
-                            call_index: region.call_index,
-                            offset: region.offset,
-                            max_offset: region.max_offset,
-                        }),
-                    reasoning_window_scroll: reasoning_scroll_region
-                        .filter(|region| i >= region.row_start && i <= region.row_end)
-                        .map(|region| ReasoningScrollMeta {
-                            history_index: idx,
-                            offset: region.offset,
-                            max_offset: region.max_offset,
-                        }),
-                    reasoning_window_target: reasoning_scroll_region
-                        .filter(|region| i >= region.row_start && i <= region.row_end)
-                        .map(|_| idx),
-                    diff_path: diff_path.clone(),
-                    pin_hit,
-                    fork_hit,
-                    continuation: false,
-                    selectable: row_kind != ChatRowKind::Chip,
-                });
+            debug_assert_eq!(prewrapped.height, prewrapped.rows.len());
+            debug_assert_eq!(prewrapped.find_text.len(), prewrapped.rows.len());
+            debug_assert_eq!(prewrapped.row_meta.len(), prewrapped.rows.len());
+            debug_assert_eq!(prewrapped.gap_rows, 0);
+            if let Some(first_row) = prewrapped.msg_first_row {
+                msg_abs_line.insert(idx, all.len() + first_row);
             }
-            // Each entry's renderer returns one bool per emitted line;
-            // pad if there's any mismatch (defensive — shouldn't
-            // happen but keeps the parallel arrays in lockstep).
-            let mut entry_conts = continuations.clone();
-            entry_conts.resize(lines.len(), false);
-            for (meta, continuation) in row_meta[entry_base..].iter_mut().zip(entry_conts) {
-                meta.continuation = continuation;
-            }
-            all.extend(lines.iter().cloned());
+            row_meta.extend(prewrapped.row_meta.iter().cloned());
+            all_find_lines.extend(prewrapped.find_text.iter().cloned());
+            all.extend(prewrapped.rows.iter().map(Rc::clone));
             // One-line gap after a block so it separates from what
             // follows. Consecutive agents share a block, and an immediate
             // ToolBox continues the assistant turn without an inter-entry gap.
@@ -1799,7 +1839,8 @@ impl App {
                 _ => false,
             };
             if gap {
-                all.push(Line::default());
+                all.push(Rc::new(Line::default()));
+                all_find_lines.push(String::new());
                 row_meta.push(ChatRowMeta::gap());
             }
         }
@@ -1808,35 +1849,49 @@ impl App {
                 .pending_render_cache
                 .get_or_insert_with(Default::default);
             let pending_lines = render_pending_incremental(pending, area.width, &mut cache.state);
-            for _ in 0..pending_lines.len() {
-                row_meta.push(ChatRowMeta::other());
-            }
-            all.extend(pending_lines);
+            append_uncached_prewrapped_rows(
+                &mut all,
+                &mut row_meta,
+                &mut all_find_lines,
+                pending_lines,
+                ChatRowMeta::other(),
+                area.width as usize,
+            );
         } else {
             self.pending_render_cache = None;
         }
         if let Some(view) = self.active_subagent_view() {
             if let Some(line) = self.active_subagent_countdown_line() {
-                row_meta.push(ChatRowMeta::other());
-                all.push(Line::from(vec![Span::styled(
-                    line,
-                    Style::default()
-                        .fg(WARNING_TEXT)
-                        .add_modifier(Modifier::ITALIC),
-                )]));
+                append_uncached_prewrapped_rows(
+                    &mut all,
+                    &mut row_meta,
+                    &mut all_find_lines,
+                    vec![Line::from(vec![Span::styled(
+                        line,
+                        Style::default()
+                            .fg(WARNING_TEXT)
+                            .add_modifier(Modifier::ITALIC),
+                    )])],
+                    ChatRowMeta::other(),
+                    area.width as usize,
+                );
             } else if let Some(notice) = &view.notice {
-                row_meta.push(ChatRowMeta::other());
-                all.push(Line::from(vec![Span::styled(
-                    notice.clone(),
-                    Style::default()
-                        .fg(Color::Indexed(MUTED_COLOR_INDEX))
-                        .add_modifier(Modifier::ITALIC),
-                )]));
+                append_uncached_prewrapped_rows(
+                    &mut all,
+                    &mut row_meta,
+                    &mut all_find_lines,
+                    vec![Line::from(vec![Span::styled(
+                        notice.clone(),
+                        Style::default()
+                            .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                            .add_modifier(Modifier::ITALIC),
+                    )])],
+                    ChatRowMeta::other(),
+                    area.width as usize,
+                );
             }
         }
 
-        let (all, row_meta, msg_abs_line) =
-            prewrap_chat_rows(all, row_meta, msg_abs_line, area.width as usize);
         // Record the abs-line map for pick/review jump after wrapping so
         // pinned messages target the visual row model used for scrolling.
         self.msg_abs_line = msg_abs_line;
@@ -1858,8 +1913,8 @@ impl App {
         if self.transcript_find.is_some() {
             self.chat_find_lines = box_lines
                 .iter()
-                .chain(all.iter())
-                .map(rendered_line_text)
+                .map(|line| rendered_line_text(line).to_lowercase())
+                .chain(all_find_lines.iter().cloned())
                 .collect();
             self.refresh_transcript_find_matches();
         } else {
@@ -1887,7 +1942,7 @@ impl App {
                 meta[box_top + i] = ChatRowMeta::banner();
             }
             for (i, line) in all.into_iter().enumerate() {
-                v[msg_top + i] = line;
+                v[msg_top + i] = line.as_ref().clone();
             }
             for (i, val) in row_meta.into_iter().enumerate() {
                 meta[msg_top + i] = val;
@@ -1899,7 +1954,7 @@ impl App {
             // and scrolls off the top with the oldest messages. Box rows
             // are non-interactive (None / false). With no box this is
             // exactly the previous behavior over `all`.
-            let mut combined = box_lines;
+            let mut combined: Vec<Rc<Line<'static>>> = box_lines.into_iter().map(Rc::new).collect();
             let prefix = combined.len();
             combined.extend(all);
             let mut combined_meta = vec![ChatRowMeta::banner(); prefix];
@@ -1917,12 +1972,17 @@ impl App {
                 let pad = area_h - total;
                 let mut v: Vec<Line<'static>> = (0..pad).map(|_| Line::default()).collect();
                 let mut meta: Vec<ChatRowMeta> = vec![ChatRowMeta::padding(); pad];
-                v.extend(combined);
+                v.extend(combined.into_iter().map(|line| line.as_ref().clone()));
                 meta.extend(combined_meta);
                 (v, meta)
             } else {
                 let drop = total - area_h - self.chat_scroll_offset;
-                let v: Vec<Line<'static>> = combined.into_iter().skip(drop).take(area_h).collect();
+                let v: Vec<Line<'static>> = combined
+                    .into_iter()
+                    .skip(drop)
+                    .take(area_h)
+                    .map(|line| line.as_ref().clone())
+                    .collect();
                 let meta: Vec<ChatRowMeta> =
                     combined_meta.into_iter().skip(drop).take(area_h).collect();
                 (v, meta)
@@ -1988,10 +2048,13 @@ impl App {
                 frame.buffer_mut(),
                 area,
                 find,
-                self.chat_total_lines,
-                self.chat_visible_lines,
-                self.chat_scroll_offset,
-                &self.chat_find_lines,
+                FindHighlightContext {
+                    total_lines: self.chat_total_lines,
+                    visible_lines: self.chat_visible_lines,
+                    scroll_offset: self.chat_scroll_offset,
+                    lines: &self.chat_find_lines,
+                    chat_text_grid: &self.chat_text_grid,
+                },
             );
         }
 
@@ -3288,27 +3351,91 @@ fn render_toast(frame: &mut ratatui::Frame, status_rect: Rect, toast: &Toast) {
     frame.render_widget(para, status_rect);
 }
 
-fn prewrap_chat_rows(
-    lines: Vec<Line<'static>>,
-    row_meta: Vec<ChatRowMeta>,
-    msg_abs_line: HashMap<usize, usize>,
+fn prewrap_entry_rows(
+    lines: &[Line<'static>],
+    row_meta: &[ChatRowMeta],
+    msg_row: Option<usize>,
     width: usize,
-) -> ChatRows {
-    if width == 0 {
-        return (lines, row_meta, msg_abs_line);
-    }
+) -> PrewrappedEntry {
+    #[cfg(test)]
+    PREWRAP_CALLS.with(|calls| calls.set(calls.get() + 1));
 
+    let (rows, row_meta, find_text, msg_first_row) =
+        prewrap_rows_impl(lines.iter().cloned(), row_meta, msg_row, width, true);
+    PrewrappedEntry {
+        height: rows.len(),
+        rows,
+        row_meta,
+        find_text,
+        msg_first_row,
+        // Inter-entry gaps depend on neighbors, not this entry signature.
+        gap_rows: 0,
+    }
+}
+
+fn append_uncached_prewrapped_rows(
+    all: &mut Vec<Rc<Line<'static>>>,
+    row_meta: &mut Vec<ChatRowMeta>,
+    find_lines: &mut Vec<String>,
+    lines: Vec<Line<'static>>,
+    meta: ChatRowMeta,
+    width: usize,
+) {
+    let meta = vec![meta; lines.len()];
+    let (rows, visual_meta, visual_find, _) = prewrap_rows_impl(lines, &meta, None, width, false);
+    all.extend(rows);
+    row_meta.extend(visual_meta);
+    find_lines.extend(visual_find);
+}
+
+fn prewrap_rows_impl<I>(
+    lines: I,
+    row_meta: &[ChatRowMeta],
+    msg_row: Option<usize>,
+    width: usize,
+    _count_rows: bool,
+) -> (
+    Vec<Rc<Line<'static>>>,
+    Vec<ChatRowMeta>,
+    Vec<String>,
+    Option<usize>,
+)
+where
+    I: IntoIterator<Item = Line<'static>>,
+{
     let mut visual_lines = Vec::new();
     let mut visual_meta = Vec::new();
-    let mut row_map = HashMap::new();
+    let mut find_text = Vec::new();
+    let mut msg_first_row = None;
 
     for (row, line) in lines.into_iter().enumerate() {
+        if width == 0 {
+            if msg_row == Some(row) {
+                msg_first_row = Some(visual_lines.len());
+            }
+            find_text.push(rendered_line_text(&line).to_lowercase());
+            visual_lines.push(Rc::new(line));
+            visual_meta.push(
+                row_meta
+                    .get(row)
+                    .cloned()
+                    .unwrap_or_else(ChatRowMeta::padding),
+            );
+            continue;
+        }
+
+        #[cfg(test)]
+        if _count_rows {
+            PREWRAP_ROWS.with(|rows| rows.set(rows.get() + 1));
+        }
+
         let wrapped = wrap_line_to_visual_rows(line, width);
         let first_visual = visual_lines.len();
-        row_map.insert(row, first_visual);
+        if msg_row == Some(row) {
+            msg_first_row = Some(first_visual);
+        }
 
         for (part_idx, (visual, start_col, end_col)) in wrapped.into_iter().enumerate() {
-            visual_lines.push(visual);
             let mut meta = row_meta
                 .get(row)
                 .cloned()
@@ -3320,16 +3447,14 @@ fn prewrap_chat_rows(
             meta.fork_hit = meta
                 .fork_hit
                 .and_then(|hit| pin_hit_for_visual_row(hit, start_col, end_col));
+            let visual = Rc::new(visual);
+            find_text.push(rendered_line_text(visual.as_ref()).to_lowercase());
+            visual_lines.push(visual);
             visual_meta.push(meta);
         }
     }
 
-    let msg_abs_line = msg_abs_line
-        .into_iter()
-        .filter_map(|(idx, row)| row_map.get(&row).copied().map(|visual| (idx, visual)))
-        .collect();
-
-    (visual_lines, visual_meta, msg_abs_line)
+    (visual_lines, visual_meta, find_text, msg_first_row)
 }
 
 fn pin_hit_for_visual_row(hit: PinHit, start_col: usize, end_col: usize) -> Option<PinHit> {
@@ -3365,9 +3490,17 @@ fn wrap_line_to_visual_rows(
     let line_alignment = line.alignment;
 
     for span in line.spans {
+        let span_style = span.style;
+        let mut segment = String::new();
         for ch in span.content.chars() {
             let ch_width = ch.width().unwrap_or(0);
             if current_width > 0 && current_width + ch_width > width {
+                if !segment.is_empty() {
+                    current_spans.push(Span {
+                        content: Cow::Owned(std::mem::take(&mut segment)),
+                        style: span_style,
+                    });
+                }
                 rows.push((
                     Line {
                         spans: std::mem::take(&mut current_spans),
@@ -3380,12 +3513,13 @@ fn wrap_line_to_visual_rows(
                 row_start += current_width;
                 current_width = 0;
             }
-            current_spans.push(Span {
-                content: Cow::Owned(ch.to_string()),
-                style: span.style,
-            });
+            segment.push(ch);
             current_width += ch_width;
             if current_width >= width {
+                current_spans.push(Span {
+                    content: Cow::Owned(std::mem::take(&mut segment)),
+                    style: span_style,
+                });
                 rows.push((
                     Line {
                         spans: std::mem::take(&mut current_spans),
@@ -3398,6 +3532,12 @@ fn wrap_line_to_visual_rows(
                 row_start += current_width;
                 current_width = 0;
             }
+        }
+        if !segment.is_empty() {
+            current_spans.push(Span {
+                content: Cow::Owned(segment),
+                style: span_style,
+            });
         }
     }
 
@@ -3567,14 +3707,19 @@ fn tail_ellipsis(text: &str, max_width: usize) -> String {
     format!("…{out}")
 }
 
+struct FindHighlightContext<'a> {
+    total_lines: usize,
+    visible_lines: usize,
+    scroll_offset: usize,
+    lines: &'a [String],
+    chat_text_grid: &'a [Vec<String>],
+}
+
 fn apply_transcript_find_highlight(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
     find: &TranscriptFind,
-    total_lines: usize,
-    visible_lines: usize,
-    scroll_offset: usize,
-    lines: &[String],
+    ctx: FindHighlightContext<'_>,
 ) {
     let Some(current) = find.current else {
         return;
@@ -3582,12 +3727,13 @@ fn apply_transcript_find_highlight(
     let Some(&abs) = find.matches.get(current) else {
         return;
     };
-    let rel = if total_lines < area.height as usize {
-        area.height as usize - total_lines + abs
+    let rel = if ctx.total_lines < area.height as usize {
+        area.height as usize - ctx.total_lines + abs
     } else {
-        let top = total_lines
-            .saturating_sub(visible_lines.max(1))
-            .saturating_sub(scroll_offset);
+        let top = ctx
+            .total_lines
+            .saturating_sub(ctx.visible_lines.max(1))
+            .saturating_sub(ctx.scroll_offset);
         let Some(rel) = abs.checked_sub(top) else {
             return;
         };
@@ -3596,26 +3742,27 @@ fn apply_transcript_find_highlight(
     if rel >= area.height as usize {
         return;
     }
-    let Some(line) = lines.get(abs) else {
+    let Some(line) = ctx.lines.get(abs) else {
         return;
     };
     let query = find.query.to_lowercase();
     if query.is_empty() {
         return;
     }
-    let folded = line.to_lowercase();
-    let Some(start_byte) = folded.find(&query) else {
+    if !line.contains(&query) {
+        return;
+    }
+    let original_line = ctx
+        .chat_text_grid
+        .get(rel)
+        .map(|row| row.concat())
+        .unwrap_or_else(|| line.clone());
+    let Some((start_byte, end_byte)) = case_insensitive_match_span(&original_line, &find.query)
+    else {
         return;
     };
-    if !line.is_char_boundary(start_byte) {
-        return;
-    }
-    let end_byte = (start_byte + find.query.len()).min(line.len());
-    if !line.is_char_boundary(end_byte) {
-        return;
-    }
-    let start_col = line[..start_byte].width();
-    let width = line[start_byte..end_byte].width().max(1);
+    let start_col = original_line[..start_byte].width();
+    let width = original_line[start_byte..end_byte].width().max(1);
     let y = area.y.saturating_add(rel as u16);
     let first = area.x.saturating_add(start_col as u16);
     let last = first
@@ -3628,6 +3775,30 @@ fn apply_transcript_find_highlight(
             cell.set_style(style);
         }
     }
+}
+
+fn case_insensitive_match_span(line: &str, query: &str) -> Option<(usize, usize)> {
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+
+    let mut folded = String::new();
+    let mut folded_byte_to_original = Vec::new();
+    for (start, ch) in line.char_indices() {
+        let end = start + ch.len_utf8();
+        let lowered = ch.to_lowercase().collect::<String>();
+        for _ in 0..lowered.len() {
+            folded_byte_to_original.push((start, end));
+        }
+        folded.push_str(&lowered);
+    }
+
+    let start = folded.find(&query)?;
+    let end = start + query.len();
+    let (original_start, _) = *folded_byte_to_original.get(start)?;
+    let (_, original_end) = *folded_byte_to_original.get(end.saturating_sub(1))?;
+    Some((original_start, original_end))
 }
 
 fn apply_selection_highlight(
@@ -4406,15 +4577,17 @@ mod slash_popup_full_list_tests {
 #[cfg(test)]
 mod render_history_spacing_tests {
     use super::{
-        App, ChatCopyTarget, ChatRowKind, ControlChip, Selection, TranscriptFind,
-        affordance_target_for_row, extract_selection_plaintext,
+        App, ChatCopyTarget, ChatRowKind, ChatRowMeta, ControlChip, PinHit, Selection,
+        TranscriptFind, affordance_target_for_row, extract_selection_plaintext,
+        pin_hit_for_visual_row, prewrap_call_count, prewrap_entry_rows, prewrap_row_count,
+        rendered_line_text, reset_prewrap_counters, wrap_line_to_visual_rows,
     };
-    use crate::tui::app::{AffordanceTarget, SandboxDownNotice, SideConversation};
+    use crate::tui::app::{AffordanceTarget, HistoryLog, SandboxDownNotice, SideConversation};
     use crate::tui::composer::VimMode;
     use crate::tui::history::{
         HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, SubagentRoutingChips, ToolCall,
-        ToolCallState, render_entry_call_count, render_pending, render_pending_incremental,
-        reset_render_entry_call_count,
+        ToolCallState, render_entry, render_entry_call_count, render_pending,
+        render_pending_incremental, reset_render_entry_call_count,
     };
     use crate::tui::markdown::{
         render_byte_count as markdown_render_byte_count,
@@ -4434,7 +4607,9 @@ mod render_history_spacing_tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
-    use ratatui::style::Modifier;
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use std::collections::HashMap;
     use std::rc::Rc;
 
     fn agent(text: &str) -> HistoryEntry {
@@ -5008,6 +5183,415 @@ mod render_history_spacing_tests {
                 active: false,
             },
         )
+    }
+
+    struct FullWrapReference {
+        rows: Vec<Line<'static>>,
+        row_meta: Vec<ChatRowMeta>,
+        msg_abs_line: HashMap<usize, usize>,
+        find_lines: Vec<String>,
+        chat_total_lines: usize,
+        chat_visible_lines: usize,
+        chat_banner_lines: usize,
+    }
+
+    fn gap_after_entry(history: &HistoryLog, idx: usize, entry: &HistoryEntry) -> bool {
+        match entry {
+            HistoryEntry::User { .. }
+            | HistoryEntry::ToolBox { .. }
+            | HistoryEntry::ToolLine { .. }
+            | HistoryEntry::CompactBoundary { .. } => true,
+            HistoryEntry::SkillAutoInjected { .. } => false,
+            HistoryEntry::Agent { .. } => {
+                !idx.checked_sub(1)
+                    .map(|i| matches!(history[i], HistoryEntry::Agent { .. }))
+                    .unwrap_or(false)
+                    && !history
+                        .get(idx + 1)
+                        .is_some_and(|next| matches!(next, HistoryEntry::ToolBox { .. }))
+            }
+            HistoryEntry::Subagent { outcome, .. } => outcome.is_some(),
+            _ => false,
+        }
+    }
+
+    fn reference_full_wrap_rows(
+        lines: Vec<Line<'static>>,
+        row_meta: Vec<ChatRowMeta>,
+        msg_abs_line: HashMap<usize, usize>,
+        width: usize,
+    ) -> (Vec<Line<'static>>, Vec<ChatRowMeta>, HashMap<usize, usize>) {
+        if width == 0 {
+            return (lines, row_meta, msg_abs_line);
+        }
+
+        let mut visual_lines = Vec::new();
+        let mut visual_meta = Vec::new();
+        let mut row_map = HashMap::new();
+
+        for (row, line) in lines.into_iter().enumerate() {
+            let wrapped = wrap_line_to_visual_rows(line, width);
+            let first_visual = visual_lines.len();
+            row_map.insert(row, first_visual);
+
+            for (part_idx, (visual, start_col, end_col)) in wrapped.into_iter().enumerate() {
+                visual_lines.push(visual);
+                let mut meta = row_meta
+                    .get(row)
+                    .cloned()
+                    .unwrap_or_else(ChatRowMeta::padding);
+                meta.continuation = meta.continuation || part_idx > 0;
+                meta.pin_hit = meta
+                    .pin_hit
+                    .and_then(|hit| pin_hit_for_visual_row(hit, start_col, end_col));
+                meta.fork_hit = meta
+                    .fork_hit
+                    .and_then(|hit| pin_hit_for_visual_row(hit, start_col, end_col));
+                visual_meta.push(meta);
+            }
+        }
+
+        let msg_abs_line = msg_abs_line
+            .into_iter()
+            .filter_map(|(idx, row)| row_map.get(&row).copied().map(|visual| (idx, visual)))
+            .collect();
+
+        (visual_lines, visual_meta, msg_abs_line)
+    }
+
+    fn full_wrap_reference(app: &mut App, width: u16, height: u16) -> FullWrapReference {
+        app.sync_history_render_versions();
+        let mut all = Vec::new();
+        let mut row_meta = Vec::new();
+        let mut msg_abs_line = HashMap::new();
+        let preflight_dots_ms = app.started_at.elapsed().as_millis();
+
+        for (idx, entry) in app.history.iter().enumerate() {
+            msg_abs_line.insert(idx, all.len());
+            let pin = App::entry_pin_seq(entry).and_then(|seq| {
+                let is_pick = app
+                    .pin_pick
+                    .as_ref()
+                    .is_some_and(|p| p.selected_history_index() == idx)
+                    || app
+                        .fork_pick
+                        .as_ref()
+                        .is_some_and(|p| p.selected_history_index() == idx)
+                    || app
+                        .copy_pick_selected_history_index()
+                        .is_some_and(|selected| selected == idx);
+                let show_control = app.mouse_capture;
+                (is_pick || show_control).then_some(crate::tui::history::PinControl {
+                    seq,
+                    pinned: app.is_seq_pinned_for_render(seq),
+                    show_control,
+                    is_pick,
+                })
+            });
+            let rendered = render_entry(
+                entry,
+                width,
+                app.thinking_setting,
+                app.markdown_opts,
+                app.diff_style,
+                app.use_emojis,
+                &app.elided_event_ids,
+                preflight_dots_ms,
+                pin,
+            );
+            row_meta.extend(App::row_meta_for_rendered_entry(entry, idx, &rendered));
+            all.extend(rendered.lines);
+            if gap_after_entry(&app.history, idx, entry) {
+                all.push(Line::default());
+                row_meta.push(ChatRowMeta::gap());
+            }
+        }
+
+        let (rows, row_meta, msg_abs_line) =
+            reference_full_wrap_rows(all, row_meta, msg_abs_line, width as usize);
+        let box_lines = app.banner_box_lines(width, height);
+        let chat_banner_lines = box_lines.len();
+        let find_lines = box_lines
+            .iter()
+            .map(|line| rendered_line_text(line).to_lowercase())
+            .chain(
+                rows.iter()
+                    .map(|line| rendered_line_text(line).to_lowercase()),
+            )
+            .collect::<Vec<_>>();
+        FullWrapReference {
+            chat_total_lines: chat_banner_lines + rows.len(),
+            chat_visible_lines: height as usize,
+            chat_banner_lines,
+            rows,
+            row_meta,
+            msg_abs_line,
+            find_lines,
+        }
+    }
+
+    fn cached_history_rows(
+        app: &App,
+    ) -> (Vec<Line<'static>>, Vec<ChatRowMeta>, HashMap<usize, usize>) {
+        let mut rows = Vec::new();
+        let mut row_meta = Vec::new();
+        let mut msg_abs_line = HashMap::new();
+
+        for (idx, entry) in app.history.iter().enumerate() {
+            let id = app.history.id_at(idx).unwrap();
+            let cached = app
+                .history_render_cache
+                .get(&id)
+                .unwrap_or_else(|| panic!("missing render cache entry for history row {idx}"));
+            assert_eq!(cached.prewrapped.height, cached.prewrapped.rows.len());
+            assert_eq!(
+                cached.prewrapped.find_text.len(),
+                cached.prewrapped.rows.len()
+            );
+            assert!(
+                cached
+                    .prewrapped
+                    .find_text
+                    .iter()
+                    .all(|line| *line == line.to_lowercase())
+            );
+            assert_eq!(
+                cached.prewrapped.row_meta.len(),
+                cached.prewrapped.rows.len()
+            );
+            if let Some(first_row) = cached.prewrapped.msg_first_row {
+                msg_abs_line.insert(idx, rows.len() + first_row);
+            }
+            rows.extend(
+                cached
+                    .prewrapped
+                    .rows
+                    .iter()
+                    .map(|line| line.as_ref().clone()),
+            );
+            row_meta.extend(cached.prewrapped.row_meta.iter().cloned());
+            if gap_after_entry(&app.history, idx, entry) {
+                rows.push(Line::default());
+                row_meta.push(ChatRowMeta::gap());
+            }
+        }
+
+        (rows, row_meta, msg_abs_line)
+    }
+
+    fn mixed_history_app(root: &std::path::Path) -> App {
+        let mut app = App::new(Some(root), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = vec![
+            user("oldest target user row"),
+            agent("agent **markdown** target with `code`"),
+            tool_box(),
+            diff_entry("src/lib.rs"),
+            HistoryEntry::Plain {
+                line: "plain target row".to_string(),
+            },
+            agent(
+                "this entry has a very long visual row that must soft wrap across the narrow \
+                 pane while preserving styled spans and metadata",
+            ),
+        ]
+        .into();
+        app
+    }
+
+    #[test]
+    fn render_history_streaming_tail_does_not_rewrap_history() {
+        const MAX_REWRAP_CALLS: usize = 2;
+        const MAX_REWRAP_ROWS: usize = 12;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..300)
+            .map(|idx| agent(&format!("stable history entry {idx}")))
+            .collect::<Vec<_>>()
+            .into();
+        app.pending = Some(PendingMsg {
+            name: "Build".to_string(),
+            text: "streaming tail".to_string(),
+            reasoning: String::new(),
+            timestamp: chrono::Local::now(),
+            started_at: std::time::Instant::now(),
+            text_started_at: Some(std::time::Instant::now()),
+            inside_think: false,
+            body_started: true,
+            tag_partial: String::new(),
+            seq: None,
+            strip_think: true,
+        });
+
+        render_history_no_selection(&mut app, 80, 12);
+        reset_prewrap_counters();
+        app.pending.as_mut().unwrap().text.push_str(" appended");
+        render_history_no_selection(&mut app, 80, 12);
+
+        assert!(prewrap_call_count() <= MAX_REWRAP_CALLS);
+        assert!(prewrap_row_count() <= MAX_REWRAP_ROWS);
+    }
+
+    fn second_render_prewrap_counts(entries: usize) -> (usize, usize) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = (0..entries)
+            .map(|idx| agent(&format!("stable cached text {idx}")))
+            .collect::<Vec<_>>()
+            .into();
+
+        render_history_no_selection(&mut app, 80, 12);
+        reset_prewrap_counters();
+        render_history_no_selection(&mut app, 80, 12);
+        (prewrap_call_count(), prewrap_row_count())
+    }
+
+    #[test]
+    fn render_history_prewrap_cost_is_flat_in_history_length() {
+        let (calls_100, rows_100) = second_render_prewrap_counts(100);
+        let (calls_1000, rows_1000) = second_render_prewrap_counts(1000);
+
+        assert_eq!(calls_100, 0);
+        assert_eq!(rows_100, 0);
+        assert_eq!(calls_1000, calls_100);
+        assert_eq!(rows_1000, rows_100);
+        assert!(rows_1000 <= rows_100 + 4);
+    }
+
+    #[test]
+    fn wrap_line_to_visual_rows_emits_one_span_per_style_run() {
+        let styles = [
+            Style::default().fg(Color::Red),
+            Style::default().fg(Color::Green),
+            Style::default().fg(Color::Blue),
+            Style::default().fg(Color::Yellow),
+            Style::default().fg(Color::Magenta),
+        ];
+        let spans = styles
+            .into_iter()
+            .enumerate()
+            .map(|(idx, style)| {
+                Span::styled(((b'a' + idx as u8) as char).to_string().repeat(100), style)
+            })
+            .collect::<Vec<_>>();
+        let original_text = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        let rows = wrap_line_to_visual_rows(Line::from(spans), 40);
+
+        assert!(rows.iter().all(|(line, _, _)| line.spans.len() <= 5));
+        assert_eq!(
+            rows.iter()
+                .map(|(line, _, _)| rendered_line_text(line))
+                .collect::<String>(),
+            original_text
+        );
+    }
+
+    #[test]
+    fn prewrap_entry_rows_width_zero_preserves_rows_and_meta() {
+        let line = Line::from("abcdef");
+        let mut meta = ChatRowMeta::other();
+        meta.pin_hit = Some(PinHit {
+            seq: 7,
+            col_start: 1,
+            col_end: 4,
+        });
+        meta.fork_hit = Some(PinHit {
+            seq: 7,
+            col_start: 2,
+            col_end: 5,
+        });
+
+        reset_prewrap_counters();
+        let prewrapped = prewrap_entry_rows(
+            std::slice::from_ref(&line),
+            std::slice::from_ref(&meta),
+            Some(0),
+            0,
+        );
+
+        assert_eq!(prewrapped.height, 1);
+        assert_eq!(prewrapped.rows[0].as_ref(), &line);
+        assert_eq!(prewrapped.row_meta, vec![meta]);
+        assert_eq!(prewrapped.msg_first_row, Some(0));
+        assert_eq!(prewrap_call_count(), 1);
+        assert_eq!(prewrap_row_count(), 0);
+    }
+
+    #[test]
+    fn prewrapped_rows_match_full_render() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = mixed_history_app(tmp.path());
+        render_history_no_selection(&mut app, 40, 80);
+
+        let reference = full_wrap_reference(&mut app, 40, 80);
+        let (cached_rows, cached_meta, _) = cached_history_rows(&app);
+
+        assert_eq!(cached_rows, reference.rows);
+        assert_eq!(cached_meta, reference.row_meta);
+    }
+
+    #[test]
+    fn msg_abs_line_matches_full_render_for_every_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = mixed_history_app(tmp.path());
+        for width in [40, 64] {
+            render_history_no_selection(&mut app, width, 80);
+            let reference = full_wrap_reference(&mut app, width, 80);
+
+            assert_eq!(app.msg_abs_line, reference.msg_abs_line);
+        }
+    }
+
+    #[test]
+    fn chat_total_lines_matches_full_wrap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = mixed_history_app(tmp.path());
+        render_history_no_selection(&mut app, 40, 80);
+        let reference = full_wrap_reference(&mut app, 40, 80);
+
+        assert_eq!(app.chat_total_lines, reference.chat_total_lines);
+        assert_eq!(app.chat_visible_lines, reference.chat_visible_lines);
+        assert_eq!(app.chat_banner_lines, reference.chat_banner_lines);
+    }
+
+    #[test]
+    fn transcript_find_matches_match_full_render() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = mixed_history_app(tmp.path());
+        app.transcript_find = Some(TranscriptFind {
+            query: "oldest target".to_string(),
+            matches: Vec::new(),
+            current: None,
+            saved_offset: 0,
+        });
+
+        render_history_no_selection(&mut app, 40, 10);
+        let reference = full_wrap_reference(&mut app, 40, 10);
+        let query = "oldest target".to_string();
+        let expected_matches = reference
+            .find_lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| line.contains(&query).then_some(idx))
+            .collect::<Vec<_>>();
+
+        assert_eq!(app.chat_find_lines, reference.find_lines);
+        assert_eq!(
+            app.transcript_find.as_ref().unwrap().matches,
+            expected_matches
+        );
+        assert!(
+            expected_matches.iter().any(|line| *line < 4),
+            "the oldest transcript rows must remain searchable"
+        );
     }
 
     #[test]
@@ -5617,6 +6201,38 @@ mod render_history_spacing_tests {
 
         let buf = render_history_buffer(&mut app, 40, 4);
         let row = find_row(&app, "needle") as u16;
+
+        assert!((0..40).any(|col| {
+            buf[(col, row)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        }));
+    }
+
+    #[test]
+    fn transcript_find_highlights_unicode_casefold_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.history = vec![
+            HistoryEntry::Plain {
+                line: "İstanbul target".to_string(),
+            },
+            HistoryEntry::Plain {
+                line: "bottom filler".to_string(),
+            },
+        ]
+        .into();
+        app.transcript_find = Some(TranscriptFind {
+            query: "İ".to_string(),
+            matches: Vec::new(),
+            current: None,
+            saved_offset: 0,
+        });
+
+        let buf = render_history_buffer(&mut app, 40, 4);
+        let row = find_row(&app, "İstanbul") as u16;
 
         assert!((0..40).any(|col| {
             buf[(col, row)]

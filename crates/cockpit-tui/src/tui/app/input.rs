@@ -4962,7 +4962,7 @@ mod chat_scrollback_key_tests {
         let mut app = scrollable_app();
         app.chat_find_lines = vec![
             "alpha".to_string(),
-            "Needle one".to_string(),
+            "needle one".to_string(),
             "middle".to_string(),
             "needle two".to_string(),
         ];

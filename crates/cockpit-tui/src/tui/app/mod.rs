@@ -91,6 +91,7 @@ use crossterm::event::{
 };
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use unicode_width::UnicodeWidthChar;
 
 use crate::tui::agent_runner::{self, AgentRunner};
@@ -1634,9 +1635,9 @@ pub struct App {
     /// Same purpose — clamp scrollback so the bottom of the visible
     /// window can't go below the top of the content.
     pub(super) chat_visible_lines: usize,
-    /// Plain-text copy of the full banner-inclusive visual line model
-    /// from the last render. Indices match `chat_total_lines` absolute
-    /// lines and are searched by transcript find.
+    /// Lowercased plain-text copy of the full banner-inclusive visual
+    /// line model from the last render. Indices match `chat_total_lines`
+    /// absolute lines and are searched by transcript find.
     pub(super) chat_find_lines: Vec<String>,
     pub(super) transcript_find: Option<TranscriptFind>,
     /// In-app drag-select state for chat content (plan.md T8.f). Set
@@ -2530,6 +2531,19 @@ enum CursorShape {
 pub(super) struct HistoryRenderCacheEntry {
     pub(super) sig: u64,
     pub(super) rendered: Rc<crate::tui::history::Rendered>,
+    pub(super) prewrapped: Rc<PrewrappedEntry>,
+}
+
+#[derive(Clone)]
+pub(super) struct PrewrappedEntry {
+    pub(super) rows: Vec<Rc<Line<'static>>>,
+    pub(super) row_meta: Vec<render::ChatRowMeta>,
+    pub(super) height: usize,
+    pub(super) find_text: Vec<String>,
+    pub(super) msg_first_row: Option<usize>,
+    /// Gap rows depend on neighboring entries, so render assembly computes them
+    /// outside the entry signature and cached entries always contribute none.
+    pub(super) gap_rows: usize,
 }
 
 #[derive(Clone, Default)]

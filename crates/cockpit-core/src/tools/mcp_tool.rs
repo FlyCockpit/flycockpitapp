@@ -3,6 +3,7 @@
 //!
 //! The script reaches enabled MCP servers through host functions
 //! exposed inside the sandbox: `mcp.search(query)`,
+//! `mcp.grep_tool_names(regex)`, `mcp.grep_tool_definitions(regex)`,
 //! `mcp.describe(server, tool)`, and `mcp.invoke(server, tool, args)`.
 //! The script's final value is returned as JSON. If the script returns
 //! `None`, captured `print(...)` output is returned as a fallback. The sandbox
@@ -19,49 +20,24 @@ use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 pub struct McpTool;
 
-const NORMAL_DESCRIPTION: &str =
-    "Run Python in a sandbox exposing mcp.search, mcp.describe, and mcp.invoke.";
+const NORMAL_DESCRIPTION: &str = "Run Python in a sandbox exposing mcp.search, cheap mcp.grep_tool_names, heavier mcp.grep_tool_definitions, mcp.describe, and mcp.invoke.";
 const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sandbox to reach MCP tools. Inside the \
      script call `mcp.search(query)` for cheap discovery (returns dicts with server, tool, \
-     and description), `mcp.describe(server, tool)` when you need one tool's full input \
-     schema, and `mcp.invoke(server, tool, args)` to call one. Process intermediate results \
-     in Python and use a final expression for the value you want back, for example \
-     `hits = mcp.search(\"calendar\")` then `hits`. If the script returns `None`, \
+     and description), `mcp.grep_tool_names(regex)` for cheap name-only regex discovery, \
+     `mcp.grep_tool_definitions(regex)` for heavier regex discovery across names, descriptions, \
+     and serialized input schemas, `mcp.describe(server, tool)` when you need one tool's full \
+     input schema, and `mcp.invoke(server, tool, args)` to call one. Search or grep before \
+     concluding a capability is missing. Process intermediate results in Python and use a final \
+     expression for the value you want back, for example `hits = mcp.search(\"calendar\")` then \
+     `hits`. If the script returns `None`, \
      printed output is captured and returned as a fallback. The sandbox has no filesystem, \
      network, or environment access.";
 
-pub(crate) fn discoverable_tool_adverts(toolbox: &ToolBox) -> Vec<String> {
-    let names = toolbox.discoverable_mcp_tool_names();
-    let mut adverts = Vec::new();
-    push_family_advert(
-        &names,
-        &mut adverts,
-        "intel tail",
-        &["word", "hot", "circular", "impact", "change_impact"],
-    );
-    push_family_advert(
-        &names,
-        &mut adverts,
-        "harness delegation",
-        &["harness_list", "harness_invoke"],
-    );
-    push_family_advert(
-        &names,
-        &mut adverts,
-        "prior sessions",
-        &["session_search", "session_read"],
-    );
-    push_family_advert(&names, &mut adverts, "goal state", &["goal"]);
-    push_family_advert(&names, &mut adverts, "code navigation", &["lsp"]);
-    push_family_advert(&names, &mut adverts, "skill management", &["skill_manage"]);
-    adverts
-}
-
 pub(crate) fn turn_start_advert_message(
-    toolbox: &ToolBox,
+    _toolbox: &ToolBox,
     session: &crate::session::Session,
 ) -> Option<String> {
-    let mut adverts = discoverable_tool_adverts(toolbox);
+    let mut adverts = Vec::new();
     if session
         .db
         .current_session_goal(session.id, false)
@@ -89,26 +65,6 @@ pub(crate) fn advert_message_from_lines(adverts: &[String]) -> Option<String> {
     Some(format!(
         "Available built-in cockpit functions:\n{advert_text}"
     ))
-}
-
-fn push_family_advert(
-    names: &[String],
-    adverts: &mut Vec<String>,
-    family: &str,
-    family_tools: &[&str],
-) {
-    let present = family_tools
-        .iter()
-        .copied()
-        .filter(|tool| names.iter().any(|name| name == tool))
-        .collect::<Vec<_>>();
-    if present.is_empty() {
-        return;
-    }
-    adverts.push(format!(
-        "{family}: {} via mcp.invoke(\"cockpit\", ...).",
-        present.join("/")
-    ));
 }
 
 #[async_trait]
@@ -211,6 +167,8 @@ mod tests {
         let t = McpTool;
         assert!(t.description().len() <= 200, "terse budget");
         assert!(t.description().contains("mcp.search"));
+        assert!(t.description().contains("mcp.grep_tool_names"));
+        assert!(t.description().contains("mcp.grep_tool_definitions"));
         assert!(t.description().contains("mcp.describe"));
         assert!(t.description().contains("mcp.invoke"));
         assert!(t.description().contains("Python"));
@@ -294,39 +252,19 @@ mod tests {
     }
 
     #[test]
-    fn advert_grouping_keeps_one_line_per_discoverable_family() {
-        let toolbox = ToolBox::new()
-            .with(Arc::new(McpTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::intel::WordTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::intel::HotTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::harness::HarnessListTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::harness::HarnessInvokeTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::session_search::SessionSearchTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::session_read::SessionReadTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::goal::GoalTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::lsp::LspTool))
-            .with_discoverable_mcp(Arc::new(crate::tools::skill_manage::SkillManageTool));
-
-        let adverts = discoverable_tool_adverts(&toolbox);
-
-        assert_eq!(adverts.len(), 6, "{adverts:?}");
-        for family in [
-            "intel tail",
-            "harness delegation",
-            "prior sessions",
-            "goal state",
-            "code navigation",
-            "skill management",
-        ] {
-            assert_eq!(
-                adverts
-                    .iter()
-                    .filter(|line| line.starts_with(family))
-                    .count(),
-                1,
-                "{family}: {adverts:?}"
+    fn mcp_descriptions_teach_grep_functions() {
+        for description in [NORMAL_DESCRIPTION, DEFENSIVE_DESCRIPTION] {
+            assert!(description.contains("grep_tool_names"), "{description}");
+            assert!(
+                description.contains("grep_tool_definitions"),
+                "{description}"
             );
         }
+        assert!(
+            DEFENSIVE_DESCRIPTION
+                .contains("Search or grep before concluding a capability is missing"),
+            "{DEFENSIVE_DESCRIPTION}"
+        );
     }
 
     #[tokio::test]

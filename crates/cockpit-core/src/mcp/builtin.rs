@@ -692,7 +692,6 @@ pub fn search(ctx: &HostContext, query: &str) -> Vec<SearchHit> {
         .filter(|func| {
             let description = func.description_for_mode(ctx.llm_mode);
             q.is_empty()
-                || BUILTIN_SERVER_ID.contains(&q)
                 || func.name.to_lowercase().contains(&q)
                 || description.to_lowercase().contains(&q)
         })
@@ -2317,6 +2316,44 @@ mod tests {
         assert_eq!(desc.name, "runtime_tool_17");
         assert_eq!(out, Value::String("result 17".to_string()));
         assert!(Arc::ptr_eq(&host.builtin_registry, &registry));
+    }
+
+    #[test]
+    fn search_short_query_does_not_dump_whole_builtin_catalog() {
+        let funcs = vec![
+            BuiltinFunction::new(
+                "alpha",
+                "Alpha only",
+                BuiltinPresentation {
+                    glyph: "a",
+                    label: "alpha".to_string(),
+                },
+                Arc::new(empty_object_schema),
+                Arc::new(|_ctx| Availability::available()),
+                true,
+                Arc::new(|_ctx, _args| Box::pin(async { Ok(Value::Null) })),
+            ),
+            BuiltinFunction::new(
+                "contains_c",
+                "Relevant hit",
+                BuiltinPresentation {
+                    glyph: "c",
+                    label: "contains_c".to_string(),
+                },
+                Arc::new(empty_object_schema),
+                Arc::new(|_ctx| Availability::available()),
+                true,
+                Arc::new(|_ctx, _args| Box::pin(async { Ok(Value::Null) })),
+            ),
+        ];
+        let host = HostContext::empty_for_tests()
+            .with_builtin_registry(Arc::new(BuiltinRegistry::from_functions(funcs)));
+        let all_hits = search(&host, "");
+        let short_hits = search(&host, "c");
+
+        assert_eq!(all_hits.len(), 2);
+        assert_eq!(short_hits.len(), 1);
+        assert_eq!(short_hits[0].tool, "contains_c");
     }
 
     #[tokio::test]

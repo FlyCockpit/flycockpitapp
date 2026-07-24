@@ -3077,17 +3077,24 @@ mod tests {
     }
 
     #[test]
-    fn advert_discoverability_invariant_covers_default_discoverable_tools() {
+    fn monty_discoverability_invariant_covers_default_discoverable_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         for &name in crate::agents::BUILTIN_AGENT_NAMES {
             let agent = load(name, &args).unwrap();
-            let advert_text =
-                crate::tools::mcp_tool::discoverable_tool_adverts(&agent.tools).join("\n");
+            let mcp_description = agent
+                .tools
+                .definitions(crate::config::extended::LlmMode::Normal)
+                .into_iter()
+                .find(|definition| definition.name == "mcp")
+                .map(|definition| definition.description)
+                .unwrap_or_default();
             for tool in agent.tools.discoverable_mcp_tool_names() {
                 assert!(
-                    advert_text.contains(&tool) || agent.role_prompt.contains(&tool),
-                    "`{name}` discoverable tool `{tool}` is not named by an advert or role prompt"
+                    mcp_description.contains("grep_tool_names")
+                        || mcp_description.contains("grep_tool_definitions")
+                        || agent.role_prompt.contains(&tool),
+                    "`{name}` discoverable tool `{tool}` is not reachable through static MCP discovery or role prompt"
                 );
             }
         }

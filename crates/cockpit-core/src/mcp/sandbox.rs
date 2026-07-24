@@ -2,12 +2,15 @@
 //!
 //! Runs a model-authored Python script in a locked-down [`monty`] VM and
 //! returns the script's final value as JSON, with captured `print(...)`
-//! output as a fallback when the final value is `None`. Three host functions
+//! output as a fallback when the final value is `None`. Host functions
 //! are exposed inside the sandbox, attached as the `mcp` namespace object:
 //!
 //! - `mcp.search(query) -> list[dict]` — fuzzy/keyword search over
 //!   enabled MCP servers' tools; each dict carries `server`,
 //!   `tool`, and a concise `description`.
+//! - `mcp.grep_tool_names(regex) -> list[dict]` — regex search over tool names.
+//! - `mcp.grep_tool_definitions(regex) -> list[dict]` — regex search over
+//!   names, descriptions, and serialized schemas; each dict carries a snippet.
 //! - `mcp.describe(server, tool) -> dict` — fetch one tool's description
 //!   plus full `input_schema` on demand.
 //! - `mcp.invoke(server, tool, args) -> result` — call a tool; the result
@@ -21,7 +24,7 @@
 //!
 //! **Async dispatch + single-async-job authority (GOALS §22).** The VM is
 //! driven on the host's tokio task: each `mcp.search`/`mcp.describe`/
-//! `mcp.invoke` suspends the VM (a `FunctionCall` snapshot), the host
+//! `mcp.invoke`/grep call suspends the VM (a `FunctionCall` snapshot), the host
 //! performs the real async MCP call, and `resume()`s with the result. The
 //! sandbox cannot spawn ambient async work — every MCP call routes through
 //! the host.
@@ -188,7 +191,7 @@ fn exc_msg(e: &MontyException) -> String {
 
 /// Dispatch a sandbox external call to the host. `method_call` means the
 /// first arg is the `mcp` receiver (we skip it). Supported: `search`,
-/// `describe`, `invoke`.
+/// `grep_tool_names`, `grep_tool_definitions`, `describe`, `invoke`.
 async fn dispatch(
     cfg: &McpConfig,
     host: &HostContext,
@@ -221,6 +224,43 @@ async fn dispatch(
             observe_child_monty(host, dispatch, async {
                 let hits = super::catalog::search(cfg, host, &query).await;
                 Ok((hits_to_monty(&hits), hits_to_json(&hits)))
+            })
+            .await
+        }
+        "grep_tool_names" => {
+            let pattern = str_arg(args, 0, "regex", "mcp.grep_tool_names")?;
+            let dispatch = McpChildDispatch::new(
+                "grep_tool_names",
+                None,
+                "mcp.grep_tool_names",
+                None,
+                serde_json::json!({ "regex": pattern }),
+            );
+            observe_child_monty(host, dispatch, async {
+                match super::catalog::grep_tool_names(cfg, host, &pattern).await {
+                    Ok(hits) => Ok((hits_to_monty(&hits), hits_to_json(&hits))),
+                    Err(e) => Err(e),
+                }
+            })
+            .await
+        }
+        "grep_tool_definitions" => {
+            let pattern = str_arg(args, 0, "regex", "mcp.grep_tool_definitions")?;
+            let dispatch = McpChildDispatch::new(
+                "grep_tool_definitions",
+                None,
+                "mcp.grep_tool_definitions",
+                None,
+                serde_json::json!({ "regex": pattern }),
+            );
+            observe_child_monty(host, dispatch, async {
+                match super::catalog::grep_tool_definitions(cfg, host, &pattern).await {
+                    Ok(hits) => Ok((
+                        definition_hits_to_monty(&hits),
+                        definition_hits_to_json(&hits),
+                    )),
+                    Err(e) => Err(e),
+                }
             })
             .await
         }
@@ -430,6 +470,34 @@ fn hits_to_monty(hits: &[super::catalog::SearchHit]) -> MontyObject {
 
 fn hits_to_json(hits: &[super::catalog::SearchHit]) -> Value {
     monty_to_json(&hits_to_monty(hits))
+}
+
+fn definition_hits_to_monty(hits: &[super::catalog::DefinitionHit]) -> MontyObject {
+    let list = hits
+        .iter()
+        .map(|h| {
+            let pairs = vec![
+                (
+                    MontyObject::String("server".into()),
+                    MontyObject::String(h.server.clone()),
+                ),
+                (
+                    MontyObject::String("tool".into()),
+                    MontyObject::String(super::protocol::sanitize_tool_name(&h.tool)),
+                ),
+                (
+                    MontyObject::String("snippet".into()),
+                    MontyObject::String(super::protocol::sanitize_tool_description(&h.snippet)),
+                ),
+            ];
+            MontyObject::Dict(DictPairs::from(pairs))
+        })
+        .collect();
+    MontyObject::List(list)
+}
+
+fn definition_hits_to_json(hits: &[super::catalog::DefinitionHit]) -> Value {
+    monty_to_json(&definition_hits_to_monty(hits))
 }
 
 fn descriptor_to_monty(server: &str, desc: &super::protocol::ToolDescriptor) -> MontyObject {
@@ -1374,6 +1442,21 @@ mod tests {
         // Passing an int raises inside the sandbox → surfaces as an error.
         let err = run("mcp.search(123)", &cfg).await;
         assert!(err.is_err(), "non-string query should error");
+    }
+
+    #[tokio::test]
+    async fn grep_invalid_regex_is_value_error() {
+        let cfg = McpConfig::default();
+        let script = "\
+try:
+    mcp.grep_tool_names('(')
+    r = 'no-error'
+except ValueError as e:
+    r = str(e)
+r";
+        let out = run(script, &cfg).await.unwrap();
+        assert!(out.contains("invalid regex"), "{out}");
+        assert!(out.contains("mcp.grep_tool_names"), "{out}");
     }
 
     #[tokio::test]

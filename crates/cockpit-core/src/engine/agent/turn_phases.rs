@@ -1745,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn advert_nudge_injected_once_at_turn_start() {
+    fn discoverable_family_advert_is_not_injected_at_turn_start() {
         let tmp = tempfile::tempdir().unwrap();
         let session = test_session(tmp.path());
         let toolbox = ToolBox::new()
@@ -1772,33 +1772,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(adverts.len(), 1, "{history:?}");
-        assert!(adverts[0].contains("intel tail"), "{}", adverts[0]);
-        assert!(adverts[0].contains("word"), "{}", adverts[0]);
-        assert!(
-            adverts[0].contains("mcp.invoke(\"cockpit\""),
-            "{}",
-            adverts[0]
-        );
-
-        inject_turn_start_system_messages(
-            &session,
-            &toolbox,
-            true,
-            crate::engine::tool::ContextUsageSnapshot::unavailable(),
-            &mut history,
-        );
-        let advert_count = history
-            .iter()
-            .filter(|message| {
-                matches!(
-                    message,
-                    Message::System { content }
-                        if content.contains("Available built-in cockpit functions")
-                )
-            })
-            .count();
-        assert_eq!(advert_count, 1, "same advert should not be duplicated");
+        assert!(adverts.is_empty(), "{history:?}");
     }
 
     #[test]

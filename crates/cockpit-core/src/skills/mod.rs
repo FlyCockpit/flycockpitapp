@@ -55,6 +55,7 @@ const TRANSCRIPT_SOURCE: &str =
     "the reusable workflow we just completed in this conversation transcript";
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
 const MAX_CATALOG_DESCRIPTION_CHARS: usize = 60;
+const MAX_MANAGED_SKILL_CHARS: usize = 100_000;
 const SUPPORT_DIRS: [&str; 4] = ["references", "templates", "scripts", "assets"];
 pub const MODEL_SKILL_CATALOG_LABEL: &str = "Available skills";
 static CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -266,6 +267,160 @@ pub struct Skill {
 
 pub fn package_root(skill: &Skill) -> &Path {
     skill.source.parent().unwrap_or(&skill.source)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillPackageTarget {
+    pub package_root: PathBuf,
+    pub name: String,
+    pub is_manifest: bool,
+    pub relative_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillPackageWriteValidation {
+    pub name: String,
+    pub is_manifest: bool,
+}
+
+impl SkillPackageWriteValidation {
+    pub fn confirmation_note(&self) -> String {
+        let kind = if self.is_manifest {
+            "manifest"
+        } else {
+            "support file"
+        };
+        format!(
+            "\n[skill] validated {} ({kind}); catalog refreshed",
+            self.name
+        )
+    }
+}
+
+pub fn package_target_for_path(
+    path: &Path,
+    cwd: &Path,
+    cfg: &SkillsConfig,
+) -> Option<SkillPackageTarget> {
+    package_target_for_path_with_skill(path, cwd, cfg).map(|(target, _)| target)
+}
+
+pub fn validate_skill_package_write(
+    path: &Path,
+    cwd: &Path,
+    cfg: &SkillsConfig,
+    content: &str,
+) -> Result<Option<SkillPackageWriteValidation>> {
+    let Some((target, skill)) = package_target_for_path_with_skill(path, cwd, cfg) else {
+        return Ok(None);
+    };
+    crate::skills::manage::ensure_plain_write_allowed(&skill, &target.package_root)?;
+    ensure_no_skill_symlink(&target)?;
+    if target.is_manifest {
+        validate_managed_skill_contents(content, &target.name)?;
+    } else {
+        validate_support_relative(&target.relative_path)?;
+        if content.chars().count() > MAX_MANAGED_SKILL_CHARS {
+            anyhow::bail!("support file exceeds {MAX_MANAGED_SKILL_CHARS} character limit");
+        }
+    }
+    Ok(Some(SkillPackageWriteValidation {
+        name: target.name,
+        is_manifest: target.is_manifest,
+    }))
+}
+
+pub fn validate_skill_package_write_for_paths(
+    requested_path: &Path,
+    effective_path: &Path,
+    cwd: &Path,
+    cfg: &SkillsConfig,
+    content: &str,
+) -> Result<Option<SkillPackageWriteValidation>> {
+    if let Some((target, _)) = package_target_for_path_with_skill(requested_path, cwd, cfg) {
+        ensure_no_skill_symlink(&target)?;
+    }
+    validate_skill_package_write(effective_path, cwd, cfg, content)
+}
+
+fn package_target_for_path_with_skill(
+    path: &Path,
+    cwd: &Path,
+    cfg: &SkillsConfig,
+) -> Option<(SkillPackageTarget, Skill)> {
+    let path = lexical_absolute_against(path, cwd);
+    let scan_dirs = resolve_scan_dirs(cwd, cfg);
+    if !scan_dirs
+        .iter()
+        .map(|dir| lexical_absolute_against(dir, cwd))
+        .any(|dir| path.starts_with(&dir) && path != dir)
+    {
+        return None;
+    }
+    let skills = discover(cwd, cfg).ok()?;
+    for skill in skills {
+        let package_root = lexical_absolute_against(package_root(&skill), cwd);
+        if !path.starts_with(&package_root) || path == package_root {
+            continue;
+        }
+        let name = package_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)?;
+        let relative_path = path.strip_prefix(&package_root).ok()?.to_path_buf();
+        let is_manifest = relative_path == Path::new("SKILL.md");
+        return Some((
+            SkillPackageTarget {
+                package_root,
+                name,
+                is_manifest,
+                relative_path,
+            },
+            skill,
+        ));
+    }
+    None
+}
+
+fn ensure_no_skill_symlink(target: &SkillPackageTarget) -> Result<()> {
+    if std::fs::symlink_metadata(&target.package_root)
+        .with_context(|| format!("checking skill package {}", target.package_root.display()))?
+        .file_type()
+        .is_symlink()
+    {
+        anyhow::bail!("skill package may not be a symlink");
+    }
+    let mut cursor = target.package_root.clone();
+    let mut components = target.relative_path.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(segment) = component else {
+            anyhow::bail!("skill package path may not contain traversal components");
+        };
+        cursor.push(segment);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!("skill package path may not traverse symlinks");
+            }
+            Ok(metadata) if components.peek().is_some() && !metadata.is_dir() => {
+                anyhow::bail!("skill support file parent is not a directory");
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", cursor.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lexical_absolute_against(path: &Path, cwd: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    lexical_normalize(&absolute)
 }
 
 /// Capabilities used to filter conditional Hermes skills for one live agent
@@ -552,7 +707,6 @@ pub(crate) fn validate_managed_skill_contents(
     raw: &str,
     expected_name: &str,
 ) -> Result<SkillFrontmatter> {
-    const MAX_MANAGED_SKILL_CHARS: usize = 100_000;
     if raw.chars().count() > MAX_MANAGED_SKILL_CHARS {
         anyhow::bail!("SKILL.md exceeds {MAX_MANAGED_SKILL_CHARS} character limit");
     }
@@ -1601,6 +1755,55 @@ mod tests {
             source: PathBuf::from("/"),
         };
         assert_eq!(package_root(&parentless), Path::new("/"));
+    }
+
+    #[test]
+    fn package_target_for_path_classifies_manifest_support_and_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join(".agents").join("skills");
+        write_skill(
+            &scan,
+            "target",
+            "---\nname: target\ndescription: d\n---\n",
+            "Body",
+        );
+        let cfg = skills_cfg(vec![".agents/skills"], false);
+        let package = scan.join("target");
+
+        let manifest =
+            package_target_for_path(&package.join("SKILL.md"), tmp.path(), &cfg).unwrap();
+        assert_eq!(manifest.name, "target");
+        assert_eq!(manifest.package_root, package);
+        assert!(manifest.is_manifest);
+        assert_eq!(manifest.relative_path, Path::new("SKILL.md"));
+
+        let support =
+            package_target_for_path(&package.join("references").join("a.md"), tmp.path(), &cfg)
+                .unwrap();
+        assert_eq!(support.name, "target");
+        assert!(!support.is_manifest);
+        assert_eq!(support.relative_path, Path::new("references/a.md"));
+
+        assert!(
+            package_target_for_path(&tmp.path().join("outside.md"), tmp.path(), &cfg).is_none()
+        );
+    }
+
+    #[test]
+    fn package_target_for_path_rejects_prefix_lookalike() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("skills");
+        write_skill(
+            &scan,
+            "target",
+            "---\nname: target\ndescription: d\n---\n",
+            "Body",
+        );
+        let lookalike = tmp.path().join("skills-other").join("target");
+        std::fs::create_dir_all(&lookalike).unwrap();
+        let cfg = skills_cfg(vec!["skills"], false);
+
+        assert!(package_target_for_path(&lookalike.join("SKILL.md"), tmp.path(), &cfg).is_none());
     }
 
     #[test]

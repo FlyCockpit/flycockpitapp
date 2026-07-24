@@ -873,6 +873,28 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn ensure_plain_write_allowed(skill: &Skill, package: &Path) -> Result<()> {
+    let name = &skill.frontmatter.name;
+    if package.components().any(is_hub_component) {
+        bail!("hub-installed skill `{name}` is read-only");
+    }
+    let provenance = read_provenance(package)?;
+    if provenance.as_ref().is_some_and(|value| value.pinned)
+        || frontmatter_flag(&skill.frontmatter, "pinned")
+    {
+        bail!("pinned skill `{name}` is read-only");
+    }
+    let protection = provenance.as_ref().and_then(|value| value.protection);
+    if let Some(protection) = protection.or_else(|| frontmatter_protection(&skill.frontmatter)) {
+        let kind = match protection {
+            SkillProtection::Bundled => "bundled",
+            SkillProtection::HubInstalled => "hub-installed",
+        };
+        bail!("{kind} skill `{name}` is read-only");
+    }
+    Ok(())
+}
+
 fn read_provenance(package: &Path) -> Result<Option<SkillProvenance>> {
     let path = package.join(PROVENANCE_FILE);
     match std::fs::read(&path) {

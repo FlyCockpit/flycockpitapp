@@ -78,13 +78,13 @@ impl Tool for WriteunlockTool {
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| crate::engine::tool::invalid_input("`content` is required"))?;
-        let path = resolve(path_arg, &ctx.cwd);
+        let requested_path = resolve(path_arg, &ctx.cwd);
 
         // Native-tool boundary check (sandboxing part 2): an out-of-cwd
         // write target escalates (naming the path) before we touch disk.
         let path = crate::tools::sandbox::check_native_access(
             ctx,
-            &path,
+            &requested_path,
             crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
         )
         .await?;
@@ -120,6 +120,15 @@ impl Tool for WriteunlockTool {
         };
 
         let normalized = normalize_line_endings(content, want_crlf);
+        let config = ctx.config.extended();
+        let skill_validation = crate::skills::validate_skill_package_write_for_paths(
+            &requested_path,
+            &path,
+            &ctx.cwd,
+            &config.skills,
+            &normalized,
+        )
+        .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
 
         let outcome = if exists {
             write_and_release(ctx, &path, normalized.as_bytes(), write_guard)?
@@ -127,6 +136,9 @@ impl Tool for WriteunlockTool {
             create_new_and_release(&path, normalized.as_bytes(), write_guard, create_new_file)?
         };
         crate::assistants::identity::record_identity_write(ctx, &path)?;
+        if skill_validation.is_some() {
+            crate::skills::invalidate_catalog_cache(&ctx.cwd, &config.skills);
+        }
 
         let mut message = format!(
             "wrote `{}` ({} bytes, {})",
@@ -134,7 +146,6 @@ impl Tool for WriteunlockTool {
             normalized.len(),
             if want_crlf { "CRLF" } else { "LF" }
         );
-        let config = ctx.config.extended();
         if let Some(lsp) = &ctx.lsp {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }
@@ -148,6 +159,9 @@ impl Tool for WriteunlockTool {
         }
         if let Some(note) = identity_note {
             message.push_str(&note);
+        }
+        if let Some(validation) = skill_validation {
+            message.push_str(&validation.confirmation_note());
         }
 
         Ok(ToolOutput::text(message))
@@ -212,6 +226,7 @@ mod tests {
     use crate::engine::tool::{ToolFailKind, classify_failure};
     use crate::tools::common::{LOCK_BOOKKEEPING_ADVISORY, test_ctx, test_ctx_with_db};
     use crate::tools::readlock::ReadlockTool;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     #[expect(
@@ -318,6 +333,85 @@ mod tests {
         }
     }
 
+    fn skill_manifest(name: &str, description: &str, body: &str) -> String {
+        format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}\n")
+    }
+
+    fn skill_manifest_with_extra(name: &str, extra: &str) -> String {
+        format!("---\nname: {name}\ndescription: d\n{extra}---\n\nBody\n")
+    }
+
+    fn write_skill_package(root: &Path, name: &str, manifest: &str) -> PathBuf {
+        let package = root.join(".agents").join("skills").join(name);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("SKILL.md"), manifest).unwrap();
+        package
+    }
+
+    fn skill_test_ctx(root: &Path) -> ToolCtx {
+        let cockpit = root.join(".cockpit");
+        std::fs::create_dir_all(&cockpit).unwrap();
+        std::fs::write(
+            cockpit.join("config.json"),
+            r#"{"skills":{"scan_dirs":[".agents/skills"]}}"#,
+        )
+        .unwrap();
+        test_ctx(root)
+    }
+
+    fn note_read(ctx: &ToolCtx, path: &Path) {
+        ctx.locks.note_read(path, &ctx.agent_id, ctx.session.id);
+    }
+
+    fn trusted_policy(root: &Path) -> crate::config::trust::WorkspaceTrustPolicy {
+        crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::TrustRoot {
+                opened_path: root.to_path_buf(),
+                root: root.to_path_buf(),
+                kind: crate::config::trust::TrustRootKind::Directory,
+            },
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        }
+    }
+
+    async fn writeunlock(path: &Path, content: &str, ctx: &ToolCtx) -> anyhow::Result<String> {
+        crate::config::trust::scope_workspace_trust_policy(trusted_policy(&ctx.cwd), async {
+            Ok(WriteunlockTool
+                .call(
+                    serde_json::json!({
+                        "path": path.display().to_string(),
+                        "content": content
+                    }),
+                    ctx,
+                )
+                .await?
+                .content)
+        })
+        .await
+    }
+
+    async fn editunlock(
+        path: &Path,
+        old: &str,
+        new: &str,
+        ctx: &ToolCtx,
+    ) -> anyhow::Result<String> {
+        crate::config::trust::scope_workspace_trust_policy(trusted_policy(&ctx.cwd), async {
+            Ok(crate::tools::editunlock::EditunlockTool
+                .call(
+                    serde_json::json!({
+                        "path": path.display().to_string(),
+                        "old_string": old,
+                        "new_string": new
+                    }),
+                    ctx,
+                )
+                .await?
+                .content)
+        })
+        .await
+    }
+
     #[tokio::test]
     async fn writeunlock_creates_new_file_without_prior_read() {
         let tmp = tempfile::tempdir().unwrap();
@@ -334,6 +428,260 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("created.md")).unwrap(),
             "hello\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn writeunlock_rejects_invalid_skill_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = skill_manifest("bad", "d", "Body");
+        let package = write_skill_package(tmp.path(), "bad", &original);
+        let ctx = skill_test_ctx(tmp.path());
+        let manifest = package.join("SKILL.md");
+        note_read(&ctx, &manifest);
+
+        let err = writeunlock(&manifest, "no frontmatter\n", &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
+        let err = err.to_string();
+
+        assert!(err.contains("YAML frontmatter"), "{err}");
+        assert_eq!(std::fs::read_to_string(manifest).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn writeunlock_rejects_skill_manifest_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = skill_manifest("stable", "d", "Body");
+        let package = write_skill_package(tmp.path(), "stable", &original);
+        let ctx = skill_test_ctx(tmp.path());
+        let manifest = package.join("SKILL.md");
+        note_read(&ctx, &manifest);
+
+        let err = writeunlock(&manifest, &skill_manifest("renamed", "d", "Body"), &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("must remain `stable`"), "{err}");
+        assert_eq!(std::fs::read_to_string(manifest).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn writeunlock_support_file_rule_matrix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package = write_skill_package(
+            tmp.path(),
+            "support",
+            &skill_manifest("support", "d", "Body"),
+        );
+        let ctx = skill_test_ctx(tmp.path());
+
+        let err = writeunlock(&package.join("notes").join("a.md"), "x", &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("support file must be under one of"), "{err}");
+
+        let err = writeunlock(
+            &package.join("references").join("..").join("escape.md"),
+            "x",
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("parent traversal"), "{err}");
+
+        let err = writeunlock(
+            &package.join("references").join("large.md"),
+            &"x".repeat(100_001),
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("100000 character limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn skill_package_protection_blocks_plain_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "hubbed",
+                skill_manifest_with_extra("hubbed", "hub-installed: true\n"),
+                "hub-installed skill `hubbed` is read-only",
+            ),
+            (
+                "bundled",
+                skill_manifest_with_extra("bundled", "bundled: true\n"),
+                "bundled skill `bundled` is read-only",
+            ),
+            (
+                "pinned",
+                skill_manifest_with_extra("pinned", "pinned: true\n"),
+                "pinned skill `pinned` is read-only",
+            ),
+        ];
+
+        let packages: Vec<_> = cases
+            .iter()
+            .map(|(name, manifest, expected)| {
+                (
+                    *name,
+                    write_skill_package(tmp.path(), name, manifest),
+                    *expected,
+                    manifest.clone(),
+                )
+            })
+            .collect();
+        let ctx = skill_test_ctx(tmp.path());
+
+        for (name, package, expected, manifest) in packages {
+            let skill_md = package.join("SKILL.md");
+            note_read(&ctx, &skill_md);
+            let write_err = writeunlock(&skill_md, &skill_manifest(name, "new", "Body"), &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(write_err.contains(expected), "{write_err}");
+
+            let edit_err = editunlock(&skill_md, "description: d", "description: new", &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(edit_err.contains(expected), "{edit_err}");
+            assert_eq!(std::fs::read_to_string(skill_md).unwrap(), manifest);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn writeunlock_refuses_symlinked_skill_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package =
+            write_skill_package(tmp.path(), "links", &skill_manifest("links", "d", "Body"));
+        let ctx = skill_test_ctx(tmp.path());
+        let refs = package.join("references");
+        std::fs::create_dir_all(&refs).unwrap();
+        let real = refs.join("real.md");
+        let link = refs.join("link.md");
+        std::fs::write(&real, "old").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        note_read(&ctx, &link);
+
+        let err = writeunlock(&link, "new", &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("may not traverse symlinks"), "{err}");
+        assert_eq!(std::fs::read_to_string(real).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn writeunlock_validates_outside_symlink_to_skill_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = skill_manifest("outside-link", "d", "Body");
+        let package = write_skill_package(tmp.path(), "outside-link", &original);
+        let ctx = skill_test_ctx(tmp.path());
+        let manifest = package.join("SKILL.md");
+        let link = tmp.path().join("manifest-link.md");
+        std::os::unix::fs::symlink(&manifest, &link).unwrap();
+        note_read(&ctx, &manifest);
+
+        let err = writeunlock(&link, "not frontmatter\n", &ctx)
+            .await
+            .unwrap_err();
+
+        assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
+        let err = err.to_string();
+        assert!(err.contains("YAML frontmatter"), "{err}");
+        assert_eq!(std::fs::read_to_string(manifest).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn valid_skill_write_invalidates_catalog_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package =
+            write_skill_package(tmp.path(), "valid", &skill_manifest("valid", "old", "Body"));
+        let ctx = skill_test_ctx(tmp.path());
+        let manifest = package.join("SKILL.md");
+        note_read(&ctx, &manifest);
+        let cfg = ctx.config.extended();
+        let discovered = crate::skills::discover(tmp.path(), &cfg.skills).unwrap();
+        assert_eq!(discovered[0].frontmatter.description, "old");
+        let before = crate::skills::catalog_generation();
+
+        writeunlock(&manifest, &skill_manifest("valid", "new", "Body"), &ctx)
+            .await
+            .unwrap();
+
+        assert!(crate::skills::catalog_generation() > before);
+        let discovered = crate::skills::discover(tmp.path(), &cfg.skills).unwrap();
+        assert_eq!(discovered[0].frontmatter.description, "new");
+    }
+
+    #[tokio::test]
+    async fn valid_skill_write_reports_validation_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package =
+            write_skill_package(tmp.path(), "note", &skill_manifest("note", "old", "Body"));
+        let ctx = skill_test_ctx(tmp.path());
+        let manifest = package.join("SKILL.md");
+        note_read(&ctx, &manifest);
+
+        let out = writeunlock(&manifest, &skill_manifest("note", "new", "Body"), &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            out.contains("[skill] validated note (manifest); catalog refreshed"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_skill_write_leaves_lock_usable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = skill_manifest("retry", "old", "Body");
+        let package = write_skill_package(tmp.path(), "retry", &original);
+        let ctx = skill_test_ctx(tmp.path());
+        let manifest = package.join("SKILL.md");
+        note_read(&ctx, &manifest);
+
+        let err = writeunlock(&manifest, "broken", &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("YAML frontmatter"), "{err}");
+        let out = writeunlock(&manifest, &skill_manifest("retry", "new", "Body"), &ctx)
+            .await
+            .unwrap();
+
+        assert!(out.contains("[skill] validated retry"), "{out}");
+        assert!(
+            std::fs::read_to_string(manifest)
+                .unwrap()
+                .contains("description: new")
+        );
+    }
+
+    #[tokio::test]
+    async fn non_skill_write_is_unaffected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let before = crate::skills::catalog_generation();
+
+        let out = writeunlock(&tmp.path().join("plain.md"), "hello", &ctx)
+            .await
+            .unwrap();
+
+        assert!(!out.contains("[skill]"), "{out}");
+        assert_eq!(crate::skills::catalog_generation(), before);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("plain.md")).unwrap(),
+            "hello"
         );
     }
 

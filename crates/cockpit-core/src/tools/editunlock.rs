@@ -116,12 +116,12 @@ impl Tool for EditunlockTool {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        let path = resolve(path_arg, &ctx.cwd);
+        let requested_path = resolve(path_arg, &ctx.cwd);
         // Native-tool boundary check (sandboxing part 2) before the
         // write-permitted check — a denied out-of-cwd path never edits.
         let path = crate::tools::sandbox::check_native_access(
             ctx,
-            &path,
+            &requested_path,
             crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
         )
         .await?;
@@ -167,8 +167,20 @@ impl Tool for EditunlockTool {
         let updated = replace_spans(&original, &spans, new_string)?;
 
         let normalized = normalize_line_endings(&updated, want_crlf);
+        let config = ctx.config.extended();
+        let skill_validation = crate::skills::validate_skill_package_write_for_paths(
+            &requested_path,
+            &path,
+            &ctx.cwd,
+            &config.skills,
+            &normalized,
+        )
+        .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
         let outcome = write_and_release(ctx, &path, normalized.as_bytes(), write_guard)?;
         crate::assistants::identity::record_identity_write(ctx, &path)?;
+        if skill_validation.is_some() {
+            crate::skills::invalidate_catalog_cache(&ctx.cwd, &config.skills);
+        }
 
         let mut message = format!(
             "edited `{}` ({}; {} bytes)",
@@ -176,7 +188,6 @@ impl Tool for EditunlockTool {
             stage,
             normalized.len()
         );
-        let config = ctx.config.extended();
         if let Some(lsp) = &ctx.lsp {
             message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
         }
@@ -190,6 +201,9 @@ impl Tool for EditunlockTool {
         }
         if let Some(note) = identity_note {
             message.push_str(&note);
+        }
+        if let Some(validation) = skill_validation {
+            message.push_str(&validation.confirmation_note());
         }
         let out = ToolOutput::text(message);
         // Per §13c, every cascade stage past `exact` is a content-
@@ -691,6 +705,52 @@ mod tests {
         );
         assert!(ctx.locks.holder(&file).is_none());
         assert!(ctx.locks.has_read(&file, &ctx.agent_id, ctx.session.id));
+    }
+
+    #[tokio::test]
+    async fn editunlock_validates_post_replace_skill_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cockpit = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&cockpit).unwrap();
+        std::fs::write(
+            cockpit.join("config.json"),
+            r#"{"skills":{"scan_dirs":[".agents/skills"]}}"#,
+        )
+        .unwrap();
+        let package = tmp.path().join(".agents").join("skills").join("post");
+        std::fs::create_dir_all(&package).unwrap();
+        let manifest = "---\nname: post\ndescription: d\n---\n\nBody\n";
+        let path = package.join("SKILL.md");
+        std::fs::write(&path, manifest).unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
+
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::TrustRoot {
+                opened_path: tmp.path().to_path_buf(),
+                root: tmp.path().to_path_buf(),
+                kind: crate::config::trust::TrustRootKind::Directory,
+            },
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let err = crate::config::trust::scope_workspace_trust_policy(policy, async {
+            EditunlockTool
+                .call(
+                    serde_json::json!({
+                        "path": path.display().to_string(),
+                        "old_string": "name: post\n",
+                        "new_string": "",
+                    }),
+                    &ctx,
+                )
+                .await
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("frontmatter"), "{err}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), manifest);
     }
 
     #[tokio::test]

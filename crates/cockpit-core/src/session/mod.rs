@@ -234,6 +234,11 @@ pub struct Session {
     /// a broken/unset utility model is reported once per session rather
     /// than every turn. In-memory only — a resume re-arms it.
     title_failure_noticed: std::sync::atomic::AtomicBool,
+    /// Latches once a tool call has been blocked because an argument
+    /// contained the configured redaction placeholder. The durable notice
+    /// is useful once per session; every blocked call still returns its
+    /// model-visible invalid-input error.
+    redaction_placeholder_noticed: std::sync::atomic::AtomicBool,
     /// Provider-reported usage from the most recent round-trip.
     /// Populated by [`Self::record_usage`] after each `model.complete`
     /// call. The TUI prefers this over the local tiktoken estimate
@@ -1451,6 +1456,17 @@ mod tests {
         assert!(s.claim_title_failure_notice(), "first claim wins");
         assert!(
             !s.claim_title_failure_notice(),
+            "second claim is suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn redaction_placeholder_notice_is_one_per_session() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        assert!(s.claim_redaction_placeholder_notice(), "first claim wins");
+        assert!(
+            !s.claim_redaction_placeholder_notice(),
             "second claim is suppressed"
         );
     }

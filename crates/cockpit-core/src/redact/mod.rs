@@ -760,6 +760,10 @@ impl RedactionTable {
         self.matcher.is_none()
     }
 
+    pub fn placeholder(&self) -> &str {
+        &self.placeholder
+    }
+
     /// A no-op table that scrubs nothing — equivalent to a disabled
     /// `RedactConfig`. Used as a fallback when a redaction chokepoint object
     /// is needed but the table couldn't be built (the chokepoint still

@@ -985,7 +985,110 @@ async fn dispatch_one(
     ctx: &ToolCtx,
     current_tool_call_id: Option<&str>,
 ) -> Result<ToolOutput> {
+    guard_redaction_placeholder_tool_args(name, &args, ctx).await?;
     tool_timeout::dispatch_with_default_timeout(tools, name, args, ctx, current_tool_call_id).await
+}
+
+pub(super) async fn guard_redaction_placeholder_tool_args(
+    tool_name: &str,
+    args: &Value,
+    ctx: &ToolCtx,
+) -> Result<()> {
+    if let Some(path) = redaction_placeholder_arg_path(args, ctx.redact.as_ref()) {
+        record_redaction_placeholder_notice(ctx).await;
+        return Err(redaction_placeholder_arg_error(
+            tool_name,
+            &path,
+            ctx.redact.placeholder(),
+        ));
+    }
+    Ok(())
+}
+
+fn redaction_placeholder_arg_path(args: &Value, redact: &RedactionTable) -> Option<String> {
+    let placeholder = redact.placeholder();
+    if redact.is_empty() || placeholder.is_empty() {
+        return None;
+    }
+    redaction_placeholder_arg_path_inner(args, placeholder, "")
+}
+
+fn redaction_placeholder_arg_path_inner(
+    value: &Value,
+    placeholder: &str,
+    path: &str,
+) -> Option<String> {
+    match value {
+        Value::String(s) if s.contains(placeholder) => Some(if path.is_empty() {
+            "<arguments>".to_string()
+        } else {
+            path.to_string()
+        }),
+        Value::Array(values) => values.iter().enumerate().find_map(|(idx, child)| {
+            let child_path = if path.is_empty() {
+                format!("[{idx}]")
+            } else {
+                format!("{path}[{idx}]")
+            };
+            redaction_placeholder_arg_path_inner(child, placeholder, &child_path)
+        }),
+        Value::Object(map) => map.iter().find_map(|(key, child)| {
+            let child_path = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            redaction_placeholder_arg_path_inner(child, placeholder, &child_path)
+        }),
+        _ => None,
+    }
+}
+
+fn redaction_placeholder_arg_error(
+    tool_name: &str,
+    path: &str,
+    placeholder: &str,
+) -> anyhow::Error {
+    invalid_input(format!(
+        "Tool `{tool_name}` argument `{path}` contains the redaction placeholder `{placeholder}`. The real value was hidden by redaction, so this call cannot run. Ask the user to allowlist the needed source under `redact.allowlist` or disable the relevant scan with `/toggle-redaction`."
+    ))
+}
+
+async fn record_redaction_placeholder_notice(ctx: &ToolCtx) {
+    if !ctx.session.claim_redaction_placeholder_notice() {
+        return;
+    }
+    match ctx.session.db.list_session_events(ctx.session.id).await {
+        Ok(events)
+            if events.iter().any(|event| {
+                event.kind == "notice"
+                    && event.data["source"] == "redaction_placeholder_in_tool_args"
+            }) =>
+        {
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to check for existing redaction placeholder notice"
+            );
+        }
+    }
+    if let Err(error) = ctx
+        .session
+        .record_notice(
+            Some(&ctx.agent_id),
+            "Tool call blocked because an argument contained the redaction placeholder. Add the needed source to `redact.allowlist` or use `/toggle-redaction` before retrying.",
+            "redaction_placeholder_in_tool_args",
+        )
+        .await
+    {
+        tracing::warn!(
+            error = %error,
+            "failed to record redaction placeholder notice"
+        );
+    }
 }
 
 async fn dispatch_one_timed(
@@ -1084,6 +1187,376 @@ mod wire_null_normalization_tests {
                 "items": [null, {"nested": null}]
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod redaction_placeholder_guard_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    struct CaptureArgsTool {
+        received: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::tool::Tool for CaptureArgsTool {
+        fn name(&self) -> &str {
+            "capture_args"
+        }
+
+        fn description(&self) -> &str {
+            "Capture dispatched arguments."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": { "type": "string" }
+                            }
+                        }
+                    },
+                    "empty": { "type": "string" }
+                }
+            })
+        }
+
+        async fn call(
+            &self,
+            args: Value,
+            _ctx: &crate::engine::tool::ToolCtx,
+        ) -> Result<crate::engine::tool::ToolOutput> {
+            self.received.lock().unwrap().push(args);
+            Ok(crate::engine::tool::ToolOutput::text("captured"))
+        }
+    }
+
+    fn tools_with_capture(received: Arc<Mutex<Vec<Value>>>) -> ToolBox {
+        ToolBox::new().with(Arc::new(CaptureArgsTool { received }))
+    }
+
+    fn redaction_table(root: &Path, placeholder: &str, enabled: bool) -> RedactionTable {
+        let cfg = crate::config::extended::RedactConfig {
+            enabled,
+            scan_environment: true,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            min_secret_length: 4,
+            placeholder: placeholder.to_string(),
+            ..crate::config::extended::RedactConfig::default()
+        };
+        let env = HashMap::from([(
+            "API_TOKEN".to_string(),
+            "super-secret-token-value".to_string(),
+        )]);
+        RedactionTable::build_with_env_and_secrets(&cfg, root, &env, Vec::<(String, String)>::new())
+            .unwrap()
+    }
+
+    fn ctx_with_redaction(root: &Path, redact: RedactionTable) -> ToolCtx {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session =
+            crate::session::Session::create(db.clone(), root.to_path_buf(), "builder").unwrap();
+        session.set_sandbox_enabled(false);
+        ToolCtx {
+            agent_id: "builder".to_string(),
+            current_tool_call_id: None,
+            llm_mode: crate::config::extended::LlmMode::Normal,
+            locks: Arc::new(crate::locks::LockManager::from_db(db).unwrap()),
+            session: Arc::new(session),
+            cwd: root.to_path_buf(),
+            redact: Arc::new(redact),
+            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
+            approver: None,
+            deferred_log: crate::engine::deferred::DeferredLog::new(),
+            seeds: crate::engine::seed_collector::SeedCollector::new(),
+            root_agent_frame: true,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
+            context_usage: None,
+            available_tools: Arc::new(std::collections::HashSet::new()),
+            mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
+                Vec::new(),
+            )),
+            has_tree: false,
+            has_bash: false,
+            events: None,
+            lsp: None,
+            resource_scheduler: None,
+            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
+        }
+    }
+
+    async fn dispatch_capture(
+        ctx: &ToolCtx,
+        args: Value,
+        received: Arc<Mutex<Vec<Value>>>,
+    ) -> Result<ToolOutput> {
+        let tools = tools_with_capture(received);
+        dispatch_one(&tools, "capture_args", args, ctx, None).await
+    }
+
+    #[tokio::test]
+    async fn placeholder_in_tool_args_blocks_dispatch_and_tool_is_never_called() {
+        let tmp = tempfile::tempdir().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let ctx = ctx_with_redaction(tmp.path(), redaction_table(tmp.path(), "[redacted]", true));
+
+        let err = dispatch_capture(
+            &ctx,
+            serde_json::json!({ "path": "/tmp/[redacted]/file.txt" }),
+            received.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            crate::engine::tool::classify_failure(&err),
+            crate::daemon::proto::ToolFailKind::Invocation
+        );
+        assert!(received.lock().unwrap().is_empty(), "tool was not called");
+    }
+
+    #[tokio::test]
+    async fn placeholder_in_tool_args_error_names_argument_and_remedy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let ctx = ctx_with_redaction(tmp.path(), redaction_table(tmp.path(), "[redacted]", true));
+
+        let err = dispatch_capture(
+            &ctx,
+            serde_json::json!({ "path": "/tmp/[redacted]/file.txt" }),
+            received,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("capture_args"), "{msg}");
+        assert!(msg.contains("path"), "{msg}");
+        assert!(msg.contains("[redacted]"), "{msg}");
+        assert!(msg.contains("redact.allowlist"), "{msg}");
+        assert!(msg.contains("/toggle-redaction"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn placeholder_in_nested_tool_args_reports_indexed_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let ctx = ctx_with_redaction(tmp.path(), redaction_table(tmp.path(), "[redacted]", true));
+
+        let err = dispatch_capture(
+            &ctx,
+            serde_json::json!({
+                "edits": [
+                    { "old_string": "replace [redacted] here" }
+                ]
+            }),
+            received,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("edits[0].old_string"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn clean_tool_args_dispatch_normally_with_non_empty_redaction_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let table = redaction_table(tmp.path(), "[redacted]", true);
+        assert!(
+            !table.is_empty(),
+            "test table should exercise enabled guard"
+        );
+        let ctx = ctx_with_redaction(tmp.path(), table);
+
+        let output = dispatch_capture(
+            &ctx,
+            serde_json::json!({ "path": "/tmp/plain/file.txt" }),
+            received.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.content, "captured");
+        assert_eq!(
+            received.lock().unwrap().as_slice(),
+            &[serde_json::json!({ "path": "/tmp/plain/file.txt" })]
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_redaction_table_does_not_block_tool_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let ctx = ctx_with_redaction(tmp.path(), redaction_table(tmp.path(), "[redacted]", false));
+
+        dispatch_capture(
+            &ctx,
+            serde_json::json!({ "path": "/tmp/[redacted]/file.txt" }),
+            received.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(received.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_placeholder_never_blocks_tool_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let table = redaction_table(tmp.path(), "", true);
+        assert!(
+            !table.is_empty(),
+            "test table should exercise empty placeholder"
+        );
+        let ctx = ctx_with_redaction(tmp.path(), table);
+
+        dispatch_capture(&ctx, serde_json::json!({ "empty": "" }), received.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(received.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn placeholder_guard_records_one_durable_notice_per_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let ctx = ctx_with_redaction(tmp.path(), redaction_table(tmp.path(), "[redacted]", true));
+
+        let first = dispatch_capture(
+            &ctx,
+            serde_json::json!({ "path": "/tmp/[redacted]/one.txt" }),
+            received.clone(),
+        )
+        .await
+        .unwrap_err();
+        let second = dispatch_capture(
+            &ctx,
+            serde_json::json!({ "path": "/tmp/[redacted]/two.txt" }),
+            received.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(first.to_string().contains("redact.allowlist"));
+        assert!(second.to_string().contains("redact.allowlist"));
+        assert!(received.lock().unwrap().is_empty(), "tool was not called");
+
+        let events = ctx
+            .session
+            .db
+            .list_session_events(ctx.session.id)
+            .await
+            .unwrap();
+        let notices = events
+            .iter()
+            .filter(|event| {
+                event.kind == "notice"
+                    && event.data["source"] == "redaction_placeholder_in_tool_args"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].agent.as_deref(), Some("builder"));
+        assert!(
+            notices[0].data["text"]
+                .as_str()
+                .unwrap()
+                .contains("redaction placeholder")
+        );
+    }
+
+    #[tokio::test]
+    async fn placeholder_guard_does_not_duplicate_durable_notice_after_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let ctx = ctx_with_redaction(tmp.path(), redaction_table(tmp.path(), "[redacted]", true));
+
+        dispatch_capture(
+            &ctx,
+            serde_json::json!({ "path": "/tmp/[redacted]/one.txt" }),
+            received.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        let resumed = Arc::new(
+            crate::session::Session::resume(ctx.session.db.clone(), ctx.session.id)
+                .unwrap()
+                .unwrap(),
+        );
+        let mut resumed_ctx = ctx.clone();
+        resumed_ctx.session = resumed;
+        dispatch_capture(
+            &resumed_ctx,
+            serde_json::json!({ "path": "/tmp/[redacted]/two.txt" }),
+            received.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        let events = ctx
+            .session
+            .db
+            .list_session_events(ctx.session.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "notice"
+                        && event.data["source"] == "redaction_placeholder_in_tool_args"
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn placeholder_guard_keeps_error_when_notice_recording_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let ctx = ctx_with_redaction(tmp.path(), redaction_table(tmp.path(), "[redacted]", true));
+        ctx.session
+            .db
+            .write(|conn| {
+                conn.execute("DROP TABLE session_events", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let err = dispatch_capture(
+            &ctx,
+            serde_json::json!({ "path": "/tmp/[redacted]/file.txt" }),
+            received.clone(),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("capture_args"), "{msg}");
+        assert!(msg.contains("path"), "{msg}");
+        assert!(msg.contains("[redacted]"), "{msg}");
+        assert!(msg.contains("redact.allowlist"), "{msg}");
+        assert!(msg.contains("/toggle-redaction"), "{msg}");
+        assert!(received.lock().unwrap().is_empty(), "tool was not called");
     }
 }
 

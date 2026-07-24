@@ -311,6 +311,12 @@ impl Session {
             .is_ok()
     }
 
+    pub fn claim_redaction_placeholder_notice(&self) -> bool {
+        self.redaction_placeholder_noticed
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
     /// Compute the `[time: <iso8601>]` prelude for the next user
     /// message (GOALS §17g). Returns `Some` when the first message of
     /// the session is about to fire, or when ≥ `interval_minutes` have

@@ -42,6 +42,10 @@ pub(crate) async fn execute_ordinary_call(
         Some(Recovery::TextEmbedded { original, .. }) => Value::String(original.clone()),
         _ => args.clone(),
     };
+    let placeholder_block = guard_redaction_placeholder_tool_args(resolved_name, &args, env.ctx)
+        .await
+        .err();
+    let placeholder_blocked = placeholder_block.is_some();
 
     // Validate-then-repair against the tool's own JSON Schema (§12).
     // Looked up by the NAME-repaired `resolved_name`, so a rebound junk
@@ -205,8 +209,7 @@ pub(crate) async fn execute_ordinary_call(
     // to the wire-history collapse site (`loop-collapse-structural-
     // dedup.md`) so the synthesized message can state "called N times".
     let mut loop_guard_count: u32 = 0;
-    let call_signature = repair_outcome
-        .valid
+    let call_signature = (repair_outcome.valid && !placeholder_blocked)
         .then(|| crate::approval::store::GrantStore::loop_signature(resolved_name, &args));
     let repeated_recoverable_tool_call = if let Some(signature) = call_signature.as_deref() {
         env.session
@@ -216,6 +219,7 @@ pub(crate) async fn execute_ordinary_call(
         None
     };
     let loop_guard_reject = if repeated_recoverable_tool_call.is_none()
+        && !placeholder_blocked
         && repair_outcome.valid
         && let Some(approver) = env.ctx.approver.as_ref()
     {
@@ -269,31 +273,34 @@ pub(crate) async fn execute_ordinary_call(
     let mut recheck_result = false;
     let mut gate_memo = replay_gate_memo;
     let mut gate_block_status = "blocked_safety_gate";
-    let gate_block: Option<String> =
-        if repair_outcome.valid && !loop_guard_reject && super::is_gated_tool(resolved_name) {
-            let gate_future = crate::engine::interrupt::with_interrupt_park_payload(
-                base_park_payload.clone(),
-                safety_gate_decision(resolved_name, &args, env.ctx, env.tx),
-            );
-            match Box::pin(gate_future).await {
-                GateOutcome::Run { recheck } => {
-                    recheck_result = recheck;
-                    gate_memo = Some(crate::db::needs_attention::InterruptGateMemo {
-                        recheck_result: recheck,
-                    });
-                    None
-                }
-                GateOutcome::Parked => {
-                    return Err(crate::engine::interrupt::InterruptParked.into());
-                }
-                GateOutcome::Block(block) => {
-                    gate_block_status = block.status;
-                    Some(block.message)
-                }
+    let gate_block: Option<String> = if !placeholder_blocked
+        && repair_outcome.valid
+        && !loop_guard_reject
+        && super::is_gated_tool(resolved_name)
+    {
+        let gate_future = crate::engine::interrupt::with_interrupt_park_payload(
+            base_park_payload.clone(),
+            safety_gate_decision(resolved_name, &args, env.ctx, env.tx),
+        );
+        match Box::pin(gate_future).await {
+            GateOutcome::Run { recheck } => {
+                recheck_result = recheck;
+                gate_memo = Some(crate::db::needs_attention::InterruptGateMemo {
+                    recheck_result: recheck,
+                });
+                None
             }
-        } else {
-            None
-        };
+            GateOutcome::Parked => {
+                return Err(crate::engine::interrupt::InterruptParked.into());
+            }
+            GateOutcome::Block(block) => {
+                gate_block_status = block.status;
+                Some(block.message)
+            }
+        }
+    } else {
+        None
+    };
     let guard = crate::config::extended::resolve_injection_guard(env.cwd);
     if should_scan_tool_result(
         resolved_name,
@@ -303,7 +310,7 @@ pub(crate) async fn execute_ordinary_call(
     ) {
         recheck_result = true;
     }
-    let cage_block: Option<String> = if repair_outcome.valid {
+    let cage_block: Option<String> = if !placeholder_blocked && repair_outcome.valid {
         env.ctx
             .review_cage
             .as_ref()
@@ -334,7 +341,8 @@ pub(crate) async fn execute_ordinary_call(
     // Loop-guard / safety-gate blocks are NOT rejections in this sense (the
     // call was valid and advertised) and are not classified.
     let rejection_reason: Option<&'static str> =
-        if loop_guard_reject || gate_block.is_some() || cage_block.is_some() {
+        if placeholder_blocked || loop_guard_reject || gate_block.is_some() || cage_block.is_some()
+        {
             None
         } else if !repair_outcome.valid {
             // A model-hallucinated nonexistent path gets its own reason so
@@ -351,7 +359,8 @@ pub(crate) async fn execute_ordinary_call(
         } else {
             None
         };
-    let lifecycle_started = repair_outcome.valid && env.active_tools.get(resolved_name).is_some();
+    let lifecycle_started = (placeholder_blocked || repair_outcome.valid)
+        && env.active_tools.get(resolved_name).is_some();
     let mut assistant_seq = None;
     if lifecycle_started {
         let (start_recovery_kind, start_recovery_stage) = recovery.db_fields();
@@ -382,7 +391,9 @@ pub(crate) async fn execute_ordinary_call(
     }
     let gate_blocked = gate_block.is_some();
     let repeated_recoverable_tool_call_reject = repeated_recoverable_tool_call.is_some();
-    let (result, duration_ms) = if let Some(msg) = repeated_recoverable_tool_call.clone() {
+    let (result, duration_ms) = if let Some(err) = placeholder_block {
+        (Err(err), 0)
+    } else if let Some(msg) = repeated_recoverable_tool_call.clone() {
         (Err(invalid_input(msg)), 0)
     } else if loop_guard_reject {
         // Loop-collapse synthesized message (`loop-collapse-
@@ -895,13 +906,17 @@ pub(crate) async fn execute_ordinary_call(
             "blocked_loop_guard"
         } else if gate_blocked {
             gate_block_status
+        } else if placeholder_blocked {
+            "blocked_redaction_placeholder"
         } else if hard_fail {
             "failed"
         } else {
             "completed"
         };
-        let dispatched =
-            !(repeated_recoverable_tool_call_reject || loop_guard_reject || gate_blocked);
+        let dispatched = !(repeated_recoverable_tool_call_reject
+            || loop_guard_reject
+            || gate_blocked
+            || placeholder_blocked);
         let mut completed_data = serde_json::json!({
             "tool": resolved_name,
             "status": lifecycle_status,
@@ -1029,6 +1044,7 @@ mod tests {
     use crate::engine::tool::Tool as _;
     use async_trait::async_trait;
     use rig::message::{AssistantContent, ToolFunction, ToolResultContent, UserContent};
+    use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1405,6 +1421,36 @@ mod tests {
         }
     }
 
+    struct IntegerOnlyTool {
+        called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for IntegerOnlyTool {
+        fn name(&self) -> &str {
+            "number"
+        }
+
+        fn description(&self) -> &str {
+            "Accepts only an integer count."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "count": { "type": "integer" }
+                },
+                "required": ["count"]
+            })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            self.called.store(true, Ordering::SeqCst);
+            Ok(ToolOutput::text("called"))
+        }
+    }
+
     struct BashFixtureTool;
 
     #[async_trait]
@@ -1628,6 +1674,24 @@ mod tests {
         Arc::new(Session::create(db, root.to_path_buf(), "Build").unwrap())
     }
 
+    fn redaction_table(root: &std::path::Path, placeholder: &str) -> RedactionTable {
+        let cfg = crate::config::extended::RedactConfig {
+            enabled: true,
+            scan_environment: true,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            min_secret_length: 4,
+            placeholder: placeholder.to_string(),
+            ..crate::config::extended::RedactConfig::default()
+        };
+        let env = HashMap::from([(
+            "API_TOKEN".to_string(),
+            "super-secret-token-value".to_string(),
+        )]);
+        RedactionTable::build_with_env_and_secrets(&cfg, root, &env, Vec::<(String, String)>::new())
+            .unwrap()
+    }
+
     async fn test_btw_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
         let parent = Session::create(db.clone(), root.to_path_buf(), "Build").unwrap();
@@ -1823,6 +1887,231 @@ mod tests {
         let result = last_tool_result_text(&history);
         assert!(result.contains("background skill review cannot call `echo`"));
         assert!(!result.contains("should not run"));
+    }
+
+    #[tokio::test]
+    async fn placeholder_guard_precedes_schema_validation_in_ordinary_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(IntegerOnlyTool {
+            called: called.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        ctx.redact = Arc::new(redaction_table(tmp.path(), "[redacted]"));
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("number", serde_json::json!({ "count": "[redacted]" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "number", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        assert!(!called.load(Ordering::SeqCst), "tool was not called");
+        let result = last_tool_result_text(&history);
+        assert!(result.contains("number"), "{result}");
+        assert!(result.contains("count"), "{result}");
+        assert!(result.contains("[redacted]"), "{result}");
+        assert!(result.contains("redact.allowlist"), "{result}");
+        assert!(result.contains("/toggle-redaction"), "{result}");
+        assert!(
+            !result.contains("schema validation"),
+            "redaction remedy should win before schema validation: {result}"
+        );
+        let events = session.db.list_session_events(session.id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "notice"
+                        && event.data["source"] == "redaction_placeholder_in_tool_args"
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn placeholder_guard_precedes_safety_gate_for_gated_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(NeverCalledTool {
+            name: "bash",
+            called: called.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        session.set_approval_mode(ApprovalMode::Auto);
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        ctx.redact = Arc::new(redaction_table(tmp.path(), "[redacted]"));
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("bash", serde_json::json!({ "command": "cat [redacted]" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        let _gate = set_safety_gate_test_override(GateOutcome::Parked);
+
+        execute_ordinary_call(&env, &mut history, &call, "bash", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        assert!(!called.load(Ordering::SeqCst), "tool was not called");
+        assert!(
+            session
+                .db
+                .list_open_interrupts(session.id)
+                .unwrap()
+                .is_empty(),
+            "placeholder block must not consult a parking safety gate"
+        );
+        let result = last_tool_result_text(&history);
+        assert!(result.contains("bash"), "{result}");
+        assert!(result.contains("command"), "{result}");
+        assert!(result.contains("[redacted]"), "{result}");
+        assert!(result.contains("redact.allowlist"), "{result}");
+        assert!(result.contains("/toggle-redaction"), "{result}");
+        let events = session.db.list_session_events(session.id).await.unwrap();
+        let completed = events
+            .iter()
+            .find(|event| event.kind == "tool_call_completed")
+            .expect("tool_call_completed event");
+        assert_eq!(completed.data["status"], "blocked_redaction_placeholder");
+        assert_eq!(completed.data["dispatched"], false);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "notice"
+                        && event.data["source"] == "redaction_placeholder_in_tool_args"
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn placeholder_guard_precedes_loop_guard_in_ordinary_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(NeverCalledTool {
+            name: "echo",
+            called: called.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut ctx = tool_ctx_with_approver(session.clone(), tmp.path(), &tx);
+        ctx.redact = Arc::new(redaction_table(tmp.path(), "[redacted]"));
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 1,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("echo", serde_json::json!({ "text": "[redacted]" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "echo", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        assert!(!called.load(Ordering::SeqCst), "tool was not called");
+        let result = last_tool_result_text(&history);
+        assert!(result.contains("redact.allowlist"), "{result}");
+        assert!(
+            !result.contains("Loop blocked"),
+            "placeholder remedy should win before loop guard: {result}"
+        );
+        let completed = session
+            .db
+            .list_session_events(session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "tool_call_completed")
+            .expect("tool_call_completed event");
+        assert_eq!(completed.data["status"], "blocked_redaction_placeholder");
+        assert_eq!(completed.data["dispatched"], false);
+    }
+
+    #[tokio::test]
+    async fn placeholder_guard_precedes_review_cage_in_ordinary_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(EchoTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        ctx.redact = Arc::new(redaction_table(tmp.path(), "[redacted]"));
+        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("echo", serde_json::json!({ "text": "[redacted]" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "echo", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        let result = last_tool_result_text(&history);
+        assert!(result.contains("redact.allowlist"), "{result}");
+        assert!(
+            !result.contains("background skill review"),
+            "placeholder remedy should win before review cage: {result}"
+        );
+        let completed = session
+            .db
+            .list_session_events(session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "tool_call_completed")
+            .expect("tool_call_completed event");
+        assert_eq!(completed.data["status"], "blocked_redaction_placeholder");
+        assert_eq!(completed.data["dispatched"], false);
     }
 
     #[tokio::test]

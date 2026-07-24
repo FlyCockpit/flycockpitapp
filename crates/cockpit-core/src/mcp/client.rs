@@ -2,17 +2,56 @@
 //! (static headers/env + OAuth bearer) per transport.
 
 use anyhow::{Result, bail};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use super::auth;
 use super::config::{ServerConfig, Transport};
 use super::protocol::McpClient;
 use super::transport::timeout::McpTimeouts;
-use super::transport::{http::HttpClient, sse::SseClient, stdio::StdioClient};
+use super::transport::{
+    http::HttpClient,
+    sse::SseClient,
+    stdio::{StdioAbandonScope, StdioClient, StdioRuntimeContext},
+};
+
+#[derive(Clone, Default)]
+pub struct McpConnectContext {
+    cancel: Option<CancellationToken>,
+    stdio_abandon_scope: Option<StdioAbandonScope>,
+}
+
+impl McpConnectContext {
+    pub fn from_tool_ctx(ctx: &crate::engine::tool::ToolCtx) -> Self {
+        Self {
+            cancel: Some(ctx.cancel.clone()),
+            stdio_abandon_scope: Some(StdioAbandonScope {
+                session_id: ctx.session.id,
+                tool_call_id: ctx.current_tool_call_id.clone(),
+            }),
+        }
+    }
+
+    fn stdio_runtime(&self) -> StdioRuntimeContext {
+        StdioRuntimeContext {
+            cancel: self.cancel.clone(),
+            abandon_scope: self.stdio_abandon_scope.clone(),
+        }
+    }
+}
 
 /// Build and `initialize` a client for `server`, applying its auth.
 /// Remote transports get resolved headers (including a refreshed OAuth
 /// bearer); stdio gets the merged env.
 pub async fn connect(name: &str, cfg: &ServerConfig) -> Result<Box<dyn McpClient>> {
+    connect_with_context(name, cfg, McpConnectContext::default()).await
+}
+
+pub async fn connect_with_context(
+    name: &str,
+    cfg: &ServerConfig,
+    context: McpConnectContext,
+) -> Result<Box<dyn McpClient>> {
     let mut resolved = auth::resolve_static_for_server(name, cfg);
     // OAuth bearer (async; refreshes if expired) → Authorization header.
     if let Some(bearer) = auth::oauth_bearer(name, cfg).await? {
@@ -41,7 +80,42 @@ pub async fn connect(name: &str, cfg: &ServerConfig) -> Result<Box<dyn McpClient
         }
         Transport::Stdio => {
             let command = cfg.require_command(name)?;
-            Box::new(StdioClient::spawn(command, &cfg.args, &resolved.env)?)
+            let timeouts =
+                McpTimeouts::from_secs(cfg.connect_timeout_secs(), cfg.request_timeout_secs());
+            let connect_deadline = Instant::now() + timeouts.connect;
+            let mut client = match tokio::time::timeout(timeouts.connect, async {
+                StdioClient::spawn(
+                    name,
+                    command,
+                    &cfg.args,
+                    &resolved.env,
+                    timeouts,
+                    context.stdio_runtime(),
+                )
+            })
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    anyhow::bail!(
+                        "MCP stdio server `{name}` spawn timed out and the connection was reset"
+                    );
+                }
+            };
+            let remaining = connect_deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            match tokio::time::timeout(remaining, client.initialize_with_deadline(remaining)).await
+            {
+                Ok(Ok(())) => return Ok(Box::new(client)),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    client.poison("initialize timeout").await;
+                    anyhow::bail!(
+                        "MCP stdio server `{name}` initialize timed out and the connection was reset"
+                    );
+                }
+            }
         }
     };
     client.initialize().await?;

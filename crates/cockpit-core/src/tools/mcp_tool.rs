@@ -169,6 +169,15 @@ impl Tool for McpTool {
             Err(e) => Ok(ToolOutput::text(format!("[mcp sandbox error] {e}"))),
         }
     }
+
+    async fn on_abandon(&self, ctx: &ToolCtx) -> Result<()> {
+        let scope = crate::mcp::transport::stdio::StdioAbandonScope {
+            session_id: ctx.session.id,
+            tool_call_id: ctx.current_tool_call_id.clone(),
+        };
+        crate::mcp::transport::stdio::poison_active_for_scope(&scope, "MCP tool abandon").await;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

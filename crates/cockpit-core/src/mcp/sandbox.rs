@@ -292,6 +292,7 @@ async fn dispatch(
                         call_args.clone(),
                         None,
                         "mcp.invoke",
+                        super::catalog::connect_context(host),
                     )
                     .await
                     {

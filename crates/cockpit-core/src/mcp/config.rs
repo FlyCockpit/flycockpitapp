@@ -4,7 +4,7 @@
 //! Each server declares a `transport` (`streamable` modern HTTP / `stdio`
 //! local subprocess / `sse` legacy), the endpoint or command, an `auth`
 //! block (one of `oauth` / `header` / `env` / `none`), `enabled`,
-//! a catalog `cache_ttl_secs`, and optional remote-transport timeouts:
+//! a catalog `cache_ttl_secs`, and optional transport timeouts:
 //! `connect_timeout_secs` (default 10) and `timeout_secs` (default 120).
 //!
 //! The file is discovered along the normal `.cockpit/` chain (GOALS §2) and
@@ -181,14 +181,16 @@ pub struct ServerConfig {
     #[serde(default = "default_cache_ttl")]
     pub cache_ttl_secs: u64,
 
-    /// Remote connect timeout in seconds for `streamable` and `sse`
-    /// transports. Defaults to 10. Ignored for stdio.
+    /// Connect timeout in seconds. For stdio this bounds spawn plus the
+    /// `initialize` handshake; for remote transports it bounds connecting to
+    /// the endpoint. Defaults to 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_timeout_secs: Option<u64>,
 
-    /// Remote request timeout in seconds for `streamable` and `sse`
-    /// transports. Defaults to 120. For legacy SSE this also bounds waiting
-    /// for the endpoint event and each streamed response message.
+    /// Request timeout in seconds for every transport. For stdio this bounds
+    /// the whole write plus response-read cycle. For legacy SSE this also
+    /// bounds waiting for the endpoint event and each streamed response
+    /// message. Defaults to 120.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
 }

@@ -1,4 +1,5 @@
 use crate::db::tool_calls::Recovery;
+use crate::mcp::client::McpConnectContext;
 use crate::mcp::config::ServerConfig;
 use crate::mcp::protocol::ToolDescriptor;
 use serde_json::Value;
@@ -86,8 +87,12 @@ pub async fn prepare_invoke_args(
     nested: Value,
     outer: Option<&Value>,
     call_name: &str,
+    connect_context: McpConnectContext,
 ) -> NestedRepair {
-    let Ok(tools) = crate::mcp::catalog::list_tools_cached(server, server_cfg).await else {
+    let Ok(tools) =
+        crate::mcp::catalog::list_tools_cached_with_context(server, server_cfg, connect_context)
+            .await
+    else {
         return NestedRepair::Dispatch {
             args: nested,
             recovery: None,

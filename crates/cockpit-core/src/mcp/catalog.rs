@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::builtin::{self, HostContext};
 use super::cache;
-use super::client;
+use super::client::{self, McpConnectContext};
 use super::config::{McpConfig, ServerConfig};
 use super::protocol::{
     ToolDescriptor, sanitize_tool_description, sanitize_tool_descriptor, sanitize_tool_name,
@@ -29,11 +29,19 @@ pub struct SearchHit {
 /// List a server's tools, using the disk cache when fresh and re-fetching
 /// (then persisting) when stale or absent.
 pub async fn list_tools_cached(name: &str, cfg: &ServerConfig) -> Result<Vec<ToolDescriptor>> {
+    list_tools_cached_with_context(name, cfg, McpConnectContext::default()).await
+}
+
+pub async fn list_tools_cached_with_context(
+    name: &str,
+    cfg: &ServerConfig,
+    context: McpConnectContext,
+) -> Result<Vec<ToolDescriptor>> {
     let key = cache::cache_key(name, cfg);
     if let Some(cached) = cache::load(&key, cfg.cache_ttl_secs) {
         return Ok(sanitize_tool_descriptors(cached.tools));
     }
-    let mut conn = client::connect(name, cfg).await?;
+    let mut conn = client::connect_with_context(name, cfg, context).await?;
     let tools = sanitize_tool_descriptors(conn.list_tools().await?);
     let _ = cache::save(&key, &tools);
     Ok(tools)
@@ -48,7 +56,8 @@ pub async fn search(cfg: &McpConfig, host: &HostContext, query: &str) -> Vec<Sea
     let q = query.trim().to_lowercase();
     let mut hits = builtin::search(host, query);
     for (name, server) in cfg.enabled_servers() {
-        let tools = match list_tools_cached(name, server).await {
+        let tools = match list_tools_cached_with_context(name, server, connect_context(host)).await
+        {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -82,7 +91,7 @@ pub async fn describe(
     if !server_cfg.enabled {
         bail!("MCP server `{server}` is disabled");
     }
-    let tools = list_tools_cached(server, server_cfg).await?;
+    let tools = list_tools_cached_with_context(server, server_cfg, connect_context(host)).await?;
     let Some(desc) = tools.into_iter().find(|desc| desc.name == tool) else {
         bail!("unknown MCP tool `{server}.{tool}`");
     };
@@ -132,8 +141,15 @@ pub async fn invoke(
     if !server_cfg.enabled {
         bail!("MCP server `{server}` is disabled");
     }
-    let mut conn = client::connect(server, server_cfg).await?;
+    let mut conn = client::connect_with_context(server, server_cfg, connect_context(host)).await?;
     conn.call_tool(tool, args).await
+}
+
+pub(crate) fn connect_context(host: &HostContext) -> McpConnectContext {
+    host.native_tool_ctx
+        .as_ref()
+        .map(McpConnectContext::from_tool_ctx)
+        .unwrap_or_default()
 }
 
 async fn approve_external_mcp_tool(

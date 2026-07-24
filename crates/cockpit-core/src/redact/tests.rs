@@ -982,10 +982,112 @@ fn json_leaf_strings_redacted_keys_never() {
     cfg.dotenv_patterns = vec!["config.env".into()];
     let t = RedactionTable::build(&cfg, dir.path()).unwrap();
     assert_eq!(t.scrub("json-secret-password"), "***REDACT***");
-    // Nested array leaf string is also a candidate.
-    assert_eq!(t.scrub("enabled-feature-x"), "***REDACT***");
+    // Non-secret-keyed array leaves are not candidates.
+    assert_eq!(t.scrub("enabled-feature-x"), "enabled-feature-x");
     // The key `password` is never scrubbed; the int `5432` is pruned.
     assert_eq!(t.scrub("password 5432"), "password 5432");
+}
+
+#[test]
+fn structured_toml_plain_values_are_not_registered() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path().join(".env");
+    std::fs::write(
+        &p,
+        "\"display-name\" = \"Christopher\"\n\"aws-region\" = \"us-east-1\"\n",
+    )
+    .unwrap();
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+
+    let table = RedactionTable::build(&cfg, dir.path()).unwrap();
+
+    assert_eq!(table.scrub("Christopher"), "Christopher");
+    assert_eq!(table.scrub("us-east-1"), "us-east-1");
+    assert!(table.is_empty());
+}
+
+#[test]
+fn structured_json_registers_only_secret_keyed_values() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path().join("config.env");
+    std::fs::write(
+        &p,
+        r#"{"password":"hunter2","name":"Christopher","url":"https://example.test/service"}"#,
+    )
+    .unwrap();
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    cfg.dotenv_patterns = vec!["config.env".into()];
+    cfg.min_secret_length = 1;
+
+    let table = RedactionTable::build(&cfg, dir.path()).unwrap();
+
+    assert_eq!(table.scrub("hunter2"), cfg.placeholder);
+    assert_eq!(table.scrub("Christopher"), "Christopher");
+    assert_eq!(
+        table.scrub("https://example.test/service"),
+        "https://example.test/service"
+    );
+}
+
+#[test]
+fn structured_yaml_secret_subtree_is_registered() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path().join(".env");
+    std::fs::write(
+        &p,
+        "credentials:\n  user: service-user\n  token: yaml-subtree-token\nmetadata:\n  region: us-east-1\n",
+    )
+    .unwrap();
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+
+    let table = RedactionTable::build(&cfg, dir.path()).unwrap();
+
+    assert_eq!(table.scrub("service-user"), cfg.placeholder);
+    assert_eq!(table.scrub("yaml-subtree-token"), cfg.placeholder);
+    assert_eq!(table.scrub("us-east-1"), "us-east-1");
+}
+
+#[test]
+fn structured_array_registration_follows_enclosing_key() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path().join("config.env");
+    std::fs::write(
+        &p,
+        r#"{"tokens":["array-token-one","array-token-two"],"regions":["us-east-1-long"]}"#,
+    )
+    .unwrap();
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    cfg.dotenv_patterns = vec!["config.env".into()];
+
+    let table = RedactionTable::build(&cfg, dir.path()).unwrap();
+
+    assert_eq!(table.scrub("array-token-one"), cfg.placeholder);
+    assert_eq!(table.scrub("array-token-two"), cfg.placeholder);
+    assert_eq!(table.scrub("us-east-1-long"), "us-east-1-long");
+}
+
+#[test]
+fn structured_length_exemption_unchanged() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path().join("config.env");
+    std::fs::write(
+        &p,
+        "\"user_pin\" = \"short-pin-value\"\n\"pin\" = \"bare-pin-value\"\n",
+    )
+    .unwrap();
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    cfg.dotenv_patterns = vec!["config.env".into()];
+    cfg.min_secret_length = 32;
+
+    let table = RedactionTable::build(&cfg, dir.path()).unwrap();
+
+    assert_eq!(table.scrub("short-pin-value"), cfg.placeholder);
+    assert_eq!(table.scrub("bare-pin-value"), "bare-pin-value");
 }
 
 #[test]
@@ -1102,8 +1204,8 @@ async fn structured_disable_marker_is_scoped_to_one_duplicate_value_occurrence()
     let p = dir.path().join(".env");
     std::fs::write(
         &p,
-        r#"marked = "shared-structured-secret" # COCKPIT_DISABLE_REDACT
-kept = "shared-structured-secret"
+        r#""marked_secret" = "shared-structured-secret" # COCKPIT_DISABLE_REDACT
+"kept_secret" = "shared-structured-secret"
 "#,
     )
     .unwrap();
@@ -1119,10 +1221,10 @@ async fn toml_marker_excludes_long_value() {
     let dir = TempDir::new().unwrap();
     let p = dir.path().join(".env");
     std::fs::write(
-            &p,
-            "marked = \"toml-marked-long-secret\" # COCKPIT_DISABLE_REDACT\nkept = \"toml-kept-long-secret\"\n",
-        )
-        .unwrap();
+        &p,
+        "\"marked_secret\" = \"toml-marked-long-secret\" # COCKPIT_DISABLE_REDACT\n\"kept_secret\" = \"toml-kept-long-secret\"\n",
+    )
+    .unwrap();
     let mut cfg = enabled_cfg();
     cfg.scan_dotenv = true;
     let t = RedactionTable::build(&cfg, dir.path()).unwrap();
@@ -1139,7 +1241,7 @@ async fn yaml_marker_excludes_long_value() {
     let p = dir.path().join(".env");
     std::fs::write(
         &p,
-        "marked: yaml-marked-long-secret # COCKPIT_DISABLE_REDACT\nkept: yaml-kept-long-secret\n",
+        "marked_secret: yaml-marked-long-secret # COCKPIT_DISABLE_REDACT\nkept_secret: yaml-kept-long-secret\n",
     )
     .unwrap();
     let mut cfg = enabled_cfg();
@@ -1156,7 +1258,7 @@ async fn yaml_marker_excludes_long_value() {
 async fn json_has_no_comment_marker() {
     // JSON is exempt from the marker: a `# COCKPIT_DISABLE_REDACT`
     // would make the doc invalid JSON, so it parses as JSON only
-    // without one and every leaf string stays a candidate.
+    // without one and secret-keyed leaf strings stay candidates.
     let dir = TempDir::new().unwrap();
     let p = dir.path().join("c.env");
     std::fs::write(&p, r#"{"token":"json-no-marker-secret"}"#).unwrap();

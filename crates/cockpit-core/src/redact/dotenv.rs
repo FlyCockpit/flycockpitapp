@@ -160,7 +160,7 @@ pub(super) fn collect_env_file_candidates(path: &Path, user_allowlist: &[String]
     // (2) JSON — has no comments, so the marker is not honored here.
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
         let mut out = Vec::new();
-        collect_json_strings(&value, &display, false, &mut out);
+        collect_json_strings(&value, &display, false, false, &mut out);
         return EnvFileScan::Candidates(out);
     }
 
@@ -168,7 +168,7 @@ pub(super) fn collect_env_file_candidates(path: &Path, user_allowlist: &[String]
     if let Ok(value) = toml::from_str::<toml::Value>(&text) {
         let mut out = Vec::new();
         let mut marked = marked.clone();
-        collect_toml_strings(&value, &display, &mut marked, false, &mut out);
+        collect_toml_strings(&value, &display, &mut marked, false, false, &mut out);
         return EnvFileScan::Candidates(out);
     }
 
@@ -176,7 +176,7 @@ pub(super) fn collect_env_file_candidates(path: &Path, user_allowlist: &[String]
     if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) {
         let mut out = Vec::new();
         let mut marked = marked;
-        collect_yaml_strings(&value, &display, &mut marked, false, &mut out);
+        collect_yaml_strings(&value, &display, &mut marked, false, false, &mut out);
         return EnvFileScan::Candidates(out);
     }
 

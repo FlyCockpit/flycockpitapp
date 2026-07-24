@@ -164,6 +164,88 @@ pub(crate) fn env_scrub_patterns(name: &str) -> bool {
         || upper.ends_with("_CREDENTIALS")
 }
 
+/// Broad inclusion predicate for key names whose values are likely secrets.
+/// This is intentionally wider than [`credential_shaped_key`]: structured
+/// config registration uses this to decide whether a value enters the table at
+/// all, while `credential_shaped_key` only grants the min-length exemption to a
+/// smaller, high-confidence subset.
+pub(crate) fn is_secret_shaped_key(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if upper.ends_with("_KEY")
+        || upper.ends_with("_SECRET")
+        || upper.ends_with("_TOKEN")
+        || upper.ends_with("_PASSWORD")
+        || upper.ends_with("_PASSWD")
+        || upper.ends_with("_PIN")
+        || upper.ends_with("_PAT")
+        || upper.ends_with("_CREDENTIALS")
+        || upper.ends_with("_PASSPHRASE")
+    {
+        return true;
+    }
+
+    let segments = key_name_segments(name);
+    if segments.iter().any(|segment| {
+        matches!(
+            segment.as_str(),
+            "password"
+                | "passwords"
+                | "passwd"
+                | "token"
+                | "tokens"
+                | "secret"
+                | "secrets"
+                | "credential"
+                | "credentials"
+                | "passphrase"
+                | "passphrases"
+        )
+    }) {
+        return true;
+    }
+    if segments.iter().any(|segment| segment == "apikey") {
+        return true;
+    }
+
+    segments.windows(2).any(|window| {
+        matches!(
+            (window[0].as_str(), window[1].as_str()),
+            ("api", "key") | ("private", "key") | ("access", "key")
+        )
+    })
+}
+
+fn key_name_segments(name: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = name.chars().collect();
+
+    for (idx, ch) in chars.iter().copied().enumerate() {
+        if !ch.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        let prev = idx.checked_sub(1).and_then(|prev| chars.get(prev)).copied();
+        let next = chars.get(idx + 1).copied();
+        let split_camel = ch.is_ascii_uppercase()
+            && !current.is_empty()
+            && (prev.is_some_and(|prev| prev.is_ascii_lowercase() || prev.is_ascii_digit())
+                || next.is_some_and(|next| next.is_ascii_lowercase()));
+        if split_camel {
+            segments.push(std::mem::take(&mut current));
+        }
+        current.push(ch.to_ascii_lowercase());
+    }
+
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
 fn credential_shaped_key(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     upper.ends_with("_PIN")
@@ -820,6 +902,76 @@ mod scrub_fast_path_tests {
         assert!(origin_is_forced("$ssh:/home/user/.ssh/id_ed25519"));
         assert!(!origin_is_forced("$PATH"));
         assert!(!origin_is_forced("/tmp/not-an-origin"));
+    }
+
+    #[test]
+    fn is_secret_shaped_key_matches_secret_family_and_env_superset() {
+        for key in [
+            "password",
+            "PASSWORD",
+            "passwd",
+            "db_password",
+            "token",
+            "TOKEN",
+            "access_token",
+            "secret",
+            "SECRET",
+            "client_secret",
+            "api_key",
+            "API_KEY",
+            "apiKey",
+            "APIKey",
+            "apikey",
+            "AWSSecretAccessKey",
+            "credential",
+            "credentials",
+            "CREDENTIALS",
+            "private_key",
+            "secret_key",
+            "access_key",
+            "AWS_SECRET_ACCESS_KEY",
+            "passphrase",
+            "PASSPHRASE",
+            "ssl_passphrase",
+            "SERVICE_KEY",
+            "SERVICE_SECRET",
+            "SERVICE_TOKEN",
+            "SERVICE_PASSWORD",
+            "SERVICE_PASSWD",
+            "SERVICE_PIN",
+            "SERVICE_PAT",
+            "SERVICE_CREDENTIALS",
+            "SERVICE_PASSPHRASE",
+        ] {
+            assert!(is_secret_shaped_key(key), "expected `{key}` to match");
+        }
+    }
+
+    #[test]
+    fn is_secret_shaped_key_rejects_plain_and_bare_ambiguous_keys() {
+        for key in [
+            "name",
+            "title",
+            "description",
+            "id",
+            "host",
+            "port",
+            "url",
+            "uri",
+            "email",
+            "username",
+            "user",
+            "path",
+            "region",
+            "bucket",
+            "version",
+            "enabled",
+            "key",
+            "pin",
+            "pat",
+        ] {
+            assert!(!is_secret_shaped_key(key), "expected `{key}` to reject");
+        }
     }
 
     #[test]

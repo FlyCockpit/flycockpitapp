@@ -1763,6 +1763,91 @@ fn openai_additional_params_injects_prompt_cache_key() {
     assert_eq!(openai_additional_params(&params), None);
 }
 
+#[test]
+fn openai_additional_params_carries_prompt_cache_key_and_retention() {
+    let params = ModelParams {
+        prompt_cache_key: Some("session-123".into()),
+        prompt_cache_retention: Some("24h".into()),
+        additional_params: Some(json!({ "reasoning_effort": "high" })),
+        ..ModelParams::default()
+    };
+    assert_eq!(
+        openai_additional_params(&params),
+        Some(json!({
+            "reasoning_effort": "high",
+            "prompt_cache_key": "session-123",
+            "prompt_cache_retention": "24h"
+        })),
+    );
+
+    let retention_only = ModelParams {
+        prompt_cache_retention: Some("24h".into()),
+        ..ModelParams::default()
+    };
+    assert_eq!(
+        openai_additional_params(&retention_only),
+        Some(json!({ "prompt_cache_retention": "24h" })),
+    );
+
+    let vendor_retention = ModelParams {
+        prompt_cache_retention: Some("24h".into()),
+        additional_params: Some(json!({ "prompt_cache_retention": "vendor-default" })),
+        ..ModelParams::default()
+    };
+    assert_eq!(
+        openai_additional_params(&vendor_retention),
+        Some(json!({ "prompt_cache_retention": "24h" })),
+    );
+
+    let no_retention = ModelParams {
+        prompt_cache_key: Some("session-123".into()),
+        prompt_cache_retention: None,
+        ..ModelParams::default()
+    };
+    assert!(
+        openai_additional_params(&no_retention)
+            .unwrap()
+            .get("prompt_cache_retention")
+            .is_none()
+    );
+
+    let empty_retention = ModelParams {
+        prompt_cache_key: Some("session-123".into()),
+        prompt_cache_retention: Some(String::new()),
+        ..ModelParams::default()
+    };
+    assert!(
+        openai_additional_params(&empty_retention)
+            .unwrap()
+            .get("prompt_cache_retention")
+            .is_none()
+    );
+
+    let non_object_vendor = ModelParams {
+        prompt_cache_key: Some("session-123".into()),
+        prompt_cache_retention: Some("24h".into()),
+        additional_params: Some(json!("vendor-owned-fragment")),
+        ..ModelParams::default()
+    };
+    assert_eq!(
+        openai_additional_params(&non_object_vendor),
+        Some(json!("vendor-owned-fragment"))
+    );
+}
+
+#[test]
+fn openai_additional_params_unchanged_when_retention_unset() {
+    let params = ModelParams {
+        prompt_cache_key: Some("session-123".into()),
+        prompt_cache_retention: None,
+        ..ModelParams::default()
+    };
+    assert_eq!(
+        openai_additional_params(&params),
+        Some(json!({ "prompt_cache_key": "session-123" })),
+    );
+}
+
 /// The captured/as-sent body reflects the cache key for the OpenAI flavor
 /// but omits it for the native Anthropic flavor (which caches per-block).
 #[test]
@@ -1794,6 +1879,43 @@ fn assembled_request_cache_key_is_openai_only() {
         &params,
     );
     // No top-level cache key in the native Anthropic capture.
+    assert_eq!(anthropic["additional_params"], serde_json::Value::Null);
+}
+
+#[test]
+fn captured_request_carries_prompt_cache_retention() {
+    let params = ModelParams {
+        prompt_cache_key: Some("sess-abc".into()),
+        prompt_cache_retention: Some("24h".into()),
+        ..ModelParams::default()
+    };
+    let openai = assembled_request(
+        "gpt",
+        "openai-compatible",
+        "SYS",
+        &[],
+        &Message::user("hi"),
+        &[],
+        &params,
+    );
+    assert_eq!(
+        openai["additional_params"]["prompt_cache_key"],
+        json!("sess-abc"),
+    );
+    assert_eq!(
+        openai["additional_params"]["prompt_cache_retention"],
+        json!("24h"),
+    );
+
+    let anthropic = assembled_request(
+        "claude",
+        "anthropic",
+        "SYS",
+        &[],
+        &Message::user("hi"),
+        &[],
+        &params,
+    );
     assert_eq!(anthropic["additional_params"], serde_json::Value::Null);
 }
 
@@ -4599,6 +4721,29 @@ async fn utility_params_applied_on_openai_arm() {
     assert_eq!(body["max_tokens"], 99, "{body}");
     assert_eq!(body["prompt_cache_key"], "session-cache-key", "{body}");
     assert_eq!(body["vendor_knob"], "on", "{body}");
+}
+
+#[tokio::test]
+async fn responses_prompt_cache_params_reach_wire() {
+    let mut provider =
+        provider_with_turns([raw_json_turn_for_wire(WireApi::Responses, false)]).await;
+    let url = provider.base_url();
+    let model = openai_model_at_with_wire(&url, WireApi::Responses, true);
+    let params = ModelParams {
+        prompt_cache_key: Some("session-cache-key".to_string()),
+        prompt_cache_retention: Some("24h".to_string()),
+        ..ModelParams::default()
+    };
+    model
+        .text_completion_with_params(UtilityCallSite::Predict, params, "hi")
+        .await
+        .unwrap();
+
+    let request = provider.next_request().await;
+    assert!(request.request_line.contains("/responses"));
+    let body = request.body;
+    assert_eq!(body["prompt_cache_key"], "session-cache-key", "{body}");
+    assert_eq!(body["prompt_cache_retention"], "24h", "{body}");
 }
 
 #[tokio::test]

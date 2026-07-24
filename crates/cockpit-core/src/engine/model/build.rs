@@ -950,6 +950,13 @@ pub struct ModelParams {
     /// `None`. The native Anthropic arm ignores it entirely (it uses
     /// provider-concrete per-block caching instead).
     pub prompt_cache_key: Option<String>,
+    /// Opaque provider-defined prompt-cache retention policy for
+    /// OpenAI-compatible backends, such as OpenAI's `"24h"`. `None` is the
+    /// default and sends no retention key, so existing request bodies are
+    /// unchanged. When set to a non-empty value, the OpenAI-compatible
+    /// additional-params composition passes it through verbatim; native
+    /// Anthropic ignores it because it uses per-block caching.
+    pub prompt_cache_retention: Option<String>,
     /// Provider-native computer-use tool overlay. This stays `None` by default;
     /// the gating prompt is responsible for attaching it only to approved
     /// computer-use subagent turns.
@@ -1094,35 +1101,56 @@ pub(super) fn build_openai_responses_agent(
     b.build()
 }
 
-/// Compose the OpenAI-compat outbound `additional_params` object: the
-/// sanitized vendor reasoning fragment plus, when set, the top-level
-/// `prompt_cache_key` (= session id, prompt `prompt-caching-strategy.md`
-/// decision 3). `prompt_cache_key` is not a cockpit-owned request key, so it
-/// survives sanitization, but we inject it explicitly rather than relying on
-/// the user's fragment. Returns `None` when there is nothing to add, so
-/// providers with no extra params and no cache key stay byte-for-byte
+/// Compose the OpenAI-compat outbound `additional_params` object. rig >=0.40
+/// deserializes this JSON fragment into its typed Responses
+/// `AdditionalParameters` (PR #1830), so this is rig's native channel for
+/// prompt-cache params rather than a side path.
+///
+/// The composed fragment is the sanitized vendor reasoning fragment plus, when
+/// set, the top-level `prompt_cache_key` (= session id, prompt
+/// `prompt-caching-strategy.md` decision 3) and opaque
+/// `prompt_cache_retention`. These keys are not cockpit-owned request keys, so
+/// they survive sanitization, but we inject them explicitly rather than relying
+/// on the user's fragment. Returns `None` when there is nothing to add, so
+/// providers with no extra params and no cache params stay byte-for-byte
 /// unchanged.
 pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_json::Value> {
     let vendor = sanitized_extra_params(params.additional_params.as_ref());
     let vendor = merge_native_computer_tools(vendor, params, |contract| {
         contract == crate::computer::ComputerToolContract::OpenAiResponses
     });
-    let Some(key) = params.prompt_cache_key.as_ref().filter(|k| !k.is_empty()) else {
+    let cache_key = params
+        .prompt_cache_key
+        .as_ref()
+        .filter(|key| !key.is_empty());
+    let cache_retention = params
+        .prompt_cache_retention
+        .as_ref()
+        .filter(|retention| !retention.is_empty());
+    if cache_key.is_none() && cache_retention.is_none() {
         return vendor;
-    };
-    // Merge the cache key into the vendor object (or start a fresh object).
+    }
+    // Merge cache params into the vendor object (or start a fresh object).
     let mut map = match vendor {
         Some(serde_json::Value::Object(m)) => m,
         // A non-object vendor fragment is a shape the config author chose; we
-        // don't silently rewrite it, so the cache key can't be merged in —
-        // keep the vendor fragment as-is (the cache key is best-effort).
+        // don't silently rewrite it, so cache params can't be merged in; keep
+        // the vendor fragment as-is (cache params are best-effort).
         Some(other) => return Some(other),
         None => serde_json::Map::new(),
     };
-    map.insert(
-        "prompt_cache_key".to_string(),
-        serde_json::Value::String(key.clone()),
-    );
+    if let Some(key) = cache_key {
+        map.insert(
+            "prompt_cache_key".to_string(),
+            serde_json::Value::String(key.clone()),
+        );
+    }
+    if let Some(retention) = cache_retention {
+        map.insert(
+            "prompt_cache_retention".to_string(),
+            serde_json::Value::String(retention.clone()),
+        );
+    }
     Some(serde_json::Value::Object(map))
 }
 

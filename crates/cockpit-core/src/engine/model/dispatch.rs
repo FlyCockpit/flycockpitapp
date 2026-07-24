@@ -1411,10 +1411,11 @@ pub(super) fn assembled_request(
         // The exact extra fragment that gets flattened into the wire body —
         // computed the same way the live request computes it, so what's
         // recorded is what's sent. The native Anthropic arm flattens only the
-        // sanitized vendor fragment (it caches per-block, no `prompt_cache_key`);
-        // every OpenAI-compat arm also injects the top-level `prompt_cache_key`
-        // (`prompt-caching-strategy.md` decision 3). Omitted when there's
-        // nothing to add, so existing providers' captured bodies are unchanged.
+        // sanitized vendor fragment (it caches per-block, no OpenAI-compatible
+        // prompt-cache keys); every OpenAI-compat arm also injects the
+        // top-level `prompt_cache_key` (`prompt-caching-strategy.md` decision
+        // 3) and optional retention. Omitted when there's nothing to add, so
+        // existing providers' captured bodies are unchanged.
         "additional_params": if provider == "anthropic" {
             anthropic_additional_params(params)
         } else {

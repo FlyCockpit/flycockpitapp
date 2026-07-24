@@ -1144,6 +1144,20 @@ fn normalized_event(session_id: Uuid, event: &proto::Event, verbose: bool) -> Op
             "tool": tool,
             "args": args
         }),
+        proto::Event::ToolProgress {
+            call_id,
+            done,
+            total,
+            unit,
+            ..
+        } => json!({
+            "event": "tool_progress",
+            "session_id": session_id,
+            "call_id": call_id,
+            "done": done,
+            "total": total,
+            "unit": unit
+        }),
         proto::Event::ToolEnd {
             agent,
             call_id,
@@ -1327,6 +1341,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Notice { session_id, .. }
         | SkillAutoInjected { session_id, .. }
         | ToolStart { session_id, .. }
+        | ToolProgress { session_id, .. }
         | ToolEnd { session_id, .. }
         | ResourceWait { session_id, .. }
         | ResourceStart { session_id, .. }

@@ -1006,6 +1006,7 @@ fn mk_call(tool: &str, summary: &str, state: ToolCallState) -> ToolCall {
         result_offset: 0,
         state,
         hint: None,
+        progress: None,
         mcp_child: None,
     }
 }
@@ -1050,6 +1051,7 @@ fn child_call(
         result_offset: 0,
         state,
         hint: None,
+        progress: None,
         mcp_child: Some(meta),
     }
 }
@@ -1070,6 +1072,74 @@ fn render_toolbox_smoke() {
     let rendered = render_toolbox(&calls, 0, true, 80, false, &no_elided());
 
     assert_eq!(line_text(&rendered.lines[0]), "│ bash: echo ok");
+}
+
+#[test]
+fn tool_progress_row_renders_bar_and_counts() {
+    let mut call = mk_call("bash", "index src", ToolCallState::Processing);
+    call.progress = Some(cockpit_core::engine::ToolProgress {
+        call_id: "id".to_string(),
+        done: 3,
+        total: 10,
+        unit: "files".to_string(),
+    });
+
+    let rendered = render_toolbox(&[call.clone()], 0, true, 80, false, &no_elided());
+    let text = line_text(&rendered.lines[0]);
+    assert!(text.contains("[███░░░░░░░] 3/10 files"), "{text}");
+    assert_eq!(
+        rendered.lines[0]
+            .spans
+            .last()
+            .and_then(|span| span.style.fg),
+        Some(WARNING_TEXT)
+    );
+
+    call.state = ToolCallState::Success;
+    let rendered = render_toolbox(&[call], 0, true, 80, false, &no_elided());
+    let text = line_text(&rendered.lines[0]);
+    assert!(!text.contains("3/10 files"), "{text}");
+    assert!(!text.contains("██"), "{text}");
+}
+
+#[test]
+fn tool_progress_render_clamps_monotonic() {
+    let mut call = mk_call("bash", "index src", ToolCallState::Processing);
+    call.progress = Some(cockpit_core::engine::ToolProgress {
+        call_id: "id".to_string(),
+        done: 12,
+        total: 10,
+        unit: "files".to_string(),
+    });
+
+    let rendered = render_toolbox(&[call], 0, true, 80, false, &no_elided());
+    let text = line_text(&rendered.lines[0]);
+    assert!(text.contains("[██████████] 10/10 files"), "{text}");
+}
+
+#[test]
+fn tool_progress_narrow_width_degrades() {
+    let mut call = mk_call("bash", "index src", ToolCallState::Processing);
+    call.progress = Some(cockpit_core::engine::ToolProgress {
+        call_id: "id".to_string(),
+        done: 3,
+        total: 10,
+        unit: "files".to_string(),
+    });
+
+    let without_bar =
+        line_text(&render_toolbox(&[call.clone()], 0, true, 25, false, &no_elided()).lines[0]);
+    assert!(!without_bar.contains('['), "{without_bar}");
+    assert!(without_bar.contains("3/10 files"), "{without_bar}");
+
+    let without_unit =
+        line_text(&render_toolbox(&[call.clone()], 0, true, 18, false, &no_elided()).lines[0]);
+    assert!(!without_unit.contains("files"), "{without_unit}");
+    assert!(without_unit.contains("3/10"), "{without_unit}");
+
+    let without_counts =
+        line_text(&render_toolbox(&[call], 0, true, 12, false, &no_elided()).lines[0]);
+    assert!(!without_counts.contains("3/10"), "{without_counts}");
 }
 
 #[test]
@@ -1677,7 +1747,7 @@ fn collapsed_tool_summary_fits_pane_for_every_tool() {
             // Mirror render_toolbox's collapsed row: indent 2 (sidebar
             // glyph + space), then glyph + bold label + ": " + summary.
             let budget = tool_call_summary_budget(&call, width, 2, /* emojis */ true);
-            let spans = tool_call_spans(&call, &truncate(&summary, budget), /* emojis */ true);
+            let spans = tool_call_spans(&call, &truncate(&summary, budget), true, None);
             // The leading sidebar glyph (1) + its space (1) = 2 columns.
             let line_cols: usize = 2 + spans.iter().map(|s| s.content.width()).sum::<usize>();
             assert!(

@@ -21,6 +21,28 @@ fn write(root: &Path, rel: &str, body: &str) {
     std::fs::write(p, body).unwrap();
 }
 
+fn write_rust_files(root: &Path, count: usize) {
+    for i in 0..count {
+        write(
+            root,
+            &format!("src/file_{i}.rs"),
+            &format!("pub fn function_{i}() {{}}\n"),
+        );
+    }
+}
+
+fn drain_tool_progress(
+    rx: &mut tokio::sync::mpsc::Receiver<crate::engine::TurnEvent>,
+) -> Vec<crate::engine::ToolProgress> {
+    let mut progress = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let crate::engine::TurnEvent::ToolProgress(tick) = event {
+            progress.push(tick);
+        }
+    }
+    progress
+}
+
 fn code_args(kind: &str, args: serde_json::Value) -> serde_json::Value {
     let mut map = match args {
         serde_json::Value::Object(map) => map,
@@ -847,6 +869,74 @@ async fn intel_walk_tool_output_contains_truncation_note() {
         "{}",
         out.content
     );
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn tool_progress_intel_bridge_emits_per_chunk() {
+    let _guard = test_recompute_counter_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_rust_files(tmp.path(), 205);
+    let (mut ctx, _db) = test_ctx_with_db(tmp.path());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    ctx.current_tool_call_id = Some("call-1".to_string());
+    ctx.events = Some(tx);
+    clear_freshness_cache();
+
+    let out = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
+    assert!(out.content.contains("src/file_0.rs"), "{}", out.content);
+
+    let progress = drain_tool_progress(&mut rx);
+    assert_eq!(progress.len(), 2, "{progress:?}");
+    assert!(progress.iter().all(|tick| tick.call_id == "call-1"));
+    assert!(progress.iter().all(|tick| tick.unit == "files"));
+    assert_eq!(progress.last().map(|tick| tick.total), Some(205));
+    assert_eq!(progress.last().map(|tick| tick.done), Some(205));
+    assert!(progress.windows(2).all(|pair| pair[0].done <= pair[1].done));
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn tool_progress_intel_bridge_noop_without_events() {
+    let _guard = test_recompute_counter_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_rust_files(tmp.path(), 205);
+    let (mut ctx, _db) = test_ctx_with_db(tmp.path());
+    ctx.current_tool_call_id = Some("call-1".to_string());
+    ctx.events = None;
+    clear_freshness_cache();
+
+    let out = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
+    assert!(out.content.contains("src/file_0.rs"), "{}", out.content);
+    clear_freshness_cache();
+}
+
+#[tokio::test]
+async fn tool_progress_full_channel_drops_ticks() {
+    let _guard = test_recompute_counter_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_rust_files(tmp.path(), 405);
+    let (mut ctx, _db) = test_ctx_with_db(tmp.path());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    ctx.current_tool_call_id = Some("call-1".to_string());
+    ctx.events = Some(tx);
+    clear_freshness_cache();
+
+    let out = CodeTool
+        .call(code_args("tree", serde_json::json!({})), &ctx)
+        .await
+        .unwrap();
+    assert!(out.content.contains("src/file_0.rs"), "{}", out.content);
+
+    let progress = drain_tool_progress(&mut rx);
+    assert_eq!(progress.len(), 1, "{progress:?}");
+    assert_eq!(progress[0].call_id, "call-1");
     clear_freshness_cache();
 }
 

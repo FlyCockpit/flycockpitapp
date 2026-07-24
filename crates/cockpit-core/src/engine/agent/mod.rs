@@ -57,7 +57,8 @@ pub use backup::{
     suggested_action_for_failure_class, turn_with_backup,
 };
 pub use events::{
-    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, TurnEvent,
+    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, ToolProgress,
+    TurnEvent,
 };
 pub use outcome::{BatchTaskEntry, TaskControlAction, TurnOutcome};
 pub(crate) use recheck::{ResultRecheckCtx, result_recheck};

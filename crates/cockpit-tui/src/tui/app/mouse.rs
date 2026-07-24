@@ -1177,6 +1177,7 @@ mod affordance_hover_tests {
             result_offset: 0,
             state: ToolCallState::Success,
             hint: None,
+            progress: None,
             mcp_child: None,
         }
     }

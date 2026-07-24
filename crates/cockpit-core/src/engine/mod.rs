@@ -55,7 +55,8 @@ pub mod translate;
 pub mod validation_hint;
 
 pub use agent::{
-    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, TurnEvent,
+    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, ToolProgress,
+    TurnEvent,
 };
 pub use driver::Driver;
 

@@ -1767,6 +1767,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Notice { session_id, .. }
         | SkillAutoInjected { session_id, .. }
         | ToolStart { session_id, .. }
+        | ToolProgress { session_id, .. }
         | ToolEnd { session_id, .. }
         | ResourceWait { session_id, .. }
         | ResourceStart { session_id, .. }
@@ -2158,6 +2159,18 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             tool,
             args,
         },
+        ToolProgress {
+            call_id,
+            done,
+            total,
+            unit,
+            ..
+        } => TurnEvent::ToolProgress(cockpit_core::engine::ToolProgress {
+            call_id,
+            done,
+            total,
+            unit,
+        }),
         ToolEnd {
             agent,
             call_id,
@@ -3378,6 +3391,81 @@ mod tests {
                 turn_id: Some(turn_id),
                 reason: cockpit_core::engine::IdleReason::Completed,
             } if turn_id == "turn-1"
+        ));
+    }
+
+    #[test]
+    fn tool_progress_proto_round_trip() {
+        let session_id = uuid::Uuid::new_v4();
+        let event = proto::Event::ToolProgress {
+            session_id,
+            call_id: "call-1".to_string(),
+            done: 3400,
+            total: 12000,
+            unit: "files".to_string(),
+        };
+        assert_eq!(event_session(&event), Some(session_id));
+
+        match proto_event_to_turn_event(event) {
+            Some(TurnEvent::ToolProgress(progress)) => {
+                assert_eq!(progress.call_id, "call-1");
+                assert_eq!(progress.done, 3400);
+                assert_eq!(progress.total, 12000);
+                assert_eq!(progress.unit, "files");
+            }
+            other => panic!("expected tool progress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_progress_routes_by_session() {
+        let session_id = uuid::Uuid::new_v4();
+        let other_session_id = uuid::Uuid::new_v4();
+        let progress = proto::Event::ToolProgress {
+            session_id,
+            call_id: "call-1".to_string(),
+            done: 1,
+            total: 2,
+            unit: "files".to_string(),
+        };
+        assert_eq!(event_session(&progress), Some(session_id));
+        assert!(!is_global_event(&progress));
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let active_agent = Arc::new(Mutex::new("Build".to_string()));
+        let active_agent_path = Arc::new(Mutex::new(vec!["Build".to_string()]));
+        let primary_agent = Arc::new(Mutex::new("Build".to_string()));
+        let last_applied_seq = Arc::new(Mutex::new(None));
+        let incoming = IncomingEventContext {
+            session_id,
+            events: &events,
+            event_notify: &notify,
+            active_agent: &active_agent,
+            active_agent_path: &active_agent_path,
+            primary_agent: &primary_agent,
+            last_applied_seq: &last_applied_seq,
+        };
+
+        apply_incoming_event(
+            proto::Event::ToolProgress {
+                session_id: other_session_id,
+                call_id: "call-2".to_string(),
+                done: 1,
+                total: 2,
+                unit: "files".to_string(),
+            },
+            &incoming,
+        );
+        assert!(events.lock().unwrap().is_empty());
+
+        apply_incoming_event(progress, &incoming);
+        let drained = events.lock().unwrap();
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(
+            &drained[0],
+            TurnEvent::ToolProgress(progress)
+                if progress.call_id == "call-1" && progress.done == 1 && progress.total == 2
         ));
     }
 

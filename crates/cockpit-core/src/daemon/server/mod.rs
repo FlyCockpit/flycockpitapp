@@ -624,6 +624,13 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             tool: _,
             args,
         } => scrub_json_strings(args, redact),
+        proto::Event::ToolProgress {
+            session_id: _,
+            call_id: _,
+            done: _,
+            total: _,
+            unit: _,
+        } => {}
         proto::Event::ToolEnd {
             session_id: _,
             agent: _,

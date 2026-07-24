@@ -733,6 +733,15 @@ pub enum Event {
         args: Value,
     },
 
+    /// UI-only progress tick for a running tool row.
+    ToolProgress {
+        session_id: Uuid,
+        call_id: String,
+        done: u64,
+        total: u64,
+        unit: String,
+    },
+
     /// Tool finished cleanly. `output` is what the model sees on its
     /// next inference call.
     ToolEnd {
@@ -1340,6 +1349,7 @@ macro_rules! event_variants {
             (Event::EventStreamLagged { .. }, "event_stream_lagged");
             (Event::SkillAutoInjected { .. }, "skill_auto_injected");
             (Event::ToolStart { .. }, "tool_start");
+            (Event::ToolProgress { .. }, "tool_progress");
             (Event::ToolEnd { .. }, "tool_end");
             (Event::ResourceWait { .. }, "resource_wait");
             (Event::ResourceStart { .. }, "resource_start");

@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 2 as const;
+export const PROTOCOL_VERSION = 3 as const;
 
 export const uuidSchema = z.string().uuid();
 export const requestIdSchema = uuidSchema;
@@ -640,6 +640,7 @@ export const knownEventKindSchema = z.enum([
   "interrupt_raised",
   "interrupt_resolved",
   "llm_mode_changed",
+  "longcache_state",
   "lsp_notice",
   "nested_turn",
   "notice",
@@ -678,6 +679,7 @@ export const knownEventKindSchema = z.enum([
   "thinking_started",
   "tool_end",
   "tool_error",
+  "tool_progress",
   "tool_start",
   "trusted_only_state",
   "usage",

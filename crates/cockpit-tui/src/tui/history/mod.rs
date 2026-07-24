@@ -24,12 +24,13 @@ use crate::tui::message_block::{
     layout_markdown_message_lines, render_markdown_message_block, slice_spans_at_width,
     wrap_lines_to_width,
 };
+use crate::tui::progress::render_bar;
 use crate::tui::theme::{
     ERROR_TEXT, INFO_TEXT, METADATA_TEXT, MUTED_COLOR_INDEX, PLAN_YELLOW, SUBAGENT_ORANGE,
     SUCCESS_TEXT, TOOL_OUTPUT, TOOL_SIDEBAR, WARNING_TEXT,
 };
 use cockpit_config::extended::ThinkingDisplay;
-use cockpit_core::engine::tool::ToolPresentation;
+use cockpit_core::engine::{ToolProgress, tool::ToolPresentation};
 
 mod pending;
 mod scroll;
@@ -429,6 +430,7 @@ pub struct ToolCall {
     /// `hint: <text>` line beneath the command output (wire-vs-user split,
     /// GOALS §14 — this is the user-side surface). `None` when no rule fired.
     pub hint: Option<String>,
+    pub progress: Option<ToolProgress>,
     pub mcp_child: Option<McpChildMeta>,
 }
 
@@ -2451,7 +2453,12 @@ fn tool_uses_read_output_renderer(tool: &str) -> bool {
 
 /// Spans for one tool-call line: `[glyph] label: summary`, the label
 /// bold and the whole line tinted by `state`.
-fn tool_call_spans(call: &ToolCall, text: &str, emojis: bool) -> Vec<Span<'static>> {
+fn tool_call_spans(
+    call: &ToolCall,
+    text: &str,
+    emojis: bool,
+    progress_width: Option<usize>,
+) -> Vec<Span<'static>> {
     let (glyph, label) = tool_call_glyph_label(call, emojis);
     let style = tool_state_style(call.state);
     let mut spans = Vec::new();
@@ -2465,6 +2472,9 @@ fn tool_call_spans(call: &ToolCall, text: &str, emojis: bool) -> Vec<Span<'stati
     if !text.is_empty() {
         spans.push(Span::raw(" ".to_string()));
         spans.push(Span::styled(text.to_string(), style));
+    }
+    if let Some(suffix) = progress_width.and_then(|width| tool_progress_suffix(call, width)) {
+        spans.push(Span::styled(suffix, style));
     }
     spans
 }
@@ -2503,7 +2513,71 @@ fn tool_summary_budget(tool: &str, width: usize, indent: usize, emojis: bool) ->
 fn tool_call_summary_budget(call: &ToolCall, width: usize, indent: usize, emojis: bool) -> usize {
     let (glyph, label) = tool_call_glyph_label(call, emojis);
     let prefix = indent + glyph.width() + label.width() + 2;
-    width.saturating_sub(prefix).max(8)
+    let available = width.saturating_sub(prefix);
+    if let Some(suffix) = tool_progress_suffix(call, available) {
+        available.saturating_sub(suffix.width())
+    } else {
+        available.max(8)
+    }
+}
+
+fn tool_call_progress_available(
+    call: &ToolCall,
+    width: usize,
+    indent: usize,
+    emojis: bool,
+) -> usize {
+    let (glyph, label) = tool_call_glyph_label(call, emojis);
+    let prefix = indent + glyph.width() + label.width() + 2;
+    width.saturating_sub(prefix)
+}
+
+fn tool_progress_suffix(call: &ToolCall, available: usize) -> Option<String> {
+    let progress = call.progress.as_ref()?;
+    if call.state != ToolCallState::Processing || progress.total == 0 {
+        return None;
+    }
+    let done = progress.done.min(progress.total);
+    let counts = format!(
+        "{}/{}",
+        format_progress_count(done),
+        format_progress_count(progress.total)
+    );
+    let unit = progress.unit.trim();
+    let pct = if progress.total == 0 {
+        0.0
+    } else {
+        done as f64 * 100.0 / progress.total as f64
+    };
+    let full = if unit.is_empty() {
+        format!(" [{}] {counts}", render_bar(pct, 10))
+    } else {
+        format!(" [{}] {counts} {unit}", render_bar(pct, 10))
+    };
+    if full.width() <= available {
+        return Some(full);
+    }
+    if !unit.is_empty() {
+        let no_bar = format!(" {counts} {unit}");
+        if no_bar.width() <= available {
+            return Some(no_bar);
+        }
+    }
+    let counts_only = format!(" {counts}");
+    (counts_only.width() <= available).then_some(counts_only)
+}
+
+fn format_progress_count(n: u64) -> String {
+    let raw = n.to_string();
+    let first = raw.len() % 3;
+    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+    for (idx, ch) in raw.chars().enumerate() {
+        if idx > 0 && (idx == first || (idx > first && (idx - first).is_multiple_of(3))) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Truncate `s` to `max` display columns with a trailing `…` when it
@@ -2682,12 +2756,18 @@ fn render_toolbox(
         } else {
             call.summary.clone()
         };
+        let progress_width = tool_call_progress_available(call, width as usize, indent, emojis);
         let budget = tool_call_summary_budget(call, width as usize, indent, emojis);
         let mut spans = Vec::new();
         if is_child {
             spans.push(Span::raw("  ".to_string()));
         }
-        spans.extend(tool_call_spans(call, &truncate(&summary, budget), emojis));
+        spans.extend(tool_call_spans(
+            call,
+            &truncate(&summary, budget),
+            emojis,
+            Some(progress_width),
+        ));
         if elided.contains(&call.call_id) {
             spans.push(Span::styled(
                 "  (pruned)".to_string(),
@@ -2718,8 +2798,16 @@ fn render_toolbox(
             let is_elided = elided.contains(&call.call_id);
             let input_lines: Vec<&str> = call.full_input.split('\n').collect();
             let first = input_lines.first().copied().unwrap_or("");
-            let mut first_spans = tool_call_spans(call, first, emojis);
             let child_indent = if call.mcp_child.is_some() { 2 } else { 0 };
+            let progress_width =
+                tool_call_progress_available(call, call_body_width, child_indent, emojis);
+            let budget = tool_call_summary_budget(call, call_body_width, child_indent, emojis);
+            let first_text = if tool_progress_suffix(call, progress_width).is_some() {
+                truncate(first, budget)
+            } else {
+                first.to_string()
+            };
+            let mut first_spans = tool_call_spans(call, &first_text, emojis, Some(progress_width));
             if child_indent > 0 {
                 first_spans.insert(0, Span::raw(" ".repeat(child_indent)));
             }
@@ -2932,6 +3020,7 @@ fn compact_tool_call(
         result_offset,
         state: ToolCallState::Success,
         hint: None,
+        progress: None,
         mcp_child: None,
     }
 }

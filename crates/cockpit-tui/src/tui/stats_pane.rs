@@ -24,6 +24,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::pane_shared::{resolve_project_id, short_id};
+use crate::tui::progress::render_bar;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_db::Db;
 use cockpit_db::stats::{
@@ -707,22 +708,6 @@ fn join_row(cells: &[String], widths: &[usize]) -> String {
     s
 }
 
-/// Horizontal bar gauge for a 0..100 percentage. `█` for the filled
-/// portion, `░` for the rest — matching the §15e UI sketch. Rounds to
-/// the nearest cell and clamps into `[0, width]`.
-fn render_bar(pct: f64, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let frac = (pct / 100.0).clamp(0.0, 1.0);
-    let filled = (frac * width as f64).round() as usize;
-    let filled = filled.min(width);
-    let mut s = String::with_capacity(width);
-    s.push_str(&"█".repeat(filled));
-    s.push_str(&"░".repeat(width - filled));
-    s
-}
-
 /// Bar width for the available terminal width, leaving `tail` columns
 /// for the label/pct/count after the bar. Clamps to `[6, BAR_WIDTH]` so
 /// the bar stays legible but never overflows a narrow terminal.
@@ -824,21 +809,6 @@ mod tests {
                 non_file: Vec::new(),
             },
         }
-    }
-
-    #[test]
-    fn bar_fills_proportionally() {
-        // Empty/half/full + clamping past the ends.
-        assert_eq!(render_bar(0.0, 10), "░".repeat(10));
-        assert_eq!(render_bar(100.0, 10), "█".repeat(10));
-        let half = render_bar(50.0, 10);
-        assert_eq!(half.chars().filter(|c| *c == '█').count(), 5);
-        assert_eq!(half.chars().count(), 10);
-        // Over-100 clamps to full, negative clamps to empty.
-        assert_eq!(render_bar(250.0, 8), "█".repeat(8));
-        assert_eq!(render_bar(-5.0, 8), "░".repeat(8));
-        // Zero-width never panics.
-        assert_eq!(render_bar(50.0, 0), "");
     }
 
     #[test]

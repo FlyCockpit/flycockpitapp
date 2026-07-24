@@ -470,6 +470,7 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
                 call.expanded.hash(&mut hasher);
                 call.result_offset.hash(&mut hasher);
                 tool_call_state_id(call.state).hash(&mut hasher);
+                call.progress.hash(&mut hasher);
                 call.hint
                     .as_ref()
                     .map(|value| value.len())
@@ -5350,6 +5351,7 @@ mod render_history_spacing_tests {
                 result_offset: 0,
                 state: ToolCallState::Success,
                 hint: None,
+                progress: None,
                 mcp_child: None,
             }],
             view_offset: 0,
@@ -5369,6 +5371,7 @@ mod render_history_spacing_tests {
                 result_offset: 0,
                 state: ToolCallState::Success,
                 hint: None,
+                progress: None,
                 mcp_child: None,
             }],
             view_offset: 0,
@@ -5388,6 +5391,7 @@ mod render_history_spacing_tests {
                 result_offset: 0,
                 state: ToolCallState::Success,
                 hint: None,
+                progress: None,
                 mcp_child: None,
             }],
             view_offset: 0,

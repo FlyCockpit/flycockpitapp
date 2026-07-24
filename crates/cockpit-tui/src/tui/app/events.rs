@@ -507,6 +507,7 @@ impl App {
                     state: ToolCallState::Processing,
                     // Populated at ToolEnd from the engine's `hint` field.
                     hint: None,
+                    progress: None,
                     mcp_child,
                 };
                 // Append to the open box (a run of consecutive boxable
@@ -531,6 +532,9 @@ impl App {
                         follow: true,
                     });
                 }
+            }
+            TurnEvent::ToolProgress(progress) => {
+                self.update_tool_progress(progress);
             }
             TurnEvent::ToolEnd {
                 tool,
@@ -1559,6 +1563,7 @@ impl App {
                         if hint.is_some() {
                             call.hint = hint;
                         }
+                        call.progress = None;
                         return true;
                     }
                 }
@@ -1574,6 +1579,40 @@ impl App {
             }
         }
         false
+    }
+
+    pub(super) fn update_tool_progress(&mut self, progress: cockpit_core::engine::ToolProgress) {
+        for entry in self.history.iter_mut().rev() {
+            let HistoryEntry::ToolBox { calls, .. } = entry else {
+                continue;
+            };
+            let Some(call) = calls
+                .iter_mut()
+                .rev()
+                .find(|call| call.call_id == progress.call_id)
+            else {
+                continue;
+            };
+            if call.state != ToolCallState::Processing {
+                return;
+            }
+            let (done, total) = call
+                .progress
+                .as_ref()
+                .map(|current| {
+                    (
+                        current.done.max(progress.done),
+                        current.total.max(progress.total),
+                    )
+                })
+                .unwrap_or((progress.done, progress.total));
+            call.progress = Some(cockpit_core::engine::ToolProgress {
+                done,
+                total,
+                ..progress
+            });
+            return;
+        }
     }
 
     /// Move the in-flight assistant turn (if any) into permanent history.
@@ -1969,6 +2008,7 @@ pub(super) fn wire_history_to_entries(
                     result_offset: 0,
                     state,
                     hint,
+                    progress: None,
                     mcp_child,
                 };
                 if let Some(meta) = call.mcp_child.as_ref() {
@@ -3138,6 +3178,86 @@ mod tests {
             "future_error".to_string()
         );
         assert_eq!(backup_failure_reason(&class), "future_error".to_string());
+    }
+
+    #[test]
+    fn tool_progress_updates_matching_processing_row_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.apply_event(TurnEvent::ToolStart {
+            agent: "Build".to_string(),
+            call_id: "call-1".to_string(),
+            tool: "context_pack".to_string(),
+            args: json!({"target": "src"}),
+        });
+        app.apply_event(TurnEvent::ToolStart {
+            agent: "Build".to_string(),
+            call_id: "call-2".to_string(),
+            tool: "read".to_string(),
+            args: json!({"path": "Cargo.toml"}),
+        });
+
+        app.apply_event(TurnEvent::ToolProgress(
+            cockpit_core::engine::ToolProgress {
+                call_id: "missing".to_string(),
+                done: 1,
+                total: 2,
+                unit: "files".to_string(),
+            },
+        ));
+        app.apply_event(TurnEvent::ToolProgress(
+            cockpit_core::engine::ToolProgress {
+                call_id: "call-1".to_string(),
+                done: 3,
+                total: 10,
+                unit: "files".to_string(),
+            },
+        ));
+        app.apply_event(TurnEvent::ToolProgress(
+            cockpit_core::engine::ToolProgress {
+                call_id: "call-1".to_string(),
+                done: 2,
+                total: 8,
+                unit: "files".to_string(),
+            },
+        ));
+
+        let HistoryEntry::ToolBox { calls, .. } = app.history.last().unwrap() else {
+            panic!("expected toolbox");
+        };
+        assert_eq!(
+            calls[0].progress.as_ref().map(|progress| progress.done),
+            Some(3)
+        );
+        assert_eq!(
+            calls[0].progress.as_ref().map(|progress| progress.total),
+            Some(10)
+        );
+        assert!(calls[1].progress.is_none());
+
+        app.apply_event(TurnEvent::ToolEnd {
+            agent: "Build".to_string(),
+            call_id: "call-1".to_string(),
+            tool: "context_pack".to_string(),
+            output: "done".to_string(),
+            truncated: false,
+            seq: None,
+            hint: None,
+        });
+        app.apply_event(TurnEvent::ToolProgress(
+            cockpit_core::engine::ToolProgress {
+                call_id: "call-1".to_string(),
+                done: 8,
+                total: 10,
+                unit: "files".to_string(),
+            },
+        ));
+
+        let HistoryEntry::ToolBox { calls, .. } = app.history.last().unwrap() else {
+            panic!("expected toolbox");
+        };
+        assert_eq!(calls[0].state, ToolCallState::Success);
+        assert!(calls[0].progress.is_none());
     }
 
     #[test]

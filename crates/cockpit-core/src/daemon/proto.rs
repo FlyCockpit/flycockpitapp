@@ -169,6 +169,13 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             tool,
             args,
         }],
+        TurnEvent::ToolProgress(progress) => vec![Event::ToolProgress {
+            session_id,
+            call_id: progress.call_id,
+            done: progress.done,
+            total: progress.total,
+            unit: progress.unit,
+        }],
         TurnEvent::ToolEnd {
             agent,
             call_id,
@@ -653,8 +660,41 @@ fn queue_target_to_proto(target: crate::engine::message::QueueTarget) -> QueueTa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::agent::TurnEvent;
+    use crate::engine::agent::{ToolProgress, TurnEvent};
     use uuid::Uuid;
+
+    #[test]
+    fn tool_progress_proto_round_trip() {
+        let session_id = Uuid::new_v4();
+        let out = turn_event_to_proto(
+            TurnEvent::ToolProgress(ToolProgress {
+                call_id: "call-1".to_string(),
+                done: 3400,
+                total: 12000,
+                unit: "files".to_string(),
+            }),
+            session_id,
+        );
+
+        match out.as_slice() {
+            [
+                Event::ToolProgress {
+                    session_id: actual_session_id,
+                    call_id,
+                    done,
+                    total,
+                    unit,
+                },
+            ] => {
+                assert_eq!(*actual_session_id, session_id);
+                assert_eq!(call_id, "call-1");
+                assert_eq!(*done, 3400);
+                assert_eq!(*total, 12000);
+                assert_eq!(unit, "files");
+            }
+            other => panic!("expected one ToolProgress event, got {other:?}"),
+        }
+    }
 
     #[test]
     fn subagent_routing_amend_roundtrips_through_proto() {

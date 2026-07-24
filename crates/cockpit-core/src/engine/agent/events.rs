@@ -20,6 +20,14 @@ pub enum ControlRequestOutcome {
     Applied,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ToolProgress {
+    pub call_id: String,
+    pub done: u64,
+    pub total: u64,
+    pub unit: String,
+}
+
 /// Events the agent emits during a turn. The driver forwards these to
 /// the TUI for display; the persistence layer can subscribe to the
 /// same channel.
@@ -192,6 +200,9 @@ pub enum TurnEvent {
         tool: String,
         args: Value,
     },
+    /// UI-only progress tick for a running tool row. Generic by design:
+    /// producers send numeric progress and the client owns formatting.
+    ToolProgress(ToolProgress),
     /// Tool finished. `output` is what the model will see next turn.
     ToolEnd {
         agent: String,

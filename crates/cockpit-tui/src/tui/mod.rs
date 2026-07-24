@@ -46,6 +46,7 @@ pub mod pane_shared;
 pub mod paste;
 pub mod permissions_pane;
 pub mod pins_overlay;
+pub(crate) mod progress;
 pub mod pty;
 pub mod quick_dialog;
 pub(crate) mod read_highlight;

@@ -461,7 +461,7 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// such as removals, renames, and type changes bump
 /// [`MIN_SUPPORTED_PROTOCOL_VERSION`] and are the only class that narrows the
 /// compatibility window.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Oldest wire schema version this binary accepts.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
@@ -1717,7 +1717,7 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const RELEASED_PROTOCOL_VERSIONS: &[u32] = &[1, 2];
+    const RELEASED_PROTOCOL_VERSIONS: &[u32] = &[1, 2, 3];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]

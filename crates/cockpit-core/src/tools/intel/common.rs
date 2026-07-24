@@ -12,6 +12,7 @@ use std::sync::{Mutex, OnceLock};
 pub(super) use crate::engine::tool::{
     Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args,
 };
+pub(super) use crate::engine::{ToolProgress, TurnEvent};
 pub(super) use crate::intel::budget::{BudgetedWriter, retained_truncated_body};
 pub(super) use crate::intel::lang::{Language, regex_outline};
 pub(super) use crate::intel::thin::{ThinLimits, thin_line_output};
@@ -107,9 +108,20 @@ pub(super) fn append_freshen_note(out: &mut ToolOutput, report: &FreshenReport) 
 }
 
 pub(super) fn freshen_options(ctx: &ToolCtx, scope: Option<String>) -> FreshenOptions {
-    FreshenOptions::default()
+    let mut options = FreshenOptions::default()
         .with_scope(scope)
-        .with_cancel(ctx.cancel.clone())
+        .with_cancel(ctx.cancel.clone());
+    if let (Some(events), Some(call_id)) = (ctx.events.clone(), ctx.current_tool_call_id.clone()) {
+        options = options.with_observer(move |progress| {
+            let _ = events.try_send(TurnEvent::ToolProgress(ToolProgress {
+                call_id: call_id.clone(),
+                done: progress.done as u64,
+                total: progress.total as u64,
+                unit: "files".to_string(),
+            }));
+        });
+    }
+    options
 }
 
 pub(super) fn parent_scope_for_file(rel: &str, ctx: &ToolCtx) -> String {

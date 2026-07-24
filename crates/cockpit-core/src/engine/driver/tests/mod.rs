@@ -15,6 +15,7 @@ mod recursion;
 mod reports;
 mod schedule;
 mod skills_preflight;
+mod turn_loop;
 
 fn test_provider_base_url() -> String {
     static PROVIDER: std::sync::OnceLock<&'static ScriptedProvider> = std::sync::OnceLock::new();

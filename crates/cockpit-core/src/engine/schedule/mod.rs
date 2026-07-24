@@ -38,7 +38,7 @@
 //!   restart drops live jobs (they are not persisted).
 
 pub mod authority;
-mod background;
+pub(crate) mod background;
 mod loop_runner;
 pub mod schemas;
 pub mod spec;

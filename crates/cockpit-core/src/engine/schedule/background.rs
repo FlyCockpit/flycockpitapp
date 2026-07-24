@@ -10,8 +10,9 @@
 //! [`crate::intel::budget::BudgetedWriter`] (§10) — a `cargo build` can
 //! dump megabytes; the model only ever sees the §22 token cap.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
@@ -26,6 +27,7 @@ use crate::engine::schedule::authority::ScheduleEvent;
 use crate::engine::schedule::spec::ScheduleKind;
 use crate::intel::budget::BudgetedWriter;
 use crate::redact::RedactionTable;
+use crate::tools::shell_sandbox::{SandboxAvailability, SandboxGate};
 
 use super::{
     ASYNC_RESULT_TOKEN_CAP, BACKGROUND_LINE_BYTE_CAP, BACKGROUND_RING_BYTE_CAP, TAIL_TOKEN_CAP,
@@ -38,6 +40,56 @@ pub struct BackgroundHandle {
     ring: Arc<Mutex<BoundedOutputRing>>,
     /// Set when the job is asked to die; the spawned task observes it.
     kill_tx: tokio::sync::watch::Sender<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackgroundLaunch {
+    pub confine: bool,
+    pub tmp_dir: Option<PathBuf>,
+    pub session_env: HashMap<String, String>,
+    #[cfg(test)]
+    test_sandbox_build: Option<TestSandboxBuild>,
+}
+
+impl BackgroundLaunch {
+    pub fn unconfined(session_env: HashMap<String, String>) -> Self {
+        Self {
+            confine: false,
+            tmp_dir: None,
+            session_env,
+            #[cfg(test)]
+            test_sandbox_build: None,
+        }
+    }
+
+    pub fn confined(tmp_dir: Option<PathBuf>, session_env: HashMap<String, String>) -> Self {
+        Self {
+            confine: true,
+            tmp_dir,
+            session_env,
+            #[cfg(test)]
+            test_sandbox_build: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_sandbox_build(mut self, test_sandbox_build: TestSandboxBuild) -> Self {
+        self.test_sandbox_build = Some(test_sandbox_build);
+        self
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+enum TestSandboxBuild {
+    ShellSuccess {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    },
+    Error(String),
+}
+
+pub fn background_launch_gate(sandbox_on: bool, availability: &SandboxAvailability) -> SandboxGate {
+    crate::tools::shell_sandbox::gate_decision(sandbox_on, availability)
 }
 
 impl BackgroundHandle {
@@ -181,13 +233,16 @@ fn truncate_line(mut line: String, cap: usize) -> (String, bool) {
 /// the task's [`tokio::task::JoinHandle`] (the authority takes its
 /// `abort_handle` for cancellation).
 pub fn spawn(
-    job_id: String,
-    label: String,
-    command: String,
-    cwd: std::path::PathBuf,
-    redact: Arc<RedactionTable>,
-    turn_tx: mpsc::Sender<TurnEvent>,
-    event_tx: mpsc::Sender<ScheduleEvent>,
+    BackgroundSpawn {
+        job_id,
+        label,
+        command,
+        cwd,
+        launch,
+        redact,
+        turn_tx,
+        event_tx,
+    }: BackgroundSpawn,
 ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
     let ring: Arc<Mutex<BoundedOutputRing>> =
         Arc::new(Mutex::new(BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP)));
@@ -205,6 +260,7 @@ pub fn spawn(
             label.clone(),
             command,
             cwd,
+            launch,
             ring,
             redact,
             turn_tx,
@@ -216,6 +272,17 @@ pub fn spawn(
         label,
     );
     (handle, task)
+}
+
+pub struct BackgroundSpawn {
+    pub job_id: String,
+    pub label: String,
+    pub command: String,
+    pub cwd: std::path::PathBuf,
+    pub launch: BackgroundLaunch,
+    pub redact: Arc<RedactionTable>,
+    pub turn_tx: mpsc::Sender<TurnEvent>,
+    pub event_tx: mpsc::Sender<ScheduleEvent>,
 }
 
 fn spawn_guarded_background<F>(
@@ -260,23 +327,29 @@ async fn run_background(
     label: String,
     command: String,
     cwd: std::path::PathBuf,
+    launch: BackgroundLaunch,
     ring: Arc<Mutex<BoundedOutputRing>>,
     _redact: Arc<RedactionTable>,
     turn_tx: mpsc::Sender<TurnEvent>,
     event_tx: mpsc::Sender<ScheduleEvent>,
     mut kill_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(&command)
-        .current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // If the authority aborts this task, kill the child too — a leaked
-        // subprocess would outlive its job (anti-runaway).
-        .kill_on_drop(true);
-    scrub_env(&mut cmd);
+    let mut cmd = match build_background_command(&command, &cwd, &launch).await {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            let _ = event_tx
+                .send(ScheduleEvent::Completed {
+                    job_id,
+                    label,
+                    kind: ScheduleKind::Background,
+                    result: format!("failed to spawn: {e}"),
+                    failed: true,
+                    requests: Vec::new(),
+                })
+                .await;
+            return;
+        }
+    };
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -400,6 +473,88 @@ async fn run_background(
         .await;
 }
 
+async fn build_background_command(
+    command: &str,
+    cwd: &std::path::Path,
+    launch: &BackgroundLaunch,
+) -> anyhow::Result<Command> {
+    let mut cmd = if launch.confine {
+        build_confined_background_command(command, cwd, launch).await?
+    } else {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command).current_dir(cwd);
+        scrub_env(&mut cmd);
+        cmd
+    };
+    configure_background_command(&mut cmd);
+    Ok(cmd)
+}
+
+async fn build_confined_background_command(
+    command: &str,
+    cwd: &std::path::Path,
+    launch: &BackgroundLaunch,
+) -> anyhow::Result<Command> {
+    #[cfg(test)]
+    if let Some(test) = &launch.test_sandbox_build {
+        match test {
+            TestSandboxBuild::ShellSuccess { calls } => {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut cmd = Command::new("sh");
+                cmd.arg("-c").arg(command).current_dir(cwd);
+                return Ok(cmd);
+            }
+            TestSandboxBuild::Error(message) => anyhow::bail!("{message}"),
+        }
+    }
+
+    crate::tools::shell_sandbox::build_sandboxed_command(
+        command,
+        cwd,
+        launch.tmp_dir.as_deref(),
+        &scrub_overrides(&launch.session_env),
+        &launch.session_env,
+        &[],
+    )
+    .await
+}
+
+fn configure_background_command(cmd: &mut Command) {
+    BACKGROUND_COMMAND_CONFIG.apply(cmd);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackgroundCommandConfig {
+    null_stdin: bool,
+    pipe_stdout: bool,
+    pipe_stderr: bool,
+    kill_on_drop: bool,
+}
+
+const BACKGROUND_COMMAND_CONFIG: BackgroundCommandConfig = BackgroundCommandConfig {
+    null_stdin: true,
+    pipe_stdout: true,
+    pipe_stderr: true,
+    kill_on_drop: true,
+};
+
+impl BackgroundCommandConfig {
+    fn apply(self, cmd: &mut Command) {
+        if self.null_stdin {
+            cmd.stdin(Stdio::null());
+        }
+        if self.pipe_stdout {
+            cmd.stdout(Stdio::piped());
+        }
+        if self.pipe_stderr {
+            cmd.stderr(Stdio::piped());
+        }
+        // If the authority aborts this task, kill the child too — a leaked
+        // subprocess would outlive its job (anti-runaway).
+        cmd.kill_on_drop(self.kill_on_drop);
+    }
+}
+
 /// Same env-injection scrub as the `bash` tool: strip injection-vector
 /// vars + `*_KEY`/`*_SECRET`/`*_TOKEN`.
 fn scrub_env(cmd: &mut Command) {
@@ -424,9 +579,51 @@ fn scrub_env(cmd: &mut Command) {
     }
 }
 
+fn scrub_overrides(session_env: &HashMap<String, String>) -> Vec<(String, String)> {
+    session_env
+        .keys()
+        .cloned()
+        .chain([
+            "BASH_ENV".to_string(),
+            "ENV".to_string(),
+            "PROMPT_COMMAND".to_string(),
+            "NODE_OPTIONS".to_string(),
+            "SHELLOPTS".to_string(),
+            "BASHOPTS".to_string(),
+            "GREP_OPTIONS".to_string(),
+            "GREP_COLORS".to_string(),
+            "AWS_ACCESS_KEY_ID".to_string(),
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+        ])
+        .filter(|k| crate::redact::env_scrub_patterns(k))
+        .map(|k| (k, String::new()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spawn_test_job(
+        label: &str,
+        command: &str,
+        cwd: std::path::PathBuf,
+        launch: BackgroundLaunch,
+        redact: Arc<RedactionTable>,
+        turn_tx: mpsc::Sender<TurnEvent>,
+        event_tx: mpsc::Sender<ScheduleEvent>,
+    ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
+        spawn(BackgroundSpawn {
+            job_id: "job-1".to_string(),
+            label: label.to_string(),
+            command: command.to_string(),
+            cwd,
+            launch,
+            redact,
+            turn_tx,
+            event_tx,
+        })
+    }
 
     #[test]
     fn window_that_fits_keeps_freshest() {
@@ -477,6 +674,126 @@ mod tests {
         assert!(snapshot.iter().any(|line| line == "third"));
     }
 
+    #[test]
+    fn background_gate_unconfined_when_sandbox_off() {
+        let availability = SandboxAvailability::Available;
+
+        assert_eq!(
+            background_launch_gate(false, &availability),
+            SandboxGate::Unconfined
+        );
+    }
+
+    #[test]
+    fn background_gate_confines_when_sandbox_available() {
+        let availability = SandboxAvailability::Available;
+
+        assert_eq!(
+            background_launch_gate(true, &availability),
+            SandboxGate::Confine
+        );
+    }
+
+    #[test]
+    fn background_gate_refuses_when_sandbox_unavailable() {
+        let availability = SandboxAvailability::Unavailable {
+            reason: "bwrap absent".to_string(),
+            fix_command: None,
+        };
+
+        assert_eq!(
+            background_launch_gate(true, &availability),
+            SandboxGate::Refuse {
+                reason: "bwrap absent".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn background_command_config_keeps_stdio_and_kill_on_drop_for_all_launch_paths() {
+        assert_eq!(
+            BACKGROUND_COMMAND_CONFIG,
+            BackgroundCommandConfig {
+                null_stdin: true,
+                pipe_stdout: true,
+                pipe_stderr: true,
+                kill_on_drop: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn background_gate_confined_launch_uses_sandboxed_command() {
+        let cfg = crate::config::extended::RedactConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let launch = BackgroundLaunch::confined(Some(tmp.path().join("tmp")), HashMap::new())
+            .with_test_sandbox_build(TestSandboxBuild::ShellSuccess {
+                calls: calls.clone(),
+            });
+        let (turn_tx, _turn_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (_handle, task) = spawn_test_job(
+            "confined",
+            "printf 'sandboxed\\n'",
+            tmp.path().to_path_buf(),
+            launch,
+            redact,
+            turn_tx,
+            event_tx,
+        );
+
+        let completed = event_rx
+            .recv()
+            .await
+            .expect("confined test job should complete");
+        task.await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        match completed {
+            ScheduleEvent::Completed { result, failed, .. } => {
+                assert!(!failed, "got {result}");
+                assert!(result.contains("sandboxed"), "got {result}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn background_gate_sandbox_build_error_fails_the_job() {
+        let cfg = crate::config::extended::RedactConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
+        let launch = BackgroundLaunch::confined(Some(tmp.path().join("tmp")), HashMap::new())
+            .with_test_sandbox_build(TestSandboxBuild::Error("sandbox build failed".to_string()));
+        let (turn_tx, _turn_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (_handle, task) = spawn_test_job(
+            "confined",
+            "printf should-not-run",
+            tmp.path().to_path_buf(),
+            launch,
+            redact,
+            turn_tx,
+            event_tx,
+        );
+
+        let completed = event_rx
+            .recv()
+            .await
+            .expect("sandbox build error should complete the job");
+        task.await.unwrap();
+
+        match completed {
+            ScheduleEvent::Completed { result, failed, .. } => {
+                assert!(failed);
+                assert!(result.contains("sandbox build failed"), "got {result}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn guarded_background_panic_sends_terminal_failure() {
         let (event_tx, mut event_rx) = mpsc::channel(1);
@@ -509,11 +826,11 @@ mod tests {
         let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
         let (turn_tx, _turn_rx) = mpsc::channel(1);
         let (event_tx, mut event_rx) = mpsc::channel(1);
-        let (handle, task) = spawn(
-            "job-1".into(),
-            "fast".into(),
-            "printf 'done\n'".into(),
+        let (handle, task) = spawn_test_job(
+            "fast",
+            "printf 'done\n'",
             tmp.path().to_path_buf(),
+            BackgroundLaunch::unconfined(HashMap::new()),
             redact,
             turn_tx,
             event_tx,
@@ -543,12 +860,12 @@ mod tests {
         let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
         let (turn_tx, _turn_rx) = mpsc::channel(64);
         let (event_tx, mut event_rx) = mpsc::channel(64);
-        let (handle, _task) = spawn(
-            "job-1".into(),
-            "slow".into(),
+        let (handle, _task) = spawn_test_job(
+            "slow",
             // Emit two lines, then sleep long enough that we can tail + kill.
-            "printf 'progress one\\nprogress two\\n'; sleep 30".into(),
+            "printf 'progress one\\nprogress two\\n'; sleep 30",
             tmp.path().to_path_buf(),
+            BackgroundLaunch::unconfined(HashMap::new()),
             redact.clone(),
             turn_tx,
             event_tx,
@@ -582,5 +899,6 @@ mod tests {
         }
     }
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 }

@@ -304,6 +304,265 @@ async fn dispatch_background_tail_unknown_id() {
     assert!(out.contains("no live background"), "got {out}");
 }
 
+#[tokio::test]
+async fn background_gate_rejects_cwd_outside_workspace() {
+    let (mut driver, _tmp) = test_driver(8);
+    let mut rx = capture_schedule_events(&mut driver);
+    let outside = tempfile::tempdir().unwrap();
+    let raw_cwd = outside.path().to_str().unwrap();
+    let expected = driver.resolve_child_cwd(Some(raw_cwd)).unwrap_err();
+
+    let out = driver
+        .dispatch_schedule_action(&serde_json::json!({
+            "action": "background.start",
+            "args": { "command": "printf should-not-run", "cwd": raw_cwd }
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(out, expected);
+    assert!(driver.schedule.snapshot().is_empty());
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn background_gate_requires_command_approval() {
+    let (mut driver, _tmp) = test_driver(8);
+    driver.session.set_sandbox_enabled(false);
+    let (_approver, hub) = install_background_approver(&mut driver);
+    let resolver = tokio::spawn(resolve_next_interrupt(
+        driver.session.db.clone(),
+        driver.session.id,
+        hub,
+        crate::approval::ID_APPROVE_ONCE,
+    ));
+
+    let out = driver
+        .dispatch_schedule_action(&serde_json::json!({
+            "action": "background.start",
+            "args": { "command": "printf approved" }
+        }))
+        .await
+        .unwrap();
+    resolver.await.unwrap();
+
+    assert!(out.starts_with("started background"), "got {out}");
+    assert!(driver.schedule.has_background());
+}
+
+#[tokio::test]
+async fn background_gate_resolved_cwd_reaches_spawn() {
+    let (mut driver, tmp) = test_driver(8);
+    driver.session.set_sandbox_enabled(false);
+    let mut rx = capture_schedule_events(&mut driver);
+    let child = tmp.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let marker = child.join("marker.txt");
+    let (_approver, hub) = install_background_approver(&mut driver);
+    let command = "printf resolved > marker.txt; printf progress\\n";
+    let resolver = tokio::spawn(resolve_next_interrupt(
+        driver.session.db.clone(),
+        driver.session.id,
+        hub,
+        crate::approval::ID_APPROVE_ONCE,
+    ));
+
+    let out = driver
+        .dispatch_schedule_action(&serde_json::json!({
+            "action": "background.start",
+            "args": { "command": command, "cwd": "child" }
+        }))
+        .await
+        .unwrap();
+    resolver.await.unwrap();
+
+    assert!(out.starts_with("started background"), "got {out}");
+    loop {
+        match rx.recv().await.expect("background should emit progress") {
+            TurnEvent::ScheduleProgress { .. } => break,
+            TurnEvent::ScheduleStarted { .. } => {}
+            other => panic!("unexpected schedule event: {other:?}"),
+        }
+    }
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "resolved");
+}
+
+#[tokio::test]
+async fn background_gate_denied_approval_starts_no_job() {
+    let (mut driver, _tmp) = test_driver(8);
+    driver.session.set_sandbox_enabled(false);
+    let mut rx = capture_schedule_events(&mut driver);
+    let (_approver, hub) = install_background_approver(&mut driver);
+    let resolver = tokio::spawn(resolve_next_interrupt(
+        driver.session.db.clone(),
+        driver.session.id,
+        hub,
+        crate::approval::ID_REJECT,
+    ));
+
+    let out = driver
+        .dispatch_schedule_action(&serde_json::json!({
+            "action": "background.start",
+            "args": { "command": "printf denied" }
+        }))
+        .await
+        .unwrap();
+    resolver.await.unwrap();
+
+    assert!(out.contains("approval denied"), "got {out}");
+    assert!(driver.schedule.snapshot().is_empty());
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn background_gate_no_approver_is_denied() {
+    let (mut driver, _tmp) = test_driver(8);
+    driver.session.set_sandbox_enabled(false);
+    let mut rx = capture_schedule_events(&mut driver);
+
+    let out = driver
+        .dispatch_schedule_action(&serde_json::json!({
+            "action": "background.start",
+            "args": { "command": "printf denied" }
+        }))
+        .await
+        .unwrap();
+
+    assert!(out.contains("requires approval"), "got {out}");
+    assert!(driver.schedule.snapshot().is_empty());
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn background_gate_noninteractive_denial_uses_shared_message() {
+    let (mut driver, _tmp) = test_driver(8);
+    driver.session.set_sandbox_enabled(false);
+    let mut rx = capture_schedule_events(&mut driver);
+    let (_approver, hub) = install_background_approver(&mut driver);
+    let resolver = tokio::spawn(resolve_next_interrupt_with_response(
+        driver.session.db.clone(),
+        driver.session.id,
+        hub,
+        crate::daemon::proto::ResolveResponse::Freetext {
+            text: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+        },
+    ));
+
+    let out = driver
+        .dispatch_schedule_action(&serde_json::json!({
+            "action": "background.start",
+            "args": { "command": "printf denied" }
+        }))
+        .await
+        .unwrap();
+    resolver.await.unwrap();
+
+    assert_eq!(out, crate::approval::NONINTERACTIVE_RUN_DENIAL);
+    assert!(driver.schedule.snapshot().is_empty());
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn background_gate_refuse_starts_no_job() {
+    let (mut driver, _tmp) = test_driver(8);
+    driver.session.set_sandbox_enabled(true);
+    let mut rx = capture_schedule_events(&mut driver);
+    let (approver, _hub) = install_background_approver(&mut driver);
+    grant_background_command(&approver, "printf refused");
+
+    let out = super::super::schedule_dispatch::with_background_sandbox_availability_for_test(
+        crate::tools::shell_sandbox::SandboxAvailability::Unavailable {
+            reason: "bwrap absent".to_string(),
+            fix_command: None,
+        },
+        driver.dispatch_schedule_action(&serde_json::json!({
+            "action": "background.start",
+            "args": { "command": "printf refused" }
+        })),
+    )
+    .await
+    .unwrap();
+
+    assert!(out.contains("bwrap absent"), "got {out}");
+    assert!(out.contains("/sandbox off"), "got {out}");
+    assert!(driver.schedule.snapshot().is_empty());
+    assert!(rx.try_recv().is_err());
+}
+
+fn capture_schedule_events(driver: &mut Driver) -> mpsc::Receiver<TurnEvent> {
+    let (tx, rx) = mpsc::channel(8);
+    driver.schedule.set_turn_tx(tx);
+    rx
+}
+
+fn install_background_approver(
+    driver: &mut Driver,
+) -> (
+    std::sync::Arc<crate::approval::Approver>,
+    std::sync::Arc<crate::engine::interrupt::InterruptHub>,
+) {
+    let hub = std::sync::Arc::new(crate::engine::interrupt::InterruptHub::detached());
+    let store = crate::approval::store::GrantStore::new(
+        driver.session.db.clone(),
+        driver.session.id,
+        driver.cwd.clone(),
+        driver.config.clone(),
+    );
+    let approver = std::sync::Arc::new(crate::approval::Approver::new(
+        store,
+        driver.session.db.clone(),
+        driver.session.id,
+        "builder",
+        hub.clone(),
+    ));
+    driver.set_approver(approver.clone());
+    (approver, hub)
+}
+
+fn grant_background_command(approver: &crate::approval::Approver, command: &str) {
+    let classification = crate::approval::classify::classify(command);
+    for info in classification.simple_commands() {
+        approver
+            .store()
+            .record_command(info, info.risk.tier, crate::approval::store::Scope::Session)
+            .unwrap();
+    }
+}
+
+async fn resolve_next_interrupt(
+    db: crate::db::Db,
+    sid: uuid::Uuid,
+    hub: std::sync::Arc<crate::engine::interrupt::InterruptHub>,
+    selected_id: &'static str,
+) -> uuid::Uuid {
+    resolve_next_interrupt_with_response(
+        db,
+        sid,
+        hub,
+        crate::daemon::proto::ResolveResponse::Single {
+            selected_id: selected_id.into(),
+        },
+    )
+    .await
+}
+
+async fn resolve_next_interrupt_with_response(
+    db: crate::db::Db,
+    sid: uuid::Uuid,
+    hub: std::sync::Arc<crate::engine::interrupt::InterruptHub>,
+    response: crate::daemon::proto::ResolveResponse,
+) -> uuid::Uuid {
+    let iid = loop {
+        let open = db.list_open_interrupts(sid).unwrap();
+        if let Some(row) = open.first() {
+            break row.interrupt_id;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert!(hub.resolve(iid, response));
+    iid
+}
+
 /// `finish_delegation_shrink`: a COLD-at-return parent (no-cache
 /// provider → always cold) with a computed prune-shrink resumes on the
 /// SHRUNK context — the driver swaps the foreground frame's history.

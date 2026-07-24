@@ -32,6 +32,7 @@
 //!   to main.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
@@ -512,26 +513,26 @@ impl ScheduleAuthority {
     }
 
     /// Start a background shell job. Returns the job id.
-    pub fn start_background(&mut self, args: BackgroundStartArgs) -> String {
+    pub fn start_background(
+        &mut self,
+        args: BackgroundStartArgs,
+        cwd: PathBuf,
+        launch: background::BackgroundLaunch,
+    ) -> String {
         let job_id = new_job_id();
         let label = background_label(&args);
         self.emit_started(&job_id, &label, ScheduleKind::Background);
 
-        let cwd = args
-            .cwd
-            .as_deref()
-            .map(|s| crate::tools::common::resolve(s, &self.ctx.cwd))
-            .unwrap_or_else(|| self.ctx.cwd.clone());
-
-        let (handle, task) = background::spawn(
-            job_id.clone(),
-            label.clone(),
-            args.command.clone(),
+        let (handle, task) = background::spawn(background::BackgroundSpawn {
+            job_id: job_id.clone(),
+            label: label.clone(),
+            command: args.command.clone(),
             cwd,
-            self.ctx.redact.clone(),
-            self.turn_tx.clone(),
-            self.event_tx.clone(),
-        );
+            launch,
+            redact: self.ctx.redact.clone(),
+            turn_tx: self.turn_tx.clone(),
+            event_tx: self.event_tx.clone(),
+        });
         let abort = task.abort_handle();
         let entry = ScheduleEntry {
             job_id: job_id.clone(),
@@ -1037,12 +1038,16 @@ mod tests {
     /// a real subprocess) so this test does not pause time.
     #[tokio::test]
     async fn background_runs_tails_and_completes() {
-        let (mut auth, mut events, mut ui, _tmp) = test_authority(8);
+        let (mut auth, mut events, mut ui, tmp) = test_authority(8);
         let args = crate::engine::schedule::spec::parse_background_start(&serde_json::json!({
             "command": "printf 'hello\\nworld\\n'"
         }))
         .unwrap();
-        let job_id = auth.start_background(args);
+        let job_id = auth.start_background(
+            args,
+            tmp.path().to_path_buf(),
+            background::BackgroundLaunch::unconfined(std::collections::HashMap::new()),
+        );
         assert!(auth.has_background());
         match ui.try_recv() {
             Ok(TurnEvent::ScheduleStarted {

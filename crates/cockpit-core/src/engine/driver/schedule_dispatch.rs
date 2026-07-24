@@ -225,7 +225,20 @@ impl Driver {
                     );
                 }
                 let parsed = crate::engine::schedule::parse_background_start(action_args)?;
-                let job_id = self.schedule.start_background(parsed);
+                let child = match self.resolve_child_cwd(parsed.cwd.as_deref()) {
+                    Ok(child) => child,
+                    Err(message) => return Ok(message),
+                };
+                if let Some(refusal) = self.approve_background_command(&parsed.command).await? {
+                    return Ok(refusal);
+                }
+                let launch = match self.resolve_background_launch(&child.resolved).await {
+                    Ok(launch) => launch,
+                    Err(refusal) => return Ok(refusal),
+                };
+                let job_id = self
+                    .schedule
+                    .start_background(parsed, child.resolved, launch);
                 Ok(format!(
                     "started background `{job_id}` — tail with schedule(action=\"background.tail\", args={{\"job_id\":\"{job_id}\"}})"
                 ))
@@ -270,6 +283,65 @@ impl Driver {
                     }
                 })
                 .to_string())
+            }
+        }
+    }
+
+    async fn approve_background_command(&self, command: &str) -> Result<Option<String>> {
+        let Some(approver) = self.approver.as_ref() else {
+            return Ok(Some(
+                "Error: background command requires approval, but no approver is available"
+                    .to_string(),
+            ));
+        };
+        match approver.approve_command(command).await? {
+            crate::approval::Decision::Allow { .. } => Ok(None),
+            crate::approval::Decision::NoninteractiveDeny => {
+                Ok(Some(crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string()))
+            }
+            crate::approval::Decision::StandingReject { scope } => Ok(Some(
+                crate::approval::standing_reject_refusal("schedule", scope),
+            )),
+            crate::approval::Decision::Deny => Ok(Some(
+                "Error: background command approval denied; no background job was started"
+                    .to_string(),
+            )),
+        }
+    }
+
+    async fn resolve_background_launch(
+        &self,
+        cwd: &std::path::Path,
+    ) -> std::result::Result<crate::engine::schedule::background::BackgroundLaunch, String> {
+        let session_env = self
+            .stack
+            .last()
+            .expect("driver stack is never empty")
+            .agent
+            .env_overlay
+            .read()
+            .map(|env| env.clone())
+            .unwrap_or_default();
+        let sandbox_on = self.session.sandbox_enabled()
+            && crate::tools::shell_sandbox::shell_sandbox_supported();
+        let availability = if sandbox_on {
+            background_sandbox_availability(cwd).await
+        } else {
+            crate::tools::shell_sandbox::SandboxAvailability::Available
+        };
+        match crate::engine::schedule::background::background_launch_gate(sandbox_on, &availability)
+        {
+            crate::tools::shell_sandbox::SandboxGate::Unconfined => {
+                Ok(crate::engine::schedule::background::BackgroundLaunch::unconfined(session_env))
+            }
+            crate::tools::shell_sandbox::SandboxGate::Confine => Ok(
+                crate::engine::schedule::background::BackgroundLaunch::confined(
+                    self.session.tmp_dir(),
+                    session_env,
+                ),
+            ),
+            crate::tools::shell_sandbox::SandboxGate::Refuse { reason } => {
+                Err(background_sandbox_unavailable_refusal(&reason))
             }
         }
     }
@@ -346,4 +418,54 @@ impl Driver {
             tracing::warn!(error = %e, "persisting schedule tool_call_event failed");
         }
     }
+}
+
+fn background_sandbox_unavailable_refusal(reason: &str) -> String {
+    format!(
+        "Error: the shell sandbox cannot start here ({reason}); `background.start` will fail until the user types `/sandbox off` in the cockpit composer (a UI command, not a shell command) — ask them to do that; do not retry or run `/sandbox off` yourself."
+    )
+}
+
+#[cfg(not(test))]
+async fn background_sandbox_availability(
+    cwd: &std::path::Path,
+) -> crate::tools::shell_sandbox::SandboxAvailability {
+    crate::tools::shell_sandbox::sandbox_available(cwd)
+        .await
+        .clone()
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_BACKGROUND_SANDBOX_AVAILABILITY:
+        std::cell::RefCell<Option<crate::tools::shell_sandbox::SandboxAvailability>>;
+}
+
+#[cfg(test)]
+async fn background_sandbox_availability(
+    cwd: &std::path::Path,
+) -> crate::tools::shell_sandbox::SandboxAvailability {
+    if let Some(availability) = TEST_BACKGROUND_SANDBOX_AVAILABILITY
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+    {
+        return availability;
+    }
+    crate::tools::shell_sandbox::sandbox_available(cwd)
+        .await
+        .clone()
+}
+
+#[cfg(test)]
+pub(in crate::engine::driver) async fn with_background_sandbox_availability_for_test<F>(
+    availability: crate::tools::shell_sandbox::SandboxAvailability,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    TEST_BACKGROUND_SANDBOX_AVAILABILITY
+        .scope(std::cell::RefCell::new(Some(availability)), future)
+        .await
 }

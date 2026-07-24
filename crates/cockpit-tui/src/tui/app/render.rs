@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -58,12 +59,30 @@ type VisibleRows = (Vec<Line<'static>>, Vec<ChatRowMeta>);
 thread_local! {
     static PREWRAP_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PREWRAP_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MATERIALIZED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GEOMETRY_RECOMPUTED_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIND_LINES_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn reset_prewrap_counters() {
     PREWRAP_ROWS.with(|rows| rows.set(0));
     PREWRAP_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_materialized_row_count() {
+    MATERIALIZED_ROWS.with(|rows| rows.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_geometry_recompute_count() {
+    GEOMETRY_RECOMPUTED_ENTRIES.with(|entries| entries.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_find_lines_rebuild_count() {
+    FIND_LINES_REBUILDS.with(|rebuilds| rebuilds.set(0));
 }
 
 #[cfg(test)]
@@ -74,6 +93,117 @@ pub(crate) fn prewrap_row_count() -> usize {
 #[cfg(test)]
 pub(crate) fn prewrap_call_count() -> usize {
     PREWRAP_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn materialized_row_count() -> usize {
+    MATERIALIZED_ROWS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn geometry_recompute_count() -> usize {
+    GEOMETRY_RECOMPUTED_ENTRIES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn find_lines_rebuild_count() -> usize {
+    FIND_LINES_REBUILDS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_materialized_row() {
+    MATERIALIZED_ROWS.with(|rows| rows.set(rows.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_materialized_row() {}
+
+#[cfg(test)]
+fn record_geometry_recomputed_entry() {
+    GEOMETRY_RECOMPUTED_ENTRIES.with(|entries| entries.set(entries.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_geometry_recomputed_entry() {}
+
+#[cfg(test)]
+fn record_find_lines_rebuild() {
+    FIND_LINES_REBUILDS.with(|rebuilds| rebuilds.set(rebuilds.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_find_lines_rebuild() {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ChatGeometry {
+    offsets: Vec<usize>,
+}
+
+impl Default for ChatGeometry {
+    fn default() -> Self {
+        Self { offsets: vec![0] }
+    }
+}
+
+impl ChatGeometry {
+    pub(super) fn entry_start_row(&self, idx: usize) -> usize {
+        self.offsets[idx]
+    }
+
+    pub(super) fn entry_at_row(&self, abs_row: usize) -> Option<(usize, usize)> {
+        if abs_row >= self.total_rows() {
+            return None;
+        }
+        let idx = self
+            .offsets
+            .partition_point(|start| *start <= abs_row)
+            .saturating_sub(1);
+        Some((idx, abs_row - self.offsets[idx]))
+    }
+
+    pub(super) fn entry_height(&self, idx: usize) -> usize {
+        self.offsets[idx + 1] - self.offsets[idx]
+    }
+
+    pub(super) fn total_rows(&self) -> usize {
+        self.offsets.last().copied().unwrap_or(0)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn visible_entry_range(&self, offset: usize, height: usize) -> Range<usize> {
+        if height == 0 || self.entry_count() == 0 {
+            return 0..0;
+        }
+        let total = self.total_rows();
+        if total == 0 {
+            return 0..0;
+        }
+        let visible = height.min(total);
+        let max_offset = total.saturating_sub(visible);
+        let start_row = total
+            .saturating_sub(visible)
+            .saturating_sub(offset.min(max_offset));
+        self.entry_range_for_rows(start_row, start_row + visible)
+    }
+
+    fn entry_count(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    fn entry_range_for_rows(&self, start_row: usize, end_row: usize) -> Range<usize> {
+        if start_row >= end_row || self.entry_count() == 0 {
+            return 0..0;
+        }
+        let start = self
+            .offsets
+            .partition_point(|row| *row <= start_row)
+            .saturating_sub(1);
+        let end = self
+            .offsets
+            .partition_point(|row| *row < end_row)
+            .min(self.entry_count());
+        start..end
+    }
 }
 
 pub(super) fn affordance_target_for_row(meta: &ChatRowMeta) -> Option<AffordanceTarget> {
@@ -623,6 +753,33 @@ fn row_kind_for_entry(entry: &HistoryEntry) -> ChatRowKind {
         HistoryEntry::Diff { .. } => ChatRowKind::Diff,
         _ => ChatRowKind::Other,
     }
+}
+
+fn history_entry_gap_rows(
+    history: &super::history_log::HistoryLog,
+    idx: usize,
+    entry: &HistoryEntry,
+) -> usize {
+    let gap = match entry {
+        HistoryEntry::User { .. }
+        | HistoryEntry::ToolBox { .. }
+        | HistoryEntry::ToolLine { .. }
+        | HistoryEntry::CompactBoundary { .. } => true,
+        // Auto-injected skill rows are visually attached to the user message
+        // they precede, so they do not add an inter-entry separator.
+        HistoryEntry::SkillAutoInjected { .. } => false,
+        HistoryEntry::Agent { .. } => {
+            !idx.checked_sub(1)
+                .map(|i| matches!(history[i], HistoryEntry::Agent { .. }))
+                .unwrap_or(false)
+                && !history
+                    .get(idx + 1)
+                    .is_some_and(|next| matches!(next, HistoryEntry::ToolBox { .. }))
+        }
+        HistoryEntry::Subagent { outcome, .. } => outcome.is_some(),
+        _ => false,
+    };
+    usize::from(gap)
 }
 
 impl App {
@@ -1550,6 +1707,8 @@ impl App {
 
     pub(super) fn sync_history_render_versions(&mut self) {
         let live_ids: std::collections::HashSet<_> = self.history.ids().iter().copied().collect();
+        let previous_geometry_entries = self.chat_geometry.entry_count();
+        let mut dirty_from: Option<usize> = None;
 
         for (idx, entry) in self.history.iter().enumerate() {
             let id = self
@@ -1569,6 +1728,7 @@ impl App {
                 if self.next_history_render_version == 0 {
                     self.next_history_render_version = 1;
                 }
+                dirty_from = Some(dirty_from.map_or(idx, |dirty| dirty.min(idx)));
             } else if !self.history_render_versions.contains_key(&id) {
                 self.history_render_versions
                     .insert(id, self.next_history_render_version);
@@ -1576,6 +1736,7 @@ impl App {
                 if self.next_history_render_version == 0 {
                     self.next_history_render_version = 1;
                 }
+                dirty_from = Some(dirty_from.map_or(idx, |dirty| dirty.min(idx)));
             }
         }
 
@@ -1585,6 +1746,161 @@ impl App {
             .retain(|id, _| live_ids.contains(id));
         self.history_render_cache
             .retain(|id, _| live_ids.contains(id));
+        if previous_geometry_entries != self.history.len() {
+            dirty_from = Some(dirty_from.unwrap_or(0).min(self.history.len()));
+        }
+        if let Some(idx) = dirty_from {
+            self.mark_chat_geometry_dirty_from(idx);
+        }
+    }
+
+    pub(super) fn chat_geometry(&mut self) -> &ChatGeometry {
+        self.recompute_chat_geometry_if_dirty();
+        &self.chat_geometry
+    }
+
+    pub(super) fn mark_chat_geometry_dirty_from(&mut self, idx: usize) {
+        self.chat_geometry_dirty_from = Some(
+            self.chat_geometry_dirty_from
+                .map_or(idx, |dirty| dirty.min(idx)),
+        );
+        self.chat_find_lines_dirty = true;
+    }
+
+    fn recompute_chat_geometry_if_dirty(&mut self) {
+        let Some(dirty_from) = self.chat_geometry_dirty_from.take() else {
+            return;
+        };
+        let history_len = self.history.len();
+        let start = if self.chat_geometry.entry_count() == history_len
+            && dirty_from <= history_len
+            && dirty_from > 0
+        {
+            self.chat_geometry.offsets.truncate(dirty_from + 1);
+            dirty_from
+        } else {
+            self.chat_geometry.offsets.clear();
+            self.chat_geometry.offsets.push(0);
+            0
+        };
+
+        for idx in start..history_len {
+            let entry = &self.history[idx];
+            let id = self
+                .history
+                .id_at(idx)
+                .expect("history entry ids stay in lockstep");
+            let entry_rows = self
+                .history_render_cache
+                .get(&id)
+                .map(|cached| cached.prewrapped.height)
+                .unwrap_or(0);
+            let gap_rows = history_entry_gap_rows(&self.history, idx, entry);
+            let next = self
+                .chat_geometry
+                .offsets
+                .last()
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(entry_rows + gap_rows);
+            self.chat_geometry.offsets.push(next);
+            record_geometry_recomputed_entry();
+        }
+    }
+
+    fn materialize_message_rows(
+        &self,
+        tail_rows: &[Rc<Line<'static>>],
+        tail_meta: &[ChatRowMeta],
+        start: usize,
+        end: usize,
+    ) -> VisibleRows {
+        if start >= end {
+            return (Vec::new(), Vec::new());
+        }
+        let mut rows = Vec::with_capacity(end - start);
+        let mut meta = Vec::with_capacity(end - start);
+        let history_total = self.chat_geometry.total_rows();
+        let history_start = start.min(history_total);
+        let history_end = end.min(history_total);
+
+        if history_start < history_end {
+            for idx in self
+                .chat_geometry
+                .entry_range_for_rows(history_start, history_end)
+            {
+                let entry_start = self.chat_geometry.entry_start_row(idx);
+                let entry_end = entry_start + self.chat_geometry.entry_height(idx);
+                let id = self
+                    .history
+                    .id_at(idx)
+                    .expect("history entry ids stay in lockstep");
+                let cached = self
+                    .history_render_cache
+                    .get(&id)
+                    .unwrap_or_else(|| panic!("missing render cache entry for history row {idx}"));
+                let content_end = entry_start + cached.prewrapped.height;
+                let overlap_start = history_start.max(entry_start);
+                let overlap_end = history_end.min(entry_end);
+
+                for abs_row in overlap_start..overlap_end {
+                    debug_assert!(self.chat_geometry.entry_at_row(abs_row).is_some());
+                    if abs_row < content_end {
+                        let row = abs_row - entry_start;
+                        record_materialized_row();
+                        rows.push(cached.prewrapped.rows[row].as_ref().clone());
+                        meta.push(cached.prewrapped.row_meta[row].clone());
+                    } else {
+                        rows.push(Line::default());
+                        meta.push(ChatRowMeta::gap());
+                    }
+                }
+            }
+        }
+
+        if end > history_total {
+            let tail_start = start.saturating_sub(history_total).min(tail_rows.len());
+            let tail_end = end.saturating_sub(history_total).min(tail_rows.len());
+            for (idx, line) in tail_rows.iter().enumerate().take(tail_end).skip(tail_start) {
+                record_materialized_row();
+                rows.push(line.as_ref().clone());
+                meta.push(
+                    tail_meta
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_else(ChatRowMeta::padding),
+                );
+            }
+        }
+
+        (rows, meta)
+    }
+
+    fn rebuild_chat_find_lines(&mut self, box_lines: &[Line<'static>], tail_find_lines: &[String]) {
+        record_find_lines_rebuild();
+        let mut lines = box_lines
+            .iter()
+            .map(|line| rendered_line_text(line).to_lowercase())
+            .collect::<Vec<_>>();
+
+        for (idx, entry) in self.history.iter().enumerate() {
+            let id = self
+                .history
+                .id_at(idx)
+                .expect("history entry ids stay in lockstep");
+            let cached = self
+                .history_render_cache
+                .get(&id)
+                .unwrap_or_else(|| panic!("missing render cache entry for history row {idx}"));
+            lines.extend(cached.prewrapped.find_text.iter().cloned());
+            for _ in 0..history_entry_gap_rows(&self.history, idx, entry) {
+                lines.push(String::new());
+            }
+        }
+        lines.extend(tail_find_lines.iter().cloned());
+        self.chat_find_lines = lines;
+        self.chat_find_lines_dirty = false;
+        self.chat_find_lines_query = self.transcript_find.as_ref().map(|find| find.query.clone());
     }
 
     fn row_meta_for_rendered_entry(
@@ -1708,13 +2024,7 @@ impl App {
             None
         };
 
-        let mut all: Vec<Rc<Line<'static>>> = Vec::new();
-        let mut all_find_lines: Vec<String> = Vec::new();
-        let mut row_meta: Vec<ChatRowMeta> = Vec::new();
-        // Absolute content line (in `all`) of each pinnable message's first
-        // row, by history index — drives the pick arrow + review jump.
-        let mut msg_abs_line: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
+        let mut recached_from: Option<usize> = None;
         for (idx, entry) in self.history.iter().enumerate() {
             let entry_id = self
                 .history
@@ -1769,6 +2079,7 @@ impl App {
                     Rc::clone(&cached.prewrapped)
                 }
                 _ => {
+                    recached_from = Some(recached_from.map_or(idx, |dirty| dirty.min(idx)));
                     let rendered = Rc::new(render_entry(
                         entry,
                         area.width,
@@ -1805,54 +2116,42 @@ impl App {
             debug_assert_eq!(prewrapped.find_text.len(), prewrapped.rows.len());
             debug_assert_eq!(prewrapped.row_meta.len(), prewrapped.rows.len());
             debug_assert_eq!(prewrapped.gap_rows, 0);
-            if let Some(first_row) = prewrapped.msg_first_row {
-                msg_abs_line.insert(idx, all.len() + first_row);
-            }
-            row_meta.extend(prewrapped.row_meta.iter().cloned());
-            all_find_lines.extend(prewrapped.find_text.iter().cloned());
-            all.extend(prewrapped.rows.iter().map(Rc::clone));
-            // One-line gap after a block so it separates from what
-            // follows. Consecutive agents share a block, and an immediate
-            // ToolBox continues the assistant turn without an inter-entry gap.
-            let gap = match entry {
-                HistoryEntry::User { .. }
-                | HistoryEntry::ToolBox { .. }
-                | HistoryEntry::ToolLine { .. }
-                | HistoryEntry::CompactBoundary { .. } => true,
-                // An auto-injected-skill row hugs the user message it was
-                // injected ahead of — no separating gap (it falls through to
-                // the `_ => false` default, called out here for the reader).
-                HistoryEntry::SkillAutoInjected { .. } => false,
-                HistoryEntry::Agent { .. } => {
-                    !idx.checked_sub(1)
-                        .map(|i| matches!(self.history[i], HistoryEntry::Agent { .. }))
-                        .unwrap_or(false)
-                        && !self
-                            .history
-                            .get(idx + 1)
-                            .is_some_and(|next| matches!(next, HistoryEntry::ToolBox { .. }))
-                }
-                // Settled subagent block gets a trailing gap; the live
-                // running line gets none (so it doesn't jump when it
-                // settles in place).
-                HistoryEntry::Subagent { outcome, .. } => outcome.is_some(),
-                _ => false,
-            };
-            if gap {
-                all.push(Rc::new(Line::default()));
-                all_find_lines.push(String::new());
-                row_meta.push(ChatRowMeta::gap());
+        }
+        if let Some(idx) = recached_from {
+            self.mark_chat_geometry_dirty_from(idx);
+        }
+        let _ = self.chat_geometry();
+
+        // Absolute content line (in the message buffer, excluding the banner)
+        // of each pinnable message's first row, by history index.
+        let mut msg_abs_line: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for idx in 0..self.history.len() {
+            let id = self
+                .history
+                .id_at(idx)
+                .expect("history entry ids stay in lockstep");
+            let cached = self
+                .history_render_cache
+                .get(&id)
+                .unwrap_or_else(|| panic!("missing render cache entry for history row {idx}"));
+            if let Some(first_row) = cached.prewrapped.msg_first_row {
+                msg_abs_line.insert(idx, self.chat_geometry.entry_start_row(idx) + first_row);
             }
         }
+
+        let mut tail_rows: Vec<Rc<Line<'static>>> = Vec::new();
+        let mut tail_find_lines: Vec<String> = Vec::new();
+        let mut tail_meta: Vec<ChatRowMeta> = Vec::new();
         if let Some(pending) = &self.pending {
             let cache = self
                 .pending_render_cache
                 .get_or_insert_with(Default::default);
             let pending_lines = render_pending_incremental(pending, area.width, &mut cache.state);
             append_uncached_prewrapped_rows(
-                &mut all,
-                &mut row_meta,
-                &mut all_find_lines,
+                &mut tail_rows,
+                &mut tail_meta,
+                &mut tail_find_lines,
                 pending_lines,
                 ChatRowMeta::other(),
                 area.width as usize,
@@ -1863,9 +2162,9 @@ impl App {
         if let Some(view) = self.active_subagent_view() {
             if let Some(line) = self.active_subagent_countdown_line() {
                 append_uncached_prewrapped_rows(
-                    &mut all,
-                    &mut row_meta,
-                    &mut all_find_lines,
+                    &mut tail_rows,
+                    &mut tail_meta,
+                    &mut tail_find_lines,
                     vec![Line::from(vec![Span::styled(
                         line,
                         Style::default()
@@ -1877,9 +2176,9 @@ impl App {
                 );
             } else if let Some(notice) = &view.notice {
                 append_uncached_prewrapped_rows(
-                    &mut all,
-                    &mut row_meta,
-                    &mut all_find_lines,
+                    &mut tail_rows,
+                    &mut tail_meta,
+                    &mut tail_find_lines,
                     vec![Line::from(vec![Span::styled(
                         notice.clone(),
                         Style::default()
@@ -1902,7 +2201,7 @@ impl App {
         // retains the original centered/slide-up/scroll-off behavior.
         let box_lines = self.banner_box_lines(area.width, area.height);
         let b = box_lines.len();
-        let m = all.len();
+        let m = self.chat_geometry.total_rows() + tail_rows.len();
 
         // Total scrollable content height, box included — drives the
         // mouse-wheel scrollback clamp.
@@ -1910,15 +2209,19 @@ impl App {
         self.chat_visible_lines = area_h;
         self.chat_banner_lines = b;
 
-        if self.transcript_find.is_some() {
-            self.chat_find_lines = box_lines
-                .iter()
-                .map(|line| rendered_line_text(line).to_lowercase())
-                .chain(all_find_lines.iter().cloned())
-                .collect();
+        if let Some(find) = self.transcript_find.as_ref() {
+            if self.chat_find_lines_dirty
+                || self
+                    .chat_find_lines_query
+                    .as_ref()
+                    .is_none_or(|query| query != &find.query)
+            {
+                self.rebuild_chat_find_lines(&box_lines, &tail_find_lines);
+            }
             self.refresh_transcript_find_matches();
         } else {
             self.chat_find_lines.clear();
+            self.chat_find_lines_query = None;
         }
 
         let (visible, visible_meta): VisibleRows = if b > 0 && b + m <= area_h {
@@ -1938,13 +2241,16 @@ impl App {
             let mut v: Vec<Line<'static>> = (0..area_h).map(|_| Line::default()).collect();
             let mut meta: Vec<ChatRowMeta> = vec![ChatRowMeta::padding(); area_h];
             for (i, line) in box_lines.into_iter().enumerate() {
+                record_materialized_row();
                 v[box_top + i] = line;
                 meta[box_top + i] = ChatRowMeta::banner();
             }
-            for (i, line) in all.into_iter().enumerate() {
-                v[msg_top + i] = line.as_ref().clone();
+            let (message_rows, message_meta) =
+                self.materialize_message_rows(&tail_rows, &tail_meta, 0, m);
+            for (i, line) in message_rows.into_iter().enumerate() {
+                v[msg_top + i] = line;
             }
-            for (i, val) in row_meta.into_iter().enumerate() {
+            for (i, val) in message_meta.into_iter().enumerate() {
                 meta[msg_top + i] = val;
             }
             (v, meta)
@@ -1953,14 +2259,8 @@ impl App {
             // the top of one contiguous, bottom-aligned scroll buffer
             // and scrolls off the top with the oldest messages. Box rows
             // are non-interactive (None / false). With no box this is
-            // exactly the previous behavior over `all`.
-            let mut combined: Vec<Rc<Line<'static>>> = box_lines.into_iter().map(Rc::new).collect();
-            let prefix = combined.len();
-            combined.extend(all);
-            let mut combined_meta = vec![ChatRowMeta::banner(); prefix];
-            combined_meta.extend(row_meta);
-
-            let total = combined.len();
+            // exactly the previous behavior over the message buffer.
+            let total = b + m;
             let max_offset = total.saturating_sub(area_h);
             if let Some(top) = previous_top {
                 self.chat_scroll_offset = chat_offset_for_top(total, area_h, top);
@@ -1972,19 +2272,42 @@ impl App {
                 let pad = area_h - total;
                 let mut v: Vec<Line<'static>> = (0..pad).map(|_| Line::default()).collect();
                 let mut meta: Vec<ChatRowMeta> = vec![ChatRowMeta::padding(); pad];
-                v.extend(combined.into_iter().map(|line| line.as_ref().clone()));
-                meta.extend(combined_meta);
+                for line in box_lines {
+                    record_materialized_row();
+                    v.push(line);
+                    meta.push(ChatRowMeta::banner());
+                }
+                let (message_rows, message_meta) =
+                    self.materialize_message_rows(&tail_rows, &tail_meta, 0, m);
+                v.extend(message_rows);
+                meta.extend(message_meta);
                 (v, meta)
             } else {
                 let drop = total - area_h - self.chat_scroll_offset;
-                let v: Vec<Line<'static>> = combined
+                let end = drop + area_h;
+                let mut v = Vec::with_capacity(area_h);
+                let mut meta = Vec::with_capacity(area_h);
+                let banner_start = drop.min(b);
+                let banner_end = end.min(b);
+                for line in box_lines
                     .into_iter()
-                    .skip(drop)
-                    .take(area_h)
-                    .map(|line| line.as_ref().clone())
-                    .collect();
-                let meta: Vec<ChatRowMeta> =
-                    combined_meta.into_iter().skip(drop).take(area_h).collect();
+                    .skip(banner_start)
+                    .take(banner_end.saturating_sub(banner_start))
+                {
+                    record_materialized_row();
+                    v.push(line);
+                    meta.push(ChatRowMeta::banner());
+                }
+                let message_start = drop.saturating_sub(b);
+                let message_end = end.saturating_sub(b).min(m);
+                let (message_rows, message_meta) = self.materialize_message_rows(
+                    &tail_rows,
+                    &tail_meta,
+                    message_start,
+                    message_end,
+                );
+                v.extend(message_rows);
+                meta.extend(message_meta);
                 (v, meta)
             }
         };
@@ -4580,9 +4903,11 @@ mod slash_popup_full_list_tests {
 mod render_history_spacing_tests {
     use super::{
         App, ChatCopyTarget, ChatRowKind, ChatRowMeta, ControlChip, PinHit, Selection,
-        TranscriptFind, affordance_target_for_row, extract_selection_plaintext,
+        TranscriptFind, affordance_target_for_row, chat_visible_top, extract_selection_plaintext,
+        find_lines_rebuild_count, geometry_recompute_count, materialized_row_count,
         pin_hit_for_visual_row, prewrap_call_count, prewrap_entry_rows, prewrap_row_count,
-        rendered_line_text, reset_prewrap_counters, wrap_line_to_visual_rows,
+        rendered_line_text, reset_find_lines_rebuild_count, reset_geometry_recompute_count,
+        reset_materialized_row_count, reset_prewrap_counters, wrap_line_to_visual_rows,
     };
     use crate::tui::app::{AffordanceTarget, HistoryLog, SandboxDownNotice, SideConversation};
     use crate::tui::composer::VimMode;
@@ -5402,6 +5727,53 @@ mod render_history_spacing_tests {
         app
     }
 
+    fn long_history_app(root: &std::path::Path, entries: usize) -> App {
+        let mut app = App::new(Some(root), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = (0..entries)
+            .map(|idx| {
+                agent(&format!(
+                    "stable cached text {idx} target words repeated for wrapping"
+                ))
+            })
+            .collect::<Vec<_>>()
+            .into();
+        app
+    }
+
+    fn visible_reference_range(
+        reference: &FullWrapReference,
+        offset: usize,
+    ) -> std::ops::Range<usize> {
+        assert_eq!(
+            reference.chat_banner_lines, 0,
+            "helper expects banner-disabled fixtures"
+        );
+        let top = chat_visible_top(
+            reference.chat_total_lines,
+            reference.chat_visible_lines.max(1),
+            offset,
+        );
+        top..(top + reference.chat_visible_lines).min(reference.rows.len())
+    }
+
+    fn visible_reference_text_rows(reference: &FullWrapReference, offset: usize) -> Vec<String> {
+        let range = visible_reference_range(reference, offset);
+        reference.rows[range]
+            .iter()
+            .map(rendered_line_text)
+            .map(|row| row.trim_end().to_string())
+            .collect()
+    }
+
+    fn visible_grid_text_rows(app: &App) -> Vec<String> {
+        app.chat_text_grid
+            .iter()
+            .map(|row| row.concat().trim_end().to_string())
+            .collect()
+    }
+
     #[test]
     fn render_history_streaming_tail_does_not_rewrap_history() {
         const MAX_REWRAP_CALLS: usize = 2;
@@ -5462,6 +5834,83 @@ mod render_history_spacing_tests {
         assert_eq!(calls_1000, calls_100);
         assert_eq!(rows_1000, rows_100);
         assert!(rows_1000 <= rows_100 + 4);
+    }
+
+    #[test]
+    fn render_history_wraps_only_visible_rows_for_long_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = long_history_app(tmp.path(), 1000);
+
+        render_history_no_selection(&mut app, 80, 12);
+        reset_prewrap_counters();
+        reset_materialized_row_count();
+        render_history_no_selection(&mut app, 80, 12);
+
+        assert_eq!(prewrap_call_count(), 0);
+        assert_eq!(prewrap_row_count(), 0);
+        assert!(materialized_row_count() > 0);
+        assert!(materialized_row_count() <= 12);
+        assert!(materialized_row_count() < app.chat_total_lines);
+    }
+
+    fn second_render_materialized_rows(entries: usize) -> usize {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = long_history_app(tmp.path(), entries);
+
+        render_history_no_selection(&mut app, 80, 16);
+        reset_materialized_row_count();
+        render_history_no_selection(&mut app, 80, 16);
+        materialized_row_count()
+    }
+
+    #[test]
+    fn render_history_materialization_is_flat_in_history_length() {
+        let rows_100 = second_render_materialized_rows(100);
+        let rows_1000 = second_render_materialized_rows(1000);
+
+        assert!(rows_100 > 0);
+        assert!(rows_100 <= 16);
+        assert!(rows_1000 > 0);
+        assert!(rows_1000 <= 16);
+        assert!(rows_1000 <= rows_100 + 4);
+    }
+
+    #[test]
+    fn geometry_recompute_is_limited_to_the_dirty_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = long_history_app(tmp.path(), 120);
+
+        render_history_no_selection(&mut app, 80, 12);
+        reset_geometry_recompute_count();
+        render_history_no_selection(&mut app, 80, 12);
+        assert_eq!(geometry_recompute_count(), 0);
+
+        app.history[118] = agent("changed near the bottom target words");
+        reset_geometry_recompute_count();
+        render_history_no_selection(&mut app, 80, 12);
+
+        assert_eq!(geometry_recompute_count(), 2);
+    }
+
+    #[test]
+    fn virtualized_visible_rows_match_full_render() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = mixed_history_app(tmp.path());
+        app.history.extend((0..30).map(|idx| {
+            agent(&format!(
+                "tail entry {idx} with enough words to wrap on a narrow pane"
+            ))
+        }));
+
+        render_history(&mut app, 36, 9);
+        app.chat_scroll_offset = 7;
+        let reference = full_wrap_reference(&mut app, 36, 9);
+        render_history(&mut app, 36, 9);
+
+        assert_eq!(
+            visible_grid_text_rows(&app),
+            visible_reference_text_rows(&reference, app.chat_scroll_offset)
+        );
     }
 
     #[test]
@@ -5594,6 +6043,105 @@ mod render_history_spacing_tests {
             expected_matches.iter().any(|line| *line < 4),
             "the oldest transcript rows must remain searchable"
         );
+    }
+
+    #[test]
+    fn chat_row_meta_matches_full_render_for_visible_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = mixed_history_app(tmp.path());
+        app.history.extend((0..20).map(|idx| {
+            agent(&format!(
+                "extra metadata row {idx} with target words that wrap visibly"
+            ))
+        }));
+
+        render_history_no_selection(&mut app, 34, 8);
+        app.chat_scroll_offset = 5;
+        let reference = full_wrap_reference(&mut app, 34, 8);
+        render_history_no_selection(&mut app, 34, 8);
+        let range = visible_reference_range(&reference, app.chat_scroll_offset);
+
+        assert_eq!(app.chat_row_meta, reference.row_meta[range].to_vec());
+    }
+
+    #[test]
+    fn scroll_anchor_round_trips_under_virtualization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = long_history_app(tmp.path(), 80);
+
+        render_history_no_selection(&mut app, 80, 10);
+        app.chat_scroll_offset = 17;
+        let before_top = chat_visible_top(
+            app.chat_total_lines,
+            app.chat_visible_lines.max(1),
+            app.chat_scroll_offset,
+        );
+        app.history
+            .push(agent("new bottom row should not move the scrolled top"));
+        render_history_no_selection(&mut app, 80, 10);
+        let after_top = chat_visible_top(
+            app.chat_total_lines,
+            app.chat_visible_lines.max(1),
+            app.chat_scroll_offset,
+        );
+
+        assert_eq!(after_top, before_top);
+    }
+
+    #[test]
+    fn chat_find_lines_rebuilds_only_when_find_query_or_transcript_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = long_history_app(tmp.path(), 40);
+        app.transcript_find = Some(TranscriptFind {
+            query: "target".to_string(),
+            matches: Vec::new(),
+            current: None,
+            saved_offset: 0,
+        });
+
+        reset_find_lines_rebuild_count();
+        render_history_no_selection(&mut app, 80, 10);
+        assert_eq!(find_lines_rebuild_count(), 1);
+
+        app.chat_scroll_offset = 3;
+        render_history_no_selection(&mut app, 80, 10);
+        assert_eq!(find_lines_rebuild_count(), 1);
+
+        app.transcript_find.as_mut().unwrap().query = "words".to_string();
+        render_history_no_selection(&mut app, 80, 10);
+        assert_eq!(find_lines_rebuild_count(), 2);
+
+        app.history
+            .push(agent("fresh transcript row with searchable words"));
+        render_history_no_selection(&mut app, 80, 10);
+        assert_eq!(find_lines_rebuild_count(), 3);
+        assert_eq!(app.chat_find_lines.len(), app.chat_total_lines);
+    }
+
+    #[test]
+    fn chat_geometry_api_round_trips_entry_and_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = mixed_history_app(tmp.path());
+
+        render_history_no_selection(&mut app, 32, 6);
+        let geometry = app.chat_geometry().clone();
+
+        assert_eq!(geometry.total_rows(), app.chat_total_lines);
+        for idx in 0..app.history.len() {
+            let start = geometry.entry_start_row(idx);
+            let height = geometry.entry_height(idx);
+            assert!(height > 0);
+            assert_eq!(geometry.entry_at_row(start), Some((idx, 0)));
+            assert_eq!(
+                geometry.entry_at_row(start + height - 1),
+                Some((idx, height - 1))
+            );
+        }
+        assert_eq!(geometry.entry_at_row(geometry.total_rows()), None);
+
+        let range = geometry.visible_entry_range(0, 4);
+        assert!(!range.is_empty());
+        assert!(range.end <= app.history.len());
     }
 
     #[test]

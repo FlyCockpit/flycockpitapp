@@ -204,6 +204,9 @@ impl App {
         self.history_render_cache = side.saved_history_render_cache;
         self.queue = side.saved_queue;
         self.pending = side.saved_pending;
+        self.mark_chat_geometry_dirty_from(0);
+        self.chat_find_lines.clear();
+        self.chat_find_lines_query = None;
         self.prunable_tokens = side.saved_prunable_tokens;
         self.cache_cold = side.saved_cache_cold;
         self.elided_event_ids = side.saved_elided_event_ids;

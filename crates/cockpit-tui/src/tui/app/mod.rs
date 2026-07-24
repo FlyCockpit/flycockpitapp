@@ -1636,10 +1636,16 @@ pub struct App {
     /// Same purpose — clamp scrollback so the bottom of the visible
     /// window can't go below the top of the content.
     pub(super) chat_visible_lines: usize,
+    /// Prefix-sum geometry for cached resident history entries. The offsets
+    /// exclude transient pending/subagent rows and the banner box.
+    pub(super) chat_geometry: render::ChatGeometry,
+    pub(super) chat_geometry_dirty_from: Option<usize>,
     /// Lowercased plain-text copy of the full banner-inclusive visual
     /// line model from the last render. Indices match `chat_total_lines`
     /// absolute lines and are searched by transcript find.
     pub(super) chat_find_lines: Vec<String>,
+    pub(super) chat_find_lines_dirty: bool,
+    pub(super) chat_find_lines_query: Option<String>,
     pub(super) transcript_find: Option<TranscriptFind>,
     /// In-app drag-select state for chat content (plan.md T8.f). Set
     /// when the user mouse-downs in the chat area; updated on drag;
@@ -2910,7 +2916,11 @@ impl App {
             chat_scroll_offset: 0,
             chat_total_lines: 0,
             chat_visible_lines: 0,
+            chat_geometry: render::ChatGeometry::default(),
+            chat_geometry_dirty_from: Some(0),
             chat_find_lines: Vec::new(),
+            chat_find_lines_dirty: true,
+            chat_find_lines_query: None,
             transcript_find: None,
             selection: None,
             chat_text_grid: Vec::new(),

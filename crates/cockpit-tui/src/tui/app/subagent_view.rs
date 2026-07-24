@@ -23,6 +23,9 @@ impl App {
         self.history_render_cache = std::mem::take(&mut view.history_render_cache);
         self.pending_render_cache = view.pending_render_cache.take();
         self.chat_scroll_offset = view.chat_scroll_offset;
+        self.mark_chat_geometry_dirty_from(0);
+        self.chat_find_lines.clear();
+        self.chat_find_lines_query = None;
         self.chat_row_meta.clear();
         self.clickable_rows.clear();
         self.box_rows.clear();
@@ -87,6 +90,9 @@ impl App {
         self.history_render_cache.clear();
         self.pending_render_cache = None;
         self.chat_scroll_offset = 0;
+        self.mark_chat_geometry_dirty_from(0);
+        self.chat_find_lines.clear();
+        self.chat_find_lines_query = None;
         self.hovered_affordance = None;
         self.hovered_control_chip = None;
         true

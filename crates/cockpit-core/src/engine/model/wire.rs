@@ -348,7 +348,6 @@ pub(super) struct ResponsesToolIdentityError {
 struct OpenResponsesCall {
     id: String,
     call_id: String,
-    source: &'static str,
     covered: bool,
 }
 
@@ -386,7 +385,6 @@ fn normalize_responses_message(
                             (call_id, "normalized_from_assistant_id")
                         }
                     };
-                    tc.id = responses_fc_prefixed_item_id(&tc.id);
                     records.push(ResponsesToolIdentityRecord {
                         cockpit_call_id: cockpit_call_id.clone(),
                         provider_item_id: tc.id.clone(),
@@ -396,7 +394,6 @@ fn normalize_responses_message(
                     open.push(OpenResponsesCall {
                         id: cockpit_call_id,
                         call_id,
-                        source,
                         covered: false,
                     });
                 }
@@ -428,15 +425,6 @@ fn normalize_responses_message(
                             tr.call_id = Some(open_call.call_id.clone());
                         }
                     }
-                    records.push(ResponsesToolIdentityRecord {
-                        cockpit_call_id: tr.id.clone(),
-                        provider_item_id: tr.id.clone(),
-                        provider_call_id: tr
-                            .call_id
-                            .clone()
-                            .unwrap_or_else(|| open_call.call_id.clone()),
-                        provider_call_id_source: open_call.source,
-                    });
                     open_call.covered = true;
                 }
             }
@@ -451,14 +439,6 @@ fn normalize_responses_message(
         }
     }
     Ok(())
-}
-
-fn responses_fc_prefixed_item_id(id: &str) -> String {
-    if id.starts_with("fc") {
-        id.to_string()
-    } else {
-        format!("fc-{id}")
-    }
 }
 
 fn ensure_responses_open_calls_covered(open: &[OpenResponsesCall]) -> Result<()> {

@@ -61,7 +61,7 @@ regex = "1"
 # workspace entry featureless-with-no-defaults prevents one member's feature
 # needs from silently growing another member's build.
 reqwest = { version = "0.13", default-features = false }
-rig = { version = "0.38", package = "rig-core", features = ["image"] }
+rig = { version = "0.40", package = "rig-core", features = ["image"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

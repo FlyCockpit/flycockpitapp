@@ -677,7 +677,7 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
         .with_context(|| format!("building native ChatGPT client for `{provider_id}`"))?;
 
     Ok(Model::ChatGpt {
-        model: chatgpt::ResponsesCompletionModel::new(client, model_id),
+        model: chatgpt::ResponsesCompletionModel::new(client, model_id).with_strict_tools(),
         model_id: model_id.to_string(),
         provider_id: provider_id.to_string(),
         utility_token_limit,
@@ -1064,6 +1064,36 @@ pub(super) fn build_agent<C: CompletionClient>(
     b.build()
 }
 
+pub(super) fn build_openai_responses_agent(
+    client: openai::Client<UsageAliasHttpClient>,
+    model_id: &str,
+    system: &str,
+    tools: &[ToolDefinition],
+    params: &ModelParams,
+) -> rig::agent::Agent<openai::responses_api::ResponsesCompletionModel<UsageAliasHttpClient>> {
+    let boxed: Vec<Box<dyn rig::tool::ToolDyn>> = tools
+        .iter()
+        .map(|def| Box::new(StaticTool(def.clone())) as Box<dyn rig::tool::ToolDyn>)
+        .collect();
+    let model =
+        openai::responses_api::ResponsesCompletionModel::new(client, model_id).with_strict_tools();
+    let mut b = rig::agent::AgentBuilder::new(model);
+    if !system.is_empty() {
+        b = b.preamble(system);
+    }
+    let mut b = b.tools(boxed);
+    if let Some(t) = params.temperature {
+        b = b.temperature(t);
+    }
+    if let Some(m) = params.max_tokens {
+        b = b.max_tokens(m);
+    }
+    if let Some(extra) = openai_additional_params(params) {
+        b = b.additional_params(extra);
+    }
+    b.build()
+}
+
 /// Compose the OpenAI-compat outbound `additional_params` object: the
 /// sanitized vendor reasoning fragment plus, when set, the top-level
 /// `prompt_cache_key` (= session id, prompt `prompt-caching-strategy.md`
@@ -1192,7 +1222,7 @@ pub(super) fn build_chatgpt_agent(
         .iter()
         .map(|def| Box::new(StaticTool(def.clone())) as Box<dyn rig::tool::ToolDyn>)
         .collect();
-    let mut b = rig::agent::AgentBuilder::new(model);
+    let mut b = rig::agent::AgentBuilder::new(model.with_strict_tools());
     if !system.is_empty() {
         b = b.preamble(system);
     }
@@ -1231,8 +1261,12 @@ impl rig::tool::Tool for StaticTool {
         self.0.name.clone()
     }
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        self.0.clone()
+    fn description(&self) -> String {
+        self.0.description.clone()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        self.0.parameters.clone()
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {

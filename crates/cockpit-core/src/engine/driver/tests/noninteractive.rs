@@ -402,60 +402,73 @@ async fn noninteractive_event_forwarder_wraps_child_events() {
     assert!(parent_rx.recv().await.is_none());
 }
 
-#[tokio::test]
-async fn noninteractive_single_spawn_amends_with_child_routing() {
-    let (mut driver, _tmp) = test_driver(8);
-    write_delegated_model_config(&mut driver, &["local", "child-single"]);
-    seed_task_delegation(&driver, "task-single-routing", "default");
-    seed_task_payload(&driver, "task-single-routing", "default", "explore");
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
-    let completion = driver
-        .execute_single_noninteractive_task(
-            single_task(
-                &driver,
-                "explore",
-                "task-single-routing",
-                Some(exact_model_selector("child-single")),
-                None,
-            ),
-            &tx,
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+#[test]
+fn noninteractive_single_spawn_amends_with_child_routing() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (mut driver, _tmp) = test_driver(8);
+                    write_delegated_model_config(&mut driver, &["local", "child-single"]);
+                    seed_task_delegation(&driver, "task-single-routing", "default");
+                    seed_task_payload(&driver, "task-single-routing", "default", "explore");
+                    let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
+                    let completion = driver
+                        .execute_single_noninteractive_task(
+                            single_task(
+                                &driver,
+                                "explore",
+                                "task-single-routing",
+                                Some(exact_model_selector("child-single")),
+                                None,
+                            ),
+                            &tx,
+                            tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await
+                        .unwrap();
 
-    assert_eq!(
-        completion.child_routing.as_ref().unwrap().model,
-        "child-single"
-    );
-    let events = drain_turn_events(&mut rx);
-    let spawn_idx = events
-        .iter()
-        .position(|event| matches!(event, TurnEvent::SubagentSpawned { task_call_id, .. } if task_call_id == "task-single-routing"))
-        .expect("spawn event");
-    let routing_idx = events
-        .iter()
-        .position(|event| matches!(event, TurnEvent::SubagentRouting { task_call_id, .. } if task_call_id == "task-single-routing"))
-        .expect("routing amend event");
-    assert!(spawn_idx < routing_idx);
-    match &events[routing_idx] {
-        TurnEvent::SubagentRouting {
-            child,
-            task_call_id,
-            label,
-            model,
-            routing,
-            ..
-        } => {
-            assert_eq!(child, "explore");
-            assert_eq!(task_call_id, "task-single-routing");
-            assert_eq!(label, "default");
-            assert_eq!(model, "child-single");
-            assert_eq!(routing["resolved_model"], "child-single");
-            assert_ne!(routing["resolved_model"], "local");
-        }
-        other => panic!("expected SubagentRouting, got {other:?}"),
-    }
+                    assert_eq!(
+                        completion.child_routing.as_ref().unwrap().model,
+                        "child-single"
+                    );
+                    let events = drain_turn_events(&mut rx);
+                    let spawn_idx = events
+                        .iter()
+                        .position(|event| matches!(event, TurnEvent::SubagentSpawned { task_call_id, .. } if task_call_id == "task-single-routing"))
+                        .expect("spawn event");
+                    let routing_idx = events
+                        .iter()
+                        .position(|event| matches!(event, TurnEvent::SubagentRouting { task_call_id, .. } if task_call_id == "task-single-routing"))
+                        .expect("routing amend event");
+                    assert!(spawn_idx < routing_idx);
+                    match &events[routing_idx] {
+                        TurnEvent::SubagentRouting {
+                            child,
+                            task_call_id,
+                            label,
+                            model,
+                            routing,
+                            ..
+                        } => {
+                            assert_eq!(child, "explore");
+                            assert_eq!(task_call_id, "task-single-routing");
+                            assert_eq!(label, "default");
+                            assert_eq!(model, "child-single");
+                            assert_eq!(routing["resolved_model"], "child-single");
+                            assert_ne!(routing["resolved_model"], "local");
+                        }
+                        other => panic!("expected SubagentRouting, got {other:?}"),
+                    }
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[tokio::test]

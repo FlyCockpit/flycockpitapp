@@ -663,20 +663,33 @@ fn responses_normalization_leaves_complete_pair_unchanged() {
     assert_eq!(tr.call_id.as_deref(), Some("provider-call"));
     assert_eq!(
         records,
-        vec![
-            ResponsesToolIdentityRecord {
-                cockpit_call_id: "fc_provider-item".into(),
-                provider_item_id: "fc_provider-item".into(),
-                provider_call_id: "provider-call".into(),
-                provider_call_id_source: "provider",
-            },
-            ResponsesToolIdentityRecord {
-                cockpit_call_id: "fc_provider-item".into(),
-                provider_item_id: "fc_provider-item".into(),
-                provider_call_id: "provider-call".into(),
-                provider_call_id_source: "provider",
-            },
-        ]
+        vec![ResponsesToolIdentityRecord {
+            cockpit_call_id: "fc_provider-item".into(),
+            provider_item_id: "fc_provider-item".into(),
+            provider_call_id: "provider-call".into(),
+            provider_call_id_source: "provider",
+        }]
+    );
+}
+
+#[test]
+fn responses_normalization_emits_one_record_per_call() {
+    let mut history = vec![assistant(vec![responses_tool_call(
+        "provider-item",
+        Some("provider-call"),
+    )])];
+    let mut prompt = tool_result_message("provider-item", Some("provider-call"));
+
+    let records = normalize_responses_tool_call_identity(&mut history, &mut prompt).unwrap();
+
+    assert_eq!(
+        records,
+        vec![ResponsesToolIdentityRecord {
+            cockpit_call_id: "provider-item".into(),
+            provider_item_id: "provider-item".into(),
+            provider_call_id: "provider-call".into(),
+            provider_call_id_source: "provider",
+        }]
     );
 }
 
@@ -689,18 +702,21 @@ fn responses_normalization_fills_missing_call_ids_with_provenance() {
 
     let tc = first_assistant_tool_call(&history[0]);
     let tr = first_tool_result(&prompt);
-    assert_eq!(tc.id, "fc-provider-item");
+    assert_eq!(tc.id, "provider-item");
     assert_eq!(tc.call_id.as_deref(), Some("provider-item"));
     assert_eq!(tr.id, "provider-item");
     assert_eq!(tr.call_id.as_deref(), Some("provider-item"));
-    assert!(records.iter().all(|record| {
-        record.provider_call_id == "provider-item"
-            && record.provider_call_id_source == "normalized_from_assistant_id"
-    }));
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].provider_item_id, "provider-item");
+    assert_eq!(records[0].provider_call_id, "provider-item");
+    assert_eq!(
+        records[0].provider_call_id_source,
+        "normalized_from_assistant_id"
+    );
 }
 
 #[test]
-fn responses_fc_prefix_rewrites_synthetic_item_id() {
+fn responses_normalization_leaves_synthetic_item_id_unchanged() {
     let mut history = vec![assistant(vec![responses_tool_call(
         "skillslash-123",
         Some("provider-call"),
@@ -711,17 +727,17 @@ fn responses_fc_prefix_rewrites_synthetic_item_id() {
 
     let tc = first_assistant_tool_call(&history[0]);
     let tr = first_tool_result(&prompt);
-    assert_eq!(tc.id, "fc-skillslash-123");
+    assert_eq!(tc.id, "skillslash-123");
     assert_eq!(tc.call_id.as_deref(), Some("provider-call"));
     assert_eq!(tr.id, "skillslash-123");
     assert_eq!(tr.call_id.as_deref(), Some("provider-call"));
     assert_eq!(records[0].cockpit_call_id, "skillslash-123");
-    assert_eq!(records[0].provider_item_id, "fc-skillslash-123");
+    assert_eq!(records[0].provider_item_id, "skillslash-123");
     assert_eq!(records[0].provider_call_id, "provider-call");
 }
 
 #[test]
-fn responses_fc_prefix_preserves_provider_ids_and_is_idempotent() {
+fn responses_normalization_preserves_provider_ids_and_is_idempotent() {
     let mut history = vec![assistant(vec![responses_tool_call("fc_1", Some("call_1"))])];
     let mut prompt = tool_result_message("fc_1", Some("call_1"));
 
@@ -747,14 +763,14 @@ fn responses_fc_prefix_preserves_provider_ids_and_is_idempotent() {
     normalize_responses_tool_call_identity(&mut rewritten_history, &mut rewritten_prompt).unwrap();
     let rewritten_tc = first_assistant_tool_call(&rewritten_history[0]);
     let rewritten_tr = first_tool_result(&rewritten_prompt);
-    assert_eq!(rewritten_tc.id, "fc-skillslash-old");
+    assert_eq!(rewritten_tc.id, "skillslash-old");
     assert_eq!(rewritten_tc.call_id.as_deref(), Some("skillslash-old"));
     assert_eq!(rewritten_tr.id, "skillslash-old");
     assert_eq!(rewritten_tr.call_id.as_deref(), Some("skillslash-old"));
 }
 
 #[test]
-fn responses_fc_prefix_rewrites_any_non_fc_id() {
+fn responses_normalization_leaves_non_fc_id_unchanged() {
     let mut history = vec![assistant(vec![responses_tool_call(
         "arbitrary-prefix-1",
         Some("call-1"),
@@ -765,14 +781,14 @@ fn responses_fc_prefix_rewrites_any_non_fc_id() {
 
     let tc = first_assistant_tool_call(&history[0]);
     let tr = first_tool_result(&prompt);
-    assert_eq!(tc.id, "fc-arbitrary-prefix-1");
+    assert_eq!(tc.id, "arbitrary-prefix-1");
     assert_eq!(tc.call_id.as_deref(), Some("call-1"));
     assert_eq!(tr.id, "arbitrary-prefix-1");
     assert_eq!(tr.call_id.as_deref(), Some("call-1"));
 }
 
 #[test]
-fn responses_fc_prefix_fills_call_id_before_rewrite() {
+fn responses_normalization_fills_call_id_without_rewriting_id() {
     let mut history = vec![assistant(vec![responses_tool_call(
         "delegation-payload-plan-abcdef123456",
         None,
@@ -783,7 +799,7 @@ fn responses_fc_prefix_fills_call_id_before_rewrite() {
 
     let tc = first_assistant_tool_call(&history[0]);
     let tr = first_tool_result(&prompt);
-    assert_eq!(tc.id, "fc-delegation-payload-plan-abcdef123456");
+    assert_eq!(tc.id, "delegation-payload-plan-abcdef123456");
     assert_eq!(
         tc.call_id.as_deref(),
         Some("delegation-payload-plan-abcdef123456")
@@ -4849,6 +4865,99 @@ async fn tool_completion_responses_identity_behavior() {
             .all(|item| item["type"] != "function_call_output"),
         "utility tool_completion is a single-shot call with no tool-result replay to normalize: {body}"
     );
+}
+
+fn responses_function_call_item<'a>(
+    body: &'a serde_json::Value,
+    call_id: &str,
+) -> &'a serde_json::Value {
+    body["input"]
+        .as_array()
+        .expect("Responses input array")
+        .iter()
+        .find(|item| item["type"] == "function_call" && item["call_id"] == call_id)
+        .unwrap_or_else(|| panic!("missing function_call item for {call_id}: {body}"))
+}
+
+#[tokio::test]
+async fn responses_replay_omits_long_non_fc_item_id() {
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::Responses)
+        .turn(Turn::Text("ok".into()))
+        .start()
+        .await;
+    let url = provider.base_url();
+    let model = openai_model_at_with_wire(&url, WireApi::Responses, true);
+    let replay_id = format!("delegation-payload-plan-{}", "x".repeat(80));
+    let history = vec![
+        assistant(vec![responses_tool_call(&replay_id, Some("provider-call"))]),
+        tool_result_message(&replay_id, Some("provider-call")),
+    ];
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+
+    model
+        .complete_captured(
+            "system",
+            &history,
+            Message::user("continue"),
+            &[],
+            ModelParams::default(),
+            "Build",
+            Some(&tx),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let request = provider.next_request().await;
+    assert!(request.request_line.contains("/responses"));
+    let function_call = responses_function_call_item(&request.body, "provider-call");
+    assert_eq!(function_call["call_id"], json!("provider-call"));
+    assert!(
+        function_call.get("id").is_none(),
+        "non-fc replay ids must be omitted by rig serialization: {function_call}"
+    );
+}
+
+#[tokio::test]
+async fn responses_replay_preserves_native_fc_item_id() {
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::Responses)
+        .turn(Turn::Text("ok".into()))
+        .start()
+        .await;
+    let url = provider.base_url();
+    let model = openai_model_at_with_wire(&url, WireApi::Responses, true);
+    let history = vec![
+        assistant(vec![responses_tool_call(
+            "fc_native_1",
+            Some("provider-call"),
+        )]),
+        tool_result_message("fc_native_1", Some("provider-call")),
+    ];
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+
+    model
+        .complete_captured(
+            "system",
+            &history,
+            Message::user("continue"),
+            &[],
+            ModelParams::default(),
+            "Build",
+            Some(&tx),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let request = provider.next_request().await;
+    assert!(request.request_line.contains("/responses"));
+    let function_call = responses_function_call_item(&request.body, "provider-call");
+    assert_eq!(function_call["id"], json!("fc_native_1"));
+    assert_eq!(function_call["call_id"], json!("provider-call"));
 }
 
 #[tokio::test]

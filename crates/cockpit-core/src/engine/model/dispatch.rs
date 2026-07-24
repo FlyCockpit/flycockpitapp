@@ -552,8 +552,9 @@ impl Model {
                         match endpoint {
                             crate::config::providers::WireApi::Responses => {
                                 let responses = client.clone().responses_api();
-                                let agent =
-                                    build_agent(&responses, model_id, system, wire_tools, &params);
+                                let agent = build_openai_responses_agent(
+                                    responses, model_id, system, wire_tools, &params,
+                                );
                                 drain_completion_stream(
                                     agent,
                                     &prompt,
@@ -1266,7 +1267,9 @@ impl Model {
                         let wire_tools = wire_schema::definitions_for_wire(wire_api, tools);
                         let wire_tools = wire_tools.as_ref();
                         let responses = client.clone().responses_api();
-                        let agent = build_agent(&responses, model_id, system, wire_tools, params);
+                        let agent = build_openai_responses_agent(
+                            responses, model_id, system, wire_tools, params,
+                        );
                         let mut req = agent.completion(prompt.clone(), history.to_vec()).await?;
                         if params.tools_required && !wire_tools.is_empty() {
                             req = req.tool_choice(ToolChoice::Required);
@@ -1326,7 +1329,7 @@ async fn openai_text_completion(
     let response = match wire_api {
         crate::config::providers::WireApi::Responses => {
             let responses = client.clone().responses_api();
-            build_agent(&responses, model_id, system.unwrap_or(""), &[], params)
+            build_openai_responses_agent(responses, model_id, system.unwrap_or(""), &[], params)
                 .prompt(prompt)
                 .await
         }
@@ -1361,7 +1364,7 @@ async fn openai_tool_completion(
     match wire_api {
         crate::config::providers::WireApi::Responses => {
             let responses = client.clone().responses_api();
-            let response = build_agent(&responses, model_id, system, &[], params)
+            let response = build_openai_responses_agent(responses, model_id, system, &[], params)
                 .completion(Message::user(prompt), Vec::<Message>::new())
                 .await?
                 .tool(wire_tool)
@@ -1561,13 +1564,9 @@ where
     )
     .await?;
     // rig requests `stream_options.include_usage = true` on every stream;
-    // the final usage chunk lands on `stream.response` (Option, because some
-    // providers omit it).
-    let usage = stream
-        .response
-        .token_usage()
-        .map(TokenUsage::from)
-        .filter(|u| !u.is_empty());
+    // providers that omit it now surface as an empty default usage value.
+    let usage = TokenUsage::from(stream.response.token_usage());
+    let usage = (!usage.is_empty()).then_some(usage);
     Ok((stream.message_id.clone(), stream.choice.clone(), usage))
 }
 

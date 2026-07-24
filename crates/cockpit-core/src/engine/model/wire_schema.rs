@@ -447,11 +447,12 @@ mod tests {
         assert_eq!(constrained["description"], "A constrained optional count");
         assert!(has_null_type(&once["properties"]["choice"]));
         assert!(has_null_type(&once["properties"]["reference"]));
-        let strict = rig::providers::openai::responses_api::ResponsesToolDefinition::function(
-            "sample",
-            "sample schema",
-            once.clone(),
-        );
+        let strict =
+            rig::providers::openai::responses_api::ResponsesToolDefinition::strict_function(
+                "sample",
+                "sample schema",
+                once.clone(),
+            );
         assert!(has_null_type(&strict.parameters["properties"]["reference"]));
         let constrained_validator =
             jsonschema::validator_for(&strict.parameters["properties"]["count"])
@@ -602,11 +603,12 @@ mod tests {
                 tool.name()
             );
             let transformed = for_responses(&canonical);
-            let strict = rig::providers::openai::responses_api::ResponsesToolDefinition::function(
-                tool.name(),
-                tool.description(),
-                transformed,
-            );
+            let strict =
+                rig::providers::openai::responses_api::ResponsesToolDefinition::strict_function(
+                    tool.name(),
+                    tool.description(),
+                    transformed,
+                );
             assert_optional_properties_nullable(&canonical, &strict.parameters);
             assert_objects_are_closed(&strict.parameters);
             assert_eq!(tool.parameters(), canonical, "canonical schema mutated");
@@ -642,11 +644,12 @@ mod tests {
             crate::tools::schedule::schedule_parameters_defensive(),
         ] {
             let transformed = for_responses(&schema);
-            let strict = rig::providers::openai::responses_api::ResponsesToolDefinition::function(
-                "schedule",
-                "schedule",
-                transformed,
-            );
+            let strict =
+                rig::providers::openai::responses_api::ResponsesToolDefinition::strict_function(
+                    "schedule",
+                    "schedule",
+                    transformed,
+                );
             assert_objects_are_closed(&strict.parameters);
         }
     }
@@ -661,11 +664,12 @@ mod tests {
         ];
         for schema in schemas {
             let transformed = for_responses(&schema);
-            let strict = rig::providers::openai::responses_api::ResponsesToolDefinition::function(
-                "skill_manage",
-                "skill_manage",
-                transformed,
-            );
+            let strict =
+                rig::providers::openai::responses_api::ResponsesToolDefinition::strict_function(
+                    "skill_manage",
+                    "skill_manage",
+                    transformed,
+                );
             assert_objects_are_closed(&strict.parameters);
         }
     }

@@ -306,6 +306,8 @@ cockpit config import-policy cockpit-policy.json
 
 Debug exports are redacted by default using the active redaction table. Use `cockpit export --include-sensitive <session>` only when you intentionally need exact captured model/tool payloads; the command prints a warning because the archive may contain secrets sent to trusted models.
 
+See [Redaction](docs/redaction.md) for `min_secret_length`, allowlist, denylist, and filesystem-path protection details.
+
 ## MCP
 
 Cockpit can expose MCP tools to agents through a layered `.cockpit/mcp.json`.

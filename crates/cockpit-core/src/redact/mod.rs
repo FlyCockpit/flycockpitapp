@@ -35,7 +35,7 @@
 //! in a longer URL is still redacted).
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use aho_corasick::{AhoCorasick, MatchKind};
@@ -45,12 +45,14 @@ use base64::Engine as _;
 use crate::config::extended::RedactConfig;
 
 mod dotenv;
+mod protected;
 mod ssh;
 mod structured;
 
 #[cfg(test)]
 use self::dotenv::*;
 use self::dotenv::{collect_env_file_candidates, consume_marked_value, matched_dotenv_paths};
+use self::protected::{ProtectedPaths, is_existing_absolute_path};
 use self::ssh::collect_ssh_key_candidates;
 #[cfg(test)]
 use self::ssh::*;
@@ -243,6 +245,13 @@ impl Candidate {
     }
 }
 
+fn origin_is_forced(origin: &str) -> bool {
+    origin == "$denylist"
+        || origin == "$credentials:flycockpit.instance_token"
+        || origin.starts_with("$secret:")
+        || origin.starts_with("$ssh:")
+}
+
 fn case_secret_variants(value: &str) -> Vec<String> {
     let mut variants = Vec::with_capacity(2);
     let lower = value.to_ascii_lowercase();
@@ -307,6 +316,8 @@ struct PersistedRedactionTable {
     placeholder: String,
     disabled: bool,
     unsupported_files: Vec<String>,
+    #[serde(default)]
+    protected: Vec<String>,
 }
 
 /// A built lookup of `value → origin-name` pairs the next outbound
@@ -334,6 +345,10 @@ pub struct RedactionTable {
     /// their candidates couldn't be collected (§4). Surfaced once as a
     /// TUI toast so the user knows redaction won't cover those files.
     unsupported_files: Vec<PathBuf>,
+    /// Protected filesystem paths carried across unions and persistence.
+    protected: ProtectedPaths,
+    /// Forced-secret origins that intentionally override protected paths.
+    protected_path_conflicts: Vec<String>,
 }
 
 impl std::fmt::Debug for RedactionTable {
@@ -344,6 +359,10 @@ impl std::fmt::Debug for RedactionTable {
             .field("patterns", &self.origins.len())
             .field("disabled", &self.disabled)
             .field("unsupported_files", &self.unsupported_files.len())
+            .field(
+                "protected_path_conflicts",
+                &self.protected_path_conflicts.len(),
+            )
             .finish()
     }
 }
@@ -403,6 +422,7 @@ impl RedactionTable {
         env: &HashMap<String, String>,
         stored_secrets: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self> {
+        let protected = ProtectedPaths::from_session(cwd, env);
         if !cfg.enabled {
             return Ok(Self {
                 matcher: None,
@@ -411,6 +431,8 @@ impl RedactionTable {
                 placeholder: cfg.placeholder.clone(),
                 disabled: true,
                 unsupported_files: Vec::new(),
+                protected,
+                protected_path_conflicts: Vec::new(),
             });
         }
 
@@ -508,7 +530,13 @@ impl RedactionTable {
             entries.push((candidate.value, candidate.origin));
         }
 
-        Self::from_entries(entries, cfg.placeholder.clone(), false, unsupported_files)
+        Self::from_entries(
+            entries,
+            cfg.placeholder.clone(),
+            false,
+            unsupported_files,
+            protected,
+        )
     }
 
     fn from_entries(
@@ -516,7 +544,34 @@ impl RedactionTable {
         placeholder: String,
         disabled: bool,
         unsupported_files: Vec<PathBuf>,
+        protected: ProtectedPaths,
     ) -> Result<Self> {
+        let protected_conflicting_origins: HashSet<String> = entries
+            .iter()
+            .filter(|(value, origin)| {
+                !origin_is_forced(origin)
+                    && (protected.contains_value(value) || is_existing_absolute_path(value))
+            })
+            .map(|(_, origin)| origin.clone())
+            .collect();
+        let mut protected_path_conflicts: Vec<String> = Vec::new();
+        entries.retain(|(value, origin)| {
+            let conflicts = protected.contains_value(value) || is_existing_absolute_path(value);
+            if origin_is_forced(origin) {
+                if conflicts {
+                    protected_path_conflicts.push(origin.clone());
+                    tracing::warn!(
+                        origin = %origin,
+                        "forced redaction entry conflicts with a protected filesystem path"
+                    );
+                }
+                true
+            } else {
+                !conflicts && !protected_conflicting_origins.contains(origin)
+            }
+        });
+        protected_path_conflicts.sort();
+        protected_path_conflicts.dedup();
         entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
         entries.dedup_by(|a, b| a.0 == b.0);
         if entries.is_empty() {
@@ -527,6 +582,8 @@ impl RedactionTable {
                 placeholder,
                 disabled,
                 unsupported_files,
+                protected,
+                protected_path_conflicts,
             });
         }
         let patterns: Vec<&str> = entries.iter().map(|(v, _)| v.as_str()).collect();
@@ -543,6 +600,8 @@ impl RedactionTable {
             placeholder,
             disabled,
             unsupported_files,
+            protected,
+            protected_path_conflicts,
         })
     }
 
@@ -553,11 +612,13 @@ impl RedactionTable {
         unsupported_files.extend(other.unsupported_files.iter().cloned());
         unsupported_files.sort();
         unsupported_files.dedup();
+        let protected = self.protected.union(&other.protected);
         Self::from_entries(
             entries,
             self.placeholder.clone(),
             self.disabled && other.disabled,
             unsupported_files,
+            protected,
         )
     }
 
@@ -574,6 +635,7 @@ impl RedactionTable {
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect(),
+            protected: self.protected.to_persisted(),
         };
         serde_json::to_string(&snapshot).context("serializing redaction table")
     }
@@ -591,6 +653,7 @@ impl RedactionTable {
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
+            ProtectedPaths::from_persisted(snapshot.protected),
         )
     }
 
@@ -634,6 +697,8 @@ impl RedactionTable {
             placeholder: RedactConfig::default().placeholder,
             disabled: true,
             unsupported_files: Vec::new(),
+            protected: ProtectedPaths::default(),
+            protected_path_conflicts: Vec::new(),
         }
     }
 
@@ -657,6 +722,12 @@ impl RedactionTable {
     #[allow(dead_code)]
     pub fn entries_for_debug(&self) -> Vec<&str> {
         self.origins.iter().map(|s| s.as_str()).collect()
+    }
+
+    /// Forced-secret origins that matched protected filesystem paths.
+    #[allow(dead_code)]
+    pub fn protected_path_conflicts(&self) -> &[String] {
+        &self.protected_path_conflicts
     }
 }
 
@@ -739,6 +810,16 @@ mod scrub_fast_path_tests {
             let input = format!("{name}=not-a-secret-value");
             assert_eq!(table.scrub(&input), input);
         }
+    }
+
+    #[test]
+    fn forced_origin_predicate_covers_every_forced_construction_site() {
+        assert!(origin_is_forced("$denylist"));
+        assert!(origin_is_forced("$credentials:flycockpit.instance_token"));
+        assert!(origin_is_forced("$secret:openai"));
+        assert!(origin_is_forced("$ssh:/home/user/.ssh/id_ed25519"));
+        assert!(!origin_is_forced("$PATH"));
+        assert!(!origin_is_forced("/tmp/not-an-origin"));
     }
 
     #[test]

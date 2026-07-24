@@ -18,6 +18,41 @@ fn enabled_cfg() -> RedactConfig {
     }
 }
 
+fn protected_cfg() -> RedactConfig {
+    let mut cfg = enabled_cfg();
+    cfg.scan_environment = true;
+    cfg.min_secret_length = 1;
+    cfg
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn build_with_session_env(
+    cfg: &RedactConfig,
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> RedactionTable {
+    RedactionTable::build_with_env_and_secrets(cfg, cwd, env, Vec::<(String, String)>::new())
+        .unwrap()
+}
+
+fn protected_paths(cwd: &Path, env: &HashMap<String, String>) -> Vec<String> {
+    protected::ProtectedPaths::from_session(cwd, env).to_persisted()
+}
+
+fn entry_origins(table: &RedactionTable) -> Vec<&str> {
+    table.entries_for_debug()
+}
+
+fn assert_origin_absent(table: &RedactionTable, origin: &str) {
+    assert!(
+        !entry_origins(table).contains(&origin),
+        "expected protected origin `{origin}` to be absent"
+    );
+}
+
 #[test]
 fn disabled_passes_through() {
     let mut cfg = enabled_cfg();
@@ -352,6 +387,276 @@ fn substring_matches() {
 }
 
 #[test]
+fn protected_path_uses_session_env_home_not_process_env() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let home = path_string(&dir.path().join("session-home-does-not-exist"));
+    let env = HashMap::from([
+        ("HOME".to_string(), home.clone()),
+        ("SESSION_HOME_COPY".to_string(), home.clone()),
+    ]);
+    let cfg = protected_cfg();
+
+    let table = build_with_session_env(&cfg, &cwd, &env);
+
+    assert_eq!(table.scrub(&home), home);
+    assert_origin_absent(&table, "$SESSION_HOME_COPY");
+}
+
+#[test]
+fn protected_path_ancestor_valued_env_var_is_not_registered() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("workspace").join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let ancestor = path_string(dir.path());
+    let env = HashMap::from([("ANCESTOR_SECRET".to_string(), ancestor.clone())]);
+    let cfg = protected_cfg();
+
+    let table = build_with_session_env(&cfg, &cwd, &env);
+
+    assert_eq!(table.scrub(&ancestor), ancestor);
+    assert_origin_absent(&table, "$ANCESTOR_SECRET");
+}
+
+#[test]
+fn protected_path_existing_absolute_directory_value_is_not_registered() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("project");
+    let other = dir.path().join("other-existing-dir");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let other = path_string(&other);
+    let env = HashMap::from([("ABSOLUTE_DIR_SECRET".to_string(), other.clone())]);
+    let cfg = protected_cfg();
+
+    let table = build_with_session_env(&cfg, &cwd, &env);
+
+    assert_eq!(table.scrub(&other), other);
+    assert_origin_absent(&table, "$ABSOLUTE_DIR_SECRET");
+}
+
+#[test]
+fn protected_path_nonexistent_absolute_value_is_still_registered() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let value = path_string(&dir.path().join("missing-absolute-secret"));
+    let env = HashMap::from([("ABSOLUTE_TOKEN".to_string(), value.clone())]);
+    let cfg = protected_cfg();
+
+    let table = build_with_session_env(&cfg, &cwd, &env);
+
+    assert_ne!(table.scrub(&value), value);
+    assert!(entry_origins(&table).contains(&"$ABSOLUTE_TOKEN"));
+}
+
+#[test]
+fn protected_path_relative_existing_filename_is_still_registered() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let value = "relative-existing-secret-file";
+    std::fs::write(cwd.join(value), "not relevant").unwrap();
+    let env = HashMap::from([("RELATIVE_TOKEN".to_string(), value.to_string())]);
+    let cfg = protected_cfg();
+
+    let table = build_with_session_env(&cfg, &cwd, &env);
+
+    assert_ne!(table.scrub(value), value);
+    assert!(entry_origins(&table).contains(&"$RELATIVE_TOKEN"));
+}
+
+#[test]
+fn protected_path_scrub_is_identity_for_every_protected_path() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("workspace").join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let home = dir.path().join("session-home");
+    let tmp = dir.path().join("session-tmp");
+    let mut env = HashMap::from([
+        ("HOME".to_string(), path_string(&home)),
+        ("TMPDIR".to_string(), path_string(&tmp)),
+    ]);
+    let paths = protected_paths(&cwd, &env);
+    for (idx, path) in paths.iter().enumerate() {
+        env.insert(format!("PROTECTED_PATH_{idx}_SECRET"), path.clone());
+    }
+    let cfg = protected_cfg();
+
+    let table = build_with_session_env(&cfg, &cwd, &env);
+
+    for path in paths {
+        assert_eq!(table.scrub(&path), path);
+    }
+}
+
+#[test]
+fn protected_path_invariant_survives_union() {
+    let first_dir = TempDir::new().unwrap();
+    let second_dir = TempDir::new().unwrap();
+    let first_cwd = first_dir.path().join("project");
+    let second_cwd = second_dir.path().join("project");
+    std::fs::create_dir_all(&first_cwd).unwrap();
+    std::fs::create_dir_all(&second_cwd).unwrap();
+    let first_home = path_string(&first_dir.path().join("session-home"));
+    let second_home = path_string(&second_dir.path().join("session-home"));
+    let first_env = HashMap::from([
+        ("HOME".to_string(), first_home.clone()),
+        ("FIRST_HOME_COPY".to_string(), first_home.clone()),
+    ]);
+    let second_env = HashMap::from([
+        ("HOME".to_string(), second_home.clone()),
+        ("SECOND_HOME_COPY".to_string(), second_home.clone()),
+    ]);
+    let cfg = protected_cfg();
+
+    let first = build_with_session_env(&cfg, &first_cwd, &first_env);
+    let second = build_with_session_env(&cfg, &second_cwd, &second_env);
+    let unioned = first.union(&second).unwrap();
+
+    assert_eq!(unioned.scrub(&first_home), first_home);
+    assert_eq!(unioned.scrub(&second_home), second_home);
+    assert_origin_absent(&unioned, "$FIRST_HOME_COPY");
+    assert_origin_absent(&unioned, "$SECOND_HOME_COPY");
+}
+
+#[test]
+fn protected_path_invariant_survives_persist_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let home = path_string(&dir.path().join("session-home"));
+    let env = HashMap::from([
+        ("HOME".to_string(), home.clone()),
+        ("SESSION_HOME_COPY".to_string(), home.clone()),
+    ]);
+    let cfg = protected_cfg();
+    let table = build_with_session_env(&cfg, &cwd, &env);
+    let json = table.to_persisted_json().unwrap();
+    let mut snapshot: serde_json::Value = serde_json::from_str(&json).unwrap();
+    snapshot["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!([home.clone(), "$SESSION_HOME_COPY"]));
+
+    let restored = RedactionTable::from_persisted_json(&snapshot.to_string()).unwrap();
+
+    assert_eq!(restored.scrub(&home), home);
+    assert_origin_absent(&restored, "$SESSION_HOME_COPY");
+}
+
+#[test]
+fn protected_path_legacy_poisoned_persisted_table_self_heals_on_union() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let home = path_string(&dir.path().join("session-home"));
+    let legacy = serde_json::json!({
+        "entries": [[home.clone(), "$SESSION_HOME_COPY"]],
+        "placeholder": "***REDACT***",
+        "disabled": false,
+        "unsupported_files": []
+    });
+    let restored = RedactionTable::from_persisted_json(&legacy.to_string()).unwrap();
+    let env = HashMap::from([
+        ("HOME".to_string(), home.clone()),
+        ("SESSION_HOME_COPY".to_string(), home.clone()),
+    ]);
+    let cfg = protected_cfg();
+    let fresh = build_with_session_env(&cfg, &cwd, &env);
+
+    assert_ne!(restored.scrub(&home), home);
+    let unioned = restored.union(&fresh).unwrap();
+    assert_eq!(unioned.scrub(&home), home);
+    assert_origin_absent(&unioned, "$SESSION_HOME_COPY");
+}
+
+#[test]
+fn protected_path_denylist_entry_still_wins_over_protected_path() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let home = path_string(&dir.path().join("session-home"));
+    let env = HashMap::from([("HOME".to_string(), home.clone())]);
+    let mut cfg = protected_cfg();
+    cfg.denylist = vec![home.clone()];
+
+    let table = build_with_session_env(&cfg, &cwd, &env);
+
+    assert_ne!(table.scrub(&home), home);
+    assert_eq!(table.protected_path_conflicts(), &["$denylist".to_string()]);
+}
+
+#[test]
+fn protected_path_named_secret_equal_to_path_still_wins() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let home = path_string(&dir.path().join("session-home"));
+    let env = HashMap::from([("HOME".to_string(), home.clone())]);
+    let cfg = protected_cfg();
+
+    let table = RedactionTable::build_with_env_and_secrets(
+        &cfg,
+        &cwd,
+        &env,
+        [("session-home".to_string(), home.clone())],
+    )
+    .unwrap();
+
+    assert_ne!(table.scrub(&home), home);
+    assert_eq!(
+        table.protected_path_conflicts(),
+        &["$secret:session-home".to_string()]
+    );
+}
+
+#[test]
+fn protected_path_conflict_records_origin_never_value() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let home = path_string(&dir.path().join("session-home"));
+    let env = HashMap::from([("HOME".to_string(), home.clone())]);
+    let mut cfg = protected_cfg();
+    cfg.denylist = vec![home.clone()];
+
+    let table = build_with_session_env(&cfg, &cwd, &env);
+    let conflicts = table.protected_path_conflicts();
+
+    assert_eq!(conflicts, &["$denylist".to_string()]);
+    assert!(!format!("{conflicts:?}").contains(&home));
+    assert!(!format!("{table:?}").contains(&home));
+}
+
+#[test]
+fn protected_path_rejected_entries_absent_from_debug_and_persisted_json() {
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let home = path_string(&dir.path().join("session-home"));
+    let env = HashMap::from([
+        ("HOME".to_string(), home.clone()),
+        ("SESSION_HOME_COPY".to_string(), home),
+    ]);
+    let cfg = protected_cfg();
+
+    let table = build_with_session_env(&cfg, &cwd, &env);
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&table.to_persisted_json().unwrap()).unwrap();
+    let entries = snapshot["entries"].as_array().unwrap();
+
+    assert_origin_absent(&table, "$SESSION_HOME_COPY");
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !entry.to_string().contains("$SESSION_HOME_COPY")),
+        "rejected protected-path entry persisted: {entries:?}"
+    );
+}
+
+#[test]
 fn default_placeholder_is_the_explicit_string() {
     // The user-visible placeholder is part of the spec; if anyone
     // edits the default, this test fails on purpose.
@@ -481,9 +786,8 @@ fn allowlisted_path_not_redacted_even_when_long() {
     // PATH is almost always long enough to clear min_secret_length;
     // confirm $PATH (and the LC_/LANG/XDG_ families) are never in
     // the table even with min_secret_length lowered all the way.
-    // (Other env vars' values may still be substrings of PATH —
-    // that's an inherent property of substring redaction and is
-    // covered by `allowlisted_env_var_names_not_in_table`.)
+    // Filesystem paths are additionally protected by value before the
+    // matcher is built; this test only verifies name allowlisting.
     let mut cfg = enabled_cfg();
     cfg.scan_environment = true;
     cfg.min_secret_length = 1;
@@ -553,10 +857,8 @@ fn user_allowlist_skips_dotenv_entry() {
 fn allowlisted_env_var_names_not_in_table() {
     // The allowlist works by *name*: even with scan_environment
     // on, `$PATH`/`$HOME`/`$SHELL` etc. must not contribute
-    // patterns to the matcher. (Substring overlap with other env
-    // vars is a separate concern and an inherent property of
-    // substring redaction; that's fine — we just don't want PATH
-    // itself catalogued.)
+    // patterns to the matcher. Filesystem-path values are rejected
+    // separately by the protected-path guard.
     let cfg = RedactConfig {
         enabled: true,
         scan_environment: true,

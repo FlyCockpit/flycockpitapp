@@ -1404,15 +1404,20 @@ pub struct RedactConfig {
     pub dotenv_patterns: Vec<String>,
     #[serde(default)]
     pub extra_dotenv_paths: Vec<PathBuf>,
+    /// Minimum length for prunable candidate values. Filesystem paths are
+    /// never registered by automatic scanning regardless of this value.
     pub min_secret_length: usize,
     pub placeholder: String,
     /// User-supplied literal values that must *always* be redacted, even
     /// if shorter than `min_secret_length` or sourced from an
-    /// allowlisted env var. Per spec §2b merging.
+    /// allowlisted env var. Forced denylist values can intentionally match
+    /// filesystem paths; automatic scanning still never registers paths.
+    /// Per spec §2b merging.
     #[serde(default)]
     pub denylist: Vec<String>,
     /// User-supplied env var names to *exclude* from the redaction
     /// table on top of the built-in `ENV_ALLOWLIST` in `redact::mod`.
+    /// This is name-based only; it does not allowlist arbitrary values.
     #[serde(default)]
     pub allowlist: Vec<String>,
 }

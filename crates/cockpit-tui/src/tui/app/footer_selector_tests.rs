@@ -293,7 +293,7 @@ fn config_drift_hover_restyles_span() {
     let drift = status
         .spans
         .iter()
-        .find(|span| span.content == " model ≠ config")
+        .find(|span| span.content == "model ≠ config")
         .expect("drift span rendered");
     assert!(drift.style.add_modifier.contains(Modifier::UNDERLINED));
 

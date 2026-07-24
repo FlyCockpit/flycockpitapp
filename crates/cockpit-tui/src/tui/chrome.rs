@@ -139,12 +139,13 @@ pub fn left_status(
             end: col,
         });
         if info.active_model_diverged {
+            push_span(&mut spans, &mut col, Span::styled(" ".to_string(), muted));
             let drift_start = col;
             push_span(
                 &mut spans,
                 &mut col,
                 Span::styled(
-                    " model ≠ config".to_string(),
+                    "model ≠ config".to_string(),
                     selected_style(
                         Style::default().fg(WARNING_TEXT),
                         selected == Some(FooterControl::ConfigDrift),
@@ -460,7 +461,23 @@ mod tests {
         )
         .spans;
 
-        assert!(spans.iter().any(|span| span.content == " model ≠ config"));
+        let text = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(
+            text,
+            "Build · openai/gpt-test model ≠ config · defensive · esc on"
+        );
+        let drift_idx = spans
+            .iter()
+            .position(|span| span.content == "model ≠ config")
+            .expect("drift span rendered");
+        assert!(drift_idx > 0, "drift span must have a separator");
+        let separator = &spans[drift_idx - 1];
+        assert_eq!(separator.content, " ");
+        assert_eq!(separator.style.fg, Some(Color::Indexed(MUTED_COLOR_INDEX)));
+        assert!(!spans.iter().any(|span| span.content == " model ≠ config"));
         assert!(!spans.iter().any(|span| span.content == " != config"));
 
         info.active_model_diverged = false;
@@ -472,8 +489,66 @@ mod tests {
             true,
         )
         .spans;
+        assert!(!spans.iter().any(|span| span.content == "model ≠ config"));
+        assert!(!spans.iter().any(|span| span.content == " "));
         assert!(!spans.iter().any(|span| span.content == " model ≠ config"));
         assert!(!spans.iter().any(|span| span.content == " != config"));
+    }
+
+    #[test]
+    fn config_drift_underline_excludes_leading_separator() {
+        let mut info = launch_info("Build");
+        info.active_model_diverged = true;
+
+        let status = left_status(
+            &info,
+            LlmMode::Defensive,
+            std::slice::from_ref(&info.agent_name),
+            Some(FooterControl::ConfigDrift),
+            true,
+        );
+        let drift_idx = status
+            .spans
+            .iter()
+            .position(|span| span.content == "model ≠ config")
+            .expect("drift span rendered");
+        let drift = &status.spans[drift_idx];
+        let separator = &status.spans[drift_idx - 1];
+
+        assert_eq!(separator.content, " ");
+        assert_eq!(separator.style.fg, Some(Color::Indexed(MUTED_COLOR_INDEX)));
+        assert!(
+            !separator
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+        assert!(
+            !separator
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert!(
+            drift
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+        assert!(
+            drift
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+
+        let hit = status
+            .hits
+            .iter()
+            .find(|hit| hit.control == FooterControl::ConfigDrift)
+            .expect("config drift hit");
+        assert_eq!(hit.end - hit.start, drift.width() as u16);
+        assert_eq!(drift.width(), 14);
     }
 
     #[test]

@@ -22,7 +22,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::config::extended::{ExtendedConfigDoc, HarnessConfig, resolve_harnesses};
+use crate::approval::Decision;
+use crate::config::extended::{ApprovalMode, ExtendedConfigDoc, HarnessConfig, resolve_harnesses};
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 use crate::engine::validation_hint::ValidationCorrection;
 use crate::harness::run::{RunContext, WritePolicy, run_harness};
@@ -404,6 +405,28 @@ impl Tool for HarnessInvokeTool {
         // is the active primary.
         let policy = write_override.unwrap_or_else(|| WritePolicy::for_primary(&ctx.agent_id));
 
+        if let Some(approver) = &ctx.approver
+            && ctx.session.approval_mode() != ApprovalMode::Yolo
+            && !hc.always_allow
+            && !approver.store().is_harness_granted(&harness_name)
+        {
+            match approver
+                .approve_harness_invoke(&harness_name, model.as_deref(), policy)
+                .await?
+            {
+                Decision::Allow { .. } => {}
+                Decision::NoninteractiveDeny => {
+                    return Err(anyhow::anyhow!(crate::approval::NONINTERACTIVE_RUN_DENIAL));
+                }
+                Decision::Deny | Decision::StandingReject { .. } => {
+                    return Err(anyhow::anyhow!(
+                        "harness invocation denied: the user declined to run external harness `{}`",
+                        harness_selector(&harness_name)
+                    ));
+                }
+            }
+        }
+
         // Load the utility-model ref + providers for over-cap summarization
         // (reusing the auto_title-style path).
         let (extended, providers) = ctx.config.configs();
@@ -523,6 +546,11 @@ fn require_workspace_trust_for_harness_spawn() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::store::{GrantStore, Scope};
+    use crate::approval::{Approver, NONINTERACTIVE_RUN_DENIAL};
+    use crate::daemon::proto::ResolveResponse;
+    use crate::engine::interrupt::InterruptHub;
+    use std::sync::Arc;
 
     async fn with_trusted_workspace<T>(
         cwd: &std::path::Path,
@@ -533,6 +561,88 @@ mod tests {
             mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         };
         crate::config::trust::scope_workspace_trust_policy(policy, f).await
+    }
+
+    fn write_test_harness_config(root: &std::path::Path, always_allow: bool) {
+        let cockpit = root.join(".cockpit");
+        std::fs::create_dir_all(&cockpit).unwrap();
+        std::fs::write(
+            cockpit.join("config.json"),
+            format!(
+                r#"{{"harnesses":{{"codex":{{"command":"definitely-not-a-real-binary-xyz","always_allow":{always_allow}}}}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn invoke_args() -> serde_json::Value {
+        serde_json::json!({
+            "harness": "codex",
+            "prompt": "do work",
+            "write": "direct",
+        })
+    }
+
+    fn ctx_with_approver(
+        root: &std::path::Path,
+    ) -> (
+        crate::engine::tool::ToolCtx,
+        Arc<Approver>,
+        crate::db::Db,
+        Arc<InterruptHub>,
+    ) {
+        let mut ctx = crate::tools::common::test_ctx(root);
+        ctx.agent_id = "Build".to_string();
+        let db = ctx.session.db.clone();
+        let hub = Arc::new(InterruptHub::detached());
+        let store = GrantStore::new(
+            db.clone(),
+            ctx.session.id,
+            root.to_path_buf(),
+            ctx.config.clone(),
+        );
+        let approver = Arc::new(Approver::new(
+            store,
+            db.clone(),
+            ctx.session.id,
+            "Build",
+            hub.clone(),
+        ));
+        ctx.approver = Some(approver.clone());
+        (ctx, approver, db, hub)
+    }
+
+    fn resolve_next_interrupt(
+        db: crate::db::Db,
+        session_id: uuid::Uuid,
+        hub: Arc<InterruptHub>,
+        response: ResolveResponse,
+    ) -> tokio::task::JoinHandle<()> {
+        let initial: Vec<uuid::Uuid> = db
+            .list_open_interrupts(session_id)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.interrupt_id)
+            .collect();
+        tokio::spawn(async move {
+            loop {
+                let open = db.list_open_interrupts(session_id).unwrap();
+                if let Some(row) = open.iter().find(|row| !initial.contains(&row.interrupt_id)) {
+                    db.resolve_interrupt(row.interrupt_id, &response).unwrap();
+                    if hub.resolve(row.interrupt_id, response.clone()) {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+
+    async fn invoke_with_missing_command(ctx: &crate::engine::tool::ToolCtx) -> anyhow::Error {
+        HarnessInvokeTool
+            .call(invoke_args(), ctx)
+            .await
+            .unwrap_err()
     }
 
     #[test]
@@ -756,6 +866,140 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("unknown harness"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn harness_invoke_approval_denial_blocks_before_preflight() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_harness_config(tmp.path(), false);
+        let (ctx, _approver, db, hub) = ctx_with_approver(tmp.path());
+        let resolver = resolve_next_interrupt(
+            db.clone(),
+            ctx.session.id,
+            hub,
+            ResolveResponse::Single {
+                selected_id: crate::approval::ID_REJECT.to_string(),
+            },
+        );
+
+        let err = with_trusted_workspace(tmp.path(), async {
+            invoke_with_missing_command(&ctx).await
+        })
+        .await;
+        resolver.await.unwrap();
+
+        let msg = err.to_string();
+        assert!(msg.contains("harness invocation denied"), "{msg}");
+        assert!(!msg.contains("not found on PATH"), "{msg}");
+        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn harness_invoke_approval_noninteractive_denial_returns_structured_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_harness_config(tmp.path(), false);
+        let (ctx, _approver, db, hub) = ctx_with_approver(tmp.path());
+        let resolver = resolve_next_interrupt(
+            db.clone(),
+            ctx.session.id,
+            hub,
+            ResolveResponse::Freetext {
+                text: NONINTERACTIVE_RUN_DENIAL.to_string(),
+            },
+        );
+
+        let err = with_trusted_workspace(tmp.path(), async {
+            invoke_with_missing_command(&ctx).await
+        })
+        .await;
+        resolver.await.unwrap();
+
+        assert_eq!(err.to_string(), NONINTERACTIVE_RUN_DENIAL);
+        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn harness_invoke_approval_yolo_opens_no_interrupt_and_reaches_preflight() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_harness_config(tmp.path(), false);
+        let (ctx, _approver, db, _hub) = ctx_with_approver(tmp.path());
+        ctx.session.set_approval_mode(ApprovalMode::Yolo);
+
+        let err = with_trusted_workspace(tmp.path(), async {
+            invoke_with_missing_command(&ctx).await
+        })
+        .await;
+
+        let msg = err.to_string();
+        assert!(msg.contains("not found on PATH"), "{msg}");
+        assert!(!msg.contains("harness invocation denied"), "{msg}");
+        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn harness_invoke_always_allow_opens_no_interrupt_in_manual_and_auto() {
+        for mode in [ApprovalMode::Manual, ApprovalMode::Auto] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_test_harness_config(tmp.path(), true);
+            let (ctx, _approver, db, _hub) = ctx_with_approver(tmp.path());
+            ctx.session.set_approval_mode(mode);
+
+            let err = with_trusted_workspace(tmp.path(), async {
+                invoke_with_missing_command(&ctx).await
+            })
+            .await;
+
+            let msg = err.to_string();
+            assert!(msg.contains("not found on PATH"), "{msg}");
+            assert!(!msg.contains("harness invocation denied"), "{msg}");
+            assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_invoke_without_approver_opens_no_interrupt_and_reaches_preflight() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_harness_config(tmp.path(), false);
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.agent_id = "Build".to_string();
+        ctx.session.set_approval_mode(ApprovalMode::Manual);
+
+        let err = with_trusted_workspace(tmp.path(), async {
+            invoke_with_missing_command(&ctx).await
+        })
+        .await;
+
+        let msg = err.to_string();
+        assert!(msg.contains("not found on PATH"), "{msg}");
+        assert!(!msg.contains("harness invocation denied"), "{msg}");
+        assert!(
+            ctx.session
+                .db
+                .list_open_interrupts(ctx.session.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn harness_invoke_session_grant_opens_no_interrupt_and_reaches_preflight() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_harness_config(tmp.path(), false);
+        let (ctx, approver, db, _hub) = ctx_with_approver(tmp.path());
+        approver
+            .store()
+            .record_harness("codex", Scope::Session)
+            .unwrap();
+
+        let err = with_trusted_workspace(tmp.path(), async {
+            invoke_with_missing_command(&ctx).await
+        })
+        .await;
+
+        let msg = err.to_string();
+        assert!(msg.contains("not found on PATH"), "{msg}");
+        assert!(!msg.contains("harness invocation denied"), "{msg}");
+        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
     }
 
     #[test]

@@ -40,6 +40,7 @@ pub mod classify;
 pub mod store;
 
 mod command;
+mod harness;
 mod options;
 mod paths;
 mod policy;

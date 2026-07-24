@@ -629,10 +629,11 @@ CREATE TABLE compaction_shadows (
 -- DB in the layered `.cockpit/` config dirs — only Session belongs in
 -- SQLite (dropped with the session via CASCADE).
 --
--- `grant_kind` is 'command' (keyed by argv[0]+subcommand, e.g. `gh pr`)
--- or 'path' or 'mcp_tool' (keyed by external MCP server/tool). Wrapper/eval
--- commands are NEVER persisted here — the store layer rejects them before
--- insert. `risk_tier` records the command tier
+-- `grant_kind` is 'command' (keyed by argv[0]+subcommand, e.g. `gh pr`),
+-- 'path', 'mcp_tool' (keyed by external MCP server/tool), or 'harness'
+-- (keyed by configured external harness name). Wrapper/eval commands are
+-- NEVER persisted here — the store layer rejects them before insert.
+-- `risk_tier` records the command tier
 -- displayed when an allow grant was issued, so future invocations of the
 -- same coarse command key only skip the prompt when their recomputed tier
 -- is no higher. Path grants, MCP-tool grants, and rejects carry no tier.
@@ -642,7 +643,7 @@ CREATE TABLE compaction_shadows (
 
 CREATE TABLE approval_grants (
     session_id  TEXT    NOT NULL,
-    grant_kind  TEXT    NOT NULL CHECK (grant_kind IN ('command', 'path', 'mcp_tool')),
+    grant_kind  TEXT    NOT NULL CHECK (grant_kind IN ('command', 'path', 'mcp_tool', 'harness')),
     grant_key   TEXT    NOT NULL,
     granted_at  INTEGER NOT NULL,
     verdict     TEXT    NOT NULL DEFAULT 'allow'

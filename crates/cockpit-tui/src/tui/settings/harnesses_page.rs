@@ -81,9 +81,10 @@ enum Field {
     AuthEnvVars,
     AuthProbeArgs,
     Timeout,
+    AlwaysAllow,
 }
 
-const FIELDS: [Field; 16] = [
+const FIELDS: [Field; 17] = [
     Field::Command,
     Field::Args,
     Field::PromptInput,
@@ -102,6 +103,7 @@ const FIELDS: [Field; 16] = [
     // AuthProbeArgs sits before Timeout in the struct but we keep the
     // common fields first; place it last so the high-traffic ones lead.
     Field::AuthProbeArgs,
+    Field::AlwaysAllow,
 ];
 
 impl Field {
@@ -123,6 +125,7 @@ impl Field {
             Field::AuthEnvVars => "auth env vars",
             Field::AuthProbeArgs => "auth probe args",
             Field::Timeout => "timeout (secs)",
+            Field::AlwaysAllow => "always allow (skip approval)",
         }
     }
 
@@ -134,6 +137,7 @@ impl Field {
                 | Field::ArgvOverflow
                 | Field::SupportsJson
                 | Field::SupportsAgentFile
+                | Field::AlwaysAllow
         )
     }
 
@@ -156,6 +160,7 @@ impl Field {
             Field::AuthEnvVars => join_args(&hc.auth_env_vars),
             Field::AuthProbeArgs => join_args(&hc.auth_probe_args),
             Field::Timeout => hc.timeout_secs.to_string(),
+            Field::AlwaysAllow => yesno(hc.always_allow),
         }
     }
 
@@ -199,7 +204,8 @@ impl Field {
             Field::PromptInput
             | Field::ArgvOverflow
             | Field::SupportsJson
-            | Field::SupportsAgentFile => {}
+            | Field::SupportsAgentFile
+            | Field::AlwaysAllow => {}
         }
     }
 
@@ -210,6 +216,7 @@ impl Field {
             Field::ArgvOverflow => hc.argv_overflow = hc.argv_overflow.cycled(),
             Field::SupportsJson => hc.supports_json_output = !hc.supports_json_output,
             Field::SupportsAgentFile => hc.supports_agent_file = !hc.supports_agent_file,
+            Field::AlwaysAllow => hc.always_allow = !hc.always_allow,
             _ => {}
         }
     }
@@ -653,6 +660,7 @@ fn blank_harness() -> HarnessConfig {
         agent_file_env: None,
         auth_env_vars: vec![],
         auth_probe_args: vec![],
+        always_allow: false,
         timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,
     }
 }
@@ -729,7 +737,7 @@ mod tests {
 
     #[test]
     fn fields_cover_all_editable_harness_fields() {
-        // 16 fields, all distinct.
+        // 17 fields, all distinct.
         let mut seen = std::collections::HashSet::new();
         for f in FIELDS {
             assert!(
@@ -738,7 +746,7 @@ mod tests {
                 f.label()
             );
         }
-        assert_eq!(FIELDS.len(), 16);
+        assert_eq!(FIELDS.len(), 17);
     }
 
     #[test]
@@ -790,5 +798,19 @@ mod tests {
         assert_eq!(hc.prompt_input, PromptInputMode::Argv);
         Field::ArgvOverflow.cycle(&mut hc);
         assert_eq!(hc.argv_overflow, ArgvOverflowBehavior::SpillToStdin);
+    }
+
+    #[test]
+    fn always_allow_row_toggles_and_renders_yes_no() {
+        let mut hc = blank_harness();
+        assert_eq!(Field::AlwaysAllow.value(&hc), "no");
+
+        Field::AlwaysAllow.cycle(&mut hc);
+        assert!(hc.always_allow);
+        assert_eq!(Field::AlwaysAllow.value(&hc), "yes");
+
+        Field::AlwaysAllow.cycle(&mut hc);
+        assert!(!hc.always_allow);
+        assert_eq!(Field::AlwaysAllow.value(&hc), "no");
     }
 }

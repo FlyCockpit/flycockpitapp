@@ -154,6 +154,10 @@ pub enum StoreError {
     /// the caller should simply not record it.
     #[error("`Once` scope is never persisted")]
     OnceNotPersistable,
+    /// Harness grants are session-only; persistent allow is stored on the
+    /// harness config itself as `always_allow`.
+    #[error("harness grants can only be stored at session scope")]
+    HarnessSessionScopeOnly,
     /// No project root could be resolved for a `Project`-scope grant
     /// (the cwd isn't inside a git worktree).
     #[error("no project root for the current directory; cannot store a project grant")]
@@ -488,6 +492,10 @@ impl GrantStore {
         None
     }
 
+    pub fn is_harness_granted(&self, harness: &str) -> bool {
+        self.session_has(GrantKind::Harness, harness, Verdict::Allow)
+    }
+
     #[cfg(test)]
     fn is_path_granted(&self, path: &Path) -> bool {
         self.is_path_granted_for(path, SandboxPathAccess::Read)
@@ -694,6 +702,24 @@ impl GrantStore {
             None,
             None,
         )
+    }
+
+    /// Record a configured external harness allow grant for this session.
+    /// Durable always-allow is a field on the harness config, not an
+    /// `approvals.json` entry, so non-session scopes are rejected.
+    pub fn record_harness(&self, harness: &str, scope: Scope) -> Result<(), StoreError> {
+        match scope {
+            Scope::Once => Err(StoreError::OnceNotPersistable),
+            Scope::Session => self.record(
+                GrantKind::Harness,
+                harness,
+                Scope::Session,
+                Verdict::Allow,
+                None,
+                None,
+            ),
+            Scope::Project | Scope::Global => Err(StoreError::HarnessSessionScopeOnly),
+        }
     }
 
     // ---- loop-guard rules -------------------------------------------------
@@ -1186,6 +1212,9 @@ fn verdict_insert(
         (GrantKind::McpTool, Verdict::Reject) => {
             file.mcp_tools_reject.insert(key.to_string());
         }
+        // Harness grants are session-only; the durable equivalent is the
+        // `harnesses.<name>.always_allow` field in config.json.
+        (GrantKind::Harness, Verdict::Allow | Verdict::Reject) => {}
     }
 }
 
@@ -1197,6 +1226,8 @@ fn verdict_remove(file: &mut ApprovalsFile, kind: GrantKind, verdict: Verdict, k
         (GrantKind::Path, Verdict::Reject) => file.paths_reject.remove(key).is_some(),
         (GrantKind::McpTool, Verdict::Allow) => file.mcp_tools.remove(key),
         (GrantKind::McpTool, Verdict::Reject) => file.mcp_tools_reject.remove(key),
+        // Harness grants are session-only and never stored in approvals.json.
+        (GrantKind::Harness, Verdict::Allow | Verdict::Reject) => false,
     }
 }
 
@@ -2388,6 +2419,40 @@ mod tests {
             Some(Scope::Global)
         );
         assert!(store.mcp_tool_reject_scope("external", "search").is_none());
+    }
+
+    #[test]
+    fn harness_grant_is_session_scope_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+
+        assert_eq!(GrantKind::Harness.as_str(), "harness");
+        assert_eq!("harness".parse::<GrantKind>().unwrap(), GrantKind::Harness);
+        assert_eq!(
+            "unknown"
+                .parse::<GrantKind>()
+                .expect_err("unknown grant kind is rejected"),
+            "unknown approval class `unknown`; expected command, path, mcp_tool, or harness"
+        );
+        assert!(!store.is_harness_granted("claude"));
+        store.record_harness("claude", Scope::Session).unwrap();
+        assert!(store.is_harness_granted("claude"));
+
+        assert!(matches!(
+            store.record_harness("codex", Scope::Once),
+            Err(StoreError::OnceNotPersistable)
+        ));
+        assert!(matches!(
+            store.record_harness("codex", Scope::Project),
+            Err(StoreError::HarnessSessionScopeOnly)
+        ));
+        assert!(matches!(
+            store.record_harness("codex", Scope::Global),
+            Err(StoreError::HarnessSessionScopeOnly)
+        ));
+        assert!(!test_project_dir(&store).join("approvals.json").exists());
+        assert!(!global.path().join("approvals.json").exists());
     }
 
     /// `Once` is never persisted in either polarity, and a wrapper command can

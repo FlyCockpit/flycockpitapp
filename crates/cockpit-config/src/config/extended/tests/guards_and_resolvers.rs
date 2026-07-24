@@ -443,6 +443,39 @@ fn resolve_harnesses_deep_merges_per_field() {
 }
 
 #[test]
+fn harness_always_allow_defaults_false_and_deep_merges() {
+    let tmp = TempDir::new().unwrap();
+    let global = tmp.path().join("global.json");
+    let project = tmp.path().join("project.json");
+    std::fs::write(
+        &global,
+        r#"{"harnesses":{"claude":{"command":"claude","args":["-p"]}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &project,
+        r#"{"harnesses":{"claude":{"always_allow":true}}}"#,
+    )
+    .unwrap();
+
+    let merged = resolve_harnesses_from_paths(&[global, project]);
+    let claude = merged.get("claude").unwrap();
+    assert_eq!(claude.command, "claude");
+    assert_eq!(claude.args, vec!["-p".to_string()]);
+    assert!(claude.always_allow);
+
+    let absent = serde_json::from_str::<HarnessConfig>(r#"{"command":"codex"}"#).unwrap();
+    assert!(!absent.always_allow);
+}
+
+#[test]
+fn harness_always_allow_is_false_for_every_builtin_preset() {
+    for (name, preset) in builtin_harness_presets() {
+        assert!(!preset.always_allow, "{name}");
+    }
+}
+
+#[test]
 fn resolve_harnesses_unions_distinct_names_and_skips_garbage() {
     let tmp = TempDir::new().unwrap();
     let a = tmp.path().join("a.json");

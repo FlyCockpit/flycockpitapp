@@ -106,6 +106,7 @@ mod tests {
             agent_file_env: None,
             auth_env_vars: vec![],
             auth_probe_args: vec![],
+            always_allow: false,
             timeout_secs: 60,
         }
     }

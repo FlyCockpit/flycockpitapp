@@ -1608,6 +1608,19 @@ mod tests {
     }
 
     #[test]
+    fn run_approve_class_grants_harness() {
+        let question = approval_question(GrantKind::Harness);
+        let resolution = resolve_run_interrupt(Some(&question), None, &[GrantKind::Harness]);
+        assert!(resolution.approved);
+        assert_eq!(resolution.class, Some(GrantKind::Harness));
+        assert!(matches!(
+            resolution.response,
+            proto::ResolveResponse::Single { ref selected_id }
+                if selected_id == crate::approval::ID_APPROVE_ONCE
+        ));
+    }
+
+    #[test]
     fn run_prints_session_id() {
         let session_id = Uuid::new_v4();
         let mut stdout = Vec::new();

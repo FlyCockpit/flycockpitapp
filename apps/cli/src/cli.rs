@@ -508,7 +508,7 @@ pub struct RunArgs {
     pub cwd: Option<PathBuf>,
 
     /// Auto-approve this existing approval taxonomy class for this run only.
-    /// Repeatable; valid classes: command, path. Grants are never persisted.
+    /// Repeatable; valid classes: command, path, mcp_tool, harness. Grants are never persisted.
     #[arg(long, value_name = "CLASS")]
     pub approve: Vec<crate::approval::store::GrantKind>,
 

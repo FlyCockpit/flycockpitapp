@@ -75,6 +75,7 @@ pub enum GrantKind {
     Command,
     Path,
     McpTool,
+    Harness,
 }
 
 impl GrantKind {
@@ -83,6 +84,7 @@ impl GrantKind {
             Self::Command => "command",
             Self::Path => "path",
             Self::McpTool => "mcp_tool",
+            Self::Harness => "harness",
         }
     }
 }
@@ -95,8 +97,9 @@ impl std::str::FromStr for GrantKind {
             "command" => Ok(Self::Command),
             "path" => Ok(Self::Path),
             "mcp_tool" => Ok(Self::McpTool),
+            "harness" => Ok(Self::Harness),
             other => Err(format!(
-                "unknown approval class `{other}`; expected command, path, or mcp_tool"
+                "unknown approval class `{other}`; expected command, path, mcp_tool, or harness"
             )),
         }
     }

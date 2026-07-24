@@ -281,6 +281,7 @@ mod tests {
             agent_file_env: None,
             auth_env_vars: vec!["ALLOWED_AUTH_TOKEN".to_string()],
             auth_probe_args: vec![],
+            always_allow: false,
             timeout_secs: 60,
         };
         let env = crate::harness::env::harness_child_env(&cfg, None);

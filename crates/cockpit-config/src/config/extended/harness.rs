@@ -158,6 +158,11 @@ pub struct HarnessConfig {
     /// `auth_env_vars` are set. Empty skips the probe (assume authed).
     #[serde(default)]
     pub auth_probe_args: Vec<String>,
+    /// Skip the per-session harness-invocation approval for this harness.
+    /// Editable in `/settings -> Harnesses`; stored as `always_allow` under
+    /// `harnesses.<name>` in `config.json`. Defaults to `false`.
+    #[serde(default)]
+    pub always_allow: bool,
     /// Per-harness wall-clock timeout (seconds) for a non-interactive
     /// invocation. The invoke tool kills the child (process group on
     /// Unix) when this elapses. Default [`DEFAULT_HARNESS_TIMEOUT_SECS`].
@@ -299,6 +304,7 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
                 agent_file_env: None,
                 auth_env_vars: vec!["ANTHROPIC_API_KEY".to_string()],
                 auth_probe_args: vec![],
+                always_allow: false,
                 timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,
             },
         ),
@@ -334,6 +340,7 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
                 agent_file_env: None,
                 auth_env_vars: vec!["OPENAI_API_KEY".to_string()],
                 auth_probe_args: vec![],
+                always_allow: false,
                 timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,
             },
         ),
@@ -361,6 +368,7 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
                 agent_file_env: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                always_allow: false,
                 timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,
             },
         ),
@@ -398,6 +406,7 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
                     "GITHUB_TOKEN".to_string(),
                 ],
                 auth_probe_args: vec![],
+                always_allow: false,
                 timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,
             },
         ),
@@ -433,6 +442,7 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
                 agent_file_env: Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string()),
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                always_allow: false,
                 timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,
             },
         ),
@@ -468,6 +478,7 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
                 agent_file_args: vec!["--agent".to_string(), "{agent_file}".to_string()],
                 agent_file_env: None,
                 auth_env_vars: vec![],
+                always_allow: false,
                 auth_probe_args: vec![],
                 timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,
             },

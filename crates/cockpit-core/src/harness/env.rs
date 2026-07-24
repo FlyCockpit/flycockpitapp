@@ -88,6 +88,7 @@ mod tests {
             agent_file_env: None,
             auth_env_vars: auth_env_vars.into_iter().map(str::to_string).collect(),
             auth_probe_args: vec![],
+            always_allow: false,
             timeout_secs: 60,
         }
     }

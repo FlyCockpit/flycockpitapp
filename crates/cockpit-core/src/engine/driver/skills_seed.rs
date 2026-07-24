@@ -814,11 +814,13 @@ impl Driver {
         // Record a successfully-loaded user-invoked skill in the seedable set
         // so a later `task.skill_seed` naming it passes host validation
         // (implementation note). The skill tool's output is
-        // `Skill \`name\`:\n\n<rendered body>`; strip that header so the seeded
-        // payload carries the instructions, not the wrapper line.
+        // `Skill \`name\` (package directory: ...):\n\n<rendered body>`; strip
+        // that header so the seeded payload carries the instructions, not the
+        // wrapper line.
         if !hard_fail {
             let seed_body = body
-                .strip_prefix(&format!("Skill `{skill_name}`:\n\n"))
+                .strip_prefix(&format!("Skill `{skill_name}` (package directory: "))
+                .and_then(|rest| rest.split_once("):\n\n").map(|(_, body)| body))
                 .unwrap_or(&body);
             self.record_active_skill(skill_name, seed_body);
         }

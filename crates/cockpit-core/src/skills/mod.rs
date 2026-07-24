@@ -264,6 +264,10 @@ pub struct Skill {
     pub source: PathBuf,
 }
 
+pub fn package_root(skill: &Skill) -> &Path {
+    skill.source.parent().unwrap_or(&skill.source)
+}
+
 /// Capabilities used to filter conditional Hermes skills for one live agent
 /// session. Toolsets are derived from Cockpit's concrete tool registry, so
 /// activation follows the surface the model can actually call.
@@ -509,10 +513,7 @@ pub fn load_body(skill: &Skill) -> Result<String> {
 pub fn load_support_file(skill: &Skill, relative: &Path) -> Result<String> {
     validate_support_relative(relative)?;
 
-    let package = skill
-        .source
-        .parent()
-        .context("SKILL.md has no package directory")?
+    let package = package_root(skill)
         .canonicalize()
         .context("canonicalizing skill package")?;
     let canonical = package
@@ -1577,6 +1578,29 @@ mod tests {
         ];
         let cat = catalog_lines(&skills);
         assert_eq!(cat, "- a: first\n- b: second\n");
+    }
+
+    #[test]
+    fn package_root_is_skill_md_parent() {
+        let skill = Skill {
+            frontmatter: SkillFrontmatter {
+                name: "package-root".into(),
+                description: "package root test".into(),
+                ..Default::default()
+            },
+            source: PathBuf::from("/x/package-root/SKILL.md"),
+        };
+        assert_eq!(package_root(&skill), Path::new("/x/package-root"));
+
+        let parentless = Skill {
+            frontmatter: SkillFrontmatter {
+                name: "parentless".into(),
+                description: "parentless source test".into(),
+                ..Default::default()
+            },
+            source: PathBuf::from("/"),
+        };
+        assert_eq!(package_root(&parentless), Path::new("/"));
     }
 
     #[test]

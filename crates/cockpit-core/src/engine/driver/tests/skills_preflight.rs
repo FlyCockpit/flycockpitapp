@@ -523,11 +523,13 @@ fn fold_injected_skills_folds_every_body_ahead_of_the_user_message() {
     let skills = vec![
         InjectedSkill {
             name: "firecrawl".to_string(),
+            package_dir: "/skills/firecrawl".to_string(),
             body: "FIRECRAWL BODY".to_string(),
             reason: Some("REASON SHOULD STAY OFF WIRE".to_string()),
         },
         InjectedSkill {
             name: "deploy".to_string(),
+            package_dir: "/skills/deploy".to_string(),
             body: "DEPLOY BODY".to_string(),
             reason: None,
         },
@@ -553,9 +555,27 @@ fn fold_injected_skills_folds_every_body_ahead_of_the_user_message() {
     assert!(fc < dp, "first-ranked body precedes the second");
     assert!(dp < um, "bodies precede the user's message");
     assert!(
-        wire.contains("Skill `firecrawl` (auto-selected):"),
+        wire.contains("Skill `firecrawl` (auto-selected, package directory: /skills/firecrawl):"),
         "each body keeps its auto-selected header"
     );
+}
+
+#[test]
+fn injected_skill_header_includes_package_directory() {
+    use crate::skills::auto_select::InjectedSkill;
+
+    let skills = vec![InjectedSkill {
+        name: "review".to_string(),
+        package_dir: "/skills/review".to_string(),
+        body: "REVIEW BODY".to_string(),
+        reason: None,
+    }];
+
+    let wire = Driver::fold_injected_skills(&skills, "check this diff");
+
+    assert!(wire.starts_with(
+        "Skill `review` (auto-selected, package directory: /skills/review):\n\nREVIEW BODY\n\n---\n\ncheck this diff"
+    ));
 }
 
 /// No injection (the empty-selection / `Selection::None` shape) leaves the

@@ -58,6 +58,7 @@ const FALLBACK_KEYWORD_COUNT: usize = 3;
 /// off-wire (GOALS §14): the reason never enters the model's context.
 pub struct InjectedSkill {
     pub name: String,
+    pub package_dir: String,
     pub body: String,
     pub reason: Option<String>,
 }
@@ -341,6 +342,7 @@ fn render_capped_and_budgeted(
             .or_else(|| fallback_reason(&survivor.matched));
         injected.push(InjectedSkill {
             name: skill.frontmatter.name.clone(),
+            package_dir: redact.scrub(&crate::skills::package_root(skill).display().to_string()),
             body: rendered,
             reason,
         });
@@ -472,17 +474,20 @@ fn selector_window(
 }
 
 /// Remove exactly the wire prefix produced by `Driver::fold_injected_skills`:
-/// one or more leading `Skill `<name>` (auto-selected):` blocks separated
+/// one or more leading `Skill `<name>` (auto-selected, package directory: ...):` blocks separated
 /// from the real user text by `\n\n---\n\n`.
 fn strip_leading_folded_auto_skills(mut text: &str) -> &str {
     loop {
         let Some(rest) = text.strip_prefix("Skill `") else {
             return text;
         };
-        let Some(after_name) = rest.split_once("` (auto-selected):\n\n") else {
+        let Some(after_name) = rest.split_once("` (auto-selected, package directory: ") else {
             return text;
         };
-        let Some((_body, after_block)) = after_name.1.split_once("\n\n---\n\n") else {
+        let Some(after_header) = after_name.1.split_once("):\n\n") else {
+            return text;
+        };
+        let Some((_body, after_block)) = after_header.1.split_once("\n\n---\n\n") else {
             return text;
         };
         text = after_block;

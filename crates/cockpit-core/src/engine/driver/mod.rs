@@ -1994,8 +1994,8 @@ impl Driver {
         let mut out = String::new();
         for skill in skills {
             out.push_str(&format!(
-                "Skill `{}` (auto-selected):\n\n{}\n\n---\n\n",
-                skill.name, skill.body
+                "Skill `{}` (auto-selected, package directory: {}):\n\n{}\n\n---\n\n",
+                skill.name, skill.package_dir, skill.body
             ));
         }
         out.push_str(user_text);

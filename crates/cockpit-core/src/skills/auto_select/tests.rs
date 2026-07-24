@@ -64,7 +64,9 @@ fn skill_strict(name: &str, description: &str, triggers: &[&str]) -> Skill {
 }
 
 fn folded_skill(name: &str, body: &str, user: &str) -> String {
-    format!("Skill `{name}` (auto-selected):\n\n{body}\n\n---\n\n{user}")
+    format!(
+        "Skill `{name}` (auto-selected, package directory: /x/{name}):\n\n{body}\n\n---\n\n{user}"
+    )
 }
 
 /// The real `firecrawl` skill description (verbatim subject prose) — the
@@ -398,6 +400,18 @@ fn selector_window_strips_leading_folded_skill_blocks_only() {
         strip_leading_folded_auto_skills(mentioned_later),
         mentioned_later
     );
+}
+
+#[test]
+fn strip_leading_folded_auto_skills_handles_package_directory_header() {
+    let original = "actual user request";
+    let folded = folded_skill(
+        "generate-benchmark",
+        "release notes deployment runbook body words",
+        original,
+    );
+
+    assert_eq!(strip_leading_folded_auto_skills(&folded), original);
 }
 
 #[test]
@@ -920,6 +934,34 @@ fn render_cap_keeps_top_n_by_order() {
     // The kept set is the top-N by relevance order (s0..s{N-1}).
     let expected: Vec<String> = (0..MAX_SELECTED_SKILLS).map(|i| format!("s{i}")).collect();
     assert_eq!(names(&injected), expected);
+}
+
+#[test]
+fn injected_skill_path_does_not_change_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s: Vec<Skill> = ["deploy", "review", "docs", "extra"]
+        .into_iter()
+        .map(|name| write_skill(tmp.path(), name, "x"))
+        .collect();
+    let chosen: Vec<Survivor> = s.iter().map(survivor).collect();
+    let extended = ExtendedConfig::default();
+
+    let injected =
+        render_capped_and_budgeted(&chosen, tmp.path(), &extended, &no_redact(tmp.path()));
+
+    assert_eq!(injected.len(), MAX_SELECTED_SKILLS);
+    assert_eq!(names(&injected), vec!["deploy", "review", "docs"]);
+    assert_eq!(
+        injected
+            .iter()
+            .map(|skill| skill.package_dir.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            tmp.path().join("deploy").display().to_string(),
+            tmp.path().join("review").display().to_string(),
+            tmp.path().join("docs").display().to_string()
+        ]
+    );
 }
 
 #[test]

@@ -173,20 +173,29 @@ fn load_skill_for_session(
     if let Some(path) = path {
         let body = crate::skills::load_support_file(skill, std::path::Path::new(path))
             .map_err(|e| invalid_input(format!("loading support file `{path}`: {e}")))?;
+        let package_dir = rendered_package_root(skill, redact);
         record_skill_view(db, skill, name);
         return Ok(ToolOutput::text(format!(
-            "Skill `{name}` support file `{path}`:\n\n{body}{setup_note}"
+            "Skill `{name}` support file `{path}` (package directory: {package_dir}):\n\n{body}{setup_note}"
         )));
     }
 
     let body = crate::skills::load_body(skill)
         .map_err(|e| anyhow::anyhow!("loading skill `{name}`: {e}"))?;
     record_skill_view(db, skill, name);
+    let package_dir = rendered_package_root(skill, redact);
     let rendered =
         crate::skills::render_body(&body, cwd, extended.skills.auto_bang_commands, redact);
     Ok(ToolOutput::text(format!(
-        "Skill `{name}`:\n\n{rendered}{setup_note}"
+        "Skill `{name}` (package directory: {package_dir}):\n\n{rendered}{setup_note}"
     )))
+}
+
+fn rendered_package_root(
+    skill: &crate::skills::Skill,
+    redact: &crate::redact::RedactionTable,
+) -> String {
+    redact.scrub(&crate::skills::package_root(skill).display().to_string())
 }
 
 fn model_invocable_available_list(skills: &[crate::skills::Skill]) -> String {
@@ -363,6 +372,100 @@ mod tests {
         .unwrap();
         assert!(out.content.contains("Skill `deploy`"));
         assert!(out.content.contains("Run the deploy checklist."));
+    }
+
+    #[test]
+    fn skill_body_output_includes_package_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        write_skill(
+            &scan,
+            "deploy",
+            "---\nname: deploy\ndescription: deploy steps\n---\n",
+            "Run the deploy checklist.",
+        );
+        let package_dir = scan.join("deploy").canonicalize().unwrap();
+
+        let out = load_skill_into_output(
+            "deploy",
+            tmp.path(),
+            &cfg_for(&scan, false),
+            &no_redact(tmp.path()),
+        )
+        .unwrap();
+
+        assert!(out.content.starts_with(&format!(
+            "Skill `deploy` (package directory: {}):\n\n",
+            package_dir.display()
+        )));
+        assert!(out.content.contains("Run the deploy checklist."));
+    }
+
+    #[test]
+    fn skill_support_file_output_includes_package_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        write_skill(
+            &scan,
+            "deploy",
+            "---\nname: deploy\ndescription: deploy steps\n---\n",
+            "Run the deploy checklist.",
+        );
+        let support_dir = scan.join("deploy/references");
+        std::fs::create_dir_all(&support_dir).unwrap();
+        std::fs::write(support_dir.join("steps.md"), "Support details.").unwrap();
+        let package_dir = scan.join("deploy").canonicalize().unwrap();
+
+        let out = load_skill_for_session(
+            "deploy",
+            Some("references/steps.md"),
+            tmp.path(),
+            &cfg_for(&scan, false),
+            &no_redact(tmp.path()),
+            &crate::skills::ActivationContext::default(),
+            &std::sync::RwLock::new(std::collections::HashMap::new()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(out.content.starts_with(&format!(
+            "Skill `deploy` support file `references/steps.md` (package directory: {}):\n\n",
+            package_dir.display()
+        )));
+        assert!(out.content.contains("Support details."));
+    }
+
+    #[test]
+    fn skill_output_package_directory_is_redacted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        write_skill(
+            &scan,
+            "deploy",
+            "---\nname: deploy\ndescription: deploy steps\n---\n",
+            "Run the deploy checklist.",
+        );
+        let package_dir = scan.join("deploy").canonicalize().unwrap();
+        let redaction_cfg = crate::config::extended::RedactConfig {
+            denylist: vec![package_dir.display().to_string()],
+            placeholder: "[skill-package-redacted]".to_string(),
+            scan_ssh_keys: false,
+            ..Default::default()
+        };
+        let redact = crate::redact::RedactionTable::build(&redaction_cfg, tmp.path()).unwrap();
+
+        let out =
+            load_skill_into_output("deploy", tmp.path(), &cfg_for(&scan, false), &redact).unwrap();
+
+        assert!(!out.content.contains(&package_dir.display().to_string()));
+        assert!(
+            out.content
+                .contains("Skill `deploy` (package directory: [skill-package-redacted]):")
+        );
     }
 
     #[test]

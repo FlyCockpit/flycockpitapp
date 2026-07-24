@@ -822,6 +822,8 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/mcp/builtin.rs",
         "crates/cockpit-core/src/redact/mod.rs",
         "crates/cockpit-core/src/session/export/mod.rs",
+        "crates/cockpit-core/src/skills/auto_select/mod.rs",
+        "crates/cockpit-core/src/tools/skill.rs",
     ];
 
     #[test]

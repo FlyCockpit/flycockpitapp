@@ -2798,13 +2798,12 @@ where
     if !send_writer_envelope(&writer_tx, hello).await {
         return Ok(());
     }
-    let _ = writer_tx
-        .send(ClientWriterMessage::Envelope(Envelope::event(
-            ctx.caffeinate_state_event(),
-        )))
-        .await;
-
-    let reader_task = tokio::spawn(run_client_reader(reader, executor_tx.clone()));
+    let reader_task = tokio::spawn(run_client_reader(
+        reader,
+        executor_tx.clone(),
+        writer_tx.clone(),
+        Some(ctx.caffeinate_state_event()),
+    ));
     let writer_task = tokio::spawn(run_client_writer(writer, writer_rx));
     let event_task = tokio::spawn(run_client_event_forwarder(
         ctx.clone(),
@@ -2847,6 +2846,7 @@ enum ClientExecutorInput {
 }
 
 enum ClientWriterMessage {
+    SetVersion(u32),
     Envelope(Envelope),
     EnvelopeWithAck {
         envelope: Envelope,
@@ -2890,12 +2890,32 @@ async fn send_writer_envelope_with_ack(
 async fn run_client_reader<R>(
     mut reader: ProtoReadHalf<R>,
     executor_tx: mpsc::Sender<ClientExecutorInput>,
+    writer_tx: mpsc::Sender<ClientWriterMessage>,
+    initial_event_after_negotiation: Option<proto::Event>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
 {
+    let mut initial_event_after_negotiation = initial_event_after_negotiation;
     loop {
         match reader.recv().await {
             Ok(Some(frame)) => {
+                if let Some(version) = negotiated_writer_version_for_frame(&frame) {
+                    if writer_tx
+                        .send(ClientWriterMessage::SetVersion(version))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if let Some(event) = initial_event_after_negotiation.take()
+                        && writer_tx
+                            .send(ClientWriterMessage::Envelope(Envelope::event(event)))
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
                 if executor_tx
                     .send(ClientExecutorInput::Frame(frame))
                     .await
@@ -2913,6 +2933,14 @@ async fn run_client_reader<R>(
     }
 }
 
+fn negotiated_writer_version_for_frame(frame: &RecvFrame) -> Option<u32> {
+    match frame {
+        RecvFrame::Envelope(env) => Some(env.v.min(proto::PROTOCOL_VERSION)),
+        RecvFrame::Unknown { v, .. } => Some((*v).min(proto::PROTOCOL_VERSION)),
+        RecvFrame::VersionMismatch { .. } => None,
+    }
+}
+
 async fn run_client_writer<W>(
     mut writer: ProtoWriteHalf<W>,
     mut writer_rx: mpsc::Receiver<ClientWriterMessage>,
@@ -2921,6 +2949,10 @@ async fn run_client_writer<W>(
 {
     while let Some(message) = writer_rx.recv().await {
         let (envelope, ack) = match message {
+            ClientWriterMessage::SetVersion(version) => {
+                writer.set_negotiated_version(version);
+                continue;
+            }
             ClientWriterMessage::Envelope(envelope) => (envelope, None),
             ClientWriterMessage::EnvelopeWithAck { envelope, ack } => (envelope, Some(ack)),
         };

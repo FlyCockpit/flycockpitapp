@@ -127,6 +127,18 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 return print_json_status(&probe).await;
             }
             match probe.status {
+                DaemonStatus::IncompatibleProtocol => {
+                    let hello = probe.hello.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("incompatible daemon did not report a hello")
+                    })?;
+                    println!(
+                        "{}",
+                        render_incompatible_protocol_status(
+                            &probe.paths.socket.display().to_string(),
+                            hello,
+                        )
+                    );
+                }
                 DaemonStatus::Running => match read_daemon_versions(&probe.paths.socket).await {
                     RunningStatusVersionRead::Versions(versions) => {
                         println!(
@@ -139,10 +151,15 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                         );
                     }
                     RunningStatusVersionRead::ProtocolMismatch => {
+                        let hello = proto::DaemonHello {
+                            daemon_version: "unknown".to_string(),
+                            protocol_version: 0,
+                        };
                         println!(
                             "{}",
                             render_incompatible_protocol_status(
-                                &probe.paths.socket.display().to_string()
+                                &probe.paths.socket.display().to_string(),
+                                &hello,
                             )
                         );
                     }
@@ -201,7 +218,17 @@ async fn print_json_status(probe: &crate::daemon::DaemonProbe) -> Result<()> {
         "version_skew_reason": serde_json::Value::Null,
     });
 
-    if probe.status == DaemonStatus::Running {
+    if probe.status == DaemonStatus::IncompatibleProtocol {
+        let hello = probe
+            .hello
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("incompatible daemon did not report a hello"))?;
+        value = incompatible_protocol_json_status(
+            &probe.paths.socket.display().to_string(),
+            &resolved_database_path,
+            hello,
+        );
+    } else if probe.status == DaemonStatus::Running {
         let response = match DaemonClient::connect(&probe.paths.socket)
             .await?
             .request(Request::DaemonStatus)
@@ -345,9 +372,11 @@ fn render_running_status(
     output
 }
 
-fn render_incompatible_protocol_status(socket: &str) -> String {
+fn render_incompatible_protocol_status(socket: &str, hello: &proto::DaemonHello) -> String {
     format!(
-        "daemon: running but speaks an incompatible protocol\n  socket: {socket}\n  client: {} (protocol v{}, supports v{}..=v{})\n  {}",
+        "daemon: running but speaks an incompatible protocol\n  socket: {socket}\n  daemon: {} (protocol v{})\n  client: {} (protocol v{}, supports v{}..=v{})\n  {}",
+        hello.daemon_version,
+        hello.protocol_version,
         proto::DAEMON_VERSION,
         proto::PROTOCOL_VERSION,
         proto::MIN_SUPPORTED_PROTOCOL_VERSION,
@@ -392,9 +421,27 @@ fn running_json_status(status: RunningJsonStatus) -> serde_json::Value {
     })
 }
 
+fn incompatible_protocol_json_status(
+    socket_path: &str,
+    database_path: &str,
+    hello: &proto::DaemonHello,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "incompatible_protocol",
+        "socket_path": socket_path,
+        "daemon_version": hello.daemon_version,
+        "protocol_version": hello.protocol_version,
+        "database_path": database_path,
+        "schema_version": serde_json::Value::Null,
+        "version_skew": false,
+        "version_skew_reason": serde_json::Value::Null,
+    })
+}
+
 fn daemon_status_name(status: DaemonStatus) -> &'static str {
     match status {
         DaemonStatus::Running => "running",
+        DaemonStatus::IncompatibleProtocol => "incompatible_protocol",
         DaemonStatus::LivePidSocketUnreachable => "live_pid_socket_unreachable",
         DaemonStatus::UnverifiedPid => "unverified_pid",
         DaemonStatus::Stale => "stale",
@@ -415,6 +462,7 @@ fn restart_should_stop(status: DaemonStatus) -> bool {
     matches!(
         status,
         DaemonStatus::Running
+            | DaemonStatus::IncompatibleProtocol
             | DaemonStatus::LivePidSocketUnreachable
             | DaemonStatus::UnverifiedPid
     )
@@ -445,9 +493,10 @@ fn restart_started_message(restarted: bool, pid: u32, socket: &std::path::Path) 
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonVersions, EPHEMERAL_TUI_NOTE, RunningJsonStatus, render_incompatible_protocol_status,
-        render_running_status, restart_release_timeout_for_stop_path, restart_should_stop,
-        restart_started_message, running_json_status, validate_grace, version_skew_reason,
+        DaemonVersions, EPHEMERAL_TUI_NOTE, RunningJsonStatus, incompatible_protocol_json_status,
+        render_incompatible_protocol_status, render_running_status,
+        restart_release_timeout_for_stop_path, restart_should_stop, restart_started_message,
+        running_json_status, validate_grace, version_skew_reason,
     };
     use crate::daemon::proto;
     use crate::daemon::{self, DaemonStatus};
@@ -472,6 +521,7 @@ mod tests {
     #[test]
     fn restart_message_routing_uses_verified_daemon_status_not_stale_pid_file() {
         assert!(restart_should_stop(DaemonStatus::Running));
+        assert!(restart_should_stop(DaemonStatus::IncompatibleProtocol));
         assert!(restart_should_stop(DaemonStatus::LivePidSocketUnreachable));
         assert!(restart_should_stop(DaemonStatus::UnverifiedPid));
         assert!(!restart_should_stop(DaemonStatus::Stale));
@@ -575,13 +625,17 @@ mod tests {
     }
 
     #[test]
-    fn daemon_status_version_protocol_mismatch_block_names_restart() {
-        let output = render_incompatible_protocol_status("/tmp/cockpit.sock");
+    fn daemon_status_incompatible_protocol_names_restart() {
+        let hello = proto::DaemonHello {
+            daemon_version: "0.0.old".to_string(),
+            protocol_version: 0,
+        };
+        let output = render_incompatible_protocol_status("/tmp/cockpit.sock", &hello);
 
         assert_eq!(
             output,
             format!(
-                "daemon: running but speaks an incompatible protocol\n  socket: /tmp/cockpit.sock\n  client: {} (protocol v{}, supports v{}..=v{})\n  run `cockpit daemon restart` to restart the daemon on this version",
+                "daemon: running but speaks an incompatible protocol\n  socket: /tmp/cockpit.sock\n  daemon: 0.0.old (protocol v0)\n  client: {} (protocol v{}, supports v{}..=v{})\n  run `cockpit daemon restart` to restart the daemon on this version",
                 proto::DAEMON_VERSION,
                 proto::PROTOCOL_VERSION,
                 proto::MIN_SUPPORTED_PROTOCOL_VERSION,
@@ -589,6 +643,41 @@ mod tests {
             )
         );
         assert!(output.contains("run `cockpit daemon restart`"));
+    }
+
+    #[test]
+    fn daemon_status_json_incompatible_protocol_shape() {
+        let hello = proto::DaemonHello {
+            daemon_version: "0.0.old".to_string(),
+            protocol_version: 0,
+        };
+        let value =
+            incompatible_protocol_json_status("/tmp/cockpit.sock", "/tmp/cockpit.db", &hello);
+        let object = value.as_object().expect("json object");
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+
+        assert_eq!(
+            keys,
+            vec![
+                "daemon_version",
+                "database_path",
+                "protocol_version",
+                "schema_version",
+                "socket_path",
+                "status",
+                "version_skew",
+                "version_skew_reason",
+            ]
+        );
+        assert_eq!(value["status"], "incompatible_protocol");
+        assert_eq!(value["socket_path"], "/tmp/cockpit.sock");
+        assert_eq!(value["daemon_version"], "0.0.old");
+        assert_eq!(value["protocol_version"], 0);
+        assert_eq!(value["database_path"], "/tmp/cockpit.db");
+        assert!(value["schema_version"].is_null());
+        assert_eq!(value["version_skew"], false);
+        assert!(value["version_skew_reason"].is_null());
     }
 
     #[test]

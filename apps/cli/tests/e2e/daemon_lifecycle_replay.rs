@@ -390,7 +390,17 @@ fn lifecycle_graceful_park_round_trip_replays_once() {
 
         restart_daemon_gracefully(&daemon).await;
 
-        let row = interrupt_row(&daemon.db_path(), interrupt_id);
+        let db_path = daemon.db_path();
+        wait_until(
+            "graceful restart parked interrupt",
+            Duration::from_secs(5),
+            || {
+                let db_path = db_path.clone();
+                async move { interrupt_row(&db_path, interrupt_id).state == "parked" }
+            },
+        )
+        .await;
+        let row = interrupt_row(&db_path, interrupt_id);
         assert_eq!(row.state, "parked");
         assert_replay_payload(&row);
         assert!(
@@ -663,10 +673,12 @@ fn lifecycle_restart_command_preserves_parked_session_and_starts_when_absent() {
             .await
             .expect("reattach session");
         assert_eq!(reattached.session_id, attached.session_id);
-        assert_eq!(
-            interrupt_row(&daemon.db_path(), interrupt_id).state,
-            "parked"
-        );
+        let db_path = daemon.db_path();
+        wait_until("restarted interrupt parked", Duration::from_secs(5), || {
+            let db_path = db_path.clone();
+            async move { interrupt_row(&db_path, interrupt_id).state == "parked" }
+        })
+        .await;
         assert_eq!(
             wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
             interrupt_id

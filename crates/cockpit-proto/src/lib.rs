@@ -496,6 +496,77 @@ pub fn version_mismatch_message(v: u32) -> String {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonHello {
+    pub daemon_version: String,
+    pub protocol_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegotiatedProtocol {
+    pub version: u32,
+    pub daemon_version: String,
+    pub daemon_protocol_version: u32,
+}
+
+impl NegotiatedProtocol {
+    pub fn current() -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            daemon_version: "unknown".to_string(),
+            daemon_protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn from_hello(hello: &DaemonHello) -> std::result::Result<Self, ErrorPayload> {
+        let version = PROTOCOL_VERSION.min(hello.protocol_version);
+        if version < MIN_SUPPORTED_PROTOCOL_VERSION {
+            return Err(ErrorPayload {
+                code: ErrorCode::ProtocolVersion,
+                message: incompatible_daemon_protocol_message(hello.protocol_version),
+            });
+        }
+        Ok(Self {
+            version,
+            daemon_version: hello.daemon_version.clone(),
+            daemon_protocol_version: hello.protocol_version,
+        })
+    }
+}
+
+pub fn incompatible_daemon_protocol_message(daemon_protocol_version: u32) -> String {
+    format!(
+        "daemon speaks protocol v{daemon_protocol_version}; this client supports v{}..=v{}. run `cockpit daemon restart`",
+        MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION
+    )
+}
+
+pub fn daemon_hello_from_envelope(env: &Envelope) -> Option<DaemonHello> {
+    let Body::Response { id, response } = &env.body else {
+        return None;
+    };
+    if !id.is_nil() {
+        return None;
+    }
+    let Response::DaemonStatus {
+        daemon_version,
+        protocol_version,
+        ..
+    } = response.as_ref()
+    else {
+        return None;
+    };
+    Some(DaemonHello {
+        daemon_version: daemon_version.clone(),
+        protocol_version: *protocol_version,
+    })
+}
+
+pub fn parse_daemon_hello_line(line: &str) -> Result<Option<DaemonHello>> {
+    let env: Envelope = serde_json::from_str(line).context("deserializing daemon hello")?;
+    Ok(daemon_hello_from_envelope(&env))
+}
+
 // ---- Envelope --------------------------------------------------------------
 
 /// Top-level frame. Always carries the protocol version and one of four
@@ -525,15 +596,23 @@ pub enum RecvFrame {
 
 impl Envelope {
     pub fn request(id: Uuid, request: Request) -> Self {
+        Self::request_at(PROTOCOL_VERSION, id, request)
+    }
+
+    pub fn request_at(v: u32, id: Uuid, request: Request) -> Self {
         Self {
-            v: PROTOCOL_VERSION,
+            v,
             body: Body::Request { id, request },
         }
     }
 
     pub fn response(id: Uuid, response: Response) -> Self {
+        Self::response_at(PROTOCOL_VERSION, id, response)
+    }
+
+    pub fn response_at(v: u32, id: Uuid, response: Response) -> Self {
         Self {
-            v: PROTOCOL_VERSION,
+            v,
             body: Body::Response {
                 id,
                 response: Box::new(response),
@@ -542,15 +621,23 @@ impl Envelope {
     }
 
     pub fn event(event: Event) -> Self {
+        Self::event_at(PROTOCOL_VERSION, event)
+    }
+
+    pub fn event_at(v: u32, event: Event) -> Self {
         Self {
-            v: PROTOCOL_VERSION,
+            v,
             body: Body::Event { event },
         }
     }
 
     pub fn error(id: Option<Uuid>, error: ErrorPayload) -> Self {
+        Self::error_at(PROTOCOL_VERSION, id, error)
+    }
+
+    pub fn error_at(v: u32, id: Option<Uuid>, error: ErrorPayload) -> Self {
         Self {
-            v: PROTOCOL_VERSION,
+            v,
             body: Body::Error { id, error },
         }
     }
@@ -1374,6 +1461,7 @@ pub enum InterruptRaiseReason {
 /// `Body` variants differ per direction.
 pub struct ProtoStream<S> {
     framed: Framed<S, LinesCodec>,
+    version: u32,
 }
 
 impl<S> ProtoStream<S>
@@ -1381,12 +1469,18 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     pub fn new(stream: S) -> Self {
+        Self::with_version(stream, PROTOCOL_VERSION)
+    }
+
+    pub fn with_version(stream: S, version: u32) -> Self {
         Self {
             framed: Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES)),
+            version,
         }
     }
 
     pub fn into_split(self) -> (ProtoReadHalf<ReadHalf<S>>, ProtoWriteHalf<WriteHalf<S>>) {
+        let version = self.version;
         let (read, write) = tokio::io::split(self.framed.into_inner());
         (
             ProtoReadHalf {
@@ -1394,15 +1488,26 @@ where
             },
             ProtoWriteHalf {
                 framed: FramedWrite::new(write, LinesCodec::new_with_max_length(MAX_FRAME_BYTES)),
+                version,
             },
         )
+    }
+
+    pub fn negotiated_version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn set_negotiated_version(&mut self, version: u32) {
+        self.version = version;
     }
 
     /// Send one envelope. Serializes to a compact single-line JSON
     /// string and writes a trailing newline (`LinesCodec` adds the
     /// newline).
     pub async fn send(&mut self, env: &Envelope) -> Result<()> {
-        let line = serde_json::to_string(env).context("serializing envelope")?;
+        let mut env = env.clone();
+        env.v = self.version;
+        let line = serde_json::to_string(&env).context("serializing envelope")?;
         self.framed
             .send(line)
             .await
@@ -1422,6 +1527,10 @@ where
 
     pub async fn recv(&mut self) -> Result<Option<RecvFrame>> {
         recv_frame(&mut self.framed).await
+    }
+
+    pub async fn recv_raw_line(&mut self) -> Result<Option<String>> {
+        recv_raw_line(&mut self.framed).await
     }
 }
 
@@ -1443,17 +1552,24 @@ where
 
 pub struct ProtoWriteHalf<W> {
     framed: FramedWrite<W, LinesCodec>,
+    version: u32,
 }
 
 impl<W> ProtoWriteHalf<W>
 where
     W: AsyncWrite + Unpin,
 {
+    pub fn set_negotiated_version(&mut self, version: u32) {
+        self.version = version;
+    }
+
     /// Send one envelope. Serializes to a compact single-line JSON
     /// string and writes a trailing newline (`LinesCodec` adds the
     /// newline).
     pub async fn send(&mut self, env: &Envelope) -> Result<()> {
-        let line = serde_json::to_string(env).context("serializing envelope")?;
+        let mut env = env.clone();
+        env.v = self.version;
+        let line = serde_json::to_string(&env).context("serializing envelope")?;
         self.framed
             .send(line)
             .await
@@ -1472,14 +1588,24 @@ where
     }
 }
 
-async fn recv_frame<T>(framed: &mut T) -> Result<Option<RecvFrame>>
+async fn recv_raw_line<T>(framed: &mut T) -> Result<Option<String>>
 where
     T: futures::Stream<Item = std::result::Result<String, LinesCodecError>> + Unpin,
 {
     match framed.next().await {
         None => Ok(None),
         Some(Err(e)) => Err(codec_error(e)).context("reading envelope"),
-        Some(Ok(line)) => {
+        Some(Ok(line)) => Ok(Some(line)),
+    }
+}
+
+async fn recv_frame<T>(framed: &mut T) -> Result<Option<RecvFrame>>
+where
+    T: futures::Stream<Item = std::result::Result<String, LinesCodecError>> + Unpin,
+{
+    match recv_raw_line(framed).await? {
+        None => Ok(None),
+        Some(line) => {
             let value: serde_json::Value =
                 serde_json::from_str(&line).context("deserializing envelope")?;
             let v = value
@@ -2895,6 +3021,86 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tokio::io::duplex;
+
+    fn hello(protocol_version: u32) -> DaemonHello {
+        DaemonHello {
+            daemon_version: "0.0.test-daemon".to_string(),
+            protocol_version,
+        }
+    }
+
+    #[test]
+    fn negotiated_version_is_min_of_client_and_daemon() {
+        let current = NegotiatedProtocol::from_hello(&hello(PROTOCOL_VERSION)).unwrap();
+        assert_eq!(current.version, PROTOCOL_VERSION);
+        assert_eq!(current.daemon_protocol_version, PROTOCOL_VERSION);
+
+        let newer = NegotiatedProtocol::from_hello(&hello(PROTOCOL_VERSION + 100)).unwrap();
+        assert_eq!(newer.version, PROTOCOL_VERSION);
+        assert_eq!(newer.daemon_protocol_version, PROTOCOL_VERSION + 100);
+
+        if PROTOCOL_VERSION > MIN_SUPPORTED_PROTOCOL_VERSION {
+            let older = NegotiatedProtocol::from_hello(&hello(PROTOCOL_VERSION - 1)).unwrap();
+            assert_eq!(older.version, PROTOCOL_VERSION - 1);
+        }
+    }
+
+    #[test]
+    fn negotiated_version_below_min_supported_is_rejected() {
+        let below_min = MIN_SUPPORTED_PROTOCOL_VERSION.saturating_sub(1);
+        let err = NegotiatedProtocol::from_hello(&hello(below_min))
+            .expect_err("below-min daemon protocol must be rejected");
+        assert_eq!(err.code, ErrorCode::ProtocolVersion);
+        assert_eq!(err.message, incompatible_daemon_protocol_message(below_min));
+    }
+
+    #[tokio::test]
+    async fn envelope_constructors_stamp_the_negotiated_version() {
+        let negotiated = MIN_SUPPORTED_PROTOCOL_VERSION;
+        let (left, right) = duplex(4096);
+        let mut sender = ProtoStream::with_version(left, negotiated);
+        let mut receiver = ProtoStream::new(right);
+
+        let request = Envelope::request(Uuid::new_v4(), Request::DaemonStatus);
+        assert_eq!(request.v, PROTOCOL_VERSION);
+        sender.send(&request).await.unwrap();
+
+        match receiver.recv().await.unwrap().expect("frame") {
+            RecvFrame::Envelope(env) => assert_eq!(env.v, negotiated),
+            other => panic!("expected envelope, got {other:?}"),
+        }
+
+        assert_eq!(
+            Envelope::request_at(negotiated, Uuid::new_v4(), Request::DaemonStatus).v,
+            negotiated
+        );
+        assert_eq!(
+            Envelope::response_at(negotiated, Uuid::new_v4(), Response::Ack).v,
+            negotiated
+        );
+        assert_eq!(
+            Envelope::event_at(
+                negotiated,
+                Event::LspNotice {
+                    text: "notice".to_string()
+                }
+            )
+            .v,
+            negotiated
+        );
+        assert_eq!(
+            Envelope::error_at(
+                negotiated,
+                None,
+                ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: "error".to_string()
+                }
+            )
+            .v,
+            negotiated
+        );
+    }
 
     #[test]
     fn request_round_trip() {

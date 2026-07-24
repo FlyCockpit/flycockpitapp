@@ -191,7 +191,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
             no_sandbox: false,
             interactive: false,
             model_override: None,
-            client_protocol_version: crate::daemon::proto::PROTOCOL_VERSION,
+            client_protocol_version: client.negotiated().version,
             env_snapshot: Some(env_snapshot.to_wire()),
             env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
         })

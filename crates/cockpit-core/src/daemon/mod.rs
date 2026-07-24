@@ -59,8 +59,6 @@ use crate::private_fs::with_private_umask;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
-use tokio::io::AsyncBufReadExt;
-#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
@@ -173,11 +171,28 @@ enum DaemonEndpointKind {
 pub struct DaemonProbe {
     pub status: DaemonStatus,
     pub paths: DaemonPaths,
+    pub hello: Option<proto::DaemonHello>,
 }
 
 impl DaemonProbe {
     fn new(status: DaemonStatus, paths: DaemonPaths) -> Self {
-        Self { status, paths }
+        Self {
+            status,
+            paths,
+            hello: None,
+        }
+    }
+
+    fn with_hello(
+        status: DaemonStatus,
+        paths: DaemonPaths,
+        hello: Option<proto::DaemonHello>,
+    ) -> Self {
+        Self {
+            status,
+            paths,
+            hello,
+        }
     }
 }
 
@@ -495,6 +510,9 @@ fn bind_private_socket(socket: &std::path::Path) -> Result<UnixListener> {
 pub enum DaemonStatus {
     /// Daemon is running and the socket accepts a connection.
     Running,
+    /// Daemon answers the hello handshake, but its protocol is outside this
+    /// client's supported range. Restart or upgrade before issuing requests.
+    IncompatibleProtocol,
     /// PID file exists and belongs to a verified cockpit daemon, but no
     /// socket path we know about answers the daemon handshake.
     LivePidSocketUnreachable,
@@ -508,39 +526,79 @@ pub enum DaemonStatus {
     NotRunning,
 }
 
-#[cfg(unix)]
-async fn socket_responds(socket: &Path) -> bool {
-    if !socket.exists() {
-        return false;
+#[derive(Debug, Clone)]
+struct SocketHelloResponse {
+    hello: Option<proto::DaemonHello>,
+}
+
+fn status_for_socket_response(response: &SocketHelloResponse) -> DaemonStatus {
+    if response
+        .hello
+        .as_ref()
+        .is_some_and(|hello| !proto::is_protocol_compatible(hello.protocol_version))
+    {
+        DaemonStatus::IncompatibleProtocol
+    } else {
+        DaemonStatus::Running
     }
-    match tokio::time::timeout(Duration::from_millis(500), UnixStream::connect(socket)).await {
-        Ok(Ok(mut stream)) => {
-            let mut reader = tokio::io::BufReader::new(&mut stream);
-            let mut line = String::new();
-            matches!(
-                tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line)).await,
-                Ok(Ok(_)) if !line.is_empty()
-            )
+}
+
+fn parse_socket_hello_line(socket: &Path, line: &str) -> Option<proto::DaemonHello> {
+    match proto::parse_daemon_hello_line(line) {
+        Ok(hello) => hello,
+        Err(error) => {
+            tracing::debug!(
+                socket = %socket.display(),
+                error = %error,
+                "daemon hello line could not be parsed"
+            );
+            None
         }
-        _ => false,
     }
 }
 
 #[cfg(unix)]
-fn socket_responds_blocking(socket: &Path) -> bool {
+async fn socket_responds(socket: &Path) -> Option<SocketHelloResponse> {
+    if !socket.exists() {
+        return None;
+    }
+    match tokio::time::timeout(Duration::from_millis(500), UnixStream::connect(socket)).await {
+        Ok(Ok(stream)) => {
+            let mut proto_stream = proto::ProtoStream::new(stream);
+            match tokio::time::timeout(Duration::from_millis(500), proto_stream.recv_raw_line())
+                .await
+            {
+                Ok(Ok(Some(line))) if !line.is_empty() => Some(SocketHelloResponse {
+                    hello: parse_socket_hello_line(socket, &line),
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn socket_responds_blocking(socket: &Path) -> Option<SocketHelloResponse> {
     use std::os::unix::net::UnixStream as StdUnixStream;
 
     if !socket.exists() {
-        return false;
+        return None;
     }
     match StdUnixStream::connect(socket) {
         Ok(s) => {
             let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
             let mut buf = String::new();
             let mut r = BufReader::new(&s);
-            r.read_line(&mut buf).is_ok() && !buf.is_empty()
+            if r.read_line(&mut buf).is_ok() && !buf.is_empty() {
+                Some(SocketHelloResponse {
+                    hello: parse_socket_hello_line(socket, &buf),
+                })
+            } else {
+                None
+            }
         }
-        Err(_) => false,
+        Err(_) => None,
     }
 }
 
@@ -604,15 +662,19 @@ pub async fn discover() -> DaemonProbe {
         && record.kind == DaemonEndpointKind::Persistent
     {
         let recorded = endpoint_paths(&canonical, &record);
-        if socket_responds(&recorded.socket).await {
-            return DaemonProbe::new(DaemonStatus::Running, recorded);
+        if let Some(response) = socket_responds(&recorded.socket).await {
+            return DaemonProbe::with_hello(
+                status_for_socket_response(&response),
+                recorded,
+                response.hello,
+            );
         }
         if !canonical.socket.exists() && canonical.pid_file.exists() {
             return DaemonProbe::new(status_for_unreachable_pid(&canonical), recorded);
         }
     }
 
-    DaemonProbe::new(probe_direct(&canonical).await, canonical)
+    probe_direct(&canonical).await
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -655,15 +717,19 @@ pub fn discover_blocking() -> DaemonProbe {
         && record.kind == DaemonEndpointKind::Persistent
     {
         let recorded = endpoint_paths(&canonical, &record);
-        if socket_responds_blocking(&recorded.socket) {
-            return DaemonProbe::new(DaemonStatus::Running, recorded);
+        if let Some(response) = socket_responds_blocking(&recorded.socket) {
+            return DaemonProbe::with_hello(
+                status_for_socket_response(&response),
+                recorded,
+                response.hello,
+            );
         }
         if !canonical.socket.exists() && canonical.pid_file.exists() {
             return DaemonProbe::new(status_for_unreachable_pid(&canonical), recorded);
         }
     }
 
-    DaemonProbe::new(probe_direct_blocking(&canonical), canonical)
+    probe_direct_blocking(&canonical)
 }
 
 #[cfg(test)]
@@ -675,8 +741,12 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
             && record.kind == DaemonEndpointKind::Persistent
         {
             let recorded = endpoint_paths(&canonical, &record);
-            if socket_responds_blocking(&recorded.socket) {
-                return DaemonProbe::new(DaemonStatus::Running, recorded);
+            if let Some(response) = socket_responds_blocking(&recorded.socket) {
+                return DaemonProbe::with_hello(
+                    status_for_socket_response(&response),
+                    recorded,
+                    response.hello,
+                );
             }
             if !canonical.socket.exists() && canonical.pid_file.exists() {
                 let status = status_for_unreachable_pid_with_cleanup(&canonical, || {
@@ -687,48 +757,56 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
         }
     }
 
-    DaemonProbe::new(probe_direct_blocking(&canonical), canonical)
+    probe_direct_blocking(&canonical)
 }
 
 #[cfg(unix)]
-async fn probe_direct(paths: &DaemonPaths) -> DaemonStatus {
-    if socket_responds(&paths.socket).await {
-        return DaemonStatus::Running;
+async fn probe_direct(paths: &DaemonPaths) -> DaemonProbe {
+    if let Some(response) = socket_responds(&paths.socket).await {
+        return DaemonProbe::with_hello(
+            status_for_socket_response(&response),
+            paths.clone(),
+            response.hello,
+        );
     }
     if paths.pid_file.exists() {
-        status_for_unreachable_pid(paths)
+        DaemonProbe::new(status_for_unreachable_pid(paths), paths.clone())
     } else {
-        DaemonStatus::NotRunning
+        DaemonProbe::new(DaemonStatus::NotRunning, paths.clone())
     }
 }
 
 #[cfg(not(unix))]
-async fn probe_direct(paths: &DaemonPaths) -> DaemonStatus {
+async fn probe_direct(paths: &DaemonPaths) -> DaemonProbe {
     if paths.pid_file.exists() {
-        status_for_unreachable_pid(paths)
+        DaemonProbe::new(status_for_unreachable_pid(paths), paths.clone())
     } else {
-        DaemonStatus::NotRunning
+        DaemonProbe::new(DaemonStatus::NotRunning, paths.clone())
     }
 }
 
 #[cfg(unix)]
-fn probe_direct_blocking(paths: &DaemonPaths) -> DaemonStatus {
-    if socket_responds_blocking(&paths.socket) {
-        return DaemonStatus::Running;
+fn probe_direct_blocking(paths: &DaemonPaths) -> DaemonProbe {
+    if let Some(response) = socket_responds_blocking(&paths.socket) {
+        return DaemonProbe::with_hello(
+            status_for_socket_response(&response),
+            paths.clone(),
+            response.hello,
+        );
     }
     if paths.pid_file.exists() {
-        status_for_unreachable_pid(paths)
+        DaemonProbe::new(status_for_unreachable_pid(paths), paths.clone())
     } else {
-        DaemonStatus::NotRunning
+        DaemonProbe::new(DaemonStatus::NotRunning, paths.clone())
     }
 }
 
 #[cfg(not(unix))]
-fn probe_direct_blocking(paths: &DaemonPaths) -> DaemonStatus {
+fn probe_direct_blocking(paths: &DaemonPaths) -> DaemonProbe {
     if paths.pid_file.exists() {
-        status_for_unreachable_pid(paths)
+        DaemonProbe::new(status_for_unreachable_pid(paths), paths.clone())
     } else {
-        DaemonStatus::NotRunning
+        DaemonProbe::new(DaemonStatus::NotRunning, paths.clone())
     }
 }
 
@@ -737,13 +815,13 @@ fn probe_direct_blocking(paths: &DaemonPaths) -> DaemonStatus {
 /// [`server::handle_client`]), so any successful read of a non-empty
 /// line confirms the daemon is alive — no client-side write needed.
 pub async fn probe(paths: &DaemonPaths) -> DaemonStatus {
-    probe_direct(paths).await
+    probe_direct(paths).await.status
 }
 
 /// Sync version of `probe`. Useful before the tokio runtime is up.
 pub fn probe_blocking(paths: &DaemonPaths) -> DaemonStatus {
     note_blocking_probe_call();
-    probe_direct_blocking(paths)
+    probe_direct_blocking(paths).status
 }
 
 /// Spawn a detached *canonical* daemon process. Returns the child PID.
@@ -990,7 +1068,10 @@ async fn run_foreground_inner_with_boot_db(
     boot_db: Option<crate::db::Db>,
 ) -> Result<()> {
     let mut timer = crate::startup::PhaseTimer::start("daemon::run_foreground");
-    if matches!(probe(&paths).await, DaemonStatus::Running) {
+    if matches!(
+        probe(&paths).await,
+        DaemonStatus::Running | DaemonStatus::IncompatibleProtocol
+    ) {
         anyhow::bail!(
             "another daemon is already running (socket: {})",
             paths.socket.display()
@@ -1001,6 +1082,7 @@ async fn run_foreground_inner_with_boot_db(
         if matches!(
             discovered.status,
             DaemonStatus::Running
+                | DaemonStatus::IncompatibleProtocol
                 | DaemonStatus::LivePidSocketUnreachable
                 | DaemonStatus::UnverifiedPid
         ) && discovered.paths.socket != paths.socket
@@ -1500,13 +1582,30 @@ mod tests {
 
     #[cfg(unix)]
     fn spawn_hello_socket(socket: PathBuf) -> std::thread::JoinHandle<()> {
+        spawn_hello_socket_with_line(socket, "{}".to_string())
+    }
+
+    #[cfg(unix)]
+    fn spawn_hello_socket_with_line(socket: PathBuf, line: String) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
             if let Ok((mut stream, _)) = listener.accept() {
                 use std::io::Write;
-                let _ = writeln!(stream, "{{}}");
+                let _ = writeln!(stream, "{line}");
             }
         })
+    }
+
+    #[cfg(unix)]
+    fn wait_for_socket(socket: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !socket.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hello socket was not bound"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn canonical_in(state_home: &Path, runtime_dir: &Path) -> DaemonPaths {
@@ -1603,14 +1702,7 @@ mod tests {
 
         // Wait until the listener thread has bound before probing; in the full
         // test suite other threads can otherwise let this test race the bind.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !socket_a.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "hello socket was not bound"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_socket(&socket_a);
 
         let paths = canonical_in(&state_home, &runtime_a);
         assert_eq!(paths.socket, socket_a);
@@ -1624,6 +1716,47 @@ mod tests {
         let probe = discover_blocking_with_canonical(canonical_b);
         assert_eq!(probe.status, DaemonStatus::Running);
         assert_eq!(probe.paths.socket, socket_a);
+        listener.join().expect("listener thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incompatible_protocol_probe_reports_incompatible_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_home = dir.path().join("state");
+        let runtime_dir = dir.path().join("runtime");
+        let paths = canonical_in(&state_home, &runtime_dir);
+        let hello = proto::Envelope::response_at(
+            0,
+            uuid::Uuid::nil(),
+            proto::Response::DaemonStatus {
+                pid: 1,
+                uptime_secs: 1,
+                active_sessions: 0,
+                socket_path: paths.socket.display().to_string(),
+                daemon_version: "0.0.old".to_string(),
+                protocol_version: 0,
+                paused_sessions: 0,
+                database_path: ":memory:".to_string(),
+                schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+            },
+        );
+        let listener = spawn_hello_socket_with_line(
+            paths.socket.clone(),
+            serde_json::to_string(&hello).unwrap(),
+        );
+        wait_for_socket(&paths.socket);
+
+        let probe = discover_blocking_with_canonical(paths);
+
+        assert_eq!(probe.status, DaemonStatus::IncompatibleProtocol);
+        assert_eq!(
+            probe.hello,
+            Some(proto::DaemonHello {
+                daemon_version: "0.0.old".to_string(),
+                protocol_version: 0,
+            })
+        );
         listener.join().expect("listener thread");
     }
 
@@ -1734,14 +1867,7 @@ mod tests {
 
         let socket_a = runtime_a.join("cockpit/cockpit.sock");
         let listener = spawn_hello_socket(socket_a.clone());
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !socket_a.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "hello socket was not bound"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_socket(&socket_a);
 
         let paths_a = canonical_in(&state_home, &runtime_a);
         write_endpoint_record_with_pid_and_canonical(&paths_a, &paths_a, std::process::id())

@@ -64,6 +64,7 @@ pub fn connect_call_count() -> usize {
 #[derive(Clone)]
 pub struct DaemonClient {
     backend: ClientBackend,
+    negotiated: proto::NegotiatedProtocol,
     /// One channel per `DaemonClient` clone, hydrated by the reader
     /// task. We use `Arc<Mutex<_>>` because `mpsc::Receiver` isn't
     /// `Clone` — clones of `DaemonClient` share access to the
@@ -104,8 +105,10 @@ impl DaemonClient {
             let stream = UnixStream::connect(socket)
                 .await
                 .with_context(|| format!("connecting to {}", socket.display()))?;
-            let proto = ProtoStream::new(stream);
-            Ok(Self::from_proto(proto))
+            let mut proto = ProtoStream::new(stream);
+            let negotiated = negotiate_hello(&mut proto).await?;
+            proto.set_negotiated_version(negotiated.version);
+            Ok(Self::from_proto_negotiated(proto, negotiated))
         }
         #[cfg(not(unix))]
         {
@@ -119,19 +122,34 @@ impl DaemonClient {
         let (request_tx, event_rx) = crate::daemon::server::spawn_in_process_client(ctx);
         Self {
             backend: ClientBackend::InProcess(request_tx),
+            negotiated: proto::NegotiatedProtocol::current(),
             events: Arc::new(tokio::sync::Mutex::new(event_rx)),
         }
     }
 
     #[cfg(unix)]
+    #[cfg(test)]
     fn from_proto(proto: ProtoStream<UnixStream>) -> Self {
+        Self::from_proto_negotiated(proto, proto::NegotiatedProtocol::current())
+    }
+
+    #[cfg(unix)]
+    fn from_proto_negotiated(
+        proto: ProtoStream<UnixStream>,
+        negotiated: proto::NegotiatedProtocol,
+    ) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<IoCommand>(REQUEST_QUEUE);
         let (event_tx, event_rx) = mpsc::channel::<proto::Event>(EVENT_QUEUE);
         tokio::spawn(run_io(proto, request_rx, event_tx));
         Self {
             backend: ClientBackend::Wire(request_tx),
+            negotiated,
             events: Arc::new(tokio::sync::Mutex::new(event_rx)),
         }
+    }
+
+    pub fn negotiated(&self) -> &proto::NegotiatedProtocol {
+        &self.negotiated
     }
 
     /// Send a request and wait for the matching response. Returns the
@@ -228,6 +246,42 @@ impl DaemonClient {
             false
         }
     }
+}
+
+#[cfg(unix)]
+async fn negotiate_hello(
+    proto_stream: &mut ProtoStream<UnixStream>,
+) -> Result<proto::NegotiatedProtocol> {
+    let line = match tokio::time::timeout(Duration::from_millis(500), proto_stream.recv_raw_line())
+        .await
+    {
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) => {
+            tracing::debug!("daemon hello absent; using current protocol version");
+            return Ok(proto::NegotiatedProtocol::current());
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(error = %error, "daemon hello unreadable; using current protocol version");
+            return Ok(proto::NegotiatedProtocol::current());
+        }
+        Err(_) => {
+            tracing::debug!("daemon hello timed out; using current protocol version");
+            return Ok(proto::NegotiatedProtocol::current());
+        }
+    };
+
+    let Some(hello) = (match proto::parse_daemon_hello_line(&line) {
+        Ok(hello) => hello,
+        Err(error) => {
+            tracing::debug!(error = %error, "daemon hello unparseable; using current protocol version");
+            return Ok(proto::NegotiatedProtocol::current());
+        }
+    }) else {
+        tracing::debug!("first daemon frame was not a hello; using current protocol version");
+        return Ok(proto::NegotiatedProtocol::current());
+    };
+
+    proto::NegotiatedProtocol::from_hello(&hello).map_err(|error| anyhow!(error.message))
 }
 
 #[cfg(unix)]
@@ -616,12 +670,21 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
             }
             if matches!(
                 discovered.status,
-                DaemonStatus::LivePidSocketUnreachable | DaemonStatus::UnverifiedPid
+                DaemonStatus::IncompatibleProtocol
+                    | DaemonStatus::LivePidSocketUnreachable
+                    | DaemonStatus::UnverifiedPid
             ) {
-                anyhow::bail!(
-                    "shared daemon pid is live but socket is unreachable: {}",
-                    discovered.paths.socket.display()
-                );
+                if let Some(hello) = discovered.hello.as_ref() {
+                    anyhow::bail!(
+                        "{}",
+                        proto::incompatible_daemon_protocol_message(hello.protocol_version)
+                    );
+                } else {
+                    anyhow::bail!(
+                        "shared daemon pid is live but socket is unreachable: {}",
+                        discovered.paths.socket.display()
+                    );
+                }
             }
         }
         LifecycleMode::AttachOwnEphemeral => {
@@ -771,19 +834,27 @@ async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
 mod tests {
     use super::*;
     use crate::daemon::DaemonPaths;
+    use tokio::net::UnixListener;
 
     fn lsp_event(text: impl Into<String>) -> proto::Event {
         proto::Event::LspNotice { text: text.into() }
     }
 
     fn daemon_status_response() -> Response {
+        daemon_status_response_with(proto::DAEMON_VERSION, proto::PROTOCOL_VERSION)
+    }
+
+    fn daemon_status_response_with(
+        daemon_version: impl Into<String>,
+        protocol_version: u32,
+    ) -> Response {
         Response::DaemonStatus {
             pid: 1,
             uptime_secs: 2,
             active_sessions: 0,
             socket_path: "/tmp/cockpit.sock".to_string(),
-            daemon_version: proto::DAEMON_VERSION.to_string(),
-            protocol_version: proto::PROTOCOL_VERSION,
+            daemon_version: daemon_version.into(),
+            protocol_version,
             paused_sessions: 0,
             database_path: ":memory:".to_string(),
             schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
@@ -791,6 +862,13 @@ mod tests {
     }
 
     fn attach_request(session_id: Option<Uuid>) -> Request {
+        attach_request_with_client_protocol_version(session_id, proto::PROTOCOL_VERSION)
+    }
+
+    fn attach_request_with_client_protocol_version(
+        session_id: Option<Uuid>,
+        client_protocol_version: u32,
+    ) -> Request {
         Request::Attach {
             session_id,
             since_seq: None,
@@ -798,7 +876,7 @@ mod tests {
             no_sandbox: false,
             interactive: true,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
+            client_protocol_version,
             env_snapshot: None,
             env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
         }
@@ -846,6 +924,27 @@ mod tests {
         }
     }
 
+    fn bind_test_socket() -> (tempfile::TempDir, PathBuf, UnixListener) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind daemon socket");
+        (dir, socket, listener)
+    }
+
+    async fn send_daemon_hello(
+        daemon: &mut ProtoStream<UnixStream>,
+        daemon_version: impl Into<String>,
+        protocol_version: u32,
+    ) {
+        daemon
+            .send(&Envelope::response(
+                Uuid::nil(),
+                daemon_status_response_with(daemon_version, protocol_version),
+            ))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn nil_daemon_status_is_known_hello() {
         assert!(is_nil_daemon_status_hello(
@@ -881,6 +980,107 @@ mod tests {
             },
         ));
         assert!(!is_nil_daemon_status_hello(Uuid::nil(), &Response::Ack));
+    }
+
+    #[tokio::test]
+    async fn negotiation_parses_daemon_hello_on_connect() {
+        let (_dir, socket, listener) = bind_test_socket();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut daemon = ProtoStream::new(stream);
+            send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION + 1).await;
+        });
+
+        let client = DaemonClient::connect(&socket).await.unwrap();
+
+        assert_eq!(client.negotiated().daemon_version, "0.1.handshake");
+        assert_eq!(
+            client.negotiated().daemon_protocol_version,
+            proto::PROTOCOL_VERSION + 1
+        );
+        assert_eq!(client.negotiated().version, proto::PROTOCOL_VERSION);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn negotiation_falls_back_to_current_version_when_hello_is_absent() {
+        let (_dir, socket, listener) = bind_test_socket();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let connect = tokio::spawn({
+            let socket = socket.clone();
+            async move { DaemonClient::connect(&socket).await.unwrap() }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let client = connect.await.unwrap();
+
+        assert_eq!(client.negotiated().version, proto::PROTOCOL_VERSION);
+        assert_eq!(client.negotiated().daemon_version, "unknown");
+        assert_eq!(
+            client.negotiated().daemon_protocol_version,
+            proto::PROTOCOL_VERSION
+        );
+        drop(client);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
+        let (_dir, socket, listener) = bind_test_socket();
+        let session_id = Uuid::new_v4();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut daemon = ProtoStream::new(stream);
+            send_daemon_hello(
+                &mut daemon,
+                "0.1.handshake",
+                proto::MIN_SUPPORTED_PROTOCOL_VERSION,
+            )
+            .await;
+            daemon.set_negotiated_version(proto::MIN_SUPPORTED_PROTOCOL_VERSION);
+            let request_id = match daemon.recv().await.unwrap().unwrap() {
+                proto::RecvFrame::Envelope(env) => match env.body {
+                    Body::Request { id, request } => {
+                        match request {
+                            Request::Attach {
+                                client_protocol_version,
+                                ..
+                            } => assert_eq!(
+                                client_protocol_version,
+                                proto::MIN_SUPPORTED_PROTOCOL_VERSION
+                            ),
+                            other => panic!("expected attach request, got {other:?}"),
+                        }
+                        id
+                    }
+                    other => panic!("expected request body, got {other:?}"),
+                },
+                other => panic!("expected request envelope, got {other:?}"),
+            };
+            daemon
+                .send(&Envelope::response(
+                    request_id,
+                    attached_response(session_id),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let client = DaemonClient::connect(&socket).await.unwrap();
+        client
+            .request(attach_request_with_client_protocol_version(
+                Some(session_id),
+                client.negotiated().version,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        server.await.unwrap();
     }
 
     #[test]

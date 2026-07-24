@@ -280,7 +280,7 @@ pub(crate) async fn attach_send_pump(
             // guidance error) rather than blocking.
             interactive: false,
             model_override: options.model_override.map(str::to_string),
-            client_protocol_version: crate::daemon::proto::PROTOCOL_VERSION,
+            client_protocol_version: client.negotiated().version,
             env_snapshot: Some(env_snapshot.to_wire()),
             env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
         })

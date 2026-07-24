@@ -116,6 +116,9 @@ impl DaemonPromptDialog {
                 DaemonStatus::UnverifiedPid => {
                     "A live daemon pid file was found, but the process identity could not be verified."
                 }
+                DaemonStatus::IncompatibleProtocol => {
+                    "The cockpit daemon speaks an incompatible protocol."
+                }
                 DaemonStatus::Running => "Daemon is running.",
             }
             .to_string(),

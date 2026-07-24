@@ -226,7 +226,7 @@ pub mod integration {
                     no_sandbox: false,
                     interactive,
                     model_override: None,
-                    client_protocol_version: crate::daemon::proto::PROTOCOL_VERSION,
+                    client_protocol_version: self.inner.negotiated().version,
                     env_snapshot: None,
                     env_policy: crate::env_snapshot::EnvDriftPolicy::default(),
                 })

@@ -5088,7 +5088,6 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             .await
             .expect("second stop forces drain");
             assert!(matches!(response, Response::Ack));
-            wait_for_shutdown_phase(&ctx, ShutdownPhase::Forced).await;
         }
         "restart_if_idle" => {
             let ctx = test_ctx();
@@ -6808,7 +6807,6 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
             .await
             .expect("stop daemon");
             assert!(matches!(response, Response::Ack));
-            wait_for_shutdown_phase(&ctx, ShutdownPhase::Draining).await;
         }
         "restart_if_idle" => {
             let ctx = test_ctx();
@@ -6822,7 +6820,6 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
                     reason: None
                 }
             ));
-            wait_for_shutdown_phase(&ctx, ShutdownPhase::Draining).await;
         }
         "lsp_control" => {
             let ctx = test_ctx();
@@ -8702,6 +8699,18 @@ where
     }
 }
 
+async fn recv_non_event_body<S>(proto: &mut ProtoStream<S>) -> Body
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    loop {
+        match recv_body(proto).await {
+            Body::Event { .. } => continue,
+            body => return body,
+        }
+    }
+}
+
 #[tokio::test]
 async fn refresh_env_compat_accepts_path_snapshot() {
     let ctx = test_ctx();
@@ -9434,33 +9443,16 @@ fn test_event_envelope(event: proto::Event) -> EventEnvelope {
     }
 }
 
-async fn wait_for_shutdown_phase(ctx: &Arc<DaemonContext>, expected: ShutdownPhase) {
-    if ctx.shutdown.phase() == expected {
-        return;
-    }
-    let mut phase_rx = ctx.shutdown.subscribe();
-    if *phase_rx.borrow() == expected {
-        return;
-    }
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            phase_rx.changed().await.expect("shutdown signal open");
-            if *phase_rx.borrow() == expected {
-                break;
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("shutdown phase did not reach {expected:?}"));
-}
-
 async fn recv_writer_body(
     writer_rx: &mut mpsc::Receiver<ClientWriterMessage>,
     label: &'static str,
 ) -> Body {
-    match writer_rx.recv().await.expect(label) {
-        ClientWriterMessage::Envelope(envelope) => envelope.body,
-        ClientWriterMessage::EnvelopeWithAck { envelope, .. } => envelope.body,
+    loop {
+        match writer_rx.recv().await.expect(label) {
+            ClientWriterMessage::SetVersion(_) => continue,
+            ClientWriterMessage::Envelope(envelope) => return envelope.body,
+            ClientWriterMessage::EnvelopeWithAck { envelope, .. } => return envelope.body,
+        }
     }
 }
 
@@ -11486,8 +11478,7 @@ async fn server_answers_too_new_request_with_protocol_version_error() {
     let server = tokio::spawn(handle_client(server_stream, ctx));
     let mut client = ProtoStream::new(client_stream);
 
-    // Initial hello + caffeinate snapshot.
-    let _ = recv_body(&mut client).await;
+    // Initial hello.
     let _ = recv_body(&mut client).await;
 
     let id = Uuid::new_v4();
@@ -11504,7 +11495,7 @@ async fn server_answers_too_new_request_with_protocol_version_error() {
         .await
         .unwrap();
 
-    match recv_body(&mut client).await {
+    match recv_non_event_body(&mut client).await {
         Body::Error {
             id: Some(got_id),
             error,
@@ -11520,14 +11511,57 @@ async fn server_answers_too_new_request_with_protocol_version_error() {
 }
 
 #[tokio::test]
+async fn server_responses_use_negotiated_client_protocol_version() {
+    let ctx = test_ctx();
+    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let server = tokio::spawn(handle_client(server_stream, ctx));
+    let mut client =
+        ProtoStream::with_version(client_stream, proto::MIN_SUPPORTED_PROTOCOL_VERSION);
+
+    // The hello is intentionally emitted at the daemon's current protocol so
+    // older clients can parse it as a raw handshake before negotiation.
+    let _ = recv_body(&mut client).await;
+
+    let status_id = Uuid::new_v4();
+    client
+        .send(&Envelope::request_at(
+            proto::MIN_SUPPORTED_PROTOCOL_VERSION,
+            status_id,
+            Request::DaemonStatus,
+        ))
+        .await
+        .unwrap();
+
+    loop {
+        match client.recv().await.unwrap().unwrap() {
+            RecvFrame::Envelope(env) => {
+                assert_eq!(env.v, proto::MIN_SUPPORTED_PROTOCOL_VERSION);
+                match env.body {
+                    Body::Event { .. } => continue,
+                    Body::Response { id, response } => {
+                        assert_eq!(id, status_id);
+                        assert!(matches!(*response, Response::DaemonStatus { .. }));
+                        break;
+                    }
+                    other => panic!("expected daemon status response, got {other:?}"),
+                }
+            }
+            other => panic!("expected negotiated response envelope, got {other:?}"),
+        }
+    }
+
+    drop(client);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn unknown_frame_request_gets_unsupported_error_and_connection_survives() {
     let ctx = test_ctx();
     let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
     let server = tokio::spawn(handle_client(server_stream, ctx));
     let mut client = ProtoStream::new(client_stream);
 
-    // Initial hello + caffeinate snapshot.
-    let _ = recv_body(&mut client).await;
+    // Initial hello.
     let _ = recv_body(&mut client).await;
 
     let id = Uuid::new_v4();
@@ -11545,7 +11579,7 @@ async fn unknown_frame_request_gets_unsupported_error_and_connection_survives() 
         .await
         .unwrap();
 
-    match recv_body(&mut client).await {
+    match recv_non_event_body(&mut client).await {
         Body::Error {
             id: Some(got_id),
             error,
@@ -11569,7 +11603,7 @@ async fn unknown_frame_request_gets_unsupported_error_and_connection_survives() 
         .send(&Envelope::request(status_id, Request::DaemonStatus))
         .await
         .unwrap();
-    match recv_body(&mut client).await {
+    match recv_non_event_body(&mut client).await {
         Body::Response { id, response } => {
             assert_eq!(id, status_id);
             assert!(matches!(*response, Response::DaemonStatus { .. }));
@@ -11588,8 +11622,7 @@ async fn unknown_frame_event_is_dropped_and_connection_survives() {
     let server = tokio::spawn(handle_client(server_stream, ctx));
     let mut client = ProtoStream::new(client_stream);
 
-    // Initial hello + caffeinate snapshot.
-    let _ = recv_body(&mut client).await;
+    // Initial hello.
     let _ = recv_body(&mut client).await;
 
     client
@@ -11610,7 +11643,7 @@ async fn unknown_frame_event_is_dropped_and_connection_survives() {
         .send(&Envelope::request(status_id, Request::DaemonStatus))
         .await
         .unwrap();
-    match recv_body(&mut client).await {
+    match recv_non_event_body(&mut client).await {
         Body::Response { id, response } => {
             assert_eq!(id, status_id);
             assert!(matches!(*response, Response::DaemonStatus { .. }));

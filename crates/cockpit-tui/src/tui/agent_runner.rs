@@ -594,16 +594,23 @@ async fn switch_session_inner(
     target: SessionTarget,
 ) -> Result<SessionSwitchOutcome, String> {
     let current_client = current_client.read().await.clone();
-    switch_session_with_attach_request(attach_context, target, move |request| {
-        let current_client = current_client.clone();
-        async move { current_client.request(request).await }
-    })
+    let client_protocol_version = current_client.negotiated().version;
+    switch_session_with_attach_request(
+        attach_context,
+        target,
+        client_protocol_version,
+        move |request| {
+            let current_client = current_client.clone();
+            async move { current_client.request(request).await }
+        },
+    )
     .await
 }
 
 async fn switch_session_with_attach_request<F, Fut>(
     attach_context: Arc<RwLock<AttachRequestContext>>,
     target: SessionTarget,
+    client_protocol_version: u32,
     send_request: F,
 ) -> Result<SessionSwitchOutcome, String>
 where
@@ -626,7 +633,7 @@ where
         no_sandbox: ctx.no_sandbox,
         interactive: true,
         model_override: None,
-        client_protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
+        client_protocol_version,
         env_snapshot: Some(ctx.env_snapshot.clone()),
         env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
     })
@@ -826,7 +833,7 @@ fn try_spawn_inner(
                     // plan-level override is only for the headless plan-run
                     // path (`cockpit run --model`).
                     model_override: None,
-                    client_protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
+                    client_protocol_version: daemon.client.negotiated().version,
                     env_snapshot: Some(env_snapshot.to_wire()),
                     env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
                 })
@@ -1850,10 +1857,16 @@ async fn resync_attach_payload(
     attach_context: &AttachRequestContext,
     last_applied_seq: &Arc<Mutex<Option<i64>>>,
 ) -> Result<AttachedPayload, ReconnectAttachError> {
-    request_attach_payload(session_id, attach_context, last_applied_seq, |request| {
-        let client = client.clone();
-        async move { client.request(request).await }
-    })
+    request_attach_payload(
+        session_id,
+        attach_context,
+        last_applied_seq,
+        client.negotiated().version,
+        |request| {
+            let client = client.clone();
+            async move { client.request(request).await }
+        },
+    )
     .await
 }
 
@@ -1861,6 +1874,7 @@ async fn request_attach_payload<F, Fut>(
     session_id: Uuid,
     attach_context: &AttachRequestContext,
     last_applied_seq: &Arc<Mutex<Option<i64>>>,
+    client_protocol_version: u32,
     send_request: F,
 ) -> Result<AttachedPayload, ReconnectAttachError>
 where
@@ -1874,7 +1888,7 @@ where
         no_sandbox: attach_context.no_sandbox,
         interactive: true,
         model_override: None,
-        client_protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
+        client_protocol_version,
         env_snapshot: Some(attach_context.env_snapshot.clone()),
         env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
     })
@@ -2987,6 +3001,7 @@ mod tests {
                                 session_id,
                                 &attach_context,
                                 &last,
+                                cockpit_core::daemon::proto::PROTOCOL_VERSION,
                                 |request| async move {
                                     match request {
                                         Request::Attach {
@@ -3263,6 +3278,7 @@ mod tests {
         let outcome = switch_session_with_attach_request(
             attach_context,
             SessionTarget::New,
+            cockpit_core::daemon::proto::PROTOCOL_VERSION,
             move |request| {
                 captured.lock().unwrap().push(request);
                 async move {

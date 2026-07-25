@@ -63,6 +63,8 @@ CREATE TABLE sessions (
     ended_at        INTEGER,
     provider        TEXT,
     model           TEXT,
+    session_llm_mode TEXT,
+    tool_surface_override_json TEXT,
     active_agent    TEXT    NOT NULL DEFAULT 'orchestrator-build',
     assistant_name  TEXT,
 

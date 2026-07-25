@@ -1325,6 +1325,14 @@ fn validate_discoverable_mcp_reachable(def: &crate::agents::AgentDef, tb: &ToolB
 /// Returns `Err` for unknown names so the `task` tool can surface
 /// "unknown agent" loudly rather than silently spawning the wrong one.
 pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
+    load_with_tool_surface_override(name, args, None)
+}
+
+pub fn load_with_tool_surface_override(
+    name: &str,
+    args: &SpawnArgs,
+    tool_surface_override: Option<&crate::agents::ToolSurfaceSelection>,
+) -> Result<Agent> {
     validate_configured_custom_tools(&args.config)?;
 
     // The docs pipeline stages are routed by the driver and never reach
@@ -1343,10 +1351,13 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
     // takes precedence over the embedded factory. A malformed override
     // fails loudly here (naming its source) rather than silently falling
     // back to the embedded default.
-    let Some(def) = crate::agents::resolve(&args.cwd, name)? else {
+    let Some(mut def) = crate::agents::resolve(&args.cwd, name)? else {
         // Not a built-in and no file on disk: unknown agent.
         bail!("unknown agent `{name}`");
     };
+    if let Some(selection) = tool_surface_override {
+        crate::agents::apply_tool_surface_override(&mut def, selection)?;
+    }
     let mut agent = agent_from_def(&def, args)?;
 
     // Per-delegation tool grants (prompt `parent-granted-tools.md`): append the

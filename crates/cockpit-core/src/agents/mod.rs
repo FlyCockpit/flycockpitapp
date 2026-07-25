@@ -189,6 +189,19 @@ pub fn tool_surface_catalog() -> Vec<ToolSurfaceItem> {
         .collect()
 }
 
+pub fn apply_tool_surface_override(
+    def: &mut AgentDef,
+    selection: &ToolSurfaceSelection,
+) -> Result<()> {
+    let mut candidate = def.clone();
+    candidate.tools = Some(selection.tools.clone());
+    candidate.tool_tiers = selection.tool_tiers.clone();
+    validate_invariants(&candidate)?;
+    def.tools = candidate.tools;
+    def.tool_tiers = candidate.tool_tiers;
+    Ok(())
+}
+
 fn tool_family(name: &str) -> &'static str {
     match name {
         "read" | "readlock" | "writeunlock" | "editunlock" | "unlock" => "files",

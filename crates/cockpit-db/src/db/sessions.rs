@@ -31,6 +31,8 @@ pub struct SessionRow {
     pub ended_at: Option<i64>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub session_llm_mode: Option<String>,
+    pub tool_surface_override_json: Option<String>,
     pub active_agent: String,
     /// Owning assistant for assistant-backed sessions. NULL for ordinary
     /// sessions and for historical rows.
@@ -127,6 +129,8 @@ impl SessionRow {
             ended_at: row.get("ended_at")?,
             provider: row.get("provider")?,
             model: row.get("model")?,
+            session_llm_mode: row.get("session_llm_mode").unwrap_or(None),
+            tool_surface_override_json: row.get("tool_surface_override_json").unwrap_or(None),
             active_agent: row.get("active_agent")?,
             assistant_name: row.get("assistant_name").unwrap_or(None),
             short_id: row.get("short_id")?,
@@ -300,9 +304,10 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
                 "INSERT INTO sessions
                  (session_id, project_id, project_root, started_at,
                   last_active_at, active_agent, short_id, provider, model,
+                  session_llm_mode, tool_surface_override_json,
                   guidance_baseline_path, guidance_baseline_hash, redaction_table_json,
                   created_by_principal, shared_with_collaborators)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     row.session_id.to_string(),
                     row.project_id,
@@ -313,6 +318,8 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
                     row.short_id,
                     row.provider,
                     row.model,
+                    row.session_llm_mode,
+                    row.tool_surface_override_json,
                     row.guidance_baseline_path,
                     row.guidance_baseline_hash,
                     row.redaction_table_json,
@@ -326,9 +333,10 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
                 "INSERT INTO sessions
                  (session_id, project_id, project_root, started_at,
                   last_active_at, active_agent, short_id, provider, model,
+                  session_llm_mode, tool_surface_override_json,
                   guidance_baseline_path, guidance_baseline_hash, created_by_principal,
                   shared_with_collaborators)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     row.session_id.to_string(),
                     row.project_id,
@@ -339,6 +347,8 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
                     row.short_id,
                     row.provider,
                     row.model,
+                    row.session_llm_mode,
+                    row.tool_surface_override_json,
                     row.guidance_baseline_path,
                     row.guidance_baseline_hash,
                     row.created_by_principal,
@@ -351,8 +361,9 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
                 "INSERT INTO sessions
                  (session_id, project_id, project_root, started_at,
                   last_active_at, active_agent, short_id, provider, model,
+                  session_llm_mode, tool_surface_override_json,
                   guidance_baseline_path, guidance_baseline_hash, redaction_table_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     row.session_id.to_string(),
                     row.project_id,
@@ -363,6 +374,8 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
                     row.short_id,
                     row.provider,
                     row.model,
+                    row.session_llm_mode,
+                    row.tool_surface_override_json,
                     row.guidance_baseline_path,
                     row.guidance_baseline_hash,
                     row.redaction_table_json,
@@ -374,8 +387,9 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
                 "INSERT INTO sessions
                  (session_id, project_id, project_root, started_at,
                   last_active_at, active_agent, short_id, provider, model,
+                  session_llm_mode, tool_surface_override_json,
                   guidance_baseline_path, guidance_baseline_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     row.session_id.to_string(),
                     row.project_id,
@@ -386,6 +400,8 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
                     row.short_id,
                     row.provider,
                     row.model,
+                    row.session_llm_mode,
+                    row.tool_surface_override_json,
                     row.guidance_baseline_path,
                     row.guidance_baseline_hash,
                 ],
@@ -501,10 +517,11 @@ fn execute_fork_insert(
          (session_id, project_id, project_root, started_at,
           last_active_at, active_agent, short_id,
           parent_session_id, fork_point_turn_id,
-          provider, model, ephemeral, user_content_tokens, title_stage,
+          provider, model, session_llm_mode, tool_surface_override_json,
+          ephemeral, user_content_tokens, title_stage,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -517,6 +534,8 @@ fn execute_fork_insert(
             fork_point_turn_id,
             row.provider,
             row.model,
+            row.session_llm_mode,
+            row.tool_surface_override_json,
             row.ephemeral as i64,
             row.user_content_tokens,
             row.title_stage,
@@ -601,6 +620,8 @@ fn build_session_row(
         ended_at: None,
         provider: None,
         model: None,
+        session_llm_mode: None,
+        tool_surface_override_json: None,
         active_agent: active_agent.to_string(),
         assistant_name,
         short_id,
@@ -1093,6 +1114,8 @@ impl Db {
                 ended_at: None,
                 provider: parent.provider,
                 model: parent.model,
+                session_llm_mode: parent.session_llm_mode,
+                tool_surface_override_json: parent.tool_surface_override_json,
                 active_agent: parent.active_agent,
                 assistant_name: parent.assistant_name,
                 short_id: Some(short_id),
@@ -1195,6 +1218,8 @@ impl Db {
             ended_at: None,
             provider: parent.provider,
             model: parent.model,
+            session_llm_mode: parent.session_llm_mode,
+            tool_surface_override_json: parent.tool_surface_override_json,
             active_agent: parent.active_agent,
             assistant_name: parent.assistant_name,
             short_id: Some(short_id),
@@ -1756,6 +1781,36 @@ impl Db {
                 params![active_agent, session_id.to_string()],
             )
             .context("setting session agent")?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_session_llm_mode(&self, session_id: Uuid, mode: Option<&str>) -> Result<()> {
+        let mode = mode.map(str::to_owned);
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET session_llm_mode = ?1 WHERE session_id = ?2",
+                params![mode, session_id.to_string()],
+            )
+            .context("setting session llm mode")?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_tool_surface_override(
+        &self,
+        session_id: Uuid,
+        override_json: Option<&str>,
+    ) -> Result<()> {
+        let override_json = override_json.map(str::to_owned);
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET tool_surface_override_json = ?1 WHERE session_id = ?2",
+                params![override_json, session_id.to_string()],
+            )
+            .context("setting session tool surface override")?;
             Ok(())
         })
         .await
@@ -2448,6 +2503,46 @@ mod tests {
         assert_eq!(stored.active_agent, "Review");
         assert_eq!(stored.title.as_deref(), Some("Reviewed title"));
         assert!(stored.user_renamed);
+    }
+
+    #[tokio::test]
+    async fn db_async_session_llm_mode_roundtrips_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+
+        db.set_session_llm_mode(session.session_id, Some("frontier"))
+            .await
+            .unwrap();
+        let stored = db.get_session(session.session_id).await.unwrap().unwrap();
+        assert_eq!(stored.session_llm_mode.as_deref(), Some("frontier"));
+
+        db.set_session_llm_mode(session.session_id, None)
+            .await
+            .unwrap();
+        let stored = db.get_session(session.session_id).await.unwrap().unwrap();
+        assert_eq!(stored.session_llm_mode, None);
+    }
+
+    #[tokio::test]
+    async fn db_async_tool_surface_override_roundtrips_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let override_json = r#"{"tools":["read","bash"],"toolTiers":{"bash":"disabled"}}"#;
+
+        db.set_tool_surface_override(session.session_id, Some(override_json))
+            .await
+            .unwrap();
+        let stored = db.get_session(session.session_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.tool_surface_override_json.as_deref(),
+            Some(override_json)
+        );
+
+        db.set_tool_surface_override(session.session_id, None)
+            .await
+            .unwrap();
+        let stored = db.get_session(session.session_id).await.unwrap().unwrap();
+        assert_eq!(stored.tool_surface_override_json, None);
     }
 
     #[tokio::test]

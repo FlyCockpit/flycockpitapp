@@ -1113,6 +1113,56 @@ Body.
 }
 
 #[test]
+fn apply_tool_surface_override_replaces_tools_and_tiers() {
+    let mut def = parse_agent(
+        "---\ndescription: d\nmode: subagent\ntools: [read, bash]\n---\nBody.\n",
+        "worker",
+        "x.md".into(),
+    )
+    .unwrap();
+    let selection = ToolSurfaceSelection {
+        tools: vec![
+            "read".to_string(),
+            "mcp".to_string(),
+            "session_search".to_string(),
+        ],
+        tool_tiers: std::collections::BTreeMap::from([(
+            "session_search".to_string(),
+            ToolTier::Discoverable,
+        )]),
+    };
+
+    apply_tool_surface_override(&mut def, &selection).unwrap();
+
+    assert_eq!(def.tools.as_deref(), Some(selection.tools.as_slice()));
+    assert_eq!(def.tool_tiers, selection.tool_tiers);
+}
+
+#[test]
+fn apply_tool_surface_override_rejects_invalid_surface() {
+    let mut def = parse_agent(
+        "---\ndescription: d\nmode: subagent\ntools: [read]\n---\nBody.\n",
+        "worker",
+        "x.md".into(),
+    )
+    .unwrap();
+    let selection = ToolSurfaceSelection {
+        tools: vec!["read".to_string()],
+        tool_tiers: std::collections::BTreeMap::from([(
+            "session_search".to_string(),
+            ToolTier::Discoverable,
+        )]),
+    };
+
+    let err = apply_tool_surface_override(&mut def, &selection).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("does not grant"), "{msg}");
+    assert!(msg.contains("session_search"), "{msg}");
+    assert_eq!(def.tools.as_deref(), Some(&["read".to_string()][..]));
+    assert!(def.tool_tiers.is_empty());
+}
+
+#[test]
 fn docs_answerer_keeps_grep_and_glob_defensive_descriptions() {
     use crate::config::extended::LlmMode;
     use crate::engine::tool::{Tool, definition_of};

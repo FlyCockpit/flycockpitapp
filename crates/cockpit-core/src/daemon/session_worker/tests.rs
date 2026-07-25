@@ -2098,6 +2098,71 @@ async fn session_llm_mode_stays_immediate_and_prune_free() {
 }
 
 #[tokio::test]
+async fn stored_session_llm_mode_restores_before_startup_resolution() {
+    use crate::config::extended::LlmMode;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let created = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    created.set_session_llm_mode(LlmMode::Frontier).unwrap();
+
+    let resumed = Session::resume(db, created.id).unwrap().unwrap();
+    assert_eq!(stored_session_llm_mode(&resumed), Some(LlmMode::Frontier));
+}
+
+#[tokio::test]
+async fn invalid_stored_session_llm_mode_falls_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let created = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    db.set_session_llm_mode(created.id, Some("turbo"))
+        .await
+        .unwrap();
+
+    let resumed = Session::resume(db, created.id).unwrap().unwrap();
+    assert_eq!(stored_session_llm_mode(&resumed), None);
+}
+
+#[tokio::test]
+async fn stored_tool_surface_override_decodes_for_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+    session
+        .set_tool_surface_override_json(Some(
+            r#"{"tools":["read","mcp","session_search"],"toolTiers":{"session_search":"discoverable"}}"#
+                .to_string(),
+        ))
+        .unwrap();
+
+    let selection = stored_tool_surface_override(&session).unwrap();
+    assert_eq!(
+        selection.tools,
+        vec![
+            "read".to_string(),
+            "mcp".to_string(),
+            "session_search".to_string()
+        ]
+    );
+    assert_eq!(
+        selection.tool_tiers.get("session_search"),
+        Some(&crate::agents::ToolTier::Discoverable)
+    );
+}
+
+#[tokio::test]
+async fn invalid_stored_tool_surface_override_falls_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+    session
+        .set_tool_surface_override_json(Some("not json".to_string()))
+        .unwrap();
+
+    assert_eq!(stored_tool_surface_override(&session), None);
+}
+
+#[tokio::test]
 async fn worker_uses_registry_resolved_config_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let snapshot = snapshot_for_tests();

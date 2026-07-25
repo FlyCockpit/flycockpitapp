@@ -198,6 +198,8 @@ pub struct Session {
     user_renamed: Mutex<bool>,
     model: Mutex<Option<String>>,
     provider: Mutex<Option<String>>,
+    session_llm_mode: Mutex<Option<String>>,
+    tool_surface_override_json: Mutex<Option<String>>,
     redaction_table_json: Mutex<Option<String>>,
     model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
     /// Last time a `[time: ...]` prelude was injected onto a user
@@ -1685,6 +1687,27 @@ mod tests {
         let row = db.get_session(s.id).await.unwrap().unwrap();
         assert_eq!(row.provider.as_deref(), Some("anthropic"));
         assert_eq!(row.model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[tokio::test]
+    async fn deferred_persist_carries_session_overrides() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "Build").unwrap();
+        let override_json = r#"{"tools":["read","bash"],"toolTiers":{"bash":"disabled"}}"#;
+
+        s.set_session_llm_mode(crate::config::extended::LlmMode::Frontier)
+            .unwrap();
+        s.set_tool_surface_override_json(Some(override_json.to_string()))
+            .unwrap();
+        assert!(db.get_session(s.id).await.unwrap().is_none());
+
+        s.persist_if_needed().unwrap();
+        let row = db.get_session(s.id).await.unwrap().unwrap();
+        assert_eq!(row.session_llm_mode.as_deref(), Some("frontier"));
+        assert_eq!(
+            row.tool_surface_override_json.as_deref(),
+            Some(override_json)
+        );
     }
 
     #[tokio::test]

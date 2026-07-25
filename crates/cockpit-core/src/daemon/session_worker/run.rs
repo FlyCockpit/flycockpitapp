@@ -23,6 +23,40 @@ pub(super) fn session_llm_mode_control(
     }
 }
 
+pub(super) fn stored_session_llm_mode(
+    session: &Session,
+) -> Option<crate::config::extended::LlmMode> {
+    let raw = session.session_llm_mode_raw()?;
+    match session.session_llm_mode() {
+        Some(mode) => Some(mode),
+        None => {
+            tracing::warn!(
+                session_id = %session.id,
+                mode = %raw,
+                "stored session llm mode is invalid; falling back to resolved config mode"
+            );
+            None
+        }
+    }
+}
+
+pub(super) fn stored_tool_surface_override(
+    session: &Session,
+) -> Option<crate::agents::ToolSurfaceSelection> {
+    let raw = session.tool_surface_override_json()?;
+    match serde_json::from_str::<crate::agents::ToolSurfaceSelection>(&raw) {
+        Ok(selection) => Some(selection),
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session.id,
+                %error,
+                "stored tool surface override is invalid JSON; falling back to agent definition"
+            );
+            None
+        }
+    }
+}
+
 pub(super) struct ParkedReplayCompletion {
     interrupt_id: uuid::Uuid,
     decision: Option<proto::InterruptDecision>,
@@ -267,8 +301,9 @@ pub(super) async fn run_worker(
     // `/model` change, which restarts the worker on the new active model). A
     // live `/llm-mode` toggle still overrides this for the running session via
     // `DriverControl::SetLlmMode`.
-    let llm_mode =
-        resolve_effective_llm_mode(&session, &start_config.providers, extended_cfg.llm_mode);
+    let llm_mode = stored_session_llm_mode(&session).unwrap_or_else(|| {
+        resolve_effective_llm_mode(&session, &start_config.providers, extended_cfg.llm_mode)
+    });
     // Root primary: the session's stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
     // configured default when it's unset/unknown. Removed stored primaries
@@ -382,9 +417,26 @@ pub(super) async fn run_worker(
         // an individual `task` delegation, never to the root spawn.
         granted_tools: Vec::new(),
     };
+    let tool_surface_override = stored_tool_surface_override(&session);
     let root = Arc::new(
-        builtin::load(&root_agent_name, &spawn_args)
-            .unwrap_or_else(|_| builtin::default_build(&spawn_args)),
+        match builtin::load_with_tool_surface_override(
+            &root_agent_name,
+            &spawn_args,
+            tool_surface_override.as_ref(),
+        ) {
+            Ok(agent) => agent,
+            Err(error) if tool_surface_override.is_some() => {
+                tracing::warn!(
+                    %error,
+                    session_id = %session_id,
+                    agent = %root_agent_name,
+                    "applying stored tool surface override failed; falling back to agent definition"
+                );
+                builtin::load(&root_agent_name, &spawn_args)
+                    .unwrap_or_else(|_| builtin::default_build(&spawn_args))
+            }
+            Err(_) => builtin::default_build(&spawn_args),
+        },
     );
 
     // Snapshot the resolved agent-guidance file body that just went into
@@ -1564,6 +1616,9 @@ pub(super) async fn run_worker(
                     }
                 }
                 SessionWork::SetSessionLlmMode { mode } => {
+                    if let Err(error) = session.set_session_llm_mode(mode) {
+                        tracing::warn!(%error, session_id = %session_id, "persisting session llm mode failed");
+                    }
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
                         session_llm_mode_control(mode),

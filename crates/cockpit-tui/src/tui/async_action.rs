@@ -83,6 +83,18 @@ pub enum AsyncActionPayload {
         label: String,
         history: Vec<crate::tui::history::HistoryEntry>,
     },
+    HistoryPage {
+        request_id: u64,
+        session_id: uuid::Uuid,
+        entries: Vec<crate::tui::history::HistoryEntry>,
+        has_more: bool,
+        oldest_seq: Option<i64>,
+    },
+    HistoryPageError {
+        request_id: u64,
+        session_id: uuid::Uuid,
+        message: String,
+    },
     ProviderUsage(Vec<cockpit_core::providers::usage::ProviderUsageSnapshot>),
     Skills(crate::tui::skills_pane::SkillsPaneFetchResult),
     NotesDb(crate::tui::notes_pane::NotesDbResult),

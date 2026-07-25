@@ -1635,7 +1635,6 @@ pub fn read_session_messages_blocking(
     }
 }
 
-#[allow(dead_code)] // Consumed by tui-scrollback-page-in; remove there.
 pub fn read_history_page_blocking(
     socket: &Path,
     session_id: uuid::Uuid,

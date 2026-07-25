@@ -154,6 +154,7 @@ impl App {
         outcome: agent_runner::SessionSwitchOutcome,
         current_session_persisted: bool,
     ) {
+        self.cancel_older_history_page_request();
         if let Some(Ok(runner)) = &mut self.agent_runner {
             runner.apply_session_switch_outcome(&outcome);
         }
@@ -179,6 +180,7 @@ impl App {
         outcome: agent_runner::SessionSwitchOutcome,
         resume_chrome: bool,
     ) {
+        self.cancel_older_history_page_request();
         let resume_history = matches!(outcome.target, agent_runner::SessionTarget::Resume { .. })
             .then(|| wire_history_to_entries(outcome.history.clone()));
         let short_id = outcome.short_id.clone();

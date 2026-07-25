@@ -1982,7 +1982,7 @@ impl App {
         }
     }
 
-    fn history_position_for_id(&self, target: HistoryEntryId) -> Option<usize> {
+    pub(super) fn history_position_for_id(&self, target: HistoryEntryId) -> Option<usize> {
         self.history.ids().iter().position(|id| *id == target)
     }
 
@@ -2004,7 +2004,8 @@ impl App {
         if history_total == 0 {
             return None;
         }
-        let visible_history_start = visible_full_start.saturating_sub(banner_rows);
+        let prefix_rows = self.history_prefix_rows_len();
+        let visible_history_start = visible_full_start.saturating_sub(banner_rows + prefix_rows);
         let anchor_history_row = visible_history_start.min(history_total.saturating_sub(1));
         let (mut entry_position, mut row_within_entry) =
             geometry.entry_at_row(anchor_history_row)?;
@@ -2019,7 +2020,7 @@ impl App {
         }
         let entry = self.history.id_at(entry_position)?;
         let full_anchor_row =
-            banner_rows + geometry.entry_start_row(entry_position) + row_within_entry;
+            banner_rows + prefix_rows + geometry.entry_start_row(entry_position) + row_within_entry;
         let screen_row = full_anchor_row.saturating_sub(visible_full_start);
         Some(ScrollAnchor {
             entry,
@@ -2027,6 +2028,10 @@ impl App {
             row_within_entry: row_within_entry.min(u16::MAX as usize) as u16,
             screen_row: screen_row.min(u16::MAX as usize) as u16,
         })
+    }
+
+    fn history_prefix_rows_len(&self) -> usize {
+        usize::from(self.older_history_marker_text().is_some())
     }
 
     fn capture_chat_scroll_anchor_from_current_offset(&mut self) {
@@ -2090,7 +2095,10 @@ impl App {
         anchor.row_within_entry = row_within_entry.min(u16::MAX as usize) as u16;
         self.chat_scroll_anchor = Some(anchor);
 
-        let anchor_full_row = banner_rows + geometry.entry_start_row(entry_idx) + row_within_entry;
+        let anchor_full_row = banner_rows
+            + self.history_prefix_rows_len()
+            + geometry.entry_start_row(entry_idx)
+            + row_within_entry;
         let desired_top = anchor_full_row.saturating_sub(anchor.screen_row as usize);
         self.chat_scroll_offset = chat_offset_for_top(total, visible, desired_top);
     }
@@ -2153,6 +2161,8 @@ impl App {
 
     fn materialize_message_rows(
         &self,
+        prefix_rows: &[Rc<Line<'static>>],
+        prefix_meta: &[ChatRowMeta],
         tail_rows: &[Rc<Line<'static>>],
         tail_meta: &[ChatRowMeta],
         start: usize,
@@ -2163,9 +2173,28 @@ impl App {
         }
         let mut rows = Vec::with_capacity(end - start);
         let mut meta = Vec::with_capacity(end - start);
+        let prefix_total = prefix_rows.len();
+        let prefix_start = start.min(prefix_total);
+        let prefix_end = end.min(prefix_total);
+        for (idx, line) in prefix_rows
+            .iter()
+            .enumerate()
+            .take(prefix_end)
+            .skip(prefix_start)
+        {
+            record_materialized_row();
+            rows.push(line.as_ref().clone());
+            meta.push(
+                prefix_meta
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(ChatRowMeta::padding),
+            );
+        }
+
         let history_total = self.chat_geometry.total_rows();
-        let history_start = start.min(history_total);
-        let history_end = end.min(history_total);
+        let history_start = start.saturating_sub(prefix_total).min(history_total);
+        let history_end = end.saturating_sub(prefix_total).min(history_total);
 
         if history_start < history_end {
             for idx in self
@@ -2204,9 +2233,14 @@ impl App {
             }
         }
 
-        if end > history_total {
-            let tail_start = start.saturating_sub(history_total).min(tail_rows.len());
-            let tail_end = end.saturating_sub(history_total).min(tail_rows.len());
+        let prefix_and_history_total = prefix_total + history_total;
+        if end > prefix_and_history_total {
+            let tail_start = start
+                .saturating_sub(prefix_and_history_total)
+                .min(tail_rows.len());
+            let tail_end = end
+                .saturating_sub(prefix_and_history_total)
+                .min(tail_rows.len());
             for (idx, line) in tail_rows.iter().enumerate().take(tail_end).skip(tail_start) {
                 record_materialized_row();
                 rows.push(line.as_ref().clone());
@@ -2254,12 +2288,18 @@ impl App {
         meta
     }
 
-    fn rebuild_chat_find_lines(&mut self, box_lines: &[Line<'static>], tail_find_lines: &[String]) {
+    fn rebuild_chat_find_lines(
+        &mut self,
+        box_lines: &[Line<'static>],
+        prefix_find_lines: &[String],
+        tail_find_lines: &[String],
+    ) {
         record_find_lines_rebuild();
         let mut lines = box_lines
             .iter()
             .map(|line| rendered_line_text(line).to_lowercase())
             .collect::<Vec<_>>();
+        lines.extend(prefix_find_lines.iter().cloned());
 
         for (idx, entry) in self.history.iter().enumerate() {
             let id = self
@@ -2495,6 +2535,24 @@ impl App {
             self.mark_chat_geometry_dirty_from(idx);
         }
         let _ = self.chat_geometry();
+        self.maybe_start_older_history_page_fetch();
+
+        let marker_text = self.older_history_marker_text();
+        let mut prefix_rows: Vec<Rc<Line<'static>>> = Vec::new();
+        let mut prefix_meta: Vec<ChatRowMeta> = Vec::new();
+        let mut prefix_find_lines: Vec<String> = Vec::new();
+        if let Some(marker) = marker_text {
+            let marker = truncate_display_width(&marker, area.width as usize);
+            prefix_find_lines.push(marker.to_lowercase());
+            prefix_rows.push(Rc::new(Line::from(vec![Span::styled(
+                marker,
+                Style::default()
+                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    .add_modifier(Modifier::ITALIC),
+            )])));
+            prefix_meta.push(ChatRowMeta::other());
+        }
+        let prefix_len = prefix_rows.len();
 
         // Absolute content line (in the message buffer, excluding the banner)
         // of each pinnable message's first row, by history index.
@@ -2510,7 +2568,10 @@ impl App {
                 .get(&id)
                 .unwrap_or_else(|| panic!("missing render cache entry for history row {idx}"));
             if let Some(first_row) = cached.prewrapped.msg_first_row {
-                msg_abs_line.insert(idx, self.chat_geometry.entry_start_row(idx) + first_row);
+                msg_abs_line.insert(
+                    idx,
+                    prefix_len + self.chat_geometry.entry_start_row(idx) + first_row,
+                );
             }
         }
 
@@ -2575,7 +2636,7 @@ impl App {
         // retains the original centered/slide-up/scroll-off behavior.
         let box_lines = self.banner_box_lines(area.width, area.height);
         let b = box_lines.len();
-        let m = self.chat_geometry.total_rows() + tail_rows.len();
+        let m = prefix_rows.len() + self.chat_geometry.total_rows() + tail_rows.len();
 
         // Total scrollable content height, box included — drives the
         // mouse-wheel scrollback clamp.
@@ -2590,7 +2651,7 @@ impl App {
                     .as_ref()
                     .is_none_or(|query| query != &find.query)
             {
-                self.rebuild_chat_find_lines(&box_lines, &tail_find_lines);
+                self.rebuild_chat_find_lines(&box_lines, &prefix_find_lines, &tail_find_lines);
             }
             self.refresh_transcript_find_matches();
         } else {
@@ -2621,8 +2682,14 @@ impl App {
                 v[box_top + i] = line;
                 meta[box_top + i] = ChatRowMeta::banner();
             }
-            let (message_rows, message_meta) =
-                self.materialize_message_rows(&tail_rows, &tail_meta, 0, m);
+            let (message_rows, message_meta) = self.materialize_message_rows(
+                &prefix_rows,
+                &prefix_meta,
+                &tail_rows,
+                &tail_meta,
+                0,
+                m,
+            );
             for (i, line) in message_rows.into_iter().enumerate() {
                 v[msg_top + i] = line;
             }
@@ -2650,8 +2717,14 @@ impl App {
                     v.push(line);
                     meta.push(ChatRowMeta::banner());
                 }
-                let (message_rows, message_meta) =
-                    self.materialize_message_rows(&tail_rows, &tail_meta, 0, m);
+                let (message_rows, message_meta) = self.materialize_message_rows(
+                    &prefix_rows,
+                    &prefix_meta,
+                    &tail_rows,
+                    &tail_meta,
+                    0,
+                    m,
+                );
                 v.extend(message_rows);
                 meta.extend(message_meta);
                 (v, meta)
@@ -2674,6 +2747,8 @@ impl App {
                 let message_start = drop.saturating_sub(b);
                 let message_end = end.saturating_sub(b).min(m);
                 let (message_rows, message_meta) = self.materialize_message_rows(
+                    &prefix_rows,
+                    &prefix_meta,
                     &tail_rows,
                     &tail_meta,
                     message_start,
@@ -2731,6 +2806,7 @@ impl App {
                 frame.buffer_mut(),
                 area,
                 self.transcript_find.as_ref(),
+                self.partial_history_find_note().as_deref(),
                 Style::default()
                     .fg(Color::Indexed(MUTED_COLOR_INDEX))
                     .add_modifier(Modifier::DIM),
@@ -4284,7 +4360,7 @@ fn capture_grid(buf: &ratatui::buffer::Buffer, area: Rect) -> Vec<Vec<String>> {
     grid
 }
 
-fn chat_visible_top(total: usize, visible: usize, offset: usize) -> usize {
+pub(super) fn chat_visible_top(total: usize, visible: usize, offset: usize) -> usize {
     total.saturating_sub(visible).saturating_sub(offset)
 }
 
@@ -4351,6 +4427,7 @@ fn render_transcript_find_bar(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
     find: Option<&TranscriptFind>,
+    note: Option<&str>,
     style: Style,
 ) {
     let Some(find) = find else {
@@ -4361,7 +4438,9 @@ fn render_transcript_find_bar(
     }
     let width = area.width as usize;
     let y = area.y.saturating_add(area.height.saturating_sub(1));
-    let counter = if find.query.is_empty() {
+    let counter = if let Some(note) = note {
+        note.to_string()
+    } else if find.query.is_empty() {
         String::new()
     } else if let Some(current) = find.current {
         format!("{}/{}", current + 1, find.matches.len())
@@ -5289,6 +5368,7 @@ mod slash_popup_full_list_tests {
 
 #[cfg(test)]
 mod render_history_spacing_tests {
+    use super::super::scrollback_page_in::{OlderHistoryMarker, PageRequest};
     use super::{
         App, ChatCopyTarget, ChatRowKind, ChatRowMeta, ControlChip, HISTORY_RENDER_CACHE_MAX_ROWS,
         HistoryRenderCacheEntry, PinHit, ScrollAnchor, Selection, TranscriptFind,
@@ -7590,6 +7670,249 @@ mod render_history_spacing_tests {
             app.history.last(),
             Some(HistoryEntry::Subagent { .. })
         ));
+    }
+
+    fn page_in_app(root: &std::path::Path, total: usize) -> (App, uuid::Uuid) {
+        let mut app = window_history_app(root, total);
+        app.daemon_prompt = None;
+        render_history_no_selection(&mut app, 80, 6);
+        let session_id = uuid::Uuid::new_v4();
+        app.launch.session_id = Some(session_id);
+        (app, session_id)
+    }
+
+    fn arm_page_request(app: &mut App, session_id: uuid::Uuid, request_id: u64) {
+        app.loading_older = Some(PageRequest {
+            id: request_id,
+            session_id,
+        });
+    }
+
+    fn apply_page(
+        app: &mut App,
+        session_id: uuid::Uuid,
+        request_id: u64,
+        start: i64,
+        end: i64,
+        has_more: bool,
+    ) {
+        let entries = (start..end).map(sequenced_user).collect::<Vec<_>>();
+        app.apply_older_history_page_result(request_id, session_id, entries, has_more, Some(start));
+    }
+
+    #[test]
+    fn history_page_in_scroll_to_beginning_loads_every_page_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = page_in_app(tmp.path(), HISTORY_WINDOW_TARGET_ENTRIES * 5);
+
+        let mut request_id = 1;
+        while app.history.has_older() {
+            let before = app.history.older_cursor().expect("older cursor");
+            let start = before.saturating_sub(HISTORY_PAGE_ENTRIES as i64);
+            arm_page_request(&mut app, session_id, request_id);
+            apply_page(&mut app, session_id, request_id, start, before, start > 0);
+            request_id += 1;
+        }
+
+        assert_eq!(app.history.len(), HISTORY_WINDOW_TARGET_ENTRIES * 5);
+        assert!(!app.history.has_older());
+        assert_eq!(app.history.older_cursor(), Some(0));
+        assert_eq!(history_text(&app.history[0]), "window row 0");
+        assert_eq!(app.older_history_marker, OlderHistoryMarker::Exhausted);
+
+        app.set_chat_scroll_offset_from_interaction(app.chat_total_lines);
+        render_history_no_selection(&mut app, 80, 6);
+        let rows = buffer_rows(&render_history_buffer(&mut app, 80, 6), 80, 6).join("\n");
+        assert!(rows.contains("beginning of conversation"));
+        assert!(rows.contains("window row 0"));
+    }
+
+    #[test]
+    fn history_page_in_leaves_viewport_lines_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = page_in_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+        render_history_no_selection(&mut app, 80, 4);
+        app.set_chat_scroll_offset_from_interaction(9);
+        let before = visible_buffer_rows(&mut app, 80, 4);
+
+        arm_page_request(&mut app, session_id, 1);
+        apply_page(&mut app, session_id, 1, 1, 201, true);
+        let after = visible_buffer_rows(&mut app, 80, 4);
+
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn history_page_in_single_in_flight_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = page_in_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+        app.startup_background.daemon_socket = Some(tmp.path().join("missing.sock"));
+        app.chat_pinned_to_tail = false;
+        app.chat_scroll_anchor = Some(ScrollAnchor {
+            entry: app.history.id_at(0).unwrap(),
+            entry_position: 0,
+            row_within_entry: 0,
+            screen_row: 0,
+        });
+
+        app.maybe_start_older_history_page_fetch();
+        let first = app.loading_older.expect("first request").id;
+        app.maybe_start_older_history_page_fetch();
+
+        assert_eq!(app.loading_older.expect("still loading").id, first);
+        assert_eq!(app.current_session_id(), Some(session_id));
+    }
+
+    #[test]
+    fn history_page_in_drops_stale_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = page_in_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+        let before_len = app.history.len();
+        let before_first = history_text(&app.history[0]).to_string();
+        arm_page_request(&mut app, session_id, 2);
+
+        apply_page(&mut app, session_id, 1, 1, 201, true);
+
+        assert_eq!(app.loading_older.expect("newer request remains").id, 2);
+        assert_eq!(app.history.len(), before_len);
+        assert_eq!(history_text(&app.history[0]), before_first);
+    }
+
+    #[tokio::test]
+    async fn history_page_in_failed_fetch_renders_retry_and_retries_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = page_in_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+        arm_page_request(&mut app, session_id, 1);
+        app.apply_older_history_page_error(1, session_id);
+
+        app.launch.session_id = None;
+        app.set_chat_scroll_offset_from_interaction(app.chat_total_lines);
+        let rows = visible_buffer_rows(&mut app, 100, 8).join("\n");
+        assert!(rows.contains("couldn't load earlier messages"));
+        assert_eq!(app.older_history_marker, OlderHistoryMarker::Failed);
+
+        app.launch.session_id = Some(session_id);
+        app.startup_background.daemon_socket = Some(tmp.path().join("missing.sock"));
+        app.chat_pinned_to_tail = false;
+        app.chat_scroll_anchor = Some(ScrollAnchor {
+            entry: app.history.id_at(0).unwrap(),
+            entry_position: 0,
+            row_within_entry: 0,
+            screen_row: 0,
+        });
+        app.maybe_start_older_history_page_fetch();
+        let retry = app.loading_older.expect("retry request");
+        app.maybe_start_older_history_page_fetch();
+
+        assert_eq!(app.loading_older.expect("single retry").id, retry.id);
+    }
+
+    #[test]
+    fn history_page_in_beginning_marker_stops_further_requests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = page_in_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+        arm_page_request(&mut app, session_id, 1);
+        apply_page(&mut app, session_id, 1, 1, 201, false);
+
+        assert!(!app.history.has_older());
+        assert_eq!(app.older_history_marker, OlderHistoryMarker::Exhausted);
+        app.maybe_start_older_history_page_fetch();
+        assert!(app.loading_older.is_none());
+
+        app.set_chat_scroll_offset_from_interaction(app.chat_total_lines);
+        let rows = visible_buffer_rows(&mut app, 100, 8).join("\n");
+        assert!(rows.contains("beginning of conversation"));
+    }
+
+    #[test]
+    fn history_page_in_marker_rows_do_not_shift_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = page_in_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+        app.chat_pinned_to_tail = false;
+        app.launch.session_id = None;
+        let anchor = app.history.id_at(0).unwrap();
+        app.chat_scroll_anchor = Some(ScrollAnchor {
+            entry: anchor,
+            entry_position: 0,
+            row_within_entry: 0,
+            screen_row: 1,
+        });
+        arm_page_request(&mut app, session_id, 1);
+        render_history_no_selection(&mut app, 80, 6);
+        let loading_row = screen_row_for_history_id(&app, anchor);
+
+        app.loading_older = None;
+        app.older_history_marker = OlderHistoryMarker::Failed;
+        render_history_no_selection(&mut app, 80, 6);
+        let failed_row = screen_row_for_history_id(&app, anchor);
+
+        app.older_history_marker = OlderHistoryMarker::Exhausted;
+        render_history_no_selection(&mut app, 80, 6);
+        let exhausted_row = screen_row_for_history_id(&app, anchor);
+
+        assert_eq!(loading_row, failed_row);
+        assert_eq!(failed_row, exhausted_row);
+    }
+
+    #[test]
+    fn history_page_in_subagent_view_cancels_in_flight_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = page_in_app(tmp.path(), 8);
+        app.history.push(running_subagent());
+        arm_page_request(&mut app, session_id, 1);
+        app.launch.session_id = None;
+
+        assert!(app.open_subagent_view_for_history_index(8));
+        assert!(app.loading_older.is_none());
+        app.launch.session_id = Some(session_id);
+        app.apply_older_history_page_result(
+            1,
+            session_id,
+            vec![sequenced_user(-1)],
+            false,
+            Some(-1),
+        );
+
+        assert!(app.history.is_empty());
+        assert!(app.return_from_subagent_view());
+        assert_eq!(app.history.len(), 9);
+    }
+
+    #[test]
+    fn history_page_in_find_notes_partial_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _) = page_in_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+        app.transcript_find = Some(TranscriptFind {
+            query: "window".to_string(),
+            matches: Vec::new(),
+            current: None,
+            saved_offset: 0,
+        });
+
+        let rows = buffer_rows(&render_history_buffer(&mut app, 120, 8), 120, 8).join("\n");
+
+        assert!(rows.contains("searched loaded messages only"));
     }
 
     #[test]

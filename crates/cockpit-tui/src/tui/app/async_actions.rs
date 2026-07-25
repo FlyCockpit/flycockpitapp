@@ -467,6 +467,26 @@ impl App {
                     line: format!("subagent steer: {e}"),
                 }),
             },
+            AsyncActionKind::DaemonRpc("history.page") => match result.payload {
+                Ok(AsyncActionPayload::HistoryPage {
+                    request_id,
+                    session_id,
+                    entries,
+                    has_more,
+                    oldest_seq,
+                }) => {
+                    self.apply_older_history_page_result(
+                        request_id, session_id, entries, has_more, oldest_seq,
+                    );
+                }
+                Ok(AsyncActionPayload::HistoryPageError {
+                    request_id,
+                    session_id,
+                    message: _,
+                }) => self.apply_older_history_page_error(request_id, session_id),
+                Ok(_) => {}
+                Err(_) => {}
+            },
             AsyncActionKind::DaemonRpc("fork.create") => match result.payload {
                 Ok(AsyncActionPayload::ForkCreated {
                     parent_session_id,

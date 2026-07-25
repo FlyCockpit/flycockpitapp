@@ -34,6 +34,7 @@ mod pins;
 mod prediction;
 mod render;
 mod resume;
+mod scrollback_page_in;
 mod session_services;
 mod side_conversation;
 mod skills_pane_actions;
@@ -1487,6 +1488,10 @@ pub struct App {
     /// history mode or when entry happened from an empty composer.
     pub(super) staged_draft: Option<String>,
     pub(super) history: HistoryWindow,
+    /// In-flight older-history page request for the main transcript.
+    pub(super) loading_older: Option<scrollback_page_in::PageRequest>,
+    pub(super) next_history_page_request_id: u64,
+    pub(super) older_history_marker: scrollback_page_in::OlderHistoryMarker,
     /// In-flight assistant turn (between `ThinkingStarted` and the
     /// matching `AssistantText`/tool boundary). When `Some`, the
     /// renderer appends a live entry to the bottom of the history
@@ -2892,6 +2897,9 @@ impl App {
             prompt_history_cursor: 0,
             staged_draft: None,
             history: HistoryWindow::default(),
+            loading_older: None,
+            next_history_page_request_id: 1,
+            older_history_marker: scrollback_page_in::OlderHistoryMarker::None,
             pending: None,
             transcript_view: TranscriptViewMeta::Main,
             transcript_view_stack: Vec::new(),

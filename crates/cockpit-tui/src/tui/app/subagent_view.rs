@@ -16,6 +16,7 @@ fn subagent_view_notice(read_only: bool, truncated: bool) -> Option<String> {
 
 impl App {
     fn capture_transcript_view(&mut self) -> StoredTranscriptView {
+        self.cancel_older_history_page_request();
         let history_render_cache_rows = self.history_render_cache_rows;
         let history_render_cache = self.take_history_render_cache();
         StoredTranscriptView {
@@ -34,6 +35,7 @@ impl App {
     }
 
     fn restore_transcript_view(&mut self, mut view: StoredTranscriptView) {
+        self.cancel_older_history_page_request();
         self.transcript_view = std::mem::take(&mut view.meta);
         self.history = std::mem::take(&mut view.history);
         self.pending = view.pending.take();

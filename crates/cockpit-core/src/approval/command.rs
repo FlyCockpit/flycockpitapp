@@ -53,12 +53,23 @@ impl Approver {
         confined_exit: i32,
         confined_stderr: String,
     ) -> Result<Decision> {
+        self.approve_command_escalated_with_denial(command, confined_exit, confined_stderr, None)
+            .await
+    }
+
+    pub async fn approve_command_escalated_with_denial(
+        &self,
+        command: &str,
+        confined_exit: i32,
+        confined_stderr: String,
+        denial: Option<SandboxDenialReport>,
+    ) -> Result<Decision> {
         let escalation = SandboxEscalation {
             confined_exit,
             confined_stderr,
             suggested_paths: Vec::new(),
             suggested_access: None,
-            denial: None,
+            denial,
         };
         self.approve_command_inner(command, Some(escalation)).await
     }
@@ -73,6 +84,26 @@ impl Approver {
         confined_exit: i32,
         confined_stderr: String,
         grant_offer: Option<&SandboxEscalationGrantOffer>,
+        command_detail: Option<CommandDetail>,
+    ) -> Result<SandboxEscalationApproval> {
+        self.approve_sandbox_escalation_with_denial(
+            command,
+            confined_exit,
+            confined_stderr,
+            grant_offer,
+            None,
+            command_detail,
+        )
+        .await
+    }
+
+    pub async fn approve_sandbox_escalation_with_denial(
+        &self,
+        command: &str,
+        confined_exit: i32,
+        confined_stderr: String,
+        grant_offer: Option<&SandboxEscalationGrantOffer>,
+        denial: Option<SandboxDenialReport>,
         command_detail: Option<CommandDetail>,
     ) -> Result<SandboxEscalationApproval> {
         let offered_scopes = grant_offer
@@ -93,7 +124,7 @@ impl Approver {
             confined_stderr,
             suggested_paths,
             suggested_access,
-            denial: None,
+            denial,
         };
 
         let accepted = if grant_offer.is_some() && !offered_scopes.is_empty() {

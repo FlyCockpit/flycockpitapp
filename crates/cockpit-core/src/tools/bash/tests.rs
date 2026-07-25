@@ -1043,6 +1043,28 @@ async fn resolve_next_interrupt_with_response(
     iid
 }
 
+async fn resolve_next_interrupt_with_escalation(
+    db: crate::db::Db,
+    sid: uuid::Uuid,
+    hub: Arc<crate::engine::interrupt::InterruptHub>,
+    selected_id: &'static str,
+) -> (uuid::Uuid, Option<SandboxEscalation>) {
+    let iid = loop {
+        let open = db.list_open_interrupts(sid).await.unwrap();
+        if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
+            break row.interrupt_id;
+        }
+        tokio::task::yield_now().await;
+    };
+    let escalation = open_escalation(&db, sid, iid).await;
+    let response = ResolveResponse::Single {
+        selected_id: selected_id.into(),
+    };
+    db.resolve_interrupt(iid, &response).await.unwrap();
+    assert!(hub.resolve(iid, response));
+    (iid, escalation)
+}
+
 async fn approve_next_path_prompt(ctx: &ToolCtx) {
     resolve_next_interrupt(
         ctx.session.db.clone(),
@@ -1809,10 +1831,9 @@ async fn ungranted_command_still_prompts_on_confined_failure() {
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
-    let resolver =
-        tokio::spawn(
-            async move { resolve_next_interrupt(db, sid, hub, ID_APPROVE_ONCE, None).await },
-        );
+    let resolver = tokio::spawn(async move {
+        resolve_next_interrupt_with_escalation(db, sid, hub, ID_APPROVE_ONCE).await
+    });
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
         Some((13, "sandbox denied".to_string())),
@@ -1833,6 +1854,227 @@ async fn ungranted_command_still_prompts_on_confined_failure() {
     assert!(meta.escalated);
     assert_eq!(meta.approval_scope_recorded.as_deref(), Some("once"));
     assert!(out.content.contains("hi"));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn sandbox_denial_grant_auto_rerun_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let command = "cat ../secret.txt";
+    grant_command(&ctx, command, Scope::Session).await;
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [
+            (
+                true,
+                shell_out("", "sh: cannot create: Permission denied", 13),
+            ),
+            (false, shell_out("hi", "", 0)),
+        ],
+    );
+
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": command, "cwd": work.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .expect("bash call returns");
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(meta.escalation_preauthorized);
+    assert!(meta.escalated);
+    assert_eq!(meta.approval_scope_recorded.as_deref(), Some("session"));
+    assert!(
+        out.content
+            .contains("reran the command once without the sandbox")
+    );
+    assert!(
+        ctx.session
+            .db
+            .list_open_interrupts(ctx.session.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "preauthorized classified denial must not prompt"
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn sandbox_denial_high_without_grant_raises_escalation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let outside = tmp.path().join("secret.txt");
+    let command = "cat ../secret.txt";
+    let db = ctx.session.db.clone();
+    let sid = ctx.session.id;
+    let hub = ctx.interrupts.clone();
+    let resolver = tokio::spawn(async move {
+        resolve_next_interrupt_with_escalation(db, sid, hub, ID_APPROVE_ONCE).await
+    });
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [
+            (
+                true,
+                shell_out("", "sh: cannot create: Permission denied", 13),
+            ),
+            (false, shell_out("hi", "", 0)),
+        ],
+    );
+
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": command, "cwd": work.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .expect("bash call returns");
+    let (_iid, escalation) = resolver.await.unwrap();
+    let escalation = escalation.expect("escalation carries detail");
+    let denial = escalation
+        .denial
+        .expect("classifier-raised interrupt has denial report");
+    assert_eq!(
+        denial.confidence,
+        crate::daemon::proto::SandboxDenialConfidence::High
+    );
+    assert!(denial.evidence.iter().any(|evidence| {
+        matches!(
+            evidence,
+            crate::daemon::proto::SandboxDenialEvidence::ReadOutsideAllowlist { path }
+                if path.as_str() == outside.display().to_string()
+        )
+    }));
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(meta.escalated);
+    assert_eq!(meta.approval_scope_recorded.as_deref(), Some("once"));
+    assert!(
+        out.content
+            .contains("reran the command once without the sandbox")
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn sandbox_denial_wire_report_populated_on_auto_raise() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let outside = tmp.path().join("secret.txt");
+    let command = "cat ../secret.txt";
+    let db = ctx.session.db.clone();
+    let sid = ctx.session.id;
+    let hub = ctx.interrupts.clone();
+    let resolver = tokio::spawn(async move {
+        resolve_next_interrupt_with_escalation(db, sid, hub, ID_REJECT).await
+    });
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [(
+            true,
+            shell_out("", "sh: cannot create: Permission denied", 13),
+        )],
+    );
+
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": command, "cwd": work.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .expect("bash call returns");
+    let (_iid, escalation) = resolver.await.unwrap();
+    let escalation = escalation.expect("escalation carries detail");
+    let denial = escalation
+        .denial
+        .expect("classifier-raised interrupt has denial report");
+
+    assert_eq!(
+        denial.confidence,
+        crate::daemon::proto::SandboxDenialConfidence::High
+    );
+    assert!(denial.evidence.iter().any(|evidence| {
+        matches!(
+            evidence,
+            crate::daemon::proto::SandboxDenialEvidence::ReadOutsideAllowlist { path }
+                if path.as_str() == outside.display().to_string()
+        )
+    }));
+    assert!(
+        out.content
+            .contains("escalation was not approved; the confined failure is preserved")
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn sandbox_denial_possible_appends_evidence_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_escalation_enabled(true);
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [(true, shell_out("", "Permission denied", 13))],
+    );
+
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": "printf 'Permission denied' >&2" }),
+            &ctx,
+        )
+        .await
+        .expect("bash call returns");
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(!meta.escalated);
+    assert!(out.content.contains("may have hit a sandbox denial"));
+    assert!(
+        out.content
+            .contains("stderr contained a permission-denial marker")
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn sandbox_denial_no_rerun_loop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let command = "cat ../secret.txt";
+    grant_command(&ctx, command, Scope::Session).await;
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        None,
+        [
+            (
+                true,
+                shell_out("", "sh: cannot create: Permission denied", 13),
+            ),
+            (false, shell_out("", "still failed", 2)),
+        ],
+    );
+
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": command, "cwd": work.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .expect("bash call returns");
+    let meta = out.sandbox.expect("bash always populates sandbox meta");
+    assert!(meta.escalated);
+    assert!(out.content.contains("still failed"));
 }
 
 #[cfg(not(windows))]
@@ -2034,7 +2276,8 @@ async fn confined_failure_omits_escalate_note_in_defensive_mode() {
     ctx.current_tool_call_id = Some("call-defensive".to_string());
     ctx.session.set_sandbox_escalation_enabled(true);
     let outcome = shell_out("", "blocked", 13);
-    let note = sandbox_escalation_note(&ctx, true, true, &outcome);
+    let denial_verdict = crate::tools::shell_sandbox::SandboxDenialVerdict::unknown();
+    let note = sandbox_escalation_note(&ctx, true, true, &outcome, &denial_verdict);
     let body = render_output(
         &outcome,
         false,

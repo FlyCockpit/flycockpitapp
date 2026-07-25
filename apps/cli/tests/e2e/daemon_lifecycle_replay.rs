@@ -10,7 +10,7 @@ use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 const TOOL_CALL_ID: &str = "call_lifecycle_bash";
-const COMMAND: &str = "cat /etc/shadow";
+const COMMAND: &str = "cat /tmp";
 
 static DAEMON_REPLAY_TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -424,7 +424,7 @@ fn lifecycle_graceful_park_round_trip_replays_once() {
         assert_eq!(raised_after_restart, interrupt_id);
 
         client
-            .approve_interrupt_once(interrupt_id)
+            .approve_interrupt_project(interrupt_id)
             .await
             .expect("approve parked interrupt");
         wait_for_resolved(&client, attached.session_id, interrupt_id).await;
@@ -493,7 +493,7 @@ fn lifecycle_sigkill_open_interrupt_reconciles_and_replays_once() {
         assert_eq!(raised_after_restart, interrupt_id);
 
         client
-            .approve_interrupt_once(interrupt_id)
+            .approve_interrupt_project(interrupt_id)
             .await
             .expect("approve parked interrupt");
         wait_for_resolved(&client, attached.session_id, interrupt_id).await;
@@ -728,7 +728,7 @@ fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without_reexe
             interrupt_id
         );
         client
-            .approve_interrupt_once(interrupt_id)
+            .approve_interrupt_project(interrupt_id)
             .await
             .expect("approve parked interrupt");
         wait_until("parked interrupt executing", Duration::from_secs(5), || {
@@ -783,7 +783,7 @@ fn lifecycle_attach_replay_across_restart_delivers_persisted_events_once_in_orde
             interrupt_id
         );
         client
-            .approve_interrupt_once(interrupt_id)
+            .approve_interrupt_project(interrupt_id)
             .await
             .expect("approve parked interrupt");
         wait_for_resolved(&client, attached.session_id, interrupt_id).await;

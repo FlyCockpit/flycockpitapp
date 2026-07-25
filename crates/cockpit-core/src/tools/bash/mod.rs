@@ -612,6 +612,12 @@ async fn call_bash_inner(
         };
     let extra_sandbox_paths =
         merged_extra_sandbox_paths(&command_resource_plan.allow_paths, &jq_shim_paths);
+    let sandbox_policy = crate::tools::shell_sandbox::sandbox_policy(
+        &cwd,
+        tmp_dir.as_deref(),
+        &session_env,
+        &extra_sandbox_paths,
+    );
 
     // First attempt: sandboxed (confined) or broadened/unconfined.
     let attempt = run_shell(
@@ -662,14 +668,43 @@ async fn call_bash_inner(
     };
 
     // Run-fail-escalate (sandboxing part 2): automatic unconfined reruns
-    // are only allowed from trusted sandbox metadata. Child stderr is
-    // attacker-controlled, and zerobox currently exposes no structured
-    // "the sandbox denied this operation" signal here, so confined
-    // failures fall through with their original result.
+    // are allowed only for trusted test metadata or a high-confidence
+    // policy-based sandbox denial classification. Child stderr alone can
+    // never enter this branch.
     let mut final_outcome = outcome;
+    let denial_verdict = if confine && !options.escalated && !final_outcome.success {
+        let stderr = String::from_utf8_lossy(&final_outcome.stderr);
+        crate::tools::shell_sandbox::SandboxDenialClassifier::classify(
+            &crate::tools::shell_sandbox::HeuristicSandboxDenialClassifier,
+            &crate::tools::shell_sandbox::SandboxDenialInput {
+                command,
+                cwd: &cwd,
+                policy: &sandbox_policy,
+                exit: final_outcome.exit,
+                stderr: &stderr,
+            },
+        )
+    } else {
+        crate::tools::shell_sandbox::SandboxDenialVerdict::unknown()
+    };
+    let mut classified_denial_action_note = None;
     if confine
-        && let Some((confined_exit, confined_stderr)) =
+        && !options.escalated
+        && let Some((confined_exit, confined_stderr, denial_report, classified_evidence)) =
             confined_failure_escalation_offer(&final_outcome)
+                .map(|(exit, stderr)| (exit, stderr, None, None))
+                .or_else(|| {
+                    denial_verdict.is_high().then(|| {
+                        (
+                            final_outcome.exit,
+                            String::from_utf8_lossy(&final_outcome.stderr)
+                                .trim_end()
+                                .to_string(),
+                            denial_verdict.wire_report(),
+                            Some(sandbox_denial_evidence_summary(&denial_verdict)),
+                        )
+                    })
+                })
     {
         meta.escalated = true;
         let approved_scope = if let Some(scope) = escalation_preauthorized_scope {
@@ -679,7 +714,12 @@ async fn call_bash_inner(
             // attempt's trusted denial detail, captured before the re-run
             // overwrites `final_outcome`.
             match approver
-                .approve_command_escalated(command, confined_exit, confined_stderr)
+                .approve_command_escalated_with_denial(
+                    command,
+                    confined_exit,
+                    confined_stderr,
+                    denial_report,
+                )
                 .await?
             {
                 crate::approval::Decision::Allow { scope } => Some(scope),
@@ -701,6 +741,11 @@ async fn call_bash_inner(
             None
         };
         if let Some(scope) = approved_scope {
+            if let Some(evidence) = classified_evidence.as_deref() {
+                classified_denial_action_note = Some(format!(
+                    "note: cockpit classified the confined failure as sandbox-caused ({evidence}) and reran the command once without the sandbox."
+                ));
+            }
             meta.approval_scope_recorded = Some(scope.as_str().to_string());
             let rerun = run_shell(
                 &prefixed,
@@ -748,6 +793,10 @@ async fn call_bash_inner(
                 }
                 RunOutcome::Done(o) => final_outcome = o,
             }
+        } else if let Some(evidence) = classified_evidence.as_deref() {
+            classified_denial_action_note = Some(format!(
+                "note: cockpit classified the confined failure as sandbox-caused ({evidence}), but escalation was not approved; the confined failure is preserved."
+            ));
         }
     }
 
@@ -776,6 +825,10 @@ async fn call_bash_inner(
         && let Some(hint) = command_resource_plan.unsupported_hint()
     {
         final_outcome.stderr.extend_from_slice(hint.as_bytes());
+        final_outcome.stderr.push(b'\n');
+    }
+    if let Some(note) = classified_denial_action_note {
+        final_outcome.stderr.extend_from_slice(note.as_bytes());
         final_outcome.stderr.push(b'\n');
     }
 
@@ -808,7 +861,13 @@ async fn call_bash_inner(
         None
     };
     let native_write_hint = durable_shell_write_hint(command);
-    let escalation_note = sandbox_escalation_note(ctx, confine, !options.escalated, &final_outcome);
+    let escalation_note = sandbox_escalation_note(
+        ctx,
+        confine,
+        !options.escalated,
+        &final_outcome,
+        &denial_verdict,
+    );
 
     // Model-facing body is unchanged — only `final_outcome` is rendered,
     // never the sandbox metadata (which rides out-of-band for the event).
@@ -1296,6 +1355,7 @@ fn sandbox_escalation_note(
     confined: bool,
     first_attempt: bool,
     outcome: &ShellOutcome,
+    denial_verdict: &crate::tools::shell_sandbox::SandboxDenialVerdict,
 ) -> Option<String> {
     if !confined
         || !first_attempt
@@ -1310,9 +1370,45 @@ fn sandbox_escalation_note(
         .as_deref()
         .map(|id| format!(" with call_id=\"{id}\""))
         .unwrap_or_default();
+    if denial_verdict.is_possible() {
+        let evidence = sandbox_denial_evidence_summary(denial_verdict);
+        return Some(format!(
+            "note: this ran under the shell sandbox and may have hit a sandbox denial ({evidence}); call `escalate`{call_id} only if the evidence matches the failed operation (add suggested_paths so future commands keep working inside the sandbox)."
+        ));
+    }
     Some(format!(
         "note: this ran under the shell sandbox; if it failed because the sandbox blocked a path, call `escalate`{call_id} (add suggested_paths so future commands keep working inside the sandbox)."
     ))
+}
+
+fn sandbox_denial_evidence_summary(
+    verdict: &crate::tools::shell_sandbox::SandboxDenialVerdict,
+) -> String {
+    let mut parts = verdict
+        .evidence
+        .iter()
+        .take(4)
+        .map(|evidence| match evidence {
+            crate::tools::shell_sandbox::DenialEvidence::WriteOutsideAllowlist { path } => {
+                format!("write outside allowlist: {}", path.display())
+            }
+            crate::tools::shell_sandbox::DenialEvidence::ReadOutsideAllowlist { path } => {
+                format!("read outside allowlist: {}", path.display())
+            }
+            crate::tools::shell_sandbox::DenialEvidence::StderrPermissionMarker => {
+                "stderr contained a permission-denial marker".to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    let remaining = verdict.evidence.len().saturating_sub(parts.len());
+    if remaining > 0 {
+        parts.push(format!("and {remaining} more"));
+    }
+    if parts.is_empty() {
+        "no concrete evidence".to_string()
+    } else {
+        parts.join("; ")
+    }
 }
 
 fn sandbox_unavailable_refusal(reason: &str, ctx: &ToolCtx, first_attempt: bool) -> String {
@@ -2291,8 +2387,14 @@ fn render_bash_outcome(
         None
     };
     let native_write_hint = durable_shell_write_hint(command);
-    let escalation_note =
-        sandbox_escalation_note(ctx, meta.confined, !meta.escalated, &final_outcome);
+    let denial_verdict = crate::tools::shell_sandbox::SandboxDenialVerdict::unknown();
+    let escalation_note = sandbox_escalation_note(
+        ctx,
+        meta.confined,
+        !meta.escalated,
+        &final_outcome,
+        &denial_verdict,
+    );
     let body = render_output(
         &final_outcome,
         compress,

@@ -52,6 +52,12 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+pub mod denial;
+pub use denial::{
+    DenialEvidence, HeuristicSandboxDenialClassifier, SandboxDenialClassifier,
+    SandboxDenialConfidence, SandboxDenialInput, SandboxDenialVerdict,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxPathAccess {
@@ -80,6 +86,55 @@ pub struct ExtraSandboxPath {
     pub kind: String,
     pub path: std::path::PathBuf,
     pub access: SandboxPathAccess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPolicy {
+    pub allow_read_roots: Vec<std::path::PathBuf>,
+    pub allow_write_roots: Vec<std::path::PathBuf>,
+    pub network_allowed: bool,
+}
+
+pub fn sandbox_policy(
+    cwd: &std::path::Path,
+    tmp_dir: Option<&std::path::Path>,
+    session_env: &std::collections::HashMap<String, String>,
+    extra_paths: &[ExtraSandboxPath],
+) -> SandboxPolicy {
+    let mut allow_read_roots = Vec::new();
+    let mut allow_write_roots = Vec::new();
+    push_unique_path(&mut allow_read_roots, cwd.to_path_buf());
+    push_unique_path(&mut allow_write_roots, cwd.to_path_buf());
+
+    for path in crate::env_snapshot::user_runtime_read_paths_from_path(
+        session_env.get("PATH").map(String::as_str),
+    ) {
+        push_unique_path(&mut allow_read_roots, path);
+    }
+
+    for extra in extra_paths {
+        push_unique_path(&mut allow_read_roots, extra.path.clone());
+        if matches!(extra.access, SandboxPathAccess::ReadWrite) {
+            push_unique_path(&mut allow_write_roots, extra.path.clone());
+        }
+    }
+
+    if let Some(tmp) = tmp_dir {
+        push_unique_path(&mut allow_read_roots, tmp.to_path_buf());
+        push_unique_path(&mut allow_write_roots, tmp.to_path_buf());
+    }
+
+    SandboxPolicy {
+        allow_read_roots,
+        allow_write_roots,
+        network_allowed: true,
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<std::path::PathBuf>, path: std::path::PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
 }
 
 /// Linux helper alias path, captured by [`init`] and read by
@@ -151,6 +206,7 @@ pub async fn build_sandboxed_command(
     session_env: &std::collections::HashMap<String, String>,
     extra_paths: &[ExtraSandboxPath],
 ) -> Result<tokio::process::Command> {
+    let policy = sandbox_policy(cwd, tmp_dir, session_env, extra_paths);
     let mut sandbox = zerobox::Sandbox::command("sh")
         .arg("-c")
         .arg(command)
@@ -171,23 +227,16 @@ pub async fn build_sandboxed_command(
         sandbox = sandbox.env(key.clone(), value.clone());
     }
 
-    for path in crate::env_snapshot::user_runtime_read_paths_from_path(
-        session_env.get("PATH").map(String::as_str),
-    ) {
-        sandbox = sandbox.allow_read(path);
+    for path in &policy.allow_read_roots {
+        sandbox = sandbox.allow_read(path.clone());
     }
 
-    for extra in extra_paths {
-        sandbox = sandbox.allow_read(extra.path.clone());
-        if matches!(extra.access, SandboxPathAccess::ReadWrite) {
-            sandbox = sandbox.allow_write(extra.path.clone());
-        }
+    for path in &policy.allow_write_roots {
+        sandbox = sandbox.allow_write(path.clone());
     }
 
     if let Some(tmp) = tmp_dir {
         sandbox = sandbox
-            .allow_read(tmp.to_path_buf())
-            .allow_write(tmp.to_path_buf())
             // Point the temp-dir env vars at the one writable scratch area.
             // Without this, `mktemp` / `tempfile` / `std::env::temp_dir()`
             // resolve to bare `/tmp` (denied — only the `cockpit-session-*`

@@ -55,7 +55,7 @@ pub(crate) use crate::approval::options::{ApprovalOptionId, ApprovalOptionSet, F
 use crate::approval::store::{GrantKind, GrantStore, LoopVerdict, Scope};
 use crate::daemon::proto::{
     CharSpan, CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet,
-    ResolveResponse, SandboxEscalation, WriteContentPreview,
+    ResolveResponse, SandboxDenialReport, SandboxEscalation, WriteContentPreview,
 };
 use crate::engine::interrupt::InterruptHub;
 

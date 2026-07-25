@@ -100,11 +100,16 @@ pub fn sandbox_policy(
     tmp_dir: Option<&std::path::Path>,
     session_env: &std::collections::HashMap<String, String>,
     extra_paths: &[ExtraSandboxPath],
+    write_scope: Option<&std::path::Path>,
 ) -> SandboxPolicy {
     let mut allow_read_roots = Vec::new();
     let mut allow_write_roots = Vec::new();
     push_unique_path(&mut allow_read_roots, cwd.to_path_buf());
-    push_unique_path(&mut allow_write_roots, cwd.to_path_buf());
+    if let Some(scope) = write_scope {
+        push_unique_path(&mut allow_write_roots, scope.to_path_buf());
+    } else {
+        push_unique_path(&mut allow_write_roots, cwd.to_path_buf());
+    }
 
     for path in crate::env_snapshot::user_runtime_read_paths_from_path(
         session_env.get("PATH").map(String::as_str),
@@ -205,8 +210,9 @@ pub async fn build_sandboxed_command(
     extra_env: &[(String, String)],
     session_env: &std::collections::HashMap<String, String>,
     extra_paths: &[ExtraSandboxPath],
+    write_scope: Option<&std::path::Path>,
 ) -> Result<tokio::process::Command> {
-    let policy = sandbox_policy(cwd, tmp_dir, session_env, extra_paths);
+    let policy = sandbox_policy(cwd, tmp_dir, session_env, extra_paths, write_scope);
     let mut sandbox = zerobox::Sandbox::command("sh")
         .arg("-c")
         .arg(command)
@@ -219,9 +225,9 @@ pub async fn build_sandboxed_command(
         // out of scope; this only changes networking, not filesystem
         // confinement (cwd + tmp read/write, deny outside still hold).
         .allow_net_all()
-        // cwd is the read+write working area.
-        .allow_read(cwd.to_path_buf())
-        .allow_write(cwd.to_path_buf());
+        // cwd is always readable; write roots come from `sandbox_policy` so a
+        // scoped child can drop cwd write access.
+        .allow_read(cwd.to_path_buf());
 
     for (key, value) in session_env {
         sandbox = sandbox.env(key.clone(), value.clone());
@@ -365,7 +371,8 @@ async fn probe_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {
     };
 
     let probe_env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    let mut cmd = match build_sandboxed_command("true", cwd, None, &[], &probe_env, &[]).await {
+    let mut cmd = match build_sandboxed_command("true", cwd, None, &[], &probe_env, &[], None).await
+    {
         Ok(c) => c,
         Err(e) => {
             return unavailable_from_raw(&e.to_string());
@@ -692,6 +699,7 @@ mod tests {
             &[("SECRET_KEY".to_string(), String::new())],
             &std::collections::HashMap::new(),
             &[],
+            None,
         )
         .await
         .expect("sandbox command builds");
@@ -700,6 +708,31 @@ mod tests {
         // binary, not `sh` directly; either way it's a non-empty program.
         let dbg = format!("{cmd:?}");
         assert!(!dbg.is_empty());
+    }
+
+    #[test]
+    fn sandbox_profile_narrows_write_to_scope() {
+        let cwd = tempfile::tempdir().unwrap();
+        let scope = cwd.path().join("crates/core");
+        std::fs::create_dir_all(&scope).unwrap();
+        let env = std::collections::HashMap::new();
+
+        let unscoped = sandbox_policy(cwd.path(), None, &env, &[], None);
+        assert!(
+            unscoped
+                .allow_read_roots
+                .contains(&cwd.path().to_path_buf())
+        );
+        assert!(
+            unscoped
+                .allow_write_roots
+                .contains(&cwd.path().to_path_buf())
+        );
+
+        let scoped = sandbox_policy(cwd.path(), None, &env, &[], Some(&scope));
+        assert!(scoped.allow_read_roots.contains(&cwd.path().to_path_buf()));
+        assert!(!scoped.allow_write_roots.contains(&cwd.path().to_path_buf()));
+        assert!(scoped.allow_write_roots.contains(&scope));
     }
 
     /// The scratch dir is wired into `TMPDIR`/`TMP`/`TEMP` on the confined
@@ -722,6 +755,7 @@ mod tests {
             &[],
             &std::collections::HashMap::new(),
             &[],
+            None,
         )
         .await
         .expect("sandbox command builds");
@@ -748,7 +782,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let session_env =
             std::collections::HashMap::from([("TMPDIR".to_string(), "/session/tmp".to_string())]);
-        let cmd = build_sandboxed_command("true", cwd.path(), None, &[], &session_env, &[])
+        let cmd = build_sandboxed_command("true", cwd.path(), None, &[], &session_env, &[], None)
             .await
             .expect("sandbox command builds");
         // We didn't set TMPDIR; whatever value appears is purely inherited,

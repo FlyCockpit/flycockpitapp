@@ -19,13 +19,13 @@ pub(crate) async fn acquire_waiting(
     tool_name: &str,
     record_read: bool,
 ) -> Result<WaitingAcquire> {
-    let preexisting_hold = matches!(ctx.locks.holder(path), Some((s, ref a)) if s == ctx.session.id && a == &ctx.agent_id);
+    let preexisting_hold = matches!(ctx.locks.holder(path), Some((s, ref a)) if s == ctx.session.id && a == &ctx.lock_identity);
     let events = ctx.events.clone();
     let waiting_path = path.display().to_string();
     let did_wait = Arc::new(AtomicBool::new(false));
     let outcome = if record_read {
         ctx.locks
-            .acquire_wait(path, &ctx.agent_id, ctx.session.id, &ctx.cancel, {
+            .acquire_wait(path, &ctx.lock_identity, ctx.session.id, &ctx.cancel, {
                 let events = events.clone();
                 let waiting_path = waiting_path.clone();
                 let did_wait = did_wait.clone();
@@ -43,7 +43,7 @@ pub(crate) async fn acquire_waiting(
             .await
     } else {
         ctx.locks
-            .acquire_wait_without_read(path, &ctx.agent_id, ctx.session.id, &ctx.cancel, {
+            .acquire_wait_without_read(path, &ctx.lock_identity, ctx.session.id, &ctx.cancel, {
                 let events = events.clone();
                 let waiting_path = waiting_path.clone();
                 let did_wait = did_wait.clone();

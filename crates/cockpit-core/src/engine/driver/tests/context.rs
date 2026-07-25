@@ -969,6 +969,8 @@ async fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
         params: old.params.clone(),
         scan_tool_results: old.scan_tool_results,
         llm_mode: crate::config::extended::LlmMode::Normal,
+        lock_identity: "Build".to_string(),
+        write_scope: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         env_overlay: old.env_overlay.clone(),

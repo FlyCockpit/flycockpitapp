@@ -314,6 +314,8 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         swarm_max_depth: spec.max_depth,
         // Background swarm children carry no per-delegation grants.
         granted_tools: Vec::new(),
+        lock_identity: None,
+        write_scope: None,
     };
     // The recursive worker unit is `bee` (GOALS §24/§26): a noninteractive,
     // write-capable, parallel worker that may itself fan out deeper `bee`

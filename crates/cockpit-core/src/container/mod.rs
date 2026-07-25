@@ -574,7 +574,7 @@ pub fn resource_profile_mounts(
     let mut seen = HashSet::new();
     let mut mounts = Vec::new();
     for root in &plan.allow_paths {
-        if path_relative_to(&root.path, &map.host_root).is_some() {
+        if root.kind != "write_scope" && path_relative_to(&root.path, &map.host_root).is_some() {
             continue;
         }
         if native_windows {

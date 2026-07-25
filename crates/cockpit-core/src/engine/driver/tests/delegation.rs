@@ -488,6 +488,7 @@ async fn resolved_cwd_unknown_agent_refuses_before_load() {
             resolved: child_dir,
         },
         context: crate::engine::agent::TaskContext::Fresh,
+        write_scope: None,
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),

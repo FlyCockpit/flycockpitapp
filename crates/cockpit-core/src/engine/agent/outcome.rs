@@ -77,6 +77,8 @@ pub enum TurnOutcome {
         /// Optional working directory for a noninteractive child. Parsed here
         /// and resolved/validated by the driver before spawn.
         cwd: Option<String>,
+        /// Optional hard write-confined subtree for this child.
+        write_scope: Option<String>,
         /// Whether the child starts with a fresh context or a forked copy of
         /// the delegating parent's transcript.
         context: TaskContext,
@@ -192,7 +194,7 @@ pub struct BatchTaskEntry {
     pub context: TaskContext,
     pub granted_tools: Vec<String>,
     pub todo_ids: Vec<uuid::Uuid>,
-    pub output_dir: Option<String>,
+    pub write_scope: Option<String>,
 }
 
 /// Resolve the `handoff` target (`Plan`/`Build`) from a model-issued

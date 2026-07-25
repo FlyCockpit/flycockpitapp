@@ -166,6 +166,10 @@ impl TaskTool {
                     "type": "string",
                     "description": "Relative paths resolve against the parent session cwd; must stay in workspace"
                 },
+                "write_scope": {
+                    "type": "string",
+                    "description": "Hard write-confined subtree; reads stay cwd-wide"
+                },
                 "grant_tools": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -216,8 +220,9 @@ impl TaskTool {
                     "type": "array",
                     "items": { "type": "string" }
                 },
-                "output_dir": {
-                    "type": "string"
+                "write_scope": {
+                    "type": "string",
+                    "description": "Required for write-capable entries; hard write-confined subtree"
                 },
                 "remaining_depth": {
                     "type": "integer",
@@ -253,6 +258,7 @@ impl TaskTool {
                 "why": delegate_payload["properties"]["why"].clone(),
                 "resume_handle": delegate_payload["properties"]["resume_handle"].clone(),
                 "cwd": delegate_payload["properties"]["cwd"].clone(),
+                "write_scope": delegate_payload["properties"]["write_scope"].clone(),
                 "grant_tools": delegate_payload["properties"]["grant_tools"].clone(),
                 "todo_ids": delegate_payload["properties"]["todo_ids"].clone(),
                 "remaining_depth": delegate_payload["properties"]["remaining_depth"].clone(),
@@ -539,6 +545,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn task_schema_uses_write_scope_not_output_dir() {
+        let tool = TaskTool::with_subagents(&["explore", "builder"]);
+        for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+            let payload = &schema["properties"]["payload"];
+            let payload_props = payload["properties"].as_object().unwrap();
+            let batch_props = payload["items"]["properties"].as_object().unwrap();
+
+            assert!(payload_props.contains_key("write_scope"), "{schema}");
+            assert!(batch_props.contains_key("write_scope"), "{schema}");
+            assert!(!payload_props.contains_key("output_dir"), "{schema}");
+            assert!(!batch_props.contains_key("output_dir"), "{schema}");
+            assert!(
+                !payload["items"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == "write_scope"),
+                "batch write_scope stays schema-optional: {schema}"
+            );
+            assert_schema_key_absent(&schema, "output_dir");
+        }
+    }
+
     fn assert_schema_key_absent(value: &Value, key: &str) {
         match value {
             Value::Object(map) => {
@@ -563,9 +593,9 @@ mod tests {
     fn task_definition_shrinks_after_seed_removal() {
         let tool = TaskTool::with_subagents(&["explore", "builder"]);
         let len = serde_json::to_string(&tool.parameters()).unwrap().len();
-        // Observed after seed schema removal: ~2860 bytes. Keep this below
-        // the prompt's hard 3,000-byte ceiling so the seed blob cannot return.
-        assert!(len < 3000, "task schema serialized to {len} bytes");
+        // Observed after seed schema removal plus scoped write support: ~3020
+        // bytes. Keep this low enough that the seed blob cannot return.
+        assert!(len < 3200, "task schema serialized to {len} bytes");
     }
 
     #[test]

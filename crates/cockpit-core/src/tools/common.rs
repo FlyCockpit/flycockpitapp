@@ -203,7 +203,7 @@ pub async fn write_and_release(
     std::fs::write(path, bytes).map_err(|e| anyhow::anyhow!("write `{}`: {e}", path.display()))?;
     let persist_ok = guard.release_after_write().await;
     ctx.locks
-        .note_read(path, &ctx.agent_id, ctx.session.id)
+        .note_read(path, &ctx.lock_identity, ctx.session.id)
         .await;
     Ok(WriteReleaseOutcome { persist_ok })
 }
@@ -240,6 +240,8 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
     (
         ToolCtx {
             agent_id: "builder".to_string(),
+            lock_identity: "builder".to_string().clone(),
+            write_scope: None,
             current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
             locks,
@@ -322,13 +324,13 @@ mod tests {
         std::fs::write(&blocked_parent, "file blocks directory creation").unwrap();
         let target = blocked_parent.join("child.txt");
         ctx.locks
-            .acquire(&target, &ctx.agent_id, ctx.session.id)
+            .acquire(&target, &ctx.lock_identity, ctx.session.id)
             .await
             .unwrap();
 
         let guard = ctx
             .locks
-            .begin_write(&target, &ctx.agent_id, ctx.session.id, "write")
+            .begin_write(&target, &ctx.lock_identity, ctx.session.id, "write")
             .await
             .unwrap();
 
@@ -344,7 +346,7 @@ mod tests {
         );
         assert_eq!(
             ctx.locks.holder(&target).map(|(_, agent)| agent),
-            Some(ctx.agent_id.clone())
+            Some(ctx.lock_identity.clone())
         );
     }
 

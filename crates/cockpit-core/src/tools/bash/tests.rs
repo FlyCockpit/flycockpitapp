@@ -547,6 +547,8 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
     let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
     ToolCtx {
         agent_id: "builder".to_string(),
+        lock_identity: "builder".to_string().clone(),
+        write_scope: None,
         current_tool_call_id: None,
         llm_mode: crate::config::extended::LlmMode::Normal,
         locks,

@@ -374,8 +374,8 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             ));
                         }
                     };
-                    let output_dir = item
-                        .get("output_dir")
+                    let write_scope = item
+                        .get("write_scope")
                         .and_then(Value::as_str)
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
@@ -391,7 +391,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         context,
                         granted_tools: task_string_array(item, "grant_tools"),
                         todo_ids: task_todo_ids(item),
-                        output_dir,
+                        write_scope,
                     });
                 }
                 return_structural!(TurnOutcome::SpawnNoninteractiveBatch {
@@ -433,6 +433,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     .map(str::to_string);
                 let cwd = args
                     .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let write_scope = args
+                    .get("write_scope")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
@@ -569,6 +575,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     why,
                     resume_handle,
                     cwd,
+                    write_scope,
                     context,
                     granted_tools,
                     todo_ids,
@@ -1449,6 +1456,8 @@ pub(crate) async fn run_turn(
     // Tool dispatch.
     let ctx = ToolCtx {
         agent_id: agent.name.clone(),
+        lock_identity: agent.lock_identity.clone(),
+        write_scope: agent.write_scope.clone(),
         current_tool_call_id: None,
         llm_mode: agent.llm_mode,
         locks,
@@ -1630,6 +1639,8 @@ mod tests {
             params: ModelParams::default(),
             scan_tool_results: true,
             llm_mode: crate::config::extended::LlmMode::Normal,
+            lock_identity: "Build".to_string(),
+            write_scope: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),

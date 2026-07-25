@@ -222,6 +222,8 @@ fn review_agent_from(root_agent: Agent) -> Agent {
         params: root_agent.params,
         scan_tool_results: false,
         llm_mode: root_agent.llm_mode,
+        lock_identity: root_agent.lock_identity,
+        write_scope: root_agent.write_scope,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         env_overlay: root_agent.env_overlay,

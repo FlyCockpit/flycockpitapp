@@ -104,6 +104,7 @@ const DELEGATE_KEYS: &[&str] = &[
     "why",
     "resume_handle",
     "cwd",
+    "write_scope",
     "grant_tools",
     "todo_ids",
 ];
@@ -754,7 +755,7 @@ mod tests {
             "intent": "batch",
             "payload": [
                 { "label": "one", "agent": "explore", "prompt": "look", "cwd": "repo-a" },
-                { "label": "two", "agent": "docs", "prompt": "check API", "cwd": "repo-b", "output_dir": "tmp/out" }
+                { "label": "two", "agent": "docs", "prompt": "check API", "cwd": "repo-b", "write_scope": "tmp/out" }
             ],
             "why": "fan out"
         });
@@ -774,7 +775,7 @@ mod tests {
             entries,
             vec![
                 json!({ "label": "one", "agent": "explore", "prompt": "look", "cwd": "repo-a" }),
-                json!({ "label": "two", "agent": "docs", "prompt": "check API", "cwd": "repo-b", "output_dir": "tmp/out" }),
+                json!({ "label": "two", "agent": "docs", "prompt": "check API", "cwd": "repo-b", "write_scope": "tmp/out" }),
             ]
         );
         assert!(

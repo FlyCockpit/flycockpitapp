@@ -875,6 +875,8 @@ mod tests {
             params: crate::engine::model::ModelParams::default(),
             scan_tool_results: true,
             llm_mode: crate::config::extended::LlmMode::default(),
+            lock_identity: "builder".to_string(),
+            write_scope: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),

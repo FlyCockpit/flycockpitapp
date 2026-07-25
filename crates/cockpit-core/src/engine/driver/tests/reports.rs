@@ -104,6 +104,8 @@ fn docs_style_agent_without_return_tool_reports_plain_answer() {
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: false,
         llm_mode: crate::config::extended::LlmMode::default(),
+        lock_identity: "Build".to_string(),
+        write_scope: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         env_overlay: driver.stack[0].agent.env_overlay.clone(),

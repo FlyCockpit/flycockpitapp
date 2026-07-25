@@ -515,6 +515,7 @@ async fn build_confined_background_command(
         &scrub_overrides(&launch.session_env),
         &launch.session_env,
         &[],
+        None,
     )
     .await
 }

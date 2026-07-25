@@ -234,7 +234,7 @@ pub(crate) async fn read_impl_outcome_with_path(
         }
         // Always track the read attempt so a subsequent write is allowed.
         ctx.locks
-            .note_read(&path, &ctx.agent_id, ctx.session.id)
+            .note_read(&path, &ctx.lock_identity, ctx.session.id)
             .await;
         return Ok(ReadOutcome::Content(ToolOutput::text(out)));
     }
@@ -250,7 +250,7 @@ pub(crate) async fn read_impl_outcome_with_path(
         tail.push_str(&truncation_marker(slice.next_offset));
         tail.push('\n');
         ctx.locks
-            .note_read(&path, &ctx.agent_id, ctx.session.id)
+            .note_read(&path, &ctx.lock_identity, ctx.session.id)
             .await;
         return Ok(ReadOutcome::Content(ToolOutput::truncated_text(format!(
             "{prelude}{tail}"
@@ -258,7 +258,7 @@ pub(crate) async fn read_impl_outcome_with_path(
     }
 
     ctx.locks
-        .note_read(&path, &ctx.agent_id, ctx.session.id)
+        .note_read(&path, &ctx.lock_identity, ctx.session.id)
         .await;
     Ok(ReadOutcome::Content(ToolOutput::text(format!(
         "{prelude}{}",
@@ -344,7 +344,7 @@ async fn read_range(
     let hash12 = &hash[..hash.len().min(12)];
 
     ctx.locks
-        .note_read(path, &ctx.agent_id, ctx.session.id)
+        .note_read(path, &ctx.lock_identity, ctx.session.id)
         .await;
 
     if slice.offset_exceeded {

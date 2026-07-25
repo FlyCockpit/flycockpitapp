@@ -497,6 +497,38 @@ async fn two_writers_same_path_is_rejected_not_noop() {
     lm.check_write_permitted(&p, "writer-1", sid).unwrap();
 }
 
+#[tokio::test]
+async fn same_named_instances_do_not_self_own_each_others_locks() {
+    let tmp = TempDir::new().unwrap();
+    let p = touch(tmp.path(), "shared.rs");
+    let (db, sid) = setup().await;
+    let lm = LockManager::in_memory(db);
+
+    lm.acquire(&p, "builder#a", sid).await.unwrap();
+
+    let err = lm
+        .check_write_permitted(&p, "builder#b", sid)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("builder#a"), "{err}");
+    lm.check_write_permitted(&p, "builder#a", sid).unwrap();
+}
+
+#[tokio::test]
+async fn read_record_is_per_lock_instance() {
+    let tmp = TempDir::new().unwrap();
+    let p = touch(tmp.path(), "shared.rs");
+    let (db, sid) = setup().await;
+    let lm = LockManager::in_memory(db);
+
+    lm.note_read(&p, "builder#a", sid).await;
+
+    assert!(lm.has_read(&p, "builder#a", sid));
+    assert!(!lm.has_read(&p, "builder#b", sid));
+    lm.check_write_permitted(&p, "builder#a", sid).unwrap();
+    assert!(lm.check_write_permitted(&p, "builder#b", sid).is_err());
+}
+
 /// The §3c write-existing-file guard holds for a **second** writer: a
 /// writer that never read the file cannot write it even though another
 /// writer is active on a different path.

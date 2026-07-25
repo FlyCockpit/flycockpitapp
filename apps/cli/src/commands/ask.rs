@@ -95,6 +95,8 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
         swarm_depth: 0,
         swarm_max_depth: extended.swarm.max_depth,
         granted_tools: Vec::new(),
+        lock_identity: None,
+        write_scope: None,
     };
     let locks = Arc::new(
         crate::locks::LockManager::from_db(db)

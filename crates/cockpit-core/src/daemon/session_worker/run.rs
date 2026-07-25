@@ -450,6 +450,8 @@ pub(super) async fn run_worker(
         // The root primary carries no per-delegation grants — grants attach to
         // an individual `task` delegation, never to the root spawn.
         granted_tools: Vec::new(),
+        lock_identity: None,
+        write_scope: None,
     };
     let tool_surface_override = stored_tool_surface_override(&session);
     let _goal_settings_override = stored_goal_settings_override(&session);

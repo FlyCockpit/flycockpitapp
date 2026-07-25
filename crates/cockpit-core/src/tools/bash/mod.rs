@@ -416,14 +416,27 @@ async fn call_bash_inner(
     //     fails with trusted sandbox-escalation metadata.
     let sandbox_enabled =
         ctx.session.sandbox_enabled() && crate::tools::shell_sandbox::shell_sandbox_supported();
-    let sandbox_on = sandbox_enabled && !options.force_unconfined;
+    if ctx.write_scope.is_some() && options.force_unconfined {
+        return Ok(ToolOutput::text(
+            "Error: scoped task children cannot run `bash` unconfined; keep shell writes inside the assigned write_scope or report the shared-file edit to the parent",
+        ));
+    }
+    let sandbox_on = if ctx.write_scope.is_some() {
+        true
+    } else {
+        sandbox_enabled && !options.force_unconfined
+    };
 
     // Windows has no zerobox backend: show the one-time per-session
     // notice that the shell runs unconfined. The flag is only ever
     // `Some` on Windows; elsewhere it stays `None`.
     let windows_notice: Option<&'static str> = windows_shell_notice(ctx);
 
-    let escalation_preauthorized_scope = command_escalation_preauthorized(ctx, command).await;
+    let escalation_preauthorized_scope = if ctx.write_scope.is_none() {
+        command_escalation_preauthorized(ctx, command).await
+    } else {
+        None
+    };
     let escalation_preauthorized = escalation_preauthorized_scope.is_some();
 
     let is_container_run = !options.force_unconfined && ctx.session.sandbox_mode().is_container();
@@ -617,6 +630,7 @@ async fn call_bash_inner(
         tmp_dir.as_deref(),
         &session_env,
         &extra_sandbox_paths,
+        ctx.write_scope.as_deref(),
     );
 
     // First attempt: sandboxed (confined) or broadened/unconfined.
@@ -672,24 +686,26 @@ async fn call_bash_inner(
     // policy-based sandbox denial classification. Child stderr alone can
     // never enter this branch.
     let mut final_outcome = outcome;
-    let denial_verdict = if confine && !options.escalated && !final_outcome.success {
-        let stderr = String::from_utf8_lossy(&final_outcome.stderr);
-        crate::tools::shell_sandbox::SandboxDenialClassifier::classify(
-            &crate::tools::shell_sandbox::HeuristicSandboxDenialClassifier,
-            &crate::tools::shell_sandbox::SandboxDenialInput {
-                command,
-                cwd: &cwd,
-                policy: &sandbox_policy,
-                exit: final_outcome.exit,
-                stderr: &stderr,
-            },
-        )
-    } else {
-        crate::tools::shell_sandbox::SandboxDenialVerdict::unknown()
-    };
+    let denial_verdict =
+        if confine && !options.escalated && ctx.write_scope.is_none() && !final_outcome.success {
+            let stderr = String::from_utf8_lossy(&final_outcome.stderr);
+            crate::tools::shell_sandbox::SandboxDenialClassifier::classify(
+                &crate::tools::shell_sandbox::HeuristicSandboxDenialClassifier,
+                &crate::tools::shell_sandbox::SandboxDenialInput {
+                    command,
+                    cwd: &cwd,
+                    policy: &sandbox_policy,
+                    exit: final_outcome.exit,
+                    stderr: &stderr,
+                },
+            )
+        } else {
+            crate::tools::shell_sandbox::SandboxDenialVerdict::unknown()
+        };
     let mut classified_denial_action_note = None;
     if confine
         && !options.escalated
+        && ctx.write_scope.is_none()
         && let Some((confined_exit, confined_stderr, denial_report, classified_evidence)) =
             confined_failure_escalation_offer(&final_outcome)
                 .map(|(exit, stderr)| (exit, stderr, None, None))
@@ -802,6 +818,7 @@ async fn call_bash_inner(
 
     if confine
         && !options.escalated
+        && ctx.write_scope.is_none()
         && !final_outcome.success
         && matches!(ctx.llm_mode, crate::config::extended::LlmMode::Defensive)
         && ctx.session.sandbox_escalation_enabled()
@@ -1448,6 +1465,14 @@ async fn command_resource_plan_with_user_grants(
     mut plan: crate::tools::command_resource_profiles::CommandResourcePlan,
     ctx: &ToolCtx,
 ) -> crate::tools::command_resource_profiles::CommandResourcePlan {
+    if let Some(scope) = ctx.write_scope.as_ref() {
+        plan.allow_paths
+            .push(crate::tools::shell_sandbox::ExtraSandboxPath {
+                kind: "write_scope".to_string(),
+                path: scope.clone(),
+                access: crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+            });
+    }
     let Some(approver) = ctx.approver.as_ref() else {
         return plan;
     };
@@ -2348,11 +2373,16 @@ async fn run_container_shell(
     };
     let profile_mounts =
         crate::container::resource_profile_mounts(command_resource_plan, &map, cfg!(windows));
+    let container_mode = if ctx.write_scope.is_some() {
+        crate::tools::sandbox_mode::SandboxMode::ContainerReadonly
+    } else {
+        mode
+    };
     let name = match manager
         .ensure_container(
             ctx.session.id,
             &image,
-            mode,
+            container_mode,
             &map,
             &profile_mounts,
             ctx.session.container_network_enabled(),
@@ -2489,6 +2519,7 @@ async fn run_shell(
             scrub,
             session_env,
             extra_sandbox_paths,
+            ctx.write_scope.as_deref(),
         )
         .await
         {

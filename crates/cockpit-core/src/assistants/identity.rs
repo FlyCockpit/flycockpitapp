@@ -441,6 +441,8 @@ mod tests {
         (
             ToolCtx {
                 agent_id: "helper".to_string(),
+                lock_identity: "helper".to_string().clone(),
+                write_scope: None,
                 current_tool_call_id: None,
                 llm_mode: crate::config::extended::LlmMode::Normal,
                 locks,

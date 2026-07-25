@@ -964,6 +964,12 @@ struct ChildCwd {
     resolved: std::path::PathBuf,
 }
 
+#[derive(Debug, Clone, Default)]
+struct DelegationConfinement {
+    lock_identity: Option<String>,
+    write_scope: Option<std::path::PathBuf>,
+}
+
 impl ChildCwd {
     fn requested_json(&self) -> Option<&str> {
         self.requested.as_deref()
@@ -2546,6 +2552,8 @@ impl Driver {
 
         let ctx = crate::engine::tool::ToolCtx {
             agent_id: agent.name.clone(),
+            lock_identity: agent.name.clone().clone(),
+            write_scope: None,
             current_tool_call_id: None,
             llm_mode: agent.llm_mode,
             locks: self.locks.clone(),
@@ -6756,6 +6764,7 @@ impl Driver {
                     why,
                     resume_handle,
                     cwd,
+                    write_scope,
                     context,
                     granted_tools,
                     todo_ids,
@@ -6823,6 +6832,7 @@ impl Driver {
                                 resume_handle,
                                 child_cwd,
                                 context,
+                                write_scope,
                                 granted_tools,
                                 todo_ids,
                                 child_recursion,
@@ -7254,6 +7264,8 @@ impl Driver {
             // No per-delegation grants by default. A `task` delegation that
             // carries grants overrides this via [`Self::spawn_args_granted`].
             granted_tools: Vec::new(),
+            lock_identity: None,
+            write_scope: None,
         }
     }
 
@@ -7287,6 +7299,25 @@ impl Driver {
         model: Option<crate::engine::model_roles::DelegationModelSelector>,
         recursion: crate::engine::builtin::DelegationRecursionContext,
     ) -> crate::engine::builtin::SpawnArgs {
+        self.spawn_args_delegated_in_cwd_scoped(
+            child_cwd,
+            interactive,
+            grant,
+            model,
+            recursion,
+            DelegationConfinement::default(),
+        )
+    }
+
+    fn spawn_args_delegated_in_cwd_scoped(
+        &self,
+        child_cwd: &std::path::Path,
+        interactive: bool,
+        grant: Vec<String>,
+        model: Option<crate::engine::model_roles::DelegationModelSelector>,
+        recursion: crate::engine::builtin::DelegationRecursionContext,
+        confinement: DelegationConfinement,
+    ) -> crate::engine::builtin::SpawnArgs {
         let model_override = if recursion.same_model_only {
             self.stack.last().map(|frame| frame.agent.model.clone())
         } else {
@@ -7299,6 +7330,8 @@ impl Driver {
             delegation_recursion: recursion,
             model_override,
             cwd: child_cwd.to_path_buf(),
+            lock_identity: confinement.lock_identity,
+            write_scope: confinement.write_scope,
             ..self.spawn_args(interactive)
         }
     }

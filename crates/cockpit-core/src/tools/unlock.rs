@@ -64,7 +64,7 @@ impl Tool for UnlockTool {
             .ok_or_else(|| crate::engine::tool::invalid_input("`path` is required"))?;
         let path = resolve(path_arg, &ctx.cwd);
         ctx.locks
-            .release(&path, &ctx.agent_id, ctx.session.id)
+            .release(&path, &ctx.lock_identity, ctx.session.id)
             .await?;
         Ok(ToolOutput::text(format!("unlocked `{}`", path.display())))
     }
@@ -109,7 +109,7 @@ mod tests {
         std::fs::write(&file, "body").unwrap();
         let ctx = test_ctx(tmp.path());
         ctx.locks
-            .acquire(&file, &ctx.agent_id, ctx.session.id)
+            .acquire(&file, &ctx.lock_identity, ctx.session.id)
             .await
             .unwrap();
 
@@ -131,7 +131,7 @@ mod tests {
         std::fs::write(&file, "body").unwrap();
         let ctx = test_ctx(tmp.path());
         ctx.locks
-            .acquire(&file, &ctx.agent_id, ctx.session.id)
+            .acquire(&file, &ctx.lock_identity, ctx.session.id)
             .await
             .unwrap();
 

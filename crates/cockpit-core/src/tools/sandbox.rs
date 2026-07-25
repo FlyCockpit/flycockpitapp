@@ -304,14 +304,11 @@ pub(crate) fn outside_session_boundary(
 }
 
 fn path_inside_boundary(candidate: &Path, root: &Path, tmp_dir: Option<&Path>) -> bool {
-    if let Ok(root) = std::fs::canonicalize(root)
-        && candidate.starts_with(&root)
-    {
+    if crate::path_containment::contained_under(root, candidate) {
         return true;
     }
     if let Some(tmp) = tmp_dir
-        && let Ok(tmp) = std::fs::canonicalize(tmp)
-        && candidate.starts_with(&tmp)
+        && crate::path_containment::contained_under(tmp, candidate)
     {
         return true;
     }
@@ -523,6 +520,8 @@ mod tests {
         let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
         ToolCtx {
             agent_id: "builder".to_string(),
+            lock_identity: "builder".to_string().clone(),
+            write_scope: None,
             current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
             locks,

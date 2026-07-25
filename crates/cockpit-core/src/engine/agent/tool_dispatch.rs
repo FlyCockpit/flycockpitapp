@@ -1573,6 +1573,8 @@ mod tests {
             params: ModelParams::default(),
             scan_tool_results: false,
             llm_mode: crate::config::extended::LlmMode::Normal,
+            lock_identity: "Build".to_string(),
+            write_scope: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -1599,6 +1601,8 @@ mod tests {
     ) -> ToolCtx {
         ToolCtx {
             agent_id: "Build".to_string(),
+            lock_identity: "Build".to_string().clone(),
+            write_scope: None,
             current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
             locks: Arc::new(crate::locks::LockManager::in_memory(session.db.clone())),

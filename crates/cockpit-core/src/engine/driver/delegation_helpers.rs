@@ -294,6 +294,46 @@ pub(super) fn extract_todo_delta(report: &str) -> Option<serde_json::Value> {
     serde_json::from_str(after[..end].trim()).ok()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(super) struct FilesTouchedReport {
+    pub(super) written: Vec<String>,
+    pub(super) needs_shared: Vec<String>,
+}
+
+pub(super) fn extract_files_touched(report: &str) -> Option<FilesTouchedReport> {
+    let marker = "```files_touched";
+    let start = report.find(marker)?;
+    let after = &report[start + marker.len()..];
+    let after = after.strip_prefix(" json").unwrap_or(after);
+    let after = after.strip_prefix('\n').unwrap_or(after);
+    let end = after.find("```")?;
+    serde_json::from_str(after[..end].trim()).ok()
+}
+
+#[cfg(test)]
+mod files_touched_tests {
+    use super::*;
+
+    #[test]
+    fn child_report_files_touched_parsed_by_parent() {
+        let report = r#"done
+```files_touched
+{"written":["crates/x/src/a.rs"],"needs_shared":["Cargo.lock"]}
+```"#;
+
+        let parsed = extract_files_touched(report).expect("files_touched parsed");
+        assert_eq!(
+            parsed,
+            FilesTouchedReport {
+                written: vec!["crates/x/src/a.rs".to_string()],
+                needs_shared: vec!["Cargo.lock".to_string()],
+            }
+        );
+        assert!(extract_files_touched("no block").is_none());
+        assert!(extract_files_touched("```files_touched\nnot json\n```").is_none());
+    }
+}
+
 /// Validate a per-delegation tool grant (prompt `parent-granted-tools.md`)
 /// against the delegation target's role invariants. Returns `Some(error)` — a
 /// clear tool-result string — when the grant is inadmissible, else `None` so

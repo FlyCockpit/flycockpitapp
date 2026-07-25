@@ -778,6 +778,8 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         swarm_depth: 0,
         swarm_max_depth: crate::config::extended::DEFAULT_SWARM_MAX_DEPTH,
         granted_tools: Vec::new(),
+        lock_identity: None,
+        write_scope: None,
     }
 }
 

@@ -117,6 +117,7 @@ impl Tool for EditTool {
             .unwrap_or(false);
 
         let requested_path = resolve(path_arg, &ctx.cwd);
+        crate::tools::write::enforce_requested_write_scope(ctx, &requested_path, self.name())?;
         // Native-tool boundary check (sandboxing part 2) before the
         // write-permitted check — a denied out-of-cwd path never edits.
         let path = crate::tools::sandbox::check_native_access(
@@ -125,6 +126,7 @@ impl Tool for EditTool {
             crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
         )
         .await?;
+        crate::tools::write::enforce_write_scope(ctx, &path, self.name())?;
         let identity_note =
             match crate::assistants::identity::check_identity_write(ctx, &path).await? {
                 crate::assistants::identity::IdentityWriteGate::Allow { note } => note,
@@ -138,7 +140,7 @@ impl Tool for EditTool {
             .locks
             .begin_write_after_wait(
                 &path,
-                &ctx.agent_id,
+                &ctx.lock_identity,
                 ctx.session.id,
                 self.name(),
                 !acquire.preexisting_hold,
@@ -644,7 +646,7 @@ mod tests {
         std::fs::write(&file, contents).unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.locks
-            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
             .await;
 
         EditTool
@@ -725,7 +727,7 @@ mod tests {
         std::fs::write(&file, "alpha beta gamma\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.locks
-            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
             .await;
         assert!(ctx.locks.holder(&file).is_none());
 
@@ -746,7 +748,10 @@ mod tests {
             "alpha delta gamma\n"
         );
         assert!(ctx.locks.holder(&file).is_none());
-        assert!(ctx.locks.has_read(&file, &ctx.agent_id, ctx.session.id));
+        assert!(
+            ctx.locks
+                .has_read(&file, &ctx.lock_identity, ctx.session.id)
+        );
     }
 
     #[tokio::test]
@@ -759,7 +764,7 @@ mod tests {
             crate::engine::tool::ReviewCage::skills_review_with_package_roots([package.clone()]),
         );
         ctx.locks
-            .note_read(&manifest, &ctx.agent_id, ctx.session.id)
+            .note_read(&manifest, &ctx.lock_identity, ctx.session.id)
             .await;
 
         let err = EditTool
@@ -817,7 +822,7 @@ mod tests {
         std::fs::write(&path, manifest).unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.locks
-            .note_read(&path, &ctx.agent_id, ctx.session.id)
+            .note_read(&path, &ctx.lock_identity, ctx.session.id)
             .await;
 
         let policy = crate::config::trust::WorkspaceTrustPolicy {
@@ -855,7 +860,7 @@ mod tests {
         std::fs::write(&file, "alpha beta gamma\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.locks
-            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
             .await;
 
         let err = EditTool
@@ -996,7 +1001,7 @@ mod tests {
         std::fs::write(&file, "alpha beta gamma\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.locks
-            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
             .await;
 
         EditTool
@@ -1025,7 +1030,7 @@ mod tests {
         std::fs::write(&file, "alpha beta gamma\n").unwrap();
         let (ctx, db) = test_ctx_with_db(tmp.path());
         ctx.locks
-            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
             .await;
         fail_lock_state_deletes(&db).await;
 
@@ -1053,7 +1058,10 @@ mod tests {
         );
         assert!(out.content.ends_with(LOCK_BOOKKEEPING_ADVISORY));
         assert!(ctx.locks.holder(&file).is_none());
-        assert!(ctx.locks.has_read(&file, &ctx.agent_id, ctx.session.id));
+        assert!(
+            ctx.locks
+                .has_read(&file, &ctx.lock_identity, ctx.session.id)
+        );
     }
 
     #[tokio::test]
@@ -1063,7 +1071,7 @@ mod tests {
         std::fs::write(&file, "[package]\nname = \"ok\"\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.locks
-            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
             .await;
 
         let out = EditTool
@@ -1096,7 +1104,7 @@ mod tests {
         std::fs::write(&file, "[package]\nname = \"old\"\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.locks
-            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
             .await;
 
         let out = EditTool

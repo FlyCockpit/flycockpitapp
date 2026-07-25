@@ -212,6 +212,12 @@ pub struct SpawnArgs {
     /// satisfying the cache-safety rule per child-run; grants never persist or
     /// leak because each spawn builds a fresh [`SpawnArgs`].
     pub granted_tools: Vec<String>,
+    /// Per-instance lock identity. Defaults to the spawned agent name; scoped
+    /// parallel task children set this to `<agent>#<label>`.
+    pub lock_identity: Option<String>,
+    /// Optional write-confined subtree for delegated children. Native writes
+    /// and shell sandboxes enforce this; reads remain cwd-wide.
+    pub write_scope: Option<std::path::PathBuf>,
 }
 
 impl SpawnArgs {
@@ -1606,6 +1612,11 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             params,
             scan_tool_results: false,
             llm_mode: args.llm_mode,
+            lock_identity: args
+                .lock_identity
+                .clone()
+                .unwrap_or_else(|| def.name.clone()),
+            write_scope: args.write_scope.clone(),
             delegated: args.delegated,
             delegation_recursion: DelegationRecursionContext {
                 enabled: args.delegation_recursion.enabled,
@@ -1688,6 +1699,11 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             .scan_tool_results
             .unwrap_or_else(|| crate::agents::default_scan_tool_results(&def.name, def.mode)),
         llm_mode: args.llm_mode,
+        lock_identity: args
+            .lock_identity
+            .clone()
+            .unwrap_or_else(|| def.name.clone()),
+        write_scope: args.write_scope.clone(),
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         env_overlay: args.env_overlay.clone(),
@@ -2001,6 +2017,11 @@ pub fn build(args: &SpawnArgs) -> Agent {
         params,
         scan_tool_results: true,
         llm_mode: args.llm_mode,
+        lock_identity: args
+            .lock_identity
+            .clone()
+            .unwrap_or_else(|| "Build".to_string()),
+        write_scope: args.write_scope.clone(),
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         env_overlay: args.env_overlay.clone(),
@@ -2053,6 +2074,11 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
         params: args.params.clone(),
         scan_tool_results: false,
         llm_mode: args.llm_mode,
+        lock_identity: args
+            .lock_identity
+            .clone()
+            .unwrap_or_else(|| "deepthink".to_string()),
+        write_scope: args.write_scope.clone(),
         delegated: args.delegated,
         delegation_recursion: DelegationRecursionContext {
             enabled: args.delegation_recursion.enabled,
@@ -2141,6 +2167,11 @@ pub fn scout(args: &SpawnArgs) -> Agent {
         params: args.params.clone(),
         scan_tool_results: false,
         llm_mode: args.llm_mode,
+        lock_identity: args
+            .lock_identity
+            .clone()
+            .unwrap_or_else(|| "scout".to_string()),
+        write_scope: args.write_scope.clone(),
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         env_overlay: args.env_overlay.clone(),
@@ -2186,6 +2217,11 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         params: args.params.clone(),
         scan_tool_results: true,
         llm_mode: args.llm_mode,
+        lock_identity: args
+            .lock_identity
+            .clone()
+            .unwrap_or_else(|| "Plan".to_string()),
+        write_scope: args.write_scope.clone(),
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         env_overlay: args.env_overlay.clone(),
@@ -2234,6 +2270,11 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
         params: args.params.clone(),
         scan_tool_results: true,
         llm_mode: args.llm_mode,
+        lock_identity: args
+            .lock_identity
+            .clone()
+            .unwrap_or_else(|| "Multireview".to_string()),
+        write_scope: args.write_scope.clone(),
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         env_overlay: args.env_overlay.clone(),
@@ -2299,6 +2340,11 @@ pub fn bee(args: &SpawnArgs) -> Agent {
         params: args.params.clone(),
         scan_tool_results: true,
         llm_mode: args.llm_mode,
+        lock_identity: args
+            .lock_identity
+            .clone()
+            .unwrap_or_else(|| "bee".to_string()),
+        write_scope: args.write_scope.clone(),
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         env_overlay: args.env_overlay.clone(),
@@ -2421,6 +2467,8 @@ mod tests {
             swarm_depth: 0,
             swarm_max_depth: crate::config::extended::DEFAULT_SWARM_MAX_DEPTH,
             granted_tools: Vec::new(),
+            lock_identity: None,
+            write_scope: None,
         }
     }
 

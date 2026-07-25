@@ -849,6 +849,8 @@ mod backup_fallback_tests {
             params: ModelParams::default(),
             scan_tool_results: true,
             llm_mode: crate::config::extended::LlmMode::Normal,
+            lock_identity: "Build".to_string(),
+            write_scope: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),

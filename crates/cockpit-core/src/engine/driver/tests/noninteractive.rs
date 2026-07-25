@@ -288,6 +288,7 @@ fn single_task(
         resume_handle: resume_handle.map(str::to_string),
         child_cwd: root_child_cwd(driver),
         context: crate::engine::agent::TaskContext::Fresh,
+        write_scope: None,
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
@@ -313,8 +314,41 @@ fn batch_entry(
         context: crate::engine::agent::TaskContext::Fresh,
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),
-        output_dir: None,
+        write_scope: None,
     }
+}
+
+fn batch_entry_with_scope(
+    label: &str,
+    child_agent: &str,
+    write_scope: &str,
+) -> crate::engine::agent::BatchTaskEntry {
+    let mut entry = batch_entry(label, child_agent, None);
+    entry.write_scope = Some(write_scope.to_string());
+    entry
+}
+
+fn set_root_llm_mode(driver: &mut Driver, mode: crate::config::extended::LlmMode) {
+    Arc::make_mut(&mut driver.stack[0].agent).llm_mode = mode;
+}
+
+fn install_test_approver(driver: &mut Driver) -> Arc<crate::approval::Approver> {
+    let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+    let store = crate::approval::store::GrantStore::new(
+        driver.session.db.clone(),
+        driver.session.id,
+        driver.cwd.clone(),
+        driver.config.clone(),
+    );
+    let approver = Arc::new(crate::approval::Approver::new(
+        store,
+        driver.session.db.clone(),
+        driver.session.id,
+        "Build",
+        hub,
+    ));
+    driver.set_approver(approver.clone());
+    approver
 }
 
 fn drain_turn_events(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
@@ -323,6 +357,236 @@ fn drain_turn_events(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
         events.push(event);
     }
     events
+}
+
+#[tokio::test]
+async fn parallel_write_batch_refused_outside_frontier() {
+    for mode in [
+        crate::config::extended::LlmMode::Normal,
+        crate::config::extended::LlmMode::Defensive,
+    ] {
+        let (mut driver, tmp) = test_driver(8);
+        set_root_llm_mode(&mut driver, mode);
+        std::fs::create_dir_all(tmp.path().join("a")).unwrap();
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+        let task = BatchNoninteractiveTask {
+            entries: vec![batch_entry_with_scope("a", "builder", "a")],
+            child_cwds: vec![root_child_cwd(&driver)],
+            why: "test".to_string(),
+            repair_notes: Vec::new(),
+            task_call_id: format!("task-mode-{mode:?}"),
+            task_function_call_id: None,
+        };
+
+        let completion = driver
+            .execute_batch_noninteractive_task(
+                task,
+                &tx,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completion.children.len(), 1);
+        assert!(completion.children[0].failed);
+        assert!(
+            completion.children[0].report.contains("Frontier-only"),
+            "{}",
+            completion.children[0].report
+        );
+        assert!(
+            drain_turn_events(&mut rx).is_empty(),
+            "refused batch should not spawn child events"
+        );
+    }
+
+    let (mut driver, tmp) = test_driver(8);
+    set_root_llm_mode(&mut driver, crate::config::extended::LlmMode::Frontier);
+    std::fs::create_dir_all(tmp.path().join("a")).unwrap();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    let task = BatchNoninteractiveTask {
+        entries: vec![batch_entry_with_scope("a", "builder", "a")],
+        child_cwds: vec![root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-mode-frontier".to_string(),
+        task_function_call_id: None,
+    };
+    let completion = driver
+        .execute_batch_noninteractive_task(task, &tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(completion.children.len(), 1);
+    assert!(
+        !completion.children[0].report.contains("Frontier-only"),
+        "{}",
+        completion.children[0].report
+    );
+}
+
+#[tokio::test]
+async fn overlapping_write_scopes_refuse_whole_batch() {
+    let (mut driver, tmp) = test_driver(8);
+    set_root_llm_mode(&mut driver, crate::config::extended::LlmMode::Frontier);
+    std::fs::create_dir_all(tmp.path().join("a/sub")).unwrap();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let task = BatchNoninteractiveTask {
+        entries: vec![
+            batch_entry_with_scope("left", "builder", "a"),
+            batch_entry_with_scope("right", "builder", "a/sub"),
+        ],
+        child_cwds: vec![root_child_cwd(&driver), root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-overlap".to_string(),
+        task_function_call_id: None,
+    };
+
+    let completion = driver
+        .execute_batch_noninteractive_task(task, &tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(completion.children.len(), 1);
+    assert!(completion.children[0].failed);
+    let report = &completion.children[0].report;
+    assert!(report.contains("overlap"), "{report}");
+    assert!(report.contains("left"), "{report}");
+    assert!(report.contains("right"), "{report}");
+    assert!(
+        drain_turn_events(&mut rx).is_empty(),
+        "refused batch should not spawn child events"
+    );
+}
+
+#[tokio::test]
+async fn write_scope_escaping_workspace_refused() {
+    let (mut driver, tmp) = test_driver(8);
+    set_root_llm_mode(&mut driver, crate::config::extended::LlmMode::Frontier);
+    let outside = tmp.path().parent().unwrap().join("outside-scope");
+    std::fs::create_dir_all(&outside).unwrap();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let task = BatchNoninteractiveTask {
+        entries: vec![batch_entry_with_scope(
+            "escape",
+            "builder",
+            &outside.display().to_string(),
+        )],
+        child_cwds: vec![root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-escape".to_string(),
+        task_function_call_id: None,
+    };
+
+    let completion = driver
+        .execute_batch_noninteractive_task(task, &tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(completion.children.len(), 1);
+    assert!(completion.children[0].failed);
+    assert!(
+        completion.children[0]
+            .report
+            .contains("outside the workspace"),
+        "{}",
+        completion.children[0].report
+    );
+    assert!(
+        drain_turn_events(&mut rx).is_empty(),
+        "refused batch should not spawn child events"
+    );
+}
+
+#[tokio::test]
+async fn write_capable_entry_requires_write_scope() {
+    let (mut driver, _tmp) = test_driver(8);
+    set_root_llm_mode(&mut driver, crate::config::extended::LlmMode::Frontier);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let task = BatchNoninteractiveTask {
+        entries: vec![batch_entry("missing", "builder", None)],
+        child_cwds: vec![root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-missing-scope".to_string(),
+        task_function_call_id: None,
+    };
+
+    let completion = driver
+        .execute_batch_noninteractive_task(task, &tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(completion.children.len(), 1);
+    assert!(completion.children[0].failed);
+    assert!(
+        completion.children[0]
+            .report
+            .contains("requires `write_scope`"),
+        "{}",
+        completion.children[0].report
+    );
+    assert!(
+        drain_turn_events(&mut rx).is_empty(),
+        "refused batch should not spawn child events"
+    );
+}
+
+#[tokio::test]
+async fn scoped_child_subtree_is_pre_granted_read_write() {
+    let (mut driver, tmp) = test_driver(8);
+    set_root_llm_mode(&mut driver, crate::config::extended::LlmMode::Frontier);
+    let approver = install_test_approver(&mut driver);
+    let scope = tmp.path().join("scope");
+    std::fs::create_dir_all(&scope).unwrap();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    let task = BatchNoninteractiveTask {
+        entries: vec![batch_entry_with_scope("scoped", "builder", "scope")],
+        child_cwds: vec![root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-pregrant".to_string(),
+        task_function_call_id: None,
+    };
+
+    let _ = driver
+        .execute_batch_noninteractive_task(task, &tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        approver
+            .store()
+            .is_path_granted_for(
+                &scope,
+                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
+            )
+            .await
+    );
+}
+
+#[test]
+fn scoped_child_holds_no_delegation_tools() {
+    let (driver, tmp) = test_driver(8);
+    let scope = tmp.path().join("scope");
+    std::fs::create_dir_all(&scope).unwrap();
+    let args = driver.spawn_args_delegated_in_cwd_scoped(
+        tmp.path(),
+        false,
+        Vec::new(),
+        None,
+        crate::engine::builtin::DelegationRecursionContext::default(),
+        DelegationConfinement {
+            lock_identity: Some("builder#scoped".to_string()),
+            write_scope: Some(scope),
+        },
+    );
+
+    let child = crate::engine::builtin::load("builder", &args).unwrap();
+    let names = child.tools.names();
+    for tool in crate::agents::invariants::DELEGATION_TOOLS {
+        assert!(
+            !names.contains(tool),
+            "scoped child unexpectedly held delegation tool `{tool}`"
+        );
+    }
 }
 
 fn child_routing_for(model: &str) -> ChildRoutingMetadata {

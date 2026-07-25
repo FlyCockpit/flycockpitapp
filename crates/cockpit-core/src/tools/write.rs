@@ -79,6 +79,7 @@ impl Tool for WriteTool {
             .and_then(Value::as_str)
             .ok_or_else(|| crate::engine::tool::invalid_input("`content` is required"))?;
         let requested_path = resolve(path_arg, &ctx.cwd);
+        enforce_requested_write_scope(ctx, &requested_path, self.name())?;
 
         // Native-tool boundary check (sandboxing part 2): an out-of-cwd
         // write target escalates (naming the path) before we touch disk.
@@ -88,6 +89,7 @@ impl Tool for WriteTool {
             crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
         )
         .await?;
+        enforce_write_scope(ctx, &path, self.name())?;
         let identity_note =
             match crate::assistants::identity::check_identity_write(ctx, &path).await? {
                 crate::assistants::identity::IdentityWriteGate::Allow { note } => note,
@@ -103,7 +105,7 @@ impl Tool for WriteTool {
             .locks
             .begin_write_after_wait(
                 &path,
-                &ctx.agent_id,
+                &ctx.lock_identity,
                 ctx.session.id,
                 self.name(),
                 !acquire.preexisting_hold,
@@ -179,6 +181,33 @@ impl Tool for WriteTool {
 
         Ok(ToolOutput::text(message))
     }
+}
+
+pub(crate) fn enforce_write_scope(ctx: &ToolCtx, path: &std::path::Path, tool: &str) -> Result<()> {
+    let Some(scope) = ctx.write_scope.as_ref() else {
+        return Ok(());
+    };
+    if crate::path_containment::contained_under(scope, path) {
+        return Ok(());
+    }
+    Err(crate::engine::tool::invalid_input(format!(
+        "refused: `{tool}` target `{}` is outside this child's write scope `{}`; keep writes inside it and report a needed shared-file edit up to your parent",
+        path.display(),
+        scope.display()
+    )))
+}
+
+pub(crate) fn enforce_requested_write_scope(
+    ctx: &ToolCtx,
+    requested_path: &std::path::Path,
+    tool: &str,
+) -> Result<()> {
+    if ctx.write_scope.is_none() {
+        return Ok(());
+    }
+    let effective = crate::path_containment::effective_path(requested_path)
+        .unwrap_or_else(|_| requested_path.to_path_buf());
+    enforce_write_scope(ctx, &effective, tool)
 }
 
 async fn create_new_and_release(
@@ -311,6 +340,8 @@ mod tests {
         );
         ToolCtx {
             agent_id: "helper".to_string(),
+            lock_identity: "helper".to_string().clone(),
+            write_scope: None,
             current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
             locks,
@@ -371,7 +402,7 @@ mod tests {
 
     async fn note_read(ctx: &ToolCtx, path: &Path) {
         ctx.locks
-            .note_read(path, &ctx.agent_id, ctx.session.id)
+            .note_read(path, &ctx.lock_identity, ctx.session.id)
             .await;
     }
 
@@ -760,7 +791,51 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\n");
         assert!(ctx.locks.holder(&file).is_none());
-        assert!(!ctx.locks.has_read(&file, &ctx.agent_id, ctx.session.id));
+        assert!(
+            !ctx.locks
+                .has_read(&file, &ctx.lock_identity, ctx.session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn write_outside_scope_hard_denied_read_unclamped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let scope = tmp.path().join("scope");
+        let outside = tmp.path().join("outside.txt");
+        std::fs::create_dir_all(&scope).unwrap();
+        std::fs::write(&outside, "readable").unwrap();
+        ctx.write_scope = Some(scope.clone());
+
+        let err = WriteTool
+            .call(
+                serde_json::json!({"path": "outside.txt", "content": "blocked"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside this child's write scope"), "{err}");
+        assert!(err.contains(&scope.display().to_string()), "{err}");
+        assert!(ctx.locks.holder(&outside).is_none());
+
+        WriteTool
+            .call(
+                serde_json::json!({"path": "scope/inside.txt", "content": "ok"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(scope.join("inside.txt")).unwrap(),
+            "ok"
+        );
+
+        let read = ReadTool
+            .call(serde_json::json!({"path": "outside.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert!(read.content.contains("readable"), "{}", read.content);
     }
 
     #[tokio::test]
@@ -784,10 +859,11 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("later.md")).unwrap(),
             "created\n"
         );
-        assert!(
-            !ctx.locks
-                .has_read(&tmp.path().join("later.md"), &ctx.agent_id, ctx.session.id)
-        );
+        assert!(!ctx.locks.has_read(
+            &tmp.path().join("later.md"),
+            &ctx.lock_identity,
+            ctx.session.id
+        ));
     }
 
     #[tokio::test]
@@ -869,7 +945,7 @@ mod tests {
         let file = tmp.path().join("existing.md");
         std::fs::write(&file, "old\n").unwrap();
         ctx.locks
-            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
             .await;
         assert!(ctx.locks.holder(&file).is_none());
 
@@ -883,7 +959,10 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
         assert!(ctx.locks.holder(&file).is_none());
-        assert!(ctx.locks.has_read(&file, &ctx.agent_id, ctx.session.id));
+        assert!(
+            ctx.locks
+                .has_read(&file, &ctx.lock_identity, ctx.session.id)
+        );
     }
 
     #[tokio::test]
@@ -893,7 +972,7 @@ mod tests {
         let file = tmp.path().join("existing.md");
         std::fs::write(&file, "old\n").unwrap();
         ctx.locks
-            .acquire(&file, &ctx.agent_id, ctx.session.id)
+            .acquire(&file, &ctx.lock_identity, ctx.session.id)
             .await
             .unwrap();
 
@@ -908,7 +987,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
         assert_eq!(
             ctx.locks.holder(&file),
-            Some((ctx.session.id, ctx.agent_id.clone()))
+            Some((ctx.session.id, ctx.lock_identity.clone()))
         );
     }
 
@@ -919,7 +998,7 @@ mod tests {
         let file = tmp.path().join("existing.md");
         std::fs::write(&file, "old\n").unwrap();
         ctx.locks
-            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
             .await;
         std::fs::write(&file, "changed\n").unwrap();
 
@@ -947,12 +1026,19 @@ mod tests {
         let path = tmp.path().join("raced.md");
 
         ctx.locks
-            .acquire(&path, &ctx.agent_id, ctx.session.id)
+            .acquire(&path, &ctx.lock_identity, ctx.session.id)
             .await
             .unwrap();
         let guard = ctx
             .locks
-            .begin_write_after_wait(&path, &ctx.agent_id, ctx.session.id, "write", true, false)
+            .begin_write_after_wait(
+                &path,
+                &ctx.lock_identity,
+                ctx.session.id,
+                "write",
+                true,
+                false,
+            )
             .await
             .unwrap();
 
@@ -984,7 +1070,7 @@ mod tests {
         let stale = tmp.path().join("stale.md");
         std::fs::write(&stale, "old\n").unwrap();
         ctx.locks
-            .note_read(&stale, &ctx.agent_id, ctx.session.id)
+            .note_read(&stale, &ctx.lock_identity, ctx.session.id)
             .await;
         std::fs::write(&stale, "changed\n").unwrap();
         let err = WriteTool
@@ -1075,7 +1161,7 @@ mod tests {
         let file = tmp.path().join("existing.json");
         std::fs::write(&file, "{}\n").unwrap();
         ctx.locks
-            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
             .await;
         fail_lock_state_deletes(&db).await;
 
@@ -1103,9 +1189,12 @@ mod tests {
         );
         assert!(out.content.ends_with(LOCK_BOOKKEEPING_ADVISORY));
         assert!(ctx.locks.holder(&file).is_none());
-        assert!(ctx.locks.has_read(&file, &ctx.agent_id, ctx.session.id));
+        assert!(
+            ctx.locks
+                .has_read(&file, &ctx.lock_identity, ctx.session.id)
+        );
         ctx.locks
-            .check_write_permitted(&file, &ctx.agent_id, ctx.session.id)
+            .check_write_permitted(&file, &ctx.lock_identity, ctx.session.id)
             .unwrap();
     }
 
@@ -1120,7 +1209,7 @@ mod tests {
             .await
             .unwrap();
         let mut ctx_b = ctx_a.clone();
-        ctx_b.agent_id = "writer-b".to_string();
+        ctx_b.lock_identity = "writer-b".to_string();
         ctx_b.session = Arc::new(
             crate::session::Session::resume(db.clone(), s_b.session_id)
                 .unwrap()
@@ -1129,11 +1218,11 @@ mod tests {
 
         ctx_a
             .locks
-            .note_read(&file, &ctx_a.agent_id, ctx_a.session.id)
+            .note_read(&file, &ctx_a.lock_identity, ctx_a.session.id)
             .await;
         ctx_b
             .locks
-            .note_read(&file, &ctx_b.agent_id, ctx_b.session.id)
+            .note_read(&file, &ctx_b.lock_identity, ctx_b.session.id)
             .await;
         fail_lock_state_deletes(&db).await;
 
@@ -1172,7 +1261,7 @@ mod tests {
         let file = tmp.path().join("busy.md");
         std::fs::write(&file, "old\n").unwrap();
         ctx.locks
-            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .note_read(&file, &ctx.lock_identity, ctx.session.id)
             .await;
         ctx.locks
             .acquire(&file, "holder", ctx.session.id)

@@ -530,6 +530,7 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
     pub(in crate::engine::driver) resume_handle: Option<String>,
     pub(in crate::engine::driver) child_cwd: ChildCwd,
     pub(in crate::engine::driver) context: crate::engine::agent::TaskContext,
+    pub(in crate::engine::driver) write_scope: Option<String>,
     pub(in crate::engine::driver) granted_tools: Vec<String>,
     pub(in crate::engine::driver) todo_ids: Vec<uuid::Uuid>,
     pub(in crate::engine::driver) child_recursion:
@@ -630,7 +631,69 @@ impl Drop for BackgroundNoninteractiveJob {
     }
 }
 
+fn resolve_write_scope(
+    scope: Option<&str>,
+    base: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(scope) = scope.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let requested = crate::tools::common::resolve(scope, base);
+    let effective = crate::path_containment::effective_path(&requested).map_err(|err| {
+        format!(
+            "`write_scope` `{}` cannot be resolved inside the workspace: {err}",
+            requested.display()
+        )
+    })?;
+    if !crate::path_containment::contained_under(workspace, &effective) {
+        return Err(format!(
+            "`write_scope` `{}` resolves outside the workspace `{}`",
+            effective.display(),
+            workspace.display()
+        ));
+    }
+    Ok(Some(effective))
+}
+
+fn overlapping_write_scope_pair(
+    scopes: &[(String, std::path::PathBuf)],
+) -> Option<(String, std::path::PathBuf, String, std::path::PathBuf)> {
+    for (idx, (left_label, left)) in scopes.iter().enumerate() {
+        for (right_label, right) in scopes.iter().skip(idx + 1) {
+            if crate::path_containment::contained_under(left, right)
+                || crate::path_containment::contained_under(right, left)
+            {
+                return Some((
+                    left_label.clone(),
+                    left.clone(),
+                    right_label.clone(),
+                    right.clone(),
+                ));
+            }
+        }
+    }
+    None
+}
+
 impl Driver {
+    async fn pregrant_write_scope(&self, scope: &std::path::Path) {
+        let Some(approver) = self.approver.as_ref() else {
+            return;
+        };
+        if let Err(e) = approver
+            .store()
+            .record_path(
+                scope,
+                crate::approval::store::Scope::Session,
+                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, scope = %scope.display(), "record scoped child write grant failed");
+        }
+    }
+
     #[cfg(test)]
     pub(in crate::engine::driver) async fn persist_delegation_payload(
         &self,
@@ -750,6 +813,7 @@ impl Driver {
             "context": task.context.as_str(),
             "requested_cwd": task.child_cwd.requested_json(),
             "resolved_cwd": &resolved_cwd_display,
+            "write_scope": &task.write_scope,
             "todo_ids": &task.todo_ids,
         }))
         .ok();
@@ -759,7 +823,7 @@ impl Driver {
             label: "default",
             child_agent: &task.child_agent,
             model: model_display.as_deref(),
-            output_dir: None,
+            output_dir: task.write_scope.as_deref(),
             requested_cwd: task.child_cwd.requested_json(),
             resolved_cwd: Some(&resolved_cwd_display),
             todo_ids_json: None,
@@ -911,6 +975,7 @@ impl Driver {
             resume_handle,
             child_cwd,
             context,
+            write_scope,
             granted_tools,
             todo_ids,
             child_recursion,
@@ -1044,6 +1109,7 @@ impl Driver {
                     "resume_handle": resume_handle.clone(),
                     "requested_cwd": child_cwd.requested_json(),
                     "resolved_cwd": child_cwd.resolved_display(),
+                    "write_scope": write_scope.clone(),
                     "grant_tools": granted_tools.clone(),
                     "todo_ids": todo_ids.clone(),
                 }),
@@ -1063,6 +1129,32 @@ impl Driver {
 
         let llm_mode = self.stack[0].agent.llm_mode;
         let followup_enabled = crate::engine::tool::Capability::FollowupSeed.enabled(llm_mode);
+        let resolved_write_scope =
+            match resolve_write_scope(write_scope.as_deref(), &child_cwd.resolved, &self.cwd) {
+                Ok(scope) => scope,
+                Err(err) => {
+                    return Ok(SingleNoninteractiveCompletion {
+                        child_agent,
+                        task_call_id,
+                        task_function_call_id,
+                        report: format!("Error: {err}"),
+                        failed: true,
+                        failure: None,
+                        partial_progress: DelegationPartialProgress::default(),
+                        new_handle: None,
+                        snapshot: NoninteractiveDelegationSnapshot::empty(),
+                        shrink: Some(PendingDelegationShrink {
+                            tracker,
+                            handle: shrink_handle,
+                        }),
+                        repair_notes,
+                        child_routing: None,
+                    });
+                }
+            };
+        if let Some(scope) = resolved_write_scope.as_ref() {
+            self.pregrant_write_scope(scope).await;
+        }
         let mut child_session = self.session.clone();
         let mut fork_prior_history = Vec::new();
         if context == crate::engine::agent::TaskContext::Fork {
@@ -1164,12 +1256,16 @@ impl Driver {
                 Ok(prior_history) => {
                     let child = match crate::engine::builtin::load(
                         &child_agent,
-                        &self.spawn_args_delegated_in_cwd(
+                        &self.spawn_args_delegated_in_cwd_scoped(
                             &child_cwd.resolved,
                             false,
                             granted_tools.clone(),
                             model.clone(),
                             child_recursion.clone(),
+                            DelegationConfinement {
+                                lock_identity: None,
+                                write_scope: resolved_write_scope.clone(),
+                            },
                         ),
                     ) {
                         Ok(child) => child,
@@ -1453,6 +1549,10 @@ impl Driver {
             &report,
             Some(&partial_progress),
         );
+        if let Some(files_touched) = extract_files_touched(&report) {
+            report_data["files_touched"] = serde_json::to_value(files_touched)
+                .unwrap_or_else(|_| serde_json::json!({ "serialization_error": true }));
+        }
         if let Some(failure) = failure.as_ref() {
             report_data["failure"] = serde_json::to_value(failure)
                 .unwrap_or_else(|_| serde_json::json!({ "serialization_error": true }));
@@ -2372,7 +2472,7 @@ impl Driver {
                     label: entry.label.as_str(),
                     child_agent: entry.child_agent.as_str(),
                     model: model.as_deref(),
-                    output_dir: entry.output_dir.as_deref(),
+                    output_dir: entry.write_scope.as_deref(),
                     requested_cwd: child_cwd.requested_json(),
                     resolved_cwd: Some(resolved_cwd.as_str()),
                     todo_ids_json: child_todo_json
@@ -2390,7 +2490,7 @@ impl Driver {
                 "resume_handle": &entry.resume_handle,
                 "requested_cwd": child_cwd.requested_json(),
                 "resolved_cwd": child_cwd.resolved_display(),
-                "output_dir": &entry.output_dir,
+                "write_scope": &entry.write_scope,
                 "todo_ids": &entry.todo_ids,
             })).collect::<Vec<_>>(),
             "why": &task.why,
@@ -2566,6 +2666,9 @@ impl Driver {
 
         let mut batch_refusal: Option<String> = None;
         let mut child_recursions = Vec::with_capacity(entries.len());
+        let mut resolved_write_scopes = Vec::with_capacity(entries.len());
+        let mut write_capable_scopes = Vec::new();
+        let mut has_write_capable_entry = false;
         for (entry, child_cwd) in entries.iter().zip(child_cwds.iter()) {
             let child_recursion = match self.resolve_task_recursion(
                 &entry.child_agent,
@@ -2594,14 +2697,53 @@ impl Driver {
                     break;
                 }
             };
-            if crate::engine::builtin::is_write_capable(&child) && entry.output_dir.is_none() {
+            let write_capable = crate::engine::builtin::is_write_capable(&child);
+            let resolved_write_scope = match resolve_write_scope(
+                entry.write_scope.as_deref(),
+                &child_cwd.resolved,
+                &self.cwd,
+            ) {
+                Ok(scope) => scope,
+                Err(err) => {
+                    batch_refusal = Some(format!("batch entry `{}`: {err}", entry.label));
+                    break;
+                }
+            };
+            if write_capable && entry.write_scope.is_none() {
                 batch_refusal = Some(format!(
-                    "parallel write-capable entry `{}` (`{}`) requires `output_dir`",
+                    "parallel write-capable entry `{}` (`{}`) requires `write_scope`",
                     entry.label, entry.child_agent
                 ));
                 break;
             }
+            if write_capable {
+                has_write_capable_entry = true;
+                if let Some(scope) = resolved_write_scope.as_ref() {
+                    write_capable_scopes.push((entry.label.clone(), scope.clone()));
+                }
+            }
             child_recursions.push(child_recursion);
+            resolved_write_scopes.push(resolved_write_scope);
+        }
+        let llm_mode = self.stack[0].agent.llm_mode;
+        if batch_refusal.is_none()
+            && has_write_capable_entry
+            && !crate::engine::tool::Capability::ScopedParallelWrite.enabled(llm_mode)
+        {
+            batch_refusal = Some(
+                "parallel write-capable task batches are Frontier-only; use sequential delegation or run in Frontier mode"
+                    .to_string(),
+            );
+        }
+        if batch_refusal.is_none()
+            && let Some((left_label, left, right_label, right)) =
+                overlapping_write_scope_pair(&write_capable_scopes)
+        {
+            batch_refusal = Some(format!(
+                "write_scope overlap between batch entries `{left_label}` (`{}`) and `{right_label}` (`{}`); write-capable scopes must be disjoint",
+                left.display(),
+                right.display()
+            ));
         }
         if let Some(msg) = batch_refusal {
             return Ok(BatchNoninteractiveCompletion {
@@ -2620,6 +2762,10 @@ impl Driver {
             });
         }
 
+        for scope in resolved_write_scopes.iter().flatten() {
+            self.pregrant_write_scope(scope).await;
+        }
+
         for entry in &entries {
             self.noninteractive_delegations.register_running(
                 &task_call_id,
@@ -2633,10 +2779,11 @@ impl Driver {
 
         let mut runs = futures::stream::FuturesUnordered::new();
         let mut children = Vec::new();
-        for (idx, ((mut entry, child_cwd), child_recursion)) in entries
+        for (idx, (((mut entry, child_cwd), child_recursion), resolved_write_scope)) in entries
             .into_iter()
             .zip(child_cwds)
             .zip(child_recursions)
+            .zip(resolved_write_scopes)
             .enumerate()
         {
             let driver = &*self;
@@ -2734,7 +2881,7 @@ impl Driver {
                     "resolved_cwd": child_cwd.resolved_display(),
                     "grant_tools": entry.granted_tools.clone(),
                     "todo_ids": entry.todo_ids.clone(),
-                    "output_dir": entry.output_dir.clone(),
+                    "write_scope": entry.write_scope.clone(),
                 }),
             ).await {
                 tracing::warn!(error = %e, "record batch subagent_spawned event failed");
@@ -2743,143 +2890,40 @@ impl Driver {
             let child_cancel = cancel.clone();
             runs.push(async move {
                 let mut snapshot = NoninteractiveDelegationSnapshot::empty();
-                let outcome =
-                    if let Some(err) = grant_rejection(
-                        &child_cwd.resolved,
-                        &driver.config,
-                        &parent,
-                        &entry.child_agent,
-                        &entry.granted_tools,
-                        &driver.session.db,
-                    )
-                    .await
-                    {
-                        DelegationChildOutcome::failed(err)
-                    } else if entry.child_agent == "docs" {
-                        // The docs pipeline bypasses `builtin::load`, so it has
-                        // no resolved child model and intentionally emits no
-                        // routing amend.
-                        if entry.resume_handle.is_some() {
-                            DelegationChildOutcome::failed(stale_handle_error(&entry.child_agent))
-                        } else {
-                            match crate::engine::docs_pipeline::run(
-                                &entry.prompt,
-                                &driver.spawn_args_delegated_in_cwd(
-                                    &child_cwd.resolved,
-                                    false,
-                                    Vec::new(),
-                                    entry.model.clone(),
-                                    child_recursion.clone(),
-                                ),
-                                driver.session.clone(),
-                                driver.locks.clone(),
-                                driver.redact.clone(),
-                                driver.config.clone(),
-                                driver.approver.clone(),
-                                driver.interrupts.clone(),
-                                child_cancel.clone(),
-                                Some(driver.tandem_set.clone()),
-                                Some(tx.clone()),
-                                Some(NoninteractiveSteerTarget::new(
-                                    entry_task_call_id.clone(),
-                                    entry.label.clone(),
-                                )),
-                            )
-                            .await
-                            {
-                                Ok(text) => DelegationChildOutcome::ok(text),
-                                Err(e) => DelegationChildOutcome::failed(format!("Error: {e:#}")),
-                            }
-                        }
+                let outcome = if let Some(err) = grant_rejection(
+                    &child_cwd.resolved,
+                    &driver.config,
+                    &parent,
+                    &entry.child_agent,
+                    &entry.granted_tools,
+                    &driver.session.db,
+                )
+                .await
+                {
+                    DelegationChildOutcome::failed(err)
+                } else if entry.child_agent == "docs" {
+                    // The docs pipeline bypasses `builtin::load`, so it has
+                    // no resolved child model and intentionally emits no
+                    // routing amend.
+                    if entry.resume_handle.is_some() {
+                        DelegationChildOutcome::failed(stale_handle_error(&entry.child_agent))
                     } else {
-                        let child = match crate::engine::builtin::load(
-                            &entry.child_agent,
+                        match crate::engine::docs_pipeline::run(
+                            &entry.prompt,
                             &driver.spawn_args_delegated_in_cwd(
                                 &child_cwd.resolved,
                                 false,
-                                entry.granted_tools.clone(),
+                                Vec::new(),
                                 entry.model.clone(),
                                 child_recursion.clone(),
                             ),
-                        ) {
-                            Ok(child) => child,
-                            Err(e) => {
-                                return (
-                                    idx,
-                                    entry,
-                                    DelegationChildOutcome::failed(format!("Error: {e:#}")),
-                                    snapshot,
-                                );
-                            }
-                        };
-                        let child_routing = ChildRoutingMetadata::from_model(&child.model);
-                        driver
-                            .emit_subagent_routing_amend(
-                                tx,
-                                &entry.child_agent,
-                                &entry_task_call_id,
-                                &entry.label,
-                                &child_routing,
-                            )
-                            .await;
-                        let mut child_session = driver.session.clone();
-                        let mut prior_history = delegation_payload_history;
-                        let mut brief = if entry.context == crate::engine::agent::TaskContext::Fork
-                        {
-                            match driver.prepare_fork_task_context().await {
-                                Ok((session, history)) => {
-                                    child_session = session;
-                                    prior_history = history;
-                                    entry.prompt.clone()
-                                }
-                                Err(e) => {
-                                    return (
-                                        idx,
-                                        entry,
-                                        DelegationChildOutcome::failed(format!(
-                                            "Error: failed to create forked task session: {e:#}"
-                                        )),
-                                        snapshot,
-                                    );
-                                }
-                            }
-                        } else {
-                            compose_subagent_brief(&entry.prompt, &entry_why)
-                        };
-                        if let Some(output_dir) = &entry.output_dir {
-                            brief = format!(
-                                "{brief}\n\nWrite constraint: keep all file writes under `{output_dir}`."
-                            );
-                        }
-                        let brief = driver.assign_todos_to_task(
-                            brief,
-                            &entry.todo_ids,
-                            &entry_task_call_id,
-                            &entry.label,
-                            &entry.child_agent,
-                        )
-                        .await;
-                        let brief = driver.expand_handoff_tags(
-                            &brief,
-                            &child_cwd.resolved,
-                            child.llm_mode,
-                            &entry.child_agent,
-                        );
-                        match run_noninteractive_resumable(
-                            child,
-                            brief,
-                            prior_history,
-                            child_session,
+                            driver.session.clone(),
                             driver.locks.clone(),
                             driver.redact.clone(),
-                            child_cwd.resolved.clone(),
                             driver.config.clone(),
+                            driver.approver.clone(),
                             driver.interrupts.clone(),
                             child_cancel.clone(),
-                            driver.approver.clone(),
-                            driver.resource_scheduler.clone(),
-                            driver.loop_guard_threshold,
-                            EXPLORE_MAX_TURNS,
                             Some(driver.tandem_set.clone()),
                             Some(tx.clone()),
                             Some(NoninteractiveSteerTarget::new(
@@ -2889,62 +2933,164 @@ impl Driver {
                         )
                         .await
                         {
-                            Ok(outcome) => {
-                                snapshot = NoninteractiveDelegationSnapshot::from_history(
-                                    outcome.history.clone(),
-                                );
-                                let final_child_routing = child_routing
-                                    .clone()
-                                    .with_fallback_decision(outcome.fallback_decision.as_ref());
-                                if outcome.fallback_decision.is_some() {
-                                    driver
-                                        .emit_subagent_routing_amend(
-                                            tx,
-                                            &entry.child_agent,
-                                            &entry_task_call_id,
-                                            &entry.label,
-                                            &final_child_routing,
-                                        )
-                                        .await;
-                                }
-                                DelegationChildOutcome::ok(outcome.report)
-                                    .with_child_routing(final_child_routing)
-                            }
-                            Err(e) => {
-                                let (message, history, fallback_decision, failure_envelope) =
-                                    e.into_parts();
-                                let partial_progress = partial_progress_from_history(&history);
-                                snapshot = NoninteractiveDelegationSnapshot::from_history(history);
-                                let final_child_routing = child_routing
-                                    .clone()
-                                    .with_fallback_decision(fallback_decision.as_ref());
-                                if fallback_decision.is_some() {
-                                    driver
-                                        .emit_subagent_routing_amend(
-                                            tx,
-                                            &entry.child_agent,
-                                            &entry_task_call_id,
-                                            &entry.label,
-                                            &final_child_routing,
-                                        )
-                                        .await;
-                                }
-                                let outcome = match failure_envelope {
-                                    Some(envelope) => {
-                                        DelegationChildOutcome::failed_with_envelope(
-                                            envelope,
-                                            partial_progress,
-                                        )
-                                    }
-                                    None => DelegationChildOutcome::failed_with_progress(
-                                        format!("Error: {message}"),
-                                        partial_progress,
-                                    ),
-                                };
-                                outcome.with_child_routing(final_child_routing)
-                            }
+                            Ok(text) => DelegationChildOutcome::ok(text),
+                            Err(e) => DelegationChildOutcome::failed(format!("Error: {e:#}")),
+                        }
+                    }
+                } else {
+                    let child = match crate::engine::builtin::load(
+                        &entry.child_agent,
+                        &driver.spawn_args_delegated_in_cwd_scoped(
+                            &child_cwd.resolved,
+                            false,
+                            entry.granted_tools.clone(),
+                            entry.model.clone(),
+                            child_recursion.clone(),
+                            DelegationConfinement {
+                                lock_identity: Some(format!(
+                                    "{}#{}",
+                                    entry.child_agent, entry.label
+                                )),
+                                write_scope: resolved_write_scope.clone(),
+                            },
+                        ),
+                    ) {
+                        Ok(child) => child,
+                        Err(e) => {
+                            return (
+                                idx,
+                                entry,
+                                DelegationChildOutcome::failed(format!("Error: {e:#}")),
+                                snapshot,
+                            );
                         }
                     };
+                    let child_routing = ChildRoutingMetadata::from_model(&child.model);
+                    driver
+                        .emit_subagent_routing_amend(
+                            tx,
+                            &entry.child_agent,
+                            &entry_task_call_id,
+                            &entry.label,
+                            &child_routing,
+                        )
+                        .await;
+                    let mut child_session = driver.session.clone();
+                    let mut prior_history = delegation_payload_history;
+                    let brief = if entry.context == crate::engine::agent::TaskContext::Fork {
+                        match driver.prepare_fork_task_context().await {
+                            Ok((session, history)) => {
+                                child_session = session;
+                                prior_history = history;
+                                entry.prompt.clone()
+                            }
+                            Err(e) => {
+                                return (
+                                    idx,
+                                    entry,
+                                    DelegationChildOutcome::failed(format!(
+                                        "Error: failed to create forked task session: {e:#}"
+                                    )),
+                                    snapshot,
+                                );
+                            }
+                        }
+                    } else {
+                        compose_subagent_brief(&entry.prompt, &entry_why)
+                    };
+                    let brief = driver
+                        .assign_todos_to_task(
+                            brief,
+                            &entry.todo_ids,
+                            &entry_task_call_id,
+                            &entry.label,
+                            &entry.child_agent,
+                        )
+                        .await;
+                    let brief = driver.expand_handoff_tags(
+                        &brief,
+                        &child_cwd.resolved,
+                        child.llm_mode,
+                        &entry.child_agent,
+                    );
+                    match run_noninteractive_resumable(
+                        child,
+                        brief,
+                        prior_history,
+                        child_session,
+                        driver.locks.clone(),
+                        driver.redact.clone(),
+                        child_cwd.resolved.clone(),
+                        driver.config.clone(),
+                        driver.interrupts.clone(),
+                        child_cancel.clone(),
+                        driver.approver.clone(),
+                        driver.resource_scheduler.clone(),
+                        driver.loop_guard_threshold,
+                        EXPLORE_MAX_TURNS,
+                        Some(driver.tandem_set.clone()),
+                        Some(tx.clone()),
+                        Some(NoninteractiveSteerTarget::new(
+                            entry_task_call_id.clone(),
+                            entry.label.clone(),
+                        )),
+                    )
+                    .await
+                    {
+                        Ok(outcome) => {
+                            snapshot = NoninteractiveDelegationSnapshot::from_history(
+                                outcome.history.clone(),
+                            );
+                            let final_child_routing = child_routing
+                                .clone()
+                                .with_fallback_decision(outcome.fallback_decision.as_ref());
+                            if outcome.fallback_decision.is_some() {
+                                driver
+                                    .emit_subagent_routing_amend(
+                                        tx,
+                                        &entry.child_agent,
+                                        &entry_task_call_id,
+                                        &entry.label,
+                                        &final_child_routing,
+                                    )
+                                    .await;
+                            }
+                            DelegationChildOutcome::ok(outcome.report)
+                                .with_child_routing(final_child_routing)
+                        }
+                        Err(e) => {
+                            let (message, history, fallback_decision, failure_envelope) =
+                                e.into_parts();
+                            let partial_progress = partial_progress_from_history(&history);
+                            snapshot = NoninteractiveDelegationSnapshot::from_history(history);
+                            let final_child_routing = child_routing
+                                .clone()
+                                .with_fallback_decision(fallback_decision.as_ref());
+                            if fallback_decision.is_some() {
+                                driver
+                                    .emit_subagent_routing_amend(
+                                        tx,
+                                        &entry.child_agent,
+                                        &entry_task_call_id,
+                                        &entry.label,
+                                        &final_child_routing,
+                                    )
+                                    .await;
+                            }
+                            let outcome = match failure_envelope {
+                                Some(envelope) => DelegationChildOutcome::failed_with_envelope(
+                                    envelope,
+                                    partial_progress,
+                                ),
+                                None => DelegationChildOutcome::failed_with_progress(
+                                    format!("Error: {message}"),
+                                    partial_progress,
+                                ),
+                            };
+                            outcome.with_child_routing(final_child_routing)
+                        }
+                    }
+                };
                 (idx, entry, outcome, snapshot)
             });
         }
@@ -2970,6 +3116,10 @@ impl Driver {
                 &report,
                 Some(&outcome.partial_progress),
             );
+            if let Some(files_touched) = extract_files_touched(&report) {
+                report_data["files_touched"] = serde_json::to_value(files_touched)
+                    .unwrap_or_else(|_| serde_json::json!({ "serialization_error": true }));
+            }
             if let Some(failure) = outcome.failure.as_ref() {
                 report_data["failure"] = serde_json::to_value(failure)
                     .unwrap_or_else(|_| serde_json::json!({ "serialization_error": true }));

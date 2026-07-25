@@ -94,6 +94,8 @@ pub struct Agent {
     /// (implementation note). Drives tool-description
     /// verbosity at [`ToolBox::definitions`] time — the one rendering seam.
     pub llm_mode: crate::config::extended::LlmMode,
+    pub lock_identity: String,
+    pub write_scope: Option<std::path::PathBuf>,
     pub delegated: bool,
     pub delegation_recursion: crate::engine::builtin::DelegationRecursionContext,
     pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
@@ -1267,6 +1269,8 @@ mod redaction_placeholder_guard_tests {
         session.set_sandbox_enabled(false);
         ToolCtx {
             agent_id: "builder".to_string(),
+            lock_identity: "builder".to_string().clone(),
+            write_scope: None,
             current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
             locks: Arc::new(crate::locks::LockManager::in_memory(db)),

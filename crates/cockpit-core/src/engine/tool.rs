@@ -814,6 +814,13 @@ impl ToolOutput {
 #[derive(Clone)]
 pub struct ToolCtx {
     pub agent_id: String,
+    /// Lock-manager identity for this concrete agent instance. Defaults to
+    /// `agent_id`; parallel same-named task children use distinct identities
+    /// such as `builder#a` so they cannot self-own each other's locks.
+    pub lock_identity: String,
+    /// Optional subtree that write-capable native tools and shell sandboxes must
+    /// confine writes to. Reads remain governed by the session boundary.
+    pub write_scope: Option<std::path::PathBuf>,
     /// Current outer model tool-call id, when this context was built for a
     /// live model-issued tool dispatch. Host-side tools can use it to parent
     /// synthetic UI/telemetry events without exposing the id to tool schemas or
@@ -1044,6 +1051,9 @@ pub enum Capability {
     /// Forking the delegating agent's transcript into a noninteractive child.
     /// Available only to frontier mode.
     ForkContext,
+    /// Parallel write-capable task fan-out in one worktree with hard scoped
+    /// write confinement. Available only to frontier mode.
+    ScopedParallelWrite,
 }
 
 impl Capability {
@@ -1058,7 +1068,9 @@ impl Capability {
             Capability::FollowupSeed | Capability::SandboxEscalate => {
                 matches!(mode, LlmMode::Normal | LlmMode::Frontier)
             }
-            Capability::ForkContext => matches!(mode, LlmMode::Frontier),
+            Capability::ForkContext | Capability::ScopedParallelWrite => {
+                matches!(mode, LlmMode::Frontier)
+            }
         }
     }
 }
@@ -1362,6 +1374,13 @@ mod capability_tests {
         assert!(!Capability::ForkContext.enabled(LlmMode::Normal));
         assert!(Capability::ForkContext.enabled(LlmMode::Frontier));
         assert!(!Capability::ForkContext.enabled(LlmMode::Defensive));
+    }
+
+    #[test]
+    fn scoped_parallel_write_capability_is_frontier_only() {
+        assert!(!Capability::ScopedParallelWrite.enabled(LlmMode::Normal));
+        assert!(Capability::ScopedParallelWrite.enabled(LlmMode::Frontier));
+        assert!(!Capability::ScopedParallelWrite.enabled(LlmMode::Defensive));
     }
 
     struct RequirementTool {

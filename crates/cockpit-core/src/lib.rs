@@ -41,6 +41,7 @@ pub mod locks;
 pub mod mcp;
 pub mod model_system_prompt;
 pub mod packages;
+pub mod path_containment;
 pub mod private_fs;
 pub mod process;
 pub mod providers;

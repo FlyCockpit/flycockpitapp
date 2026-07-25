@@ -424,7 +424,7 @@ mod tests {
             .unwrap()
             .unwrap();
         session.set_sandbox_enabled(false);
-        let locks = Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap());
+        let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
         let redact = Arc::new(
             crate::redact::RedactionTable::build(
                 &crate::config::extended::RedactConfig::default(),

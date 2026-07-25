@@ -1045,7 +1045,7 @@ mod tests {
     fn test_context() -> (tempfile::TempDir, Arc<DaemonContext>) {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
-        let locks = Arc::new(LockManager::from_db(db.clone()).unwrap());
+        let locks = Arc::new(LockManager::in_memory(db.clone()));
         let paths = crate::daemon::DaemonPaths {
             pid_file: tmp.path().join("daemon.pid"),
             socket: tmp.path().join("daemon.sock"),

@@ -22,19 +22,11 @@ pub(super) fn schedule_session_locks_unattended(
             locks, counter, live, session_id, reason,
         ));
     } else {
-        std::thread::spawn(move || {
-            if counter.load(Ordering::SeqCst) != 0 || live.processing() {
-                return;
-            }
-            if let Err(e) = locks.suspend_session(session_id) {
-                tracing::warn!(
-                    error = %e,
-                    %session_id,
-                    reason,
-                    "releasing session locks failed"
-                );
-            }
-        });
+        tracing::warn!(
+            %session_id,
+            reason,
+            "cannot schedule unattended lock release outside a tokio runtime"
+        );
     }
 }
 
@@ -90,23 +82,14 @@ pub(super) async fn release_session_locks_unattended(
     if counter.load(Ordering::SeqCst) != 0 || live.processing() {
         return;
     }
-    let result = tokio::task::spawn_blocking(move || locks.suspend_session(session_id)).await;
-    match result {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            tracing::warn!(
-                error = %e,
-                %session_id,
-                reason,
-                "releasing session locks failed"
-            );
-        }
+    match locks.suspend_session(session_id).await {
+        Ok(_) => {}
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 %session_id,
                 reason,
-                "lock release blocking task failed"
+                "releasing session locks failed"
             );
         }
     }

@@ -346,6 +346,7 @@ mod tests {
         };
         let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
         let ctx = crate::daemon::boot_in_process_with_db(paths.clone(), db)
+            .await
             .expect("boot in-process daemon context");
 
         let outcome = restart_skewed_daemon_if_idle_with_cooldown(&paths, Duration::ZERO)

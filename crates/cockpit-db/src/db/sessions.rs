@@ -3012,13 +3012,13 @@ mod tests {
             )
             .await
             .unwrap();
-        db.pin_message(parent.session_id, first).unwrap();
+        db.pin_message(parent.session_id, first).await.unwrap();
 
         let fork = db.create_fork(parent.session_id, None).await.unwrap();
         let fork_events = db.list_session_events(fork.session_id).await.unwrap();
         assert_eq!(fork_events.len(), 1);
         assert_eq!(fork_events[0].data["text"], "parent before fork");
-        let fork_pins = db.list_pin_seqs(fork.session_id).unwrap();
+        let fork_pins = db.list_pin_seqs(fork.session_id).await.unwrap();
         assert_eq!(fork_pins, vec![fork_events[0].seq]);
 
         db.insert_session_event(
@@ -3136,7 +3136,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         let seq = record_message(&db, parent.session_id, "pinned", false).await;
-        db.pin_message(parent.session_id, seq).unwrap();
+        db.pin_message(parent.session_id, seq).await.unwrap();
         install_trigger(
             &db,
             "CREATE TEMP TRIGGER fail_fork_pin_copy
@@ -3198,15 +3198,15 @@ mod tests {
         let s1 = record_message(&db, parent.session_id, "s1", false).await;
         let fork_point = record_message(&db, parent.session_id, "s2", true).await;
         let s3 = record_message(&db, parent.session_id, "s3", false).await;
-        db.pin_message(parent.session_id, s1).unwrap();
-        db.pin_message(parent.session_id, s3).unwrap();
+        db.pin_message(parent.session_id, s1).await.unwrap();
+        db.pin_message(parent.session_id, s3).await.unwrap();
 
         let fork = db
             .create_fork(parent.session_id, Some(fork_point.to_string()))
             .await
             .unwrap();
         let fork_events = db.list_session_events(fork.session_id).await.unwrap();
-        let fork_pins = db.list_pin_seqs(fork.session_id).unwrap();
+        let fork_pins = db.list_pin_seqs(fork.session_id).await.unwrap();
 
         assert_eq!(fork_pins, vec![fork_events[0].seq]);
     }

@@ -1888,25 +1888,29 @@ pub(crate) fn in_process_context(socket: &Path) -> Option<Arc<DaemonContext>> {
 
 /// Bootstrap the daemon: open the DB, build the lock manager, return
 /// a ready-to-use context. Called from `daemon::run_foreground`.
-pub fn boot(
+pub async fn boot(
     paths: DaemonPaths,
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
 ) -> Result<DaemonContext> {
     let mut timer = crate::startup::PhaseTimer::start("daemon::boot");
     let db = Db::open_default().context("opening session DB")?;
-    let ctx = boot_with_db(paths, db, &mut timer, terminal_factory)?;
+    let ctx = boot_with_db(paths, db, &mut timer, terminal_factory).await?;
     timer.done();
     Ok(ctx)
 }
 
-pub(crate) fn boot_with_db(
+pub(crate) async fn boot_with_db(
     paths: DaemonPaths,
     db: Db,
     timer: &mut crate::startup::PhaseTimer,
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
 ) -> Result<DaemonContext> {
     timer.phase("db_open_and_migrate");
-    let locks = Arc::new(LockManager::from_db(db.clone()).context("loading lock state")?);
+    let locks = Arc::new(
+        LockManager::from_db(db.clone())
+            .await
+            .context("loading lock state")?,
+    );
     timer.phase("lock_manager");
     run_boot_housekeeping(&db);
     timer.phase("prune_and_sweep");

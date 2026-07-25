@@ -423,6 +423,7 @@ async fn shadow_brief_predrafts() {
             .session
             .db
             .compaction_shadow(driver.session.id)
+            .await
             .unwrap()
             .is_some(),
         "ready shadow brief is persisted eagerly"
@@ -506,10 +507,18 @@ async fn ready_brief_survives_driver_drop() {
     let redact = driver.redact.clone();
     let cwd = driver.cwd.clone();
     let root = driver.stack[0].agent.clone();
-    assert!(session.db.compaction_shadow(session.id).unwrap().is_some());
+    assert!(
+        session
+            .db
+            .compaction_shadow(session.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
     drop(driver);
 
     let mut restored = Driver::new(session.clone(), locks, redact, cwd, root);
+    restored.load_compaction_shadow_from_store().await;
     append_complete_test_turns(&mut restored, 3);
     install_test_providers(
         &mut restored,
@@ -561,6 +570,7 @@ async fn consumed_brief_is_deleted() {
             .session
             .db
             .compaction_shadow(driver.session.id)
+            .await
             .unwrap()
             .is_some()
     );
@@ -575,6 +585,7 @@ async fn consumed_brief_is_deleted() {
             .session
             .db
             .compaction_shadow(driver.session.id)
+            .await
             .unwrap()
             .is_none(),
         "consuming a ready shadow deletes its durable row"
@@ -593,7 +604,7 @@ async fn load_without_row_clears_memory_view() {
         brief: "memory only".to_string(),
     }));
 
-    driver.load_compaction_shadow_from_store();
+    driver.load_compaction_shadow_from_store().await;
 
     assert!(
         driver.shadow_brief.is_none(),
@@ -615,6 +626,7 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
         .session
         .db
         .upsert_compaction_shadow(driver.session.id, &serde_json::to_string(&payload).unwrap())
+        .await
         .unwrap();
 
     let mut restored = Driver::new(
@@ -624,6 +636,7 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
         driver.cwd.clone(),
         driver.stack[0].agent.clone(),
     );
+    restored.load_compaction_shadow_from_store().await;
 
     assert_eq!(restored.shadow_brief_generation, 7);
     assert!(matches!(
@@ -642,9 +655,10 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
         .session
         .db
         .upsert_compaction_shadow(restored.session.id, &serde_json::to_string(&older).unwrap())
+        .await
         .unwrap();
     restored.shadow_brief_generation = 8;
-    restored.load_compaction_shadow_from_store();
+    restored.load_compaction_shadow_from_store().await;
 
     assert!(restored.shadow_brief.is_none());
     assert!(
@@ -652,6 +666,7 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
             .session
             .db
             .compaction_shadow(restored.session.id)
+            .await
             .unwrap()
             .is_none(),
         "stored generation behind the live driver is discarded"
@@ -672,10 +687,11 @@ async fn stale_loaded_brief_is_discarded() {
         .session
         .db
         .upsert_compaction_shadow(driver.session.id, &serde_json::to_string(&payload).unwrap())
+        .await
         .unwrap();
     append_complete_test_turns(&mut driver, 9);
 
-    driver.load_compaction_shadow_from_store();
+    driver.load_compaction_shadow_from_store().await;
 
     assert!(driver.shadow_brief.is_none());
     assert!(
@@ -683,6 +699,7 @@ async fn stale_loaded_brief_is_discarded() {
             .session
             .db
             .compaction_shadow(driver.session.id)
+            .await
             .unwrap()
             .is_none(),
         "stale loaded shadow row is deleted"
@@ -706,6 +723,7 @@ async fn killswitch_writes_no_rows() {
         .session
         .db
         .upsert_compaction_shadow(driver.session.id, &serde_json::to_string(&payload).unwrap())
+        .await
         .unwrap();
     append_complete_test_turns(&mut driver, 2);
     let cfg = ContextConfig {
@@ -723,6 +741,7 @@ async fn killswitch_writes_no_rows() {
             .session
             .db
             .compaction_shadow(driver.session.id)
+            .await
             .unwrap()
             .is_none()
     );
@@ -769,6 +788,7 @@ async fn ephemeral_session_writes_no_rows() {
             .session
             .db
             .compaction_shadow(driver.session.id)
+            .await
             .unwrap()
             .is_none(),
         "ephemeral session shadows are not persisted"

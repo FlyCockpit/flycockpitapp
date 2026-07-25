@@ -97,7 +97,7 @@ mod tests {
         .unwrap();
         let session =
             Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
-        let locks = Arc::new(LockManager::from_db(db.clone()).unwrap());
+        let locks = Arc::new(LockManager::from_db(db.clone()).await.unwrap());
         let (handle, _work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
         let mut events = handle.subscribe();
         let source = ConfigSource::new(

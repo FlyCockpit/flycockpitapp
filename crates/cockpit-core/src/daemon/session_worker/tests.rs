@@ -53,7 +53,7 @@ fn test_session_handle() -> SessionWorkerHandle {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
-    let locks = Arc::new(LockManager::from_db(db).unwrap());
+    let locks = Arc::new(LockManager::in_memory(db));
     SessionWorkerHandle::test_handle(session, locks)
 }
 
@@ -649,7 +649,7 @@ async fn driver_join_outcome_observes_panics() {
 async fn absent_scheduler_is_not_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let locks = Arc::new(LockManager::from_db(db.clone()).unwrap());
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
     let session = Arc::new(Session::create(db, tmp.path().to_path_buf(), "Build").unwrap());
     let providers = lmstudio_test_providers();
     let redact = Arc::new(RedactionTable::empty());
@@ -1579,7 +1579,7 @@ async fn last_detach_while_idle_releases_locks() {
         .unwrap()
         .session_id;
     let locks = Arc::new(LockManager::in_memory(db));
-    locks.acquire(&p, "builder", sid).unwrap();
+    locks.acquire(&p, "builder", sid).await.unwrap();
 
     let counter = Arc::new(AtomicUsize::new(0));
     let live = Arc::new(LiveState::default()); // not processing = idle
@@ -1611,7 +1611,7 @@ async fn quick_reattach_skips_scheduled_unattended_release() {
         .unwrap()
         .session_id;
     let locks = Arc::new(LockManager::in_memory(db));
-    locks.acquire(&p, "builder", sid).unwrap();
+    locks.acquire(&p, "builder", sid).await.unwrap();
 
     let counter = Arc::new(AtomicUsize::new(0));
     let live = Arc::new(LiveState::default());
@@ -1642,7 +1642,7 @@ async fn mid_turn_detach_keeps_locks_then_idle_releases() {
         .unwrap()
         .session_id;
     let locks = Arc::new(LockManager::in_memory(db));
-    locks.acquire(&p, "builder", sid).unwrap();
+    locks.acquire(&p, "builder", sid).await.unwrap();
 
     let counter = Arc::new(AtomicUsize::new(0));
     let live = Arc::new(LiveState::default());
@@ -1689,7 +1689,7 @@ async fn multi_attach_releases_only_on_last_detach() {
         .unwrap()
         .session_id;
     let locks = Arc::new(LockManager::in_memory(db));
-    locks.acquire(&p, "builder", sid).unwrap();
+    locks.acquire(&p, "builder", sid).await.unwrap();
 
     let counter = Arc::new(AtomicUsize::new(0));
     let live = Arc::new(LiveState::default());
@@ -2183,7 +2183,7 @@ async fn worker_broadcast_delivers_config_snapshot_to_subscriber() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
-    let locks = Arc::new(LockManager::from_db(db).unwrap());
+    let locks = Arc::new(LockManager::in_memory(db));
     let (handle, _rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
     replace_config_snapshot(
         &handle.config_snapshot,
@@ -2223,7 +2223,7 @@ async fn dispatch_reresolve_fans_out_to_all_attached_clients() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
-    let locks = Arc::new(LockManager::from_db(db).unwrap());
+    let locks = Arc::new(LockManager::in_memory(db));
     let (handle, _rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
     let mut a = handle.subscribe();
     let mut b = handle.subscribe();

@@ -42,13 +42,9 @@ impl Db {
     /// Pin the message at `(session_id, seq)`. Idempotent: pinning an
     /// already-pinned message is a no-op (no error). Returns `true` when a
     /// new pin was created, `false` when it was already pinned.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn pin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
+    pub async fn pin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         let pinned_ms = now_ms();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let n = conn
                 .execute(
                     "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms)
@@ -58,17 +54,14 @@ impl Db {
                 .context("inserting pin")?;
             Ok(n == 1)
         })
+        .await
     }
 
     /// Unpin the message at `(session_id, seq)`. Returns `true` when a pin
     /// was removed, `false` when there was none. The unpin path for both
     /// `d` (delete) and checking a checklist item in `/pins`.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn unpin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
-        self.write_blocking(move |conn| {
+    pub async fn unpin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
+        self.write(move |conn| {
             let n = conn
                 .execute(
                     "DELETE FROM pins WHERE session_id = ?1 AND seq = ?2",
@@ -77,15 +70,12 @@ impl Db {
                 .context("deleting pin")?;
             Ok(n == 1)
         })
+        .await
     }
 
     /// Whether the message at `(session_id, seq)` is currently pinned.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn is_pinned(&self, session_id: Uuid, seq: i64) -> Result<bool> {
-        self.read_blocking(|conn| {
+    pub async fn is_pinned(&self, session_id: Uuid, seq: i64) -> Result<bool> {
+        self.read(move |conn| {
             let found: Option<i64> = conn
                 .query_row(
                     "SELECT 1 FROM pins WHERE session_id = ?1 AND seq = ?2",
@@ -96,30 +86,48 @@ impl Db {
                 .context("querying pin")?;
             Ok(found.is_some())
         })
+        .await
     }
 
     /// Toggle the pin state of `(session_id, seq)`. Returns the NEW state
     /// (`true` = now pinned). The natural affordance for the mouse control
     /// and the message-pick mode.
-    pub fn toggle_pin(&self, session_id: Uuid, seq: i64) -> Result<bool> {
-        if self.is_pinned(session_id, seq)? {
-            self.unpin_message(session_id, seq)?;
-            Ok(false)
-        } else {
-            self.pin_message(session_id, seq)?;
-            Ok(true)
-        }
+    pub async fn toggle_pin(&self, session_id: Uuid, seq: i64) -> Result<bool> {
+        let pinned_ms = now_ms();
+        self.transaction(move |conn| {
+            let found: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM pins WHERE session_id = ?1 AND seq = ?2",
+                    params![session_id.to_string(), seq],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("querying pin")?;
+            if found.is_some() {
+                conn.execute(
+                    "DELETE FROM pins WHERE session_id = ?1 AND seq = ?2",
+                    params![session_id.to_string(), seq],
+                )
+                .context("deleting pin")?;
+                Ok(false)
+            } else {
+                conn.execute(
+                    "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![session_id.to_string(), seq, pinned_ms],
+                )
+                .context("inserting pin")?;
+                Ok(true)
+            }
+        })
+        .await
     }
 
     /// Count of pinned messages for one session. `0` when none — the
     /// below-input indicator and the `/sessions` per-session chrome read
     /// this.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn count_pins(&self, session_id: Uuid) -> Result<i64> {
-        self.read_blocking(|conn| {
+    pub async fn count_pins(&self, session_id: Uuid) -> Result<i64> {
+        self.read(move |conn| {
             let n: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM pins WHERE session_id = ?1",
@@ -129,17 +137,14 @@ impl Db {
                 .context("counting pins")?;
             Ok(n)
         })
+        .await
     }
 
     /// The `seq`s pinned in one session, in pin order (oldest pin first).
     /// Bare seqs, no text — for callers that only need the set (e.g. the
     /// mouse control's pinned/unpinned decision per rendered message).
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_pin_seqs(&self, session_id: Uuid) -> Result<Vec<i64>> {
-        self.read_blocking(|conn| {
+    pub async fn list_pin_seqs(&self, session_id: Uuid) -> Result<Vec<i64>> {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT seq FROM pins WHERE session_id = ?1 ORDER BY pinned_ms ASC, rowid ASC",
@@ -154,6 +159,7 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 
     /// Pinned messages for one session, in pin order, each resolved
@@ -165,12 +171,8 @@ impl Db {
     /// A pin whose referenced event row is missing is skipped (the FK
     /// CASCADE makes this unreachable in practice, but the read stays
     /// defensive).
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_pins_with_text(&self, session_id: Uuid) -> Result<Vec<PinnedMessage>> {
-        self.read_blocking(|conn| {
+    pub async fn list_pins_with_text(&self, session_id: Uuid) -> Result<Vec<PinnedMessage>> {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT e.seq, e.type, e.data_json
@@ -206,6 +208,7 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 }
 
@@ -231,19 +234,19 @@ mod tests {
         let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello").await;
         let a = record_msg(&db, sid, SessionEventKind::AssistantMessage, "hi there").await;
 
-        assert_eq!(db.count_pins(sid).unwrap(), 0);
-        assert!(!db.is_pinned(sid, u).unwrap());
+        assert_eq!(db.count_pins(sid).await.unwrap(), 0);
+        assert!(!db.is_pinned(sid, u).await.unwrap());
 
-        assert!(db.pin_message(sid, u).unwrap(), "first pin created");
-        assert!(db.pin_message(sid, a).unwrap());
-        assert_eq!(db.count_pins(sid).unwrap(), 2);
-        assert!(db.is_pinned(sid, u).unwrap());
-        assert_eq!(db.list_pin_seqs(sid).unwrap(), vec![u, a]);
+        assert!(db.pin_message(sid, u).await.unwrap(), "first pin created");
+        assert!(db.pin_message(sid, a).await.unwrap());
+        assert_eq!(db.count_pins(sid).await.unwrap(), 2);
+        assert!(db.is_pinned(sid, u).await.unwrap());
+        assert_eq!(db.list_pin_seqs(sid).await.unwrap(), vec![u, a]);
 
-        assert!(db.unpin_message(sid, u).unwrap(), "pin removed");
-        assert_eq!(db.count_pins(sid).unwrap(), 1);
-        assert!(!db.is_pinned(sid, u).unwrap());
-        assert_eq!(db.list_pin_seqs(sid).unwrap(), vec![a]);
+        assert!(db.unpin_message(sid, u).await.unwrap(), "pin removed");
+        assert_eq!(db.count_pins(sid).await.unwrap(), 1);
+        assert!(!db.is_pinned(sid, u).await.unwrap());
+        assert_eq!(db.list_pin_seqs(sid).await.unwrap(), vec![a]);
     }
 
     #[tokio::test]
@@ -253,12 +256,19 @@ mod tests {
         let sid = s.session_id;
         let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello").await;
 
-        assert!(db.pin_message(sid, u).unwrap(), "first pin returns true");
         assert!(
-            !db.pin_message(sid, u).unwrap(),
+            db.pin_message(sid, u).await.unwrap(),
+            "first pin returns true"
+        );
+        assert!(
+            !db.pin_message(sid, u).await.unwrap(),
             "second pin is a no-op (false)"
         );
-        assert_eq!(db.count_pins(sid).unwrap(), 1, "still exactly one pin");
+        assert_eq!(
+            db.count_pins(sid).await.unwrap(),
+            1,
+            "still exactly one pin"
+        );
     }
 
     #[tokio::test]
@@ -268,10 +278,16 @@ mod tests {
         let sid = s.session_id;
         let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello").await;
 
-        assert!(db.toggle_pin(sid, u).unwrap(), "toggle on → now pinned");
-        assert!(db.is_pinned(sid, u).unwrap());
-        assert!(!db.toggle_pin(sid, u).unwrap(), "toggle off → now unpinned");
-        assert!(!db.is_pinned(sid, u).unwrap());
+        assert!(
+            db.toggle_pin(sid, u).await.unwrap(),
+            "toggle on → now pinned"
+        );
+        assert!(db.is_pinned(sid, u).await.unwrap());
+        assert!(
+            !db.toggle_pin(sid, u).await.unwrap(),
+            "toggle off → now unpinned"
+        );
+        assert!(!db.is_pinned(sid, u).await.unwrap());
     }
 
     #[tokio::test]
@@ -282,10 +298,10 @@ mod tests {
         let u = record_msg(&db, sid, SessionEventKind::UserMessage, "the question").await;
         let a = record_msg(&db, sid, SessionEventKind::AssistantMessage, "the answer").await;
 
-        db.pin_message(sid, a).unwrap();
-        db.pin_message(sid, u).unwrap();
+        db.pin_message(sid, a).await.unwrap();
+        db.pin_message(sid, u).await.unwrap();
 
-        let pins = db.list_pins_with_text(sid).unwrap();
+        let pins = db.list_pins_with_text(sid).await.unwrap();
         // Pin order (oldest pin first): assistant was pinned first.
         assert_eq!(pins.len(), 2);
         assert_eq!(pins[0].seq, a);
@@ -309,7 +325,7 @@ mod tests {
         let sid = s.session_id;
         let original = "FULL ORIGINAL MESSAGE BODY with lots of content here";
         let a = record_msg(&db, sid, SessionEventKind::AssistantMessage, original).await;
-        db.pin_message(sid, a).unwrap();
+        db.pin_message(sid, a).await.unwrap();
 
         // Simulate `/prune` + `/compact`: both append timeline markers and
         // touch only the in-memory wire payload; they NEVER UPDATE/DELETE
@@ -336,7 +352,7 @@ mod tests {
 
         // The pin still resolves the ORIGINAL full text from the durable
         // transcript.
-        let listed = db.list_pins_with_text(sid).unwrap();
+        let listed = db.list_pins_with_text(sid).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].seq, a);
         assert!(listed[0].is_assistant);
@@ -350,29 +366,25 @@ mod tests {
         let b = db.create_session("p", "/y", "Auto").await.unwrap();
         let ua = record_msg(&db, a.session_id, SessionEventKind::UserMessage, "in a").await;
         let ub = record_msg(&db, b.session_id, SessionEventKind::UserMessage, "in b").await;
-        db.pin_message(a.session_id, ua).unwrap();
-        db.pin_message(b.session_id, ub).unwrap();
+        db.pin_message(a.session_id, ua).await.unwrap();
+        db.pin_message(b.session_id, ub).await.unwrap();
 
-        assert_eq!(db.count_pins(a.session_id).unwrap(), 1);
-        assert_eq!(db.count_pins(b.session_id).unwrap(), 1);
-        assert_eq!(db.list_pin_seqs(a.session_id).unwrap(), vec![ua]);
-        assert_eq!(db.list_pin_seqs(b.session_id).unwrap(), vec![ub]);
+        assert_eq!(db.count_pins(a.session_id).await.unwrap(), 1);
+        assert_eq!(db.count_pins(b.session_id).await.unwrap(), 1);
+        assert_eq!(db.list_pin_seqs(a.session_id).await.unwrap(), vec![ua]);
+        assert_eq!(db.list_pin_seqs(b.session_id).await.unwrap(), vec![ub]);
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn pin_cascades_when_session_deleted() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Auto").await.unwrap();
         let sid = s.session_id;
         let u = record_msg(&db, sid, SessionEventKind::UserMessage, "hello").await;
-        db.pin_message(sid, u).unwrap();
-        assert_eq!(db.count_pins(sid).unwrap(), 1);
+        db.pin_message(sid, u).await.unwrap();
+        assert_eq!(db.count_pins(sid).await.unwrap(), 1);
 
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute(
                 "DELETE FROM sessions WHERE session_id = ?1",
                 [sid.to_string()],
@@ -380,7 +392,12 @@ mod tests {
             .unwrap();
             Ok(())
         })
+        .await
         .unwrap();
-        assert_eq!(db.count_pins(sid).unwrap(), 0, "pin cascaded with session");
+        assert_eq!(
+            db.count_pins(sid).await.unwrap(),
+            0,
+            "pin cascaded with session"
+        );
     }
 }

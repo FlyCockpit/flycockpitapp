@@ -1123,7 +1123,7 @@ impl Driver {
                     let read_only = crate::engine::builtin::is_read_only_noninteractive(&child);
                     let write_capable = crate::engine::builtin::is_write_capable(&child);
                     if resume_handle.is_some() && write_capable {
-                        match self.locks.resume_agent(&child_agent, self.session.id) {
+                        match self.locks.resume_agent(&child_agent, self.session.id).await {
                             Ok(reacquired) => {
                                 tracing::debug!(
                                     agent = %child_agent,
@@ -1257,8 +1257,10 @@ impl Driver {
                                     seeds = collector.drain();
                                 }
                                 if write_capable
-                                    && let Err(e) =
-                                        self.locks.suspend_agent(&child_agent, self.session.id)
+                                    && let Err(e) = self
+                                        .locks
+                                        .suspend_agent(&child_agent, self.session.id)
+                                        .await
                                 {
                                     tracing::warn!(error = ?e, agent = %child_agent, "followup suspend_agent at finish failed");
                                 }
@@ -1726,7 +1728,7 @@ impl Driver {
         });
     }
 
-    pub(in crate::engine::driver) fn release_noninteractive_child_locks(
+    pub(in crate::engine::driver) async fn release_noninteractive_child_locks(
         &self,
         rows: &[crate::db::task_delegations::DelegationChildDetail],
     ) {
@@ -1735,7 +1737,11 @@ impl Driver {
             if !released.insert(row.child_agent.as_str()) {
                 continue;
             }
-            if let Err(e) = self.locks.suspend_agent(&row.child_agent, self.session.id) {
+            if let Err(e) = self
+                .locks
+                .suspend_agent(&row.child_agent, self.session.id)
+                .await
+            {
                 tracing::warn!(
                     error = ?e,
                     agent = %row.child_agent,
@@ -1931,7 +1937,7 @@ impl Driver {
         ))
     }
 
-    pub(in crate::engine::driver) fn dispatch_task_control(
+    pub(in crate::engine::driver) async fn dispatch_task_control(
         &mut self,
         action: TaskControlAction,
         target_task_call_id: Option<String>,
@@ -1987,7 +1993,7 @@ impl Driver {
                     && let Some(job) = self.noninteractive_jobs.remove(&task_call_id)
                 {
                     job.handle.abort();
-                    self.release_noninteractive_child_locks(&selected);
+                    self.release_noninteractive_child_locks(&selected).await;
                 }
                 let mut changed = Vec::new();
                 let mut unchanged = Vec::new();

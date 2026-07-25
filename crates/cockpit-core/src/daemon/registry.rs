@@ -624,27 +624,7 @@ impl SessionRegistry {
         let locks = self.inner.locks.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                match tokio::task::spawn_blocking(move || locks.resume_session(session_id)).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            error = %e,
-                            %session_id,
-                            "re-acquiring session locks on reattach failed"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            %session_id,
-                            "reattach lock resume blocking task failed"
-                        );
-                    }
-                }
-            });
-        } else {
-            std::thread::spawn(move || {
-                if let Err(e) = locks.resume_session(session_id) {
+                if let Err(e) = locks.resume_session(session_id).await {
                     tracing::warn!(
                         error = %e,
                         %session_id,
@@ -652,6 +632,11 @@ impl SessionRegistry {
                     );
                 }
             });
+        } else {
+            tracing::warn!(
+                %session_id,
+                "cannot schedule reattach lock resume outside a tokio runtime"
+            );
         }
     }
 
@@ -1276,7 +1261,7 @@ mod tests {
         // The DB + lock manager aren't touched by `drain_all`; point them at
         // a throwaway in-memory DB so construction never hits user state.
         let db = Db::open_in_memory().expect("in-memory db");
-        let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
+        let locks = Arc::new(LockManager::in_memory(db.clone()));
         SessionRegistry::new(db, locks, ShutdownSignal::new(), None, config_source)
     }
 
@@ -2335,7 +2320,7 @@ mod tests {
             .await
             .expect("session")
             .session_id;
-        let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
+        let locks = Arc::new(LockManager::in_memory(db.clone()));
         let reg = SessionRegistry::new(
             db,
             locks.clone(),
@@ -2352,11 +2337,11 @@ mod tests {
         let drift = tmp.path().join("drift.rs");
         std::fs::write(&keep, "v1").unwrap();
         std::fs::write(&drift, "v1").unwrap();
-        locks.acquire(&keep, "builder", sid).unwrap();
-        locks.acquire(&drift, "builder", sid).unwrap();
+        locks.acquire(&keep, "builder", sid).await.unwrap();
+        locks.acquire(&drift, "builder", sid).await.unwrap();
 
         // Last detach while idle → session-scoped release.
-        let released = locks.suspend_session(sid).unwrap();
+        let released = locks.suspend_session(sid).await.unwrap();
         assert_eq!(released.len(), 2);
         assert!(locks.holder(&keep).is_none());
         assert!(locks.holder(&drift).is_none());

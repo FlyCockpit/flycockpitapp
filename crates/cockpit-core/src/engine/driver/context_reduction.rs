@@ -126,15 +126,20 @@ impl Driver {
             > shadow_stale_after_turns(keep_recent_turns)
     }
 
-    fn delete_durable_shadow_brief(&self) {
-        if let Err(error) = self.session.db.delete_compaction_shadow(self.session.id) {
+    async fn delete_durable_shadow_brief(&self) {
+        if let Err(error) = self
+            .session
+            .db
+            .delete_compaction_shadow(self.session.id)
+            .await
+        {
             tracing::warn!(error = %error, "compact shadow: deleting durable shadow failed");
         }
     }
 
-    fn persist_ready_shadow_brief(&self, ready: &ShadowBriefReady) {
+    async fn persist_ready_shadow_brief(&self, ready: &ShadowBriefReady) {
         if !self.resolve_context_config().compact_shadow {
-            self.delete_durable_shadow_brief();
+            self.delete_durable_shadow_brief().await;
             return;
         }
         let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief::from(ready));
@@ -149,19 +154,20 @@ impl Driver {
             .session
             .db
             .upsert_compaction_shadow(self.session.id, &payload_json)
+            .await
         {
             tracing::warn!(error = %error, "compact shadow: persisting durable shadow failed");
         }
     }
 
-    pub(in crate::engine::driver) fn load_compaction_shadow_from_store(&mut self) {
+    pub(in crate::engine::driver) async fn load_compaction_shadow_from_store(&mut self) {
         let ctx_cfg = self.resolve_context_config();
         if !ctx_cfg.compact_shadow {
             self.shadow_brief = None;
-            self.delete_durable_shadow_brief();
+            self.delete_durable_shadow_brief().await;
             return;
         }
-        let row = match self.session.db.compaction_shadow(self.session.id) {
+        let row = match self.session.db.compaction_shadow(self.session.id).await {
             Ok(row) => row,
             Err(error) => {
                 tracing::warn!(error = %error, "compact shadow: loading durable shadow failed");
@@ -177,7 +183,7 @@ impl Driver {
             Err(error) => {
                 tracing::warn!(error = %error, "compact shadow: deserializing durable shadow failed");
                 self.shadow_brief = None;
-                self.delete_durable_shadow_brief();
+                self.delete_durable_shadow_brief().await;
                 return;
             }
         };
@@ -187,14 +193,14 @@ impl Driver {
         };
         if record.generation < self.shadow_brief_generation {
             self.shadow_brief = None;
-            self.delete_durable_shadow_brief();
+            self.delete_durable_shadow_brief().await;
             return;
         }
         self.shadow_brief_generation = record.generation;
         let ready = ShadowBriefReady::from(record);
         if self.shadow_ready_is_stale(&ready, ctx_cfg.compact_keep_recent_turns) {
             self.shadow_brief = None;
-            self.delete_durable_shadow_brief();
+            self.delete_durable_shadow_brief().await;
             return;
         }
         self.shadow_brief = Some(ShadowBriefState::Ready(ready));
@@ -670,7 +676,7 @@ impl Driver {
                 snapshot_tail_turns: task.snapshot_tail_turns,
                 brief,
             };
-            self.persist_ready_shadow_brief(&ready);
+            self.persist_ready_shadow_brief(&ready).await;
             self.shadow_brief = Some(ShadowBriefState::Ready(ready));
         }
     }
@@ -715,7 +721,7 @@ impl Driver {
         if !ctx_cfg.compact_shadow {
             self.cancel_shadow_brief_inflight().await;
             self.shadow_brief = None;
-            self.delete_durable_shadow_brief();
+            self.delete_durable_shadow_brief().await;
             return false;
         }
 
@@ -728,7 +734,7 @@ impl Driver {
                     > shadow_stale_after_turns(ctx_cfg.compact_keep_recent_turns)
         ) {
             self.shadow_brief = None;
-            self.delete_durable_shadow_brief();
+            self.delete_durable_shadow_brief().await;
         }
         if self.shadow_brief.is_some() {
             return false;
@@ -803,10 +809,10 @@ impl Driver {
                 if ready.generation == self.shadow_brief_generation
                     && !self.shadow_ready_is_stale(&ready, keep_recent_turns)
                 {
-                    self.delete_durable_shadow_brief();
+                    self.delete_durable_shadow_brief().await;
                     Some(ready)
                 } else {
-                    self.delete_durable_shadow_brief();
+                    self.delete_durable_shadow_brief().await;
                     None
                 }
             }
@@ -936,7 +942,7 @@ impl Driver {
         } else {
             self.cancel_shadow_brief_inflight().await;
             self.shadow_brief = None;
-            self.delete_durable_shadow_brief();
+            self.delete_durable_shadow_brief().await;
             None
         };
         let trigger_ctx_pct = match (self.context_input_tokens(context_window), context_window) {

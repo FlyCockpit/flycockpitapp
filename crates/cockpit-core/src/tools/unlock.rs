@@ -63,7 +63,9 @@ impl Tool for UnlockTool {
             .and_then(Value::as_str)
             .ok_or_else(|| crate::engine::tool::invalid_input("`path` is required"))?;
         let path = resolve(path_arg, &ctx.cwd);
-        ctx.locks.release(&path, &ctx.agent_id, ctx.session.id)?;
+        ctx.locks
+            .release(&path, &ctx.agent_id, ctx.session.id)
+            .await?;
         Ok(ToolOutput::text(format!("unlocked `{}`", path.display())))
     }
 }
@@ -85,8 +87,9 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn unlock_schema_carries_path_annotations() {
+    #[tokio::test]
+
+    async fn unlock_schema_carries_path_annotations() {
         let read = ReadTool;
         let unlock = UnlockTool;
         for schema in [
@@ -107,6 +110,7 @@ mod tests {
         let ctx = test_ctx(tmp.path());
         ctx.locks
             .acquire(&file, &ctx.agent_id, ctx.session.id)
+            .await
             .unwrap();
 
         let tool = UnlockTool;
@@ -128,6 +132,7 @@ mod tests {
         let ctx = test_ctx(tmp.path());
         ctx.locks
             .acquire(&file, &ctx.agent_id, ctx.session.id)
+            .await
             .unwrap();
 
         let output = UnlockTool
@@ -139,8 +144,9 @@ mod tests {
         assert!(output.content.contains("locked.txt"), "{output:?}");
     }
 
-    #[test]
-    fn unlock_is_recovery_only_in_descriptions() {
+    #[tokio::test]
+
+    async fn unlock_is_recovery_only_in_descriptions() {
         let tool = UnlockTool;
         let description = tool.description();
         let defensive = tool.defensive_description().expect("defensive description");

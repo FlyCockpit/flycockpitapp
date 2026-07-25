@@ -730,7 +730,7 @@ mod tests {
             .map(|_| ())
         })
         .expect("trust root");
-        let locks = std::sync::Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap());
+        let locks = std::sync::Arc::new(crate::locks::LockManager::in_memory(db.clone()));
         crate::daemon::server::DaemonContext::new(
             db,
             locks,

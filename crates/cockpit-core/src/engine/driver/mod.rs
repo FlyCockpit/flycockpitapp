@@ -1453,7 +1453,7 @@ impl Driver {
             initial_tools.names(),
             crate::engine::tool::Capability::SandboxEscalate.enabled(root.llm_mode),
         );
-        let mut driver = Self {
+        Self {
             session,
             locks,
             redact,
@@ -1546,9 +1546,7 @@ impl Driver {
             redaction_scan_dotenv_override: None,
             redaction_scan_ssh_keys_override: None,
             redaction_unsupported_notified: HashSet::new(),
-        };
-        driver.load_compaction_shadow_from_store();
-        driver
+        }
     }
 
     /// Install the plan-level model override (prompt
@@ -1963,7 +1961,7 @@ impl Driver {
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             });
-        self.load_compaction_shadow_from_store();
+        self.load_compaction_shadow_from_store().await;
         Ok(Some(rehydrated))
     }
 
@@ -5067,13 +5065,20 @@ impl Driver {
         // Drop any locks the child still held — the §3c invariant doesn't
         // extend across the child's lifetime, and lingering locks would block
         // whatever takes its slot next.
-        if let Err(e) = self.locks.suspend_agent(&child.agent.name, self.session.id) {
+        if let Err(e) = self
+            .locks
+            .suspend_agent(&child.agent.name, self.session.id)
+            .await
+        {
             tracing::warn!(error = ?e, agent = %child.agent.name, "suspend_agent on pop failed");
         }
         // The agent now back on top regains its lock set for files whose hash
         // matches the snapshot taken when it was suspended.
         if let Some(parent) = self.stack.last()
-            && let Err(e) = self.locks.resume_agent(&parent.agent.name, self.session.id)
+            && let Err(e) = self
+                .locks
+                .resume_agent(&parent.agent.name, self.session.id)
+                .await
         {
             tracing::warn!(error = ?e, agent = %parent.agent.name, "resume_agent on pop failed");
         }
@@ -5214,7 +5219,11 @@ impl Driver {
                 .expect("unwind_stack_to_root requires a child frame");
             self.prune_watermark.remove(&popped_depth);
 
-            if let Err(e) = self.locks.suspend_agent(&child.agent.name, self.session.id) {
+            if let Err(e) = self
+                .locks
+                .suspend_agent(&child.agent.name, self.session.id)
+                .await
+            {
                 tracing::warn!(
                     error = ?e,
                     agent = %child.agent.name,
@@ -5222,7 +5231,10 @@ impl Driver {
                 );
             }
             if let Some(parent) = self.stack.last()
-                && let Err(e) = self.locks.resume_agent(&parent.agent.name, self.session.id)
+                && let Err(e) = self
+                    .locks
+                    .resume_agent(&parent.agent.name, self.session.id)
+                    .await
             {
                 tracing::warn!(
                     error = ?e,
@@ -6148,6 +6160,7 @@ impl Driver {
                         && let Err(e) = self
                             .locks
                             .suspend_agent(&parent.agent.name, self.session.id)
+                            .await
                     {
                         tracing::warn!(error = ?e, agent = %parent.agent.name, "suspend_agent on push failed");
                     }
@@ -6417,8 +6430,9 @@ impl Driver {
                     task_call_id,
                     task_function_call_id,
                 } => {
-                    let body =
-                        self.dispatch_task_control(action, target_task_call_id, label, message);
+                    let body = self
+                        .dispatch_task_control(action, target_task_call_id, label, message)
+                        .await;
                     next_prompt = Message::tool_result_with_call_id(
                         task_call_id,
                         task_function_call_id,

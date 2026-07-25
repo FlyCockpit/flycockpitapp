@@ -99,14 +99,17 @@ impl Tool for WriteTool {
         let exists = path.exists();
         let acquire =
             crate::tools::lock_wait::acquire_waiting(ctx, &path, self.name(), false).await?;
-        let write_guard = ctx.locks.begin_write_after_wait(
-            &path,
-            &ctx.agent_id,
-            ctx.session.id,
-            self.name(),
-            !acquire.preexisting_hold,
-            exists,
-        )?;
+        let write_guard = ctx
+            .locks
+            .begin_write_after_wait(
+                &path,
+                &ctx.agent_id,
+                ctx.session.id,
+                self.name(),
+                !acquire.preexisting_hold,
+                exists,
+            )
+            .await?;
 
         // Decide line-ending mode based on the existing file (when
         // present). For new files default to LF on every platform —
@@ -131,9 +134,10 @@ impl Tool for WriteTool {
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
 
         let outcome = if exists {
-            write_and_release(ctx, &path, normalized.as_bytes(), write_guard)?
+            write_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?
         } else {
-            create_new_and_release(&path, normalized.as_bytes(), write_guard, create_new_file)?
+            create_new_and_release(&path, normalized.as_bytes(), write_guard, create_new_file)
+                .await?
         };
         crate::assistants::identity::record_identity_write(ctx, &path)?;
         if skill_validation.is_some() {
@@ -168,7 +172,7 @@ impl Tool for WriteTool {
     }
 }
 
-fn create_new_and_release(
+async fn create_new_and_release(
     path: &std::path::Path,
     bytes: &[u8],
     guard: crate::locks::WriteGuard<'_>,
@@ -185,7 +189,7 @@ fn create_new_and_release(
             anyhow::anyhow!("create `{}`: {err}", path.display())
         }
     })?;
-    let persist_ok = guard.release_after_write();
+    let persist_ok = guard.release_after_write().await;
     Ok(crate::tools::common::WriteReleaseOutcome { persist_ok })
 }
 
@@ -229,12 +233,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
-    )]
-    fn fail_lock_state_deletes(db: &Db) {
-        db.write_blocking(move |conn| {
+    async fn fail_lock_state_deletes(db: &Db) {
+        db.write(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_lock_state_delete
                  BEFORE DELETE ON lock_state
@@ -244,14 +244,11 @@ mod tests {
             )?;
             Ok(())
         })
+        .await
         .unwrap();
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
-    )]
-    fn identity_refusal_ctx(home: &std::path::Path) -> ToolCtx {
+    async fn identity_refusal_ctx(home: &std::path::Path) -> ToolCtx {
         crate::assistants::identity::seed_identity_files(home).unwrap();
         let db = Db::open_in_memory().unwrap();
         let cfg = crate::assistants::AssistantConfig {
@@ -277,7 +274,7 @@ mod tests {
         let project_id = crate::session::project_id_for(&home.to_path_buf());
         let project_root = home.display().to_string();
         let session_row = db
-            .write_blocking(move |conn| {
+            .write(move |conn| {
                 crate::db::Db::insert_session_row_conn(
                     conn,
                     &crate::db::Db::build_new_assistant_session_row_conn(
@@ -289,11 +286,12 @@ mod tests {
                     )?,
                 )
             })
+            .await
             .unwrap();
         let session = crate::session::Session::resume(db.clone(), session_row.session_id)
             .unwrap()
             .unwrap();
-        let locks = Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap());
+        let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
         let redact = Arc::new(
             crate::redact::RedactionTable::build(
                 &crate::config::extended::RedactConfig::default(),
@@ -362,8 +360,10 @@ mod tests {
         ctx
     }
 
-    fn note_read(ctx: &ToolCtx, path: &Path) {
-        ctx.locks.note_read(path, &ctx.agent_id, ctx.session.id);
+    async fn note_read(ctx: &ToolCtx, path: &Path) {
+        ctx.locks
+            .note_read(path, &ctx.agent_id, ctx.session.id)
+            .await;
     }
 
     fn trusted_policy(root: &Path) -> crate::config::trust::WorkspaceTrustPolicy {
@@ -436,7 +436,7 @@ mod tests {
         let package = write_skill_package(tmp.path(), "bad", &original);
         let ctx = skill_test_ctx(tmp.path());
         let manifest = package.join("SKILL.md");
-        note_read(&ctx, &manifest);
+        note_read(&ctx, &manifest).await;
 
         let err = write(&manifest, "no frontmatter\n", &ctx)
             .await
@@ -455,7 +455,7 @@ mod tests {
         let package = write_skill_package(tmp.path(), "stable", &original);
         let ctx = skill_test_ctx(tmp.path());
         let manifest = package.join("SKILL.md");
-        note_read(&ctx, &manifest);
+        note_read(&ctx, &manifest).await;
 
         let err = write(&manifest, &skill_manifest("renamed", "d", "Body"), &ctx)
             .await
@@ -539,7 +539,7 @@ mod tests {
 
         for (name, package, expected, manifest) in packages {
             let skill_md = package.join("SKILL.md");
-            note_read(&ctx, &skill_md);
+            note_read(&ctx, &skill_md).await;
             let write_err = write(&skill_md, &skill_manifest(name, "new", "Body"), &ctx)
                 .await
                 .unwrap_err()
@@ -568,7 +568,7 @@ mod tests {
         let link = refs.join("link.md");
         std::fs::write(&real, "old").unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        note_read(&ctx, &link);
+        note_read(&ctx, &link).await;
 
         let err = write(&link, "new", &ctx).await.unwrap_err().to_string();
 
@@ -586,7 +586,7 @@ mod tests {
         let manifest = package.join("SKILL.md");
         let link = tmp.path().join("manifest-link.md");
         std::os::unix::fs::symlink(&manifest, &link).unwrap();
-        note_read(&ctx, &manifest);
+        note_read(&ctx, &manifest).await;
 
         let err = write(&link, "not frontmatter\n", &ctx).await.unwrap_err();
 
@@ -603,7 +603,7 @@ mod tests {
             write_skill_package(tmp.path(), "valid", &skill_manifest("valid", "old", "Body"));
         let ctx = skill_test_ctx(tmp.path());
         let manifest = package.join("SKILL.md");
-        note_read(&ctx, &manifest);
+        note_read(&ctx, &manifest).await;
         let cfg = ctx.config.extended();
         let discovered = crate::skills::discover(tmp.path(), &cfg.skills).unwrap();
         assert_eq!(discovered[0].frontmatter.description, "old");
@@ -625,7 +625,7 @@ mod tests {
             write_skill_package(tmp.path(), "note", &skill_manifest("note", "old", "Body"));
         let ctx = skill_test_ctx(tmp.path());
         let manifest = package.join("SKILL.md");
-        note_read(&ctx, &manifest);
+        note_read(&ctx, &manifest).await;
 
         let out = write(&manifest, &skill_manifest("note", "new", "Body"), &ctx)
             .await
@@ -644,7 +644,7 @@ mod tests {
         let package = write_skill_package(tmp.path(), "retry", &original);
         let ctx = skill_test_ctx(tmp.path());
         let manifest = package.join("SKILL.md");
-        note_read(&ctx, &manifest);
+        note_read(&ctx, &manifest).await;
 
         let err = write(&manifest, "broken", &ctx).await.unwrap_err();
         assert!(err.to_string().contains("YAML frontmatter"), "{err}");
@@ -802,7 +802,9 @@ mod tests {
         let ctx = test_ctx(tmp.path());
         let file = tmp.path().join("existing.md");
         std::fs::write(&file, "old\n").unwrap();
-        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+        ctx.locks
+            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .await;
         assert!(ctx.locks.holder(&file).is_none());
 
         WriteTool
@@ -826,6 +828,7 @@ mod tests {
         std::fs::write(&file, "old\n").unwrap();
         ctx.locks
             .acquire(&file, &ctx.agent_id, ctx.session.id)
+            .await
             .unwrap();
 
         WriteTool
@@ -849,7 +852,9 @@ mod tests {
         let ctx = test_ctx(tmp.path());
         let file = tmp.path().join("existing.md");
         std::fs::write(&file, "old\n").unwrap();
-        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+        ctx.locks
+            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .await;
         std::fs::write(&file, "changed\n").unwrap();
 
         let err = WriteTool
@@ -868,18 +873,21 @@ mod tests {
         assert!(ctx.locks.holder(&file).is_none());
     }
 
-    #[test]
-    fn create_new_race_reports_file_now_exists() {
+    #[tokio::test]
+
+    async fn create_new_race_reports_file_now_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
         let path = tmp.path().join("raced.md");
 
         ctx.locks
             .acquire(&path, &ctx.agent_id, ctx.session.id)
+            .await
             .unwrap();
         let guard = ctx
             .locks
             .begin_write_after_wait(&path, &ctx.agent_id, ctx.session.id, "write", true, false)
+            .await
             .unwrap();
 
         let err = create_new_and_release(&path, b"new\n", guard, |path, _| {
@@ -890,6 +898,7 @@ mod tests {
                 .open(path)
                 .map(|_| ())
         })
+        .await
         .unwrap_err();
 
         assert!(
@@ -908,7 +917,9 @@ mod tests {
 
         let stale = tmp.path().join("stale.md");
         std::fs::write(&stale, "old\n").unwrap();
-        ctx.locks.note_read(&stale, &ctx.agent_id, ctx.session.id);
+        ctx.locks
+            .note_read(&stale, &ctx.agent_id, ctx.session.id)
+            .await;
         std::fs::write(&stale, "changed\n").unwrap();
         let err = WriteTool
             .call(
@@ -942,7 +953,7 @@ mod tests {
         assert!(ctx.locks.holder(&outside).is_none());
 
         let identity_home = tempfile::tempdir().unwrap();
-        let identity_ctx = identity_refusal_ctx(identity_home.path());
+        let identity_ctx = identity_refusal_ctx(identity_home.path()).await;
         let soul = crate::assistants::identity::soul_path(identity_home.path());
         let out = WriteTool
             .call(
@@ -997,8 +1008,10 @@ mod tests {
         let (ctx, db) = test_ctx_with_db(tmp.path());
         let file = tmp.path().join("existing.json");
         std::fs::write(&file, "{}\n").unwrap();
-        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
-        fail_lock_state_deletes(&db);
+        ctx.locks
+            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .await;
+        fail_lock_state_deletes(&db).await;
 
         let out = WriteTool
             .call(
@@ -1050,11 +1063,13 @@ mod tests {
 
         ctx_a
             .locks
-            .note_read(&file, &ctx_a.agent_id, ctx_a.session.id);
+            .note_read(&file, &ctx_a.agent_id, ctx_a.session.id)
+            .await;
         ctx_b
             .locks
-            .note_read(&file, &ctx_b.agent_id, ctx_b.session.id);
-        fail_lock_state_deletes(&db);
+            .note_read(&file, &ctx_b.agent_id, ctx_b.session.id)
+            .await;
+        fail_lock_state_deletes(&db).await;
 
         let out = WriteTool
             .call(
@@ -1090,8 +1105,13 @@ mod tests {
         let mut ctx = test_ctx(tmp.path());
         let file = tmp.path().join("busy.md");
         std::fs::write(&file, "old\n").unwrap();
-        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
-        ctx.locks.acquire(&file, "holder", ctx.session.id).unwrap();
+        ctx.locks
+            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .await;
+        ctx.locks
+            .acquire(&file, "holder", ctx.session.id)
+            .await
+            .unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         ctx.events = Some(tx);
         let locks = ctx.locks.clone();
@@ -1121,7 +1141,10 @@ mod tests {
             } if path == &file.display().to_string() && holder_agent == "holder"
         ));
 
-        locks.release(&file_for_release, "holder", sid).unwrap();
+        locks
+            .release(&file_for_release, "holder", sid)
+            .await
+            .unwrap();
         let out = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
             .await
             .expect("write resolves after release")
@@ -1148,7 +1171,10 @@ mod tests {
         let mut ctx = test_ctx(tmp.path());
         let file = tmp.path().join("busy.md");
         std::fs::write(&file, "old\n").unwrap();
-        ctx.locks.acquire(&file, "holder", ctx.session.id).unwrap();
+        ctx.locks
+            .acquire(&file, "holder", ctx.session.id)
+            .await
+            .unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         ctx.events = Some(tx);
         let locks = ctx.locks.clone();
@@ -1191,7 +1217,10 @@ mod tests {
             locks.holder(&file).map(|(_, agent)| agent),
             Some("holder".to_string())
         );
-        locks.release(&file_for_release, "holder", sid).unwrap();
+        locks
+            .release(&file_for_release, "holder", sid)
+            .await
+            .unwrap();
         assert!(locks.holder(&file).is_none());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
     }

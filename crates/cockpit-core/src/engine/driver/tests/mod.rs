@@ -57,7 +57,7 @@ fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, 
     let root = tmp.path().to_path_buf();
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = Arc::new(Session::create(db.clone(), root.clone(), "Build").unwrap());
-    let locks = Arc::new(crate::locks::LockManager::from_db(db).unwrap());
+    let locks = Arc::new(crate::locks::LockManager::in_memory(db));
     let rcfg = crate::config::extended::RedactConfig::default();
     let redact = Arc::new(RedactionTable::build(&rcfg, &root).unwrap());
 
@@ -245,7 +245,7 @@ fn learn_driver(
     });
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
-    let locks = Arc::new(crate::locks::LockManager::from_db(db).unwrap());
+    let locks = Arc::new(crate::locks::LockManager::in_memory(db));
     let redact = Arc::new(RedactionTable::empty());
     let mut driver =
         Driver::with_max_schedules(session, locks, redact, tmp.path().to_path_buf(), agent, 1);
@@ -725,15 +725,18 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
     driver
         .locks
         .acquire(&parent_lock, "Build", driver.session.id)
+        .await
         .unwrap();
     driver
         .locks
         .suspend_agent("Build", driver.session.id)
+        .await
         .unwrap();
     push_answering_child(&mut driver, call_id, function_call_id);
     driver
         .locks
         .acquire(&child_lock, "builder", driver.session.id)
+        .await
         .unwrap();
 
     let tracker = crate::engine::deleg_shrink::DelegationShrink::new(

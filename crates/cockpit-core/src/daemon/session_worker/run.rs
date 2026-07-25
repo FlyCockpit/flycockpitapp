@@ -2016,7 +2016,7 @@ pub(super) async fn run_worker(
     } else {
         // Mark session ended in DB for destructive/explicit worker stops. A
         // graceful daemon drain keeps the session resumable instead.
-        if let Err(e) = locks.end_session(session_id) {
+        if let Err(e) = locks.end_session(session_id).await {
             tracing::warn!(error = %e, "lock cleanup failed during terminal session shutdown");
         }
         if let Err(e) = session.end() {

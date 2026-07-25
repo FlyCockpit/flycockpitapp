@@ -1270,7 +1270,7 @@ mod redaction_placeholder_guard_tests {
             agent_id: "builder".to_string(),
             current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
-            locks: Arc::new(crate::locks::LockManager::from_db(db).unwrap()),
+            locks: Arc::new(crate::locks::LockManager::in_memory(db)),
             session: Arc::new(session),
             cwd: root.to_path_buf(),
             redact: Arc::new(redact),

@@ -1423,7 +1423,7 @@ fn test_ctx_with_config_source(
     config_source: crate::daemon::config_source::ConfigSource,
 ) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
-    let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
     let paths = DaemonPaths {
         socket: std::path::PathBuf::from("/tmp/cockpit-test.sock"),
         pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
@@ -1556,7 +1556,7 @@ fn write_curator_skill(skill_root: &Path, name: &str) {
 
 fn persistent_test_ctx() -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
-    let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
     let paths = DaemonPaths {
         socket: std::path::PathBuf::from("/tmp/cockpit-persistent-test.sock"),
         pid_file: std::path::PathBuf::from("/tmp/cockpit-persistent-test.pid"),
@@ -1573,7 +1573,7 @@ fn persistent_test_ctx() -> Arc<DaemonContext> {
 
 fn persistent_test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
-    let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
     let paths = DaemonPaths {
         socket: std::path::PathBuf::from("/tmp/cockpit-persistent-test.sock"),
         pid_file: std::path::PathBuf::from("/tmp/cockpit-persistent-test.pid"),
@@ -1593,7 +1593,7 @@ fn persistent_test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<Dae
 
 fn test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
-    let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
     let paths = DaemonPaths {
         socket: std::path::PathBuf::from("/tmp/cockpit-test.sock"),
         pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
@@ -1937,6 +1937,7 @@ async fn remote_fs_write_hash_mismatch_and_lock_conflict_are_typed() {
     ctx.registry
         .locks()
         .acquire(&path, "builder", session.session_id)
+        .await
         .unwrap();
     let err = handle_request(
         Request::FsWrite {
@@ -1985,7 +1986,7 @@ async fn remote_fs_mutations_are_audited_with_path() {
 #[tokio::test]
 async fn resource_scheduler_is_shared_only_for_persistent_daemons() {
     let persistent_db = Db::open_in_memory().expect("in-memory db");
-    let persistent_locks = Arc::new(LockManager::from_db(persistent_db.clone()).expect("locks"));
+    let persistent_locks = Arc::new(LockManager::in_memory(persistent_db.clone()));
     let persistent = DaemonContext::new(
         persistent_db,
         persistent_locks,
@@ -2000,7 +2001,7 @@ async fn resource_scheduler_is_shared_only_for_persistent_daemons() {
     assert!(persistent.registry.resource_scheduler().is_some());
 
     let ephemeral_db = Db::open_in_memory().expect("in-memory db");
-    let ephemeral_locks = Arc::new(LockManager::from_db(ephemeral_db.clone()).expect("locks"));
+    let ephemeral_locks = Arc::new(LockManager::in_memory(ephemeral_db.clone()));
     let ephemeral = DaemonContext::new(
         ephemeral_db,
         ephemeral_locks,
@@ -2237,7 +2238,7 @@ fn attached_state_with_worker_receiver(
             .unwrap()
             .unwrap(),
     );
-    let locks = Arc::new(LockManager::from_db(ctx.db.clone()).expect("locks"));
+    let locks = Arc::new(LockManager::in_memory(ctx.db.clone()));
     let (handle, work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
     (
         MutableClientState {
@@ -8916,7 +8917,7 @@ fn insert_hung_worker(ctx: &Arc<DaemonContext>, session_id: Uuid) {
             .unwrap()
             .expect("session row"),
     );
-    let locks = Arc::new(LockManager::from_db(ctx.db.clone()).expect("locks"));
+    let locks = Arc::new(LockManager::in_memory(ctx.db.clone()));
     let handle = SessionWorkerHandle::test_handle(session, locks);
     let join = tokio::spawn(async move {
         std::future::pending::<()>().await;

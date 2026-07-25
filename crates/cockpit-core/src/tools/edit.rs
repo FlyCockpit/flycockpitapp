@@ -134,14 +134,17 @@ impl Tool for EditTool {
             };
         let acquire =
             crate::tools::lock_wait::acquire_waiting(ctx, &path, self.name(), false).await?;
-        let write_guard = ctx.locks.begin_write_after_wait(
-            &path,
-            &ctx.agent_id,
-            ctx.session.id,
-            self.name(),
-            !acquire.preexisting_hold,
-            true,
-        )?;
+        let write_guard = ctx
+            .locks
+            .begin_write_after_wait(
+                &path,
+                &ctx.agent_id,
+                ctx.session.id,
+                self.name(),
+                !acquire.preexisting_hold,
+                true,
+            )
+            .await?;
 
         let existing =
             std::fs::read(&path).map_err(|e| anyhow::anyhow!("read `{}`: {e}", path.display()))?;
@@ -176,7 +179,7 @@ impl Tool for EditTool {
             &normalized,
         )
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
-        let outcome = write_and_release(ctx, &path, normalized.as_bytes(), write_guard)?;
+        let outcome = write_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?;
         crate::assistants::identity::record_identity_write(ctx, &path)?;
         if skill_validation.is_some() {
             crate::skills::invalidate_catalog_cache(&ctx.cwd, &config.skills);
@@ -606,12 +609,8 @@ mod tests {
     use crate::engine::tool::Tool;
     use crate::tools::common::{LOCK_BOOKKEEPING_ADVISORY, test_ctx_with_db};
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
-    )]
-    fn fail_lock_state_deletes(db: &Db) {
-        db.write_blocking(move |conn| {
+    async fn fail_lock_state_deletes(db: &Db) {
+        db.write(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_lock_state_delete
                  BEFORE DELETE ON lock_state
@@ -621,6 +620,7 @@ mod tests {
             )?;
             Ok(())
         })
+        .await
         .unwrap();
     }
 
@@ -634,7 +634,9 @@ mod tests {
         let file = tmp.path().join("edit.txt");
         std::fs::write(&file, contents).unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
-        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+        ctx.locks
+            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .await;
 
         EditTool
             .call(
@@ -684,7 +686,9 @@ mod tests {
         let file = tmp.path().join("edit.txt");
         std::fs::write(&file, "alpha beta gamma\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
-        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+        ctx.locks
+            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .await;
         assert!(ctx.locks.holder(&file).is_none());
 
         EditTool
@@ -723,7 +727,9 @@ mod tests {
         let path = package.join("SKILL.md");
         std::fs::write(&path, manifest).unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
-        ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
+        ctx.locks
+            .note_read(&path, &ctx.agent_id, ctx.session.id)
+            .await;
 
         let policy = crate::config::trust::WorkspaceTrustPolicy {
             root: crate::config::trust::TrustRoot {
@@ -759,7 +765,9 @@ mod tests {
         let file = tmp.path().join("edit.txt");
         std::fs::write(&file, "alpha beta gamma\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
-        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+        ctx.locks
+            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .await;
 
         let err = EditTool
             .call(
@@ -898,7 +906,9 @@ mod tests {
         let file = tmp.path().join("delete.txt");
         std::fs::write(&file, "alpha beta gamma\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
-        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+        ctx.locks
+            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .await;
 
         EditTool
             .call(
@@ -925,8 +935,10 @@ mod tests {
         let file = tmp.path().join("edit.txt");
         std::fs::write(&file, "alpha beta gamma\n").unwrap();
         let (ctx, db) = test_ctx_with_db(tmp.path());
-        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
-        fail_lock_state_deletes(&db);
+        ctx.locks
+            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .await;
+        fail_lock_state_deletes(&db).await;
 
         let out = EditTool
             .call(
@@ -961,7 +973,9 @@ mod tests {
         let file = tmp.path().join("Cargo.toml");
         std::fs::write(&file, "[package]\nname = \"ok\"\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
-        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+        ctx.locks
+            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .await;
 
         let out = EditTool
             .call(
@@ -992,7 +1006,9 @@ mod tests {
         let file = tmp.path().join("Cargo.toml");
         std::fs::write(&file, "[package]\nname = \"old\"\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
-        ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
+        ctx.locks
+            .note_read(&file, &ctx.agent_id, ctx.session.id)
+            .await;
 
         let out = EditTool
             .call(

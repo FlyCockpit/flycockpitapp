@@ -314,7 +314,7 @@ pub(super) async fn handle_serialized_request(
                 .cancel_paused_session_work(session_id)
                 .map_err(internal)?;
             if changed {
-                if let Err(e) = ctx.registry.locks().suspend_session(session_id) {
+                if let Err(e) = ctx.registry.locks().suspend_session(session_id).await {
                     tracing::warn!(error = %e, %session_id, "releasing cancelled paused work locks failed");
                 }
                 if let Some(att) = state.attached.as_ref()
@@ -1935,7 +1935,7 @@ pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) {
                 return;
             }
             let now = chrono::Utc::now().timestamp();
-            match locks.sweep_expired(now) {
+            match locks.sweep_expired(now).await {
                 Ok(reclaimed) if !reclaimed.is_empty() => {
                     tracing::info!(count = reclaimed.len(), "swept idle-expired locks");
                 }

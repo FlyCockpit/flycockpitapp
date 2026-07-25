@@ -831,18 +831,18 @@ async fn write_capable_followup_reacquires_locks_hash_matched() {
     std::fs::write(&p, "v1").unwrap();
     let sid = driver.session.id;
     // Original builder run: acquire + write, then finish (suspend snapshots).
-    driver.locks.acquire(&p, "builder", sid).unwrap();
+    driver.locks.acquire(&p, "builder", sid).await.unwrap();
     driver
         .locks
         .check_write_permitted(&p, "builder", sid)
         .unwrap();
-    driver.locks.suspend_agent("builder", sid).unwrap();
+    driver.locks.suspend_agent("builder", sid).await.unwrap();
     assert!(
         driver.locks.holder(&p).is_none(),
         "finish releases the lock"
     );
     // Follow-up: worktree unchanged → resume reacquires hash-matched.
-    let reacquired = driver.locks.resume_agent("builder", sid).unwrap();
+    let reacquired = driver.locks.resume_agent("builder", sid).await.unwrap();
     assert_eq!(reacquired.len(), 1);
     assert_eq!(
         driver.locks.holder(&p).map(|(_, a)| a).as_deref(),
@@ -864,11 +864,11 @@ async fn write_capable_followup_forces_reread_on_drift() {
     let p = tmp.path().join("a.rs");
     std::fs::write(&p, "v1").unwrap();
     let sid = driver.session.id;
-    driver.locks.acquire(&p, "builder", sid).unwrap();
-    driver.locks.suspend_agent("builder", sid).unwrap();
+    driver.locks.acquire(&p, "builder", sid).await.unwrap();
+    driver.locks.suspend_agent("builder", sid).await.unwrap();
     // The user / another agent edits the file while the builder was finished.
     std::fs::write(&p, "v2-drift").unwrap();
-    let reacquired = driver.locks.resume_agent("builder", sid).unwrap();
+    let reacquired = driver.locks.resume_agent("builder", sid).await.unwrap();
     assert!(reacquired.is_empty(), "drifted file must not reacquire");
     assert!(driver.locks.holder(&p).is_none());
     // Write is refused (the read record was invalidated) — no stale write.
@@ -879,7 +879,7 @@ async fn write_capable_followup_forces_reread_on_drift() {
             .is_err()
     );
     // After an explicit re-read the write is permitted again.
-    driver.locks.note_read(&p, "builder", sid);
+    driver.locks.note_read(&p, "builder", sid).await;
     driver
         .locks
         .check_write_permitted(&p, "builder", sid)
@@ -903,14 +903,15 @@ async fn write_capable_followup_defers_to_other_lock_holder() {
         .create_session("p", "/x", "builder")
         .await
         .unwrap();
-    driver.locks.acquire(&p, "builder", sid).unwrap();
-    driver.locks.suspend_agent("builder", sid).unwrap();
+    driver.locks.acquire(&p, "builder", sid).await.unwrap();
+    driver.locks.suspend_agent("builder", sid).await.unwrap();
     driver
         .locks
         .acquire(&p, "builder", other.session_id)
+        .await
         .unwrap();
     // Follow-up resume can't reacquire — the other holder wins.
-    let reacquired = driver.locks.resume_agent("builder", sid).unwrap();
+    let reacquired = driver.locks.resume_agent("builder", sid).await.unwrap();
     assert!(reacquired.is_empty());
     assert_eq!(
         driver.locks.holder(&p).map(|(s, _)| s),

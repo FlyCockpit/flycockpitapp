@@ -1614,7 +1614,7 @@ mod tests {
     }
 
     fn production_registry(db: Db) -> SessionRegistry {
-        let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
+        let locks = Arc::new(LockManager::in_memory(db.clone()));
         SessionRegistry::new(
             db,
             locks,
@@ -1639,7 +1639,7 @@ mod tests {
         let registry = production_registry(db.clone());
         let session =
             Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
-        let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
+        let locks = Arc::new(LockManager::in_memory(db.clone()));
         let (handle, work_rx) =
             SessionWorkerHandle::test_handle_with_receiver(session.clone(), locks);
         let join = tokio::spawn(std::future::pending::<()>());

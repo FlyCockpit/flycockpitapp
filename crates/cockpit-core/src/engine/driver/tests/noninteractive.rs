@@ -769,6 +769,7 @@ async fn whole_job_cancel_releases_aborted_child_locks() {
     driver
         .locks
         .acquire(&path, "explore", driver.session.id)
+        .await
         .unwrap();
     driver.noninteractive_jobs.insert(
         "task-lock".to_string(),
@@ -780,12 +781,14 @@ async fn whole_job_cancel_releases_aborted_child_locks() {
         },
     );
 
-    let body = driver.dispatch_task_control(
-        TaskControlAction::Cancel,
-        Some("task-lock".to_string()),
-        None,
-        None,
-    );
+    let body = driver
+        .dispatch_task_control(
+            TaskControlAction::Cancel,
+            Some("task-lock".to_string()),
+            None,
+            None,
+        )
+        .await;
 
     assert!(body.contains("cancelled"), "{body}");
     assert!(driver.locks.holder(&path).is_none());
@@ -1594,7 +1597,9 @@ async fn task_control_orphan_list_status_cancel_and_refuse_live_actions() {
     let (mut driver, _tmp) = test_driver(8);
     seed_task_delegation(&driver, "task-orphan", "default");
 
-    let list = driver.dispatch_task_control(TaskControlAction::List, None, None, None);
+    let list = driver
+        .dispatch_task_control(TaskControlAction::List, None, None, None)
+        .await;
     let list_json: serde_json::Value = serde_json::from_str(&list).unwrap();
     assert_eq!(list_json["type"], "task_delegation");
     assert_eq!(list_json["version"], 1);
@@ -1609,23 +1614,27 @@ async fn task_control_orphan_list_status_cancel_and_refuse_live_actions() {
     assert_eq!(list_json["children"][0]["orphaned"], true);
     assert_eq!(list_json["children"][0]["actionable"], false);
 
-    let status = driver.dispatch_task_control(
-        TaskControlAction::Status,
-        Some("task-orphan".to_string()),
-        Some("default".to_string()),
-        None,
-    );
+    let status = driver
+        .dispatch_task_control(
+            TaskControlAction::Status,
+            Some("task-orphan".to_string()),
+            Some("default".to_string()),
+            None,
+        )
+        .await;
     let status_json: serde_json::Value = serde_json::from_str(&status).unwrap();
     assert_eq!(status_json["state"], "status");
     assert_eq!(status_json["children"][0]["status"], "lost");
     assert_eq!(status_json["children"][0]["orphaned"], true);
 
-    let query = driver.dispatch_task_control(
-        TaskControlAction::Query,
-        Some("task-orphan".to_string()),
-        Some("default".to_string()),
-        None,
-    );
+    let query = driver
+        .dispatch_task_control(
+            TaskControlAction::Query,
+            Some("task-orphan".to_string()),
+            Some("default".to_string()),
+            None,
+        )
+        .await;
     let query_json: serde_json::Value = serde_json::from_str(&query).unwrap();
     assert_eq!(query_json["state"], "refused");
     assert_eq!(query_json["actionable"], false);
@@ -1636,12 +1645,14 @@ async fn task_control_orphan_list_status_cancel_and_refuse_live_actions() {
     assert_eq!(query_json["report_source"], "none");
     assert_eq!(query_json["children"][0]["status"], "lost");
 
-    let steer = driver.dispatch_task_control(
-        TaskControlAction::Steer,
-        Some("task-orphan".to_string()),
-        Some("default".to_string()),
-        Some("please continue".to_string()),
-    );
+    let steer = driver
+        .dispatch_task_control(
+            TaskControlAction::Steer,
+            Some("task-orphan".to_string()),
+            Some("default".to_string()),
+            Some("please continue".to_string()),
+        )
+        .await;
     let steer_json: serde_json::Value = serde_json::from_str(&steer).unwrap();
     assert_eq!(steer_json["state"], "refused");
     assert_eq!(steer_json["actionable"], false);
@@ -1651,12 +1662,14 @@ async fn task_control_orphan_list_status_cancel_and_refuse_live_actions() {
     );
     assert_eq!(steer_json["children"][0]["status"], "lost");
 
-    let cancel = driver.dispatch_task_control(
-        TaskControlAction::Cancel,
-        Some("task-orphan".to_string()),
-        Some("default".to_string()),
-        None,
-    );
+    let cancel = driver
+        .dispatch_task_control(
+            TaskControlAction::Cancel,
+            Some("task-orphan".to_string()),
+            Some("default".to_string()),
+            None,
+        )
+        .await;
     let cancel_json: serde_json::Value = serde_json::from_str(&cancel).unwrap();
     assert_eq!(cancel_json["state"], "lost");
     assert_eq!(cancel_json["cancelled"].as_array().unwrap().len(), 0);
@@ -1683,7 +1696,9 @@ async fn task_control_live_registry_entry_keeps_happy_path() {
         NoninteractiveDelegationSnapshot::from_history(vec![Message::user("live context")]),
     );
 
-    let list = driver.dispatch_task_control(TaskControlAction::List, None, None, None);
+    let list = driver
+        .dispatch_task_control(TaskControlAction::List, None, None, None)
+        .await;
     let list_json: serde_json::Value = serde_json::from_str(&list).unwrap();
     assert_eq!(list_json["state"], "list");
     assert_eq!(list_json["children"][0]["status"], "running");
@@ -1696,12 +1711,14 @@ async fn task_control_live_registry_entry_keeps_happy_path() {
     assert_eq!(list_json["children"][0]["orphaned"], false);
     assert_eq!(list_json["children"][0]["actionable"], true);
 
-    let query = driver.dispatch_task_control(
-        TaskControlAction::Query,
-        Some("task-live".to_string()),
-        Some("default".to_string()),
-        None,
-    );
+    let query = driver
+        .dispatch_task_control(
+            TaskControlAction::Query,
+            Some("task-live".to_string()),
+            Some("default".to_string()),
+            None,
+        )
+        .await;
     let query_json: serde_json::Value = serde_json::from_str(&query).unwrap();
     assert_eq!(query_json["state"], "query");
     assert_eq!(query_json["task_call_id"], "task-live");
@@ -1717,24 +1734,28 @@ async fn task_control_live_registry_entry_keeps_happy_path() {
     );
     assert_eq!(query_json["children"][0]["status"], "running");
 
-    let steer = driver.dispatch_task_control(
-        TaskControlAction::Steer,
-        Some("task-live".to_string()),
-        Some("default".to_string()),
-        Some("keep going".to_string()),
-    );
+    let steer = driver
+        .dispatch_task_control(
+            TaskControlAction::Steer,
+            Some("task-live".to_string()),
+            Some("default".to_string()),
+            Some("keep going".to_string()),
+        )
+        .await;
     let steer_json: serde_json::Value = serde_json::from_str(&steer).unwrap();
     assert_eq!(steer_json["state"], "steer_queued");
     assert_eq!(steer_json["applies_at"], "next_child_turn_boundary");
     assert_eq!(steer_json["applies_if"], "child_still_running_actionable");
     assert_eq!(steer_json["children"][0]["pending_steers"], 1);
 
-    let cancel = driver.dispatch_task_control(
-        TaskControlAction::Cancel,
-        Some("task-live".to_string()),
-        Some("default".to_string()),
-        None,
-    );
+    let cancel = driver
+        .dispatch_task_control(
+            TaskControlAction::Cancel,
+            Some("task-live".to_string()),
+            Some("default".to_string()),
+            None,
+        )
+        .await;
     let cancel_json: serde_json::Value = serde_json::from_str(&cancel).unwrap();
     assert_eq!(cancel_json["state"], "cancelled");
     assert_eq!(cancel_json["cancelled"][0], "task-live:default");
@@ -1775,12 +1796,14 @@ async fn task_query_reports_db_and_none_sources() {
         NoninteractiveDelegationSnapshot::from_history(vec![Message::user("live fallback")]),
     );
 
-    let db_query = driver.dispatch_task_control(
-        TaskControlAction::Query,
-        Some("task-db".to_string()),
-        Some("default".to_string()),
-        None,
-    );
+    let db_query = driver
+        .dispatch_task_control(
+            TaskControlAction::Query,
+            Some("task-db".to_string()),
+            Some("default".to_string()),
+            None,
+        )
+        .await;
     let db_json: serde_json::Value = serde_json::from_str(&db_query).unwrap();
     assert_eq!(db_json["state"], "query");
     assert_eq!(db_json["report_source"], "db");
@@ -1794,12 +1817,14 @@ async fn task_query_reports_db_and_none_sources() {
         "explore".to_string(),
         NoninteractiveDelegationSnapshot::empty(),
     );
-    let none_query = driver.dispatch_task_control(
-        TaskControlAction::Query,
-        Some("task-none".to_string()),
-        Some("default".to_string()),
-        None,
-    );
+    let none_query = driver
+        .dispatch_task_control(
+            TaskControlAction::Query,
+            Some("task-none".to_string()),
+            Some("default".to_string()),
+            None,
+        )
+        .await;
     let none_json: serde_json::Value = serde_json::from_str(&none_query).unwrap();
     assert_eq!(none_json["state"], "query");
     assert_eq!(none_json["report_source"], "none");

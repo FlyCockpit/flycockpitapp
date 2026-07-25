@@ -96,7 +96,11 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
         swarm_max_depth: extended.swarm.max_depth,
         granted_tools: Vec::new(),
     };
-    let locks = Arc::new(crate::locks::LockManager::from_db(db).context("loading lock state")?);
+    let locks = Arc::new(
+        crate::locks::LockManager::from_db(db)
+            .await
+            .context("loading lock state")?,
+    );
     let brief = build_docs_brief(package_id, question);
     crate::engine::docs_pipeline::run(
         &brief,

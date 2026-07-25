@@ -12,7 +12,7 @@ impl LockManager {
     /// when the agent is resumed.
     ///
     /// Returns the paths that were released, in canonical form.
-    pub fn suspend_agent(&self, agent: &str, session: Uuid) -> Result<Vec<PathBuf>> {
+    pub async fn suspend_agent(&self, agent: &str, session: Uuid) -> Result<Vec<PathBuf>> {
         let key = (session, agent.to_string());
         let to_release: Vec<PathBuf> = {
             let state = crate::sync::lock_or_recover(&self.inner);
@@ -41,6 +41,7 @@ impl LockManager {
         for path in &to_release {
             self.db
                 .lock_release(path, agent, session)
+                .await
                 .with_context(|| format!("persisting suspend release for `{}`", path.display()))?;
         }
         {
@@ -64,7 +65,7 @@ impl LockManager {
     /// `read` them again before writing.
     ///
     /// Returns the paths that were successfully reacquired.
-    pub fn resume_agent(&self, agent: &str, session: Uuid) -> Result<Vec<PathBuf>> {
+    pub async fn resume_agent(&self, agent: &str, session: Uuid) -> Result<Vec<PathBuf>> {
         let key = (session, agent.to_string());
         let snapshot = {
             let mut state = crate::sync::lock_or_recover(&self.inner);
@@ -113,11 +114,13 @@ impl LockManager {
         for path in &reacquired {
             self.db
                 .lock_acquire(path, agent, session)
+                .await
                 .with_context(|| format!("persisting resume reacquire for `{}`", path.display()))?;
         }
         for path in &invalidated {
             self.db
                 .lock_delete_read(path, agent, session)
+                .await
                 .with_context(|| {
                     format!(
                         "persisting resume read invalidation for `{}`",
@@ -132,7 +135,7 @@ impl LockManager {
     /// another within the same session. Used for primary swaps between
     /// write-capable agents so a re-root does not strand locks under the old
     /// primary name.
-    pub fn transfer_agent_locks(
+    pub async fn transfer_agent_locks(
         &self,
         from_agent: &str,
         to_agent: &str,
@@ -156,6 +159,7 @@ impl LockManager {
 
         self.db
             .lock_transfer_agent(session, from_agent, to_agent)
+            .await
             .context("persisting primary lock transfer")?;
 
         {
@@ -195,7 +199,7 @@ impl LockManager {
     /// freed here lets a cross-session `read` proceed.
     ///
     /// Returns the paths that were released, in canonical form.
-    pub fn suspend_session(&self, session: Uuid) -> Result<Vec<PathBuf>> {
+    pub async fn suspend_session(&self, session: Uuid) -> Result<Vec<PathBuf>> {
         let to_release: Vec<(PathBuf, AgentId)> = {
             let state = crate::sync::lock_or_recover(&self.inner);
             state
@@ -221,6 +225,7 @@ impl LockManager {
         for (path, agent) in &to_release {
             self.db
                 .lock_release(path, agent, session)
+                .await
                 .with_context(|| {
                     format!("persisting session-detach release for `{}`", path.display())
                 })?;
@@ -243,9 +248,10 @@ impl LockManager {
     ///
     /// This is distinct from [`Self::suspend_session`]: no resume snapshot is
     /// retained, and every read guard for every agent in the session is purged.
-    pub fn end_session(&self, session: Uuid) -> Result<()> {
+    pub async fn end_session(&self, session: Uuid) -> Result<()> {
         self.db
             .lock_cleanup_session(session)
+            .await
             .context("persisting permanent session lock cleanup")?;
 
         let released_any = {
@@ -279,7 +285,7 @@ impl LockManager {
     /// attach to an already-resumed session does nothing.
     ///
     /// Returns the paths that were successfully reacquired.
-    pub fn resume_session(&self, session: Uuid) -> Result<Vec<PathBuf>> {
+    pub async fn resume_session(&self, session: Uuid) -> Result<Vec<PathBuf>> {
         let snapshot = {
             let mut state = crate::sync::lock_or_recover(&self.inner);
             match state.session_released.remove(&session) {
@@ -330,6 +336,7 @@ impl LockManager {
             let agent = &snapshot[path].0;
             self.db
                 .lock_acquire(path, agent, session)
+                .await
                 .with_context(|| {
                     format!(
                         "persisting session-resume reacquire for `{}`",
@@ -340,6 +347,7 @@ impl LockManager {
         for (path, agent) in &invalidated {
             self.db
                 .lock_delete_read(path, agent, session)
+                .await
                 .with_context(|| {
                     format!(
                         "persisting session-resume read invalidation for `{}`",

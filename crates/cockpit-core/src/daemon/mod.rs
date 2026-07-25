@@ -993,7 +993,7 @@ pub async fn run_foreground_with_resume(
     .await
 }
 
-pub(crate) fn boot_in_process(
+pub(crate) async fn boot_in_process(
     paths: DaemonPaths,
     terminal_factory: terminal::TerminalHostFactory,
 ) -> Result<std::sync::Arc<server::DaemonContext>> {
@@ -1001,7 +1001,7 @@ pub(crate) fn boot_in_process(
         return Ok(ctx);
     }
 
-    let ctx = std::sync::Arc::new(server::boot(paths, terminal_factory)?);
+    let ctx = std::sync::Arc::new(server::boot(paths, terminal_factory).await?);
     #[cfg(not(test))]
     {
         server::spawn_lock_sweeper(ctx.clone());
@@ -1014,14 +1014,14 @@ pub(crate) fn boot_in_process(
 }
 
 #[cfg(test)]
-pub(crate) fn boot_in_process_with_db(
+pub(crate) async fn boot_in_process_with_db(
     paths: DaemonPaths,
     db: crate::db::Db,
 ) -> Result<std::sync::Arc<server::DaemonContext>> {
     if let Some(ctx) = server::in_process_context(&paths.socket) {
         return Ok(ctx);
     }
-    let locks = Arc::new(crate::locks::LockManager::from_db(db.clone())?);
+    let locks = Arc::new(crate::locks::LockManager::from_db(db.clone()).await?);
     let ctx = std::sync::Arc::new(server::DaemonContext::new(
         db,
         locks,
@@ -1108,8 +1108,8 @@ async fn run_foreground_inner_with_boot_db(
     timer.phase("probe_pidfile_bind");
 
     let ctx = std::sync::Arc::new(match boot_db {
-        Some(db) => server::boot_with_db(paths.clone(), db, &mut timer, terminal_factory)?,
-        None => server::boot(paths.clone(), terminal_factory)?,
+        Some(db) => server::boot_with_db(paths.clone(), db, &mut timer, terminal_factory).await?,
+        None => server::boot(paths.clone(), terminal_factory).await?,
     });
     if resume_all_sessions {
         resume_all_paused_sessions(&ctx.db)?;

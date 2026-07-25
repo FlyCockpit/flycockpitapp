@@ -288,6 +288,66 @@ impl App {
                     tracing::debug!(error = %e, "paste token count failed");
                 }
             },
+            AsyncActionKind::Refresh("pins.state") => match result.payload {
+                Ok(AsyncActionPayload::PinState {
+                    session_id,
+                    count,
+                    pinned_seqs,
+                }) => {
+                    self.apply_pin_state(session_id, count, pinned_seqs);
+                }
+                Ok(_) => {
+                    tracing::debug!("pin state refresh returned unexpected payload");
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "pin state refresh failed");
+                }
+            },
+            AsyncActionKind::Internal("pins.toggle") => match result.payload {
+                Ok(AsyncActionPayload::PinToggle {
+                    session_id,
+                    seq,
+                    now_pinned,
+                    count,
+                    pinned_seqs,
+                }) => {
+                    self.apply_pin_toggle(session_id, seq, now_pinned, count, pinned_seqs);
+                }
+                Ok(_) => self.pin_toast("pin: unexpected response".to_string()),
+                Err(e) => self.pin_toast(format!("pin: {e}")),
+            },
+            AsyncActionKind::Internal("pins.review") => match result.payload {
+                Ok(AsyncActionPayload::PinsReview { session_id, pins }) => {
+                    self.apply_pins_review(session_id, pins);
+                }
+                Ok(_) => self.push_plain("/pins: unexpected response".to_string()),
+                Err(e) => self.push_plain(format!("/pins: {e}")),
+            },
+            AsyncActionKind::Internal("pins.pin") => match result.payload {
+                Ok(AsyncActionPayload::PinMessage {
+                    session_id,
+                    seq: _,
+                    inserted,
+                    count,
+                    pinned_seqs,
+                }) => {
+                    self.apply_pin_message(session_id, inserted, count, pinned_seqs);
+                }
+                Ok(_) => self.pin_toast("pin: unexpected response".to_string()),
+                Err(e) => self.pin_toast(format!("pin: {e}")),
+            },
+            AsyncActionKind::Internal("pins.unpin") => match result.payload {
+                Ok(AsyncActionPayload::PinUnpin {
+                    session_id,
+                    seq,
+                    count,
+                    pinned_seqs,
+                }) => {
+                    self.apply_pin_unpin(session_id, seq, count, pinned_seqs);
+                }
+                Ok(_) => self.pin_toast("unpin: unexpected response".to_string()),
+                Err(e) => self.pin_toast(format!("unpin: {e}")),
+            },
             AsyncActionKind::DaemonRpc("resources.snapshot") => {
                 if let Overlay::Resources(pane) = &mut self.overlay {
                     let payload = match result.payload {

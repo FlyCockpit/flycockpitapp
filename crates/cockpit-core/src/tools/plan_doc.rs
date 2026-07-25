@@ -33,7 +33,7 @@ impl Tool for PlanReadTool {
     }
 
     async fn call(&self, _args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let doc = ctx.session.db.get_session_plan_doc(ctx.session.id)?;
+        let doc = ctx.session.db.get_session_plan_doc(ctx.session.id).await?;
         Ok(ToolOutput::text(render_doc(doc)))
     }
 }
@@ -79,13 +79,14 @@ impl Tool for PlanWriteTool {
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_input("`content` is required"))?;
-        let old = ctx.session.db.get_session_plan_doc(ctx.session.id)?;
+        let old = ctx.session.db.get_session_plan_doc(ctx.session.id).await?;
         validate_plan_write_revision(&args, old.as_ref())?;
         enforce_size(content)?;
         let doc = ctx
             .session
             .db
-            .write_session_plan_doc(ctx.session.id, content)?;
+            .write_session_plan_doc(ctx.session.id, content)
+            .await?;
         Ok(ToolOutput::text(render_update(
             "wrote",
             old.as_ref().map(|d| d.content.as_str()).unwrap_or(""),
@@ -142,7 +143,7 @@ impl Tool for PlanEditTool {
             .get("new_string")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_input("`new_string` is required"))?;
-        let Some(old_doc) = ctx.session.db.get_session_plan_doc(ctx.session.id)? else {
+        let Some(old_doc) = ctx.session.db.get_session_plan_doc(ctx.session.id).await? else {
             return Err(invalid_input(
                 "no plan document exists; call plan_write first",
             ));
@@ -161,7 +162,8 @@ impl Tool for PlanEditTool {
                 let doc = ctx
                     .session
                     .db
-                    .write_session_plan_doc(ctx.session.id, &updated)?;
+                    .write_session_plan_doc(ctx.session.id, &updated)
+                    .await?;
                 Ok(ToolOutput::text(render_update(
                     "edited",
                     &old_doc.content,
@@ -204,7 +206,7 @@ impl Tool for StartBuildTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let force = parse_start_build_force(&args)?;
-        let Some(doc) = ctx.session.db.get_session_plan_doc(ctx.session.id)? else {
+        let Some(doc) = ctx.session.db.get_session_plan_doc(ctx.session.id).await? else {
             return Err(invalid_input(
                 "write a non-empty plan document before calling start_build",
             ));
@@ -462,12 +464,11 @@ mod tests {
             .unwrap()
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
-    )]
-    fn other_sessions(db: &crate::db::Db, plan_session_id: Uuid) -> Vec<(Uuid, String, String)> {
-        db.read_blocking(|conn| {
+    async fn other_sessions(
+        db: &crate::db::Db,
+        plan_session_id: Uuid,
+    ) -> Vec<(Uuid, String, String)> {
+        db.read(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT session_id, active_agent, COALESCE(short_id, 'unknown')
                   FROM sessions
@@ -486,6 +487,7 @@ mod tests {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
+        .await
         .unwrap()
     }
 
@@ -589,14 +591,18 @@ mod tests {
         assert!(edited.content.contains("revision 2"));
         assert!(edited.content.contains("+"));
 
-        let doc = db.get_session_plan_doc(ctx.session.id).unwrap().unwrap();
+        let doc = db
+            .get_session_plan_doc(ctx.session.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(doc.revision, 2);
         assert_eq!(doc.content, "# Plan\n\n- build the better thing");
 
         let resumed = crate::session::Session::resume(db.clone(), ctx.session.id)
             .unwrap()
             .unwrap();
-        let persisted = db.get_session_plan_doc(resumed.id).unwrap().unwrap();
+        let persisted = db.get_session_plan_doc(resumed.id).await.unwrap().unwrap();
         assert_eq!(persisted.content, doc.content);
     }
 
@@ -611,7 +617,11 @@ mod tests {
             .unwrap();
 
         assert!(wrote.content.contains("revision 1"));
-        let doc = db.get_session_plan_doc(ctx.session.id).unwrap().unwrap();
+        let doc = db
+            .get_session_plan_doc(ctx.session.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(doc.revision, 1);
         assert_eq!(doc.content, "# First plan");
     }
@@ -633,7 +643,11 @@ mod tests {
         assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
         let text = format!("{err:#}");
         assert!(text.contains("plan_read"), "{text}");
-        let doc = db.get_session_plan_doc(ctx.session.id).unwrap().unwrap();
+        let doc = db
+            .get_session_plan_doc(ctx.session.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(doc.revision, 1);
         assert_eq!(doc.content, "original");
     }
@@ -660,7 +674,11 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("expected 1"), "{text}");
         assert!(text.contains("current revision is 2"), "{text}");
-        let doc = db.get_session_plan_doc(ctx.session.id).unwrap().unwrap();
+        let doc = db
+            .get_session_plan_doc(ctx.session.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(doc.revision, 2);
         assert_eq!(doc.content, "v2");
     }
@@ -685,7 +703,11 @@ mod tests {
             .unwrap();
 
         assert!(wrote.content.contains("revision 2"));
-        let doc = db.get_session_plan_doc(ctx.session.id).unwrap().unwrap();
+        let doc = db
+            .get_session_plan_doc(ctx.session.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(doc.revision, revision + 1);
         assert_eq!(doc.content, "v2");
     }
@@ -706,7 +728,11 @@ mod tests {
 
         assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
         assert!(format!("{err:#}").contains("must be an integer"));
-        let doc = db.get_session_plan_doc(ctx.session.id).unwrap().unwrap();
+        let doc = db
+            .get_session_plan_doc(ctx.session.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(doc.revision, 1);
         assert_eq!(doc.content, "v1");
     }
@@ -766,10 +792,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-locks-and-plan-docs"
-    )]
     async fn start_build_creates_fresh_build_session_with_only_plan_message() {
         let tmp = TempDir::new().unwrap();
         let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
@@ -795,7 +817,7 @@ mod tests {
         assert!(output.contains("created Build session"));
 
         let rows: Vec<(String, String)> = db
-            .read_blocking(|conn| {
+            .read(move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT session_id, active_agent FROM sessions WHERE session_id != ?1",
                 )?;
@@ -806,12 +828,13 @@ mod tests {
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             })
+            .await
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1, "Build");
 
         let events: Vec<(String, serde_json::Value)> = db
-            .read_blocking(|conn| {
+            .read(move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT type, data_json FROM session_events WHERE session_id = ?1 ORDER BY seq",
                 )?;
@@ -824,6 +847,7 @@ mod tests {
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             })
+            .await
             .unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].0, "user_message");
@@ -854,7 +878,7 @@ mod tests {
 
         assert!(second.contains(&first_ref));
         assert!(second.contains("no new session was created"));
-        let sessions = other_sessions(&db, ctx.session.id);
+        let sessions = other_sessions(&db, ctx.session.id).await;
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].1, "Build");
         assert_eq!(
@@ -891,7 +915,7 @@ mod tests {
         assert!(forced.contains("created new Build session"));
         assert!(forced.contains("forced fork"));
         assert_ne!(forced_ref, first_ref);
-        assert_eq!(other_sessions(&db, ctx.session.id).len(), 2);
+        assert_eq!(other_sessions(&db, ctx.session.id).await.len(), 2);
         assert_eq!(plan_handoff_notes(&db, ctx.session.id).await.len(), 2);
     }
 
@@ -932,7 +956,7 @@ mod tests {
             .content;
         assert!(second.contains(&build_ref));
         assert!(second.contains("no new session was created"));
-        assert_eq!(other_sessions(&db, ctx.session.id).len(), 1);
+        assert_eq!(other_sessions(&db, ctx.session.id).await.len(), 1);
     }
 
     #[tokio::test]
@@ -976,7 +1000,7 @@ mod tests {
 
         assert!(fresh.contains("created Build session"));
         assert_ne!(fresh_ref, first_ref);
-        assert_eq!(other_sessions(&db, ctx.session.id).len(), 2);
+        assert_eq!(other_sessions(&db, ctx.session.id).await.len(), 2);
 
         let idempotent = StartBuildTool
             .call(Value::Null, &ctx)
@@ -985,7 +1009,7 @@ mod tests {
             .content;
         assert!(idempotent.contains(&fresh_ref));
         assert!(idempotent.contains("no new session was created"));
-        assert_eq!(other_sessions(&db, ctx.session.id).len(), 2);
+        assert_eq!(other_sessions(&db, ctx.session.id).await.len(), 2);
     }
 
     #[tokio::test]

@@ -3,10 +3,10 @@ use super::*;
 impl LockManager {
     /// Build a new manager backed by `db`, rebuilding in-memory state
     /// from the persisted mirror. Called once at daemon startup.
-    pub fn from_db(db: Db) -> Result<Self> {
+    pub async fn from_db(db: Db) -> Result<Self> {
         let mut state = LockState::default();
 
-        for row in db.list_held_locks().context("loading held locks")? {
+        for row in db.list_held_locks().await.context("loading held locks")? {
             let path = PathBuf::from(row.path);
             // `acquired_at` doubles as the last-touched field — seed the
             // sweeper's deadline from the persisted timestamp so a lock
@@ -16,7 +16,7 @@ impl LockManager {
             state.held.insert(path, (row.session_id, row.agent_id));
         }
 
-        for row in db.list_lock_reads().context("loading lock reads")? {
+        for row in db.list_lock_reads().await.context("loading lock reads")? {
             state
                 .read_tracker
                 .entry((row.session_id, row.agent_id))
@@ -26,7 +26,7 @@ impl LockManager {
 
         Ok(Self {
             db,
-            inner: Mutex::new(state),
+            inner: Arc::new(Mutex::new(state)),
             notify: Arc::new(Notify::new()),
         })
     }
@@ -38,7 +38,7 @@ impl LockManager {
     pub fn in_memory(db: Db) -> Self {
         Self {
             db,
-            inner: Mutex::new(LockState::default()),
+            inner: Arc::new(Mutex::new(LockState::default())),
             notify: Arc::new(Notify::new()),
         }
     }
@@ -53,39 +53,42 @@ impl LockManager {
     /// conflict-message string is load-bearing for those internal callers —
     /// do not change it (implementation note).
     #[allow(dead_code)]
-    pub fn acquire(&self, path: &Path, agent: &str, session: Uuid) -> Result<()> {
+    pub async fn acquire(&self, path: &Path, agent: &str, session: Uuid) -> Result<()> {
         let canon = canonicalize(path);
         let read_hash = file_hash(&canon);
-        let mut state = crate::sync::lock_or_recover(&self.inner);
-        match state.held.get(&canon) {
-            Some((s, a)) if *s == session && a == agent => return Ok(()),
-            Some((s, a)) => bail!(
-                "lock on `{}` is held by `{a}` in session {s}",
-                canon.display()
-            ),
-            None => {}
-        }
-        state
-            .held
-            .insert(canon.clone(), (session, agent.to_string()));
-        state.touched.insert(canon.clone(), now_secs());
-        state
-            .read_tracker
-            .entry((session, agent.to_string()))
-            .or_default()
-            .insert(canon.clone(), read_hash);
-        let was_forced_released = state.forced_released.contains(&canon);
+        let was_forced_released = {
+            let mut state = crate::sync::lock_or_recover(&self.inner);
+            match state.held.get(&canon) {
+                Some((s, a)) if *s == session && a == agent => return Ok(()),
+                Some((s, a)) => bail!(
+                    "lock on `{}` is held by `{a}` in session {s}",
+                    canon.display()
+                ),
+                None => {}
+            }
+            state
+                .held
+                .insert(canon.clone(), (session, agent.to_string()));
+            state.touched.insert(canon.clone(), now_secs());
+            state
+                .read_tracker
+                .entry((session, agent.to_string()))
+                .or_default()
+                .insert(canon.clone(), read_hash);
+            state.forced_released.contains(&canon)
+        };
 
         // Persist before returning so a crash here doesn't leak the
         // lock as "held in memory only."
-        drop(state);
         let acquire_result = if was_forced_released {
             self.db
                 .lock_force_acquire_with_read(&canon, agent, session, read_hash)
+                .await
                 .context("persisting forced lock_acquire/read")
         } else {
             self.db
                 .lock_acquire_with_read(&canon, agent, session, read_hash)
+                .await
                 .context("persisting lock_acquire/read")
         };
         if let Err(error) = acquire_result {
@@ -114,7 +117,7 @@ impl LockManager {
     /// `(session, agent)` — that holder is the one `acquire_wait` must wait
     /// on. The state lock is dropped before any DB write so it is never held
     /// across an `.await`.
-    fn try_acquire(
+    async fn try_acquire(
         &self,
         canon: &Path,
         agent: &str,
@@ -122,40 +125,45 @@ impl LockManager {
         record_read: bool,
     ) -> Result<Option<(Uuid, AgentId)>> {
         let read_hash = record_read.then(|| file_hash(canon));
-        let mut state = crate::sync::lock_or_recover(&self.inner);
-        match state.held.get(canon) {
-            Some((s, a)) if *s == session && a == agent => return Ok(None),
-            Some((s, a)) => return Ok(Some((*s, a.clone()))),
-            None => {}
-        }
-        state
-            .held
-            .insert(canon.to_path_buf(), (session, agent.to_string()));
-        state.touched.insert(canon.to_path_buf(), now_secs());
-        if record_read {
+        let was_forced_released = {
+            let mut state = crate::sync::lock_or_recover(&self.inner);
+            match state.held.get(canon) {
+                Some((s, a)) if *s == session && a == agent => return Ok(None),
+                Some((s, a)) => return Ok(Some((*s, a.clone()))),
+                None => {}
+            }
             state
-                .read_tracker
-                .entry((session, agent.to_string()))
-                .or_default()
-                .insert(canon.to_path_buf(), read_hash.flatten());
-        }
-        let was_forced_released = state.forced_released.contains(canon);
-        drop(state);
+                .held
+                .insert(canon.to_path_buf(), (session, agent.to_string()));
+            state.touched.insert(canon.to_path_buf(), now_secs());
+            if record_read {
+                state
+                    .read_tracker
+                    .entry((session, agent.to_string()))
+                    .or_default()
+                    .insert(canon.to_path_buf(), read_hash.flatten());
+            }
+            state.forced_released.contains(canon)
+        };
         let acquire_result = if record_read && was_forced_released {
             self.db
                 .lock_force_acquire_with_read(canon, agent, session, read_hash.flatten())
+                .await
                 .context("persisting forced lock_acquire/read")
         } else if was_forced_released {
             self.db
                 .lock_force_acquire(canon, agent, session)
+                .await
                 .context("persisting forced lock_acquire")
         } else if record_read {
             self.db
                 .lock_acquire_with_read(canon, agent, session, read_hash.flatten())
+                .await
                 .context("persisting lock_acquire/read")
         } else {
             self.db
                 .lock_acquire(canon, agent, session)
+                .await
                 .context("persisting lock_acquire")
         };
         if let Err(error) = acquire_result {
@@ -249,7 +257,8 @@ impl LockManager {
         let waiter_key = (session, agent.to_string());
         // Fast path: acquire immediately if free / already ours.
         if self
-            .try_acquire(&canon, agent, session, record_read)?
+            .try_acquire(&canon, agent, session, record_read)
+            .await?
             .is_none()
         {
             self.clear_waiter(&waiter_key);
@@ -269,7 +278,10 @@ impl LockManager {
 
             // Re-check under the lock: a release may have landed since the
             // last attempt (or since `enable()`). If acquired, we're done.
-            match self.try_acquire(&canon, agent, session, record_read)? {
+            match self
+                .try_acquire(&canon, agent, session, record_read)
+                .await?
+            {
                 None => {
                     self.clear_waiter(&waiter_key);
                     return Ok(AcquireWait::Acquired);
@@ -312,7 +324,7 @@ impl LockManager {
     /// so an agent legitimately mid-task keeps its locks; only a hung /
     /// abandoned holder ages out. Best-effort persistence — the in-memory
     /// `touched` map is what the sweeper reads.
-    pub fn touch_holder(&self, agent: &str, session: Uuid) {
+    pub async fn touch_holder(&self, agent: &str, session: Uuid) {
         let now = now_secs();
         let touched: Vec<PathBuf> = {
             let mut state = crate::sync::lock_or_recover(&self.inner);
@@ -328,7 +340,7 @@ impl LockManager {
             paths
         };
         for p in &touched {
-            if let Err(e) = self.db.lock_touch(p, agent, session, now) {
+            if let Err(e) = self.db.lock_touch(p, agent, session, now).await {
                 tracing::warn!(error = %e, path = %p.display(), "persisting lock_touch failed");
             }
         }
@@ -343,15 +355,18 @@ impl LockManager {
     /// persists the release, and — once any lock was reclaimed — wakes
     /// blocked `acquire_wait` waiters so they re-contend. Returns the
     /// reclaimed paths (canonical).
-    pub fn sweep_expired(&self, now: i64) -> Result<Vec<PathBuf>> {
-        self.sweep_expired_with_hook(now, || {})
+    pub async fn sweep_expired(&self, now: i64) -> Result<Vec<PathBuf>> {
+        self.sweep_expired_with_hook(now, || async {}).await
     }
 
-    pub(super) fn sweep_expired_with_hook(
+    pub(super) async fn sweep_expired_with_hook<Fut>(
         &self,
         now: i64,
-        hook: impl FnOnce(),
-    ) -> Result<Vec<PathBuf>> {
+        hook: impl FnOnce() -> Fut,
+    ) -> Result<Vec<PathBuf>>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
         let cutoff = now - LOCK_IDLE_TIMEOUT.as_secs() as i64;
         // Collect under the state lock, then persist before mutating memory or
         // notifying waiters. A failed DB write leaves the live view unchanged.
@@ -371,9 +386,10 @@ impl LockManager {
 
         self.db
             .lock_release_and_delete_reads(&reclaimed)
+            .await
             .context("persisting idle-expiry release/read cleanup")?;
 
-        hook();
+        hook().await;
 
         let actually_reclaimed = {
             let mut state = crate::sync::lock_or_recover(&self.inner);
@@ -410,7 +426,7 @@ impl LockManager {
 
     /// Release the lock on `path` if held by `(session, agent)`. No-op when no
     /// one holds it (idempotent — common with `*unlock` variants).
-    pub fn release(&self, path: &Path, agent: &str, session: Uuid) -> Result<()> {
+    pub async fn release(&self, path: &Path, agent: &str, session: Uuid) -> Result<()> {
         let canon = canonicalize(path);
         {
             let state = crate::sync::lock_or_recover(&self.inner);
@@ -433,6 +449,7 @@ impl LockManager {
         }
         self.db
             .lock_release(&canon, agent, session)
+            .await
             .context("persisting lock_release")?;
         {
             let mut state = crate::sync::lock_or_recover(&self.inner);
@@ -451,10 +468,16 @@ impl LockManager {
     /// Release `path` held by `(session, agent)` and drop its §3c read-record.
     /// Used when a `read` acquired the lock but produced no file bytes, so
     /// neither the lock nor the implicit read grant should survive. Idempotent.
-    pub fn release_and_drop_read(&self, path: &Path, agent: &str, session: Uuid) -> Result<()> {
+    pub async fn release_and_drop_read(
+        &self,
+        path: &Path,
+        agent: &str,
+        session: Uuid,
+    ) -> Result<()> {
         let canon = canonicalize(path);
         self.db
             .lock_release_and_delete_reads(&[(canon.clone(), session, agent.to_string())])
+            .await
             .context("persisting lock release/read cleanup")?;
 
         let mut released = false;
@@ -490,7 +513,7 @@ impl LockManager {
     /// nothing to release so a landed write is never converted to an error.
     /// Returns `true` when the persistent release committed, `false` when the
     /// release was forced in memory only.
-    pub fn release_force_memory(&self, path: &Path, agent: &str, session: Uuid) -> bool {
+    pub async fn release_force_memory(&self, path: &Path, agent: &str, session: Uuid) -> bool {
         let canon = canonicalize(path);
         {
             let state = crate::sync::lock_or_recover(&self.inner);
@@ -500,7 +523,7 @@ impl LockManager {
             }
         }
 
-        let persist_ok = match self.db.lock_release(&canon, agent, session) {
+        let persist_ok = match self.db.lock_release(&canon, agent, session).await {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(
@@ -532,10 +555,14 @@ impl LockManager {
     /// already calls this internally; non-locking reads (the `read`
     /// tool exposed to `Build`) call it explicitly so a
     /// subsequent `write` is permitted.
-    pub fn note_read(&self, path: &Path, agent: &str, session: Uuid) {
+    pub async fn note_read(&self, path: &Path, agent: &str, session: Uuid) {
         let canon = canonicalize(path);
         let read_hash = file_hash(&canon);
-        if let Err(e) = self.db.lock_note_read(&canon, agent, session, read_hash) {
+        if let Err(e) = self
+            .db
+            .lock_note_read(&canon, agent, session, read_hash)
+            .await
+        {
             tracing::warn!(error = %e, "persisting note_read failed");
             return;
         }
@@ -580,7 +607,7 @@ impl LockManager {
     /// `release_after_write` still unlocks after a successful write. If no one
     /// holds the path, a prior read record is required and the guard acquires a
     /// temporary exclusive hold before returning.
-    pub fn begin_write<'a>(
+    pub async fn begin_write<'a>(
         &'a self,
         path: &Path,
         agent: &str,
@@ -632,6 +659,7 @@ impl LockManager {
             && let Err(error) = self
                 .db
                 .lock_acquire(&canon, agent, session)
+                .await
                 .context("persisting write guard acquire")
         {
             let mut state = crate::sync::lock_or_recover(&self.inner);
@@ -656,7 +684,7 @@ impl LockManager {
     /// through the waiting path. `acquired_by_wait` means this call owns the
     /// hold and should release it on success/drop; `require_fresh_read` keeps
     /// the §3c stale-content guard load-bearing for existing-file writes.
-    pub fn begin_write_after_wait<'a>(
+    pub async fn begin_write_after_wait<'a>(
         &'a self,
         path: &Path,
         agent: &str,
@@ -703,7 +731,7 @@ impl LockManager {
 
         if let Err(error) = result {
             if acquired_by_wait {
-                let _ = self.release_force_memory(&canon, agent, session);
+                let _ = self.release_force_memory(&canon, agent, session).await;
             }
             return Err(error);
         }

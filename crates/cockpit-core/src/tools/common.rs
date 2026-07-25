@@ -191,7 +191,7 @@ impl WriteReleaseOutcome {
 /// tool. Once the write lands, lock bookkeeping becomes best-effort:
 /// callers still report the write as success and append the rare advisory
 /// when release persistence failed.
-pub fn write_and_release(
+pub async fn write_and_release(
     ctx: &ToolCtx,
     path: &Path,
     bytes: &[u8],
@@ -201,8 +201,10 @@ pub fn write_and_release(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, bytes).map_err(|e| anyhow::anyhow!("write `{}`: {e}", path.display()))?;
-    let persist_ok = guard.release_after_write();
-    ctx.locks.note_read(path, &ctx.agent_id, ctx.session.id);
+    let persist_ok = guard.release_after_write().await;
+    ctx.locks
+        .note_read(path, &ctx.agent_id, ctx.session.id)
+        .await;
     Ok(WriteReleaseOutcome { persist_ok })
 }
 
@@ -232,7 +234,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
     // session sandbox OFF — tests that exercise sandbox config/decision
     // logic build their own ctx or flip the flag explicitly.
     session.set_sandbox_enabled(false);
-    let locks = Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap());
+    let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
     let cfg = crate::config::extended::RedactConfig::default();
     let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, root).unwrap());
     (
@@ -296,8 +298,9 @@ pub fn normalize_line_endings(content: &str, want_crlf: bool) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn line_number_unpadded_pipe_format() {
+    #[tokio::test]
+
+    async fn line_number_unpadded_pipe_format() {
         // Single-digit line: no leading padding, `|` separator, no trailing
         // space; an empty content line is `${n}|`.
         assert_eq!(line_number("x", 5), "5|x\n");
@@ -311,8 +314,9 @@ mod tests {
         assert_eq!(line_number("a\nb", 99), "99|a\n100|b\n");
     }
 
-    #[test]
-    fn write_and_release_prewrite_failure_errors_and_keeps_lock() {
+    #[tokio::test]
+
+    async fn write_and_release_prewrite_failure_errors_and_keeps_lock() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
         let blocked_parent = tmp.path().join("not-a-dir");
@@ -320,14 +324,18 @@ mod tests {
         let target = blocked_parent.join("child.txt");
         ctx.locks
             .acquire(&target, &ctx.agent_id, ctx.session.id)
+            .await
             .unwrap();
 
         let guard = ctx
             .locks
             .begin_write(&target, &ctx.agent_id, ctx.session.id, "write")
+            .await
             .unwrap();
 
-        let err = write_and_release(&ctx, &target, b"new", guard).unwrap_err();
+        let err = write_and_release(&ctx, &target, b"new", guard)
+            .await
+            .unwrap_err();
 
         assert!(
             err.to_string().contains("Not a directory")
@@ -341,13 +349,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn truncate_head_tail_short_input_unchanged() {
+    #[tokio::test]
+
+    async fn truncate_head_tail_short_input_unchanged() {
         assert_eq!(truncate_head_tail("hello", 100), "hello");
     }
 
-    #[test]
-    fn read_slice_empty_file_reports_eof_metadata() {
+    #[tokio::test]
+
+    async fn read_slice_empty_file_reports_eof_metadata() {
         let slice = read_slice("", 1, READ_LINE_CAP);
 
         assert_eq!(slice.numbered, "");
@@ -357,8 +367,9 @@ mod tests {
         assert!(slice.offset_exceeded);
     }
 
-    #[test]
-    fn read_slice_offset_beyond_eof_reports_total_once() {
+    #[tokio::test]
+
+    async fn read_slice_offset_beyond_eof_reports_total_once() {
         let slice = read_slice("a\nb\n", 4, 2);
 
         assert_eq!(slice.numbered, "");
@@ -368,8 +379,9 @@ mod tests {
         assert!(slice.offset_exceeded);
     }
 
-    #[test]
-    fn read_slice_exact_limit_is_not_truncated() {
+    #[tokio::test]
+
+    async fn read_slice_exact_limit_is_not_truncated() {
         let slice = read_slice("a\nb\nc\n", 2, 2);
 
         assert_eq!(slice.numbered, "2|b\n3|c\n");
@@ -379,8 +391,9 @@ mod tests {
         assert!(!slice.offset_exceeded);
     }
 
-    #[test]
-    fn read_slice_truncation_reports_next_offset() {
+    #[tokio::test]
+
+    async fn read_slice_truncation_reports_next_offset() {
         let slice = read_slice("a\nb\nc\n", 1, 2);
 
         assert_eq!(slice.numbered, "1|a\n2|b\n");
@@ -390,8 +403,9 @@ mod tests {
         assert!(!slice.offset_exceeded);
     }
 
-    #[test]
-    fn read_slice_byte_cap_does_not_skip_unshown_lines() {
+    #[tokio::test]
+
+    async fn read_slice_byte_cap_does_not_skip_unshown_lines() {
         let huge = "x".repeat(OUTPUT_BYTE_CAP + 200);
         let slice = read_slice(&format!("{huge}\nsmall\n"), 1, READ_LINE_CAP);
 
@@ -402,8 +416,9 @@ mod tests {
         assert!(!slice.offset_exceeded);
     }
 
-    #[test]
-    fn read_slice_with_byte_cap_uses_explicit_ceiling() {
+    #[tokio::test]
+
+    async fn read_slice_with_byte_cap_uses_explicit_ceiling() {
         let text = format!("{}\nsmall\n", "x".repeat(OUTPUT_BYTE_CAP + 200));
         let legacy = read_slice(&text, 1, READ_LINE_CAP);
         let larger = read_slice_with_byte_cap(&text, 1, READ_LINE_CAP, 48 * 1024);
@@ -415,8 +430,9 @@ mod tests {
         assert!(larger.numbered.contains("2|small"));
     }
 
-    #[test]
-    fn truncate_head_tail_never_panics_on_multibyte_boundary() {
+    #[tokio::test]
+
+    async fn truncate_head_tail_never_panics_on_multibyte_boundary() {
         // The bug this guards: `String::truncate` panics if the cap
         // lands mid-codepoint. Build a string of 4-byte chars so most
         // byte offsets are NOT char boundaries.
@@ -432,8 +448,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn truncate_head_tail_keeps_head_and_tail() {
+    #[tokio::test]
+
+    async fn truncate_head_tail_keeps_head_and_tail() {
         let s = format!("{}TAILMARKER", "x".repeat(20_000));
         let out = truncate_head_tail(&s, 1000);
         assert!(out.starts_with("xxxx"));

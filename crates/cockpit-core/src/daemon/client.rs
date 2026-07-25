@@ -696,7 +696,8 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
             let ctx = crate::daemon::boot_in_process(
                 own.clone(),
                 crate::daemon::terminal::default_host_factory(),
-            )?;
+            )
+            .await?;
             return Ok(ConnectedDaemon {
                 client: DaemonClient::from_in_process(ctx),
                 owns_daemon: false,
@@ -1515,6 +1516,7 @@ mod tests {
         );
         let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
         let ctx = crate::daemon::boot_in_process_with_db(paths.clone(), db)
+            .await
             .expect("boot local daemon context");
         let client = DaemonClient::connect(&paths.socket)
             .await
@@ -1548,6 +1550,7 @@ mod tests {
         set_own_ephemeral_paths_for_test(own.clone());
         let db = crate::db::Db::open_in_memory().expect("in-memory daemon db");
         let _ctx = crate::daemon::boot_in_process_with_db(own.clone(), db)
+            .await
             .expect("boot local daemon context");
 
         let connected = probe_or_spawn(LifecycleMode::AttachOwnEphemeral)

@@ -154,7 +154,7 @@ async fn run_review_turn(
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<Option<String>> {
     let session = scratch_session(&cwd)?;
-    let locks = Arc::new(crate::locks::LockManager::from_db(session.db.clone())?);
+    let locks = Arc::new(crate::locks::LockManager::from_db(session.db.clone()).await?);
     let cage = ReviewCage::skills_review();
     let agent = review_agent_from(root_agent);
     let mut history = Vec::new();

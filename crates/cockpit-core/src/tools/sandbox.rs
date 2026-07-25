@@ -500,7 +500,7 @@ mod tests {
             crate::session::Session::create(db.clone(), cwd.to_path_buf(), "builder").unwrap();
         session.set_sandbox_enabled(true);
         let sid = session.id;
-        let locks = Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap());
+        let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
         let cfg = crate::config::extended::RedactConfig::default();
         let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, cwd).unwrap());
         let hub = Arc::new(InterruptHub::detached());

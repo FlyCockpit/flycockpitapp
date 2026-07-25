@@ -181,7 +181,8 @@ pub(crate) async fn execute_ordinary_call(
     // per-tool — it covers every dispatched call uniformly.
     env.ctx
         .locks
-        .touch_holder(&env.ctx.agent_id, env.ctx.session.id);
+        .touch_holder(&env.ctx.agent_id, env.ctx.session.id)
+        .await;
 
     let _ = env
         .tx
@@ -1600,7 +1601,7 @@ mod tests {
             agent_id: "Build".to_string(),
             current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
-            locks: Arc::new(crate::locks::LockManager::from_db(session.db.clone()).unwrap()),
+            locks: Arc::new(crate::locks::LockManager::in_memory(session.db.clone())),
             session,
             cwd: root.to_path_buf(),
             redact: Arc::new(RedactionTable::empty()),

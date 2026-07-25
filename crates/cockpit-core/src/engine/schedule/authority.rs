@@ -824,7 +824,7 @@ mod tests {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session =
             Arc::new(crate::session::Session::create(db.clone(), root.clone(), "builder").unwrap());
-        let locks = Arc::new(crate::locks::LockManager::from_db(db).unwrap());
+        let locks = Arc::new(crate::locks::LockManager::in_memory(db));
         let cfg = crate::config::extended::RedactConfig::default();
         let redact = Arc::new(RedactionTable::build(&cfg, &root).unwrap());
 

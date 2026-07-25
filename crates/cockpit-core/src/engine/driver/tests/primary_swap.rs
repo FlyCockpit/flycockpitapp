@@ -622,6 +622,7 @@ async fn roster_trim_swap_to_removed_swarm_keeps_locks_with_build() {
     driver
         .locks
         .acquire(&path, "Build", driver.session.id)
+        .await
         .unwrap();
 
     driver.swap_primary("Swarm", &tx).await;
@@ -648,6 +649,7 @@ async fn primary_swap_releases_locks_when_incoming_is_read_only() {
     driver
         .locks
         .acquire(&path, "Build", driver.session.id)
+        .await
         .unwrap();
 
     driver.swap_primary("Plan", &tx).await;
@@ -973,7 +975,11 @@ async fn fresh_driver_rehydrates_persisted_pruned_context() {
     // A brand-new driver for the SAME session (a fresh worker after an
     // unclean restart) rehydrates automatically.
     let s2 = Arc::new(Session::resume(db.clone(), sid).unwrap().unwrap());
-    let locks = Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap());
+    let locks = Arc::new(
+        crate::locks::LockManager::from_db(db.clone())
+            .await
+            .unwrap(),
+    );
     let rcfg = crate::config::extended::RedactConfig::default();
     let redact = Arc::new(RedactionTable::build(&rcfg, &s2.project_root).unwrap());
     let agent = Arc::new(Agent {

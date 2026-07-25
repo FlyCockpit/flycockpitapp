@@ -103,9 +103,9 @@ impl Tool for ReadTool {
             {
                 return Ok(refusal);
             }
-            return read_impl_with_path(args, ctx, false, checked);
+            return read_impl_with_path(args, ctx, false, checked).await;
         }
-        read_impl(args, ctx, false)
+        read_impl(args, ctx, false).await
     }
 }
 
@@ -122,32 +122,32 @@ pub(crate) enum ReadOutcome {
 /// Shared implementation for snapshot reads. Real reads mark the file as read
 /// in the lock manager's read-tracker, so a subsequent `write` or `edit` is
 /// permitted without exposing a separate lock-acquire tool.
-pub(crate) fn read_impl(args: Value, ctx: &ToolCtx, _was_locked: bool) -> Result<ToolOutput> {
-    match read_impl_outcome(args, ctx, false)? {
+pub(crate) async fn read_impl(args: Value, ctx: &ToolCtx, _was_locked: bool) -> Result<ToolOutput> {
+    match read_impl_outcome(args, ctx, false).await? {
         ReadOutcome::Content(out) | ReadOutcome::NoContent(out) => Ok(out),
     }
 }
 
-pub(crate) fn read_impl_with_path(
+pub(crate) async fn read_impl_with_path(
     args: Value,
     ctx: &ToolCtx,
     _was_locked: bool,
     path: PathBuf,
 ) -> Result<ToolOutput> {
-    match read_impl_outcome_with_path(args, ctx, false, path, |path| std::fs::read(path))? {
+    match read_impl_outcome_with_path(args, ctx, false, path, |path| std::fs::read(path)).await? {
         ReadOutcome::Content(out) | ReadOutcome::NoContent(out) => Ok(out),
     }
 }
 
-pub(crate) fn read_impl_outcome(
+pub(crate) async fn read_impl_outcome(
     args: Value,
     ctx: &ToolCtx,
     was_locked: bool,
 ) -> Result<ReadOutcome> {
-    read_impl_outcome_with(args, ctx, was_locked, |path| std::fs::read(path))
+    read_impl_outcome_with(args, ctx, was_locked, |path| std::fs::read(path)).await
 }
 
-pub(crate) fn read_impl_outcome_with(
+pub(crate) async fn read_impl_outcome_with(
     args: Value,
     ctx: &ToolCtx,
     was_locked: bool,
@@ -158,10 +158,10 @@ pub(crate) fn read_impl_outcome_with(
         .and_then(Value::as_str)
         .ok_or_else(|| crate::engine::tool::invalid_input("`path` is required"))?;
     let path = resolve(path_arg, &ctx.cwd);
-    read_impl_outcome_with_path(args, ctx, was_locked, path, read_file)
+    read_impl_outcome_with_path(args, ctx, was_locked, path, read_file).await
 }
 
-pub(crate) fn read_impl_outcome_with_path(
+pub(crate) async fn read_impl_outcome_with_path(
     args: Value,
     ctx: &ToolCtx,
     was_locked: bool,
@@ -207,7 +207,9 @@ pub(crate) fn read_impl_outcome_with_path(
     // is a separate path; when neither is present the behavior below is
     // byte-identical to before.
     if args.get("start_line").is_some() || args.get("end_line").is_some() {
-        return read_range(&bytes, &text, &path, args, ctx, was_locked).map(ReadOutcome::Content);
+        return read_range(&bytes, &text, &path, args, ctx, was_locked)
+            .await
+            .map(ReadOutcome::Content);
     }
 
     let (offset, default_offset) = match args.get("offset").and_then(Value::as_u64) {
@@ -231,7 +233,9 @@ pub(crate) fn read_impl_outcome_with_path(
             ));
         }
         // Always track the read attempt so a subsequent write is allowed.
-        ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
+        ctx.locks
+            .note_read(&path, &ctx.agent_id, ctx.session.id)
+            .await;
         return Ok(ReadOutcome::Content(ToolOutput::text(out)));
     }
 
@@ -245,13 +249,17 @@ pub(crate) fn read_impl_outcome_with_path(
         let mut tail = slice.numbered;
         tail.push_str(&truncation_marker(slice.next_offset));
         tail.push('\n');
-        ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
+        ctx.locks
+            .note_read(&path, &ctx.agent_id, ctx.session.id)
+            .await;
         return Ok(ReadOutcome::Content(ToolOutput::truncated_text(format!(
             "{prelude}{tail}"
         ))));
     }
 
-    ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
+    ctx.locks
+        .note_read(&path, &ctx.agent_id, ctx.session.id)
+        .await;
     Ok(ReadOutcome::Content(ToolOutput::text(format!(
         "{prelude}{}",
         slice.numbered
@@ -304,7 +312,7 @@ fn classify_read_race(path: &Path, ctx: &ToolCtx, err: &io::Error) -> Option<Too
 /// returned=<a>-<b>]` header so a caller (the intel tools) can verify
 /// the file hasn't shifted under it. `end_line` defaults to EOF;
 /// `start_line` defaults to 1.
-fn read_range(
+async fn read_range(
     bytes: &[u8],
     text: &str,
     path: &std::path::Path,
@@ -335,7 +343,9 @@ fn read_range(
     let hash = crate::intel::hex_lower(&digest);
     let hash12 = &hash[..hash.len().min(12)];
 
-    ctx.locks.note_read(path, &ctx.agent_id, ctx.session.id);
+    ctx.locks
+        .note_read(path, &ctx.agent_id, ctx.session.id)
+        .await;
 
     if slice.offset_exceeded {
         let header = format!("[hash={hash12} total_lines={total} returned=none]\n");
@@ -435,8 +445,9 @@ mod tests {
     }
 
     /// Steering variant (a): an agent holding `code` is pointed at code/tree.
-    #[test]
-    fn directory_message_suggests_tree_when_available() {
+    #[tokio::test]
+
+    async fn directory_message_suggests_tree_when_available() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("d");
         std::fs::create_dir(&dir).unwrap();
@@ -444,15 +455,16 @@ mod tests {
         ctx.has_tree = true;
         ctx.has_bash = true; // tree wins even when bash is also present
         let args = serde_json::json!({ "path": dir.to_string_lossy() });
-        let out = read_impl(args, &ctx, false).unwrap();
+        let out = read_impl(args, &ctx, false).await.unwrap();
         assert!(out.content.contains("`code`"), "got: {}", out.content);
         assert!(out.content.contains("kind `tree`"), "got: {}", out.content);
         assert!(!out.content.contains("`bash`"), "got: {}", out.content);
     }
 
     /// Steering variant (b): no `code` but `bash` → suggest `bash`.
-    #[test]
-    fn directory_message_suggests_bash_when_no_tree() {
+    #[tokio::test]
+
+    async fn directory_message_suggests_bash_when_no_tree() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("d");
         std::fs::create_dir(&dir).unwrap();
@@ -460,15 +472,16 @@ mod tests {
         ctx.has_tree = false;
         ctx.has_bash = true;
         let args = serde_json::json!({ "path": dir.to_string_lossy() });
-        let out = read_impl(args, &ctx, false).unwrap();
+        let out = read_impl(args, &ctx, false).await.unwrap();
         assert!(out.content.contains("`bash`"), "got: {}", out.content);
         assert!(!out.content.contains("kind `tree`"), "got: {}", out.content);
     }
 
     /// Steering variant (c): neither `code` nor `bash` (e.g. the `docs`
     /// answerer) → no alternative tool is named.
-    #[test]
-    fn directory_message_suggests_nothing_without_tree_or_bash() {
+    #[tokio::test]
+
+    async fn directory_message_suggests_nothing_without_tree_or_bash() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("d");
         std::fs::create_dir(&dir).unwrap();
@@ -476,7 +489,7 @@ mod tests {
         ctx.has_tree = false;
         ctx.has_bash = false;
         let args = serde_json::json!({ "path": dir.to_string_lossy() });
-        let out = read_impl(args, &ctx, false).unwrap();
+        let out = read_impl(args, &ctx, false).await.unwrap();
         assert!(
             out.content.contains("is a directory"),
             "got: {}",
@@ -488,15 +501,16 @@ mod tests {
 
     /// A nonexistent path (the weak-model path-hallucination case) returns a
     /// non-`Err` recovery message that steers to code/tree, never a raw OS error.
-    #[test]
-    fn nonexistent_path_steers_to_tree_when_available() {
+    #[tokio::test]
+
+    async fn nonexistent_path_steers_to_tree_when_available() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(tmp.path());
         ctx.has_tree = true;
         ctx.has_bash = true; // tree wins
         let missing = tmp.path().join("CONTRIBUTING.md");
         let args = serde_json::json!({ "path": missing.to_string_lossy() });
-        let out = read_impl(args, &ctx, false).unwrap();
+        let out = read_impl(args, &ctx, false).await.unwrap();
         assert!(
             out.content.contains("does not exist"),
             "got: {}",
@@ -512,15 +526,16 @@ mod tests {
     }
 
     /// No `code` but `bash` present → steer to `bash` instead.
-    #[test]
-    fn nonexistent_path_steers_to_bash_when_no_tree() {
+    #[tokio::test]
+
+    async fn nonexistent_path_steers_to_bash_when_no_tree() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(tmp.path());
         ctx.has_tree = false;
         ctx.has_bash = true;
         let missing = tmp.path().join("README.md");
         let args = serde_json::json!({ "path": missing.to_string_lossy() });
-        let out = read_impl(args, &ctx, false).unwrap();
+        let out = read_impl(args, &ctx, false).await.unwrap();
         assert!(
             out.content.contains("does not exist"),
             "got: {}",
@@ -530,8 +545,9 @@ mod tests {
         assert!(!out.content.contains("kind `tree`"), "got: {}", out.content);
     }
 
-    #[test]
-    fn read_deleted_after_preflight_uses_missing_path_recovery() {
+    #[tokio::test]
+
+    async fn read_deleted_after_preflight_uses_missing_path_recovery() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("gone.txt");
         std::fs::write(&file, "content").unwrap();
@@ -543,6 +559,7 @@ mod tests {
             std::fs::remove_file(path).unwrap();
             Err(io::Error::new(io::ErrorKind::NotFound, "gone"))
         })
+        .await
         .unwrap()
         {
             ReadOutcome::NoContent(out) => out,
@@ -564,8 +581,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_replaced_by_directory_after_preflight_uses_directory_recovery() {
+    #[tokio::test]
+
+    async fn read_replaced_by_directory_after_preflight_uses_directory_recovery() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("now-dir");
         std::fs::write(&file, "content").unwrap();
@@ -578,6 +596,7 @@ mod tests {
             std::fs::create_dir(path).unwrap();
             Err(io::Error::other("became directory"))
         })
+        .await
         .unwrap()
         {
             ReadOutcome::NoContent(out) => out,
@@ -598,8 +617,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_unclassified_error_stays_hard_error() {
+    #[tokio::test]
+
+    async fn read_unclassified_error_stays_hard_error() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("f.txt");
         std::fs::write(&file, "content").unwrap();
@@ -609,6 +629,7 @@ mod tests {
         let err = read_impl_outcome_with(args, &ctx, false, |_| {
             Err(io::Error::new(io::ErrorKind::PermissionDenied, "blocked"))
         })
+        .await
         .unwrap_err();
 
         let msg = err.to_string();
@@ -616,15 +637,16 @@ mod tests {
         assert!(msg.contains("blocked"), "got: {msg}");
     }
 
-    #[test]
-    fn binary_file_hint_backticks_commands() {
+    #[tokio::test]
+
+    async fn binary_file_hint_backticks_commands() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("blob.bin");
         std::fs::write(&file, b"\0binary").unwrap();
         let mut ctx = test_ctx(tmp.path());
         ctx.has_bash = true;
         let args = serde_json::json!({ "path": file.to_string_lossy() });
-        let out = read_impl(args, &ctx, false).unwrap();
+        let out = read_impl(args, &ctx, false).await.unwrap();
 
         assert!(
             out.content.contains("use `bash` with `head -c` or `file`"),

@@ -82,6 +82,35 @@ pub enum AsyncActionPayload {
         block_id: u64,
         tokens: usize,
     },
+    PinState {
+        session_id: uuid::Uuid,
+        count: usize,
+        pinned_seqs: Vec<i64>,
+    },
+    PinToggle {
+        session_id: uuid::Uuid,
+        seq: i64,
+        now_pinned: bool,
+        count: usize,
+        pinned_seqs: Vec<i64>,
+    },
+    PinsReview {
+        session_id: uuid::Uuid,
+        pins: Vec<cockpit_db::pins::PinnedMessage>,
+    },
+    PinMessage {
+        session_id: uuid::Uuid,
+        seq: i64,
+        inserted: bool,
+        count: usize,
+        pinned_seqs: Vec<i64>,
+    },
+    PinUnpin {
+        session_id: uuid::Uuid,
+        seq: i64,
+        count: usize,
+        pinned_seqs: Vec<i64>,
+    },
     LocalCommand {
         label: String,
         raw_output: String,

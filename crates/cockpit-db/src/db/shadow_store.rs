@@ -22,17 +22,14 @@ impl Db {
     /// Store or replace the one speculative compaction shadow for a
     /// non-ephemeral session. Returns `false` when the session row is absent or
     /// ephemeral; in both cases any stale shadow row is removed.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn upsert_compaction_shadow(&self, session_id: Uuid, payload_json: &str) -> Result<bool> {
+    pub async fn upsert_compaction_shadow(
+        &self,
+        session_id: Uuid,
+        payload_json: &str,
+    ) -> Result<bool> {
         let payload_json = payload_json.to_string();
-        self.write_blocking(move |conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .context("begin upsert_compaction_shadow tx")?;
-            let ephemeral = tx
+        self.transaction(move |conn| {
+            let ephemeral = conn
                 .query_row(
                     "SELECT ephemeral FROM sessions WHERE session_id = ?1",
                     params![session_id.to_string()],
@@ -41,18 +38,16 @@ impl Db {
                 .optional()
                 .context("querying compaction shadow session")?;
             if ephemeral != Some(0) {
-                tx.execute(
+                conn.execute(
                     "DELETE FROM compaction_shadows WHERE session_id = ?1",
                     params![session_id.to_string()],
                 )
                 .context("clearing compaction shadow for non-durable session")?;
-                tx.commit()
-                    .context("commit skipped upsert_compaction_shadow tx")?;
                 return Ok(false);
             }
 
             let now = now_ms();
-            tx.execute(
+            conn.execute(
                 "INSERT INTO compaction_shadows
                    (session_id, payload_json, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?3)
@@ -62,17 +57,13 @@ impl Db {
                 params![session_id.to_string(), payload_json, now],
             )
             .context("upserting compaction shadow")?;
-            tx.commit().context("commit upsert_compaction_shadow tx")?;
             Ok(true)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn compaction_shadow(&self, session_id: Uuid) -> Result<Option<CompactionShadowRow>> {
-        self.read_blocking(move |conn| {
+    pub async fn compaction_shadow(&self, session_id: Uuid) -> Result<Option<CompactionShadowRow>> {
+        self.read(move |conn| {
             conn.query_row(
                 "SELECT session_id, payload_json, created_at, updated_at
                    FROM compaction_shadows
@@ -83,14 +74,11 @@ impl Db {
             .optional()
             .context("querying compaction shadow")
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn delete_compaction_shadow(&self, session_id: Uuid) -> Result<()> {
-        self.write_blocking(move |conn| {
+    pub async fn delete_compaction_shadow(&self, session_id: Uuid) -> Result<()> {
+        self.write(move |conn| {
             conn.execute(
                 "DELETE FROM compaction_shadows WHERE session_id = ?1",
                 params![session_id.to_string()],
@@ -98,21 +86,19 @@ impl Db {
             .context("deleting compaction shadow")?;
             Ok(())
         })
+        .await
     }
 
     #[cfg(test)]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn count_compaction_shadows(&self) -> Result<usize> {
-        self.read_blocking(|conn| {
+    async fn count_compaction_shadows(&self) -> Result<usize> {
+        self.read(|conn| {
             let count: i64 =
                 conn.query_row("SELECT COUNT(*) FROM compaction_shadows", [], |row| {
                     row.get(0)
                 })?;
             Ok(count.max(0) as usize)
         })
+        .await
     }
 }
 
@@ -147,30 +133,41 @@ mod tests {
 
         assert!(
             db.upsert_compaction_shadow(one, r#"{"brief":"first"}"#)
+                .await
                 .unwrap()
         );
         assert!(
             db.upsert_compaction_shadow(one, r#"{"brief":"second"}"#)
+                .await
                 .unwrap()
         );
         assert!(
             db.upsert_compaction_shadow(two, r#"{"brief":"other"}"#)
+                .await
                 .unwrap()
         );
 
-        assert_eq!(db.count_compaction_shadows().unwrap(), 2);
+        assert_eq!(db.count_compaction_shadows().await.unwrap(), 2);
         assert_eq!(
-            db.compaction_shadow(one).unwrap().unwrap().payload_json,
+            db.compaction_shadow(one)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload_json,
             r#"{"brief":"second"}"#
         );
         assert_eq!(
-            db.compaction_shadow(two).unwrap().unwrap().payload_json,
+            db.compaction_shadow(two)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload_json,
             r#"{"brief":"other"}"#
         );
 
         db.delete_session(one, true).await.unwrap();
-        assert!(db.compaction_shadow(one).unwrap().is_none());
-        assert_eq!(db.count_compaction_shadows().unwrap(), 1);
+        assert!(db.compaction_shadow(one).await.unwrap().is_none());
+        assert_eq!(db.count_compaction_shadows().await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -195,9 +192,10 @@ mod tests {
         let payload_json = serde_json::to_string(&payload).unwrap();
 
         db.upsert_compaction_shadow(session_id, &payload_json)
+            .await
             .unwrap();
 
-        let stored = db.compaction_shadow(session_id).unwrap().unwrap();
+        let stored = db.compaction_shadow(session_id).await.unwrap().unwrap();
         assert_eq!(stored.payload_json, payload_json);
     }
 
@@ -214,10 +212,12 @@ mod tests {
         assert!(payload_json.len() > 16 * 1024);
 
         db.upsert_compaction_shadow(session_id, &payload_json)
+            .await
             .unwrap();
 
         assert_eq!(
             db.compaction_shadow(session_id)
+                .await
                 .unwrap()
                 .unwrap()
                 .payload_json,
@@ -237,10 +237,11 @@ mod tests {
 
         assert!(
             !db.upsert_compaction_shadow(ephemeral, r#"{"brief":"discard"}"#)
+                .await
                 .unwrap()
         );
 
-        assert!(db.compaction_shadow(ephemeral).unwrap().is_none());
-        assert_eq!(db.count_compaction_shadows().unwrap(), 0);
+        assert!(db.compaction_shadow(ephemeral).await.unwrap().is_none());
+        assert_eq!(db.count_compaction_shadows().await.unwrap(), 0);
     }
 }

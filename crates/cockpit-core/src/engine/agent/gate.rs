@@ -520,7 +520,7 @@ mod safety_gate_tests {
         session.set_sandbox_enabled(false);
         session.set_approval_mode(mode);
         let sid = session.id;
-        let locks = Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap());
+        let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
         let cfg = crate::config::extended::RedactConfig::default();
         let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, root).unwrap());
         let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());

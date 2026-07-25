@@ -80,10 +80,10 @@ pub enum AcquireWait {
     Cancelled,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LockManager {
     db: Db,
-    inner: Mutex<LockState>,
+    inner: Arc<Mutex<LockState>>,
     /// Single per-manager wakeup hub for [`LockManager::acquire_wait`]
     /// waiters. Every release (`release`/`suspend_agent`/`sweep_expired`/
     /// session-detach) calls `notify_waiters()` so all blocked waiters
@@ -141,6 +141,46 @@ struct WaitingOn {
 }
 
 impl LockManager {
+    fn release_abandoned_write_guard_memory(
+        &self,
+        path: &Path,
+        agent: &str,
+        session: Uuid,
+    ) -> bool {
+        let canon = canonicalize(path);
+        let mut state = crate::sync::lock_or_recover(&self.inner);
+        if !matches!(state.held.get(&canon), Some((s, a)) if *s == session && a == agent) {
+            return false;
+        }
+        state.held.remove(&canon);
+        state.touched.remove(&canon);
+        state.forced_released.insert(canon);
+        drop(state);
+        self.notify.notify_waiters();
+        true
+    }
+
+    async fn persist_abandoned_write_guard_release(
+        &self,
+        path: PathBuf,
+        agent: AgentId,
+        session: Uuid,
+    ) {
+        match self.db.lock_release(&path, &agent, session).await {
+            Ok(()) => {
+                let mut state = crate::sync::lock_or_recover(&self.inner);
+                state.forced_released.remove(&path);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    path = %path.display(),
+                    "failed to persist abandoned write guard release"
+                );
+            }
+        }
+    }
+
     #[cfg(test)]
     pub async fn acquire_wait_all_ordered(
         &self,
@@ -161,13 +201,13 @@ impl LockManager {
                 Ok(AcquireWait::Acquired) => acquired.push(path),
                 Ok(AcquireWait::Cancelled) => {
                     for path in acquired.into_iter().rev() {
-                        let _ = self.release(&path, agent, session);
+                        let _ = self.release(&path, agent, session).await;
                     }
                     return Ok(AcquireWait::Cancelled);
                 }
                 Err(err) => {
                     for path in acquired.into_iter().rev() {
-                        let _ = self.release(&path, agent, session);
+                        let _ = self.release(&path, agent, session).await;
                     }
                     return Err(err);
                 }
@@ -240,11 +280,12 @@ pub struct WriteGuard<'a> {
 }
 
 impl WriteGuard<'_> {
-    pub fn release_after_write(mut self) -> bool {
+    pub async fn release_after_write(mut self) -> bool {
         self.active = false;
         if self.acquired_by_guard {
             self.locks
                 .release_force_memory(&self.path, &self.agent, self.session)
+                .await
         } else {
             true
         }
@@ -256,11 +297,23 @@ impl Drop for WriteGuard<'_> {
         if !self.active || !self.acquired_by_guard {
             return;
         }
-        if let Err(error) = self.locks.release(&self.path, &self.agent, self.session) {
+        let locks = (*self.locks).clone();
+        let path = self.path.clone();
+        let agent = self.agent.clone();
+        let session = self.session;
+        if !locks.release_abandoned_write_guard_memory(&path, &agent, session) {
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                locks
+                    .persist_abandoned_write_guard_release(path, agent, session)
+                    .await;
+            });
+        } else {
             tracing::warn!(
-                error = %error,
                 path = %self.path.display(),
-                "failed to release abandoned write guard"
+                "abandoned write guard dropped outside a tokio runtime; persisted release will wait for lock recovery"
             );
         }
     }

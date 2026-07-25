@@ -16,12 +16,8 @@ pub struct SessionPlanDoc {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn get_session_plan_doc(&self, session_id: Uuid) -> Result<Option<SessionPlanDoc>> {
-        self.read_blocking(|conn| {
+    pub async fn get_session_plan_doc(&self, session_id: Uuid) -> Result<Option<SessionPlanDoc>> {
+        self.read(move |conn| {
             conn.query_row(
                 "SELECT session_id, content, revision, updated_at
                    FROM session_plan_docs
@@ -47,20 +43,17 @@ impl Db {
             .optional()
             .context("reading session plan document")
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn write_session_plan_doc(
+    pub async fn write_session_plan_doc(
         &self,
         session_id: Uuid,
         content: &str,
     ) -> Result<SessionPlanDoc> {
         let updated_at = Utc::now().timestamp();
         let content = content.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let next_revision: i64 = conn
                 .query_row(
                     "SELECT COALESCE(revision, 0) + 1
@@ -89,5 +82,6 @@ impl Db {
                 updated_at,
             })
         })
+        .await
     }
 }

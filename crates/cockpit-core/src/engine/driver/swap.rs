@@ -490,10 +490,12 @@ impl Driver {
                     let lock_result = if incoming_write_capable {
                         self.locks
                             .transfer_agent_locks(&outgoing, &agent.name, self.session.id)
+                            .await
                             .map(|_| ())
                     } else {
                         self.locks
                             .suspend_agent(&outgoing, self.session.id)
+                            .await
                             .map(|_| ())
                     };
                     if let Err(e) = lock_result {

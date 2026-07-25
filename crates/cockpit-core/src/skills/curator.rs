@@ -814,7 +814,11 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let registry = crate::daemon::registry::SessionRegistry::new(
             db.clone(),
-            Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap()),
+            Arc::new(
+                crate::locks::LockManager::from_db(db.clone())
+                    .await
+                    .unwrap(),
+            ),
             crate::daemon::shutdown::ShutdownSignal::new(),
             None,
             crate::daemon::config_source::ConfigSource::production(),

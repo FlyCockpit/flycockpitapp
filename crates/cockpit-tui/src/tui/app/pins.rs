@@ -6,13 +6,21 @@
 //! (`open_default`, same pattern as `/sessions` + `/export`). Nothing here
 //! ever enters the outbound model prompt (token economy, priority #2).
 
+use crate::tui::async_action::{
+    AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
+};
 use crate::tui::history::HistoryEntry;
 use cockpit_db::Db;
 
 use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
-use std::collections::HashSet;
 
 use super::{App, ToastKind, render};
+
+async fn load_pin_state(db: &Db, sid: uuid::Uuid) -> Result<(usize, Vec<i64>), String> {
+    let count = db.count_pins(sid).await.map_err(|e| e.to_string())?.max(0) as usize;
+    let pinned_seqs = db.list_pin_seqs(sid).await.map_err(|e| e.to_string())?;
+    Ok((count, pinned_seqs))
+}
 
 #[cfg(test)]
 thread_local! {
@@ -37,7 +45,7 @@ pub(super) enum CopyShape {
 
 impl App {
     /// Transient info toast for a pin action.
-    fn pin_toast(&mut self, text: impl Into<String>) {
+    pub(super) fn pin_toast(&mut self, text: impl Into<String>) {
         self.show_toast(text, ToastKind::Info);
     }
 
@@ -82,7 +90,7 @@ impl App {
             return;
         };
         match Db::open_default() {
-            Ok(db) => self.refresh_pin_state_from_db(sid, &db),
+            Ok(db) => self.start_pin_state_refresh(sid, db, true),
             Err(_) => {
                 self.pin_count_session = Some(sid);
                 self.pinned_seqs_session = Some(sid);
@@ -91,16 +99,49 @@ impl App {
         }
     }
 
-    fn refresh_pin_state_from_db(&mut self, sid: uuid::Uuid, db: &Db) {
+    fn start_pin_state_refresh(&mut self, sid: uuid::Uuid, db: Db, clear_first: bool) {
+        if clear_first {
+            self.pin_count = 0;
+            self.pinned_seqs_cache.clear();
+        }
         self.pin_count_session = Some(sid);
         self.pinned_seqs_session = Some(sid);
-        if let Ok(n) = db.count_pins(sid) {
+        self.async_actions.start(
+            AsyncActionKind::Refresh("pins.state"),
+            AsyncActionPolicy::Replace(AsyncActionKey::new(format!("pins.state:{sid}"))),
+            async move {
+                let (count, pinned_seqs) = load_pin_state(&db, sid).await?;
+                Ok(AsyncActionPayload::PinState {
+                    session_id: sid,
+                    count,
+                    pinned_seqs,
+                })
+            },
+        );
+    }
+
+    #[cfg(test)]
+    async fn refresh_pin_state_from_db(&mut self, sid: uuid::Uuid, db: &Db) {
+        self.pin_count_session = Some(sid);
+        self.pinned_seqs_session = Some(sid);
+        if let Ok(n) = db.count_pins(sid).await {
             self.pin_count = n.max(0) as usize;
         }
         self.pinned_seqs_cache = db
             .list_pin_seqs(sid)
+            .await
             .map(|seqs| seqs.into_iter().collect())
-            .unwrap_or_else(|_| HashSet::new());
+            .unwrap_or_default();
+    }
+
+    pub(super) fn apply_pin_state(&mut self, sid: uuid::Uuid, count: usize, pinned_seqs: Vec<i64>) {
+        if self.current_session_id() != Some(sid) {
+            return;
+        }
+        self.pin_count_session = Some(sid);
+        self.pinned_seqs_session = Some(sid);
+        self.pin_count = count;
+        self.pinned_seqs_cache = pinned_seqs.into_iter().collect();
     }
 
     /// Whether a history entry is a pinnable message with a resolved
@@ -160,26 +201,21 @@ impl App {
             return;
         };
         let Some(db) = self.pins_db() else { return };
-        match db.toggle_pin(sid, seq) {
-            Ok(now_pinned) => {
-                self.pin_toast(if now_pinned {
-                    "pinned".to_string()
-                } else {
-                    "unpinned".to_string()
-                });
-            }
-            Err(e) => {
-                self.pin_toast(format!("pin: {e}"));
-                return;
-            }
-        }
-        self.refresh_pin_count();
-        // Keep an open review in sync if the toggle unpinned a listed item.
-        if let Some(review) = self.pins_review.as_mut()
-            && review.remove_seq_if_present(seq)
-        {
-            self.pins_review = None;
-        }
+        self.async_actions.start(
+            AsyncActionKind::Internal("pins.toggle"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let now_pinned = db.toggle_pin(sid, seq).await.map_err(|e| e.to_string())?;
+                let (count, pinned_seqs) = load_pin_state(&db, sid).await?;
+                Ok(AsyncActionPayload::PinToggle {
+                    session_id: sid,
+                    seq,
+                    now_pinned,
+                    count,
+                    pinned_seqs,
+                })
+            },
+        );
     }
 
     /// `/pin` — enter pick-a-message mode. Unfocuses the composer and
@@ -217,13 +253,30 @@ impl App {
             return;
         };
         let Some(db) = self.pins_db() else { return };
-        let pins = match db.list_pins_with_text(sid) {
-            Ok(p) => p,
-            Err(e) => {
-                self.push_plain(format!("/pins: {e}"));
-                return;
-            }
-        };
+        self.async_actions.start(
+            AsyncActionKind::Internal("pins.review"),
+            AsyncActionPolicy::Replace(AsyncActionKey::new(format!("pins.review:{sid}"))),
+            async move {
+                let pins = db
+                    .list_pins_with_text(sid)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(AsyncActionPayload::PinsReview {
+                    session_id: sid,
+                    pins,
+                })
+            },
+        );
+    }
+
+    pub(super) fn apply_pins_review(
+        &mut self,
+        sid: uuid::Uuid,
+        pins: Vec<cockpit_db::pins::PinnedMessage>,
+    ) {
+        if self.current_session_id() != Some(sid) {
+            return;
+        }
         match PinsReview::enter(pins) {
             Some(review) => {
                 self.pin_pick = None;
@@ -235,6 +288,30 @@ impl App {
             None => {
                 self.push_plain("/pins: no pinned messages".to_string());
             }
+        }
+    }
+
+    pub(super) fn apply_pin_toggle(
+        &mut self,
+        sid: uuid::Uuid,
+        seq: i64,
+        now_pinned: bool,
+        count: usize,
+        pinned_seqs: Vec<i64>,
+    ) {
+        if self.current_session_id() != Some(sid) {
+            return;
+        }
+        self.pin_toast(if now_pinned {
+            "pinned".to_string()
+        } else {
+            "unpinned".to_string()
+        });
+        self.apply_pin_state(sid, count, pinned_seqs);
+        if let Some(review) = self.pins_review.as_mut()
+            && review.remove_seq_if_present(seq)
+        {
+            self.pins_review = None;
         }
     }
 
@@ -404,12 +481,22 @@ impl App {
                     return;
                 };
                 if let Some(db) = self.pins_db() {
-                    match db.pin_message(sid, seq) {
-                        Ok(true) => self.pin_toast("pinned".to_string()),
-                        Ok(false) => self.pin_toast("already pinned".to_string()),
-                        Err(e) => self.pin_toast(format!("pin: {e}")),
-                    }
-                    self.refresh_pin_count();
+                    self.async_actions.start(
+                        AsyncActionKind::Internal("pins.pin"),
+                        AsyncActionPolicy::AllowConcurrent,
+                        async move {
+                            let inserted =
+                                db.pin_message(sid, seq).await.map_err(|e| e.to_string())?;
+                            let (count, pinned_seqs) = load_pin_state(&db, sid).await?;
+                            Ok(AsyncActionPayload::PinMessage {
+                                session_id: sid,
+                                seq,
+                                inserted,
+                                count,
+                                pinned_seqs,
+                            })
+                        },
+                    );
                 }
             }
             None => {
@@ -465,12 +552,54 @@ impl App {
             return;
         };
         if let Some(db) = self.pins_db() {
-            if let Err(e) = db.unpin_message(sid, seq) {
-                self.pin_toast(format!("unpin: {e}"));
-                return;
-            }
-            self.refresh_pin_count();
+            self.async_actions.start(
+                AsyncActionKind::Internal("pins.unpin"),
+                AsyncActionPolicy::AllowConcurrent,
+                async move {
+                    db.unpin_message(sid, seq)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let (count, pinned_seqs) = load_pin_state(&db, sid).await?;
+                    Ok(AsyncActionPayload::PinUnpin {
+                        session_id: sid,
+                        seq,
+                        count,
+                        pinned_seqs,
+                    })
+                },
+            );
         }
+    }
+
+    pub(super) fn apply_pin_message(
+        &mut self,
+        sid: uuid::Uuid,
+        inserted: bool,
+        count: usize,
+        pinned_seqs: Vec<i64>,
+    ) {
+        if self.current_session_id() != Some(sid) {
+            return;
+        }
+        self.pin_toast(if inserted {
+            "pinned".to_string()
+        } else {
+            "already pinned".to_string()
+        });
+        self.apply_pin_state(sid, count, pinned_seqs);
+    }
+
+    pub(super) fn apply_pin_unpin(
+        &mut self,
+        sid: uuid::Uuid,
+        seq: i64,
+        count: usize,
+        pinned_seqs: Vec<i64>,
+    ) {
+        if self.current_session_id() != Some(sid) {
+            return;
+        }
+        self.apply_pin_state(sid, count, pinned_seqs);
         if let Some(review) = self.pins_review.as_mut() {
             let emptied = review.remove_seq(seq);
             if emptied {
@@ -1021,17 +1150,17 @@ mod tests {
         app.launch.session_id = Some(sid);
         let seq = record_msg(&db, sid, "pin me").await;
 
-        app.refresh_pin_state_from_db(sid, &db);
+        app.refresh_pin_state_from_db(sid, &db).await;
         assert_eq!(app.pin_count, 0);
         assert!(!app.is_seq_pinned_for_render(seq));
 
-        assert!(db.pin_message(sid, seq).unwrap());
-        app.refresh_pin_state_from_db(sid, &db);
+        assert!(db.pin_message(sid, seq).await.unwrap());
+        app.refresh_pin_state_from_db(sid, &db).await;
         assert_eq!(app.pin_count, 1);
         assert!(app.is_seq_pinned_for_render(seq));
 
-        assert!(db.unpin_message(sid, seq).unwrap());
-        app.refresh_pin_state_from_db(sid, &db);
+        assert!(db.unpin_message(sid, seq).await.unwrap());
+        app.refresh_pin_state_from_db(sid, &db).await;
         assert_eq!(app.pin_count, 0);
         assert!(!app.is_seq_pinned_for_render(seq));
     }

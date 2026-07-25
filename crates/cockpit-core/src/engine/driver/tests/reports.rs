@@ -214,6 +214,7 @@ async fn set_swarm_config_threads_caps_to_authority() {
             driver
                 .schedule
                 .spawn_swarm(crate::engine::schedule::authority::SpawnSpec {
+                    job_id: None,
                     worker: crate::engine::schedule::authority::SpawnWorkerKind::Bee,
                     prompt: "s".into(),
                     output_dir: "/tmp/o".into(),

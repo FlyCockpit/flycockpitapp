@@ -43,7 +43,12 @@ pub(crate) use reports::{
 };
 use skills_seed::SkillPair;
 
-use std::{collections::HashSet, path::PathBuf, pin::Pin, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc;
@@ -222,12 +227,51 @@ const GOAL_USAGE_LIMIT_BACKOFF_BASE: Duration = Duration::from_secs(30);
 const GOAL_USAGE_LIMIT_BACKOFF_MAX: Duration = Duration::from_secs(300);
 const GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS: u8 = 3;
 const GOAL_USAGE_LIMIT_INTERVENTION_CODE: &str = "usage_limit_persisted";
+const GOAL_VERIFICATION_FAILED_CODE: &str = "verification_failed";
+const GOAL_VERIFICATION_FRAMINGS: &[&str] = &[
+    "Find the strongest concrete reason this goal is NOT complete.",
+    "Assume the reported validation is misleading; verify acceptance independently.",
+    "Search for an unaddressed acceptance criterion or missing guard.",
+    "Look for late-result, race, rollback, or integration evidence that contradicts completion.",
+    "Challenge the implementation quality: missing tests, unsafe shortcuts, or scoped omissions.",
+];
 
 #[derive(Debug, PartialEq, Eq)]
 enum GoalUsageLimitWatchdogAction {
     NotUsageLimited,
     AutoResume,
     Exhausted,
+}
+
+#[derive(Debug, Clone)]
+struct GoalVerificationRound {
+    goal_id: uuid::Uuid,
+    round: i64,
+    total: usize,
+    jobs: HashMap<String, GoalVerificationJob>,
+    cannot_refute: usize,
+    refutations: Vec<String>,
+    inconclusive: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GoalVerificationJob {
+    index: usize,
+    framing: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GoalSkepticVerdict {
+    CannotRefute,
+    Refuted(String),
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GoalVerificationDecision {
+    Complete,
+    Refuted(Vec<String>),
+    Inconclusive,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +284,57 @@ struct GoalProgressObservation {
 impl GoalProgressObservation {
     fn no_progress(self) -> bool {
         self.observed_turn && !self.mutating_action && !self.context_delta
+    }
+}
+
+fn parse_goal_skeptic_verdict(text: &str) -> GoalSkepticVerdict {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("goal_verification_verdict: cannot_refute")
+        || lower.contains("\"verdict\":\"cannot_refute\"")
+        || lower.contains("\"verdict\": \"cannot_refute\"")
+    {
+        return GoalSkepticVerdict::CannotRefute;
+    }
+    if let Some(idx) = lower.find("goal_verification_verdict: refuted") {
+        let finding = text[idx..]
+            .split_once('-')
+            .map(|(_, finding)| finding.trim())
+            .filter(|finding| !finding.is_empty())
+            .unwrap_or("skeptic refuted completion without a specific finding");
+        return GoalSkepticVerdict::Refuted(finding.to_string());
+    }
+    if lower.contains("\"verdict\":\"refuted\"") || lower.contains("\"verdict\": \"refuted\"") {
+        let finding = text
+            .lines()
+            .find(|line| line.to_ascii_lowercase().contains("finding"))
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .unwrap_or("skeptic refuted completion without a specific finding");
+        return GoalSkepticVerdict::Refuted(finding.to_string());
+    }
+    GoalSkepticVerdict::Inconclusive
+}
+
+#[cfg(test)]
+mod goal_verification_tests {
+    use super::*;
+
+    #[test]
+    fn goal_skeptic_verdict_parser_accepts_cannot_refute_marker() {
+        assert_eq!(
+            parse_goal_skeptic_verdict("checked\nGOAL_VERIFICATION_VERDICT: cannot_refute"),
+            GoalSkepticVerdict::CannotRefute
+        );
+    }
+
+    #[test]
+    fn goal_skeptic_verdict_parser_extracts_refutation_marker() {
+        assert_eq!(
+            parse_goal_skeptic_verdict(
+                "issue found\nGOAL_VERIFICATION_VERDICT: refuted - missing acceptance test",
+            ),
+            GoalSkepticVerdict::Refuted("missing acceptance test".to_string())
+        );
     }
 }
 
@@ -542,6 +637,7 @@ pub struct Driver {
     goal_idle_intervention_code: Option<&'static str>,
     goal_was_active_recently: bool,
     goal_usage_limit_auto_resume_attempts: u8,
+    goal_verification_round: Option<GoalVerificationRound>,
     pending_idle_reason: Option<crate::engine::IdleReason>,
     /// Interrupt wakeup hub (GOALS §3b) threaded into every tool call so
     /// the `question` tool can block on a human answer. Defaults to a
@@ -1186,6 +1282,7 @@ impl Driver {
             goal_idle_intervention_code: None,
             goal_was_active_recently: self.goal_was_active_recently,
             goal_usage_limit_auto_resume_attempts: self.goal_usage_limit_auto_resume_attempts,
+            goal_verification_round: self.goal_verification_round.clone(),
             pending_idle_reason: self.pending_idle_reason.clone(),
             interrupts: self.interrupts.clone(),
             skills_no_utility_model_logged: self.skills_no_utility_model_logged,
@@ -1484,6 +1581,7 @@ impl Driver {
             goal_idle_intervention_code: None,
             goal_was_active_recently: false,
             goal_usage_limit_auto_resume_attempts: 0,
+            goal_verification_round: None,
             pending_idle_reason: None,
             interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             skills_no_utility_model_logged: false,
@@ -3285,6 +3383,12 @@ impl Driver {
                 self.clear_goal_idle_intervention();
                 return Ok(());
             };
+            if goal.status == crate::db::session_goals::GoalStatus::PendingVerification {
+                self.maybe_start_goal_verification_round(&goal, tx).await?;
+                self.reset_goal_progress_tracking().await;
+                self.clear_goal_idle_intervention();
+                return Ok(());
+            }
             if goal.status != crate::db::session_goals::GoalStatus::Active {
                 self.reset_goal_progress_tracking().await;
                 self.clear_goal_idle_intervention();
@@ -3347,6 +3451,276 @@ impl Driver {
             self.run_user_input(UserSubmission::text(prompt), input_rx, tx)
                 .await?;
         }
+    }
+
+    async fn maybe_start_goal_verification_round(
+        &mut self,
+        goal: &crate::db::session_goals::SessionGoal,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
+        if let Some(round) = &self.goal_verification_round
+            && round.goal_id == goal.id
+            && round.round == goal.verification_rounds
+        {
+            self.emit_goal_verification_progress(tx).await;
+            return Ok(());
+        }
+
+        let cfg = self.config.extended().goal_verification;
+        let max_rounds = i64::from(cfg.effective_max_rounds());
+        if goal.verification_rounds >= max_rounds {
+            self.goal_idle_intervention_pending = true;
+            self.goal_idle_intervention_code = Some(GOAL_VERIFICATION_FAILED_CODE);
+            self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                code: GOAL_VERIFICATION_FAILED_CODE.to_string(),
+            });
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: "goal: completion verification failed repeatedly; run `/goal resume` after adding direction".to_string(),
+                })
+                .await;
+            return Ok(());
+        }
+
+        let total = cfg.effective_skeptic_count();
+        let mut round = GoalVerificationRound {
+            goal_id: goal.id,
+            round: goal.verification_rounds,
+            total,
+            jobs: HashMap::new(),
+            cannot_refute: 0,
+            refutations: Vec::new(),
+            inconclusive: 0,
+        };
+        for idx in 0..total {
+            let framing = GOAL_VERIFICATION_FRAMINGS[idx % GOAL_VERIFICATION_FRAMINGS.len()];
+            let job_id = format!("goal-verif-{}", uuid::Uuid::new_v4().simple());
+            let prompt = self
+                .goal_verification_prompt(goal, idx, total, framing)
+                .await?;
+            let output_dir = std::env::temp_dir()
+                .join("cockpit-goal-verification")
+                .join(goal.id.to_string())
+                .join(format!("round-{}", goal.verification_rounds))
+                .join(format!("skeptic-{idx}"))
+                .display()
+                .to_string();
+            self.schedule
+                .spawn_swarm(crate::engine::schedule::authority::SpawnSpec {
+                    job_id: Some(job_id.clone()),
+                    worker: crate::engine::schedule::authority::SpawnWorkerKind::Scout,
+                    prompt,
+                    output_dir,
+                    model: cfg.skeptic_model.clone(),
+                    depth: 0,
+                    max_depth: self.swarm_max_depth,
+                });
+            round.jobs.insert(
+                job_id,
+                GoalVerificationJob {
+                    index: idx,
+                    framing,
+                },
+            );
+        }
+        self.goal_verification_round = Some(round);
+        self.emit_goal_verification_progress(tx).await;
+        Ok(())
+    }
+
+    async fn goal_verification_prompt(
+        &self,
+        goal: &crate::db::session_goals::SessionGoal,
+        idx: usize,
+        total: usize,
+        framing: &str,
+    ) -> Result<String> {
+        let recent = self.recent_goal_verification_context().await;
+        Ok(format!(
+            "Goal completion skeptic {}/{} for goal `{}`.\n\nRefute framing: {}\n\nGoal objective:\n{}\n\nGoal context / acceptance criteria:\n{}\n\nCompletion evidence claimed by primary:\n{}\n\nRecent transcript and validation signals:\n{}\n\nInspect the repository/worktree as needed. Try to refute that the goal is complete. Return a concise answer ending with exactly one of these lines:\nGOAL_VERIFICATION_VERDICT: cannot_refute\nGOAL_VERIFICATION_VERDICT: refuted - <specific finding>\nIf you cannot inspect enough evidence to decide, end with:\nGOAL_VERIFICATION_VERDICT: inconclusive",
+            idx + 1,
+            total,
+            goal.id,
+            framing,
+            goal.objective,
+            goal.context.as_deref().unwrap_or("(none)"),
+            goal.completion_evidence.as_deref().unwrap_or("(missing)"),
+            recent,
+        ))
+    }
+
+    async fn recent_goal_verification_context(&self) -> String {
+        let Ok(events) = self.session.db.list_session_events(self.session.id).await else {
+            return "(recent transcript unavailable)".to_string();
+        };
+        let mut out = String::new();
+        for event in events.iter().rev().take(24).rev() {
+            let snippet = event.data.to_string();
+            let snippet: String = snippet.chars().take(600).collect();
+            out.push_str(&format!(
+                "- seq {} kind {} agent {:?}: {}\n",
+                event.seq, event.kind, event.agent, snippet
+            ));
+        }
+        if out.trim().is_empty() {
+            "(no recent events recorded)".to_string()
+        } else {
+            out
+        }
+    }
+
+    async fn emit_goal_verification_progress(&self, tx: &mpsc::Sender<TurnEvent>) {
+        if let Some(round) = &self.goal_verification_round {
+            let done = round
+                .cannot_refute
+                .saturating_add(round.refutations.len())
+                .saturating_add(round.inconclusive);
+            let _ = tx
+                .send(TurnEvent::GoalVerificationProgress {
+                    done,
+                    total: round.total,
+                })
+                .await;
+        }
+    }
+
+    pub(in crate::engine::driver) async fn handle_goal_verification_completion(
+        &mut self,
+        job_id: &str,
+        result: &str,
+        failed: bool,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<bool> {
+        let Some(mut round) = self.goal_verification_round.take() else {
+            return Ok(false);
+        };
+        let Some(job) = round.jobs.remove(job_id) else {
+            self.goal_verification_round = Some(round);
+            return Ok(false);
+        };
+
+        match if failed {
+            GoalSkepticVerdict::Inconclusive
+        } else {
+            parse_goal_skeptic_verdict(result)
+        } {
+            GoalSkepticVerdict::CannotRefute => round.cannot_refute += 1,
+            GoalSkepticVerdict::Refuted(finding) => round.refutations.push(format!(
+                "skeptic {} ({}): {}",
+                job.index + 1,
+                job.framing,
+                finding
+            )),
+            GoalSkepticVerdict::Inconclusive => round.inconclusive += 1,
+        }
+
+        let done = round
+            .cannot_refute
+            .saturating_add(round.refutations.len())
+            .saturating_add(round.inconclusive);
+        let majority = round.total / 2 + 1;
+        let decision = if round.cannot_refute >= majority {
+            Some(GoalVerificationDecision::Complete)
+        } else if round.refutations.len() >= majority {
+            Some(GoalVerificationDecision::Refuted(round.refutations.clone()))
+        } else if done >= round.total {
+            Some(GoalVerificationDecision::Inconclusive)
+        } else {
+            None
+        };
+        let goal_id = round.goal_id;
+        let total = round.total;
+        if decision.is_none() {
+            self.goal_verification_round = Some(round);
+        }
+        let _ = tx
+            .send(TurnEvent::GoalVerificationProgress { done, total })
+            .await;
+
+        let Some(decision) = decision else {
+            return Ok(true);
+        };
+
+        match decision {
+            GoalVerificationDecision::Complete => {
+                if self
+                    .session
+                    .db
+                    .complete_pending_session_goal_verification(self.session.id, goal_id)
+                    .await?
+                    .is_some()
+                {
+                    self.pending_idle_reason = Some(crate::engine::IdleReason::GoalComplete);
+                    self.goal_was_active_recently = false;
+                }
+            }
+            GoalVerificationDecision::Refuted(findings) => {
+                self.reopen_goal_after_verification_failure(
+                    goal_id,
+                    findings.join("\n"),
+                    input_rx,
+                    tx,
+                )
+                .await?;
+            }
+            GoalVerificationDecision::Inconclusive => {
+                self.reopen_goal_after_verification_failure(
+                    goal_id,
+                    "verification could not form a majority; continue, gather stronger evidence, and re-attempt completion".to_string(),
+                    input_rx,
+                    tx,
+                )
+                .await?;
+            }
+        }
+        Ok(true)
+    }
+
+    async fn reopen_goal_after_verification_failure(
+        &mut self,
+        goal_id: uuid::Uuid,
+        findings: String,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
+        let context_delta = format!("Completion verification did not pass:\n{findings}");
+        let Some(goal) = self
+            .session
+            .db
+            .reopen_pending_session_goal_verification(self.session.id, goal_id, &context_delta)
+            .await?
+        else {
+            return Ok(());
+        };
+        let max_rounds = i64::from(
+            self.config
+                .extended()
+                .goal_verification
+                .effective_max_rounds(),
+        );
+        if goal.verification_rounds >= max_rounds {
+            self.goal_idle_intervention_pending = true;
+            self.goal_idle_intervention_code = Some(GOAL_VERIFICATION_FAILED_CODE);
+            self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                code: GOAL_VERIFICATION_FAILED_CODE.to_string(),
+            });
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: "goal: verification failed after the configured round cap; run `/goal resume` after adding direction".to_string(),
+                })
+                .await;
+            return Ok(());
+        }
+
+        let prompt = format!(
+            "Goal completion was refuted by skeptic verification. Continue the active goal and address these findings before trying to complete it again:\n\n{findings}"
+        );
+        self.reset_goal_progress_tracking().await;
+        self.clear_goal_idle_intervention();
+        self.run_user_input(UserSubmission::text(prompt), input_rx, tx)
+            .await?;
+        Ok(())
     }
 
     async fn reset_goal_progress_tracking(&mut self) {
@@ -6502,6 +6876,7 @@ impl Driver {
                             };
                             self.schedule.spawn_swarm(
                                 crate::engine::schedule::authority::SpawnSpec {
+                                    job_id: None,
                                     worker,
                                     prompt,
                                     output_dir,

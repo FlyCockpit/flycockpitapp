@@ -158,6 +158,34 @@ async fn handle_update(args: GoalArgs, ctx: &ToolCtx) -> Result<ToolOutput> {
             )));
         }
     };
+    if status == GoalStatus::Complete {
+        let current = ctx
+            .session
+            .db
+            .current_session_goal(ctx.session.id, false)
+            .await?;
+        let verification = ctx.config.extended().goal_verification;
+        if current
+            .as_ref()
+            .is_some_and(|goal| verification.enabled_for_token_budget(goal.token_budget))
+        {
+            let evidence = required_opt_str(args.evidence.as_deref(), "evidence")?;
+            let goal = ctx
+                .session
+                .db
+                .begin_session_goal_verification(
+                    ctx.session.id,
+                    evidence,
+                    args.context_delta.as_deref(),
+                )
+                .await?;
+            return Ok(ToolOutput::text(format!(
+                "Goal `{}` status is now `{}`; completion evidence is queued for skeptic verification.",
+                goal.id,
+                goal.status.as_str()
+            )));
+        }
+    }
     match ctx
         .session
         .db
@@ -227,6 +255,149 @@ mod tests {
             .unwrap_err();
         assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
         assert!(err.to_string().contains("valid statuses"));
+    }
+
+    #[tokio::test]
+    async fn complete_with_verification_enabled_enters_pending_verification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.session
+            .db
+            .create_session_goal(
+                ctx.session.id,
+                &ctx.session.project_id,
+                "ship feature",
+                None,
+                Some(100),
+            )
+            .await
+            .unwrap();
+        ctx.session
+            .db
+            .current_session_goal(ctx.session.id, true)
+            .await
+            .unwrap();
+
+        let out = GoalTool
+            .call(
+                serde_json::json!({
+                    "action": "update",
+                    "status": "complete",
+                    "evidence": "focused tests passed"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let goal = ctx
+            .session
+            .db
+            .current_session_goal(ctx.session.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.status, GoalStatus::PendingVerification);
+        assert_eq!(
+            goal.completion_evidence.as_deref(),
+            Some("focused tests passed")
+        );
+        assert!(out.content.contains("skeptic verification"));
+    }
+
+    #[tokio::test]
+    async fn complete_with_verification_disabled_completes_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.goal_verification.enabled = false;
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+        ctx.session
+            .db
+            .create_session_goal(
+                ctx.session.id,
+                &ctx.session.project_id,
+                "ship feature",
+                None,
+                Some(100),
+            )
+            .await
+            .unwrap();
+        ctx.session
+            .db
+            .current_session_goal(ctx.session.id, true)
+            .await
+            .unwrap();
+
+        GoalTool
+            .call(
+                serde_json::json!({
+                    "action": "update",
+                    "status": "complete",
+                    "evidence": "done"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ctx.session
+                .db
+                .current_session_goal(ctx.session.id, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_without_token_budget_completes_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.session
+            .db
+            .create_session_goal(
+                ctx.session.id,
+                &ctx.session.project_id,
+                "ship feature",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        ctx.session
+            .db
+            .current_session_goal(ctx.session.id, true)
+            .await
+            .unwrap();
+
+        GoalTool
+            .call(
+                serde_json::json!({
+                    "action": "update",
+                    "status": "complete",
+                    "evidence": "done"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ctx.session
+                .db
+                .current_session_goal(ctx.session.id, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

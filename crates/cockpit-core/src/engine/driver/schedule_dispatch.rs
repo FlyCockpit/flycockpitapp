@@ -37,6 +37,12 @@ impl Driver {
                 if matches!(kind, crate::engine::schedule::ScheduleKind::Swarm) {
                     self.schedule.swarm_completed();
                 }
+                if self
+                    .handle_goal_verification_completion(&job_id, &result, failed, input_rx, tx)
+                    .await?
+                {
+                    return Ok(());
+                }
                 // UI marker for the strip / transcript.
                 let _ = tx
                     .send(TurnEvent::ScheduleCompleted {

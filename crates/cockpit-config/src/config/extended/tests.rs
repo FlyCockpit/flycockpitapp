@@ -17,6 +17,40 @@ fn skills_write_approval_defaults_on() {
     );
 }
 
+#[test]
+fn goal_verification_defaults_and_sparse_write_round_trip() {
+    let default = GoalVerificationConfig::default();
+    assert!(default.enabled_for_token_budget(Some(100)));
+    assert!(!default.enabled_for_token_budget(None));
+    assert_eq!(
+        default.effective_skeptic_count(),
+        DEFAULT_GOAL_VERIFICATION_SKEPTIC_COUNT
+    );
+    assert_eq!(
+        default.effective_max_rounds(),
+        DEFAULT_GOAL_VERIFICATION_MAX_ROUNDS
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let mut cfg = ExtendedConfig::default();
+    cfg.goal_verification.enabled = false;
+    cfg.goal_verification.skeptic_count = 5;
+    cfg.goal_verification.skeptic_model = Some("provider:model".into());
+    cfg.goal_verification.max_rounds = 4;
+    doc.write(&cfg).unwrap();
+
+    let reloaded = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert!(!reloaded.goal_verification.enabled);
+    assert_eq!(reloaded.goal_verification.skeptic_count, 5);
+    assert_eq!(
+        reloaded.goal_verification.skeptic_model.as_deref(),
+        Some("provider:model")
+    );
+    assert_eq!(reloaded.goal_verification.max_rounds, 4);
+}
+
 /// Consolidation (GOALS §2a): a single `config.json` holding BOTH
 /// layer-wide provider metadata AND the former-`ExtendedConfig` keys must
 /// deserialize cleanly through each loader — neither rejects the

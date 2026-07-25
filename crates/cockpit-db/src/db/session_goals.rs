@@ -14,6 +14,7 @@ pub enum GoalStatus {
     Active,
     Paused,
     Blocked,
+    PendingVerification,
     Complete,
     BudgetLimited,
     UsageLimited,
@@ -25,6 +26,7 @@ impl GoalStatus {
             Self::Active => "active",
             Self::Paused => "paused",
             Self::Blocked => "blocked",
+            Self::PendingVerification => "pending_verification",
             Self::Complete => "complete",
             Self::BudgetLimited => "budget_limited",
             Self::UsageLimited => "usage_limited",
@@ -36,6 +38,7 @@ impl GoalStatus {
             "active" => Ok(Self::Active),
             "paused" => Ok(Self::Paused),
             "blocked" => Ok(Self::Blocked),
+            "pending_verification" => Ok(Self::PendingVerification),
             "complete" => Ok(Self::Complete),
             "budget_limited" => Ok(Self::BudgetLimited),
             "usage_limited" => Ok(Self::UsageLimited),
@@ -55,6 +58,8 @@ pub struct SessionGoal {
     pub token_budget: Option<i64>,
     pub tokens_used: i64,
     pub blocked_attempts: i64,
+    pub completion_evidence: Option<String>,
+    pub verification_rounds: i64,
     pub last_read_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -67,10 +72,11 @@ pub enum GoalUpdateOutcome {
 }
 
 pub const BLOCK_ATTEMPTS_REQUIRED: i64 = 3;
-const OPEN_STATUS_VALUES: [&str; 5] = [
+const OPEN_STATUS_VALUES: [&str; 6] = [
     "active",
     "paused",
     "blocked",
+    "pending_verification",
     "budget_limited",
     "usage_limited",
 ];
@@ -197,6 +203,7 @@ impl Db {
                 }
                 GoalStatus::Active
                 | GoalStatus::Paused
+                | GoalStatus::PendingVerification
                 | GoalStatus::BudgetLimited
                 | GoalStatus::UsageLimited => {}
             }
@@ -231,6 +238,106 @@ impl Db {
             .await
     }
 
+    pub async fn begin_session_goal_verification(
+        &self,
+        session_id: Uuid,
+        evidence: &str,
+        context_delta: Option<&str>,
+    ) -> Result<SessionGoal> {
+        let evidence = evidence.to_owned();
+        let context_delta = context_delta.map(str::to_owned);
+        let now = Utc::now().timestamp();
+        self.write(move |conn| {
+            let mut goal = current_goal_required(conn, session_id)?;
+            let evidence = clean_opt(Some(evidence.as_str()))
+                .ok_or_else(|| anyhow::anyhow!("complete requires evidence"))?;
+            let read_at = goal
+                .last_read_at
+                .ok_or_else(|| anyhow::anyhow!("complete requires goal(action=\"get\") first"))?;
+            if read_at < goal.updated_at {
+                anyhow::bail!(
+                    "goal changed since last goal(action=\"get\"); reread before complete"
+                );
+            }
+            let context = append_context(goal.context.as_deref(), context_delta.as_deref());
+            conn.execute(
+                "UPDATE session_goals
+                    SET status = 'pending_verification',
+                        context = COALESCE(?1, context),
+                        completion_evidence = ?2,
+                        updated_at = ?3
+                  WHERE id = ?4 AND session_id = ?5",
+                params![
+                    context,
+                    evidence,
+                    now,
+                    goal.id.to_string(),
+                    session_id.to_string()
+                ],
+            )
+            .context("beginning session goal verification")?;
+            goal.status = GoalStatus::PendingVerification;
+            load_goal(conn, session_id, goal.id)
+        })
+        .await
+    }
+
+    pub async fn complete_pending_session_goal_verification(
+        &self,
+        session_id: Uuid,
+        goal_id: Uuid,
+    ) -> Result<Option<SessionGoal>> {
+        self.write(move |conn| {
+            let Some(goal) = load_goal_optional(conn, session_id, goal_id)? else {
+                return Ok(None);
+            };
+            if goal.status != GoalStatus::PendingVerification {
+                return Ok(None);
+            }
+            let now = Utc::now().timestamp();
+            conn.execute(
+                "UPDATE session_goals
+                    SET status = 'complete', updated_at = ?1
+                  WHERE id = ?2 AND session_id = ?3 AND status = 'pending_verification'",
+                params![now, goal.id.to_string(), session_id.to_string()],
+            )
+            .context("completing pending goal verification")?;
+            Ok(Some(load_goal(conn, session_id, goal.id)?))
+        })
+        .await
+    }
+
+    pub async fn reopen_pending_session_goal_verification(
+        &self,
+        session_id: Uuid,
+        goal_id: Uuid,
+        context_delta: &str,
+    ) -> Result<Option<SessionGoal>> {
+        let context_delta = context_delta.to_owned();
+        self.write(move |conn| {
+            let Some(goal) = load_goal_optional(conn, session_id, goal_id)? else {
+                return Ok(None);
+            };
+            if goal.status != GoalStatus::PendingVerification {
+                return Ok(None);
+            }
+            let now = Utc::now().timestamp();
+            let context = append_context(goal.context.as_deref(), Some(context_delta.as_str()));
+            conn.execute(
+                "UPDATE session_goals
+                    SET status = 'active',
+                        context = COALESCE(?1, context),
+                        verification_rounds = verification_rounds + 1,
+                        updated_at = ?2
+                  WHERE id = ?3 AND session_id = ?4 AND status = 'pending_verification'",
+                params![context, now, goal.id.to_string(), session_id.to_string()],
+            )
+            .context("reopening pending goal verification")?;
+            Ok(Some(load_goal(conn, session_id, goal.id)?))
+        })
+        .await
+    }
+
     pub async fn set_session_goal_status(
         &self,
         session_id: Uuid,
@@ -261,7 +368,8 @@ impl Db {
             .query_row(
                 &format!(
                     "SELECT id, session_id, project_id, objective, context, status, token_budget,
-                        tokens_used, blocked_attempts, last_read_at, created_at, updated_at
+                        tokens_used, blocked_attempts, completion_evidence, verification_rounds,
+                        last_read_at, created_at, updated_at
                  FROM session_goals
                  WHERE session_id = ?1
                    AND status IN ({open_statuses})
@@ -269,8 +377,9 @@ impl Db {
                      WHEN 'active' THEN 0
                      WHEN 'paused' THEN 1
                      WHEN 'blocked' THEN 2
-                     WHEN 'budget_limited' THEN 3
-                     WHEN 'usage_limited' THEN 4
+                     WHEN 'pending_verification' THEN 3
+                     WHEN 'budget_limited' THEN 4
+                     WHEN 'usage_limited' THEN 5
                  END, updated_at DESC
                  LIMIT 1"
                 ),
@@ -379,7 +488,8 @@ fn current_goal_required(conn: &rusqlite::Connection, session_id: Uuid) -> Resul
     conn.query_row(
         &format!(
             "SELECT id, session_id, project_id, objective, context, status, token_budget,
-                tokens_used, blocked_attempts, last_read_at, created_at, updated_at
+                tokens_used, blocked_attempts, completion_evidence, verification_rounds,
+                last_read_at, created_at, updated_at
          FROM session_goals
          WHERE session_id = ?1
            AND status IN ({open_statuses})
@@ -413,13 +523,32 @@ fn param_refs(params: &[Box<dyn rusqlite::ToSql>]) -> Vec<&dyn rusqlite::ToSql> 
 fn load_goal(conn: &rusqlite::Connection, session_id: Uuid, id: Uuid) -> Result<SessionGoal> {
     conn.query_row(
         "SELECT id, session_id, project_id, objective, context, status, token_budget,
-                tokens_used, blocked_attempts, last_read_at, created_at, updated_at
+                tokens_used, blocked_attempts, completion_evidence, verification_rounds,
+                last_read_at, created_at, updated_at
          FROM session_goals
          WHERE session_id = ?1 AND id = ?2",
         params![session_id.to_string(), id.to_string()],
         decode_goal,
     )
     .context("loading session goal")
+}
+
+fn load_goal_optional(
+    conn: &rusqlite::Connection,
+    session_id: Uuid,
+    id: Uuid,
+) -> Result<Option<SessionGoal>> {
+    conn.query_row(
+        "SELECT id, session_id, project_id, objective, context, status, token_budget,
+                tokens_used, blocked_attempts, completion_evidence, verification_rounds,
+                last_read_at, created_at, updated_at
+         FROM session_goals
+         WHERE session_id = ?1 AND id = ?2",
+        params![session_id.to_string(), id.to_string()],
+        decode_goal,
+    )
+    .optional()
+    .context("loading optional session goal")
 }
 
 fn decode_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionGoal> {
@@ -438,9 +567,11 @@ fn decode_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionGoal> {
         token_budget: row.get(6)?,
         tokens_used: row.get(7)?,
         blocked_attempts: row.get(8)?,
-        last_read_at: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        completion_evidence: row.get(9)?,
+        verification_rounds: row.get(10)?,
+        last_read_at: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
@@ -455,6 +586,14 @@ mod tests {
     #[tokio::test]
     async fn goal_status_parse_rejects_draft() {
         assert!(GoalStatus::parse("draft").is_err());
+    }
+
+    #[tokio::test]
+    async fn goal_status_pending_verification_round_trips() {
+        let status = GoalStatus::parse("pending_verification").unwrap();
+        assert_eq!(status, GoalStatus::PendingVerification);
+        assert_eq!(status.as_str(), "pending_verification");
+        assert!(OPEN_STATUS_VALUES.contains(&"pending_verification"));
     }
 
     #[tokio::test]
@@ -499,6 +638,107 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(out, GoalUpdateOutcome::Updated(g) if g.status == GoalStatus::Complete));
+    }
+
+    #[tokio::test]
+    async fn begin_verification_stores_completion_evidence() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("p", "/tmp/goal-test", "Build")
+            .await
+            .unwrap();
+        db.create_session_goal(
+            session.session_id,
+            &session.project_id,
+            "ship feature",
+            None,
+            Some(100),
+        )
+        .await
+        .unwrap();
+        db.current_session_goal(session.session_id, true)
+            .await
+            .unwrap();
+
+        let goal = db
+            .begin_session_goal_verification(session.session_id, "tests passed", None)
+            .await
+            .unwrap();
+
+        assert_eq!(goal.status, GoalStatus::PendingVerification);
+        assert_eq!(goal.completion_evidence.as_deref(), Some("tests passed"));
+        assert_eq!(goal.verification_rounds, 0);
+    }
+
+    #[tokio::test]
+    async fn goal_clear_force_completes_pending_verification() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("p", "/tmp/goal-test", "Build")
+            .await
+            .unwrap();
+        db.create_session_goal(
+            session.session_id,
+            &session.project_id,
+            "ship feature",
+            None,
+            Some(100),
+        )
+        .await
+        .unwrap();
+        db.current_session_goal(session.session_id, true)
+            .await
+            .unwrap();
+        db.begin_session_goal_verification(session.session_id, "done", None)
+            .await
+            .unwrap();
+
+        assert!(db.clear_session_goal(session.session_id).await.unwrap());
+        assert!(
+            db.current_session_goal(session.session_id, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_verification_result_ignores_late_non_pending_goal() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("p", "/tmp/goal-test", "Build")
+            .await
+            .unwrap();
+        let goal = db
+            .create_session_goal(
+                session.session_id,
+                &session.project_id,
+                "ship feature",
+                None,
+                Some(100),
+            )
+            .await
+            .unwrap();
+        db.current_session_goal(session.session_id, true)
+            .await
+            .unwrap();
+        db.begin_session_goal_verification(session.session_id, "done", None)
+            .await
+            .unwrap();
+        assert!(db.clear_session_goal(session.session_id).await.unwrap());
+
+        assert!(
+            db.reopen_pending_session_goal_verification(session.session_id, goal.id, "late refute")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.complete_pending_session_goal_verification(session.session_id, goal.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

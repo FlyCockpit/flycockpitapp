@@ -193,6 +193,9 @@ pub enum SpawnWorkerKind {
 /// concurrency cap centrally.
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
+    /// Optional preassigned job id for callers that need to correlate queued
+    /// work before a concurrency slot is available.
+    pub job_id: Option<String>,
     /// Which worker factory to use. Both route through this same authority:
     /// write-capable `bee` for Swarm, read-only `scout` for Multireview.
     pub worker: SpawnWorkerKind,
@@ -329,6 +332,14 @@ impl ScheduleAuthority {
                 MAX_SWARM_PROMPT_BYTES
             );
         }
+        let spec = SpawnSpec {
+            job_id: spec.job_id.or_else(|| Some(new_job_id())),
+            ..spec
+        };
+        let job_id = spec
+            .job_id
+            .clone()
+            .expect("spawn_swarm assigns a job id before queueing");
         if self.swarm_at_capacity() {
             if self.swarm_queue.len() >= MAX_SWARM_QUEUE_LEN {
                 return format!(
@@ -339,7 +350,7 @@ impl ScheduleAuthority {
             }
             self.swarm_queue.push_back(spec);
             return format!(
-                "queued (swarm concurrency cap {} reached; {} waiting) — starts when a slot frees",
+                "queued swarm subagent `{job_id}` (swarm concurrency cap {} reached; {} waiting) — starts when a slot frees",
                 self.swarm_max_concurrency,
                 self.swarm_queue.len()
             );
@@ -352,7 +363,7 @@ impl ScheduleAuthority {
     /// reserved by the caller's cap check). Registers the job, bumps the
     /// running count, and spawns the runner. Returns the job id.
     fn start_swarm_now(&mut self, spec: SpawnSpec) -> String {
-        let job_id = new_job_id();
+        let job_id = spec.job_id.clone().unwrap_or_else(new_job_id);
         let label = swarm_label(&spec);
         self.running_swarm += 1;
         self.emit_started(&job_id, &label, ScheduleKind::Swarm);
@@ -1086,6 +1097,7 @@ mod tests {
     /// A [`SpawnSpec`] for the recursive-`Swarm` cap/queue tests.
     fn swarm_spec(depth: u32) -> SpawnSpec {
         SpawnSpec {
+            job_id: None,
             worker: SpawnWorkerKind::Bee,
             prompt: "slice".into(),
             output_dir: "/tmp/out".into(),

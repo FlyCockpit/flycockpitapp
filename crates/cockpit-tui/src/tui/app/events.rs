@@ -888,6 +888,12 @@ impl App {
                 // accounts for it.
                 self.estimate_at_last_usage = self.estimate_context_tokens();
             }
+            TurnEvent::GoalVerificationProgress { done, total } => {
+                self.idle_reason_status = Some(super::IdleReasonStatus {
+                    text: format!("verifying completion ({done}/{total})..."),
+                    kind: super::ToastKind::Info,
+                });
+            }
             TurnEvent::AgentIdle { turn_id, reason } => {
                 let has_working_span = self.has_working_span_in_progress();
                 let matches_working_span = self.working_span_matches(turn_id.as_deref());

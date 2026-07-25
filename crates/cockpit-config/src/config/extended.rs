@@ -281,6 +281,15 @@ pub struct ExtendedConfig {
     #[serde(default)]
     pub review: ReviewConfig,
 
+    /// Goal-completion skeptic verification defaults. The driver applies this
+    /// only to budgeted goals unless a later per-session override says more.
+    #[serde(
+        rename = "goalVerification",
+        default,
+        skip_serializing_if = "GoalVerificationConfig::is_default"
+    )]
+    pub goal_verification: GoalVerificationConfig,
+
     /// Language Server Protocol diagnostics and navigation settings.
     #[serde(default)]
     pub lsp: LspConfig,
@@ -1567,6 +1576,7 @@ impl Default for ExtendedConfig {
             deepthink: DeepthinkConfig::default(),
             swarm: SwarmConfig::default(),
             review: ReviewConfig::default(),
+            goal_verification: GoalVerificationConfig::default(),
             lsp: LspConfig::default(),
             data_syntax: DataSyntaxConfig::default(),
             loop_guard: LoopGuardConfig::default(),
@@ -1590,6 +1600,73 @@ impl Default for ExtendedConfig {
             intel: IntelConfig::default(),
         }
     }
+}
+
+pub const DEFAULT_GOAL_VERIFICATION_SKEPTIC_COUNT: usize = 3;
+pub const DEFAULT_GOAL_VERIFICATION_MAX_ROUNDS: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalVerificationConfig {
+    /// Master switch for completion verification. Effective verification is
+    /// also gated on the goal having a token budget in this prompt's default
+    /// surface.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Number of parallel refute-framed skeptics per verification round.
+    #[serde(
+        rename = "skepticCount",
+        default = "default_goal_verification_skeptic_count"
+    )]
+    pub skeptic_count: usize,
+    /// Optional model selector (`provider:model-id`) for skeptic agents.
+    /// Unset falls back to the session model.
+    #[serde(
+        rename = "skepticModel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub skeptic_model: Option<String>,
+    /// Failed/inconclusive rounds before the driver stops and surfaces
+    /// `verification_failed`.
+    #[serde(rename = "maxRounds", default = "default_goal_verification_max_rounds")]
+    pub max_rounds: u32,
+}
+
+impl GoalVerificationConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn effective_skeptic_count(&self) -> usize {
+        self.skeptic_count.max(1)
+    }
+
+    pub fn effective_max_rounds(&self) -> u32 {
+        self.max_rounds.max(1)
+    }
+
+    pub fn enabled_for_token_budget(&self, token_budget: Option<i64>) -> bool {
+        self.enabled && token_budget.is_some()
+    }
+}
+
+impl Default for GoalVerificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            skeptic_count: DEFAULT_GOAL_VERIFICATION_SKEPTIC_COUNT,
+            skeptic_model: None,
+            max_rounds: DEFAULT_GOAL_VERIFICATION_MAX_ROUNDS,
+        }
+    }
+}
+
+fn default_goal_verification_skeptic_count() -> usize {
+    DEFAULT_GOAL_VERIFICATION_SKEPTIC_COUNT
+}
+
+fn default_goal_verification_max_rounds() -> u32 {
+    DEFAULT_GOAL_VERIFICATION_MAX_ROUNDS
 }
 
 fn default_agent_guidance_files() -> Vec<String> {
@@ -1848,6 +1925,7 @@ impl ExtendedConfigDoc {
         parse_field!("deepthink", deepthink);
         parse_field!("swarm", swarm);
         parse_field!("review", review);
+        parse_field!("goalVerification", goal_verification);
         parse_field!("lsp", lsp);
         parse_field!("data_syntax", data_syntax);
         parse_field!("loop_guard", loop_guard);
@@ -1936,6 +2014,7 @@ impl ExtendedConfigDoc {
         remove_malformed!("approvalPolicy", ApprovalPolicyConfig);
         remove_malformed!("sandbox", SandboxConfig);
         remove_malformed!("review", ReviewConfig);
+        remove_malformed!("goalVerification", GoalVerificationConfig);
         raw
     }
 
@@ -2021,6 +2100,7 @@ impl ExtendedConfigDoc {
             "sandbox",
             "tools",
             "web",
+            "goalVerification",
         ] {
             if serialized.get(key).is_none() {
                 obj.remove(key);

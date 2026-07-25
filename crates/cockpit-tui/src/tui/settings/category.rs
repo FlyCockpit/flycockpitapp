@@ -394,6 +394,10 @@ pub(super) enum SettingId {
     DelegationMaxParallel,
     SwarmMaxDepth,
     SwarmMaxConcurrency,
+    GoalVerificationEnabled,
+    GoalVerificationSkepticCount,
+    GoalVerificationModel,
+    GoalVerificationMaxRounds,
     DialogLockoutMs,
     TimeInjectionInterval,
     PackagesDir,
@@ -488,6 +492,10 @@ const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::DelegationMaxParallel,
     SettingId::SwarmMaxDepth,
     SettingId::SwarmMaxConcurrency,
+    SettingId::GoalVerificationEnabled,
+    SettingId::GoalVerificationSkepticCount,
+    SettingId::GoalVerificationModel,
+    SettingId::GoalVerificationMaxRounds,
     SettingId::DialogLockoutMs,
     SettingId::TimeInjectionInterval,
     SettingId::PackagesDir,
@@ -585,6 +593,10 @@ impl SettingId {
             SettingId::DelegationMaxParallel => "max parallel task delegations",
             SettingId::SwarmMaxDepth => "swarm max depth",
             SettingId::SwarmMaxConcurrency => "swarm max concurrency",
+            SettingId::GoalVerificationEnabled => "goal completion verification",
+            SettingId::GoalVerificationSkepticCount => "goal skeptic count",
+            SettingId::GoalVerificationModel => "goal skeptic model",
+            SettingId::GoalVerificationMaxRounds => "goal verification rounds",
             SettingId::DialogLockoutMs => "dialog lockout (ms)",
             SettingId::TimeInjectionInterval => "time-injection interval (min)",
             SettingId::PackagesDir => "packages dir",
@@ -924,6 +936,23 @@ impl SettingId {
                  tree (not per level). Spawns beyond it queue and start as slots \
                  free. `0` means unlimited. Default 8."
             }
+            SettingId::GoalVerificationEnabled => {
+                "Verify model-claimed goal completion before closing budgeted goals. On \
+                 (default) means a complete update on a token-budgeted goal runs \
+                 refute-framed skeptic scouts first; off restores immediate completion."
+            }
+            SettingId::GoalVerificationSkepticCount => {
+                "How many refute-framed skeptic scouts run in parallel for each \
+                 completion verification round. A majority decides. Default 3."
+            }
+            SettingId::GoalVerificationModel => {
+                "Optional model selector (`provider:model-id`) for completion skeptics. \
+                 Blank falls back to the same model as the active session."
+            }
+            SettingId::GoalVerificationMaxRounds => {
+                "How many failed or inconclusive verification rounds the driver will \
+                 auto-reopen before surfacing `verification_failed`. Default 2."
+            }
             SettingId::DialogLockoutMs => {
                 "How long (milliseconds) an answer dialog ignores input after it \
                  appears, so a keystroke you were mid-typing can't accidentally \
@@ -1093,6 +1122,7 @@ impl SettingId {
             | SettingId::SkillInjectionModel
             | SettingId::PredictNextMessageModel
             | SettingId::HarnessReportSummarizationModel
+            | SettingId::GoalVerificationModel
             | SettingId::CompactModel
             | SettingId::Instructions
             | SettingId::RedactPatterns
@@ -1111,6 +1141,8 @@ impl SettingId {
             | SettingId::DelegationMaxParallel
             | SettingId::SwarmMaxDepth
             | SettingId::SwarmMaxConcurrency
+            | SettingId::GoalVerificationSkepticCount
+            | SettingId::GoalVerificationMaxRounds
             | SettingId::DialogLockoutMs
             | SettingId::TimeInjectionInterval
             | SettingId::CompactPrompt
@@ -1592,6 +1624,10 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::DelegationMaxParallel),
             Setting(S::SwarmMaxDepth),
             Setting(S::SwarmMaxConcurrency),
+            Setting(S::GoalVerificationEnabled),
+            Setting(S::GoalVerificationSkepticCount),
+            Setting(S::GoalVerificationModel),
+            Setting(S::GoalVerificationMaxRounds),
             Setting(S::DialogLockoutMs),
             Setting(S::TimeInjectionInterval),
             Setting(S::PackagesDir),
@@ -1823,6 +1859,27 @@ impl SettingsCx {
             S::SwarmMaxConcurrency => format!(
                 "{} (global recursive spawn cap; 0 = unlimited)",
                 e.swarm.max_concurrency
+            ),
+            S::GoalVerificationEnabled => on_off(
+                e.goal_verification.enabled,
+                "on (default — budgeted goals verify completion)",
+                "off (complete immediately)",
+            ),
+            S::GoalVerificationSkepticCount => format!(
+                "{} (parallel skeptic scouts; default {})",
+                e.goal_verification.effective_skeptic_count(),
+                cockpit_config::extended::DEFAULT_GOAL_VERIFICATION_SKEPTIC_COUNT
+            ),
+            S::GoalVerificationModel => e
+                .goal_verification
+                .skeptic_model
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "(session model fallback)".to_string()),
+            S::GoalVerificationMaxRounds => format!(
+                "{} (failed/inconclusive rounds before intervention; default {})",
+                e.goal_verification.effective_max_rounds(),
+                cockpit_config::extended::DEFAULT_GOAL_VERIFICATION_MAX_ROUNDS
             ),
             S::DialogLockoutMs => format!(
                 "{} (answer-dialog input lockout; default 1500)",
@@ -2437,6 +2494,9 @@ impl SettingsCx {
             S::ScheduleAllowUnboundedLoops => {
                 e.schedule.allow_unbounded_loops = !e.schedule.allow_unbounded_loops
             }
+            S::GoalVerificationEnabled => {
+                e.goal_verification.enabled = !e.goal_verification.enabled
+            }
             S::SandboxDefaultMode => {
                 e.sandbox.default_mode = cycle_sandbox_mode(e.sandbox.default_mode)
             }
@@ -2470,6 +2530,10 @@ impl SettingsCx {
             S::DelegationMaxParallel => e.delegation.max_parallel.to_string(),
             S::SwarmMaxDepth => e.swarm.max_depth.to_string(),
             S::SwarmMaxConcurrency => e.swarm.max_concurrency.to_string(),
+            S::GoalVerificationSkepticCount => {
+                e.goal_verification.effective_skeptic_count().to_string()
+            }
+            S::GoalVerificationMaxRounds => e.goal_verification.effective_max_rounds().to_string(),
             S::DialogLockoutMs => e.dialog.lockout_ms.to_string(),
             S::TimeInjectionInterval => e.system_prompt.time_injection_interval_minutes.to_string(),
             S::CommandProfileWrappers => pretty_json(&e.command_resource_profiles.wrappers),
@@ -2494,6 +2558,11 @@ impl SettingsCx {
             S::PreflightModel => e.preflight.model.clone().unwrap_or_default(),
             S::PreflightPrompt => e.preflight.preflight_prompt.clone().unwrap_or_default(),
             S::CompactModel => e.compact_model.clone().unwrap_or_default(),
+            S::GoalVerificationModel => e
+                .goal_verification
+                .skeptic_model
+                .clone()
+                .unwrap_or_default(),
             S::CompactPrompt => e.compact_prompt.clone().unwrap_or_default(),
             S::RedactMinSecretLength => e.redact.min_secret_length.to_string(),
             S::RedactPlaceholder => e.redact.placeholder.clone(),
@@ -2545,6 +2614,14 @@ impl SettingsCx {
                 // 0 = unlimited, so the floor is 0.
                 let v = parse_min_usize(trimmed, 0)?;
                 self.extended.swarm.max_concurrency = v;
+            }
+            S::GoalVerificationSkepticCount => {
+                let v = parse_min_usize(trimmed, 1)?;
+                self.extended.goal_verification.skeptic_count = v;
+            }
+            S::GoalVerificationMaxRounds => {
+                let v = parse_min_u32(trimmed, 1)?;
+                self.extended.goal_verification.max_rounds = v;
             }
             S::DialogLockoutMs => {
                 let v: u64 = trimmed
@@ -2612,6 +2689,13 @@ impl SettingsCx {
             S::CompactModel => {
                 // Blank → unset (drafts the brief with the active agent's model).
                 self.extended.compact_model = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
+            S::GoalVerificationModel => {
+                self.extended.goal_verification.skeptic_model = if trimmed.is_empty() {
                     None
                 } else {
                     Some(trimmed.to_string())
@@ -2713,6 +2797,7 @@ impl SettingsCx {
             | S::SkillInjectionModel
             | S::PredictNextMessageModel
             | S::HarnessReportSummarizationModel
+            | S::GoalVerificationModel
             | S::CompactModel => {
                 p.utility_picker = Some(Box::new(UtilityModelPicker::new(
                     &self.config,
@@ -2756,6 +2841,7 @@ impl SettingsCx {
             S::SkillInjectionModel => e.skill_injection.clone(),
             S::PredictNextMessageModel => e.predict_next_message_model.clone(),
             S::HarnessReportSummarizationModel => e.harness_report_summarization.clone(),
+            S::GoalVerificationModel => e.goal_verification.skeptic_model.clone(),
             S::CompactModel => e.compact_model.clone(),
             _ => None,
         }
@@ -2775,6 +2861,7 @@ impl SettingsCx {
             S::SkillInjectionModel => e.skill_injection = value,
             S::PredictNextMessageModel => e.predict_next_message_model = value,
             S::HarnessReportSummarizationModel => e.harness_report_summarization = value,
+            S::GoalVerificationModel => e.goal_verification.skeptic_model = value,
             S::CompactModel => e.compact_model = value,
             _ => {}
         }
@@ -2810,6 +2897,7 @@ impl SettingsCx {
                 e.concurrency = d.concurrency;
                 e.schedule = d.schedule;
                 e.swarm = d.swarm;
+                e.goal_verification = d.goal_verification;
                 e.dialog = d.dialog;
                 e.system_prompt = d.system_prompt;
                 // Utility model, instructions, packages dir, and agent dirs
@@ -2918,6 +3006,8 @@ fn numeric_text_setting(id: SettingId) -> bool {
             | SettingId::DelegationMaxParallel
             | SettingId::SwarmMaxDepth
             | SettingId::SwarmMaxConcurrency
+            | SettingId::GoalVerificationSkepticCount
+            | SettingId::GoalVerificationMaxRounds
             | SettingId::DialogLockoutMs
             | SettingId::TimeInjectionInterval
             | SettingId::RedactMinSecretLength
@@ -3013,6 +3103,10 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::DelegationMaxParallel => &["delegation", "max_parallel"],
         S::SwarmMaxDepth => &["swarm", "max_depth"],
         S::SwarmMaxConcurrency => &["swarm", "max_concurrency"],
+        S::GoalVerificationEnabled => &["goalVerification", "enabled"],
+        S::GoalVerificationSkepticCount => &["goalVerification", "skepticCount"],
+        S::GoalVerificationModel => &["goalVerification", "skepticModel"],
+        S::GoalVerificationMaxRounds => &["goalVerification", "maxRounds"],
         S::DialogLockoutMs => &["dialog", "lockout_ms"],
         S::TimeInjectionInterval => &["system_prompt", "time_injection_interval_minutes"],
         S::PackagesDir => &["packages_directory"],

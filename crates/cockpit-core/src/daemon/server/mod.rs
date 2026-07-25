@@ -467,6 +467,11 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             turn_id: _,
             reason: _,
         }
+        | proto::Event::GoalVerificationProgress {
+            session_id: _,
+            done: _,
+            total: _,
+        }
         | proto::Event::LlmModeChanged {
             session_id: _,
             mode: _,

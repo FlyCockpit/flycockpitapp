@@ -1000,6 +1000,15 @@ pub enum Event {
         reason: IdleReason,
     },
 
+    /// A pending goal-completion verification round progressed. Clients show
+    /// this while skeptic checks are still in flight; the normal goal-complete
+    /// signal is emitted only after the goal reaches `complete`.
+    GoalVerificationProgress {
+        session_id: Uuid,
+        done: usize,
+        total: usize,
+    },
+
     /// The primary (root-frame) agent was swapped in place (`/plan` →
     /// `Plan`, `/build` → `Build`, `plan.md §4.6.d`). The client chrome's
     /// active-agent slot tracks `name`.
@@ -1368,6 +1377,7 @@ macro_rules! event_variants {
             (Event::InterruptResolved { .. }, "interrupt_resolved");
             (Event::HistoryReplay { .. }, "history_replay");
             (Event::AgentIdle { .. }, "agent_idle");
+            (Event::GoalVerificationProgress { .. }, "goal_verification_progress");
             (Event::PrimarySwapped { .. }, "primary_swapped");
             (Event::LlmModeChanged { .. }, "llm_mode_changed");
             (Event::SessionEnded { .. }, "session_ended");

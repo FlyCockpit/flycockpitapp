@@ -1108,6 +1108,8 @@ CREATE TABLE session_goals (
     token_budget INTEGER,
     tokens_used INTEGER NOT NULL DEFAULT 0,
     blocked_attempts INTEGER NOT NULL DEFAULT 0,
+    completion_evidence TEXT,
+    verification_rounds INTEGER NOT NULL DEFAULT 0,
     last_read_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -1116,7 +1118,7 @@ CREATE TABLE session_goals (
 -- At most one goal in a non-terminal status per session.
 CREATE UNIQUE INDEX idx_session_goals_one_open
     ON session_goals(session_id)
-    WHERE status IN ('active', 'paused', 'blocked', 'budget_limited', 'usage_limited');
+    WHERE status IN ('active', 'paused', 'blocked', 'pending_verification', 'budget_limited', 'usage_limited');
 
 CREATE INDEX idx_session_goals_session_status
     ON session_goals(session_id, status, updated_at DESC);

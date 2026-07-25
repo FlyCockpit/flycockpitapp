@@ -1786,6 +1786,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | HistoryReplay { session_id, .. }
         | InterruptQueueChanged { session_id, .. }
         | AgentIdle { session_id, .. }
+        | GoalVerificationProgress { session_id, .. }
         | PrimarySwapped { session_id, .. }
         | LlmModeChanged { session_id, .. }
         | SessionEnded { session_id, .. }
@@ -2379,6 +2380,9 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         AgentIdle {
             turn_id, reason, ..
         } => TurnEvent::AgentIdle { turn_id, reason },
+        GoalVerificationProgress { done, total, .. } => {
+            TurnEvent::GoalVerificationProgress { done, total }
+        }
         PausedWorkAvailable {
             session_id, items, ..
         } => TurnEvent::PausedWorkAvailable { session_id, items },

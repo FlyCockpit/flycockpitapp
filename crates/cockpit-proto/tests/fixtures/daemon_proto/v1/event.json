@@ -395,6 +395,14 @@
     },
     "event": "gitignore_allow"
   },
+  "goal_verification_progress": {
+    "data": {
+      "done": 1,
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "total": 3
+    },
+    "event": "goal_verification_progress"
+  },
   "history_replay": {
     "data": {
       "entries": [

@@ -243,6 +243,7 @@ async fn route_child_spawn(
         );
     }
     let child = SpawnSpec {
+        job_id: None,
         worker: spec.worker,
         prompt: prompt.to_string(),
         output_dir: output_dir.to_string(),
@@ -383,6 +384,7 @@ mod tests {
 
     fn spec(depth: u32, max_depth: u32) -> SpawnSpec {
         SpawnSpec {
+            job_id: None,
             worker: SpawnWorkerKind::Bee,
             prompt: "find every firm in this state".into(),
             output_dir: "/tmp/state-ca".into(),

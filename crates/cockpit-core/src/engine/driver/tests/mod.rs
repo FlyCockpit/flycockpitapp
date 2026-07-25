@@ -990,38 +990,9 @@ async fn compact_inference_purposes(driver: &Driver) -> Vec<String> {
         .collect()
 }
 
-// ---- re-queryable subagents + seeding (GOALS §3c) --------------------
-
-use crate::db::seed_tools::SeedTool;
-
 // ── write-capable follow-up (implementation note) ──
 
-/// Build a driver whose root (caller) agent holds the `read` tool so
-/// `inject_seeds` can re-execute a `read` seed in the caller's cwd.
-fn driver_with_read_caller() -> (Driver, tempfile::TempDir) {
-    let (mut driver, tmp) = test_driver(8);
-    let old = driver.stack[0].agent.clone();
-    let tools =
-        crate::engine::tool::ToolBox::new().with(std::sync::Arc::new(crate::tools::read::ReadTool));
-    driver.stack[0].agent = std::sync::Arc::new(Agent {
-        name: old.name.clone(),
-        system: old.system.clone(),
-        role_prompt: old.role_prompt.clone(),
-        tools,
-        model: old.model.clone(),
-        params: old.params.clone(),
-        scan_tool_results: old.scan_tool_results,
-        llm_mode: crate::config::extended::LlmMode::Normal,
-        delegated: false,
-        delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
-        env_overlay: old.env_overlay.clone(),
-    });
-    (driver, tmp)
-}
-
-/// A caller assistant turn that ends in a `task` tool call (the turn a
-/// noninteractive delegation came from). `inject_seeds` folds seed calls
-/// into this turn.
+/// A caller assistant turn that ends in a `task` tool call.
 fn assistant_with_task_call(task_call_id: &str) -> Message {
     use crate::engine::message::{AssistantContent, OneOrMany, ToolCall};
     use rig::message::ToolFunction;
@@ -1087,7 +1058,6 @@ fn single_noninteractive_completion(
         failed: false,
         failure: None,
         partial_progress: DelegationPartialProgress::default(),
-        seeds: Vec::new(),
         new_handle: None,
         snapshot: NoninteractiveDelegationSnapshot::empty(),
         shrink: None,
@@ -1162,34 +1132,6 @@ async fn seed_batch_task_delegation(driver: &Driver, task_call_id: &str, labels:
         )
         .await
         .unwrap();
-}
-
-// ---- Caller→child read-only pre-seeding (`task.seed`) -----------------
-// (implementation note). The parent→child mirror of
-// `inject_seeds`: re-execute read-only seeds in the CHILD's cwd and
-// prepend native tool-call/result pairs to the child's initial history.
-
-/// A child agent holding `read` + `code` (read-only) and `write`
-/// (write) — enough to assert read-only seeds execute, a write seed is
-/// never executed, and a failed read is surfaced (not aborted).
-fn child_with_read_write_tools(agent: &Arc<Agent>) -> Agent {
-    let tools = crate::engine::tool::ToolBox::new()
-        .with(std::sync::Arc::new(crate::tools::read::ReadTool))
-        .with(std::sync::Arc::new(crate::tools::intel::CodeTool))
-        .with(std::sync::Arc::new(crate::tools::write::WriteTool));
-    Agent {
-        name: "explore".into(),
-        system: agent.system.clone(),
-        role_prompt: agent.role_prompt.clone(),
-        tools,
-        model: agent.model.clone(),
-        params: agent.params.clone(),
-        scan_tool_results: false,
-        llm_mode: crate::config::extended::LlmMode::Normal,
-        delegated: false,
-        delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
-        env_overlay: agent.env_overlay.clone(),
-    }
 }
 
 /// Build a driver whose root agent holds the `skill` tool, so

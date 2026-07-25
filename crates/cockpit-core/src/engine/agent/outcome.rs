@@ -23,21 +23,7 @@ pub enum TurnOutcome {
         /// invariants, then builds the child with base + grants for this run
         /// only. Empty when the parent granted nothing.
         granted_tools: Vec<String>,
-        /// Caller→child read-only pre-seeds (`task.seed`,
-        /// implementation note): read-only tool calls the
-        /// driver re-executes in the CHILD's cwd and injects into the child's
-        /// initial history as native tool-call/result pairs, before its first
-        /// turn. Empty when the parent seeded nothing.
-        seeds: Vec<crate::db::seed_tools::SeedTool>,
         todo_ids: Vec<uuid::Uuid>,
-        /// Parent→child skill seeds (`task.skill_seed`,
-        /// implementation note): names of skills the parent
-        /// wants seeded into this child's brief. The driver validates each
-        /// against the parent's active-skill set (user-invoked OR auto-injected)
-        /// and deterministically strips any that isn't active. Empty when the
-        /// parent seeded no skill. Distinct from `seed` — carries skill
-        /// instructions, not a re-executed tool call.
-        skill_seed: Vec<String>,
         repair_notes: Vec<String>,
         /// Outstanding tool-call id the driver must answer when the
         /// subagent finishes. `ToolCall.id` is `String`; `ToolCall.call_id`
@@ -75,21 +61,7 @@ pub enum TurnOutcome {
         /// invariants, then builds the child with base + grants for this run
         /// only. Empty when the parent granted nothing.
         granted_tools: Vec<String>,
-        /// Caller→child read-only pre-seeds (`task.seed`,
-        /// implementation note): read-only tool calls the
-        /// driver re-executes in the CHILD's cwd and injects into the child's
-        /// initial history as native tool-call/result pairs, before its first
-        /// turn. Empty when the parent seeded nothing.
-        seeds: Vec<crate::db::seed_tools::SeedTool>,
         todo_ids: Vec<uuid::Uuid>,
-        /// Parent→child skill seeds (`task.skill_seed`,
-        /// implementation note): names of skills the parent
-        /// wants seeded into this child's brief. The driver validates each
-        /// against the parent's active-skill set (user-invoked OR auto-injected)
-        /// and deterministically strips any that isn't active. Empty when the
-        /// parent seeded no skill. Distinct from `seed` — carries skill
-        /// instructions, not a re-executed tool call.
-        skill_seed: Vec<String>,
         repair_notes: Vec<String>,
         task_call_id: String,
         task_function_call_id: Option<String>,
@@ -193,9 +165,7 @@ pub struct BatchTaskEntry {
     pub resume_handle: Option<String>,
     pub cwd: Option<String>,
     pub granted_tools: Vec<String>,
-    pub seeds: Vec<crate::db::seed_tools::SeedTool>,
     pub todo_ids: Vec<uuid::Uuid>,
-    pub skill_seed: Vec<String>,
     pub output_dir: Option<String>,
 }
 
@@ -270,36 +240,6 @@ pub(super) fn task_string_array(args: &Value, key: &str) -> Vec<String> {
                 {
                     out.push(s.to_string());
                 }
-            }
-            out
-        })
-        .unwrap_or_default()
-}
-
-pub(super) fn task_seed_array(args: &Value) -> Vec<crate::db::seed_tools::SeedTool> {
-    args.get("seed")
-        .and_then(Value::as_array)
-        .map(|a| {
-            let mut out = Vec::new();
-            for entry in a {
-                let Some(name) = entry
-                    .get("tool")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                else {
-                    continue;
-                };
-                if !crate::engine::compact::is_read_only_seed_tool(name) {
-                    continue;
-                }
-                let Some(args) = entry.get("args").cloned().filter(Value::is_object) else {
-                    continue;
-                };
-                out.push(crate::db::seed_tools::SeedTool {
-                    tool: name.to_string(),
-                    args,
-                });
             }
             out
         })

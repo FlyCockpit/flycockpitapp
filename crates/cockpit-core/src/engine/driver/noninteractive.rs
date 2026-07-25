@@ -530,9 +530,7 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
     pub(in crate::engine::driver) resume_handle: Option<String>,
     pub(in crate::engine::driver) child_cwd: ChildCwd,
     pub(in crate::engine::driver) granted_tools: Vec<String>,
-    pub(in crate::engine::driver) prefill_seeds: Vec<crate::db::seed_tools::SeedTool>,
     pub(in crate::engine::driver) todo_ids: Vec<uuid::Uuid>,
-    pub(in crate::engine::driver) skill_seed: Vec<String>,
     pub(in crate::engine::driver) child_recursion:
         crate::engine::builtin::DelegationRecursionContext,
     pub(in crate::engine::driver) repair_notes: Vec<String>,
@@ -548,7 +546,6 @@ pub(in crate::engine::driver) struct SingleNoninteractiveCompletion {
     pub(in crate::engine::driver) failed: bool,
     pub(in crate::engine::driver) failure: Option<SubagentFailureEnvelope>,
     pub(in crate::engine::driver) partial_progress: DelegationPartialProgress,
-    pub(in crate::engine::driver) seeds: Vec<crate::db::seed_tools::SeedTool>,
     pub(in crate::engine::driver) new_handle: Option<String>,
     pub(in crate::engine::driver) snapshot: NoninteractiveDelegationSnapshot,
     pub(in crate::engine::driver) shrink: Option<PendingDelegationShrink>,
@@ -719,7 +716,6 @@ impl Driver {
             "requested_cwd": task.child_cwd.requested_json(),
             "resolved_cwd": &resolved_cwd_display,
             "todo_ids": &task.todo_ids,
-            "skill_seed": &task.skill_seed,
         }))
         .ok();
         let parent_agent = self.stack.last().unwrap().agent.name.clone();
@@ -876,9 +872,7 @@ impl Driver {
             resume_handle,
             child_cwd,
             granted_tools,
-            prefill_seeds,
             todo_ids,
-            skill_seed,
             child_recursion,
             repair_notes,
             task_call_id,
@@ -911,7 +905,6 @@ impl Driver {
                 failed: true,
                 failure: None,
                 partial_progress: DelegationPartialProgress::default(),
-                seeds: Vec::new(),
                 new_handle: None,
                 snapshot: NoninteractiveDelegationSnapshot::empty(),
                 shrink: None,
@@ -935,7 +928,6 @@ impl Driver {
                     failed: true,
                     failure: None,
                     partial_progress: DelegationPartialProgress::default(),
-                    seeds: Vec::new(),
                     new_handle: None,
                     snapshot: NoninteractiveDelegationSnapshot::empty(),
                     shrink: None,
@@ -1001,8 +993,6 @@ impl Driver {
                     "requested_cwd": child_cwd.requested_json(),
                     "resolved_cwd": child_cwd.resolved_display(),
                     "grant_tools": granted_tools.clone(),
-                    "seed": prefill_seeds.clone(),
-                    "skill_seed": skill_seed.clone(),
                     "todo_ids": todo_ids.clone(),
                 }),
             )
@@ -1021,14 +1011,7 @@ impl Driver {
 
         let llm_mode = self.stack[0].agent.llm_mode;
         let followup_enabled = crate::engine::tool::Capability::FollowupSeed.enabled(llm_mode);
-        let skill_block = self.seed_skills_block(&skill_seed, &child_agent);
         let composed_brief = compose_subagent_brief(&delivered_brief, &why);
-        let composed_brief = if skill_block.is_empty() {
-            composed_brief
-        } else {
-            format!("{skill_block}{composed_brief}")
-        };
-        let mut seeds: Vec<crate::db::seed_tools::SeedTool> = Vec::new();
         let mut new_handle: Option<String> = None;
         let mut snapshot = NoninteractiveDelegationSnapshot::empty();
         let composed_brief = self
@@ -1040,6 +1023,8 @@ impl Driver {
                 &child_agent,
             )
             .await;
+        let composed_brief =
+            self.expand_handoff_tags(&composed_brief, &child_cwd.resolved, llm_mode, &child_agent);
 
         let outcome = if child_agent == "docs" {
             // The docs pipeline is not a built-in child agent load, so there is
@@ -1048,7 +1033,7 @@ impl Driver {
                 DelegationChildOutcome::failed(stale_handle_error(&child_agent))
             } else {
                 match crate::engine::docs_pipeline::run(
-                    &delivered_brief,
+                    &composed_brief,
                     &self.spawn_args_delegated_in_cwd(
                         &child_cwd.resolved,
                         false,
@@ -1112,7 +1097,6 @@ impl Driver {
                                 failed: true,
                                 failure: None,
                                 partial_progress: DelegationPartialProgress::default(),
-                                seeds: Vec::new(),
                                 new_handle: None,
                                 snapshot: NoninteractiveDelegationSnapshot::empty(),
                                 shrink: Some(PendingDelegationShrink {
@@ -1133,7 +1117,6 @@ impl Driver {
                         &child_routing,
                     )
                     .await;
-                    let read_only = crate::engine::builtin::is_read_only_noninteractive(&child);
                     let write_capable = crate::engine::builtin::is_write_capable(&child);
                     if resume_handle.is_some() && write_capable {
                         match self.locks.resume_agent(&child_agent, self.session.id).await {
@@ -1168,28 +1151,16 @@ impl Driver {
                             tracing::warn!(error = %e, "record followup reuse event failed");
                         }
                     }
-                    let (seed_prefix, seeds_truncated) = self
-                        .prefill_child_seeds(&prefill_seeds, &child, &child_cwd.resolved, None)
-                        .await;
                     let mut prior_history = prior_history;
                     let mut delivery_history = delegation_payload_history.clone();
-                    let mut seed_prefix = seed_prefix;
-                    if !delivery_history.is_empty() || !seed_prefix.is_empty() {
-                        delivery_history.append(&mut seed_prefix);
+                    if !delivery_history.is_empty() {
                         delivery_history.append(&mut prior_history);
                         prior_history = delivery_history;
                     }
-                    let composed_brief = if seeds_truncated {
-                        format!("{composed_brief}{SEED_PREFILL_TRUNCATION_NOTE}")
-                    } else {
-                        composed_brief.clone()
-                    };
-                    let collector = crate::engine::seed_collector::SeedCollector::new();
                     match run_noninteractive_resumable(
                         child,
-                        composed_brief,
+                        composed_brief.clone(),
                         prior_history,
-                        collector.clone(),
                         self.session.clone(),
                         self.locks.clone(),
                         self.redact.clone(),
@@ -1268,9 +1239,6 @@ impl Driver {
                                         resume_handle.as_deref(),
                                     )
                                     .await;
-                                if read_only {
-                                    seeds = collector.drain();
-                                }
                                 if write_capable
                                     && let Err(e) = self
                                         .locks
@@ -1296,7 +1264,6 @@ impl Driver {
             failed: outcome.failed,
             failure: outcome.failure,
             partial_progress: outcome.partial_progress,
-            seeds,
             new_handle,
             snapshot,
             shrink: Some(PendingDelegationShrink {
@@ -1322,7 +1289,6 @@ impl Driver {
             failed,
             failure,
             partial_progress,
-            seeds,
             new_handle,
             snapshot,
             shrink,
@@ -1336,6 +1302,9 @@ impl Driver {
             let report = self
                 .maybe_scan_task_report(&child_agent, report, tx)
                 .await?;
+            let caller = self.stack.last().expect("stack never empty").agent.clone();
+            let report =
+                self.expand_handoff_tags(&report, &self.cwd, caller.llm_mode, &caller.name);
             let result = Message::tool_result_with_call_id(
                 task_call_id.clone(),
                 task_function_call_id,
@@ -1371,18 +1340,6 @@ impl Driver {
             Self::discard_delegation_shrink(shrink);
         }
 
-        let seeds_truncated = if seeds.is_empty() {
-            false
-        } else {
-            self.inject_seeds(&seeds, &task_call_id, tx).await
-        };
-
-        let mut report = report;
-        if seeds_truncated {
-            report.push_str(
-                "\n\n[note: some seeded results were omitted to stay within the report budget]",
-            );
-        }
         let report = self
             .reconcile_todo_delta(&task_call_id, "default", &child_agent, &report, failed)
             .await;
@@ -1394,6 +1351,8 @@ impl Driver {
         let report = self
             .maybe_scan_task_report(&child_agent, report, tx)
             .await?;
+        let caller = self.stack.last().expect("stack never empty").agent.clone();
+        let report = self.expand_handoff_tags(&report, &self.cwd, caller.llm_mode, &caller.name);
 
         let mut report_data = subagent_report_event_data(
             &child_agent,
@@ -2341,7 +2300,6 @@ impl Driver {
                 "resolved_cwd": child_cwd.resolved_display(),
                 "output_dir": &entry.output_dir,
                 "todo_ids": &entry.todo_ids,
-                "skill_seed": &entry.skill_seed,
             })).collect::<Vec<_>>(),
             "why": &task.why,
         }))
@@ -2675,8 +2633,6 @@ impl Driver {
                     "requested_cwd": child_cwd.requested_json(),
                     "resolved_cwd": child_cwd.resolved_display(),
                     "grant_tools": entry.granted_tools.clone(),
-                    "seed": entry.seeds.clone(),
-                    "skill_seed": entry.skill_seed.clone(),
                     "todo_ids": entry.todo_ids.clone(),
                     "output_dir": entry.output_dir.clone(),
                 }),
@@ -2766,16 +2722,11 @@ impl Driver {
                                 &child_routing,
                             )
                             .await;
-                        let skill_block =
-                            driver.seed_skills_block(&entry.skill_seed, &entry.child_agent);
                         let mut brief = compose_subagent_brief(&entry.prompt, &entry_why);
                         if let Some(output_dir) = &entry.output_dir {
                             brief = format!(
                                 "{brief}\n\nWrite constraint: keep all file writes under `{output_dir}`."
                             );
-                        }
-                        if !skill_block.is_empty() {
-                            brief = format!("{skill_block}{brief}");
                         }
                         let brief = driver.assign_todos_to_task(
                             brief,
@@ -2785,26 +2736,17 @@ impl Driver {
                             &entry.child_agent,
                         )
                         .await;
-                        let (seed_prefix, seeds_truncated) =
-                            driver
-                                .prefill_child_seeds(&entry.seeds, &child, &child_cwd.resolved, None)
-                                .await;
-                        let mut prior_history = delegation_payload_history;
-                        let mut seed_prefix = seed_prefix;
-                        if !seed_prefix.is_empty() {
-                            prior_history.append(&mut seed_prefix);
-                        }
-                        let brief = if seeds_truncated {
-                            format!("{brief}{SEED_PREFILL_TRUNCATION_NOTE}")
-                        } else {
-                            brief
-                        };
-                        let collector = crate::engine::seed_collector::SeedCollector::new();
+                        let brief = driver.expand_handoff_tags(
+                            &brief,
+                            &child_cwd.resolved,
+                            child.llm_mode,
+                            &entry.child_agent,
+                        );
+                        let prior_history = delegation_payload_history;
                         match run_noninteractive_resumable(
                             child,
                             brief,
                             prior_history,
-                            collector,
                             driver.session.clone(),
                             driver.locks.clone(),
                             driver.redact.clone(),
@@ -2895,6 +2837,9 @@ impl Driver {
                     outcome.failed,
                 )
                 .await;
+            let caller = self.stack.last().expect("stack never empty").agent.clone();
+            let report =
+                self.expand_handoff_tags(&report, &self.cwd, caller.llm_mode, &caller.name);
             let mut report_data = subagent_report_event_data(
                 &entry.child_agent,
                 Some(&task_call_id),
@@ -2977,11 +2922,11 @@ impl Driver {
             && children[0].child_agent.is_empty()
             && children[0].failed
         {
-            return Message::tool_result_with_call_id(
-                task_call_id,
-                task_function_call_id,
-                prepend_task_repair_notes(children.remove(0).report, &repair_notes),
-            );
+            return Message::tool_result_with_call_id(task_call_id, task_function_call_id, {
+                let caller = self.stack.last().expect("stack never empty").agent.clone();
+                let report = prepend_task_repair_notes(children.remove(0).report, &repair_notes);
+                self.expand_handoff_tags(&report, &self.cwd, caller.llm_mode, &caller.name)
+            });
         }
 
         children.sort_by_key(|child| child.idx);
@@ -3444,14 +3389,12 @@ pub(crate) async fn run_noninteractive(
     event_tx: Option<mpsc::Sender<TurnEvent>>,
     steer_target: Option<NoninteractiveSteerTarget>,
 ) -> Result<String> {
-    // The docs pipeline (the only other caller) neither rehydrates nor
-    // seeds: a fresh transcript, no prior history, and a throwaway seed
-    // collector. It only needs the report text.
+    // The docs pipeline (the only other caller) neither rehydrates nor needs
+    // transcript context: it only needs the report text.
     let out = run_noninteractive_resumable(
         child,
         brief,
         Vec::new(),
-        crate::engine::seed_collector::SeedCollector::new(),
         session,
         locks,
         redact,
@@ -3710,15 +3653,14 @@ impl std::fmt::Display for NoninteractiveRunError {
 impl std::error::Error for NoninteractiveRunError {}
 
 /// Run a child agent's loop to completion, optionally **rehydrated** from a
-/// prior transcript (`prior_history`) and collecting any `seed` calls into
-/// `seeds`. Returns the report + the full transcript. [`run_noninteractive`]
-/// is the no-rehydrate, no-seed wrapper used by the `docs` pipeline.
+/// prior transcript (`prior_history`). Returns the report + the full
+/// transcript. [`run_noninteractive`] is the no-rehydrate wrapper used by the
+/// `docs` pipeline.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_noninteractive_resumable(
     child: Agent,
     brief: String,
     prior_history: Vec<Message>,
-    seeds: crate::engine::seed_collector::SeedCollector,
     session: Arc<Session>,
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
@@ -3818,7 +3760,6 @@ pub(crate) async fn run_noninteractive_resumable(
             None,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             deferred_log.clone(),
-            seeds.clone(),
             call_id,
             tandem.as_ref(),
             None,

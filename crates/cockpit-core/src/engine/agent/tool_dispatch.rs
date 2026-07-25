@@ -203,7 +203,7 @@ pub(crate) async fn execute_ordinary_call(
     // guard rejects (one-off, an always-reject rule, or headless), the
     // call is *not* dispatched and a guidance error stands in as the
     // tool result so the model changes course. With no approver wired
-    // (seed-tool re-exec, tool tests) the guard is skipped — never
+    // (tool tests/headless) the guard is skipped — never
     // silently denied, matching the command/path approval contract.
     // `loop_guard_reject` gates dispatch; `loop_guard_count` is the live
     // consecutive-repeat count of the rejected `(tool, args)` run, carried
@@ -1611,7 +1611,6 @@ mod tests {
             shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
-            seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
             review_cage: None,

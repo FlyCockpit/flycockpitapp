@@ -456,7 +456,26 @@ pub fn expand_tags_with_policy(buffer: &str, policy: &TagPolicy) -> ExpandResult
     expand_tags_inner(buffer, &policy.cwd, Some(policy))
 }
 
+pub fn expand_assembly_tags_with_policy(buffer: &str, policy: &TagPolicy) -> ExpandResult {
+    expand_tags_inner_with_mode(buffer, &policy.cwd, Some(policy), ExpansionMode::Assembly)
+}
+
 fn expand_tags_inner(buffer: &str, cwd: &Path, policy: Option<&TagPolicy>) -> ExpandResult {
+    expand_tags_inner_with_mode(buffer, cwd, policy, ExpansionMode::Composer)
+}
+
+#[derive(Clone, Copy)]
+enum ExpansionMode {
+    Composer,
+    Assembly,
+}
+
+fn expand_tags_inner_with_mode(
+    buffer: &str,
+    cwd: &Path,
+    policy: Option<&TagPolicy>,
+    mode: ExpansionMode,
+) -> ExpandResult {
     let mut wire = String::with_capacity(buffer.len());
     let mut expansions: Vec<TagExpansion> = Vec::new();
     // Dedup state, per call (one message): a repeated `@`-tag of the same
@@ -484,7 +503,7 @@ fn expand_tags_inner(buffer: &str, cwd: &Path, policy: Option<&TagPolicy>) -> Ex
                 wire.push_str(&reference_marker(cwd, path_part));
             } else {
                 seen.insert(key);
-                let exp = try_inline(cwd, path_part, range, raw, policy);
+                let exp = try_inline(cwd, path_part, range, raw, policy, mode);
                 wire.push_str(&exp.wire_piece);
                 expansions.push(exp.expansion);
             }
@@ -593,6 +612,7 @@ fn try_inline(
     range: Option<(usize, usize)>,
     raw: &str,
     policy: Option<&TagPolicy>,
+    mode: ExpansionMode,
 ) -> Expanded {
     let resolved = resolve_path(cwd, path_part);
     if let Some(policy) = policy
@@ -625,6 +645,9 @@ fn try_inline(
                 "line range not valid for a directory".into(),
                 "skipped",
             );
+        }
+        if matches!(mode, ExpansionMode::Assembly) {
+            return lazy_reference("list", path_part, raw, "directory reference");
         }
         let (block, count) = render_directory(&resolved, path_part, policy, caps);
         return Expanded {
@@ -666,6 +689,9 @@ fn try_inline(
     // context bloat the token economy avoids (GOALS §1e / §10). A tag
     // with an explicit range is always inlined (the slice is bounded).
     if range.is_none() {
+        if matches!(mode, ExpansionMode::Assembly) {
+            return lazy_reference("read", path_part, raw, "file reference");
+        }
         let line_count = text.lines().count();
         if line_count > caps.max_lines || bytes.len() > caps.max_bytes {
             let note = format!(
@@ -691,6 +717,18 @@ fn try_inline(
             path: path_part.to_string(),
             detail: format!("{lines_shown} lines"),
             ok: true,
+        },
+    }
+}
+
+fn lazy_reference(tool: &'static str, path: &str, raw: &str, detail: &str) -> Expanded {
+    Expanded {
+        wire_piece: raw.to_string(),
+        expansion: TagExpansion {
+            tool,
+            path: path.to_string(),
+            detail: detail.to_string(),
+            ok: false,
         },
     }
 }

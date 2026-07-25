@@ -4,34 +4,7 @@ use super::lifecycle::*;
 use super::run::*;
 use super::*;
 use crate::db::Db;
-use std::io;
 use std::sync::Mutex as StdMutex;
-use tracing::Level;
-use tracing_subscriber::fmt::MakeWriter;
-
-#[derive(Clone)]
-struct CaptureWriter(std::sync::Arc<StdMutex<Vec<u8>>>);
-
-struct CaptureGuard(std::sync::Arc<StdMutex<Vec<u8>>>);
-
-impl io::Write for CaptureGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for CaptureWriter {
-    type Writer = CaptureGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        CaptureGuard(self.0.clone())
-    }
-}
 
 fn text_delta(agent: &str, delta: &str) -> proto::Event {
     proto::Event::AssistantTextDelta {
@@ -282,17 +255,6 @@ async fn stream_delta_coalescer_timer_flushes_after_window() {
         &flushed[0],
         proto::Event::AssistantTextDelta { delta, .. } if delta == "ab"
     ));
-}
-
-fn capture_warn_log(f: impl FnOnce()) -> String {
-    let bytes = std::sync::Arc::new(StdMutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(Level::WARN)
-        .with_ansi(false)
-        .with_writer(CaptureWriter(bytes.clone()))
-        .finish();
-    tracing::subscriber::with_default(subscriber, f);
-    String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
 }
 
 #[tokio::test]
@@ -825,21 +787,6 @@ async fn roster_trim_initial_active_agent_uses_build_or_plan() {
 
     assert_eq!(initial_active_agent(&cfg_with(D::Build)), "Build");
     assert_eq!(initial_active_agent(&cfg_with(D::Plan)), "Plan");
-}
-
-#[tokio::test]
-async fn seed_tool_drain_failure_warns_with_session_id_without_payload() {
-    let session_id = Uuid::new_v4();
-    let log = capture_warn_log(|| {
-        let error = anyhow::anyhow!("db unavailable");
-        log_seed_tool_drain_failed(session_id, &error);
-    });
-
-    assert!(log.contains(&session_id.to_string()));
-    assert!(log.contains("seed-tool replay skipped"));
-    assert!(log.contains("db unavailable"));
-    assert!(!log.contains("prompt text"));
-    assert!(!log.contains("tool output"));
 }
 
 #[tokio::test]

@@ -40,7 +40,6 @@ pub mod return_tool;
 pub mod sandbox;
 pub mod sandbox_mode;
 pub mod schedule;
-pub mod seed;
 pub mod session_read;
 pub mod session_search;
 pub mod shell_compress;

@@ -53,7 +53,6 @@ pub mod prune_ledger;
 pub mod remote_audit_upload;
 pub mod retention;
 pub mod scheduler;
-pub mod seed_tools;
 pub mod session_goals;
 pub mod session_log;
 pub mod session_plan_docs;

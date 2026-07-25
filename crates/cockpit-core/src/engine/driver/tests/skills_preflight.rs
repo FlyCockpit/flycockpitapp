@@ -1,415 +1,5 @@
 use super::*;
 
-/// Seeds re-execute in the caller's cwd and land as native tool-call/
-/// result pairs folded into the task turn; oversized seeds are dropped
-/// under the budget and truncation is reported.
-#[tokio::test]
-async fn inject_seeds_caps_under_budget_and_injects_pairs() {
-    let (mut driver, tmp) = driver_with_read_caller();
-    // A small file (fits) followed by several sizeable ones. Each
-    // sizeable file is ~1.5K tokens of distinct lines; the shared 2K-token
-    // seed budget admits the small one, then trips before all the big ones
-    // fit — so at least one whole seed is dropped, deterministically.
-    let small = tmp.path().join("small.txt");
-    std::fs::write(&small, "hello\n").unwrap();
-    let mut big_paths = Vec::new();
-    for i in 0..3 {
-        let p = tmp.path().join(format!("big{i}.txt"));
-        // ~600 short, distinct lines → comfortably above ~1K tokens each.
-        let body: String = (0..600).map(|n| format!("file{i} line {n}\n")).collect();
-        std::fs::write(&p, body).unwrap();
-        big_paths.push(p);
-    }
-
-    // The caller's last turn is the `task` call the delegation came from.
-    let task_call_id = "task-1";
-    driver.stack[0].history = vec![
-        Message::user("please investigate"),
-        assistant_with_task_call(task_call_id),
-    ];
-
-    let mut seeds = vec![SeedTool {
-        tool: "read".into(),
-        args: serde_json::json!({ "path": small.to_string_lossy() }),
-    }];
-    for p in &big_paths {
-        seeds.push(SeedTool {
-            tool: "read".into(),
-            args: serde_json::json!({ "path": p.to_string_lossy() }),
-        });
-    }
-
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    let truncated = driver.inject_seeds(&seeds, task_call_id, &tx).await;
-    drop(tx);
-    while rx.recv().await.is_some() {}
-
-    // The cumulative seed output blew the 2K budget → truncation reported,
-    // at least one whole seed dropped.
-    assert!(truncated, "oversized seeds should trip the budget");
-
-    let history = &driver.stack[0].history;
-    // The task turn now carries the original task call PLUS exactly one
-    // seed tool call (the small read); the big one was dropped whole.
-    let last_assistant = history
-        .iter()
-        .rev()
-        .find_map(|m| match m {
-            Message::Assistant { content, .. } => Some(content),
-            _ => None,
-        })
-        .unwrap();
-    use crate::engine::message::AssistantContent;
-    let tool_calls: Vec<_> = last_assistant
-        .iter()
-        .filter_map(|c| match c {
-            AssistantContent::ToolCall(tc) => Some(tc.function.name.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        tool_calls.iter().any(|n| n == "task"),
-        "task call preserved"
-    );
-    let seed_calls = tool_calls.iter().filter(|n| *n == "read").count();
-    // At least the small seed fit, and at least one big seed was dropped
-    // (so fewer than the 4 requested were folded in).
-    assert!(seed_calls >= 1, "in-budget seeds folded in");
-    assert!(seed_calls < seeds.len(), "an over-budget seed was dropped");
-    let seed_call_ids: Vec<_> = last_assistant
-        .iter()
-        .filter_map(|c| match c {
-            AssistantContent::ToolCall(tc) if tc.function.name == "read" => {
-                Some((tc.id.clone(), tc.call_id.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    for (id, call_id) in &seed_call_ids {
-        assert!(id.starts_with("fc-seed-"), "seed call id is tagged");
-        assert_eq!(
-            call_id.as_deref(),
-            Some(id.as_str()),
-            "seed ToolCall.call_id uses the Cockpit synthetic provider id"
-        );
-    }
-
-    // Each folded seed call has exactly one matching tool_result pair.
-    use rig::message::UserContent;
-    let seed_results: Vec<_> = history
-        .iter()
-        .filter_map(|m| match m {
-            Message::User { content } => Some(content),
-            _ => None,
-        })
-        .flat_map(|content| content.iter())
-        .filter_map(|c| match c {
-            UserContent::ToolResult(result) if result.id.starts_with("fc-seed-") => {
-                Some((result.id.clone(), result.call_id.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        seed_results.len(),
-        seed_calls,
-        "one result pair per folded seed"
-    );
-    for (id, call_id) in &seed_results {
-        assert_eq!(
-            call_id.as_deref(),
-            Some(id.as_str()),
-            "seed ToolResult.call_id matches the synthetic provider id"
-        );
-    }
-
-    // Each folded seed is also persisted as a tool-call audit row (GOALS
-    // §14) so it survives in a session export, not just the live stream.
-    // A seed is emitted verbatim → `wire == original`, no recovery.
-    let rows = driver
-        .session
-        .db
-        .list_tool_calls_for_session(driver.session.id)
-        .await
-        .unwrap();
-    let seed_rows: Vec<_> = rows.iter().filter(|r| r.tool == "read").collect();
-    assert_eq!(
-        seed_rows.len(),
-        seed_calls,
-        "each folded seed has a persisted tool-call row"
-    );
-    for r in seed_rows {
-        assert!(
-            r.call_id.starts_with("fc-seed-"),
-            "seed row tagged as a seed"
-        );
-        assert_eq!(r.provider_item_id.as_deref(), Some(r.call_id.as_str()));
-        assert_eq!(r.provider_call_id.as_deref(), Some(r.call_id.as_str()));
-        assert_eq!(
-            r.provider_call_id_source.as_deref(),
-            Some("synthetic_from_cockpit_call_id")
-        );
-        assert_eq!(r.wire_api.as_deref(), Some("completions"));
-        assert_eq!(r.provider_family.as_deref(), Some("cockpit"));
-        assert_eq!(
-            r.wire_input_json, r.original_input_json,
-            "a seed is verbatim: wire == original (GOALS §14)"
-        );
-        assert_eq!(r.recovery, crate::db::tool_calls::Recovery::Clean);
-    }
-}
-
-/// A seed naming a tool the caller doesn't hold (or a non-read-only tool)
-/// is skipped — `inject_seeds` never dispatches a write/unknown path.
-#[tokio::test]
-async fn inject_seeds_skips_tools_the_caller_lacks() {
-    let (mut driver, _t) = driver_with_read_caller();
-    let task_call_id = "task-1";
-    driver.stack[0].history = vec![assistant_with_task_call(task_call_id)];
-    // `code` is read-only but the caller (read-only `read` toolbox)
-    // doesn't hold it → skipped; nothing is folded in.
-    let seeds = vec![SeedTool {
-        tool: "code".into(),
-        args: serde_json::json!({ "kind": "outline", "path": "/x.rs" }),
-    }];
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    let _ = driver.inject_seeds(&seeds, task_call_id, &tx).await;
-    drop(tx);
-    while rx.recv().await.is_some() {}
-    // History unchanged: only the original task turn remains.
-    assert_eq!(driver.stack[0].history.len(), 1);
-}
-
-/// Read-only pre-seeds re-execute in the CHILD's cwd and become a native
-/// assistant-tool-call + matching tool_result prefix for the child's
-/// initial history — supporting any read-only tool, not just `read`.
-#[tokio::test]
-async fn prefill_child_seeds_injects_native_pairs_in_child_cwd() {
-    let (driver, tmp) = test_driver(8);
-    let child = child_with_read_write_tools(&driver.stack[0].agent.clone());
-
-    let child_dir = tmp.path().join("child-cwd");
-    std::fs::create_dir(&child_dir).unwrap();
-    let f = child_dir.join("hello.txt");
-    std::fs::write(&f, "hello from the child cwd\n").unwrap();
-
-    let seeds = vec![SeedTool {
-        tool: "read".into(),
-        args: serde_json::json!({ "path": "hello.txt" }),
-    }];
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    let (prefix, truncated) = driver
-        .prefill_child_seeds(&seeds, &child, &child_dir, Some(&tx))
-        .await;
-    drop(tx);
-    while rx.recv().await.is_some() {}
-
-    assert!(!truncated, "one small seed fits the budget");
-    // One assistant turn carrying the read call, then one tool_result.
-    assert_eq!(prefix.len(), 2, "assistant call turn + tool_result");
-    use crate::engine::message::AssistantContent;
-    let calls: Vec<_> = match &prefix[0] {
-        Message::Assistant { content, .. } => content
-            .iter()
-            .filter_map(|c| match c {
-                AssistantContent::ToolCall(tc) => {
-                    Some((tc.function.name.clone(), tc.id.clone(), tc.call_id.clone()))
-                }
-                _ => None,
-            })
-            .collect(),
-        _ => panic!("first prefix message is an assistant turn"),
-    };
-    assert_eq!(calls.len(), 1, "the read seed became one native call");
-    assert_eq!(calls[0].0, "read");
-    assert_eq!(
-        calls[0].2.as_deref(),
-        Some(calls[0].1.as_str()),
-        "prefill seed ToolCall.call_id uses the synthetic provider id"
-    );
-    use rig::message::{ToolResultContent, UserContent};
-    match &prefix[1] {
-        Message::User { content } => {
-            let result = content
-                .iter()
-                .find_map(|c| match c {
-                    UserContent::ToolResult(tr) => Some(tr),
-                    _ => None,
-                })
-                .expect("prefill seed tool_result");
-            assert_eq!(result.id, calls[0].1);
-            assert_eq!(
-                result.call_id.as_deref(),
-                Some(calls[0].1.as_str()),
-                "prefill seed ToolResult.call_id matches the synthetic provider id"
-            );
-            let got = result.content.iter().any(|rc| {
-                matches!(
-                    rc,
-                    ToolResultContent::Text(t) if t.text.contains("hello from the child cwd")
-                )
-            });
-            assert!(
-                got,
-                "the result carries the file body read in the child cwd"
-            );
-        }
-        _ => panic!("second prefix message is the tool_result"),
-    }
-    let rows = driver
-        .session
-        .db
-        .list_tool_calls_for_session(driver.session.id)
-        .await
-        .unwrap();
-    let row = rows
-        .iter()
-        .find(|row| row.call_id == calls[0].1)
-        .expect("prefill seed audit row");
-    assert_eq!(row.provider_call_id.as_deref(), Some(row.call_id.as_str()));
-    assert_eq!(
-        row.provider_call_id_source.as_deref(),
-        Some("synthetic_from_cockpit_call_id")
-    );
-}
-
-/// A write/lock seed is never executed — the execution-time read-only gate
-/// (same rule as `seed.rs`) drops it, so nothing is injected.
-#[tokio::test]
-async fn prefill_child_seeds_never_executes_a_write_seed() {
-    let (driver, tmp) = test_driver(8);
-    let child = child_with_read_write_tools(&driver.stack[0].agent.clone());
-    let target = tmp.path().join("must_not_exist.txt");
-    // A write seed (even though the child holds `write`): rejected at
-    // the read-only gate, never dispatched.
-    let seeds = vec![SeedTool {
-        tool: "write".into(),
-        args: serde_json::json!({ "path": target.to_string_lossy(), "content": "x" }),
-    }];
-    let (prefix, _truncated) = driver
-        .prefill_child_seeds(&seeds, &child, tmp.path(), None)
-        .await;
-    assert!(prefix.is_empty(), "a write seed injects nothing");
-    assert!(!target.exists(), "a write seed is never executed");
-}
-
-/// A seed that fails to execute in the child's cwd (missing path) is
-/// surfaced as a failed seed — its `Error:` body is injected as the
-/// tool_result — not a hard abort of the delegation.
-#[tokio::test]
-async fn prefill_child_seeds_surfaces_a_failed_seed_without_aborting() {
-    let (driver, tmp) = test_driver(8);
-    let child = child_with_read_write_tools(&driver.stack[0].agent.clone());
-    let good = tmp.path().join("ok.txt");
-    std::fs::write(&good, "fine\n").unwrap();
-    let missing = tmp.path().join("nope.txt");
-    let seeds = vec![
-        SeedTool {
-            tool: "read".into(),
-            args: serde_json::json!({ "path": missing.to_string_lossy() }),
-        },
-        SeedTool {
-            tool: "read".into(),
-            args: serde_json::json!({ "path": good.to_string_lossy() }),
-        },
-    ];
-    let (prefix, _truncated) = driver
-        .prefill_child_seeds(&seeds, &child, tmp.path(), None)
-        .await;
-    // Both seeds are injected: the failed one carries an `Error:` body, the
-    // good one carries its content — the run is not aborted.
-    use crate::engine::message::AssistantContent;
-    let n_calls = match &prefix[0] {
-        Message::Assistant { content, .. } => content
-            .iter()
-            .filter(|c| matches!(c, AssistantContent::ToolCall(_)))
-            .count(),
-        _ => panic!("assistant turn expected"),
-    };
-    assert_eq!(n_calls, 2, "both seeds injected (failed + ok)");
-    let bodies: String = prefix
-        .iter()
-        .skip(1)
-        .filter_map(|m| match m {
-            Message::User { content } => Some(
-                content
-                    .iter()
-                    .filter_map(|c| match c {
-                        rig::message::UserContent::ToolResult(tr) => Some(
-                            tr.content
-                                .iter()
-                                .filter_map(|rc| match rc {
-                                    rig::message::ToolResultContent::Text(t) => {
-                                        Some(t.text.clone())
-                                    }
-                                    _ => None,
-                                })
-                                .collect::<String>(),
-                        ),
-                        _ => None,
-                    })
-                    .collect::<String>(),
-            ),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        bodies.contains("Error:"),
-        "failed seed surfaced as an error"
-    );
-    assert!(bodies.contains("fine"), "the good seed still executed");
-}
-
-/// Oversized pre-seeds are dropped whole under the budget and the
-/// truncation flag is set so the caller appends a model-visible note.
-#[tokio::test]
-async fn prefill_child_seeds_caps_under_budget_and_drops_whole_entries() {
-    let (driver, tmp) = test_driver(8);
-    let child = child_with_read_write_tools(&driver.stack[0].agent.clone());
-    let small = tmp.path().join("small.txt");
-    std::fs::write(&small, "tiny\n").unwrap();
-    let mut seeds = vec![SeedTool {
-        tool: "read".into(),
-        args: serde_json::json!({ "path": small.to_string_lossy() }),
-    }];
-    for i in 0..3 {
-        let p = tmp.path().join(format!("big{i}.txt"));
-        let body: String = (0..600).map(|n| format!("file{i} line {n}\n")).collect();
-        std::fs::write(&p, body).unwrap();
-        seeds.push(SeedTool {
-            tool: "read".into(),
-            args: serde_json::json!({ "path": p.to_string_lossy() }),
-        });
-    }
-    let (prefix, truncated) = driver
-        .prefill_child_seeds(&seeds, &child, tmp.path(), None)
-        .await;
-    assert!(truncated, "the cumulative seed output trips the budget");
-    use crate::engine::message::AssistantContent;
-    let n_calls = match &prefix[0] {
-        Message::Assistant { content, .. } => content
-            .iter()
-            .filter(|c| matches!(c, AssistantContent::ToolCall(_)))
-            .count(),
-        _ => panic!("assistant turn expected"),
-    };
-    assert!(n_calls >= 1, "in-budget seeds injected");
-    assert!(n_calls < seeds.len(), "at least one whole seed dropped");
-}
-
-/// Absent/empty pre-seeds behave exactly as today: nothing injected, no
-/// truncation.
-#[tokio::test]
-async fn prefill_child_seeds_empty_is_a_noop() {
-    let (driver, tmp) = test_driver(8);
-    let child = child_with_read_write_tools(&driver.stack[0].agent.clone());
-    let (prefix, truncated) = driver
-        .prefill_child_seeds(&[], &child, tmp.path(), None)
-        .await;
-    assert!(prefix.is_empty());
-    assert!(!truncated);
-}
-
 /// A user-issued `/<skill>` seeds a real, recorded `skill` tool call —
 /// folded into history as an assistant `skill` ToolCall + its tool_result
 /// (not a model-initiated call) — with the wire-vs-user split preserved
@@ -792,13 +382,13 @@ fn record_active_skill_dedups_latest_wins() {
     );
 }
 
-/// A parent resolving an active skill seeds it into
-/// the child. An ACTIVE skill contributes its instructions PLUS the
+/// A parent resolving an active skill can tag it into the child handoff.
+/// An ACTIVE skill contributes its instructions PLUS the
 /// delegation framing (we are resolving skill X; it takes precedence over
 /// the child's baked-in default), so the child drafts instead of
 /// implementing.
 #[test]
-fn seed_skills_block_seeds_active_skill_with_framing() {
+fn skill_tag_expands_to_instructions() {
     let (mut driver, _tmp) = test_driver(1);
     // The release-notes skill is active in the parent's context (e.g.
     // user-invoked `/release-notes`).
@@ -806,7 +396,7 @@ fn seed_skills_block_seeds_active_skill_with_framing() {
         "release-notes",
         "Turn the rough change summary into release notes. Do NOT implement it.",
     );
-    let block = driver.seed_skills_block(&["release-notes".to_string()], "builder");
+    let block = driver.expand_skill_tags("please /skill release-notes now", "builder");
     // Carries the skill's instructions...
     assert!(
         block.contains("release notes"),
@@ -824,26 +414,75 @@ fn seed_skills_block_seeds_active_skill_with_framing() {
         block.contains("builder"),
         "framing names the delegated child: {block:?}"
     );
-    // No spurious strip note when everything requested was active.
+    // No spurious not-found note when the requested skill was active.
     assert!(
-        !block.contains("dropped because"),
+        !block.contains("not found"),
         "no strip note for an active skill: {block:?}"
     );
 }
 
-/// Host-side validation (validate, don't trust the model): a parent that
-/// names a skill NOT active in its context has that seed deterministically
-/// stripped, surfaced as a model-visible note — never a body conjured from
-/// thin air, never a hard error.
 #[test]
-fn seed_skills_block_strips_non_active_skill_with_note() {
+fn delegation_prompt_tags_expand_in_child() {
+    let (driver, tmp) = test_driver(1);
+    let file = tmp.path().join("handoff.txt");
+    std::fs::write(&file, "alpha\nbeta\n").unwrap();
+
+    let expanded = driver.expand_handoff_tags(
+        "Read @handoff.txt:1-1",
+        tmp.path(),
+        crate::config::extended::LlmMode::Normal,
+        "builder",
+    );
+
+    assert!(expanded.contains("<file path=\"handoff.txt\">"));
+    assert!(expanded.contains("alpha"));
+}
+
+#[test]
+fn subagent_return_tags_reach_caller() {
+    let (driver, tmp) = test_driver(1);
+    let file = tmp.path().join("report.txt");
+    std::fs::write(&file, "finding\nextra\n").unwrap();
+
+    let expanded = driver.expand_handoff_tags(
+        "Result uses @report.txt:1-1",
+        tmp.path(),
+        crate::config::extended::LlmMode::Normal,
+        "Build",
+    );
+
+    assert!(expanded.contains("<file path=\"report.txt\">"));
+    assert!(expanded.contains("finding"));
+}
+
+#[test]
+fn assembly_blocks_escaping_tag_with_chip() {
+    let (driver, tmp) = test_driver(1);
+    let child = tmp.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(tmp.path().join("outside.txt"), "secret\n").unwrap();
+
+    let expanded = driver.expand_handoff_tags(
+        "Read @../outside.txt:1-1",
+        &child,
+        crate::config::extended::LlmMode::Normal,
+        "builder",
+    );
+
+    assert!(expanded.contains("@../outside.txt:1-1"));
+    assert!(expanded.contains("[note: @../outside.txt"));
+    assert!(expanded.contains("blocked"));
+}
+
+/// Host-side validation (validate, don't trust the model): a parent that
+/// tags a skill NOT active in its context gets a model-visible note — never a
+/// body conjured from thin air, never a hard error.
+#[test]
+fn skill_tag_unknown_skill_yields_note() {
     let (mut driver, _tmp) = test_driver(1);
     // Only `release-notes` is active; `made-up` is not.
     driver.record_active_skill("release-notes", "release body");
-    let block = driver.seed_skills_block(
-        &["release-notes".to_string(), "made-up".to_string()],
-        "builder",
-    );
+    let block = driver.expand_skill_tags("/skill release-notes and /skill made-up", "builder");
     // The active one is still seeded...
     assert!(
         block.contains("release body"),
@@ -852,7 +491,7 @@ fn seed_skills_block_strips_non_active_skill_with_note() {
     // ...and the non-active one is stripped with a model-visible note that
     // names it and explains why.
     assert!(
-        block.contains("`made-up`") && block.contains("dropped because"),
+        block.contains("[note: /skill made-up not found]"),
         "non-active skill stripped with a visible note: {block:?}"
     );
     // The non-active skill's instructions never appear (nothing conjured).
@@ -862,24 +501,20 @@ fn seed_skills_block_strips_non_active_skill_with_note() {
     );
 }
 
-/// Seeding is opt-in: a delegation that requests no skill seed (or only
-/// blank names) produces an empty block — neither a seed nor a note.
+/// Expansion is opt-in: text without a `/skill <name>` tag is unchanged.
 #[test]
-fn seed_skills_block_empty_when_nothing_requested() {
+fn skill_tag_expansion_leaves_untagged_text_unchanged() {
     let (mut driver, _tmp) = test_driver(1);
     driver.record_active_skill("release-notes", "body");
-    assert!(driver.seed_skills_block(&[], "builder").is_empty());
-    assert!(
-        driver
-            .seed_skills_block(&["   ".to_string()], "builder")
-            .is_empty(),
-        "blank names contribute nothing"
+    assert_eq!(
+        driver.expand_skill_tags("plain handoff", "builder"),
+        "plain handoff"
     );
 }
 
 /// End-to-end: a user-invoked `/<skill>` whose body loads makes that skill
-/// part of the seedable set, so a later `task.skill_seed` naming it passes
-/// host validation. Writes a real skill under the cwd's seeded scan dir.
+/// part of the active set, so a later `/skill <name>` tag can expand it.
+/// Writes a real skill under the cwd's seeded scan dir.
 #[tokio::test(flavor = "current_thread")]
 async fn user_invoked_skill_enters_the_seedable_set() {
     let (mut driver, tmp) = driver_with_skill_caller();
@@ -919,9 +554,9 @@ async fn user_invoked_skill_enters_the_seedable_set() {
         "user-invoked skill body enters the seedable set, wrapper stripped"
     );
 
-    // The skill is now active in the parent's context, so seeding it into a
+    // The skill is now active in the parent's context, so tagging it into a
     // child succeeds and carries the loaded body.
-    let block = driver.seed_skills_block(&["release-notes".to_string()], "builder");
+    let block = driver.expand_skill_tags("/skill release-notes", "builder");
     assert!(
         block.contains("RELEASE NOTES, do not implement."),
         "user-invoked skill body is seedable: {block:?}"
@@ -940,9 +575,9 @@ async fn failed_user_invoked_skill_does_not_enter_seedable_set() {
         driver.active_skills.is_empty(),
         "failed skill invocation must not become seedable"
     );
-    let block = driver.seed_skills_block(&["missing-skill".to_string()], "builder");
+    let block = driver.expand_skill_tags("/skill missing-skill", "builder");
     assert!(
-        block.contains("dropped because they are not active"),
+        block.contains("[note: /skill missing-skill not found]"),
         "inactive failed skill should be stripped with a note: {block:?}"
     );
     assert!(

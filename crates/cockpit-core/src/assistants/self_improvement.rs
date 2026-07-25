@@ -186,7 +186,6 @@ async fn run_review_turn(
             Some(cage.clone()),
             ContextUsageSnapshot::unavailable(),
             crate::engine::deferred::DeferredLog::new(),
-            crate::engine::seed_collector::SeedCollector::new(),
             uuid::Uuid::new_v4(),
             None,
             None,

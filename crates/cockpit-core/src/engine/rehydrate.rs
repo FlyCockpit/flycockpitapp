@@ -3769,9 +3769,7 @@ mod tests {
     }
 
     /// A `/compact` successor that has ALREADY had turns rebuilds from its
-    /// transcript (rehydration returns `Some`). The session_worker gate
-    /// keys off this `Some`/`None` to skip seed-tool re-execution — the two
-    /// paths are mutually exclusive (implementation note).
+    /// transcript (rehydration returns `Some`).
     #[tokio::test]
     async fn successor_with_turns_rebuilds_from_transcript() {
         let s = root_session();
@@ -3780,10 +3778,9 @@ mod tests {
         let r = rehydrate_session(&s.db, s.id, "Build").await.unwrap();
         assert!(
             r.is_some(),
-            "a successor with turns rebuilds → seeds are skipped"
+            "a successor with turns rebuilds from transcript"
         );
-        // A fresh successor with NO recorded turns rehydrates to None → the
-        // seed-tool path runs instead.
+        // A fresh successor with NO recorded turns rehydrates to None.
         let fresh = root_session();
         assert!(
             rehydrate_session(&fresh.db, fresh.id, "Build")

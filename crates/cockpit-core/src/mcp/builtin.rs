@@ -805,7 +805,7 @@ fn default_functions() -> Vec<BuiltinFunction> {
         ),
         BuiltinFunction::new(
             "request_compact",
-            "Schedule compaction of the root context at the next safe boundary",
+            "Schedule compaction of the root context; handoff output may use @file, @file:XX-YY, @dir/, and /skill tags",
             BuiltinPresentation {
                 glyph: "🧹",
                 label: "request_compact".to_string(),

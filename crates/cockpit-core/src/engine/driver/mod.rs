@@ -80,7 +80,7 @@ pub enum DriverControl {
     Prune,
     /// Assemble a `/compact` handoff for the foreground agent: prune
     /// first (fixed ordering), draft the model brief, append the
-    /// deterministic appendix, derive seed-tools, create a fresh session,
+    /// deterministic appendix, derive context tags, create a fresh session,
     /// and emit `CompactReady`.
     Compact,
     /// Pin a user message verbatim for the next `/compact` (`/pin`).
@@ -531,12 +531,6 @@ pub struct Driver {
     shadow_brief_generation: u64,
     self_improvement_review: Option<crate::assistants::self_improvement::RunningReview>,
     self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule,
-    /// Re-executed seed-tool context for a `/compact` fresh session
-    /// (T6.e). Set by [`Self::run_seed_tools`] before the loop starts;
-    /// prepended to the **first** user message so the fresh agent's first
-    /// inference carries the live working set, then cleared. Avoids two
-    /// consecutive user messages on the wire.
-    pending_seed_context: Option<String>,
     goal_no_tool_idle_count: u8,
     goal_turns_since_mutating_action: u16,
     goal_turns_since_goal_context_delta: u16,
@@ -611,8 +605,7 @@ pub struct Driver {
     /// tools' out-of-boundary path checks can prompt + remember. `None`
     /// until the session worker installs it via
     /// [`Self::set_approver`] before the loop starts (same shape as the
-    /// interrupt hub); seed-tool re-execution before that runs with no
-    /// approver (skips the prompt, never denies).
+    /// interrupt hub). A missing approver skips the prompt, never denies.
     approver: Option<Arc<crate::approval::Approver>>,
     /// Daemon-owned LSP manager, installed by the session worker. Optional so
     /// in-process tests and replay paths can skip advisory LSP cleanly.
@@ -670,16 +663,15 @@ pub struct Driver {
     /// deliberately survive a swap and direct the new primary — today nothing
     /// sets it, so every user-invoked pair is owned-and-stripped on swap.
     skill_pairs: Vec<SkillPair>,
-    /// Seedable-set ledger for parent→child skill seeding
+    /// Active-skill ledger for `/skill <name>` handoff tags
     /// (implementation note). Records every skill genuinely
     /// **active in this primary's context** — user-invoked (folded by
     /// [`Self::seed_forced_skill`]) OR auto-injected (folded by
     /// [`Self::maybe_inject_skill`]) — keyed by skill name to its rendered
-    /// (`!`-processed, scrubbed) body. When the primary delegates via `task`
-    /// and names a skill in `task.skill_seed`, the host seeds that skill's
-    /// instructions + framing into the child's brief **only if the name is in
-    /// this set** (validate, don't trust the model); a named skill absent here
-    /// is deterministically stripped with a model-visible note. The latest body
+    /// (`!`-processed, scrubbed) body. When a handoff/report includes
+    /// `/skill <name>`, the host expands that skill's instructions + framing
+    /// **only if the name is in this set** (validate, don't trust the model);
+    /// an absent name renders a model-visible note. The latest body
     /// for a given name wins (a re-invoked / re-injected skill refreshes it).
     active_skills: Vec<(String, String)>,
     /// Per-session set of skill names already **auto-injected** this session
@@ -688,9 +680,9 @@ pub struct Driver {
     /// session: it is removed before the utility-model catalog is built, so it
     /// can be neither re-voted nor re-passed by the backstop — never re-paying
     /// its body for a skill the agent already has in context. Distinct from
-    /// [`Self::active_skills`] (the *seedable* set, which also holds
-    /// user-`/skill`-invoked and `task.skill_seed` bodies — a different intent
-    /// this exclusion must not cover): scope is strictly the auto-injection
+    /// [`Self::active_skills`] (the handoff-tag expansion set, which also
+    /// holds user-`/skill`-invoked bodies — a different intent this exclusion
+    /// must not cover): scope is strictly the auto-injection
     /// path. Populated on actual injection (in [`Self::maybe_inject_skill`]'s
     /// `Selection::Skills` arm), not on a vote/match. In-memory and
     /// session-scoped only — never persisted to config or DB (a resumed
@@ -1186,7 +1178,6 @@ impl Driver {
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
             ),
-            pending_seed_context: None,
             goal_no_tool_idle_count: 0,
             goal_turns_since_mutating_action: self.goal_turns_since_mutating_action,
             goal_turns_since_goal_context_delta: self.goal_turns_since_goal_context_delta,
@@ -1485,7 +1476,6 @@ impl Driver {
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
             ),
-            pending_seed_context: None,
             goal_no_tool_idle_count: 0,
             goal_turns_since_mutating_action: 0,
             goal_turns_since_goal_context_delta: 0,
@@ -2460,7 +2450,6 @@ impl Driver {
                 .context("driver stack is empty")?
                 .deferred_log
                 .clone(),
-            seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: self.stack.len() == 1,
             skill_write_origin: payload.resume.call_origin,
             review_cage: None,
@@ -2605,7 +2594,6 @@ impl Driver {
                     None,
                     context_usage,
                     deferred_log,
-                    crate::engine::seed_collector::SeedCollector::new(),
                     call_id,
                     tandem.as_ref(),
                     Some(lifecycle_turn_id.clone()),
@@ -4873,6 +4861,20 @@ impl Driver {
         }
     }
 
+    fn expand_handoff_tags(
+        &self,
+        text: &str,
+        cwd: &std::path::Path,
+        llm_mode: crate::config::extended::LlmMode,
+        child_agent: &str,
+    ) -> String {
+        let text = self.expand_skill_tags(text, child_agent);
+        let mut allow = crate::config::extended::resolve_gitignore_allow(cwd);
+        allow.extend(self.session.gitignore_session_allow());
+        let policy = crate::tags::TagPolicy::new_for_mode(cwd, allow, llm_mode);
+        crate::tags::expand_assembly_tags_with_policy(&text, &policy).wire
+    }
+
     /// Begin compact-after-delegation tracking for the paused parent frame
     /// (implementation note). `parent_full` is a clone of
     /// the parent's full history at delegation start. Resolves the cache +
@@ -5172,6 +5174,8 @@ impl Driver {
         } else {
             report
         };
+        let parent = self.stack.last().expect("stack never empty").agent.clone();
+        let report = self.expand_handoff_tags(&report, &self.cwd, parent.llm_mode, &parent.name);
         let task_call_id = child
             .answering
             .as_ref()
@@ -5581,14 +5585,6 @@ impl Driver {
             });
         }
 
-        // Prepend any pending `/compact` seed-tool context to the first
-        // user message so the fresh agent's first inference carries the
-        // re-executed working set (T6.e). One-shot.
-        let user_text = match self.pending_seed_context.take() {
-            Some(seed) => format!("{seed}\n\n{user_text}"),
-            None => user_text,
-        };
-
         // Skills auto-selection (GOALS §5): consult the cheap utility
         // model with the skill catalog + this message; if it picks one,
         // prepend the (`!`-processed, scrubbed) body so the main agent's
@@ -5759,7 +5755,6 @@ impl Driver {
                     // tool (it's a read-only-noninteractive-subagent + normal-
                     // mode affordance, GOALS §3c); a fresh empty collector
                     // satisfies the signature and is never drained here.
-                    crate::engine::seed_collector::SeedCollector::new(),
                     call_id,
                     tandem.as_ref(),
                     Some(lifecycle_turn_id.clone()),
@@ -6047,9 +6042,7 @@ impl Driver {
                     model,
                     remaining_depth,
                     granted_tools,
-                    seeds: prefill_seeds,
                     todo_ids,
-                    skill_seed,
                     repair_notes,
                     task_call_id,
                     task_function_call_id,
@@ -6101,7 +6094,6 @@ impl Driver {
                         "model": model_selector_json(&model),
                         "remaining_depth": remaining_depth,
                         "todo_ids": &todo_ids,
-                        "skill_seed": &skill_seed,
                         "interactive": true,
                     }))
                     .ok();
@@ -6153,7 +6145,7 @@ impl Driver {
                             continue;
                         }
                     }
-                    let (mut delegation_payload_history, brief) = match self
+                    let (delegation_payload_history, brief) = match self
                         .delegation_payload_delivery(&task_call_id, "default", &brief, true)
                         .await
                     {
@@ -6189,6 +6181,7 @@ impl Driver {
                         }
                     };
                     let child_routing = ChildRoutingMetadata::from_model(&child.model);
+                    let child_llm_mode = child.llm_mode;
                     self.emit_subagent_routing_amend(
                         tx,
                         &child_agent,
@@ -6229,21 +6222,6 @@ impl Driver {
                     let (tracker, handle) = self.begin_delegation_shrink(parent_full);
                     self.deleg_shrinks
                         .insert(parent_depth, PendingDelegationShrink { tracker, handle });
-                    // Caller→child read-only pre-seeds (`task.seed`,
-                    // implementation note): re-execute each
-                    // in the CHILD's cwd against the child's own toolbox and
-                    // prepend the native tool-call/result pairs to its initial
-                    // history, so the child starts grounded before its first
-                    // turn. Budget-capped (whole entries dropped past the cap);
-                    // a dropped-seed note is appended to the brief so the child
-                    // knows context was trimmed.
-                    let (seed_prefix, seeds_truncated) = self
-                        .prefill_child_seeds(&prefill_seeds, &child, &self.cwd, Some(tx))
-                        .await;
-                    let mut seed_prefix = seed_prefix;
-                    if !seed_prefix.is_empty() {
-                        delegation_payload_history.append(&mut seed_prefix);
-                    }
                     self.stack.push(AgentSession {
                         queue_target: crate::engine::message::QueueTarget::child(
                             child.name.clone(),
@@ -6271,11 +6249,6 @@ impl Driver {
                     if self.prompt_cache_retention_override.is_some() {
                         self.emit_longcache_state(tx).await;
                     }
-                    let brief = if seeds_truncated {
-                        format!("{brief}{SEED_PREFILL_TRUNCATION_NOTE}")
-                    } else {
-                        brief
-                    };
                     let brief = self
                         .assign_todos_to_task(
                             brief,
@@ -6285,19 +6258,8 @@ impl Driver {
                             &child_agent,
                         )
                         .await;
-                    // Parent→child skill seeding (`task.skill_seed`,
-                    // implementation note): validate the
-                    // requested skill names against this primary's active-skill
-                    // set and prepend the seeded instructions + framing (or a
-                    // model-visible strip note) to the child's brief. Woven into
-                    // the brief only — scoped to this child's run, never folded
-                    // into the parent's active-skill set or the root history.
-                    let skill_block = self.seed_skills_block(&skill_seed, &child_agent);
-                    let brief = if skill_block.is_empty() {
-                        brief
-                    } else {
-                        format!("{skill_block}{brief}")
-                    };
+                    let brief =
+                        self.expand_handoff_tags(&brief, &self.cwd, child_llm_mode, &child_agent);
                     next_prompt = Message::user(brief);
                     continue;
                 }
@@ -6310,9 +6272,7 @@ impl Driver {
                     resume_handle,
                     cwd,
                     granted_tools,
-                    seeds: prefill_seeds,
                     todo_ids,
-                    skill_seed,
                     repair_notes,
                     task_call_id,
                     task_function_call_id,
@@ -6377,9 +6337,7 @@ impl Driver {
                                 resume_handle,
                                 child_cwd,
                                 granted_tools,
-                                prefill_seeds,
                                 todo_ids,
-                                skill_seed,
                                 child_recursion,
                                 repair_notes,
                                 task_call_id,
@@ -7065,21 +7023,6 @@ pub(crate) const EXPLORE_MAX_TURNS: usize = 64;
 /// parent model that keeps re-issuing delegation after child failures; each
 /// batch consumes one unit so siblings in a batch do not starve one another.
 pub(crate) const DELEGATION_RETRY_BUDGET_PER_TURN: usize = 4;
-
-/// Token cap on the seeded read-only results a re-queryable subagent injects
-/// into its caller's transcript (GOALS §3c). Seeds are real injected context,
-/// so they ride the standard subagent-report budget (§10) — the same default
-/// cap as an async job's injected result ([`crate::engine::schedule::ASYNC_RESULT_TOKEN_CAP`]).
-/// Enforced via [`crate::intel::budget::BudgetedWriter`]: whole seeds are
-/// dropped once the cap is reached, deterministically, with a truncation note.
-const SEED_INJECTION_TOKEN_CAP: usize = crate::engine::schedule::ASYNC_RESULT_TOKEN_CAP;
-
-/// Model-visible note appended to a child's brief when one or more
-/// caller→child pre-seeds (`task.seed`,
-/// implementation note) were dropped to stay within the
-/// seed budget — so the child knows its pre-loaded context was trimmed and can
-/// re-gather what it needs.
-const SEED_PREFILL_TRUNCATION_NOTE: &str = "\n\n[note: some pre-seeded read-only context was omitted to stay within the context budget; re-read anything you need]";
 
 #[cfg(test)]
 mod tests;

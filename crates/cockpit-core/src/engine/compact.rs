@@ -14,9 +14,9 @@
 //!    ledger from the runtime, not LLM-written: files read/edited with
 //!    hashes, commands run with exit codes, git branch + dirty files,
 //!    open todos, and pinned messages verbatim.
-//! 3. **Seed-tools** ([`derive_seed_tools`]) — read-only, idempotent
-//!    tool calls that reconstruct the working set. **Re-executed** in
-//!    the new thread, never replayed from stale snapshots.
+//! 3. **Context tags** ([`derive_seed_tags`]) — bounded references to
+//!    read-only working-set material that the fresh thread can expand through
+//!    the shared `@`-tag policy.
 //! 4. **Pinned messages** — injected verbatim, never summarized.
 //! 5. **Review then commit** — the assembled handoff goes into the
 //!    composer; on confirm a new session is seeded with it.
@@ -30,32 +30,29 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::db::seed_tools::SeedTool;
 use crate::db::tool_calls::ToolCallEvent;
 use crate::engine::message::Message;
 
-/// Read-only / idempotent tools eligible to be re-executed as seed-tools
-/// in the new thread. Never `bash`, `write`, `edit` (GOALS §10). `read`
-/// and the read-only intel tools reconstruct the working set; `ls` /
-/// `git status` are surfaced through dedicated seed entries below.
-const SEED_TOOLS: &[&str] = &["read", "code", "graph", "search"];
+/// Read-only / idempotent tools eligible to become `/compact` context tags.
+/// Never `bash`, `write`, or `edit` (GOALS §10).
+const CONTEXT_TAG_TOOLS: &[&str] = &["read", "code", "graph", "search"];
 
-pub fn read_only_seed_tool_names() -> Vec<&'static str> {
-    SEED_TOOLS.iter().copied().chain(["grep", "glob"]).collect()
+pub fn read_only_context_tag_tool_names() -> Vec<&'static str> {
+    CONTEXT_TAG_TOOLS
+        .iter()
+        .copied()
+        .chain(["grep", "glob"])
+        .collect()
 }
 
-fn is_seed_tool(name: &str) -> bool {
-    SEED_TOOLS.contains(&name)
+fn is_context_tag_tool(name: &str) -> bool {
+    CONTEXT_TAG_TOOLS.contains(&name)
 }
 
-/// Whether `name` is a read-only / idempotent tool eligible to be emitted as
-/// a seed and re-executed in another agent's context. Shared by the
-/// `/compact` handoff and the re-queryable-subagent `seed` tool (GOALS §3c)
-/// so both honor one allowlist. The sandboxed `grep`/`glob` (docs-answerer
-/// only) are included as read-only for completeness; the driver re-exec is
-/// the hard gate (it only dispatches a seed the *caller* actually holds).
-pub fn is_read_only_seed_tool(name: &str) -> bool {
-    is_seed_tool(name) || matches!(name, "grep" | "glob")
+/// Whether `name` is a read-only / idempotent tool eligible to be represented
+/// as a context tag.
+pub fn is_read_only_context_tag_tool(name: &str) -> bool {
+    is_context_tag_tool(name) || matches!(name, "grep" | "glob")
 }
 
 /// The deterministic state appendix. Built from the runtime ledger, not
@@ -269,29 +266,24 @@ pub fn render_task_todo_overview(
         .collect()
 }
 
-/// Derive the seed-tool list: read-only / idempotent calls whose results
-/// were the live working set just before compaction. We re-execute the
-/// **most recent** identical (tool, args) call for every snapshot tool
-/// the session used, so the new agent gets the current content without a
-/// round-trip — but **never** replays the old output (the call is
-/// re-dispatched in the new thread).
+/// Derive context tags from read-only / idempotent calls whose results were
+/// the live working set just before compaction.
 ///
-/// Restricted to [`SEED_TOOLS`]. Deduped by `(tool, canonical_args)` so
-/// a file read five times yields one seed. Ordered by last use so the
+/// Restricted to [`CONTEXT_TAG_TOOLS`]. Deduped by `(tool, canonical_args)` so
+/// a file read five times yields one tag. Ordered by last use so the
 /// most-relevant context lands first.
-pub fn derive_seed_tools(calls: &[ToolCallEvent]) -> Vec<SeedTool> {
+pub fn derive_seed_tags(calls: &[ToolCallEvent]) -> Vec<String> {
     // Last-occurrence index per identity, to dedup while keeping order.
     let mut last_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut order: Vec<(String, SeedTool)> = Vec::new();
+    let mut order: Vec<(String, String)> = Vec::new();
 
     for call in calls {
-        if !is_seed_tool(&call.tool) || call.hard_fail {
+        if !is_context_tag_tool(&call.tool) || call.hard_fail {
             continue;
         }
         let key = format!("{}\u{0}{}", call.tool, canonical(&call.wire_input_json));
-        let seed = SeedTool {
-            tool: call.tool.clone(),
-            args: call.wire_input_json.clone(),
+        let Some(seed) = seed_tag_for_call(call) else {
+            continue;
         };
         match last_index.get(&key).copied() {
             Some(i) => {
@@ -304,6 +296,37 @@ pub fn derive_seed_tools(calls: &[ToolCallEvent]) -> Vec<SeedTool> {
         }
     }
     order.into_iter().map(|(_, s)| s).collect()
+}
+
+fn seed_tag_for_call(call: &ToolCallEvent) -> Option<String> {
+    let path = call
+        .wire_input_json
+        .get("path")
+        .and_then(Value::as_str)
+        .or(call.path.as_deref())?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    if call.tool == "read" {
+        let offset = call.wire_input_json.get("offset").and_then(Value::as_u64);
+        let limit = call.wire_input_json.get("limit").and_then(Value::as_u64);
+        return Some(match (offset, limit) {
+            (Some(start), Some(limit)) if limit > 0 => {
+                format!(
+                    "@{path}:{start}-{}",
+                    start.saturating_add(limit).saturating_sub(1)
+                )
+            }
+            (Some(start), _) => format!("@{path}:{start}-"),
+            _ => format!("@{path}"),
+        });
+    }
+    Some(if path.ends_with('/') {
+        format!("@{path}")
+    } else {
+        format!("@{path}/")
+    })
 }
 
 /// Build the prompt sent to the model to draft the self-contained brief
@@ -328,24 +351,36 @@ pub fn brief_prompt(override_prompt: Option<&str>) -> String {
      ## Unresolved / open questions\n\
      ## Bugs & gotchas\n\
      ## Next steps\n\n\
-     Put judgment and continuation guidance under those sections. Do not list \
-     files or commands — a deterministic appendix covers those. Refer to pinned \
-     messages when relevant but do not restate them; they survive verbatim in \
-     the appendix."
+     Put judgment and continuation guidance under those sections. Pin the few \
+     files, ranges, directories, or skills the fresh agent should resolve with \
+     @file, @file:XX-YY, @dir/, and /skill tags; the deterministic appendix \
+     still carries the full ledger. Refer to pinned messages when relevant but \
+     do not restate them; they survive verbatim in the appendix."
         .to_string()
 }
 
 pub const HISTORY_AGENT_NUDGE: &str = "Note: information summarized away in this handoff is not lost - the full prior conversation, tool output, and every compacted predecessor session remain on disk. If you need a detail that is not in this brief, invoke the `history` agent via `task` to search and retrieve it rather than guessing or asking the user to repeat themselves.";
 
 /// Assemble the full review-ready handoff: model brief + deterministic
-/// appendix. (Seed-tools are surfaced separately; they re-execute, they
-/// aren't part of the prose.)
+/// appendix + context tags.
 pub fn assemble_handoff(
     brief: &str,
     appendix: &StateAppendix,
+    seed_tags: &[String],
     history_agent_available: bool,
 ) -> String {
     let mut handoff = format!("{}{}", brief.trim(), appendix.render());
+    if !seed_tags.is_empty() {
+        handoff.push_str("\n\n## Context tags\n");
+        handoff.push_str(
+            "Use these @file, @file:XX-YY, @dir/, and /skill tags to resolve the working set through the shared tag policy:\n",
+        );
+        for tag in seed_tags {
+            handoff.push_str("- ");
+            handoff.push_str(tag);
+            handoff.push('\n');
+        }
+    }
     if history_agent_available {
         handoff.push_str("\n\n");
         handoff.push_str(HISTORY_AGENT_NUDGE);
@@ -737,28 +772,59 @@ mod tests {
     }
 
     #[test]
-    fn seed_tools_only_read_only_and_deduped() {
+    fn compact_handoff_emits_tags_not_seed_rows() {
         let calls = vec![
-            call("read", json!({"path": "/a.rs"}), Some("/a.rs"), "x", false),
-            call("read", json!({"path": "/a.rs"}), Some("/a.rs"), "x", false),
+            call("read", json!({"path": "a.rs"}), Some("a.rs"), "x", false),
+            call(
+                "read",
+                json!({"path": "a.rs", "offset": 10, "limit": 3}),
+                Some("a.rs"),
+                "x",
+                false,
+            ),
+            call("read", json!({"path": "a.rs"}), Some("a.rs"), "x", false),
             call("bash", json!({"command": "ls"}), None, "x", false),
-            call("write", json!({"path": "/b.rs"}), Some("/b.rs"), "x", false),
+            call("write", json!({"path": "b.rs"}), Some("b.rs"), "x", false),
             call(
                 "code",
-                json!({"kind": "outline", "path": "/a.rs"}),
+                json!({"kind": "outline", "path": "src/"}),
                 None,
                 "x",
                 false,
             ),
             // A failed read is not a trustworthy seed.
-            call("read", json!({"path": "/c.rs"}), Some("/c.rs"), "err", true),
+            call("read", json!({"path": "c.rs"}), Some("c.rs"), "err", true),
         ];
-        let seeds = derive_seed_tools(&calls);
-        // read /a.rs (deduped) + code outline /a.rs — bash, write, failed read excluded.
-        assert_eq!(seeds.len(), 2);
-        assert!(seeds.iter().any(|s| s.tool == "read"));
-        assert!(seeds.iter().any(|s| s.tool == "code"));
-        assert!(!seeds.iter().any(|s| s.tool == "bash" || s.tool == "write"));
+        let tags = derive_seed_tags(&calls);
+        assert_eq!(tags, vec!["@a.rs", "@a.rs:10-12", "@src/"]);
+
+        let handoff = assemble_handoff("Continue.", &StateAppendix::default(), &tags, false);
+        assert!(handoff.contains("## Context tags"));
+        assert!(handoff.contains("@a.rs:10-12"));
+        assert!(!handoff.contains("<seed"));
+    }
+
+    #[test]
+    fn seed_tag_copy_present_in_prompt_surfaces() {
+        use crate::engine::tool::Tool;
+
+        fn has_all_tags(text: &str) -> bool {
+            text.contains("@file")
+                && text.contains("@file:XX-YY")
+                && text.contains("@dir/")
+                && text.contains("/skill")
+        }
+
+        let request_compact_source = include_str!("../mcp/builtin.rs");
+        let brief = brief_prompt(None);
+        let return_tool = crate::tools::return_tool::ReturnTool;
+        let task_tool = crate::tools::task::TaskTool::with_subagents(&["explore", "builder"]);
+
+        assert!(has_all_tags(request_compact_source));
+        assert!(has_all_tags(&brief));
+        assert!(!brief.contains("Do not list files"));
+        assert!(has_all_tags(return_tool.description()));
+        assert!(has_all_tags(task_tool.description()));
     }
 
     #[test]
@@ -767,7 +833,7 @@ mod tests {
             files_read: vec!["/a.rs".into()],
             ..Default::default()
         };
-        let h = assemble_handoff("Continue the refactor.", &appendix, false);
+        let h = assemble_handoff("Continue the refactor.", &appendix, &[], false);
         assert!(h.starts_with("Continue the refactor."));
         assert!(h.contains("State appendix"));
         assert!(h.contains("/a.rs"));
@@ -780,7 +846,7 @@ mod tests {
             files_read: vec!["/a.rs".into()],
             ..Default::default()
         };
-        let h = assemble_handoff("Continue the refactor.", &appendix, true);
+        let h = assemble_handoff("Continue the refactor.", &appendix, &[], true);
 
         assert!(h.contains("State appendix"));
         assert!(h.ends_with(HISTORY_AGENT_NUDGE));
@@ -790,7 +856,7 @@ mod tests {
     #[test]
     fn history_nudge_omitted_when_history_agent_unavailable() {
         let appendix = StateAppendix::default();
-        let h = assemble_handoff("Continue the refactor.", &appendix, false);
+        let h = assemble_handoff("Continue the refactor.", &appendix, &[], false);
 
         assert!(!h.contains(HISTORY_AGENT_NUDGE));
         assert!(!h.contains("`history` agent via `task`"));

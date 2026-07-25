@@ -71,7 +71,7 @@ impl TaskTool {
             })
             .unwrap_or_default();
         let description = format!(
-            "Delegate/control subagents ({list}) with `intent` plus optional `payload`. Backgrounded JSON means call closed, child detached/result pending; use task_call_id controls or async result.{recursion_note}"
+            "Delegate/control {list} with `intent` plus optional `payload`. Handoff uses @file/@file:XX-YY/@dir/ and /skill tags. Backgrounded JSON: detached child; use task_call_id controls/async result.{recursion_note}"
         );
         // Defensive (`LlmMode::Defensive`) steering: decompose harder and
         // route narrow pieces through subagents so each does one focused job
@@ -84,7 +84,9 @@ impl TaskTool {
              narrow pieces and delegate each one, so the subagent does its focused job in its \
              own context and returns just a short report — keeping your own context lean. Write \
              `payload.prompt` as a complete, standalone brief: the goal, the constraints, the exact \
-             files involved, and what \"done\" looks like — the subagent does NOT see your \
+             files involved, and what \"done\" looks like. Use @file, @file:XX-YY, @dir/, and /skill \
+             tags in that handoff prompt when the child needs bounded source or skill context — the \
+             subagent does NOT see your \
              conversation. An interactive subagent (e.g. the writer or the planning interviewer) \
              takes over the conversation with the user; the others run on their own and report \
              back. Only `builder` may write files, in either case. Use `intent=models` to discover \
@@ -97,50 +99,38 @@ impl TaskTool {
              If a noninteractive task returns a backgrounded task_delegation JSON envelope, the original tool call is closed and the child is still running detached with result_pending=true. Do not treat it as the report or redelegate solely because it backgrounded; continue the current conversation and use the async task_delegation result or task status/query/list with task_call_id. Read each child status and optional error; backgrounded children can later complete, fail, be cancelled, or be lost. task steer applies at the next child turn boundary only if still running/actionable. resume_handle is not a universal background-task control channel. \
              Do not add legacy delegate/batch/control siblings. Query/steer require message."
         );
-        let seed_schema = serde_json::json!({
-            "type": "array",
-            "items": crate::tools::seed::seed_item_schema(),
-            "description": "Read-only tool calls re-executed in the child's cwd and pre-loaded into its context; omit otherwise"
-        });
         let model_selector_schema = serde_json::json!({
             "type": "object",
-            "description": "Optional structured subagent model selector. Discover allowed choices with intent=models. Exact: {\"kind\":\"exact\",\"selector\":\"provider:model\"}. Category: {\"kind\":\"category\",\"category\":\"cheap_code\",\"trust\":\"trusted\",\"optimize\":\"quality\"}. Optional constraints: requires, min_context_tokens",
             "properties": {
                 "kind": {
                     "type": "string",
-                    "enum": ["exact", "category"],
-                    "description": "Selector kind"
+                    "enum": ["exact", "category"]
                 },
                 "selector": {
-                    "type": "string",
-                    "description": "Exact provider:model selector; required when kind=exact"
+                    "type": "string"
                 },
                 "category": {
-                    "type": "string",
-                    "description": "Policy category such as cheap_code, smart_code, reasoning, or translation"
+                    "type": "string"
                 },
                 "trust": {
                     "type": "string",
-                    "enum": ["trusted", "untrusted"],
-                    "description": "Optional trust filter"
+                    "enum": ["trusted", "untrusted"]
                 },
                 "optimize": {
                     "type": "string",
-                    "enum": ["quality", "cost", "balanced"],
-                    "description": "Category tie-break preference"
+                    "enum": ["quality", "cost", "balanced"]
                 },
                 "requires": {
                     "type": "array",
                     "items": {
                         "type": "string",
                         "enum": ["tool_calling", "images", "reasoning", "structured_outputs"]
-                    },
-                    "description": "Required model capabilities"
+                    }
                 },
                 "min_context_tokens": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Minimum context tokens; omit unless the task genuinely requires a minimum"
+                    "description": "omit unless a minimum context size is required"
                 }
             },
             "required": ["kind"]
@@ -150,51 +140,40 @@ impl TaskTool {
             "properties": {
                 "agent":  {
                     "type": "string",
-                    "description": "Subagent name; `docs` answers dependency API usage from real source, `explore` investigates, `builder` writes/edits",
+                    "description": "`docs` for dependency API usage; `explore`; `builder`",
                     "enum": agents
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Self-contained brief: goal, constraints, files, what \"done\" looks like"
+                    "description": "Brief"
                 },
                 "mode": {
                     "type": "string",
-                    "description": "Delegation mode override",
                     "enum": ["subagent", "subagent_interactive"]
                 },
                 "model": model_selector_schema.clone(),
                 "why": {
-                    "type": "string",
-                    "description": "Motivation for this delegation"
+                    "type": "string"
                 },
                 "resume_handle": {
-                    "type": "string",
-                    "description": "Handle of a prior read-only subagent to re-query"
+                    "type": "string"
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Optional working directory for noninteractive child runs. Relative paths resolve against the parent session cwd; absolute paths must remain inside the trusted workspace and must name an existing directory"
+                    "description": "Relative paths resolve against the parent session cwd; must stay in workspace"
                 },
                 "grant_tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Extra tools to grant this one delegation only if the task needs them (e.g. `mcp`); omit otherwise"
-                },
-                "seed": seed_schema,
-                "skill_seed": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Names of active skills to seed (instructions + framing) into the child when its work is part of resolving that skill; omit otherwise"
+                    "description": "Extra tools"
                 },
                 "todo_ids": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Todo UUIDs this subagent is responsible for"
+                    "items": { "type": "string" }
                 },
                 "remaining_depth": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "Optional recursive child-edge budget to grant this child. Omit or use 0 for a leaf child; recursive callers may reduce but never increase their inherited budget"
+                    "minimum": 0
                 }
             },
             "required": ["agent", "prompt"]
@@ -202,49 +181,39 @@ impl TaskTool {
         let batch_entry = serde_json::json!({
             "type": "object",
             "properties": {
-                "label": { "type": "string", "description": "Stable concise label for this child within the batch" },
+                "label": { "type": "string" },
                 "agent":  {
                     "type": "string",
-                    "description": "Subagent name; batch entries must target noninteractive agents such as `explore` or `docs`; use `docs` for dependency API uncertainty",
+                    "description": "`docs` for dependency API usage; `explore`",
                     "enum": agents
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Self-contained brief: goal, constraints, files, what \"done\" looks like"
+                    "description": "Brief"
                 },
                 "model": model_selector_schema.clone(),
                 "resume_handle": {
-                    "type": "string",
-                    "description": "Handle of a prior read-only subagent to re-query"
+                    "type": "string"
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Optional working directory for this noninteractive child. Relative paths resolve against the parent session cwd; absolute paths must remain inside the trusted workspace and must name an existing directory"
+                    "description": "Relative paths resolve against the parent session cwd; must stay in workspace"
                 },
                 "grant_tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Extra tools to grant this one delegation only if the task needs them; omit otherwise"
-                },
-                "seed": seed_schema,
-                "skill_seed": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Names of active skills to seed into the child"
+                    "description": "Extra tools"
                 },
                 "todo_ids": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Todo UUIDs this subagent is responsible for"
+                    "items": { "type": "string" }
                 },
                 "output_dir": {
-                    "type": "string",
-                    "description": "Required for write-capable batch entries; child must keep writes under this directory"
+                    "type": "string"
                 },
                 "remaining_depth": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "Optional recursive child-edge budget to grant this child. Omit or use 0 for a leaf child; recursive callers may reduce but never increase their inherited budget"
+                    "minimum": 0
                 }
             },
             "required": ["agent", "prompt"]
@@ -253,22 +222,20 @@ impl TaskTool {
             "type": "object",
             "properties": {
                 "task_call_id": {
-                    "type": "string",
-                    "description": "Delegation task_call_id for status/cancel/query/steer when needed to disambiguate"
+                    "type": "string"
                 },
                 "label": {
-                    "type": "string",
-                    "description": "Child label within a delegation for status/cancel/query/steer"
+                    "type": "string"
                 },
                 "message": {
                     "type": "string",
-                    "description": "Required for query and steer only: question for query or steering instruction for steer"
+                    "description": "Required for query and steer"
                 }
             }
         });
         let payload_schema = serde_json::json!({
             "type": ["object", "array", "null"],
-            "description": "Payload selected by `intent`: delegate uses an object with `agent`/`prompt` (use `docs` for dependency API uncertainty); batch uses an array of entries; models/list may omit/null/{}; status/cancel/query/steer use control fields; query/steer require `message`",
+            "description": "Payload for intent; use docs for dependency API; query/steer require message",
             "properties": {
                 "agent": delegate_payload["properties"]["agent"].clone(),
                 "prompt": delegate_payload["properties"]["prompt"].clone(),
@@ -278,8 +245,6 @@ impl TaskTool {
                 "resume_handle": delegate_payload["properties"]["resume_handle"].clone(),
                 "cwd": delegate_payload["properties"]["cwd"].clone(),
                 "grant_tools": delegate_payload["properties"]["grant_tools"].clone(),
-                "seed": delegate_payload["properties"]["seed"].clone(),
-                "skill_seed": delegate_payload["properties"]["skill_seed"].clone(),
                 "todo_ids": delegate_payload["properties"]["todo_ids"].clone(),
                 "remaining_depth": delegate_payload["properties"]["remaining_depth"].clone(),
                 "task_call_id": control_payload["properties"]["task_call_id"].clone(),
@@ -293,7 +258,6 @@ impl TaskTool {
             "properties": {
                 "intent": {
                     "type": "string",
-                    "description": "Choose exactly one task operation: delegate, batch, models, list, status, cancel, query, or steer",
                     "enum": ["delegate", "batch", "models", "list", "status", "cancel", "query", "steer"]
                 },
                 "payload": payload_schema
@@ -373,7 +337,10 @@ mod tests {
         );
         assert!(tool.description().contains("Backgrounded JSON"));
         assert!(tool.description().contains("task_call_id controls"));
-        assert!(tool.description().len() <= 200);
+        assert!(tool.description().contains("@file"));
+        assert!(tool.description().contains("@file:XX-YY"));
+        assert!(tool.description().contains("@dir/"));
+        assert!(tool.description().contains("/skill"));
         let defensive_description = tool.defensive_description().unwrap();
         assert!(defensive_description.contains("\"intent\": \"delegate\""));
         assert!(defensive_description.contains("\"intent\": \"batch\""));
@@ -448,12 +415,27 @@ mod tests {
                 payload_props["grant_tools"]["type"], "array",
                 "grant_tools is an array: {schema}"
             );
-            // Caller→child read-only pre-seeding (`task.seed`,
-            // implementation note): present in BOTH modes
-            // from session start (cache-safe fixed shape) and optional.
             assert!(
-                payload_props.contains_key("seed"),
-                "missing `seed`: {schema}"
+                !payload_props.contains_key("seed"),
+                "`seed` should be replaced by handoff tags: {schema}"
+            );
+            assert!(
+                !payload_props.contains_key("skill_seed"),
+                "`skill_seed` should be replaced by /skill tags: {schema}"
+            );
+            assert!(
+                !payload["items"]["properties"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("seed"),
+                "batch `seed` should be absent: {schema}"
+            );
+            assert!(
+                !payload["items"]["properties"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("skill_seed"),
+                "batch `skill_seed` should be absent: {schema}"
             );
             assert!(
                 payload_props.contains_key("model"),
@@ -471,26 +453,9 @@ mod tests {
                 payload["items"]["properties"]["model"]["type"], "object",
                 "batch model selector is structured: {schema}"
             );
-            assert_eq!(
-                payload_props["seed"]["type"], "array",
-                "seed is an array: {schema}"
-            );
-            // Parent→child skill seeding (`task.skill_seed`,
-            // implementation note): present in BOTH modes
-            // from session start (cache-safe fixed shape) and optional. A
-            // separate mechanism from the read-only `seed` field — it carries
-            // skill instructions, not a re-executed tool call.
-            assert!(
-                payload_props.contains_key("skill_seed"),
-                "missing `skill_seed`: {schema}"
-            );
             assert!(
                 payload_props.contains_key("todo_ids"),
                 "missing `todo_ids`: {schema}"
-            );
-            assert_eq!(
-                payload_props["skill_seed"]["type"], "array",
-                "skill_seed is an array: {schema}"
             );
             let agent_enum = payload_props["agent"]["enum"].as_array().unwrap();
             assert!(agent_enum.iter().any(|value| value == "explore"));
@@ -533,21 +498,42 @@ mod tests {
     }
 
     #[test]
-    fn task_seed_schema_matches_seed_tool_schema() {
+    fn task_schema_has_no_seed_or_skill_seed() {
         let tool = TaskTool::with_subagents(&["explore", "builder"]);
-        let expected = crate::tools::seed::seed_item_schema();
 
         for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
-            let payload = &schema["properties"]["payload"];
-            assert_eq!(
-                payload["properties"]["seed"]["items"], expected,
-                "delegate seed item schema must match the seed tool schema"
-            );
-            assert_eq!(
-                payload["items"]["properties"]["seed"]["items"], expected,
-                "batch seed item schema must match the seed tool schema"
-            );
+            assert_schema_key_absent(&schema, "seed");
+            assert_schema_key_absent(&schema, "skill_seed");
         }
+    }
+
+    fn assert_schema_key_absent(value: &Value, key: &str) {
+        match value {
+            Value::Object(map) => {
+                assert!(
+                    !map.contains_key(key),
+                    "schema still contains `{key}`: {value}"
+                );
+                for child in map.values() {
+                    assert_schema_key_absent(child, key);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    assert_schema_key_absent(child, key);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn task_definition_shrinks_after_seed_removal() {
+        let tool = TaskTool::with_subagents(&["explore", "builder"]);
+        let len = serde_json::to_string(&tool.parameters()).unwrap().len();
+        // Observed after seed schema removal: ~2860 bytes. Keep this below
+        // the prompt's hard 3,000-byte ceiling so the seed blob cannot return.
+        assert!(len < 3000, "task schema serialized to {len} bytes");
     }
 
     #[test]

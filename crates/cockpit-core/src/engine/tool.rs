@@ -695,7 +695,7 @@ pub struct ToolCtx {
     /// today only `bash`, which appends a defensive-mode-only file/search
     /// routing nudge to its result body
     /// (implementation note). Mirrors
-    /// `agent.llm_mode` at the dispatch site; `Normal` in test/seed-tool
+    /// `agent.llm_mode` at the dispatch site; `Normal` in test/headless
     /// contexts so the nudge is silent there.
     pub llm_mode: crate::config::extended::LlmMode,
     pub locks: Arc<crate::locks::LockManager>,
@@ -739,7 +739,7 @@ pub struct ToolCtx {
     /// non-zero sandboxed exit), and the native file/intel tools consult
     /// it via [`crate::tools::sandbox::check_native_access`] to escalate
     /// an out-of-boundary path access. `None` on paths with no client
-    /// fan-out (seed-tool re-execution, tool tests): a missing approver
+    /// fan-out (tool tests/headless): a missing approver
     /// skips the prompt — it never silently denies. Shared `Arc` so one
     /// approver instance backs the whole delegation tree.
     pub approver: Option<Arc<crate::approval::Approver>>,
@@ -747,16 +747,9 @@ pub struct ToolCtx {
     /// `defer_to_orchestrator` tool appends out-of-scope asks here; the
     /// driver drains it when the frame pops and folds it into the report the
     /// parent ingests. `Default` (empty) for the root frame and for contexts
-    /// with no subagent (tests, seed-tool re-exec) — defer there is a no-op
+    /// with no subagent (tests/headless) — defer there is a no-op
     /// drain nobody reads.
     pub deferred_log: crate::engine::deferred::DeferredLog,
-    /// The current frame's seed collector (GOALS §3c). A re-queryable
-    /// read-only noninteractive subagent's `seed` tool appends `{tool, args}`
-    /// entries here; the driver drains them on return and injects them into
-    /// the caller's transcript. `Default` (empty) for the root frame, the
-    /// interactive path, and contexts with no subagent (tests, seed-tool
-    /// re-exec) — `seed` there is a no-op drain nobody reads.
-    pub seeds: crate::engine::seed_collector::SeedCollector,
     /// Whether this tool call belongs to the foreground root frame. Driver-level
     /// controls such as agent-requested compaction are only valid there.
     pub root_agent_frame: bool,
@@ -781,7 +774,7 @@ pub struct ToolCtx {
     /// recovery hint to the caller's actual surface (e.g. `read` on a
     /// directory suggests code/tree only when the agent can use it) rather than
     /// name-guessing capabilities. Populated from the agent's `ToolBox` at the
-    /// live dispatch site; `false` in test/seed-tool contexts with no toolbox.
+    /// live dispatch site; `false` in test/headless contexts with no toolbox.
     pub has_tree: bool,
     /// Whether the calling agent holds the `bash` tool. The `bash` fallback for
     /// the same surface-aware recovery hints (used when `code` is absent).
@@ -791,7 +784,7 @@ pub struct ToolCtx {
     /// second broadcast authority — it routes through the same seam the turn
     /// loop uses (implementation note). Today only
     /// `read` uses it, to emit the `WaitingForLock` start/clear pair while
-    /// blocked on a contended lock. `None` in test / seed-tool / headless
+    /// blocked on a contended lock. `None` in test/headless
     /// contexts with no client fan-out — emitting is then a silent no-op.
     pub events: Option<tokio::sync::mpsc::Sender<crate::engine::agent::TurnEvent>>,
     /// Daemon-owned LSP manager. `None` in tests/replay contexts; LSP is
@@ -2056,7 +2049,7 @@ mod llm_mode_tests {
         for name in crate::engine::prune::SNAPSHOT_TOOLS
             .iter()
             .copied()
-            .chain(crate::engine::compact::read_only_seed_tool_names())
+            .chain(crate::engine::compact::read_only_context_tag_tool_names())
         {
             assert!(
                 builtin_names.contains(name),
@@ -2466,7 +2459,6 @@ mod llm_mode_tests {
             ("return", ToolEffect::Dynamic),
             ("schedule", ToolEffect::Dynamic),
             ("search", ToolEffect::Dynamic),
-            ("seed", ToolEffect::Dynamic),
             ("session_lineage_search", ToolEffect::ReadOnly),
             ("session_read", ToolEffect::ReadOnly),
             ("session_search", ToolEffect::ReadOnly),

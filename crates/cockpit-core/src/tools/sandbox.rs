@@ -90,7 +90,7 @@ pub fn within_root(canonical_root: &Path, candidate: &Path) -> bool {
 /// control; an out-of-boundary native operation is unconfined and therefore
 /// takes grant-or-ask, with path grants avoiding repeated prompts at the
 /// chosen scope. When no approver is wired (a degraded state such as
-/// seed-tool re-execution before the approver exists), already-proven
+/// headless/tool contexts before an approver exists, already-proven
 /// in-boundary paths continue to work, but unproven or out-of-boundary
 /// paths fail closed because there is no safe prompt path.
 ///
@@ -526,7 +526,6 @@ mod tests {
             shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver: Some(approver),
             deferred_log: crate::engine::deferred::DeferredLog::new(),
-            seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
             review_cage: None,

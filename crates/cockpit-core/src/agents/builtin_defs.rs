@@ -177,18 +177,20 @@ fn build_def() -> AgentDef {
         "task".to_string(),
         ToolDescriptionSpec::PerMode {
             normal: Some(
-                "Delegate substantive feature work to a subagent (builder writes, explore investigates); if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
+                "Delegate substantive feature work to a subagent (builder writes, explore investigates); handoff prompts may use @file, @file:XX-YY, @dir/, and /skill tags; if task returns backgrounded JSON, the call is closed but the child is detached/result-pending, so use task_call_id controls or the async result rather than duplicate work; use docs by default for unfamiliar or version-sensitive dependency APIs"
                     .to_string(),
             ),
             frontier: Some(
-                "Write small local edits directly; delegate larger, multi-file, risky, or isolated work to builder/explore; backgrounded JSON means the task call closed but the child is detached/result-pending; use docs when APIs are unfamiliar or version-sensitive"
+                "Write small local edits directly; delegate larger, multi-file, risky, or isolated work to builder/explore; handoff prompts may use @file, @file:XX-YY, @dir/, and /skill tags; backgrounded JSON means the task call closed but the child is detached/result-pending; use docs when APIs are unfamiliar or version-sensitive"
                     .to_string(),
             ),
             defensive: Some(
                 "Delegate substantive implementation instead of doing it inline: hand each \
                  well-scoped piece to `builder` to write/edit files, or to `explore` for \
                  read-only investigation, with a complete standalone brief (goal, constraints, \
-                 exact files, what \"done\" looks like). Each `builder` task is one \
+                 exact files, what \"done\" looks like). Use @file, @file:XX-YY, @dir/, and \
+                 /skill tags in handoff prompts when the child needs source or skill context. \
+                 Each `builder` task is one \
                  implementation slice, not a bundle of unrelated asks. If the user asks for a \
                  follow-up implementation iteration after `builder` returns, start a fresh \
                  `builder` brief seeded with the prior result summary, relevant changed files, \
@@ -317,8 +319,7 @@ fn history_def() -> AgentDef {
 }
 
 /// `deepthink` — optional tool-free reasoning worker. It receives only its
-/// standalone task prompt plus explicit seeds, then returns structured
-/// analysis.
+/// standalone task prompt, then returns structured analysis.
 fn deepthink_def() -> AgentDef {
     def(
         "deepthink",

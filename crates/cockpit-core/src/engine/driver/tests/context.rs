@@ -1123,7 +1123,7 @@ async fn prepare_commits_nothing() {
         before_history
     );
     assert_eq!(prepared.compressed_entries.len(), 1);
-    assert_eq!(prepared.seed_tools.len(), 1);
+    assert_eq!(prepared.seed_tags.len(), 1);
     assert!(
         driver
             .session
@@ -1133,16 +1133,6 @@ async fn prepare_commits_nothing() {
             .unwrap()
             .is_empty(),
         "prepare must not persist compressed results"
-    );
-    assert!(
-        driver
-            .session
-            .db
-            .take_seed_tools(driver.session.id)
-            .await
-            .unwrap()
-            .is_empty(),
-        "prepare must not persist seed tools"
     );
     let events_after = driver
         .session
@@ -1290,20 +1280,6 @@ async fn apply_of_prepared_matches_synchronous_path() {
         compact_record_without_session_ids(&split_driver).await,
         compact_record_without_session_ids(&sync_driver).await
     );
-    assert_eq!(
-        split_driver
-            .session
-            .db
-            .take_seed_tools(split_driver.session.id)
-            .await
-            .unwrap(),
-        sync_driver
-            .session
-            .db
-            .take_seed_tools(sync_driver.session.id)
-            .await
-            .unwrap()
-    );
 }
 
 #[tokio::test]
@@ -1326,43 +1302,29 @@ async fn compact_end_to_end_unchanged() {
         "history_hash": test_json_hash(&serde_json::to_value(&driver.stack[0].history).unwrap()),
         "compact_ready": compact_ready_without_session_id(ready),
         "session_compacted_hash": test_json_hash(&compact_record_without_session_ids(&driver).await),
-        "seed_tools": driver
-            .session
-            .db
-            .take_seed_tools(driver.session.id)
-            .await
-            .unwrap(),
     });
     let expected_handoff = format!(
-        "test compact brief\n\n---\n## State appendix (deterministic — runtime ledger)\n\n\n**Files read:**\n- `seed.txt`\n\n\n{}",
+        "test compact brief\n\n---\n## State appendix (deterministic — runtime ledger)\n\n\n**Files read:**\n- `seed.txt`\n\n\n## Context tags\nUse these @file, @file:XX-YY, @dir/, and /skill tags to resolve the working set through the shared tag policy:\n- @seed.txt\n\n\n{}",
         crate::engine::compact::HISTORY_AGENT_NUDGE
     );
     assert_eq!(
         snapshot,
         serde_json::json!({
-            "history_hash": "5318a4b4dde3cc277a99f810021196a63087eb935f0003b798e9b6afece0f0b7",
+            "history_hash": "86a65ec681935e0d3d0364beeda1f0906408bb2fdd3fa099bc7b5fd269dccdb8",
             "compact_ready": {
                 "brief": "test compact brief",
                 "handoff": expected_handoff,
                 "seed_tool_count": 1,
-                "seed_tool_tokens": 6,
+                "seed_tool_tokens": 3,
                 "source": "manual",
                 "tail_kept": 2,
                 "tail_trimmed": 0,
-                "tokens_after": 2339,
+                "tokens_after": 2381,
                 "tokens_before": 3642,
                 "trigger_ctx_pct": null,
                 "turns_summarized": 0,
             },
-            "session_compacted_hash": "f74c1f05ff41cc8fd9356322c0fb3312ef102a0de278f651d72d325b2792f6bc",
-            "seed_tools": [
-                {
-                    "args": {
-                        "path": "seed.txt",
-                    },
-                    "tool": "read",
-                },
-            ],
+            "session_compacted_hash": "afdb4820cef864b98fc54e284ab98e60213387ccd3e1b691ed35d9a243322567",
         })
     );
     assert!(
@@ -1411,22 +1373,10 @@ async fn apply_ordering_persists_then_runs_seeds_then_emits_ready() {
     while let Some(event) = rx.recv().await {
         emitted.push(event);
     }
-    let seed_start = emitted
-        .iter()
-        .position(|event| matches!(event, TurnEvent::ToolStart { tool, .. } if tool == "read"))
-        .expect("seed read starts");
-    let seed_end = emitted
-        .iter()
-        .position(|event| matches!(event, TurnEvent::ToolEnd { tool, output, .. } if tool == "read" && output.contains("seed body")))
-        .expect("seed read ends");
     let ready = emitted
         .iter()
         .position(|event| matches!(event, TurnEvent::CompactReady { .. }))
         .expect("CompactReady emitted");
-    assert!(
-        seed_start < seed_end && seed_end < ready,
-        "seed tools run before CompactReady: {emitted:?}"
-    );
     assert_eq!(ready, emitted.len() - 1, "CompactReady is last");
 
     let stored = driver
@@ -1436,13 +1386,6 @@ async fn apply_ordering_persists_then_runs_seeds_then_emits_ready() {
         .await
         .unwrap();
     assert_eq!(stored.len(), 1);
-    let persisted_seeds = driver
-        .session
-        .db
-        .take_seed_tools(driver.session.id)
-        .await
-        .unwrap();
-    assert_eq!(persisted_seeds.len(), 1);
     let db_events = driver
         .session
         .db
@@ -1461,9 +1404,7 @@ async fn apply_ordering_persists_then_runs_seeds_then_emits_ready() {
         [
             "compressed_results_persisted",
             "live_history_swapped",
-            "seed_tools_persisted",
             "timeline_recorded",
-            "seed_tools_ran",
             "compact_ready_emitted",
         ]
     );
@@ -1591,7 +1532,12 @@ async fn auto_compact_fires_at_threshold_once() {
     use crate::config::providers::{CacheMode, ContextConfig};
     let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
-    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 240);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        5_000,
+    );
     let fixture_model = driver.stack[0].agent.model.clone();
     let mut build = crate::engine::builtin::load("Build", &driver.spawn_args(true)).unwrap();
     build.model = fixture_model;
@@ -1628,13 +1574,13 @@ async fn auto_compact_fires_at_threshold_once() {
         .await
         .unwrap();
 
-    // 25% < 60 → no compact.
+    // 50% < 60 → no compact.
     driver
         .session
         .record_usage(
             uuid::Uuid::new_v4(),
             crate::tokens::TokenUsage {
-                input_tokens: 50,
+                input_tokens: 2_500,
                 output_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -1653,7 +1599,7 @@ async fn auto_compact_fires_at_threshold_once() {
         .record_usage(
             uuid::Uuid::new_v4(),
             crate::tokens::TokenUsage {
-                input_tokens: 160,
+                input_tokens: 3_100,
                 output_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -1672,23 +1618,20 @@ async fn auto_compact_fires_at_threshold_once() {
     while let Some(ev) = rx.recv().await {
         events.push(ev);
     }
-    let seed_start = events
-        .iter()
-        .position(|ev| matches!(ev, TurnEvent::ToolStart { tool, .. } if tool == "read"))
-        .unwrap_or_else(|| panic!("seed read starts without a user follow-up: {events:?}"));
-    let seed_end = events
-        .iter()
-        .position(|ev| matches!(ev, TurnEvent::ToolEnd { tool, output, .. } if tool == "read" && output.contains("seed body")))
-        .expect("seed read completes without a user follow-up");
     let compact_ready = events
         .iter()
         .position(
             |ev| matches!(ev, TurnEvent::CompactReady { brief, .. } if !brief.trim().is_empty()),
         )
         .expect("compact ready event emitted");
+    assert_eq!(
+        compact_ready,
+        events.len() - 1,
+        "CompactReady remains last: {events:?}"
+    );
     assert!(
-        seed_start < seed_end && seed_end < compact_ready,
-        "seed tools should run before CompactReady: {events:?}"
+        !events.iter().any(|ev| matches!(ev, TurnEvent::ToolStart { tool, .. } | TurnEvent::ToolEnd { tool, .. } if tool == "read")),
+        "tag-based compaction does not re-run seed read tools: {events:?}"
     );
 }
 

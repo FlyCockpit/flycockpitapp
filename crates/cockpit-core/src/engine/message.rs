@@ -512,7 +512,7 @@ impl UserSubmission {
     pub fn compact_notice() -> Self {
         Self {
             kind: UserSubmissionKind::Compact,
-            text: "/compact: assembling handoff (prune-first, model brief, deterministic appendix, seed tools)...".to_string(),
+            text: "/compact: assembling handoff (prune-first, model brief, deterministic appendix, context tags)...".to_string(),
             ..Self::default()
         }
     }

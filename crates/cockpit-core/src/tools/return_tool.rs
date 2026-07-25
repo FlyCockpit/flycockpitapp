@@ -27,7 +27,7 @@ impl Tool for ReturnTool {
     }
 
     fn description(&self) -> &str {
-        "Finish and report a structured summary to your caller: what you did, decisions, context for its next step, and follow-ups."
+        "Finish and report a structured summary to your caller: what you did, decisions, next context, follow-ups, and any @file/@file:XX-YY/@dir/ or /skill tags it should resolve."
     }
 
     fn defensive_description(&self) -> Option<String> {
@@ -37,7 +37,8 @@ impl Tool for ReturnTool {
              `accomplished` (what you actually did), `decisions_made` (decisions you took so the \
              caller does not re-litigate them), `context_for_next` (anything the caller needs to \
              guide its next step), and `remaining` (what you deliberately did NOT do / follow-ups). \
-             Do not list the files you changed — the harness records those for you."
+             Use @file, @file:XX-YY, @dir/, and /skill tags when the caller needs bounded source \
+             or skill context. Do not list the files you changed — the harness records those for you."
                 .to_string(),
         )
     }

@@ -902,38 +902,6 @@ pub(super) async fn run_worker(
         }
     }
 
-    // Seed-tool re-execution (`/compact` handoff, T6.e): if this session
-    // was created by `/compact`, its derived seed-tool plan was persisted
-    // keyed by this session id. Drain it and dispatch the calls (read-only
-    // / idempotent only) into the fresh agent's initial context *before*
-    // the first inference — re-executed, never replayed from a stale
-    // transcript. Done synchronously before the driver loop starts so it
-    // can never race the first user message. Best-effort.
-    //
-    // MUTUALLY EXCLUSIVE with rehydration: seed re-execution is for a
-    // *fresh* successor's first inference. When this worker rehydrated a
-    // successor that has ALREADY had turns, the full pruned context is
-    // rebuilt from its transcript — re-running seed tools too would
-    // double-seed. So skip seeds when rehydration produced a history; the
-    // seed rows are taken (drained) regardless so they never re-fire on a
-    // later resume (idempotent).
-    match session.db.take_seed_tools(session_id).await {
-        Ok(seeds)
-            if !seeds.is_empty()
-                && rehydrated.is_none()
-                && repair_required
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .is_none() =>
-        {
-            driver.run_seed_tools(&seeds, &engine_event_tx).await;
-        }
-        Ok(_) => {}
-        Err(error) => {
-            log_seed_tool_drain_failed(session_id, &error);
-        }
-    }
-
     // Session-only redaction source overrides (`/toggle-redaction`). The
     // base config is reloaded at every turn boundary so dotenv/settings/SSH
     // changes made after session start are picked up before the next provider

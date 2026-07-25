@@ -555,7 +555,6 @@ mod safety_gate_tests {
             shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
-            seeds: crate::engine::seed_collector::SeedCollector::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
             review_cage: None,

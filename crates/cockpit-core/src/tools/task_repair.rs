@@ -103,8 +103,6 @@ const DELEGATE_KEYS: &[&str] = &[
     "why",
     "resume_handle",
     "grant_tools",
-    "seed",
-    "skill_seed",
     "todo_ids",
 ];
 

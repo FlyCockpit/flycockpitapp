@@ -114,14 +114,6 @@ pub(super) fn queue_target_to_proto(
     }
 }
 
-pub(super) fn log_seed_tool_drain_failed(session_id: Uuid, error: &anyhow::Error) {
-    tracing::warn!(
-        session_id = %session_id,
-        error = %error,
-        "seed-tool replay skipped because draining persisted seed tools failed"
-    );
-}
-
 /// Resolve the root-frame agent for a session. Assistant sessions keep their
 /// durable assistant identity so the shared agent loader can resolve the
 /// authored assistant definition; ordinary sessions use their stored active

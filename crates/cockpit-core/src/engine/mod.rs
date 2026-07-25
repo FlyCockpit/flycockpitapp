@@ -46,7 +46,6 @@ pub mod resource_scheduler;
 pub mod retry;
 pub mod safety_gate;
 pub mod schedule;
-pub mod seed_collector;
 pub mod task_identity;
 pub mod text_call;
 pub mod think;

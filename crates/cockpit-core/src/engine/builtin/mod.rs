@@ -816,7 +816,6 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
         Arc::new(tools::goal::GoalTool),
         Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
-        Arc::new(tools::seed::SeedEmitTool),
         Arc::new(tools::grep::GrepTool),
         Arc::new(tools::glob::GlobTool),
         Arc::new(tools::docs::ListPackagesTool::new(
@@ -1545,34 +1544,6 @@ fn is_primary(name: &str) -> bool {
     matches!(name, "Build" | "Plan" | "Multireview")
 }
 
-/// Register the `seed` tool (GOALS §3c) on `tb` when this is a read-only
-/// noninteractive subagent spawned in `normal` mode. The capability is gated
-/// at the engine's point of action ([`crate::engine::tool::Capability`]); the
-/// tool surface follows the same gate so a `defensive`-mode subagent never
-/// even sees `seed`. `name` is the agent's own name; the read-only check
-/// against the lock/write tools is done on `tb` as it stands.
-fn maybe_with_seed_tool(
-    tb: ToolBox,
-    name: &str,
-    llm_mode: crate::config::extended::LlmMode,
-) -> ToolBox {
-    use crate::engine::tool::Capability;
-    if !Capability::FollowupSeed.enabled(llm_mode)
-        || !is_noninteractive(name)
-        || is_docs_pipeline(name)
-    {
-        return tb;
-    }
-    let names = tb.names();
-    let writes = crate::agents::invariants::LOCK_WRITE_TOOLS
-        .iter()
-        .any(|w| names.contains(w));
-    if writes {
-        return tb;
-    }
-    tb.with(Arc::new(crate::tools::seed::SeedEmitTool))
-}
-
 /// Build an [`Agent`] from a resolved [`crate::agents::AgentDef`] — the
 /// path taken for an on-disk override (edited built-in) or a custom
 /// agent. The def's `prompt`, `tools`, `temperature`, and (when
@@ -1643,11 +1614,6 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
     if !is_internal_agent_def_name(&def.name) {
         // Cross-session recall tools, gated on interactive spawn.
         tb = with_tiered_recall_tools(tb, args, def, is_assistant, &grant)?;
-        // `seed` (GOALS §3c): a custom read-only noninteractive subagent in
-        // normal mode may emit seeds to its caller. The helper re-checks the
-        // (now-built) tool surface for write/lock tools, so only a genuinely
-        // read-only custom subagent gets it.
-        tb = maybe_with_seed_tool(tb, &def.name, args.llm_mode);
         // `return` (structured-summary envelope, `structured-subagent
         // -return-summary.md`): a delegated subagent finishes by returning a
         // structured summary. An on-disk override of a bundled agent keeps its name,
@@ -2046,7 +2012,7 @@ pub fn history(args: &SpawnArgs) -> Agent {
 /// `deepthink` — optional tool-free reasoning worker. It is intentionally a
 /// leaf: no read/bash/MCP/custom tools, no `return`, no recursive `task`, and
 /// no grant application. It receives only the caller-authored brief plus
-/// explicit seeds already materialized by the delegation path.
+/// context already materialized in the delegation prompt.
 pub fn deepthink(args: &SpawnArgs) -> Agent {
     Agent {
         name: "deepthink".to_string(),
@@ -4418,16 +4384,13 @@ mod tests {
     }
 
     #[test]
-    fn explore_gets_seed_tool_in_normal_mode_only() {
+    fn explore_never_gets_removed_seed_tool() {
         let tmp = tempfile::tempdir().unwrap();
-        // Defensive (default): the feature is gated off — no `seed` tool.
         let mut args = test_spawn_args(tmp.path());
         args.llm_mode = crate::config::extended::LlmMode::Defensive;
         assert!(!explore(&args).tools.names().contains(&"seed"));
-        // Normal: the capability is enabled, so the read-only noninteractive
-        // subagent carries `seed`.
         args.llm_mode = crate::config::extended::LlmMode::Normal;
-        assert!(explore(&args).tools.names().contains(&"seed"));
+        assert!(!explore(&args).tools.names().contains(&"seed"));
     }
 
     #[test]

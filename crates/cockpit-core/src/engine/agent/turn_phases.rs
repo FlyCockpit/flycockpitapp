@@ -24,7 +24,6 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) review_cage: Option<crate::engine::tool::ReviewCage>,
     pub(crate) context_usage: crate::engine::tool::ContextUsageSnapshot,
     pub(crate) deferred_log: crate::engine::deferred::DeferredLog,
-    pub(crate) seeds: crate::engine::seed_collector::SeedCollector,
     pub(crate) emit_inference_error_ui: bool,
     pub(crate) call_id: Uuid,
     pub(crate) tandem: Option<&'a crate::engine::schedule::TandemSet>,
@@ -304,9 +303,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         resume_handle,
                         cwd,
                         granted_tools: task_string_array(item, "grant_tools"),
-                        seeds: task_seed_array(item),
                         todo_ids: task_todo_ids(item),
-                        skill_seed: task_string_array(item, "skill_seed"),
                         output_dir,
                     });
                 }
@@ -394,26 +391,6 @@ pub(crate) async fn phase_10_dispatch_one_call(
                 // Collected loosely here (trimmed, de-blanked, de-duplicated);
                 // role-invariant rejection happens at the single driver chokepoint.
                 let granted_tools = task_string_array(&args, "grant_tools");
-                // Caller→child read-only pre-seeds (`task.seed`,
-                // implementation note): the parent may attach
-                // read-only tool calls to pre-load the child's context. Present in
-                // the `task` schema from session start (cache-safe fixed shape).
-                // Collected loosely here — keep only well-formed `{tool, args}`
-                // entries naming a read-only tool with object args (the SAME
-                // read-only rule the `seed` tool enforces, `is_read_only_seed_tool`);
-                // a write/lock/bash entry is dropped, never executed. The driver
-                // re-executes each survivor in the CHILD's cwd; a per-entry
-                // execution failure there is surfaced as a failed seed, not an abort.
-                let seeds = task_seed_array(&args);
-                // Parent→child skill seeds (`task.skill_seed`,
-                // implementation note): names of active skills
-                // the parent wants seeded (instructions + framing) into the child.
-                // Collected loosely here (trimmed, de-blanked, de-duplicated); the
-                // single driver chokepoint validates each against the parent's
-                // active-skill set and deterministically strips a non-active name
-                // with a model-visible note. Carries skill INSTRUCTIONS, not a
-                // re-executed tool call (that is `seed`) — kept fully separate.
-                let skill_seed = task_string_array(&args, "skill_seed");
                 let todo_ids = task_todo_ids(&args);
                 if !noninteractive {
                     // Timeline event (Part B): an interactive `task`
@@ -448,8 +425,6 @@ pub(crate) async fn phase_10_dispatch_one_call(
                                 "why": why,
                                 "resume_handle": resume_handle.clone(),
                                 "grant_tools": granted_tools.clone(),
-                                "seed": seeds.clone(),
-                                "skill_seed": skill_seed.clone(),
                                 "todo_ids": todo_ids.clone(),
                             }),
                         )
@@ -477,9 +452,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         model,
                         remaining_depth,
                         granted_tools,
-                        seeds,
                         todo_ids,
-                        skill_seed,
                         repair_notes,
                         task_call_id: tc.id.clone(),
                         task_function_call_id: tc.call_id.clone(),
@@ -494,9 +467,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     resume_handle,
                     cwd,
                     granted_tools,
-                    seeds,
                     todo_ids,
-                    skill_seed,
                     repair_notes,
                     task_call_id: tc.id.clone(),
                     task_function_call_id: tc.call_id.clone(),
@@ -635,7 +606,6 @@ pub(crate) async fn run_turn(
     let review_cage = ctx.review_cage;
     let context_usage = ctx.context_usage;
     let deferred_log = ctx.deferred_log;
-    let seeds = ctx.seeds;
     let emit_inference_error_ui = ctx.emit_inference_error_ui;
     let call_id = ctx.call_id;
     let tandem = ctx.tandem;
@@ -1387,7 +1357,6 @@ pub(crate) async fn run_turn(
         shutdown_gate: agent.model.shutdown_gate(),
         approver,
         deferred_log,
-        seeds,
         root_agent_frame: is_root,
         skill_write_origin,
         review_cage,

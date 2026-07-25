@@ -114,9 +114,8 @@ impl Driver {
                 let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
                 tracing::debug!(skills = ?names, "skills auto-selection injected skill bodies");
                 for skill in &skills {
-                    // Record the auto-injected body in the seedable set so a
-                    // later `task.skill_seed` naming this skill passes host
-                    // validation (implementation note).
+                    // Record the auto-injected body so a later `/skill <name>`
+                    // handoff tag can expand it (implementation note).
                     self.record_active_skill(&skill.name, &skill.body);
                     // Record it in the auto-injection suppression set so it is
                     // not re-injected later this session (once-per-session,

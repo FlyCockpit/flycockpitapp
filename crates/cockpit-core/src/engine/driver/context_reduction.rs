@@ -23,7 +23,7 @@ pub struct PreparedCompaction {
     pub tokens_before: u64,
     pub tokens_after: u64,
     pub trigger_ctx_pct: Option<f64>,
-    pub seed_tools: Vec<crate::db::seed_tools::SeedTool>,
+    pub seed_tags: Vec<String>,
     pub seed_tool_tokens: u64,
     pub compressed_entries: Vec<crate::db::compressed_results::CompressedToolResultEntry>,
 }
@@ -884,7 +884,7 @@ impl Driver {
 
     /// Assemble and apply a `/compact` handoff for the foreground agent.
     /// Prune-first (fixed ordering), draft the model brief, append the
-    /// deterministic appendix, derive seed-tools, then reset the foreground
+    /// deterministic appendix, derive context tags, then reset the foreground
     /// context window in this same session.
     pub(in crate::engine::driver) async fn do_compact(&mut self, tx: &mpsc::Sender<TurnEvent>) {
         self.do_compact_with_source(tx, "manual").await;
@@ -1022,11 +1022,11 @@ impl Driver {
         }
         let history_agent_available = self.history_agent_available_for_compaction_nudge().await;
 
-        // 3. Seed-tools (read-only/idempotent; re-executed, not replayed).
-        let seeds = compact::derive_seed_tools(&calls);
-        let seed_tool_tokens: u64 = seeds
+        // 3. Context tags (read-only/idempotent working-set references).
+        let seed_tags = compact::derive_seed_tags(&calls);
+        let seed_tool_tokens: u64 = seed_tags
             .iter()
-            .map(|s| crate::tokens::count(&s.args.to_string()) as u64)
+            .map(|s| crate::tokens::count(s) as u64)
             .sum();
 
         // 4. Draft + assemble against the exact tail that will survive. The
@@ -1051,7 +1051,8 @@ impl Driver {
                 self.draft_brief(tx, &tail_message_seqs, filtered_history.clone())
                     .await
             };
-            let handoff = compact::assemble_handoff(&brief, &appendix, history_agent_available);
+            let handoff =
+                compact::assemble_handoff(&brief, &appendix, &seed_tags, history_agent_available);
             let plan = match compact::plan_compacted_history(
                 &filtered_history,
                 &handoff,
@@ -1108,7 +1109,7 @@ impl Driver {
             tokens_after: plan.tokens_after,
             trigger_ctx_pct,
             seed_tool_tokens,
-            seed_tools: seeds,
+            seed_tags,
             compressed_entries,
         })
     }
@@ -1122,9 +1123,9 @@ impl Driver {
     }
 
     /// Commit a prepared compaction without drafting. This remains a
-    /// `Driver` method because seed-tool re-execution needs the live tool
-    /// context and `pending_seed_context`; the injected inference test pins
-    /// the zero-model-call guarantee for this apply path.
+    /// `Driver` method because applying compaction mutates live driver state;
+    /// the injected inference test pins the zero-model-call guarantee for this
+    /// apply path.
     pub(in crate::engine::driver) async fn apply_prepared_compaction(
         &mut self,
         prepared: PreparedCompaction,
@@ -1161,20 +1162,6 @@ impl Driver {
         #[cfg(test)]
         self.trace_compaction_apply("live_history_swapped");
 
-        // Persist the seed-tool plan on this session for the follow-up
-        // prompt's re-execution kickoff.
-        if let Err(e) = self
-            .session
-            .db
-            .set_seed_tools(self.session.id, &prepared.seed_tools)
-            .await
-        {
-            tracing::warn!(error = %e, "compact: persisting seed tools failed");
-        } else {
-            #[cfg(test)]
-            self.trace_compaction_apply("seed_tools_persisted");
-        }
-
         // Timeline boundary: `/compact` reset this session in place.
         if let Err(e) = self
             .session
@@ -1183,7 +1170,7 @@ impl Driver {
                 crate::session::SessionCompactionRecord {
                     successor_session_id: self.session.id,
                     successor_short_id: &self.session.short_id,
-                    seed_tool_count: prepared.seed_tools.len(),
+                    seed_tool_count: prepared.seed_tags.len(),
                     brief_text: &prepared.brief,
                     handoff_text: &prepared.handoff,
                     source: &prepared.source,
@@ -1205,10 +1192,6 @@ impl Driver {
         }
 
         self.session.reset_compact_self_nudge_latch();
-        self.run_seed_tools(&prepared.seed_tools, tx).await;
-        #[cfg(test)]
-        self.trace_compaction_apply("seed_tools_ran");
-
         let _ = tx
             .send(TurnEvent::CompactReady {
                 new_session_id: self.session.id,
@@ -1221,7 +1204,7 @@ impl Driver {
                 turns_summarized: prepared.turns_summarized,
                 tail_kept: prepared.tail_kept,
                 tail_trimmed: prepared.tail_trimmed,
-                seed_tool_count: prepared.seed_tools.len(),
+                seed_tool_count: prepared.seed_tags.len(),
                 seed_tool_tokens: prepared.seed_tool_tokens,
             })
             .await;

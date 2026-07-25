@@ -125,7 +125,6 @@ async fn run_swarm_loop(
     let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
     let cancel = tokio_util::sync::CancellationToken::new();
     let deferred_log = crate::engine::deferred::DeferredLog::new();
-    let seeds = crate::engine::seed_collector::SeedCollector::new();
 
     // Per-turn backup-model fallback for the background `Swarm` child
     // (implementation note): `Swarm` is in scope, so the
@@ -159,7 +158,6 @@ async fn run_swarm_loop(
             None,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             deferred_log.clone(),
-            seeds.clone(),
             // Swarm subagents run in detached job tasks, not the driver
             // stack, and are not tandem-shadowed; a fresh per-round id satisfies
             // the shared `turn` contract.

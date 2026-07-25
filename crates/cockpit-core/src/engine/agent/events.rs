@@ -507,8 +507,8 @@ pub enum TurnEvent {
 
     /// `/compact` assembled a fresh-thread handoff. Carries the
     /// review-ready handoff text (brief + deterministic appendix +
-    /// seed-tool plan) for the TUI to drop into the composer, plus the
-    /// new session id the daemon created and the seed-tool count. The
+    /// context tags) for the TUI to drop into the composer, plus the
+    /// new session id the daemon created and the context-tag count. The
     /// old session stays recoverable in SQLite.
     CompactReady {
         new_session_id: uuid::Uuid,

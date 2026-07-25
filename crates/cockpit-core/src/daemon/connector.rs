@@ -96,7 +96,8 @@ async fn sync_once(
     };
     let Some(state) = ctx
         .db
-        .connector_state(&credential.server_url, &credential.instance_id)?
+        .connector_state(&credential.server_url, &credential.instance_id)
+        .await?
     else {
         return Ok(ConnectorRunOutcome::Disabled);
     };
@@ -112,7 +113,8 @@ async fn sync_once(
                 relay_region: state.relay_region.as_deref(),
                 last_error: None,
             },
-        );
+        )
+        .await;
         return Ok(ConnectorRunOutcome::Disabled);
     }
 
@@ -133,7 +135,8 @@ async fn run_enabled_connector(
         }
         let Some(state) = ctx
             .db
-            .connector_state(&credential.server_url, &credential.instance_id)?
+            .connector_state(&credential.server_url, &credential.instance_id)
+            .await?
         else {
             return Ok(ConnectorRunOutcome::Disabled);
         };
@@ -149,7 +152,8 @@ async fn run_enabled_connector(
                     relay_region: state.relay_region.as_deref(),
                     last_error: None,
                 },
-            );
+            )
+            .await;
             return Ok(ConnectorRunOutcome::Disabled);
         }
 
@@ -164,7 +168,8 @@ async fn run_enabled_connector(
                 relay_region: state.relay_region.as_deref(),
                 last_error: None,
             },
-        );
+        )
+        .await;
 
         let client = match FlycockpitClient::new(&credential.server_url) {
             Ok(client) => client,
@@ -181,7 +186,8 @@ async fn run_enabled_connector(
                         relay_region: state.relay_region.as_deref(),
                         last_error: Some(&message),
                     },
-                );
+                )
+                .await;
                 sleep_or_connector_wake(wake_rx, backoff.next(&jitter)).await;
                 continue;
             }
@@ -204,7 +210,8 @@ async fn run_enabled_connector(
                             relay_region: state.relay_region.as_deref(),
                             last_error: Some(message),
                         },
-                    );
+                    )
+                    .await;
                     first_connect = false;
                     sleep_or_connector_wake(wake_rx, backoff.next(&jitter)).await;
                     continue;
@@ -222,14 +229,18 @@ async fn run_enabled_connector(
                             relay_region: state.relay_region.as_deref(),
                             last_error: Some(&message),
                         },
-                    );
+                    )
+                    .await;
                     if is_terminal_auth_error(&message) {
                         let _ = clear_credential();
-                        let _ = ctx.db.set_connector_enabled(
-                            &credential.server_url,
-                            &credential.instance_id,
-                            false,
-                        );
+                        let _ = ctx
+                            .db
+                            .set_connector_enabled(
+                                &credential.server_url,
+                                &credential.instance_id,
+                                false,
+                            )
+                            .await;
                         publish_status(
                             &ctx,
                             &credential,
@@ -241,7 +252,8 @@ async fn run_enabled_connector(
                                 relay_region: None,
                                 last_error: Some(&message),
                             },
-                        );
+                        )
+                        .await;
                         return Ok(ConnectorRunOutcome::Revoked);
                     }
                     first_connect = false;
@@ -284,14 +296,18 @@ async fn run_enabled_connector(
                             relay_region: selected.choice.region.as_deref(),
                             last_error: Some(&message),
                         },
-                    );
+                    )
+                    .await;
                     if is_terminal_auth_error(&message) {
                         let _ = clear_credential();
-                        let _ = ctx.db.set_connector_enabled(
-                            &credential.server_url,
-                            &credential.instance_id,
-                            false,
-                        );
+                        let _ = ctx
+                            .db
+                            .set_connector_enabled(
+                                &credential.server_url,
+                                &credential.instance_id,
+                                false,
+                            )
+                            .await;
                         publish_status(
                             &ctx,
                             &credential,
@@ -303,7 +319,8 @@ async fn run_enabled_connector(
                                 relay_region: None,
                                 last_error: Some(&message),
                             },
-                        );
+                        )
+                        .await;
                         return Ok(ConnectorRunOutcome::Revoked);
                     }
                     first_connect = false;
@@ -333,7 +350,8 @@ async fn run_enabled_connector(
                         relay_region: choice.region.as_deref(),
                         last_error: None,
                     },
-                );
+                )
+                .await;
                 let connected_at = Instant::now();
                 let refresh_after = token_refresh_delay(token.expires_at.as_deref());
                 let mut socket_wake_rx = wake_rx.clone();
@@ -364,7 +382,8 @@ async fn run_enabled_connector(
                                 relay_region: choice.region.as_deref(),
                                 last_error: Some("refreshing connector token"),
                             },
-                        );
+                        )
+                        .await;
                         continue;
                     }
                     Ok(_) => {
@@ -379,7 +398,8 @@ async fn run_enabled_connector(
                                 relay_region: choice.region.as_deref(),
                                 last_error: Some("relay socket disconnected"),
                             },
-                        );
+                        )
+                        .await;
                     }
                     Err(error) => {
                         let message = error.to_string();
@@ -394,7 +414,8 @@ async fn run_enabled_connector(
                                 relay_region: choice.region.as_deref(),
                                 last_error: Some(&message),
                             },
-                        );
+                        )
+                        .await;
                     }
                 }
             }
@@ -411,7 +432,8 @@ async fn run_enabled_connector(
                         relay_region: choice.region.as_deref(),
                         last_error: Some(&message),
                     },
-                );
+                )
+                .await;
             }
         }
         sleep_or_connector_wake(wake_rx, backoff.next(&jitter)).await;
@@ -784,15 +806,16 @@ async fn channel_task(
     Ok(())
 }
 
-fn publish_status(
+async fn publish_status(
     ctx: &DaemonContext,
     credential: &StoredFlycockpitCredential,
     enabled: bool,
     update: ConnectorStatusUpdate<'_>,
 ) {
-    if let Err(error) =
-        ctx.db
-            .update_connector_status(&credential.server_url, &credential.instance_id, update)
+    if let Err(error) = ctx
+        .db
+        .update_connector_status(&credential.server_url, &credential.instance_id, update)
+        .await
     {
         tracing::warn!(error = %error, "updating connector status failed");
     }
@@ -844,10 +867,6 @@ pub(crate) fn attention_payload_for_event(event: &Event, ctx: &DaemonContext) ->
     serde_json::to_value(payload).ok()
 }
 
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; connector attention path remains sync until db-async-session-log"
-)]
 fn attention_payload_for_event_with_meta(
     event: &Event,
     ctx: &DaemonContext,
@@ -908,7 +927,9 @@ fn attention_payload_for_event_with_meta(
     };
     let project_root = ctx
         .db
-        .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+        .blocking_write_for_sync_maintenance(move |conn| {
+            crate::db::Db::get_session_conn(conn, session_id)
+        })
         .ok()
         .flatten()
         .map(|row| row.project_root);
@@ -1068,7 +1089,7 @@ mod tests {
 
     fn test_session_id(ctx: &DaemonContext) -> Uuid {
         ctx.db
-            .write_blocking(|conn| {
+            .blocking_write_for_sync_maintenance(|conn| {
                 crate::db::Db::insert_session_row_conn(
                     conn,
                     &crate::db::Db::build_new_session_row_conn(conn, "project", "/repo", "Build")?,

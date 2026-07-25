@@ -473,7 +473,11 @@ impl App {
             }
             Overlay::Stats(mut pane) => {
                 if !pane.handle_key(key) {
+                    let fetch = pane.take_pending_fetch_key();
                     self.overlay = Overlay::Stats(pane);
+                    if let Some(key) = fetch {
+                        self.start_stats_rollup_action(key);
+                    }
                 }
                 return false;
             }

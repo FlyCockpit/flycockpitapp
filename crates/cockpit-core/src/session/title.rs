@@ -10,7 +10,7 @@ impl Session {
         let title_for_db = title.to_string();
         let updated = self
             .db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 let affected = conn
                     .execute(
                         "UPDATE sessions SET title = ?1
@@ -36,7 +36,7 @@ impl Session {
         let title_for_db = title.to_string();
         let updated = self
             .db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 let affected = conn
                     .execute(
                         "UPDATE sessions SET title = ?1, user_renamed = 0
@@ -62,7 +62,7 @@ impl Session {
         let title_for_db = title.to_string();
         let updated = self
             .db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 let affected = conn
                     .execute(
                         "UPDATE sessions SET title = ?1, user_renamed = 0
@@ -90,10 +90,9 @@ impl Session {
 
     pub(crate) fn agent_rename_session_available(&self, auto_title_configured: bool) -> bool {
         let session_id = self.id;
-        let Ok(Some(row)) = self
-            .db
-            .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
-        else {
+        let Ok(Some(row)) = self.db.blocking_write_for_sync_maintenance(move |conn| {
+            crate::db::Db::get_session_conn(conn, session_id)
+        }) else {
             return false;
         };
         if row.user_renamed || row.ephemeral {
@@ -107,10 +106,9 @@ impl Session {
 
     pub(crate) fn agent_rename_session_invoke_allowed(&self, auto_title_configured: bool) -> bool {
         let session_id = self.id;
-        let Ok(Some(row)) = self
-            .db
-            .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
-        else {
+        let Ok(Some(row)) = self.db.blocking_write_for_sync_maintenance(move |conn| {
+            crate::db::Db::get_session_conn(conn, session_id)
+        }) else {
             return false;
         };
         if row.user_renamed || row.ephemeral {
@@ -134,7 +132,9 @@ impl Session {
         let session_id = self.id;
         let row = self
             .db
-            .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::get_session_conn(conn, session_id)
+            })
             .ok()
             .flatten()?;
         if row.user_renamed || row.ephemeral || row.title.is_some() {
@@ -267,7 +267,7 @@ impl Session {
         let tokens = self.user_content_tokens.load(Ordering::Relaxed) as i64;
         let stage = self.title_stage.load(Ordering::Relaxed) as i64;
         let session_id = self.id;
-        if let Err(e) = self.db.write_blocking(move |conn| {
+        if let Err(e) = self.db.blocking_write_for_sync_maintenance(move |conn| {
             conn.execute(
                 "UPDATE sessions
                  SET user_content_tokens = ?1, title_stage = ?2

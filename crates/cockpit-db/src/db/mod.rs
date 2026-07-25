@@ -388,12 +388,8 @@ impl Db {
     }
 
     /// Return the exact squashed-schema identity recorded in SQLite.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn schema_version(&self) -> Result<i64> {
-        self.read_blocking(sqlite_schema_version)
+    pub async fn schema_version(&self) -> Result<i64> {
+        self.read(sqlite_schema_version).await
     }
 
     pub async fn read<F, T>(&self, f: F) -> Result<T>
@@ -875,38 +871,66 @@ mod tests {
     use std::time::Instant;
     use tempfile::TempDir;
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn migrate_idempotent() {
+    #[tokio::test]
+    async fn migrate_idempotent() {
         let db = Db::open_in_memory().unwrap();
         // Second migrate call is a no-op.
-        db.read_blocking(migrate).unwrap();
+        db.read(migrate).await.unwrap();
         let v: i64 = db
-            .read_blocking(|conn| {
+            .read(|conn| {
                 Ok(
                     conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| {
                         row.get(0)
                     })?,
                 )
             })
+            .await
             .unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn connection_pragmas_set_busy_timeout_to_five_seconds() {
+    #[tokio::test]
+    async fn connection_pragmas_set_busy_timeout_to_five_seconds() {
         let db = Db::open_in_memory().unwrap();
         let timeout_ms: i64 = db
-            .read_blocking(|conn| Ok(conn.query_row("PRAGMA busy_timeout;", [], |row| row.get(0))?))
+            .read(|conn| Ok(conn.query_row("PRAGMA busy_timeout;", [], |row| row.get(0))?))
+            .await
             .unwrap();
         assert_eq!(timeout_ms, 5000);
+    }
+
+    #[tokio::test]
+    async fn db_async_ops_schema_version_available_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), EXPECTED_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn db_async_ops_accessor_layer_has_no_blocking_calls() {
+        let db_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("db");
+        let mut stack = vec![db_dir];
+        while let Some(path) = stack.pop() {
+            for entry in std::fs::read_dir(&path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                if path.file_name().and_then(|name| name.to_str()) == Some("mod.rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                assert!(
+                    !source.contains("read_blocking") && !source.contains("write_blocking"),
+                    "blocking DB accessor token remains in {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1230,17 +1254,13 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     fn busy_timeout_waits_for_short_write_contention() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("busy.db");
         let db_a = Db::open(&path).unwrap();
         let db_b = Db::open(&path).unwrap();
 
-        db_a.write_blocking(move |conn| {
+        db_a.blocking_for_sync_cli(move |conn| {
             conn.execute_batch(
                 "CREATE TABLE busy_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
             )?;
@@ -1248,7 +1268,7 @@ mod tests {
         })
         .unwrap();
 
-        db_a.write_blocking(move |conn| {
+        db_a.blocking_for_sync_cli(move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE;")?;
             conn.execute("INSERT INTO busy_probe (value) VALUES ('held')", [])?;
             Ok(())
@@ -1258,7 +1278,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let started = Instant::now();
         let writer = std::thread::spawn(move || {
-            let result = db_b.write_blocking(move |conn| {
+            let result = db_b.blocking_for_sync_cli(move |conn| {
                 conn.execute("INSERT INTO busy_probe (value) VALUES ('waited')", [])?;
                 Ok(())
             });
@@ -1271,7 +1291,7 @@ mod tests {
             "second writer returned immediately instead of waiting for busy timeout"
         );
 
-        db_a.write_blocking(move |conn| {
+        db_a.blocking_for_sync_cli(move |conn| {
             conn.execute_batch("COMMIT;")?;
             Ok(())
         })
@@ -1286,7 +1306,7 @@ mod tests {
         );
 
         let count: i64 = db_a
-            .read_blocking(|conn| {
+            .blocking_for_sync_cli(|conn| {
                 Ok(conn.query_row("SELECT COUNT(*) FROM busy_probe", [], |row| row.get(0))?)
             })
             .unwrap();
@@ -1591,12 +1611,8 @@ mod tests {
         assert_eq!(orphan_count, 1);
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn essential_tables_exist() {
+    #[tokio::test]
+    async fn essential_tables_exist() {
         let db = Db::open_in_memory().unwrap();
         for table in [
             "sessions",
@@ -1607,38 +1623,36 @@ mod tests {
             "needs_attention",
         ] {
             let count: i64 = db
-                .read_blocking(|conn| {
+                .read(move |conn| {
                     Ok(conn.query_row(
                         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                         [table],
                         |row| row.get(0),
                     )?)
                 })
+                .await
                 .unwrap();
             assert_eq!(count, 1, "table `{table}` missing");
         }
         // And the view.
         let view_count: i64 = db
-            .read_blocking(|conn| {
+            .read(|conn| {
                 Ok(conn.query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='tool_call_stats'",
                     [],
                     |row| row.get(0),
                 )?)
             })
+            .await
             .unwrap();
         assert_eq!(view_count, 1);
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn approval_grants_has_risk_tier_column() {
+    #[tokio::test]
+    async fn approval_grants_has_risk_tier_column() {
         let db = Db::open_in_memory().unwrap();
         let columns: Vec<(String, String)> = db
-            .read_blocking(|conn| {
+            .read(|conn| {
                 let mut stmt = conn.prepare("PRAGMA table_info(approval_grants)")?;
                 let rows = stmt.query_map([], |row| {
                     Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
@@ -1649,6 +1663,7 @@ mod tests {
                 }
                 Ok(columns)
             })
+            .await
             .unwrap();
 
         assert!(
@@ -1659,16 +1674,12 @@ mod tests {
         );
     }
 
-    #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn approval_grants_allows_mcp_tool_kind_with_null_access() {
+    #[tokio::test]
+    async fn approval_grants_allows_mcp_tool_kind_with_null_access() {
         let db = Db::open_in_memory().unwrap();
         let session_id = uuid::Uuid::new_v4().to_string();
 
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute(
                 "INSERT INTO sessions \
                  (session_id, project_id, project_root, started_at, last_active_at) \
@@ -1706,6 +1717,7 @@ mod tests {
             );
             Ok(())
         })
+        .await
         .unwrap();
     }
 

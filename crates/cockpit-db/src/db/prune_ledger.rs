@@ -35,14 +35,10 @@ impl Db {
     /// Persist (upsert) the prune ledger for `session_id`. Idempotent on
     /// the session id, so persisting again at the next inference boundary
     /// replaces the prior ledger with the current pruned state.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn save_prune_ledger(&self, session_id: Uuid, ledger: &PruneLedger) -> Result<()> {
+    pub async fn save_prune_ledger(&self, session_id: Uuid, ledger: &PruneLedger) -> Result<()> {
         let ledger_json = serde_json::to_string(ledger).context("serializing prune ledger")?;
         let now = chrono::Utc::now().timestamp();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO prune_ledger (session_id, ledger_json, updated_at)
                  VALUES (?1, ?2, ?3)
@@ -54,6 +50,7 @@ impl Db {
             .context("inserting prune_ledger")?;
             Ok(())
         })
+        .await
     }
 
     /// Load the prune ledger for `session_id`. Returns `None` when no
@@ -63,12 +60,9 @@ impl Db {
     /// Returns an `Err` only when a stored ledger fails to deserialize
     /// (corrupt row) so the caller can treat it as a missing ledger and
     /// fall back to the full unpruned form with a warning.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn load_prune_ledger(&self, session_id: Uuid) -> Result<Option<PruneLedger>> {
-        self.write_blocking(move |conn| Self::load_prune_ledger_conn(conn, session_id))
+    pub async fn load_prune_ledger(&self, session_id: Uuid) -> Result<Option<PruneLedger>> {
+        self.read(move |conn| Self::load_prune_ledger_conn(conn, session_id))
+            .await
     }
 
     pub fn load_prune_ledger_conn(
@@ -117,8 +111,8 @@ mod tests {
             ],
             watermark: 7,
         };
-        db.save_prune_ledger(s.session_id, &ledger).unwrap();
-        let got = db.load_prune_ledger(s.session_id).unwrap().unwrap();
+        db.save_prune_ledger(s.session_id, &ledger).await.unwrap();
+        let got = db.load_prune_ledger(s.session_id).await.unwrap().unwrap();
         assert_eq!(got, ledger);
     }
 
@@ -134,7 +128,7 @@ mod tests {
             }],
             watermark: 2,
         };
-        db.save_prune_ledger(s.session_id, &l1).unwrap();
+        db.save_prune_ledger(s.session_id, &l1).await.unwrap();
         let l2 = PruneLedger {
             elided: vec![
                 LedgerEntry {
@@ -150,14 +144,19 @@ mod tests {
             ],
             watermark: 5,
         };
-        db.save_prune_ledger(s.session_id, &l2).unwrap();
-        let got = db.load_prune_ledger(s.session_id).unwrap().unwrap();
+        db.save_prune_ledger(s.session_id, &l2).await.unwrap();
+        let got = db.load_prune_ledger(s.session_id).await.unwrap().unwrap();
         assert_eq!(got, l2);
     }
 
     #[tokio::test]
     async fn unknown_session_is_none() {
         let db = Db::open_in_memory().unwrap();
-        assert!(db.load_prune_ledger(Uuid::new_v4()).unwrap().is_none());
+        assert!(
+            db.load_prune_ledger(Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

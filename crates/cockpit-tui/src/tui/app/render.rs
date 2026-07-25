@@ -5546,6 +5546,20 @@ mod render_history_spacing_tests {
     }
 
     #[test]
+    fn db_async_render_subagent_view_renders_empty_state_without_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.daemon_prompt = None;
+        app.history.push(user("root prompt"));
+        app.history.push(running_subagent());
+
+        assert!(app.open_subagent_view_for_history_index(1));
+        assert!(app.history.is_empty());
+        render_history_no_selection(&mut app, 80, 8);
+        assert!(app.active_subagent_view().is_some());
+    }
+
+    #[test]
     fn subagent_view_swap_keeps_render_maps_with_their_log() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
@@ -5568,6 +5582,30 @@ mod render_history_spacing_tests {
 
         assert!(Rc::ptr_eq(&before, &after));
         assert_history_render_maps_only_live_ids(&app);
+    }
+
+    #[test]
+    fn db_async_render_stale_fetch_for_other_session_is_discarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.daemon_prompt = None;
+        app.history.push(user("root prompt"));
+        app.history.push(running_subagent());
+
+        assert!(app.open_subagent_view_for_history_index(1));
+        assert!(app.history.is_empty());
+
+        app.apply_subagent_history_result(
+            uuid::Uuid::new_v4(),
+            "call-1",
+            "default",
+            vec![user("stale child row")],
+        );
+
+        assert!(
+            app.history.is_empty(),
+            "history from a different session must not populate active subagent view"
+        );
     }
 
     #[test]

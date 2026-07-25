@@ -243,7 +243,7 @@ impl Session {
         }
         let session_id = self.id;
         self.db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
                     "UPDATE sessions SET session_llm_mode = ?1 WHERE session_id = ?2",
                     params![raw, session_id.to_string()],
@@ -269,7 +269,7 @@ impl Session {
         }
         let session_id = self.id;
         self.db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
                     "UPDATE sessions SET tool_surface_override_json = ?1 WHERE session_id = ?2",
                     params![override_json, session_id.to_string()],
@@ -294,7 +294,7 @@ impl Session {
         let provider = provider.to_string();
         let model = model.to_string();
         self.db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
                     "UPDATE sessions SET provider = ?1, model = ?2 WHERE session_id = ?3",
                     params![provider, model, session_id.to_string()],
@@ -324,7 +324,7 @@ impl Session {
         let session_id = self.id;
         let active_agent = agent.to_string();
         self.db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
                     "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
                     params![active_agent, session_id.to_string()],

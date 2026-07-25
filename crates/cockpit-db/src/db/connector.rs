@@ -36,11 +36,7 @@ pub struct ConnectorDisclosure {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_connector_enabled(
+    pub async fn set_connector_enabled(
         &self,
         server_url: &str,
         instance_id: &str,
@@ -50,7 +46,7 @@ impl Db {
         let status = if enabled { "reconnecting" } else { "off" };
         let server_url = server_url.to_owned();
         let instance_id = instance_id.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO connector_state
                        (server_url, instance_id, enabled, status, updated_at_ms)
@@ -64,18 +60,17 @@ impl Db {
             )?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn connector_state(
+    pub async fn connector_state(
         &self,
         server_url: &str,
         instance_id: &str,
     ) -> Result<Option<ConnectorState>> {
-        self.read_blocking(|conn| {
+        let server_url = server_url.to_owned();
+        let instance_id = instance_id.to_owned();
+        self.read(move |conn| {
             conn.query_row(
                 "SELECT server_url, instance_id, enabled, status, relay_url, relay_id, relay_region,
                         last_connected_at_ms, last_error
@@ -87,15 +82,17 @@ impl Db {
             .optional()
             .map_err(Into::into)
         })
+        .await
     }
 
-    pub fn connector_disclosure(
+    pub async fn connector_disclosure(
         &self,
         server_url: &str,
         instance_id: &str,
     ) -> Result<Option<ConnectorDisclosure>> {
         Ok(self
-            .connector_state(server_url, instance_id)?
+            .connector_state(server_url, instance_id)
+            .await?
             .map(|state| ConnectorDisclosure {
                 enabled: state.enabled,
                 status: state.status,
@@ -106,11 +103,7 @@ impl Db {
             }))
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn update_connector_status(
+    pub async fn update_connector_status(
         &self,
         server_url: &str,
         instance_id: &str,
@@ -125,7 +118,7 @@ impl Db {
         let relay_id = update.relay_id.map(str::to_owned);
         let relay_region = update.relay_region.map(str::to_owned);
         let last_error = update.last_error.map(str::to_owned);
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO connector_state
                        (server_url, instance_id, enabled, status, relay_url, relay_id, relay_region,
@@ -154,6 +147,7 @@ impl Db {
             )?;
             Ok(())
         })
+        .await
     }
 }
 
@@ -179,10 +173,11 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn connector_state_round_trips() {
+    #[tokio::test]
+    async fn connector_state_round_trips() {
         let db = Db::open_in_memory().unwrap();
         db.set_connector_enabled("https://app.example.test", "inst-1", true)
+            .await
             .unwrap();
         db.update_connector_status(
             "https://app.example.test",
@@ -195,10 +190,12 @@ mod tests {
                 last_error: None,
             },
         )
+        .await
         .unwrap();
 
         let state = db
             .connector_state("https://app.example.test", "inst-1")
+            .await
             .unwrap()
             .unwrap();
         assert!(state.enabled);
@@ -211,9 +208,11 @@ mod tests {
         assert_eq!(state.relay_region.as_deref(), Some("iad"));
 
         db.set_connector_enabled("https://app.example.test", "inst-1", false)
+            .await
             .unwrap();
         let disclosure = db
             .connector_disclosure("https://app.example.test", "inst-1")
+            .await
             .unwrap()
             .unwrap();
         assert!(!disclosure.enabled);

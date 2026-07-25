@@ -264,6 +264,24 @@ impl App {
                     self.connector_disclosure = connector;
                 }
             }
+            AsyncActionKind::Refresh("stats.rollup") => {
+                if let Overlay::Stats(pane) = &mut self.overlay
+                    && let Ok(AsyncActionPayload::StatsRollup(result)) = result.payload
+                {
+                    pane.apply_fetch_result(result);
+                }
+            }
+            AsyncActionKind::Internal("subagent.history") => {
+                if let Ok(AsyncActionPayload::SubagentHistory {
+                    session_id,
+                    task_call_id,
+                    label,
+                    history,
+                }) = result.payload
+                {
+                    self.apply_subagent_history_result(session_id, &task_call_id, &label, history);
+                }
+            }
             AsyncActionKind::Refresh("provider.usage") => match result.payload {
                 Ok(AsyncActionPayload::ProviderUsage(rows)) => {
                     self.overlay = Overlay::Usage(crate::tui::usage_pane::UsagePane::open(rows));
@@ -781,6 +799,22 @@ impl App {
                 .await
                 .map(AsyncActionPayload::ProviderUsage)
                 .map_err(|e| e.to_string())
+            },
+        );
+    }
+
+    pub(super) fn start_stats_rollup_action(
+        &mut self,
+        key: crate::tui::stats_pane::StatsPaneFetchKey,
+    ) {
+        let db = self.startup_background.db.clone();
+        self.async_actions.start(
+            AsyncActionKind::Refresh("stats.rollup"),
+            AsyncActionPolicy::Replace(AsyncActionKey::new("stats.rollup")),
+            async move {
+                Ok(AsyncActionPayload::StatsRollup(
+                    crate::tui::stats_pane::fetch_stats_rollup(db, key).await,
+                ))
             },
         );
     }

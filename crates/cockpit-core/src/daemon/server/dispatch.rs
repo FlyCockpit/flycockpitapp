@@ -1067,7 +1067,7 @@ pub(super) async fn handle_serialized_request(
                 .path()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "<in-memory>".to_string()),
-            schema_version: ctx.db.schema_version().map_err(internal)?,
+            schema_version: ctx.db.schema_version().await.map_err(internal)?,
         }),
 
         Request::RefreshEnv { vars } => {
@@ -1159,10 +1159,13 @@ pub(super) async fn handle_serialized_request(
             // fresh-chat indicator, so the system prompt omits the
             // `Session:` line — matching what the engine then sends.
             let cwd = Path::new(&project_root);
-            let (strategy, scale) = ctx.db.resolve_tokenizer(
-                provider.as_deref().unwrap_or(""),
-                model.as_deref().unwrap_or(""),
-            );
+            let (strategy, scale) = ctx
+                .db
+                .resolve_tokenizer(
+                    provider.as_deref().unwrap_or(""),
+                    model.as_deref().unwrap_or(""),
+                )
+                .await;
             let system_prompt = crate::engine::builtin::default_chat_system_prompt(cwd, "");
             let system_tokens = crate::tokens::scaled_estimate(&system_prompt, strategy, scale);
             let model_instruction_tokens = provider
@@ -1494,7 +1497,7 @@ pub(super) async fn handle_concurrent_request(
                 .path()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "<in-memory>".to_string()),
-            schema_version: ctx.db.schema_version().map_err(internal)?,
+            schema_version: ctx.db.schema_version().await.map_err(internal)?,
         }),
         Request::GetUsageCounts { project_id } => {
             let since = chrono::Utc::now().timestamp() - crate::db::usage_events::USAGE_WINDOW_SECS;
@@ -1531,7 +1534,7 @@ pub(super) async fn handle_concurrent_request(
             project_root,
             provider,
             model,
-        } => guidance_estimate(&ctx, project_root, provider, model),
+        } => guidance_estimate(&ctx, project_root, provider, model).await,
         _ => Err(ErrorPayload {
             code: ErrorCode::Internal,
             message: format!("request `{request_kind}` is not marked concurrent"),
@@ -1743,17 +1746,20 @@ pub(super) async fn list_models_shared(
     Ok(Response::Models { models })
 }
 
-pub(super) fn guidance_estimate(
+pub(super) async fn guidance_estimate(
     ctx: &DaemonContext,
     project_root: String,
     provider: Option<String>,
     model: Option<String>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let cwd = Path::new(&project_root);
-    let (strategy, scale) = ctx.db.resolve_tokenizer(
-        provider.as_deref().unwrap_or(""),
-        model.as_deref().unwrap_or(""),
-    );
+    let (strategy, scale) = ctx
+        .db
+        .resolve_tokenizer(
+            provider.as_deref().unwrap_or(""),
+            model.as_deref().unwrap_or(""),
+        )
+        .await;
     let system_prompt = crate::engine::builtin::default_chat_system_prompt(cwd, "");
     let system_tokens = crate::tokens::scaled_estimate(&system_prompt, strategy, scale);
     let model_instruction_tokens = provider

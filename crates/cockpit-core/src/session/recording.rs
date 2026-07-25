@@ -362,7 +362,7 @@ impl Session {
     /// already post-redaction (reused from the main call's assembled body) —
     /// no second redaction pass.
     #[allow(clippy::too_many_arguments)]
-    pub fn record_tandem_inference(
+    pub async fn record_tandem_inference(
         &self,
         id: &str,
         parent_call_id: &str,
@@ -389,6 +389,7 @@ impl Session {
                 usage,
                 status,
             )
+            .await
             .context("inserting tandem_inference")
     }
 

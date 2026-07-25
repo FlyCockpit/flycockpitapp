@@ -354,9 +354,7 @@ impl PriceTable {
 /// epoch-seconds for the range window (injected for deterministic
 /// tests).
 ///
-/// Heavy scan — drive it through [`Db::run_blocking`] (async, off the
-/// executor) or [`Db::read_blocking`] (sync); the free-function shape
-/// mirrors `intel::ensure_fresh_blocking` so callers own the
+/// Heavy scan — drive it through [`Db::read`] so callers own the
 /// connection-acquisition strategy.
 pub fn rollup(
     conn: &rusqlite::Connection,
@@ -991,13 +989,17 @@ mod tests {
         .unwrap();
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn run(db: &Db, scope: StatsScope, range: StatsRange, prices: &PriceTable) -> StatsRollup {
+    async fn run(
+        db: &Db,
+        scope: StatsScope,
+        range: StatsRange,
+        prices: &PriceTable,
+    ) -> StatsRollup {
         // now = 1_000_000 keeps the 7d window's lower bound well-defined.
-        db.read_blocking(|conn| super::rollup(conn, &scope, range, prices, false, 1_000_000))
+        let scope = scope.clone();
+        let prices = prices.clone();
+        db.read(move |conn| super::rollup(conn, &scope, range, &prices, false, 1_000_000))
+            .await
             .unwrap()
     }
 
@@ -1014,7 +1016,8 @@ mod tests {
             StatsScope::Project("p1".into()),
             StatsRange::AllTime,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         assert_eq!(r.tokens.by_model.len(), 2);
         // opus sorts first (more total tokens).
         let opus = &r.tokens.by_model[0];
@@ -1026,6 +1029,32 @@ mod tests {
         assert_eq!(opus.total_tokens, 440);
         assert_eq!(opus.calls, 2);
         assert!(opus.cost_usd.is_none(), "no prices => None");
+    }
+
+    #[tokio::test]
+    async fn db_async_ops_stats_query_returns_expected_values_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let sid = seed_session(&db, "p1").await;
+        ic(&db, sid, "p1", "gpt-5", "openai", 1000, 11, 7, 0).await;
+
+        let prices = PriceTable::empty();
+        let rollup = db
+            .read(move |conn| {
+                super::rollup(
+                    conn,
+                    &StatsScope::Project("p1".into()),
+                    StatsRange::AllTime,
+                    &prices,
+                    false,
+                    1_000_000,
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(rollup.tokens.by_model.len(), 1);
+        assert_eq!(rollup.tokens.by_model[0].input_tokens, 11);
+        assert_eq!(rollup.tokens.by_model[0].output_tokens, 7);
     }
 
     #[tokio::test]
@@ -1063,7 +1092,8 @@ mod tests {
             StatsScope::Project("p1".into()),
             StatsRange::AllTime,
             &prices,
-        );
+        )
+        .await;
         let row = &r.tokens.by_model[0];
         // 1M input @ $3 + 1M output @ $15 + 1M cached @ $0.30
         // + 1M cache-creation @ $3.75 = $22.05.
@@ -1153,7 +1183,8 @@ mod tests {
             StatsScope::Project("p1".into()),
             StatsRange::AllTime,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         let row = &r.recovery.by_model[0];
         assert_eq!(row.calls, 10);
         assert_eq!(row.recovered, 2);
@@ -1245,7 +1276,8 @@ mod tests {
             StatsScope::Project("p1".into()),
             StatsRange::AllTime,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         let normal = r
             .recovery
             .by_llm_mode
@@ -1298,7 +1330,8 @@ mod tests {
             StatsScope::Project("p1".into()),
             StatsRange::AllTime,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         let unknown = r
             .recovery
             .by_llm_mode
@@ -1374,7 +1407,8 @@ mod tests {
             StatsScope::Project("p1".into()),
             StatsRange::AllTime,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         assert!(
             r.recovery.hard_fail_shapes.iter().any(|row| {
                 row.llm_mode == "normal"
@@ -1423,7 +1457,8 @@ mod tests {
             StatsScope::Project("p1".into()),
             StatsRange::AllTime,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         assert!(
             r.recovery
                 .hard_fail_shapes
@@ -1462,7 +1497,8 @@ mod tests {
             StatsScope::Project("p1".into()),
             StatsRange::AllTime,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         assert_eq!(r.recovery.hard_fail_shapes.len(), 20);
     }
 
@@ -1530,7 +1566,8 @@ mod tests {
             StatsScope::Project("p1".into()),
             StatsRange::AllTime,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         let model = &r.recovery.by_model[0];
         assert_eq!(model.model, "qwen");
         assert_eq!(model.calls, 3);
@@ -1630,7 +1667,8 @@ mod tests {
             StatsScope::Project("p1".into()),
             StatsRange::AllTime,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         let lang = &r.language;
         assert_eq!(lang.total_file_calls, 54);
         // 8 named + 1 Other.
@@ -1664,7 +1702,8 @@ mod tests {
             StatsScope::Project("p1".into()),
             StatsRange::AllTime,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         assert_eq!(r.tokens.by_model[0].input_tokens, 109);
 
         // Scope=p1, range=7d → only recent p1 row.
@@ -1673,7 +1712,8 @@ mod tests {
             StatsScope::Project("p1".into()),
             StatsRange::Last7Days,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         assert_eq!(r.tokens.by_model[0].input_tokens, 10);
 
         // Scope=all, range=all → all three projects' tokens (10+99+5).
@@ -1682,7 +1722,8 @@ mod tests {
             StatsScope::All,
             StatsRange::AllTime,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         assert_eq!(r.tokens.by_model[0].input_tokens, 114);
 
         // Scope=all, range=7d → recent only (10+5).
@@ -1691,7 +1732,8 @@ mod tests {
             StatsScope::All,
             StatsRange::Last7Days,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         assert_eq!(r.tokens.by_model[0].input_tokens, 15);
     }
 
@@ -1703,7 +1745,8 @@ mod tests {
             StatsScope::All,
             StatsRange::AllTime,
             &PriceTable::empty(),
-        );
+        )
+        .await;
         assert!(r.tokens.by_model.is_empty());
         assert!(r.recovery.by_model.is_empty());
         assert!(r.language.languages.is_empty());
@@ -1712,10 +1755,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn by_role_breakdown() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
@@ -1751,16 +1790,18 @@ mod tests {
         .await;
 
         let r = db
-            .read_blocking(|conn| {
+            .read(|conn| {
+                let prices = PriceTable::empty();
                 super::rollup(
                     conn,
                     &StatsScope::Project("p1".into()),
                     StatsRange::AllTime,
-                    &PriceTable::empty(),
+                    &prices,
                     true,
                     1_000_000,
                 )
             })
+            .await
             .unwrap();
         let roles = r.tokens.by_role.expect("by_role requested");
         assert_eq!(roles.len(), 2);
@@ -1771,10 +1812,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn by_role_same_agent_multiple_tool_rows_count_once() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
@@ -1797,16 +1834,18 @@ mod tests {
         }
 
         let r = db
-            .read_blocking(|conn| {
+            .read(|conn| {
+                let prices = PriceTable::empty();
                 super::rollup(
                     conn,
                     &StatsScope::Project("p1".into()),
                     StatsRange::AllTime,
-                    &PriceTable::empty(),
+                    &prices,
                     true,
                     1_000_000,
                 )
             })
+            .await
             .unwrap();
         let roles = r.tokens.by_role.expect("by_role requested");
 

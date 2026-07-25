@@ -13,28 +13,24 @@ pub async fn run(cmd: SessionCommand) -> Result<()> {
     match cmd {
         SessionCommand::Answer(args) => answer(args).await,
         SessionCommand::Show { session_id, json } => show(&session_id, json),
-        SessionCommand::List(args) => list(args),
+        SessionCommand::List(args) => list(args).await,
         SessionCommand::Delete { .. } => anyhow::bail!(
             "cockpit session is not implemented yet (planned; backed by ~/.local/share/cockpit/cockpit.db)"
         ),
     }
 }
 
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; CLI session command remains sync until db-async-session-log"
-)]
-fn list(args: SessionListArgs) -> Result<()> {
+async fn list(args: SessionListArgs) -> Result<()> {
     let db = Db::open_default().context("opening cockpit DB")?;
     let sessions = if let Some(assistant) = args.assistant.as_deref() {
         let assistant = assistant.to_string();
         let assistant_label = assistant.clone();
-        db.write_blocking(move |conn| {
-            Db::list_sessions_for_assistant_conn(conn, &assistant, false, 100)
-        })
-        .with_context(|| format!("listing sessions for assistant `{assistant_label}`"))?
+        db.write(move |conn| Db::list_sessions_for_assistant_conn(conn, &assistant, false, 100))
+            .await
+            .with_context(|| format!("listing sessions for assistant `{assistant_label}`"))?
     } else {
-        db.write_blocking(move |conn| Db::list_sessions_conn(conn, false, 100))
+        db.write(move |conn| Db::list_sessions_conn(conn, false, 100))
+            .await
             .context("listing sessions")?
     };
     if sessions.is_empty() {

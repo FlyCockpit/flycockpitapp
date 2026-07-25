@@ -1048,7 +1048,7 @@ pub(crate) async fn run_turn(
         // Feed the round into tokenizer calibration only after the cheap
         // discard guards pass. Building the basis serializes the whole turn
         // history and is intentionally skipped when the sample cannot be used.
-        if session.should_note_calibration_sample(u) {
+        if session.should_note_calibration_sample(u).await {
             let mut basis = String::new();
             for m in history.iter() {
                 if let Ok(s) = serde_json::to_string(m) {
@@ -1059,7 +1059,7 @@ pub(crate) async fn run_turn(
                 basis.push_str(&s);
             }
             basis.push_str(&text);
-            session.note_calibration_sample(&basis, u);
+            session.note_calibration_sample(&basis, u).await;
         }
 
         let _ = tx

@@ -410,7 +410,7 @@ impl Session {
         }
         let session_id = self.id;
         self.db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
                     "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
                     params![principal, session_id.to_string()],
@@ -503,7 +503,7 @@ impl Session {
         self.pinned_messages.lock().unwrap().clone()
     }
 
-    pub fn should_note_calibration_sample(&self, usage: crate::tokens::TokenUsage) -> bool {
+    pub async fn should_note_calibration_sample(&self, usage: crate::tokens::TokenUsage) -> bool {
         if usage.is_empty() || usage.cached_input_tokens != 0 {
             return false;
         }
@@ -513,6 +513,7 @@ impl Session {
         !self
             .db
             .tokenizer_calibration_fresh(&provider, &model, Utc::now().timestamp())
+            .await
     }
 
     /// Feed one inference round into the tokenizer-calibration window.
@@ -523,7 +524,7 @@ impl Session {
     /// calibration row already exists for the active `(provider,
     /// model)`. When the window closes, the best `(strategy, scale)` is
     /// fitted and persisted with a 90-day expiry.
-    pub fn note_calibration_sample(&self, basis: &str, usage: crate::tokens::TokenUsage) {
+    pub async fn note_calibration_sample(&self, basis: &str, usage: crate::tokens::TokenUsage) {
         if usage.is_empty() || usage.cached_input_tokens != 0 {
             return;
         }
@@ -531,30 +532,50 @@ impl Session {
             return;
         };
         let now = Utc::now().timestamp();
-        if self.db.tokenizer_calibration_fresh(&provider, &model, now) {
+        if self
+            .db
+            .tokenizer_calibration_fresh(&provider, &model, now)
+            .await
+        {
             return;
         }
         let actual = usage.input_tokens.saturating_add(usage.output_tokens);
-        let mut cal = self.calibrator.lock().unwrap();
-        cal.add_sample(basis, actual);
-        if cal.window_closed()
-            && let Some((strategy, scale)) = cal.result()
-        {
-            let total = cal.cumulative_actual() as i64;
-            let calls = cal.sample_calls() as i64;
-            if let Err(e) = self.db.upsert_tokenizer_calibration(
-                &provider,
-                &model,
-                strategy.as_str(),
-                scale,
-                now,
-                now + crate::db::tokenizer_calibration::CALIBRATION_TTL_SECS,
-                total,
-                calls,
-            ) {
-                tracing::warn!(error = %e, "upsert tokenizer_calibration failed");
+        let row = {
+            let mut cal = self.calibrator.lock().unwrap();
+            cal.add_sample(basis, actual);
+            if cal.window_closed() {
+                let row = cal.result().map(|(strategy, scale)| {
+                    (
+                        strategy,
+                        scale,
+                        cal.cumulative_actual() as i64,
+                        cal.sample_calls() as i64,
+                    )
+                });
+                if row.is_some() {
+                    *cal = crate::tokens::Calibrator::new();
+                }
+                row
+            } else {
+                None
             }
-            *cal = crate::tokens::Calibrator::new();
+        };
+        if let Some((strategy, scale, total, calls)) = row
+            && let Err(e) = self
+                .db
+                .upsert_tokenizer_calibration(
+                    &provider,
+                    &model,
+                    strategy.as_str(),
+                    scale,
+                    now,
+                    now + crate::db::tokenizer_calibration::CALIBRATION_TTL_SECS,
+                    total,
+                    calls,
+                )
+                .await
+        {
+            tracing::warn!(error = %e, "upsert tokenizer_calibration failed");
         }
     }
 }
@@ -798,7 +819,9 @@ fn scheduled_title_slot(user_turns: usize, last_slot: u8) -> Option<u8> {
 }
 
 fn count_user_turns_for_title(db: &Db, session_id: Uuid) -> usize {
-    match db.write_blocking(move |conn| crate::db::Db::thread_turns_conn(conn, session_id)) {
+    match db.blocking_write_for_sync_maintenance(move |conn| {
+        crate::db::Db::thread_turns_conn(conn, session_id)
+    }) {
         Ok(turns) => turns.iter().filter(|t| t.role == "user").count(),
         Err(e) => {
             tracing::debug!(error = %e, "auto_title: reading user turn count failed");

@@ -108,13 +108,13 @@ pub async fn fs_read(
     join_fs_handler(
         "fs_read",
         tokio::task::spawn_blocking(move || {
-            fs_read_blocking(&ctx, &principal, &project_root, &path, wants_base64)
+            fs_read_sync(&ctx, &principal, &project_root, &path, wants_base64)
         }),
     )
     .await
 }
 
-pub(crate) fn fs_read_blocking(
+pub(crate) fn fs_read_sync(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
     project_root: &str,
@@ -234,13 +234,13 @@ pub async fn fs_write(
     join_fs_handler(
         "fs_write",
         tokio::task::spawn_blocking(move || {
-            fs_write_blocking(&ctx, &project_root, &path, &content, base_hash)
+            fs_write_sync(&ctx, &project_root, &path, &content, base_hash)
         }),
     )
     .await
 }
 
-pub(crate) fn fs_write_blocking(
+pub(crate) fn fs_write_sync(
     ctx: &DaemonContext,
     project_root: &str,
     path: &str,
@@ -544,10 +544,6 @@ fn secret_blocked_for_sharee(
     Ok(crate::gitignore::is_gitignored(path) || dotenv_pattern_matches(ctx, root, path)?)
 }
 
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; filesystem sync helpers migrate in a later prompt"
-)]
 fn dotenv_pattern_matches(
     ctx: &DaemonContext,
     root: &Path,
@@ -557,7 +553,7 @@ fn dotenv_pattern_matches(
     let root_for_db = trust_root.root.clone();
     let trust_policy = ctx
         .db
-        .write_blocking(move |conn| {
+        .blocking_write_for_sync_maintenance(move |conn| {
             let decision = crate::db::Db::workspace_trust_by_root_conn(conn, &root_for_db)?;
             let Some(decision) = decision else {
                 anyhow::bail!("workspace trust is unset for {}", root_for_db.display());
@@ -720,7 +716,7 @@ mod tests {
     fn test_ctx(root: &Path) -> crate::daemon::server::DaemonContext {
         let db = crate::db::Db::open_in_memory().expect("in-memory db");
         let normalized_root = root.canonicalize().unwrap().to_string_lossy().into_owned();
-        db.write_blocking(move |conn| {
+        db.blocking_write_for_sync_maintenance(move |conn| {
             crate::db::Db::set_workspace_trust_conn(
                 conn,
                 &normalized_root,
@@ -906,7 +902,7 @@ mod tests {
         let principal = ClientPrincipal::owner();
         let project_root = root.to_string_lossy().into_owned();
 
-        let sync = fs_read_blocking(&ctx, &principal, &project_root, "read.txt", false)
+        let sync = fs_read_sync(&ctx, &principal, &project_root, "read.txt", false)
             .expect("sync read succeeds");
         let async_result = fs_read(ctx, principal, project_root, "read.txt".to_string(), false)
             .await

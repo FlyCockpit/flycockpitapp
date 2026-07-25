@@ -392,7 +392,9 @@ fn persisted_active_agent(driver: &Driver) -> String {
     driver
         .session
         .db
-        .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+        .blocking_write_for_sync_maintenance(move |conn| {
+            crate::db::Db::get_session_conn(conn, session_id)
+        })
         .unwrap()
         .unwrap()
         .active_agent

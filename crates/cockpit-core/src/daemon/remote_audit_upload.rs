@@ -80,7 +80,7 @@ pub async fn sync_current_credential_once(db: &Db) -> Result<RemoteAuditUploadOn
     let Some(credential) = maybe_load_credential() else {
         return Ok(RemoteAuditUploadOnceOutcome::NoCredential);
     };
-    if !audit_upload_enabled(db, &credential)? {
+    if !audit_upload_enabled(db, &credential).await? {
         return Ok(RemoteAuditUploadOnceOutcome::Disabled);
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -165,9 +165,10 @@ impl RemoteAuditUploadHttpClient {
     }
 }
 
-fn audit_upload_enabled(db: &Db, credential: &StoredFlycockpitCredential) -> Result<bool> {
+async fn audit_upload_enabled(db: &Db, credential: &StoredFlycockpitCredential) -> Result<bool> {
     Ok(db
-        .connector_state(&credential.server_url, &credential.instance_id)?
+        .connector_state(&credential.server_url, &credential.instance_id)
+        .await?
         .map(|state| state.enabled)
         .unwrap_or(false))
 }
@@ -179,12 +180,14 @@ async fn sync_once_with_client(
     redaction: &RedactionTable,
     sleep: SleepFn<'_>,
 ) -> Result<RemoteAuditUploadOnceOutcome> {
-    if !audit_upload_enabled(db, credential)? {
+    if !audit_upload_enabled(db, credential).await? {
         return Ok(RemoteAuditUploadOnceOutcome::Disabled);
     }
-    db.upsert_remote_audit_upload_state(&credential.server_url, &credential.instance_id)?;
+    db.upsert_remote_audit_upload_state(&credential.server_url, &credential.instance_id)
+        .await?;
     let state = db
-        .remote_audit_upload_state(&credential.server_url, &credential.instance_id)?
+        .remote_audit_upload_state(&credential.server_url, &credential.instance_id)
+        .await?
         .ok_or_else(|| anyhow!("remote audit upload state missing after upsert"))?;
     let built = build_batch(db, credential, state.cursor_audit_id, redaction).await?;
     match built {
@@ -194,7 +197,8 @@ async fn sync_once_with_client(
                 &credential.server_url,
                 &credential.instance_id,
                 cursor_audit_id,
-            )?;
+            )
+            .await?;
             Ok(RemoteAuditUploadOnceOutcome::Skipped { cursor_audit_id })
         }
         BatchBuild::Ready {
@@ -209,7 +213,8 @@ async fn sync_once_with_client(
                         &credential.server_url,
                         &credential.instance_id,
                         &error.to_string(),
-                    )?;
+                    )
+                    .await?;
                     return Err(error);
                 }
             };
@@ -219,7 +224,8 @@ async fn sync_once_with_client(
                         &credential.server_url,
                         &credential.instance_id,
                         cursor_audit_id,
-                    )?;
+                    )
+                    .await?;
                     Ok(RemoteAuditUploadOnceOutcome::Uploaded {
                         events: event_count,
                         cursor_audit_id,
@@ -230,7 +236,8 @@ async fn sync_once_with_client(
                         &credential.server_url,
                         &credential.instance_id,
                         "Flycockpit instance credential rejected",
-                    )?;
+                    )
+                    .await?;
                     Ok(RemoteAuditUploadOnceOutcome::Revoked)
                 }
             }
@@ -442,6 +449,7 @@ mod tests {
         let (server, requests) = start_test_server(responses).await;
         let credential = credential(server.clone());
         db.set_connector_enabled(&server, &credential.instance_id, true)
+            .await
             .unwrap();
         let client = RemoteAuditUploadHttpClient::new(&server).unwrap();
         let redaction = RedactionTable::empty();
@@ -463,7 +471,7 @@ mod tests {
 
     async fn insert_remote(db: &Db, kind: &str, path: Option<&str>) -> i64 {
         let session = db
-            .write_blocking(|conn| {
+            .write(|conn| {
                 crate::db::Db::insert_session_row_conn(
                     conn,
                     &crate::db::Db::build_new_session_row_conn(
@@ -474,6 +482,7 @@ mod tests {
                     )?,
                 )
             })
+            .await
             .unwrap();
         db.insert_remote_audit_with_path(
             "flycockpit:user-1",
@@ -513,6 +522,7 @@ mod tests {
         );
         let state = db
             .remote_audit_upload_state(&server, "inst-1")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(state.cursor_audit_id, audit_id);
@@ -538,6 +548,7 @@ mod tests {
         .await;
         let credential = credential(server.clone());
         db.set_connector_enabled(&server, &credential.instance_id, true)
+            .await
             .unwrap();
         let client = RemoteAuditUploadHttpClient::new(&server).unwrap();
         let redaction = RedactionTable::empty();
@@ -548,6 +559,7 @@ mod tests {
         assert!(error.to_string().contains("remote audit ingest failed"));
         let state = db
             .remote_audit_upload_state(&server, "inst-1")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(state.cursor_audit_id, 0);
@@ -563,6 +575,7 @@ mod tests {
         assert_eq!(outcome, RemoteAuditUploadOnceOutcome::Revoked);
         let state = db
             .remote_audit_upload_state(&server, "inst-1")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(state.cursor_audit_id, 0);
@@ -632,17 +645,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn upload_gate_requires_connect_enabled() {
+    #[tokio::test]
+    async fn upload_gate_requires_connect_enabled() {
         let db = Db::open_in_memory().unwrap();
         let credential = credential("https://app.example.test".to_string());
-        assert!(!audit_upload_enabled(&db, &credential).unwrap());
+        assert!(!audit_upload_enabled(&db, &credential).await.unwrap());
         db.set_connector_enabled(&credential.server_url, &credential.instance_id, false)
+            .await
             .unwrap();
-        assert!(!audit_upload_enabled(&db, &credential).unwrap());
+        assert!(!audit_upload_enabled(&db, &credential).await.unwrap());
         db.set_connector_enabled(&credential.server_url, &credential.instance_id, true)
+            .await
             .unwrap();
-        assert!(audit_upload_enabled(&db, &credential).unwrap());
+        assert!(audit_upload_enabled(&db, &credential).await.unwrap());
     }
 
     #[derive(Clone)]

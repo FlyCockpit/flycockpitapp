@@ -1022,7 +1022,12 @@ fn run_trusted_only(app: &mut App, args: &str) -> bool {
 }
 
 fn run_stats(app: &mut App, _: &str) -> bool {
-    app.overlay = Overlay::Stats(crate::tui::stats_pane::StatsPane::open(&app.launch.cwd));
+    let mut pane = crate::tui::stats_pane::StatsPane::open(&app.launch.cwd);
+    let fetch = pane.take_pending_fetch_key();
+    app.overlay = Overlay::Stats(pane);
+    if let Some(key) = fetch {
+        app.start_stats_rollup_action(key);
+    }
     false
 }
 
@@ -1654,10 +1659,6 @@ impl App {
     /// creating one when none exists. Uses the same resume path as the
     /// sessions browser so daemon attach, transcript rebuild, and workspace
     /// trust behavior stay centralized.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; TUI assistant slash path remains sync until db-async-session-log"
-    )]
     pub(super) fn handle_assistant_command(&mut self, arg: &str) {
         let name = arg.trim();
         if name.is_empty() {
@@ -1671,13 +1672,13 @@ impl App {
         let session = match cockpit_db::Db::open_default().and_then(|db| {
             let name_for_row = name.to_string();
             let row = db
-                .blocking_for_sync_cli(move |conn| {
+                .blocking_write_for_sync_ui(move |conn| {
                     cockpit_db::Db::get_assistant_conn(conn, &name_for_row)
                 })?
                 .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
             cockpit_core::assistants::load_from_row(&row)?;
             let name_for_lookup = name.to_string();
-            if let Some(session) = db.write_blocking(move |conn| {
+            if let Some(session) = db.blocking_write_for_sync_ui(move |conn| {
                 cockpit_db::Db::most_recent_session_for_assistant_conn(conn, &name_for_lookup)
             })? {
                 return Ok(session);
@@ -1685,7 +1686,7 @@ impl App {
             let project_id = cockpit_core::session::project_id_for(&self.launch.cwd);
             let project_root = self.launch.cwd.to_string_lossy().into_owned();
             let name_for_create = name.to_string();
-            db.write_blocking(move |conn| {
+            db.blocking_write_for_sync_ui(move |conn| {
                 let row = cockpit_db::Db::build_new_assistant_session_row_conn(
                     conn,
                     &project_id,

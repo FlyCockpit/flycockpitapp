@@ -62,57 +62,38 @@ pub struct RetentionOutcome {
 
 impl Db {
     /// Delete old payload rows for closed sessions, preserving session rows.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn prune_session_payloads(&self, payload_cutoff_secs: i64) -> Result<u64> {
+    pub async fn prune_session_payloads(&self, payload_cutoff_secs: i64) -> Result<u64> {
         if payload_cutoff_secs <= 0 {
             return Ok(0);
         }
-        self.write_blocking(move |conn| prune_session_payloads_conn(conn, payload_cutoff_secs))
+        self.write(move |conn| prune_session_payloads_conn(conn, payload_cutoff_secs))
+            .await
     }
 
     /// Delete old closed, non-ephemeral root sessions whose subtrees are closed.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn expire_old_sessions(&self, session_cutoff_secs: i64) -> Result<u64> {
+    pub async fn expire_old_sessions(&self, session_cutoff_secs: i64) -> Result<u64> {
         if session_cutoff_secs <= 0 {
             return Ok(0);
         }
-        let roots = self.read_blocking(|conn| old_session_roots(conn, session_cutoff_secs))?;
-        let mut removed = 0;
-        for root in roots {
-            self.write_blocking(move |conn| {
-                crate::db::sessions::delete_session_conn(conn, root, true)
-            })
-            .with_context(|| format!("expiring old session {root}"))?;
-            removed += 1;
-        }
-        Ok(removed)
+        self.write(move |conn| expire_old_sessions_conn(conn, session_cutoff_secs))
+            .await
     }
 
     /// Decide whether retention should vacuum after a pass.
-    pub fn should_vacuum(&self, deleted: u64, now_secs: i64, cfg: &RetentionConfig) -> bool {
+    pub async fn should_vacuum(&self, deleted: u64, now_secs: i64, cfg: &RetentionConfig) -> bool {
         if deleted >= cfg.vacuum_min_deletions {
             return true;
         }
         if cfg.vacuum_interval_days == 0 {
             return false;
         }
-        let last = self.last_vacuum_secs().ok().flatten().unwrap_or(0);
+        let last = self.last_vacuum_secs().await.ok().flatten().unwrap_or(0);
         now_secs.saturating_sub(last) >= (cfg.vacuum_interval_days as i64) * 86_400
     }
 
     /// Record a successful retention vacuum timestamp.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn record_vacuum(&self, now_secs: i64) -> Result<()> {
-        self.write_blocking(move |conn| {
+    pub async fn record_vacuum(&self, now_secs: i64) -> Result<()> {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO retention_meta (key, value) VALUES ('last_vacuum_secs', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -121,10 +102,11 @@ impl Db {
             .context("recording retention vacuum timestamp")?;
             Ok(())
         })
+        .await
     }
 
     /// Run the two-tier retention pass and optional on-disk vacuum.
-    pub fn run_retention_pass(
+    pub async fn run_retention_pass(
         &self,
         cfg: &RetentionConfig,
         now_secs: i64,
@@ -133,36 +115,32 @@ impl Db {
 
         if cfg.session_window_days > 0 {
             let cutoff = now_secs - (cfg.session_window_days as i64) * 86_400;
-            outcome.sessions_expired = self.expire_old_sessions(cutoff)?;
+            outcome.sessions_expired = self.expire_old_sessions(cutoff).await?;
         }
         if cfg.payload_window_days > 0 {
             let cutoff = now_secs - (cfg.payload_window_days as i64) * 86_400;
-            outcome.payload_rows_deleted = self.prune_session_payloads(cutoff)?;
+            outcome.payload_rows_deleted = self.prune_session_payloads(cutoff).await?;
         }
 
         let deleted = outcome.sessions_expired + outcome.payload_rows_deleted;
         if self.path.is_some()
-            && self.should_vacuum(deleted, now_secs, cfg)
-            && self.vacuum_retention_database()?
+            && self.should_vacuum(deleted, now_secs, cfg).await
+            && self.vacuum_retention_database().await?
         {
-            self.record_vacuum(now_secs)?;
+            self.record_vacuum(now_secs).await?;
             outcome.vacuumed = true;
         }
 
         Ok(outcome)
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn vacuum_retention_database(&self) -> Result<bool> {
+    async fn vacuum_retention_database(&self) -> Result<bool> {
         if self.path.is_none() {
             return Ok(false);
         }
         // VACUUM under WAL still needs exclusive access to rewrite the DB. Keep it on
         // the writer connection so retention does not bypass writer serialization.
-        self.write_blocking(|conn| match conn.execute_batch("VACUUM") {
+        self.write(|conn| match conn.execute_batch("VACUUM") {
             Ok(()) => Ok(true),
             Err(err) if sqlite_busy(&err) => {
                 tracing::debug!(error = %err, "retention vacuum skipped because sqlite is busy");
@@ -170,14 +148,11 @@ impl Db {
             }
             Err(err) => Err(err).context("vacuuming after retention pass"),
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn last_vacuum_secs(&self) -> Result<Option<i64>> {
-        self.read_blocking(|conn| {
+    async fn last_vacuum_secs(&self) -> Result<Option<i64>> {
+        self.read(|conn| {
             conn.query_row(
                 "SELECT value FROM retention_meta WHERE key = 'last_vacuum_secs'",
                 [],
@@ -186,6 +161,7 @@ impl Db {
             .optional()
             .context("querying retention vacuum timestamp")
         })
+        .await
     }
 }
 
@@ -264,6 +240,17 @@ fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
     Ok(out)
 }
 
+fn expire_old_sessions_conn(conn: &Connection, cutoff_secs: i64) -> Result<u64> {
+    let roots = old_session_roots(conn, cutoff_secs)?;
+    let mut removed = 0;
+    for root in roots {
+        crate::db::sessions::delete_session_conn(conn, root, true)
+            .with_context(|| format!("expiring old session {root}"))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 fn parse_uuid_sql(raw: String) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(&raw).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
@@ -273,28 +260,21 @@ fn parse_uuid_sql(raw: String) -> rusqlite::Result<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn close_session(db: &Db, id: Uuid, ts: i64) {
-        db.write_blocking(move |conn| {
+    async fn close_session(db: &Db, id: Uuid, ts: i64) {
+        db.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET ended_at = ?2, last_active_at = ?2 WHERE session_id = ?1",
                 params![id.to_string(), ts],
             )?;
             Ok(())
         })
+        .await
         .unwrap();
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn insert_payload_rows(db: &Db, session_id: Uuid, call_id: &str, ts_secs: i64) {
+    async fn insert_payload_rows(db: &Db, session_id: Uuid, call_id: &str, ts_secs: i64) {
         let call_id = call_id.to_owned();
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute(
                 "INSERT INTO inference_requests (call_id, session_id, ts_ms, payload_json)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -326,15 +306,13 @@ mod tests {
             )?;
             Ok(())
         })
+        .await
         .unwrap();
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn payload_count(db: &Db, table: &str, session_id: Uuid) -> i64 {
-        db.read_blocking(|conn| {
+    async fn payload_count(db: &Db, table: &str, session_id: Uuid) -> i64 {
+        let table = table.to_owned();
+        db.read(move |conn| {
             conn.query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
                 params![session_id.to_string()],
@@ -342,6 +320,7 @@ mod tests {
             )
             .context("counting payload rows")
         })
+        .await
         .unwrap()
     }
 
@@ -350,11 +329,11 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let closed = db.create_session("p", "/x", "Build").await.unwrap();
         let open = db.create_session("p", "/x", "Build").await.unwrap();
-        close_session(&db, closed.session_id, 10);
-        insert_payload_rows(&db, closed.session_id, "closed", 10);
-        insert_payload_rows(&db, open.session_id, "open", 10);
+        close_session(&db, closed.session_id, 10).await;
+        insert_payload_rows(&db, closed.session_id, "closed", 10).await;
+        insert_payload_rows(&db, open.session_id, "open", 10).await;
 
-        assert_eq!(db.prune_session_payloads(20).unwrap(), 4);
+        assert_eq!(db.prune_session_payloads(20).await.unwrap(), 4);
 
         for table in [
             "inference_requests",
@@ -362,22 +341,26 @@ mod tests {
             "tool_call_events",
             "inference_calls",
         ] {
-            assert_eq!(payload_count(&db, table, closed.session_id), 0, "{table}");
-            assert_eq!(payload_count(&db, table, open.session_id), 1, "{table}");
+            assert_eq!(
+                payload_count(&db, table, closed.session_id).await,
+                0,
+                "{table}"
+            );
+            assert_eq!(
+                payload_count(&db, table, open.session_id).await,
+                1,
+                "{table}"
+            );
         }
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn payload_prune_failure_rolls_back_prior_table_deletes() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").await.unwrap();
-        close_session(&db, s.session_id, 10);
-        insert_payload_rows(&db, s.session_id, "closed", 10);
-        db.write_blocking(move |conn| {
+        close_session(&db, s.session_id, 10).await;
+        insert_payload_rows(&db, s.session_id, "closed", 10).await;
+        db.write(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_session_event_prune
                  BEFORE DELETE ON session_events
@@ -387,9 +370,10 @@ mod tests {
             )?;
             Ok(())
         })
+        .await
         .unwrap();
 
-        let err = db.prune_session_payloads(20).unwrap_err();
+        let err = db.prune_session_payloads(20).await.unwrap_err();
 
         assert!(
             format!("{err:#}").contains("injected payload prune failure"),
@@ -401,7 +385,7 @@ mod tests {
             "tool_call_events",
             "inference_calls",
         ] {
-            assert_eq!(payload_count(&db, table, s.session_id), 1, "{table}");
+            assert_eq!(payload_count(&db, table, s.session_id).await, 1, "{table}");
         }
     }
 
@@ -410,12 +394,12 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let at = db.create_session("p", "/x", "Build").await.unwrap();
         let old = db.create_session("p", "/x", "Build").await.unwrap();
-        close_session(&db, at.session_id, 100);
-        close_session(&db, old.session_id, 99);
-        insert_payload_rows(&db, at.session_id, "at", 100);
-        insert_payload_rows(&db, old.session_id, "old", 99);
+        close_session(&db, at.session_id, 100).await;
+        close_session(&db, old.session_id, 99).await;
+        insert_payload_rows(&db, at.session_id, "at", 100).await;
+        insert_payload_rows(&db, old.session_id, "old", 99).await;
 
-        assert_eq!(db.prune_session_payloads(100).unwrap(), 4);
+        assert_eq!(db.prune_session_payloads(100).await.unwrap(), 4);
 
         for table in [
             "inference_requests",
@@ -423,8 +407,12 @@ mod tests {
             "tool_call_events",
             "inference_calls",
         ] {
-            assert_eq!(payload_count(&db, table, at.session_id), 1, "{table}");
-            assert_eq!(payload_count(&db, table, old.session_id), 0, "{table}");
+            assert_eq!(payload_count(&db, table, at.session_id).await, 1, "{table}");
+            assert_eq!(
+                payload_count(&db, table, old.session_id).await,
+                0,
+                "{table}"
+            );
         }
     }
 
@@ -432,10 +420,10 @@ mod tests {
     async fn payload_age_out_preserves_session_metadata_row() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").await.unwrap();
-        close_session(&db, s.session_id, 10);
-        insert_payload_rows(&db, s.session_id, "closed", 10);
+        close_session(&db, s.session_id, 10).await;
+        insert_payload_rows(&db, s.session_id, "closed", 10).await;
 
-        db.prune_session_payloads(20).unwrap();
+        db.prune_session_payloads(20).await.unwrap();
 
         assert!(db.get_session(s.session_id).await.unwrap().is_some());
     }
@@ -445,31 +433,28 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let root = db.create_session("p", "/x", "Build").await.unwrap();
         let _child = db.create_fork(root.session_id, None).await.unwrap();
-        close_session(&db, root.session_id, 10);
+        close_session(&db, root.session_id, 10).await;
 
-        assert_eq!(db.expire_old_sessions(20).unwrap(), 0);
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 0);
         assert!(db.get_session(root.session_id).await.unwrap().is_some());
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn session_age_out_skips_ephemeral() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").await.unwrap();
-        close_session(&db, s.session_id, 10);
-        db.write_blocking(move |conn| {
+        close_session(&db, s.session_id, 10).await;
+        db.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET ephemeral = 1 WHERE session_id = ?1",
                 params![s.session_id.to_string()],
             )?;
             Ok(())
         })
+        .await
         .unwrap();
 
-        assert_eq!(db.expire_old_sessions(20).unwrap(), 0);
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 0);
         assert!(db.get_session(s.session_id).await.unwrap().is_some());
     }
 
@@ -477,9 +462,9 @@ mod tests {
     async fn session_age_out_zero_window_is_noop() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").await.unwrap();
-        close_session(&db, s.session_id, 10);
+        close_session(&db, s.session_id, 10).await;
 
-        assert_eq!(db.expire_old_sessions(0).unwrap(), 0);
+        assert_eq!(db.expire_old_sessions(0).await.unwrap(), 0);
         assert!(db.get_session(s.session_id).await.unwrap().is_some());
     }
 
@@ -487,48 +472,31 @@ mod tests {
     async fn vacuum_triggers_on_deletion_threshold() {
         let db = Db::open_in_memory().unwrap();
         let cfg = RetentionConfig::default();
-        assert!(db.should_vacuum(cfg.vacuum_min_deletions, 100, &cfg));
+        assert!(db.should_vacuum(cfg.vacuum_min_deletions, 100, &cfg).await);
     }
 
     #[tokio::test]
     async fn vacuum_triggers_on_interval() {
         let db = Db::open_in_memory().unwrap();
         let cfg = RetentionConfig::default();
-        db.record_vacuum(100).unwrap();
-        assert!(!db.should_vacuum(0, 100 + 6 * 86_400, &cfg));
-        assert!(db.should_vacuum(0, 100 + 7 * 86_400, &cfg));
+        db.record_vacuum(100).await.unwrap();
+        assert!(!db.should_vacuum(0, 100 + 6 * 86_400, &cfg).await);
+        assert!(db.should_vacuum(0, 100 + 7 * 86_400, &cfg).await);
     }
 
     #[tokio::test]
     async fn record_vacuum_round_trips() {
         let db = Db::open_in_memory().unwrap();
         let cfg = RetentionConfig::default();
-        db.record_vacuum(100).unwrap();
-        assert!(!db.should_vacuum(0, 100, &cfg));
+        db.record_vacuum(100).await.unwrap();
+        assert!(!db.should_vacuum(0, 100, &cfg).await);
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    async fn vacuum_uses_dedicated_connection_without_shared_mutex() {
+    async fn vacuum_uses_writer_connection() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = Db::open(&tmp.path().join("retention.db")).unwrap();
-        let db_for_vacuum = db.clone();
-        db.read_blocking(|_conn| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                tx.send(db_for_vacuum.vacuum_retention_database()).unwrap();
-            });
-            let result = rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("vacuum should not wait for the shared connection mutex")
-                .unwrap();
-            assert!(result);
-            Ok(())
-        })
-        .unwrap();
+        assert!(db.vacuum_retention_database().await.unwrap());
     }
 
     #[tokio::test]
@@ -542,25 +510,44 @@ mod tests {
         };
 
         assert_eq!(
-            db.run_retention_pass(&cfg, 100).unwrap(),
+            db.run_retention_pass(&cfg, 100).await.unwrap(),
             RetentionOutcome::default()
         );
     }
 
     #[tokio::test]
-    async fn retention_pass_is_idempotent() {
+    async fn db_async_ops_retention_pass_runs_through_async_api() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").await.unwrap();
-        close_session(&db, s.session_id, 10);
-        insert_payload_rows(&db, s.session_id, "closed", 10);
+        close_session(&db, s.session_id, 10).await;
+        insert_payload_rows(&db, s.session_id, "closed", 10).await;
         let cfg = RetentionConfig {
             payload_window_days: 1,
             vacuum_interval_days: 0,
             ..RetentionConfig::default()
         };
 
-        let first = db.run_retention_pass(&cfg, 100_000).unwrap();
-        let second = db.run_retention_pass(&cfg, 100_000).unwrap();
+        let outcome = db.run_retention_pass(&cfg, 100_000).await.unwrap();
+
+        assert_eq!(outcome.payload_rows_deleted, 4);
+        assert_eq!(outcome.sessions_expired, 0);
+        assert!(!outcome.vacuumed);
+    }
+
+    #[tokio::test]
+    async fn retention_pass_is_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
+        close_session(&db, s.session_id, 10).await;
+        insert_payload_rows(&db, s.session_id, "closed", 10).await;
+        let cfg = RetentionConfig {
+            payload_window_days: 1,
+            vacuum_interval_days: 0,
+            ..RetentionConfig::default()
+        };
+
+        let first = db.run_retention_pass(&cfg, 100_000).await.unwrap();
+        let second = db.run_retention_pass(&cfg, 100_000).await.unwrap();
 
         assert_eq!(first.payload_rows_deleted, 4);
         assert_eq!(first.sessions_expired, 0);

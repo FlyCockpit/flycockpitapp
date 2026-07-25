@@ -1975,11 +1975,12 @@ async fn run_boot_housekeeping(db: &Db) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "sweeping ephemeral sessions on boot failed"),
     }
-    run_retention_pass_blocking(
+    run_retention_pass(
         db.clone(),
         retention_config(),
         chrono::Utc::now().timestamp(),
-    );
+    )
+    .await;
     match db.reconcile_orphaned_task_delegations().await {
         Ok(n) if n > 0 => {
             tracing::info!(count = n, "marked orphaned task delegations lost on boot")
@@ -1991,12 +1992,8 @@ async fn run_boot_housekeeping(db: &Db) {
     }
 }
 
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; daemon boot remains sync until boot path is async"
-)]
 fn sweep_ephemeral_sessions_blocking(db: &Db) -> Result<usize> {
-    db.write_blocking(|conn| {
+    db.blocking_write_for_sync_maintenance(|conn| {
         let mut stmt = conn
             .prepare(
                 "SELECT session_id
@@ -2109,8 +2106,8 @@ fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
     }
 }
 
-fn run_retention_pass_blocking(db: Db, cfg: RetentionConfig, now_secs: i64) {
-    match db.run_retention_pass(&cfg, now_secs) {
+async fn run_retention_pass(db: Db, cfg: RetentionConfig, now_secs: i64) {
+    match db.run_retention_pass(&cfg, now_secs).await {
         Ok(outcome) => log_retention_outcome(outcome),
         Err(error) => tracing::warn!(error = %error, "session payload retention pass failed"),
     }
@@ -2122,15 +2119,7 @@ async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
 
 async fn run_retention_tick_db(db: Db, cfg: RetentionConfig) {
     let now_secs = chrono::Utc::now().timestamp();
-    match tokio::task::spawn_blocking(move || db.run_retention_pass(&cfg, now_secs)).await {
-        Ok(Ok(outcome)) => log_retention_outcome(outcome),
-        Ok(Err(error)) => {
-            tracing::warn!(error = %error, "session payload retention pass failed")
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, "session payload retention worker failed")
-        }
-    }
+    run_retention_pass(db, cfg, now_secs).await;
 }
 
 #[cfg(unix)]
@@ -2810,7 +2799,7 @@ where
                 .path()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "<in-memory>".to_string()),
-            schema_version: ctx.db.schema_version().unwrap_or(0),
+            schema_version: ctx.db.schema_version().await.unwrap_or(0),
         },
     );
     if !send_writer_envelope(&writer_tx, hello).await {

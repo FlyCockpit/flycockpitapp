@@ -73,7 +73,9 @@ impl App {
             return false;
         };
 
-        let history = self.backfill_subagent_history(&task_call_id, &label);
+        let session_id = self.current_session_id();
+        let fetch_task_call_id = task_call_id.clone();
+        let fetch_label = label.clone();
         let read_only = outcome.is_some() || child == "docs";
         let finished = outcome.is_some();
         let meta = SubagentViewMeta {
@@ -95,7 +97,7 @@ impl App {
         let previous = self.capture_transcript_view();
         self.transcript_view_stack.push(previous);
         self.transcript_view = TranscriptViewMeta::Subagent(meta);
-        self.history = history.into();
+        self.history = Vec::new().into();
         self.pending = None;
         self.history_render_versions = std::collections::HashMap::new();
         self.history_render_fingerprints = std::collections::HashMap::new();
@@ -107,30 +109,80 @@ impl App {
         self.chat_find_lines_query = None;
         self.hovered_affordance = None;
         self.hovered_control_chip = None;
+        if let Some(session_id) = session_id {
+            self.start_subagent_history_fetch(session_id, fetch_task_call_id, fetch_label);
+        }
         true
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-    )]
-    fn backfill_subagent_history(&self, task_call_id: &str, label: &str) -> Vec<HistoryEntry> {
-        let Some(session_id) = self.current_session_id() else {
-            return Vec::new();
-        };
-        let snapshot = cockpit_db::Db::open_default()
-            .and_then(|db| {
-                db.read_blocking(|conn| {
-                    cockpit_core::engine::rehydrate::subagent_history_snapshot_conn(
-                        conn,
-                        session_id,
-                        task_call_id,
-                        label,
-                    )
+    fn start_subagent_history_fetch(
+        &mut self,
+        session_id: uuid::Uuid,
+        task_call_id: String,
+        label: String,
+    ) {
+        let db = self.startup_background.db.clone();
+        let key = format!("subagent.history:{session_id}:{task_call_id}:{label}");
+        self.async_actions.start(
+            AsyncActionKind::Internal("subagent.history"),
+            AsyncActionPolicy::Replace(AsyncActionKey::new(key)),
+            async move {
+                let history = match db {
+                    Some(db) => {
+                        let query_task_call_id = task_call_id.clone();
+                        let query_label = label.clone();
+                        let snapshot = db
+                            .read(move |conn| {
+                                cockpit_core::engine::rehydrate::subagent_history_snapshot_conn(
+                                    conn,
+                                    session_id,
+                                    &query_task_call_id,
+                                    &query_label,
+                                )
+                            })
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        wire_history_to_entries(snapshot)
+                    }
+                    None => Vec::new(),
+                };
+                Ok(AsyncActionPayload::SubagentHistory {
+                    session_id,
+                    task_call_id,
+                    label,
+                    history,
                 })
-            })
-            .unwrap_or_default();
-        wire_history_to_entries(snapshot)
+            },
+        );
+    }
+
+    pub(super) fn apply_subagent_history_result(
+        &mut self,
+        session_id: uuid::Uuid,
+        task_call_id: &str,
+        label: &str,
+        history: Vec<HistoryEntry>,
+    ) {
+        if self.current_session_id() != Some(session_id) {
+            return;
+        }
+        let Some(view) = self.active_subagent_view() else {
+            return;
+        };
+        if view.task_call_id != task_call_id || view.label != label {
+            return;
+        }
+        self.history = history.into();
+        self.history_render_versions = std::collections::HashMap::new();
+        self.history_render_fingerprints = std::collections::HashMap::new();
+        self.history_render_cache_clear();
+        self.pending_render_cache = None;
+        self.pin_chat_to_tail();
+        self.mark_chat_geometry_dirty_from(0);
+        self.chat_find_lines.clear();
+        self.chat_find_lines_query = None;
+        self.hovered_affordance = None;
+        self.hovered_control_chip = None;
     }
 
     pub(super) fn return_from_subagent_view(&mut self) -> bool {

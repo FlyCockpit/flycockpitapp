@@ -53,11 +53,7 @@ impl Db {
     /// the same row land on one row (`INSERT OR REPLACE`); the dispatch
     /// `ts_ms` is preserved across the update via `COALESCE`.
     #[allow(clippy::too_many_arguments)]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn upsert_tandem_inference(
+    pub async fn upsert_tandem_inference(
         &self,
         id: &str,
         session_id: Uuid,
@@ -86,7 +82,7 @@ impl Db {
         let agent = agent.map(str::to_owned);
         let provider = provider.to_owned();
         let model = model.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO tandem_inference
                    (id, session_id, parent_call_id, parent_seq, agent,
@@ -119,18 +115,16 @@ impl Db {
             .context("inserting tandem_inference")?;
             Ok(())
         })
+        .await
     }
 
     /// All tandem records for a session, ordered by `(parent_seq, model)` so
     /// the export lists shadows grouped under the main call they shadow. Used
     /// by `/export debug` to emit the `inference_requests_tandem/` files and
     /// the `tandem_inference` events.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_tandem_inference(&self, session_id: Uuid) -> Result<Vec<TandemRecord>> {
-        self.read_blocking(|conn| Self::list_tandem_inference_conn(conn, session_id))
+    pub async fn list_tandem_inference(&self, session_id: Uuid) -> Result<Vec<TandemRecord>> {
+        self.read(move |conn| Self::list_tandem_inference_conn(conn, session_id))
+            .await
     }
 
     pub fn list_tandem_inference_conn(
@@ -218,6 +212,7 @@ mod tests {
             None,
             InferenceRequestStatus::Pending,
         )
+        .await
         .unwrap();
 
         // Settle: completed, with response + usage.
@@ -234,9 +229,10 @@ mod tests {
             Some(&json!({ "input_tokens": 10, "output_tokens": 3 })),
             InferenceRequestStatus::Completed,
         )
+        .await
         .unwrap();
 
-        let rows = db.list_tandem_inference(s.session_id).unwrap();
+        let rows = db.list_tandem_inference(s.session_id).await.unwrap();
         assert_eq!(rows.len(), 1, "upsert keyed by id keeps one row");
         let r = &rows[0];
         assert_eq!(r.parent_call_id, parent);
@@ -266,8 +262,9 @@ mod tests {
             None,
             InferenceRequestStatus::Pending,
         )
+        .await
         .unwrap();
-        let rows = db.list_tandem_inference(s.session_id).unwrap();
+        let rows = db.list_tandem_inference(s.session_id).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "pending");
         assert!(rows[0].response.is_none());

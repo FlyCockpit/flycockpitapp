@@ -56,10 +56,6 @@ pub async fn run_with_session(
     app.run().await
 }
 
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; TUI command boot remains sync until db-async-workspace-trust"
-)]
 fn prepare_tui_workspace_trust(
     project: Option<&Path>,
 ) -> Result<(crate::db::Db, StartupWorkspaceTrust)> {
@@ -73,7 +69,7 @@ fn prepare_tui_workspace_trust(
     let db = crate::db::Db::open_default().context("opening cockpit DB")?;
     timer.phase("db_open");
     let root_for_db = root.root.clone();
-    if let Some(decision) = db.write_blocking(move |conn| {
+    if let Some(decision) = db.blocking_write_for_sync_maintenance(move |conn| {
         crate::db::Db::workspace_trust_by_root_conn(conn, &root_for_db)
     })? {
         timer.phase("trust_lookup");
@@ -110,10 +106,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-workspace-trust"
-    )]
     fn trust_gate_excludes_project_config_until_decided() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
@@ -127,7 +119,7 @@ mod tests {
 
         let root = crate::config::trust::resolve_trust_root(tmp.path()).unwrap();
         let normalized_root = root.root.to_string_lossy().into_owned();
-        db.write_blocking(move |conn| {
+        db.blocking_write_for_sync_maintenance(move |conn| {
             crate::db::Db::set_workspace_trust_conn(
                 conn,
                 &normalized_root,

@@ -3641,7 +3641,7 @@ mod tests {
             }],
             watermark: 4,
         };
-        s.db.save_prune_ledger(s.id, &ledger).unwrap();
+        s.db.save_prune_ledger(s.id, &ledger).await.unwrap();
 
         let r = rehydrate_session(&s.db, s.id, "Build")
             .await
@@ -3686,7 +3686,7 @@ mod tests {
             }],
             watermark: 9,
         };
-        s.db.save_prune_ledger(s.id, &ledger).unwrap();
+        s.db.save_prune_ledger(s.id, &ledger).await.unwrap();
 
         let r = rehydrate_session(&s.db, s.id, "Build")
             .await

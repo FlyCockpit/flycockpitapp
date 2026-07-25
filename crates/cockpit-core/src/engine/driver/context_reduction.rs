@@ -448,7 +448,7 @@ impl Driver {
         // prune is transient (its frame is never resumed), so skip the
         // write there to avoid clobbering the root ledger.
         if depth == 1 {
-            self.persist_prune_ledger();
+            self.persist_prune_ledger().await;
             self.drop_stale_owner_ledgers().await;
         }
 

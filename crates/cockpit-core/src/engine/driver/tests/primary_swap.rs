@@ -972,7 +972,7 @@ async fn fresh_driver_rehydrates_persisted_pruned_context() {
         }],
         watermark: 5,
     };
-    db.save_prune_ledger(sid, &ledger).unwrap();
+    db.save_prune_ledger(sid, &ledger).await.unwrap();
     drop(driver); // the daemon "died" — in-memory history is gone.
 
     // A brand-new driver for the SAME session (a fresh worker after an

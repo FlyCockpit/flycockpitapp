@@ -120,10 +120,10 @@ impl App {
         );
 
         let db = self.startup_background.db.clone();
-        self.async_actions.start_blocking(
+        self.async_actions.start(
             AsyncActionKind::Internal("startup.remote_disclosures"),
             AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.remote_disclosures")),
-            move || {
+            async move {
                 let Some(credential) = cockpit_core::auth::flycockpit::maybe_load_credential()
                 else {
                     return Ok(AsyncActionPayload::RemoteDisclosures {
@@ -137,9 +137,11 @@ impl App {
                 };
                 let org = db
                     .org_sync_disclosure_for_server(&credential.server_url)
+                    .await
                     .map_err(|e| e.to_string())?;
                 let connector = db
                     .connector_disclosure(&credential.server_url, &credential.instance_id)
+                    .await
                     .map_err(|e| e.to_string())?;
                 Ok(AsyncActionPayload::RemoteDisclosures { org, connector })
             },

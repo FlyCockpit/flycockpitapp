@@ -413,7 +413,7 @@ mod tests {
         let project_id = crate::session::project_id_for(&project.to_path_buf());
         let project_root = project.display().to_string();
         let session_row = db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 crate::db::Db::insert_session_row_conn(
                     conn,
                     &crate::db::Db::build_new_assistant_session_row_conn(

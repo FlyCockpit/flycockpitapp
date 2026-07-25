@@ -76,6 +76,13 @@ pub enum AsyncActionPayload {
         org: Option<cockpit_db::org_sync::OrgSyncDisclosure>,
         connector: Option<cockpit_db::connector::ConnectorDisclosure>,
     },
+    StatsRollup(crate::tui::stats_pane::StatsPaneFetchResult),
+    SubagentHistory {
+        session_id: uuid::Uuid,
+        task_call_id: String,
+        label: String,
+        history: Vec<crate::tui::history::HistoryEntry>,
+    },
     ProviderUsage(Vec<cockpit_core::providers::usage::ProviderUsageSnapshot>),
     Skills(crate::tui::skills_pane::SkillsPaneFetchResult),
     NotesDb(crate::tui::notes_pane::NotesDbResult),

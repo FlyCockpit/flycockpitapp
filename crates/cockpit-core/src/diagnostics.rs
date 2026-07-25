@@ -173,10 +173,6 @@ fn session_label(id: Option<uuid::Uuid>, short_id: Option<&str>) -> String {
     }
 }
 
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; diagnostics remain sync until db-async-workspace-trust"
-)]
 fn workspace_trust_mode(cwd: &Path) -> String {
     let Ok(db) = crate::db::Db::open_default() else {
         return "unresolved".to_string();
@@ -184,11 +180,13 @@ fn workspace_trust_mode(cwd: &Path) -> String {
     let Ok(root) = crate::config::trust::resolve_trust_root(cwd) else {
         return "unresolved".to_string();
     };
-    db.write_blocking(move |conn| crate::db::Db::workspace_trust_by_root_conn(conn, &root.root))
-        .ok()
-        .flatten()
-        .map(|decision| decision.mode.as_str().to_string())
-        .unwrap_or_else(|| "unresolved".to_string())
+    db.blocking_write_for_sync_maintenance(move |conn| {
+        crate::db::Db::workspace_trust_by_root_conn(conn, &root.root)
+    })
+    .ok()
+    .flatten()
+    .map(|decision| decision.mode.as_str().to_string())
+    .unwrap_or_else(|| "unresolved".to_string())
 }
 
 fn provider_lines(

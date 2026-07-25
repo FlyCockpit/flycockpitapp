@@ -17,11 +17,7 @@ pub struct RemoteAuditUploadState {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn upsert_remote_audit_upload_state(
+    pub async fn upsert_remote_audit_upload_state(
         &self,
         server_url: &str,
         instance_id: &str,
@@ -29,7 +25,7 @@ impl Db {
         let now = now_ms();
         let server_url = server_url.to_owned();
         let instance_id = instance_id.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO remote_audit_upload_state
                    (server_url, instance_id, cursor_audit_id, updated_at_ms)
@@ -41,18 +37,17 @@ impl Db {
             .context("upserting remote audit upload state")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn remote_audit_upload_state(
+    pub async fn remote_audit_upload_state(
         &self,
         server_url: &str,
         instance_id: &str,
     ) -> Result<Option<RemoteAuditUploadState>> {
-        self.read_blocking(|conn| {
+        let server_url = server_url.to_owned();
+        let instance_id = instance_id.to_owned();
+        self.read(move |conn| {
             conn.query_row(
                 "SELECT server_url, instance_id, cursor_audit_id,
                         last_uploaded_at_ms, last_error, updated_at_ms
@@ -64,14 +59,11 @@ impl Db {
             .optional()
             .context("querying remote audit upload state")
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_remote_audit_upload_states(&self) -> Result<Vec<RemoteAuditUploadState>> {
-        self.read_blocking(|conn| {
+    pub async fn list_remote_audit_upload_states(&self) -> Result<Vec<RemoteAuditUploadState>> {
+        self.read(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT server_url, instance_id, cursor_audit_id,
@@ -89,13 +81,10 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn update_remote_audit_upload_cursor(
+    pub async fn update_remote_audit_upload_cursor(
         &self,
         server_url: &str,
         instance_id: &str,
@@ -104,7 +93,7 @@ impl Db {
         let now = now_ms();
         let server_url = server_url.to_owned();
         let instance_id = instance_id.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO remote_audit_upload_state
                    (server_url, instance_id, cursor_audit_id, last_uploaded_at_ms, last_error, updated_at_ms)
@@ -119,13 +108,10 @@ impl Db {
             .context("updating remote audit upload cursor")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn update_remote_audit_upload_error(
+    pub async fn update_remote_audit_upload_error(
         &self,
         server_url: &str,
         instance_id: &str,
@@ -135,7 +121,7 @@ impl Db {
         let server_url = server_url.to_owned();
         let instance_id = instance_id.to_owned();
         let error = error.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO remote_audit_upload_state
                    (server_url, instance_id, cursor_audit_id, last_error, updated_at_ms)
@@ -148,6 +134,7 @@ impl Db {
             .context("updating remote audit upload error")?;
             Ok(())
         })
+        .await
     }
 }
 
@@ -166,31 +153,37 @@ fn decode_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteAuditUploadSt
 mod tests {
     use super::*;
 
-    #[test]
-    fn upload_state_round_trips_and_cursor_is_monotonic() {
+    #[tokio::test]
+    async fn upload_state_round_trips_and_cursor_is_monotonic() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_remote_audit_upload_state("https://app.example.test", "inst-1")
+            .await
             .unwrap();
         let state = db
             .remote_audit_upload_state("https://app.example.test", "inst-1")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(state.cursor_audit_id, 0);
 
         db.update_remote_audit_upload_cursor("https://app.example.test", "inst-1", 10)
+            .await
             .unwrap();
         db.update_remote_audit_upload_cursor("https://app.example.test", "inst-1", 7)
+            .await
             .unwrap();
         let state = db
             .remote_audit_upload_state("https://app.example.test", "inst-1")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(state.cursor_audit_id, 10);
         assert!(state.last_uploaded_at_ms.is_some());
 
         db.update_remote_audit_upload_error("https://app.example.test", "inst-1", "offline")
+            .await
             .unwrap();
-        let states = db.list_remote_audit_upload_states().unwrap();
+        let states = db.list_remote_audit_upload_states().await.unwrap();
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].last_error.as_deref(), Some("offline"));
     }

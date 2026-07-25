@@ -59,11 +59,14 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     let enable_remote_access = remote_access_choice(&args)?;
     let db = crate::db::Db::open_default().ok();
     if let Some(db) = db.as_ref() {
-        if let Err(error) = db.set_connector_enabled(
-            &credential.server_url,
-            &credential.instance_id,
-            enable_remote_access,
-        ) {
+        if let Err(error) = db
+            .set_connector_enabled(
+                &credential.server_url,
+                &credential.instance_id,
+                enable_remote_access,
+            )
+            .await
+        {
             tracing::warn!(error = %error, "Flycockpit account login: updating remote access setting failed");
         } else if enable_remote_access {
             println!("Remote access: enabled (use `cockpit connect off` to disable)");
@@ -95,7 +98,7 @@ pub async fn logout() -> Result<()> {
     }
     clear_credential_via_daemon_or_direct().await?;
     if let Ok(db) = crate::db::Db::open_default()
-        && let Err(error) = db.mark_org_sync_disabled(&credential.server_url)
+        && let Err(error) = db.mark_org_sync_disabled(&credential.server_url).await
     {
         tracing::warn!(error = %error, "Flycockpit account logout: disabling org sync state failed");
     }
@@ -177,20 +180,22 @@ pub async fn whoami() -> Result<()> {
         Ok(client) => client.connection_status(&credential).await,
         Err(error) => ConnectionStatus::Error(error.to_string()),
     };
-    let (sync, connector) = crate::db::Db::open_default()
-        .ok()
-        .map(|db| {
+    let (sync, connector) = match crate::db::Db::open_default() {
+        Ok(db) => {
             let sync = db
                 .org_sync_disclosure_for_server(&credential.server_url)
+                .await
                 .ok()
                 .flatten();
             let connector = db
                 .connector_disclosure(&credential.server_url, &credential.instance_id)
+                .await
                 .ok()
                 .flatten();
             (sync, connector)
-        })
-        .unwrap_or((None, None));
+        }
+        Err(_) => (None, None),
+    };
     print!(
         "{}",
         render_whoami_with_sync_and_connector(

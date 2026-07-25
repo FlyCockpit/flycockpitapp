@@ -55,21 +55,26 @@ impl Db {
     /// Resolve the tokenizer for `(provider, model)`. Returns the stored
     /// `(strategy, scale)` even if expired; falls back to
     /// `(cl100k_base, 1.0)` when there's no row.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn resolve_tokenizer(&self, provider: &str, model: &str) -> (TokenizerStrategy, f64) {
-        let row = match self.read_blocking(|conn| {
-            conn.query_row(
-                "SELECT strategy, scale FROM tokenizer_calibration
+    pub async fn resolve_tokenizer(&self, provider: &str, model: &str) -> (TokenizerStrategy, f64) {
+        let provider = provider.to_owned();
+        let model = model.to_owned();
+        let row = match self
+            .read({
+                let provider = provider.clone();
+                let model = model.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT strategy, scale FROM tokenizer_calibration
                       WHERE provider = ?1 AND model = ?2",
-                params![provider, model],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)),
-            )
-            .optional()
-            .context("reading tokenizer_calibration")
-        }) {
+                        params![provider, model],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)),
+                    )
+                    .optional()
+                    .context("reading tokenizer_calibration")
+                }
+            })
+            .await
+        {
             Ok(row) => row,
             Err(error) => {
                 tracing::warn!(
@@ -90,20 +95,25 @@ impl Db {
     /// Whether a non-expired calibration row exists for `(provider,
     /// model)`. The calibration accumulator skips recomputing while one
     /// does.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn tokenizer_calibration_fresh(&self, provider: &str, model: &str, now: i64) -> bool {
-        match self.read_blocking(|conn| {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM tokenizer_calibration
+    pub async fn tokenizer_calibration_fresh(&self, provider: &str, model: &str, now: i64) -> bool {
+        let provider = provider.to_owned();
+        let model = model.to_owned();
+        match self
+            .read({
+                let provider = provider.clone();
+                let model = model.clone();
+                move |conn| {
+                    let count: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM tokenizer_calibration
                   WHERE provider = ?1 AND model = ?2 AND expires_at > ?3",
-                params![provider, model, now],
-                |r| r.get(0),
-            )?;
-            Ok(count > 0)
-        }) {
+                        params![provider, model, now],
+                        |r| r.get(0),
+                    )?;
+                    Ok(count > 0)
+                }
+            })
+            .await
+        {
             Ok(fresh) => fresh,
             Err(error) => {
                 tracing::warn!(
@@ -119,11 +129,7 @@ impl Db {
 
     /// Insert or replace the calibration row for `(provider, model)`.
     #[allow(clippy::too_many_arguments)]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn upsert_tokenizer_calibration(
+    pub async fn upsert_tokenizer_calibration(
         &self,
         provider: &str,
         model: &str,
@@ -137,7 +143,7 @@ impl Db {
         let provider = provider.to_owned();
         let model = model.to_owned();
         let strategy = strategy.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO tokenizer_calibration
                    (provider, model, strategy, scale, computed_at, expires_at,
@@ -164,6 +170,7 @@ impl Db {
             .context("upserting tokenizer_calibration")?;
             Ok(())
         })
+        .await
     }
 }
 
@@ -254,16 +261,16 @@ mod tests {
         String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
     }
 
-    #[test]
-    fn resolver_falls_back_to_cl100k_default() {
+    #[tokio::test]
+    async fn resolver_falls_back_to_cl100k_default() {
         let db = Db::open_in_memory().unwrap();
-        let (strategy, scale) = db.resolve_tokenizer("anthropic", "claude");
+        let (strategy, scale) = db.resolve_tokenizer("anthropic", "claude").await;
         assert_eq!(strategy, TokenizerStrategy::Cl100k);
         assert_eq!(scale, 1.0);
     }
 
-    #[test]
-    fn resolver_returns_expired_row_over_default() {
+    #[tokio::test]
+    async fn resolver_returns_expired_row_over_default() {
         let db = Db::open_in_memory().unwrap();
         let now = 2_000_000_000i64;
         // computed long ago; already expired.
@@ -277,16 +284,17 @@ mod tests {
             50_000,
             12,
         )
+        .await
         .unwrap();
-        assert!(!db.tokenizer_calibration_fresh("openai", "gpt", now));
+        assert!(!db.tokenizer_calibration_fresh("openai", "gpt", now).await);
         // Still returned despite being expired — beats the default.
-        let (strategy, scale) = db.resolve_tokenizer("openai", "gpt");
+        let (strategy, scale) = db.resolve_tokenizer("openai", "gpt").await;
         assert_eq!(strategy, TokenizerStrategy::O200k);
         assert_eq!(scale, 1.25);
     }
 
-    #[test]
-    fn fresh_row_is_reported_fresh_and_upsert_overwrites() {
+    #[tokio::test]
+    async fn fresh_row_is_reported_fresh_and_upsert_overwrites() {
         let db = Db::open_in_memory().unwrap();
         let now = 2_000_000_000i64;
         db.upsert_tokenizer_calibration(
@@ -299,8 +307,9 @@ mod tests {
             20_000,
             5,
         )
+        .await
         .unwrap();
-        assert!(db.tokenizer_calibration_fresh("p", "m", now));
+        assert!(db.tokenizer_calibration_fresh("p", "m", now).await);
         // Overwrite with a new fit.
         db.upsert_tokenizer_calibration(
             "p",
@@ -312,8 +321,9 @@ mod tests {
             25_000,
             7,
         )
+        .await
         .unwrap();
-        let (strategy, scale) = db.resolve_tokenizer("p", "m");
+        let (strategy, scale) = db.resolve_tokenizer("p", "m").await;
         assert_eq!(strategy, TokenizerStrategy::P50k);
         assert_eq!(scale, 0.9);
     }

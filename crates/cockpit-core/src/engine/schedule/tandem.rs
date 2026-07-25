@@ -181,18 +181,21 @@ fn spawn_all(session: &Arc<Session>, set: &TandemSet, dispatch: TandemDispatch) 
             let pending_body = target
                 .handle
                 .assemble_dispatch_request(&system, &history, &prompt, &tools, &params);
-            if let Err(e) = session.record_tandem_inference(
-                &row_id,
-                &parent_call_id,
-                parent_seq,
-                Some(&agent),
-                &target.provider,
-                &target.model,
-                &pending_body,
-                None,
-                None,
-                InferenceRequestStatus::Pending,
-            ) {
+            if let Err(e) = session
+                .record_tandem_inference(
+                    &row_id,
+                    &parent_call_id,
+                    parent_seq,
+                    Some(&agent),
+                    &target.provider,
+                    &target.model,
+                    &pending_body,
+                    None,
+                    None,
+                    InferenceRequestStatus::Pending,
+                )
+                .await
+            {
                 tracing::warn!(error = %e, "record tandem_inference (pending) failed");
             }
 
@@ -203,18 +206,21 @@ fn spawn_all(session: &Arc<Session>, set: &TandemSet, dispatch: TandemDispatch) 
                 .complete_tandem(&system, &history, &prompt, &tools, &params)
                 .await;
 
-            if let Err(e) = session.record_tandem_inference(
-                &row_id,
-                &parent_call_id,
-                parent_seq,
-                Some(&agent),
-                &target.provider,
-                &target.model,
-                &outcome.request,
-                outcome.response.as_ref(),
-                outcome.usage.as_ref(),
-                outcome.status,
-            ) {
+            if let Err(e) = session
+                .record_tandem_inference(
+                    &row_id,
+                    &parent_call_id,
+                    parent_seq,
+                    Some(&agent),
+                    &target.provider,
+                    &target.model,
+                    &outcome.request,
+                    outcome.response.as_ref(),
+                    outcome.usage.as_ref(),
+                    outcome.status,
+                )
+                .await
+            {
                 tracing::warn!(error = %e, "record tandem_inference (settle) failed");
             }
         });

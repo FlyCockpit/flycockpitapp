@@ -8,14 +8,14 @@ use crate::db::Db;
 
 pub async fn run(cmd: SyncCommand) -> Result<()> {
     match cmd {
-        SyncCommand::Status => status(),
+        SyncCommand::Status => status().await,
     }
 }
 
-fn status() -> Result<()> {
+async fn status() -> Result<()> {
     let db = Db::open_default().context("opening cockpit DB")?;
-    let org_states = db.list_org_sync_states()?;
-    let audit_states = db.list_remote_audit_upload_states()?;
+    let org_states = db.list_org_sync_states().await?;
+    let audit_states = db.list_remote_audit_upload_states().await?;
     let credential = maybe_load_credential();
 
     if org_states.is_empty() {
@@ -59,7 +59,8 @@ fn status() -> Result<()> {
                 })
                 .unwrap_or(false);
             let connect_enabled = db
-                .connector_state(&state.server_url, &state.instance_id)?
+                .connector_state(&state.server_url, &state.instance_id)
+                .await?
                 .map(|connector| connector.enabled)
                 .unwrap_or(false);
             println!(

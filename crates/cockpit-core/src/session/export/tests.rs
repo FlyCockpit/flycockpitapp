@@ -2927,6 +2927,7 @@ async fn export_includes_tandem_sibling_dir_and_events() {
         Some(&json!({ "input_tokens": 5, "output_tokens": 2 })),
         crate::db::session_log::InferenceRequestStatus::Completed,
     )
+    .await
     .unwrap();
     db.upsert_tandem_inference(
         "tan-b",
@@ -2941,6 +2942,7 @@ async fn export_includes_tandem_sibling_dir_and_events() {
         None,
         crate::db::session_log::InferenceRequestStatus::Pending,
     )
+    .await
     .unwrap();
 
     let target = get_test_session(&db, sid).await;
@@ -3028,6 +3030,7 @@ async fn export_sanitizes_tandem_parent_call_id_filename_segment() {
         Some(&json!({ "input_tokens": 5, "output_tokens": 2 })),
         crate::db::session_log::InferenceRequestStatus::Completed,
     )
+    .await
     .unwrap();
 
     let target = get_test_session(&db, sid).await;
@@ -3185,6 +3188,7 @@ async fn export_includes_tandem_tool_call_validation_in_file_and_event() {
         None,
         crate::db::session_log::InferenceRequestStatus::Completed,
     )
+    .await
     .unwrap();
 
     let target = get_test_session(&db, sid).await;

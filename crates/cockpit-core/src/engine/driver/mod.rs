@@ -1969,12 +1969,17 @@ impl Driver {
     /// set from the live wire history the same way [`prune::current_elided_ids`]
     /// does (single marker format), so the ledger is always in lockstep
     /// with what the model last saw.
-    fn persist_prune_ledger(&self) {
+    async fn persist_prune_ledger(&self) {
         // Only the root frame's history is the resumable context.
         let history = &self.stack[0].history;
         let watermark = self.prune_watermark.get(&1).copied().unwrap_or(0);
         let ledger = prune::capture_ledger(history, watermark);
-        if let Err(e) = self.session.db.save_prune_ledger(self.session.id, &ledger) {
+        if let Err(e) = self
+            .session
+            .db
+            .save_prune_ledger(self.session.id, &ledger)
+            .await
+        {
             tracing::warn!(error = %e, "persisting prune ledger failed");
         }
     }
@@ -2668,7 +2673,7 @@ impl Driver {
             };
 
             if is_root {
-                self.persist_prune_ledger();
+                self.persist_prune_ledger().await;
                 if let Err(e) = self
                     .session
                     .db
@@ -5871,7 +5876,7 @@ impl Driver {
             // context — not only on a graceful `/exit`. Root frame only (a
             // subagent frame is transient and never resumed); best-effort.
             if is_root {
-                self.persist_prune_ledger();
+                self.persist_prune_ledger().await;
                 if let Err(e) = self
                     .session
                     .db

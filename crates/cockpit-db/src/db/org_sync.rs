@@ -27,11 +27,7 @@ pub struct OrgSyncDisclosure {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn upsert_org_sync_policy(
+    pub async fn upsert_org_sync_policy(
         &self,
         server_url: &str,
         org_id: &str,
@@ -45,7 +41,7 @@ impl Db {
         let server_url = server_url.to_owned();
         let org_id = org_id.to_owned();
         let policy_version = policy_version.map(str::to_owned);
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO sync_state
                    (server_url, org_id, cursor_seq, policy_version, policy_json, enabled, last_error, updated_at_ms)
@@ -68,14 +64,17 @@ impl Db {
             .context("upserting org sync policy")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn org_sync_state(&self, server_url: &str, org_id: &str) -> Result<Option<OrgSyncState>> {
-        self.read_blocking(|conn| {
+    pub async fn org_sync_state(
+        &self,
+        server_url: &str,
+        org_id: &str,
+    ) -> Result<Option<OrgSyncState>> {
+        let server_url = server_url.to_owned();
+        let org_id = org_id.to_owned();
+        self.read(move |conn| {
             conn.query_row(
                 "SELECT server_url, org_id, cursor_seq, policy_version, enabled,
                         last_synced_at_ms, last_error, updated_at_ms
@@ -87,17 +86,15 @@ impl Db {
             .optional()
             .context("querying org sync state")
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn active_org_sync_state_for_server(
+    pub async fn active_org_sync_state_for_server(
         &self,
         server_url: &str,
     ) -> Result<Option<OrgSyncState>> {
-        self.read_blocking(|conn| {
+        let server_url = server_url.to_owned();
+        self.read(move |conn| {
             conn.query_row(
                 "SELECT server_url, org_id, cursor_seq, policy_version, enabled,
                         last_synced_at_ms, last_error, updated_at_ms
@@ -111,14 +108,16 @@ impl Db {
             .optional()
             .context("querying active org sync state")
         })
+        .await
     }
 
-    pub fn org_sync_disclosure_for_server(
+    pub async fn org_sync_disclosure_for_server(
         &self,
         server_url: &str,
     ) -> Result<Option<OrgSyncDisclosure>> {
         Ok(self
-            .active_org_sync_state_for_server(server_url)?
+            .active_org_sync_state_for_server(server_url)
+            .await?
             .map(|state| OrgSyncDisclosure {
                 org_id: state.org_id,
                 cursor_seq: state.cursor_seq,
@@ -126,12 +125,8 @@ impl Db {
             }))
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_org_sync_states(&self) -> Result<Vec<OrgSyncState>> {
-        self.read_blocking(|conn| {
+    pub async fn list_org_sync_states(&self) -> Result<Vec<OrgSyncState>> {
+        self.read(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT server_url, org_id, cursor_seq, policy_version, enabled,
@@ -149,16 +144,13 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn mark_org_sync_disabled(&self, server_url: &str) -> Result<()> {
+    pub async fn mark_org_sync_disabled(&self, server_url: &str) -> Result<()> {
         let updated_at_ms = now_ms();
         let server_url = server_url.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sync_state
                     SET enabled = 0, updated_at_ms = ?2
@@ -168,13 +160,10 @@ impl Db {
             .context("marking org sync disabled")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn update_org_sync_cursor(
+    pub async fn update_org_sync_cursor(
         &self,
         server_url: &str,
         org_id: &str,
@@ -183,7 +172,7 @@ impl Db {
         let now = now_ms();
         let server_url = server_url.to_owned();
         let org_id = org_id.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sync_state
                     SET cursor_seq = MAX(cursor_seq, ?3),
@@ -196,18 +185,20 @@ impl Db {
             .context("updating org sync cursor")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn update_org_sync_error(&self, server_url: &str, org_id: &str, error: &str) -> Result<()> {
+    pub async fn update_org_sync_error(
+        &self,
+        server_url: &str,
+        org_id: &str,
+        error: &str,
+    ) -> Result<()> {
         let now = now_ms();
         let server_url = server_url.to_owned();
         let org_id = org_id.to_owned();
         let error = error.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sync_state
                     SET last_error = ?3,
@@ -218,18 +209,15 @@ impl Db {
             .context("updating org sync error")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_org_sync_events_after(
+    pub async fn list_org_sync_events_after(
         &self,
         cursor_seq: i64,
         limit: usize,
     ) -> Result<Vec<SessionEventRow>> {
-        self.read_blocking(|conn| {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label,
@@ -276,6 +264,7 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 }
 
@@ -298,8 +287,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn state_round_trips_and_disclosure_only_reports_enabled_policy() {
+    #[tokio::test]
+    async fn state_round_trips_and_disclosure_only_reports_enabled_policy() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_org_sync_policy(
             "https://app.example.test",
@@ -308,21 +297,50 @@ mod tests {
             &json!({"enabled": true}),
             true,
         )
+        .await
         .unwrap();
 
         let disclosure = db
             .org_sync_disclosure_for_server("https://app.example.test")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(disclosure.org_id, "org-1");
         assert_eq!(disclosure.cursor_seq, 0);
 
         db.mark_org_sync_disabled("https://app.example.test")
+            .await
             .unwrap();
         assert!(
             db.org_sync_disclosure_for_server("https://app.example.test")
+                .await
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn db_async_ops_org_sync_roundtrip_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_org_sync_policy(
+            "https://app.example.test",
+            "org-async",
+            Some("v2"),
+            &json!({"enabled": true}),
+            true,
+        )
+        .await
+        .unwrap();
+        db.update_org_sync_cursor("https://app.example.test", "org-async", 42)
+            .await
+            .unwrap();
+
+        let state = db
+            .org_sync_state("https://app.example.test", "org-async")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.cursor_seq, 42);
+        assert_eq!(state.policy_version.as_deref(), Some("v2"));
     }
 }

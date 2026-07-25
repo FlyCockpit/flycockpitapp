@@ -18,7 +18,7 @@ impl Session {
         let project_id_for_db = project_id.clone();
         let project_root_for_db = project_root_str.clone();
         let active_agent_for_db = active_agent.to_string();
-        let mut row = db.write_blocking(move |conn| {
+        let mut row = db.blocking_write_for_sync_maintenance(move |conn| {
             crate::db::Db::build_new_session_row_conn(
                 conn,
                 &project_id_for_db,
@@ -30,7 +30,9 @@ impl Session {
             capture_model_system_prompt_snapshot_json(&project_root);
         let row_for_db = row.clone();
         let row = db
-            .write_blocking(move |conn| crate::db::Db::insert_session_row_conn(conn, &row_for_db))
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::insert_session_row_conn(conn, &row_for_db)
+            })
             .context("creating session row")?;
         Self::from_row(db, project_root, row)
     }
@@ -48,7 +50,7 @@ impl Session {
         let project_root_for_db = project_root_str.clone();
         let active_agent_for_db = active_agent.to_string();
         let mut row = db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 crate::db::Db::build_new_session_row_conn(
                     conn,
                     &project_id_for_db,
@@ -81,7 +83,7 @@ impl Session {
         let active_agent_for_db = active_agent.to_string();
         let assistant_name_for_db = assistant_name.to_string();
         let mut row = db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 crate::db::Db::build_new_assistant_session_row_conn(
                     conn,
                     &project_id_for_db,
@@ -127,10 +129,9 @@ impl Session {
             }
         };
         let row_for_db = row.clone();
-        match self
-            .db
-            .write_blocking(move |conn| crate::db::Db::insert_session_row_conn(conn, &row_for_db))
-        {
+        match self.db.blocking_write_for_sync_maintenance(move |conn| {
+            crate::db::Db::insert_session_row_conn(conn, &row_for_db)
+        }) {
             Ok(_) => {}
             Err(e) => {
                 // Restore the pending row so a transient failure can retry on
@@ -141,7 +142,7 @@ impl Session {
         }
         let session_id = self.id;
         if row.last_viewed_at.is_some()
-            && let Err(e) = self.db.write_blocking(move |conn| {
+            && let Err(e) = self.db.blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
                     "UPDATE sessions SET last_viewed_at = ?1 WHERE session_id = ?2",
                     params![Utc::now().timestamp(), session_id.to_string()],
@@ -186,7 +187,7 @@ impl Session {
         fork_point_turn_id: Option<String>,
     ) -> Result<Self> {
         let row = db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 crate::db::Db::create_fork_conn(
                     conn,
                     parent_session_id,
@@ -205,7 +206,9 @@ impl Session {
     /// Backfills `short_id` if missing (lazy migration from pre-§17 rows).
     pub fn resume(db: Db, session_id: Uuid) -> Result<Option<Self>> {
         let Some(row) = db
-            .write_blocking(move |conn| crate::db::Db::get_session_conn(conn, session_id))
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::get_session_conn(conn, session_id)
+            })
             .context("fetching session")?
         else {
             return Ok(None);
@@ -225,8 +228,10 @@ impl Session {
             Some(s) => s,
             None => {
                 let session_id = row.session_id;
-                db.write_blocking(move |conn| crate::db::Db::ensure_short_id_conn(conn, session_id))
-                    .context("backfilling short_id")?
+                db.blocking_write_for_sync_maintenance(move |conn| {
+                    crate::db::Db::ensure_short_id_conn(conn, session_id)
+                })
+                .context("backfilling short_id")?
             }
         };
         Ok(Self {
@@ -355,7 +360,7 @@ impl Session {
         let title = new_title.to_string();
         let session_id = self.id;
         self.db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
                     "UPDATE sessions SET title = ?1, user_renamed = 1 WHERE session_id = ?2",
                     params![title, session_id.to_string()],
@@ -381,7 +386,7 @@ impl Session {
         }
         let session_id = self.id;
         self.db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
                     "UPDATE sessions SET redaction_table_json = ?1 WHERE session_id = ?2",
                     params![Some(json), session_id.to_string()],
@@ -411,7 +416,7 @@ impl Session {
         }
         let session_id = self.id;
         self.db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
                     "UPDATE sessions SET last_active_at = ?1 WHERE session_id = ?2",
                     params![Utc::now().timestamp(), session_id.to_string()],
@@ -433,7 +438,7 @@ impl Session {
         }
         let session_id = self.id;
         self.db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
                     "UPDATE sessions SET last_viewed_at = ?1 WHERE session_id = ?2",
                     params![Utc::now().timestamp(), session_id.to_string()],
@@ -452,7 +457,7 @@ impl Session {
         self.remove_tmp_dir();
         let session_id = self.id;
         self.db
-            .write_blocking(move |conn| {
+            .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
                     "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2",
                     params![Utc::now().timestamp(), session_id.to_string()],

@@ -491,10 +491,6 @@ fn daemon_autostart_notice(
 }
 
 impl App {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; TUI trust persistence remains sync until db-async-workspace-trust"
-    )]
     pub(super) fn apply_workspace_trust_choice(
         &mut self,
         root: cockpit_config::trust::TrustRoot,
@@ -505,7 +501,7 @@ impl App {
             return false;
         };
         let normalized_root = root.root.to_string_lossy().into_owned();
-        if let Err(error) = db.write_blocking(move |conn| {
+        if let Err(error) = db.blocking_write_for_sync_ui(move |conn| {
             cockpit_db::Db::set_workspace_trust_conn(
                 conn,
                 &normalized_root,

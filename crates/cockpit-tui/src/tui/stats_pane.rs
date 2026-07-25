@@ -6,10 +6,9 @@
 //! language breakdown — with interactive scope (current project / all)
 //! and range (7d / all) toggles plus an expandable recovery drilldown.
 //!
-//! The pane owns no query logic: it opens the session DB read-only
-//! ([`Db::open_default`]), runs `rollup`, and re-queries whenever the
-//! scope/range toggles change. Stats are local-only (GOALS §15) — the
-//! pane reads the DB and sends nothing.
+//! The pane owns no DB access. It renders cached roll-up state while `App`
+//! schedules async refreshes whenever the pane opens or its scope/range
+//! toggles change.
 //!
 //! Mirrors the [`crate::tui::model_picker`] dialog's shape: a struct
 //! with `open` / `handle_key` / `render`, opened over the chat body by
@@ -26,7 +25,6 @@ use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::pane_shared::{resolve_project_id, short_id};
 use crate::tui::progress::render_bar;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-use cockpit_db::Db;
 use cockpit_db::stats::{
     LanguageSection, PriceTable, RecoverySection, StatsRange, StatsRollup, StatsScope, TokenSpend,
 };
@@ -74,14 +72,11 @@ pub struct StatsPane {
     /// resolved to a project. When `None`, the scope toggle is pinned to
     /// `All` (there's no project to scope to).
     project_id: Option<String>,
-    /// Loaded once at open and reloaded only on a toggle change — the
-    /// roll-up scan is heavy, so we don't re-run it per frame.
-    db: Option<Db>,
-    prices: PriceTable,
     scope: ScopeToggle,
     range: RangeToggle,
     /// Latest roll-up, or an error string if the query failed.
-    rollup: Result<StatsRollup, String>,
+    rollup: StatsPaneState,
+    pending_fetch: Option<StatsPaneFetchKey>,
     /// Which recovery `by_model` rows are expanded (drilldown shown).
     /// Indexed by position in `rollup.recovery.by_model`. Reset on a
     /// scope/range change (the model set may differ).
@@ -94,11 +89,29 @@ pub struct StatsPane {
     last_content_rows: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsPaneFetchKey {
+    project_id: Option<String>,
+    scope: ScopeToggle,
+    range: RangeToggle,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatsPaneFetchResult {
+    pub key: StatsPaneFetchKey,
+    pub result: Result<StatsRollup, String>,
+}
+
+#[derive(Debug, Clone)]
+enum StatsPaneState {
+    Loading,
+    Ready(Box<StatsRollup>),
+    Error(String),
+}
+
 impl StatsPane {
-    /// Open the pane for `cwd`. Opens the session DB read-only and runs
-    /// the first roll-up (current project / 7d by default, per §15a).
-    /// DB-open failure is non-fatal — the pane renders an error line
-    /// rather than refusing to open, so `/stats` always shows something.
+    /// Open the pane for `cwd` and request the first roll-up (current
+    /// project / 7d by default, per §15a).
     pub fn open(cwd: &std::path::Path) -> Self {
         let project_id = resolve_project_id(cwd);
         let scope = if project_id.is_some() {
@@ -107,18 +120,18 @@ impl StatsPane {
             ScopeToggle::All
         };
         let range = RangeToggle::Last7Days;
-        let prices = PriceTable::load_default();
-        let db = Db::open_default().ok();
-        let rollup = run_rollup(db.as_ref(), &project_id, scope, range, &prices);
-        let expanded = init_expanded(&rollup);
-        Self {
-            project_id,
-            db,
-            prices,
+        let key = StatsPaneFetchKey {
+            project_id: project_id.clone(),
             scope,
             range,
-            rollup,
-            expanded,
+        };
+        Self {
+            project_id,
+            scope,
+            range,
+            rollup: StatsPaneState::Loading,
+            pending_fetch: Some(key),
+            expanded: Vec::new(),
             list: ScrollList::new(),
             last_body_height: 0,
             last_content_rows: 0,
@@ -129,21 +142,40 @@ impl StatsPane {
     /// drilldown state (the model set may differ across scopes, so a
     /// stale expand/cursor index would point at the wrong row).
     fn requery(&mut self) {
-        self.rollup = run_rollup(
-            self.db.as_ref(),
-            &self.project_id,
-            self.scope,
-            self.range,
-            &self.prices,
-        );
+        self.rollup = StatsPaneState::Loading;
+        self.pending_fetch = Some(self.current_fetch_key());
         self.expanded = init_expanded(&self.rollup);
         self.list.reset();
+    }
+
+    pub(crate) fn take_pending_fetch_key(&mut self) -> Option<StatsPaneFetchKey> {
+        self.pending_fetch.take()
+    }
+
+    pub(crate) fn apply_fetch_result(&mut self, result: StatsPaneFetchResult) {
+        if result.key != self.current_fetch_key() {
+            return;
+        }
+        self.rollup = match result.result {
+            Ok(rollup) => StatsPaneState::Ready(Box::new(rollup)),
+            Err(error) => StatsPaneState::Error(error),
+        };
+        self.expanded = init_expanded(&self.rollup);
+        self.list.reset();
+    }
+
+    fn current_fetch_key(&self) -> StatsPaneFetchKey {
+        StatsPaneFetchKey {
+            project_id: self.project_id.clone(),
+            scope: self.scope,
+            range: self.range,
+        }
     }
 
     /// Number of recovery `by_model` rows, used to clamp the cursor.
     fn recovery_rows(&self) -> usize {
         self.rollup
-            .as_ref()
+            .ready()
             .map(|r| r.recovery.by_model.len())
             .unwrap_or(0)
     }
@@ -249,7 +281,7 @@ impl StatsPane {
     }
 
     fn cursor_body_line(&self) -> Option<usize> {
-        let rollup = self.rollup.as_ref().ok()?;
+        let rollup = self.rollup.ready()?;
         if rollup.recovery.by_model.is_empty()
             || self.list.cursor() >= rollup.recovery.by_model.len()
         {
@@ -329,13 +361,19 @@ impl StatsPane {
     fn body_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         match &self.rollup {
-            Err(e) => {
+            StatsPaneState::Loading => {
+                lines.push(Line::from(Span::styled(
+                    "loading stats...",
+                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                )));
+            }
+            StatsPaneState::Error(e) => {
                 lines.push(Line::from(Span::styled(
                     format!("stats unavailable: {e}"),
                     Style::default().fg(Color::Red),
                 )));
             }
-            Ok(r) => {
+            StatsPaneState::Ready(r) => {
                 lines.extend(section_tokens(&r.tokens));
                 lines.push(Line::default());
                 lines.extend(section_recovery(
@@ -363,26 +401,64 @@ impl Pane for StatsPane {
     }
 }
 
-// ---- DB / scope plumbing ---------------------------------------------------
+// ---- async fetch plumbing --------------------------------------------------
 
-/// Run the roll-up for the current toggles, mapping the toggle state to
-/// the part-1 [`StatsScope`] / [`StatsRange`]. Returns the error as a
-/// string so the pane can render it inline rather than panicking.
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; migrated later in db-async-ops-and-tui-render"
-)]
-fn run_rollup(
-    db: Option<&Db>,
-    project_id: &Option<String>,
-    scope: ScopeToggle,
-    range: RangeToggle,
-    prices: &PriceTable,
-) -> Result<StatsRollup, String> {
-    let Some(db) = db else {
-        return Err("could not open the session database".to_string());
-    };
-    let stats_scope = match scope {
+impl StatsPaneFetchKey {
+    pub(crate) fn scope(&self) -> StatsScope {
+        match self.scope {
+            ScopeToggle::Project => match &self.project_id {
+                Some(id) => StatsScope::Project(id.clone()),
+                None => StatsScope::All,
+            },
+            ScopeToggle::All => StatsScope::All,
+        }
+    }
+
+    pub(crate) fn range(&self) -> StatsRange {
+        self.range.to_range()
+    }
+}
+
+impl StatsPaneState {
+    fn ready(&self) -> Option<&StatsRollup> {
+        match self {
+            Self::Ready(rollup) => Some(rollup),
+            Self::Loading | Self::Error(_) => None,
+        }
+    }
+}
+
+/// Initial expand flags — all collapsed, one per recovery model row.
+fn init_expanded(rollup: &StatsPaneState) -> Vec<bool> {
+    match rollup {
+        StatsPaneState::Ready(r) => vec![false; r.recovery.by_model.len()],
+        StatsPaneState::Loading | StatsPaneState::Error(_) => Vec::new(),
+    }
+}
+
+pub(crate) async fn fetch_stats_rollup(
+    db: Option<cockpit_db::Db>,
+    key: StatsPaneFetchKey,
+) -> StatsPaneFetchResult {
+    let result = async {
+        let Some(db) = db else {
+            return Err("could not open the session database".to_string());
+        };
+        let prices = PriceTable::load_default();
+        let scope = key.scope();
+        let range = key.range();
+        let now = chrono::Utc::now().timestamp();
+        db.read(move |conn| cockpit_db::stats::rollup(conn, &scope, range, &prices, false, now))
+            .await
+            .map_err(|e| e.to_string())
+    }
+    .await;
+    StatsPaneFetchResult { key, result }
+}
+
+#[allow(dead_code)]
+fn _scope_toggle_to_stats_scope(project_id: &Option<String>, scope: ScopeToggle) -> StatsScope {
+    match scope {
         ScopeToggle::Project => match project_id {
             Some(id) => StatsScope::Project(id.clone()),
             // Defensive: `Project` is never selected without an id, but
@@ -390,19 +466,6 @@ fn run_rollup(
             None => StatsScope::All,
         },
         ScopeToggle::All => StatsScope::All,
-    };
-    let now = chrono::Utc::now().timestamp();
-    db.read_blocking(|conn| {
-        cockpit_db::stats::rollup(conn, &stats_scope, range.to_range(), prices, false, now)
-    })
-    .map_err(|e| e.to_string())
-}
-
-/// Initial expand flags — all collapsed, one per recovery model row.
-fn init_expanded(rollup: &Result<StatsRollup, String>) -> Vec<bool> {
-    match rollup {
-        Ok(r) => vec![false; r.recovery.by_model.len()],
-        Err(_) => Vec::new(),
     }
 }
 
@@ -776,11 +839,10 @@ mod tests {
         let expanded = vec![false; rollup.recovery.by_model.len()];
         StatsPane {
             project_id: Some("abcdef1234".into()),
-            db: None,
-            prices: PriceTable::empty(),
             scope: ScopeToggle::Project,
             range: RangeToggle::Last7Days,
-            rollup: Ok(rollup),
+            rollup: StatsPaneState::Ready(Box::new(rollup)),
+            pending_fetch: None,
             expanded,
             list: ScrollList::new(),
             last_body_height: 100,
@@ -849,6 +911,30 @@ mod tests {
         assert!(joined.contains("Tool-call recovery"));
         assert!(joined.contains("Language"));
         assert_eq!(joined.matches("(no data)").count(), 3);
+    }
+
+    #[test]
+    fn db_async_render_stats_pane_renders_empty_state_without_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pane = StatsPane::open(tmp.path());
+        assert!(pane.take_pending_fetch_key().is_some());
+        let text = render_text(&pane, 80);
+        assert!(text.contains("loading stats"));
+    }
+
+    #[test]
+    fn db_async_render_stats_pane_renders_fetched_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pane = StatsPane::open(tmp.path());
+        let key = pane.take_pending_fetch_key().unwrap();
+        pane.apply_fetch_result(StatsPaneFetchResult {
+            key,
+            result: Ok(empty_rollup()),
+        });
+
+        let text = render_text(&pane, 80);
+        assert!(text.contains("Token spend"));
+        assert!(text.contains("(no data)"));
     }
 
     #[test]

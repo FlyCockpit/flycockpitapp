@@ -222,11 +222,11 @@ async fn sync_once_with_client(
     let policy = match client.fetch_policy(credential).await? {
         PolicyFetchOutcome::Active(policy) => policy,
         PolicyFetchOutcome::Disabled => {
-            db.mark_org_sync_disabled(&credential.server_url)?;
+            db.mark_org_sync_disabled(&credential.server_url).await?;
             return Ok(OrgSyncOnceOutcome::Disabled);
         }
         PolicyFetchOutcome::Revoked => {
-            db.mark_org_sync_disabled(&credential.server_url)?;
+            db.mark_org_sync_disabled(&credential.server_url).await?;
             return Ok(OrgSyncOnceOutcome::Revoked);
         }
     };
@@ -237,15 +237,18 @@ async fn sync_once_with_client(
         policy.policy_version.as_deref(),
         &policy.raw,
         true,
-    )?;
+    )
+    .await?;
     let state = db
-        .org_sync_state(&credential.server_url, &policy.org_id)?
+        .org_sync_state(&credential.server_url, &policy.org_id)
+        .await?
         .ok_or_else(|| anyhow!("org sync state missing after policy upsert"))?;
     let built = build_batch(db, credential, &policy, state.cursor_seq, redaction).await?;
     match built {
         BatchBuild::Idle => Ok(OrgSyncOnceOutcome::Idle),
         BatchBuild::Filtered { cursor_seq } => {
-            db.update_org_sync_cursor(&credential.server_url, &policy.org_id, cursor_seq)?;
+            db.update_org_sync_cursor(&credential.server_url, &policy.org_id, cursor_seq)
+                .await?;
             Ok(OrgSyncOnceOutcome::Filtered { cursor_seq })
         }
         BatchBuild::Ready {
@@ -263,20 +266,22 @@ async fn sync_once_with_client(
                         &credential.server_url,
                         &policy.org_id,
                         &error.to_string(),
-                    )?;
+                    )
+                    .await?;
                     return Err(error);
                 }
             };
             match ingest {
                 IngestOutcome::Accepted => {
-                    db.update_org_sync_cursor(&credential.server_url, &policy.org_id, cursor_seq)?;
+                    db.update_org_sync_cursor(&credential.server_url, &policy.org_id, cursor_seq)
+                        .await?;
                     Ok(OrgSyncOnceOutcome::Uploaded {
                         events: event_count,
                         cursor_seq,
                     })
                 }
                 IngestOutcome::Revoked => {
-                    db.mark_org_sync_disabled(&credential.server_url)?;
+                    db.mark_org_sync_disabled(&credential.server_url).await?;
                     Ok(OrgSyncOnceOutcome::Revoked)
                 }
             }
@@ -303,7 +308,9 @@ async fn build_batch(
     cursor_seq: i64,
     redaction: &RedactionTable,
 ) -> Result<BatchBuild> {
-    let rows = db.list_org_sync_events_after(cursor_seq, MAX_BATCH_EVENTS)?;
+    let rows = db
+        .list_org_sync_events_after(cursor_seq, MAX_BATCH_EVENTS)
+        .await?;
     if rows.is_empty() {
         return Ok(BatchBuild::Idle);
     }
@@ -558,7 +565,7 @@ mod tests {
 
     async fn insert_event(db: &Db, kind: SessionEventKind, text: &str) -> i64 {
         let session = db
-            .write_blocking(|conn| {
+            .blocking_write_for_sync_maintenance(|conn| {
                 crate::db::Db::insert_session_row_conn(
                     conn,
                     &crate::db::Db::build_new_session_row_conn(
@@ -601,7 +608,10 @@ mod tests {
         let ingest = requests.iter().find(|r| r.starts_with("POST ")).unwrap();
         assert!(ingest.contains(&format!("\"seq\":{first}")));
         assert!(ingest.contains(&format!("\"seq\":{second}")));
-        assert_eq!(db.list_org_sync_states().unwrap()[0].cursor_seq, second);
+        assert_eq!(
+            db.list_org_sync_states().await.unwrap()[0].cursor_seq,
+            second
+        );
     }
 
     #[tokio::test]
@@ -612,8 +622,11 @@ mod tests {
         let (server, requests) =
             start_test_server(vec![response(200, active_policy()), response(200, "{}")]).await;
         db.upsert_org_sync_policy(&server, "org-1", Some("v1"), &json!({}), true)
+            .await
             .unwrap();
-        db.update_org_sync_cursor(&server, "org-1", first).unwrap();
+        db.update_org_sync_cursor(&server, "org-1", first)
+            .await
+            .unwrap();
         let credential = credential(server.clone());
         let client = OrgSyncHttpClient::new(&server).unwrap();
         let redaction = RedactionTable::empty();
@@ -690,6 +703,7 @@ mod tests {
         insert_event(&db, SessionEventKind::UserMessage, "secret").await;
         let (server, _) = start_test_server(vec![response(401, r#"{"error":"revoked"}"#)]).await;
         db.upsert_org_sync_policy(&server, "org-1", Some("v1"), &json!({}), true)
+            .await
             .unwrap();
         let credential = credential(server.clone());
         let client = OrgSyncHttpClient::new(&server).unwrap();
@@ -701,6 +715,7 @@ mod tests {
         assert_eq!(outcome, OrgSyncOnceOutcome::Revoked);
         assert!(
             db.active_org_sync_state_for_server(&server)
+                .await
                 .unwrap()
                 .is_none()
         );

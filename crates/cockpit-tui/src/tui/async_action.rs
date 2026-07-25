@@ -82,6 +82,8 @@ pub enum AsyncActionPayload {
         task_call_id: String,
         label: String,
         history: Vec<crate::tui::history::HistoryEntry>,
+        has_more: bool,
+        oldest_seq: Option<i64>,
     },
     HistoryPage {
         request_id: u64,
@@ -93,6 +95,22 @@ pub enum AsyncActionPayload {
     HistoryPageError {
         request_id: u64,
         session_id: uuid::Uuid,
+        message: String,
+    },
+    SubagentHistoryPage {
+        request_id: u64,
+        session_id: uuid::Uuid,
+        task_call_id: String,
+        label: String,
+        entries: Vec<crate::tui::history::HistoryEntry>,
+        has_more: bool,
+        oldest_seq: Option<i64>,
+    },
+    SubagentHistoryPageError {
+        request_id: u64,
+        session_id: uuid::Uuid,
+        task_call_id: String,
+        label: String,
         message: String,
     },
     ProviderUsage(Vec<cockpit_core::providers::usage::ProviderUsageSnapshot>),

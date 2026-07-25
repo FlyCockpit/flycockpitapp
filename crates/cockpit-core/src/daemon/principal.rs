@@ -306,6 +306,7 @@ mod tests {
             "list_skills",
             "read_history_page",
             "read_session_messages",
+            "read_subagent_history_page",
             "resource_snapshot",
             "session_live_status",
             "stats_rollup",

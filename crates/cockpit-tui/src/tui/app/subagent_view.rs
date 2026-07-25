@@ -8,7 +8,7 @@ fn subagent_view_notice(read_only: bool, truncated: bool) -> Option<String> {
     }
     if truncated {
         parts.push(format!(
-            "Showing the most recent {HISTORY_WINDOW_TARGET_ENTRIES} messages - older subagent history is not loaded (use /export for the full transcript)."
+            "Showing the most recent {HISTORY_WINDOW_TARGET_ENTRIES} messages - scroll up to load older messages."
         ));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
@@ -139,30 +139,38 @@ impl App {
             AsyncActionKind::Internal("subagent.history"),
             AsyncActionPolicy::Replace(AsyncActionKey::new(key)),
             async move {
-                let history = match db {
+                let (history, has_more, oldest_seq) = match db {
                     Some(db) => {
                         let query_task_call_id = task_call_id.clone();
                         let query_label = label.clone();
-                        let snapshot = db
+                        let page = db
                             .read(move |conn| {
-                                cockpit_core::engine::rehydrate::subagent_history_snapshot_conn(
+                                cockpit_core::engine::rehydrate::subagent_history_page_before_conn(
                                     conn,
                                     session_id,
                                     &query_task_call_id,
                                     &query_label,
+                                    None,
+                                    HISTORY_WINDOW_TARGET_ENTRIES as u32,
                                 )
                             })
                             .await
                             .map_err(|e| e.to_string())?;
-                        wire_history_to_entries(snapshot)
+                        (
+                            wire_history_to_entries(page.entries),
+                            page.has_more,
+                            page.oldest_seq,
+                        )
                     }
-                    None => Vec::new(),
+                    None => (Vec::new(), false, None),
                 };
                 Ok(AsyncActionPayload::SubagentHistory {
                     session_id,
                     task_call_id,
                     label,
                     history,
+                    has_more,
+                    oldest_seq,
                 })
             },
         );
@@ -174,6 +182,8 @@ impl App {
         task_call_id: &str,
         label: &str,
         history: Vec<HistoryEntry>,
+        has_more: bool,
+        oldest_seq: Option<i64>,
     ) {
         if self.current_session_id() != Some(session_id) {
             return;
@@ -184,11 +194,11 @@ impl App {
         if view.task_call_id != task_call_id || view.label != label {
             return;
         }
-        let window = HistoryWindow::from_capped_newest(history, HISTORY_WINDOW_TARGET_ENTRIES);
-        let truncated = window.has_older();
+        let window = HistoryWindow::from_history_page(history, oldest_seq, has_more);
         self.history = window;
+        self.older_history_marker = super::scrollback_page_in::OlderHistoryMarker::None;
         if let Some(view) = self.active_subagent_view_mut() {
-            view.notice = subagent_view_notice(view.read_only && !view.finished, truncated);
+            view.notice = subagent_view_notice(view.read_only && !view.finished, has_more);
         }
         self.history_render_versions = std::collections::HashMap::new();
         self.history_render_fingerprints = std::collections::HashMap::new();
@@ -200,6 +210,77 @@ impl App {
         self.chat_find_lines_query = None;
         self.hovered_affordance = None;
         self.hovered_control_chip = None;
+    }
+
+    pub(super) fn apply_subagent_history_page_error(
+        &mut self,
+        request_id: u64,
+        session_id: uuid::Uuid,
+        task_call_id: &str,
+        label: &str,
+    ) {
+        let Some(loading) = self.loading_older else {
+            return;
+        };
+        if loading.id != request_id
+            || loading.session_id != session_id
+            || loading.scope != super::scrollback_page_in::PageRequestScope::Subagent
+        {
+            return;
+        }
+        if self.current_session_id() != Some(session_id) {
+            return;
+        }
+        let Some(view) = self.active_subagent_view() else {
+            return;
+        };
+        if view.task_call_id != task_call_id || view.label != label {
+            return;
+        }
+        self.loading_older = None;
+        self.older_history_marker = super::scrollback_page_in::OlderHistoryMarker::Failed;
+    }
+
+    pub(super) fn apply_subagent_history_page_result(
+        &mut self,
+        request_id: u64,
+        session_id: uuid::Uuid,
+        subagent_key: (&str, &str),
+        entries: Vec<HistoryEntry>,
+        has_more: bool,
+        oldest_seq: Option<i64>,
+    ) {
+        let (task_call_id, label) = subagent_key;
+        let Some(loading) = self.loading_older else {
+            return;
+        };
+        if loading.id != request_id
+            || loading.session_id != session_id
+            || loading.scope != super::scrollback_page_in::PageRequestScope::Subagent
+        {
+            return;
+        }
+        if self.current_session_id() != Some(session_id) {
+            return;
+        }
+        let Some(view) = self.active_subagent_view() else {
+            return;
+        };
+        if view.task_call_id != task_call_id || view.label != label {
+            return;
+        }
+
+        self.loading_older = None;
+        let accepted = self.prepend_history_page(entries, oldest_seq, has_more);
+        self.older_history_marker = if accepted {
+            super::scrollback_page_in::OlderHistoryMarker::None
+        } else {
+            super::scrollback_page_in::OlderHistoryMarker::Failed
+        };
+        let has_older = self.history.has_older();
+        if accepted && let Some(view) = self.active_subagent_view_mut() {
+            view.notice = subagent_view_notice(view.read_only && !view.finished, has_older);
+        }
     }
 
     pub(super) fn return_from_subagent_view(&mut self) -> bool {

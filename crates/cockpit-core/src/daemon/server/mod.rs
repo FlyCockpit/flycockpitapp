@@ -293,6 +293,17 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             has_more: _,
             oldest_seq: _,
         } => scrub_history_entries(entries, redact),
+        proto::Response::SubagentHistoryPage {
+            session_id: _,
+            task_call_id: _,
+            label,
+            entries,
+            has_more: _,
+            oldest_seq: _,
+        } => {
+            scrub_string(label, redact);
+            scrub_history_entries(entries, redact);
+        }
         proto::Response::GoalStatus { goal } => {
             if let Some(goal) = goal {
                 scrub_goal_summary(goal, redact);

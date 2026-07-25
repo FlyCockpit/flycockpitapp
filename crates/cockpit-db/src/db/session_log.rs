@@ -596,6 +596,61 @@ impl Db {
         })
     }
 
+    pub fn list_subagent_session_events_before_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        task_call_id: &str,
+        label: &str,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> Result<SessionEventPage> {
+        let limit = limit.clamp(1, LIST_SESSION_EVENTS_MAX_LIMIT);
+        let fetch_limit = i64::from(limit) + 1;
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label,
+                        origin_principal, provider_id, model_id, llm_mode, model_trust, data_json
+                   FROM session_events
+                  WHERE session_id = ?1
+                    AND task_call_id = ?2
+                    AND label = ?3
+                    AND (?4 IS NULL OR seq < ?5)
+                  ORDER BY seq DESC
+                  LIMIT ?6",
+            )
+            .context("preparing list_subagent_session_events_before")?;
+        let rows = stmt
+            .query_map(
+                params![
+                    session_id.to_string(),
+                    task_call_id,
+                    label,
+                    before_seq,
+                    before_seq,
+                    fetch_limit
+                ],
+                raw_event_row,
+            )
+            .context("querying subagent session_events before seq")?;
+        let mut raw = Vec::new();
+        for row in rows {
+            raw.push(row.context("reading subagent session_event row")?);
+        }
+        let has_more = raw.len() > limit as usize;
+        if has_more {
+            raw.truncate(limit as usize);
+        }
+        raw.reverse();
+        let mut events = decode_event_rows(raw)?;
+        hydrate_compaction_payloads_conn(conn, session_id, &mut events)?;
+        let oldest_seq = events.first().map(|event| event.seq);
+        Ok(SessionEventPage {
+            events,
+            has_more,
+            oldest_seq,
+        })
+    }
+
     pub async fn read_session_messages(
         &self,
         session_id: Uuid,

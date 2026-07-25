@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 3 as const;
+export const PROTOCOL_VERSION = 4 as const;
 
 export const uuidSchema = z.string().uuid();
 export const requestIdSchema = uuidSchema;
@@ -204,6 +204,15 @@ const requestParamSchemas = {
       limit: z.number().int().positive(),
     })
     .strict(),
+  read_subagent_history_page: z
+    .object({
+      session_id: uuidSchema,
+      task_call_id: z.string().min(1),
+      label: z.string().min(1),
+      before_seq: z.number().int().nonnegative().nullable().optional(),
+      limit: z.number().int().positive(),
+    })
+    .strict(),
   read_session_messages: z
     .object({
       session_id: uuidSchema,
@@ -291,6 +300,7 @@ export const clientRequestSchema: z.ZodType<ClientRequest> = z.discriminatedUnio
   requestVariant("list_sessions", requestParamSchemas.list_sessions),
   requestVariant("read_history_page", requestParamSchemas.read_history_page),
   requestVariant("read_session_messages", requestParamSchemas.read_session_messages),
+  requestVariant("read_subagent_history_page", requestParamSchemas.read_subagent_history_page),
   requestVariant("rename_session", requestParamSchemas.rename_session),
   requestVariant("resolve_interrupt", requestParamSchemas.resolve_interrupt),
   requestVariantNoParams("restart_if_idle"),
@@ -329,6 +339,7 @@ export const responseNameSchema = z.enum([
   "session_live_status",
   "sessions",
   "stats_rollup",
+  "subagent_history_page",
 ]);
 export type ResponseName = z.infer<typeof responseNameSchema>;
 
@@ -529,6 +540,20 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
         session_id: uuidSchema,
         entries: z.array(historyEntryWireSchema),
         has_more: z.boolean(),
+        oldest_seq: z.number().int().nullable().optional(),
+      })
+      .passthrough(),
+  ),
+  responseVariant(
+    "subagent_history_page",
+    z
+      .object({
+        session_id: uuidSchema,
+        task_call_id: z.string(),
+        label: z.string(),
+        entries: z.array(historyEntryWireSchema),
+        has_more: z.boolean(),
+        oldest_seq: z.number().int().nullable().optional(),
       })
       .passthrough(),
   ),
@@ -632,6 +657,7 @@ export const knownEventKindSchema = z.enum([
   "event_stream_lagged",
   "foreground_input_target",
   "gitignore_allow",
+  "goal_verification_progress",
   "history_replay",
   "inference_failed",
   "inference_succeeded",
@@ -843,7 +869,22 @@ export const sessionMessagesResultSchema = z
   })
   .passthrough();
 export const historyPageResultSchema = z
-  .object({ session_id: uuidSchema, entries: z.array(historyEntrySchema), has_more: z.boolean() })
+  .object({
+    session_id: uuidSchema,
+    entries: z.array(historyEntrySchema),
+    has_more: z.boolean(),
+    oldest_seq: z.number().int().nullable().optional(),
+  })
+  .passthrough();
+export const subagentHistoryPageResultSchema = z
+  .object({
+    session_id: uuidSchema,
+    task_call_id: z.string(),
+    label: z.string(),
+    entries: z.array(historyEntrySchema),
+    has_more: z.boolean(),
+    oldest_seq: z.number().int().nullable().optional(),
+  })
   .passthrough();
 export const fsListResultSchema = z
   .object({ entries: z.array(fsEntrySchema), truncated: z.boolean() })
@@ -874,6 +915,7 @@ export type AckResult = z.infer<typeof ackResultSchema>;
 export type ListSessionsResult = z.infer<typeof listSessionsResultSchema>;
 export type SessionMessagesResult = z.infer<typeof sessionMessagesResultSchema>;
 export type HistoryPageResult = z.infer<typeof historyPageResultSchema>;
+export type SubagentHistoryPageResult = z.infer<typeof subagentHistoryPageResultSchema>;
 export type FsListResult = z.infer<typeof fsListResultSchema>;
 export type FsStatResult = z.infer<typeof fsStatResultSchema>;
 export type FsReadResult = z.infer<typeof fsReadResultSchema>;

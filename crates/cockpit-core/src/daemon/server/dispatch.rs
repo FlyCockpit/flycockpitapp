@@ -659,6 +659,39 @@ pub(super) async fn handle_serialized_request(
             })
         }
 
+        Request::ReadSubagentHistoryPage {
+            session_id,
+            task_call_id,
+            label,
+            before_seq,
+            limit,
+        } => {
+            let db = ctx.db.clone();
+            let query_task_call_id = task_call_id.clone();
+            let query_label = label.clone();
+            let page = db
+                .read(move |conn| {
+                    read_subagent_history_page_conn(
+                        conn,
+                        session_id,
+                        &query_task_call_id,
+                        &query_label,
+                        before_seq,
+                        limit,
+                    )
+                })
+                .await
+                .map_err(internal)?;
+            Ok(Response::SubagentHistoryPage {
+                session_id,
+                task_call_id,
+                label,
+                entries: page.entries,
+                has_more: page.has_more,
+                oldest_seq: page.oldest_seq,
+            })
+        }
+
         Request::SessionLiveStatus { session_ids } => {
             let mut visible_ids = Vec::new();
             for id in session_ids {
@@ -1470,6 +1503,38 @@ pub(super) async fn handle_concurrent_request(
                 oldest_seq: page.oldest_seq,
             })
         }
+        Request::ReadSubagentHistoryPage {
+            session_id,
+            task_call_id,
+            label,
+            before_seq,
+            limit,
+        } => {
+            let db = ctx.db.clone();
+            let query_task_call_id = task_call_id.clone();
+            let query_label = label.clone();
+            let page = db
+                .read(move |conn| {
+                    read_subagent_history_page_conn(
+                        conn,
+                        session_id,
+                        &query_task_call_id,
+                        &query_label,
+                        before_seq,
+                        limit,
+                    )
+                })
+                .await
+                .map_err(internal)?;
+            Ok(Response::SubagentHistoryPage {
+                session_id,
+                task_call_id,
+                label,
+                entries: page.entries,
+                has_more: page.has_more,
+                oldest_seq: page.oldest_seq,
+            })
+        }
         Request::SessionLiveStatus { session_ids } => {
             let mut visible_ids = Vec::new();
             for id in session_ids {
@@ -1959,6 +2024,24 @@ fn read_history_page_conn(
         conn,
         session_id,
         &root_agent,
+        before_seq,
+        limit,
+    )
+}
+
+fn read_subagent_history_page_conn(
+    conn: &rusqlite::Connection,
+    session_id: Uuid,
+    task_call_id: &str,
+    label: &str,
+    before_seq: Option<i64>,
+    limit: u32,
+) -> anyhow::Result<crate::engine::rehydrate::HistoryPage> {
+    crate::engine::rehydrate::subagent_history_page_before_conn(
+        conn,
+        session_id,
+        task_call_id,
+        label,
         before_seq,
         limit,
     )

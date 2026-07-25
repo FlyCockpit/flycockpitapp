@@ -342,6 +342,20 @@ pub(super) async fn authorize_read_history_page(
     authorize_session_reader_by_id(&state.principal, ctx, *session_id).await
 }
 
+pub(super) async fn authorize_read_subagent_history_page(
+    request: &Request,
+    state: &MutableClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let Request::ReadSubagentHistoryPage { session_id, .. } = request else {
+        unreachable!(
+            "authorize_read_subagent_history_page called for non-ReadSubagentHistoryPage request"
+        );
+    };
+
+    authorize_session_reader_by_id(&state.principal, ctx, *session_id).await
+}
+
 async fn authorize_session_reader_by_id(
     principal: &ClientPrincipal,
     ctx: &DaemonContext,
@@ -489,7 +503,8 @@ pub(super) async fn authorize_shared_custom(
         }
         Request::SubagentTranscript { session_id, .. }
         | Request::ReadSessionMessages { session_id, .. }
-        | Request::ReadHistoryPage { session_id, .. } => {
+        | Request::ReadHistoryPage { session_id, .. }
+        | Request::ReadSubagentHistoryPage { session_id, .. } => {
             match ctx.db.get_session(*session_id).await {
                 Ok(Some(row)) => match session_access_for_row(principal, &row) {
                     SessionAccess::Writer | SessionAccess::Readonly | SessionAccess::Owner => {

@@ -702,19 +702,56 @@ pub fn subagent_history_snapshot_conn(
         .map_err(|e| anyhow!("loading session events for subagent history snapshot: {e}"))?;
     let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
         .map_err(|e| anyhow!("loading tool calls for subagent history snapshot: {e}"))?;
+    let owned_events = events
+        .into_iter()
+        .filter(|ev| {
+            ev.task_call_id.as_deref() == Some(task_call_id) && ev.label.as_deref() == Some(label)
+        })
+        .collect::<Vec<_>>();
+    Ok(subagent_history_entries_from_events(
+        &owned_events,
+        &tool_calls,
+    ))
+}
 
+pub fn subagent_history_page_before_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    task_call_id: &str,
+    label: &str,
+    before_seq: Option<i64>,
+    limit: u32,
+) -> Result<HistoryPage> {
+    let page = Db::list_subagent_session_events_before_conn(
+        conn,
+        session_id,
+        task_call_id,
+        label,
+        before_seq,
+        limit,
+    )
+    .map_err(|e| anyhow!("loading session events for subagent history page: {e}"))?;
+    let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
+        .map_err(|e| anyhow!("loading tool calls for subagent history page: {e}"))?;
+    Ok(HistoryPage {
+        entries: subagent_history_entries_from_events(&page.events, &tool_calls),
+        has_more: page.has_more,
+        oldest_seq: page.oldest_seq,
+    })
+}
+
+fn subagent_history_entries_from_events(
+    events: &[SessionEventRow],
+    tool_calls: &[ToolCallEvent],
+) -> Vec<proto::HistoryEntry> {
     let mut tc_by_id: std::collections::HashMap<&str, &ToolCallEvent> =
         std::collections::HashMap::new();
-    for tc in &tool_calls {
+    for tc in tool_calls {
         tc_by_id.insert(tc.call_id.as_str(), tc);
     }
 
-    let owns_row = |ev: &SessionEventRow| {
-        ev.task_call_id.as_deref() == Some(task_call_id) && ev.label.as_deref() == Some(label)
-    };
-
     let mut snapshot: Vec<proto::HistoryEntry> = Vec::new();
-    for ev in events.iter().filter(|ev| owns_row(ev)) {
+    for ev in events {
         match ev.kind.as_str() {
             "user_message" => {
                 let text = ev
@@ -911,8 +948,7 @@ pub fn subagent_history_snapshot_conn(
             _ => {}
         }
     }
-
-    Ok(snapshot)
+    snapshot
 }
 
 fn inference_failure_summary(data: &serde_json::Value) -> String {
@@ -4700,6 +4736,71 @@ mod tests {
         assert_eq!(third.entries.len(), 1);
         assert!(
             matches!(&third.entries[0], proto::HistoryEntry::User { text, .. } if text == "one")
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_history_page_query_scopes_and_orders() {
+        let s = root_session();
+        let session_id = s.id;
+
+        async fn record_subagent_user(
+            s: &Session,
+            task_call_id: &'static str,
+            label: &'static str,
+            text: &'static str,
+        ) -> i64 {
+            s.db.insert_session_event_with_context(
+                s.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Explore"),
+                None,
+                crate::db::session_log::SessionEventContext {
+                    task_call_id: Some(task_call_id),
+                    label: Some(label),
+                    ..Default::default()
+                },
+                &json!({ "text": text }),
+            )
+            .await
+            .unwrap()
+        }
+
+        let _a1 = record_subagent_user(&s, "task-a", "default", "a1").await;
+        let _other_task = record_subagent_user(&s, "task-b", "default", "b1").await;
+        let _other_label = record_subagent_user(&s, "task-a", "alternate", "alt1").await;
+        let a2 = record_subagent_user(&s, "task-a", "default", "a2").await;
+        let _a3 = record_subagent_user(&s, "task-a", "default", "a3").await;
+
+        let first =
+            s.db.read(move |conn| {
+                subagent_history_page_before_conn(conn, session_id, "task-a", "default", None, 2)
+            })
+            .await
+            .unwrap();
+        assert!(first.has_more);
+        assert_eq!(first.oldest_seq, Some(a2));
+        assert_eq!(first.entries.len(), 2);
+        assert!(
+            matches!(&first.entries[0], proto::HistoryEntry::User { text, .. } if text == "a2")
+        );
+        assert!(
+            matches!(&first.entries[1], proto::HistoryEntry::User { text, .. } if text == "a3")
+        );
+
+        let before_seq = first.oldest_seq;
+        let second =
+            s.db.read(move |conn| {
+                subagent_history_page_before_conn(
+                    conn, session_id, "task-a", "default", before_seq, 2,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(!second.has_more);
+        assert_eq!(second.entries.len(), 1);
+        assert!(
+            matches!(&second.entries[0], proto::HistoryEntry::User { text, .. } if text == "a1")
         );
     }
 

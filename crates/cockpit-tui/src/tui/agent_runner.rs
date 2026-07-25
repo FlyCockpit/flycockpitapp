@@ -1659,6 +1659,40 @@ pub fn read_history_page_blocking(
     }
 }
 
+pub fn read_subagent_history_page_blocking(
+    socket: &Path,
+    session_id: uuid::Uuid,
+    task_call_id: String,
+    label: String,
+    before_seq: Option<i64>,
+    limit: u32,
+) -> Result<(Vec<proto::HistoryEntry>, bool, Option<i64>), String> {
+    match daemon_request_at_blocking(
+        socket,
+        Request::ReadSubagentHistoryPage {
+            session_id,
+            task_call_id: task_call_id.clone(),
+            label: label.clone(),
+            before_seq,
+            limit,
+        },
+    )? {
+        Response::SubagentHistoryPage {
+            session_id: got,
+            task_call_id: got_task_call_id,
+            label: got_label,
+            entries,
+            has_more,
+            oldest_seq,
+        } if got == session_id && got_task_call_id == task_call_id && got_label == label => {
+            Ok((entries, has_more, oldest_seq))
+        }
+        other => Err(format!(
+            "unexpected read_subagent_history_page response: {other:?}"
+        )),
+    }
+}
+
 pub fn resource_snapshot_blocking() -> Result<proto::Response, String> {
     match daemon_request_blocking(Request::ResourceSnapshot)? {
         response @ Response::ResourceSnapshot { .. } => Ok(response),

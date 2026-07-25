@@ -132,6 +132,16 @@ pub enum Response {
         oldest_seq: Option<i64>,
     },
 
+    SubagentHistoryPage {
+        session_id: Uuid,
+        task_call_id: String,
+        label: String,
+        entries: Vec<HistoryEntry>,
+        has_more: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oldest_seq: Option<i64>,
+    },
+
     /// A `/note` session-history note was recorded ([`Request::RecordSessionNote`]).
     /// `seq` is the assigned monotonic `session_events` sequence so the client
     /// can place the note row in the correct chronological position.
@@ -416,6 +426,7 @@ macro_rules! response_variants {
             (Response::Sessions { .. }, "sessions");
             (Response::SessionMessages { .. }, "session_messages");
             (Response::HistoryPage { .. }, "history_page");
+            (Response::SubagentHistoryPage { .. }, "subagent_history_page");
             (Response::NoteRecorded { .. }, "note_recorded");
             (Response::GoalStatus { .. }, "goal_status");
             (Response::GoalUpdated { .. }, "goal_updated");

@@ -277,9 +277,18 @@ impl App {
                     task_call_id,
                     label,
                     history,
+                    has_more,
+                    oldest_seq,
                 }) = result.payload
                 {
-                    self.apply_subagent_history_result(session_id, &task_call_id, &label, history);
+                    self.apply_subagent_history_result(
+                        session_id,
+                        &task_call_id,
+                        &label,
+                        history,
+                        has_more,
+                        oldest_seq,
+                    );
                 }
             }
             AsyncActionKind::Refresh("provider.usage") => match result.payload {
@@ -484,6 +493,40 @@ impl App {
                     session_id,
                     message: _,
                 }) => self.apply_older_history_page_error(request_id, session_id),
+                Ok(_) => {}
+                Err(_) => {}
+            },
+            AsyncActionKind::DaemonRpc("subagent.history.page") => match result.payload {
+                Ok(AsyncActionPayload::SubagentHistoryPage {
+                    request_id,
+                    session_id,
+                    task_call_id,
+                    label,
+                    entries,
+                    has_more,
+                    oldest_seq,
+                }) => {
+                    self.apply_subagent_history_page_result(
+                        request_id,
+                        session_id,
+                        (&task_call_id, &label),
+                        entries,
+                        has_more,
+                        oldest_seq,
+                    );
+                }
+                Ok(AsyncActionPayload::SubagentHistoryPageError {
+                    request_id,
+                    session_id,
+                    task_call_id,
+                    label,
+                    message: _,
+                }) => self.apply_subagent_history_page_error(
+                    request_id,
+                    session_id,
+                    &task_call_id,
+                    &label,
+                ),
                 Ok(_) => {}
                 Err(_) => {}
             },

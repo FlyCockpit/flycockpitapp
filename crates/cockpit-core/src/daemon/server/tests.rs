@@ -2400,6 +2400,7 @@ fn dispatch_matrix_class_for_command(
         | ("list_sessions", "public_read", false)
         | ("read_session_messages", "custom", false)
         | ("read_history_page", "custom", false)
+        | ("read_subagent_history_page", "custom", false)
         | ("session_live_status", "public_read", false)
         | ("goal_status", "session_row_reader", false)
         | ("list_skills", "project_read", false)
@@ -2438,6 +2439,7 @@ enum ReadonlyDispatchCaseKind {
     ListSessions,
     ReadSessionMessages,
     ReadHistoryPage,
+    ReadSubagentHistoryPage,
     SessionLiveStatus,
     GoalStatus,
     ListSkills,
@@ -2486,6 +2488,10 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
         ReadonlyDispatchCase {
             kind: "read_history_page",
             case: ReadonlyDispatchCaseKind::ReadHistoryPage,
+        },
+        ReadonlyDispatchCase {
+            kind: "read_subagent_history_page",
+            case: ReadonlyDispatchCaseKind::ReadSubagentHistoryPage,
         },
         ReadonlyDispatchCase {
             kind: "session_live_status",
@@ -3040,6 +3046,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "lsp_control"
         | "read_session_messages"
         | "read_history_page"
+        | "read_subagent_history_page"
         | "unarchive_session"
         | "fork_session"
         | "btw_create"
@@ -3161,6 +3168,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("resolve_interrupt"),
         authz_session_reader("read_session_messages"),
         authz_session_reader("read_history_page"),
+        authz_session_reader("read_subagent_history_page"),
         authz_session_writer("archive_session"),
         authz_session_writer("unarchive_session"),
         authz_session_writer("fork_session"),
@@ -4082,6 +4090,13 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             before_seq: None,
             limit: 20,
         },
+        "read_subagent_history_page" => Request::ReadSubagentHistoryPage {
+            session_id,
+            task_call_id: "task-1".into(),
+            label: "child".into(),
+            before_seq: None,
+            limit: 20,
+        },
         "archive_session" => Request::ArchiveSession {
             session_id,
             cascade: false,
@@ -4417,6 +4432,50 @@ impl ReadonlyDispatchCaseKind {
                     matches!(&entries[0], proto::HistoryEntry::User { seq: got, .. } if *got == seq)
                 );
             }
+            Self::ReadSubagentHistoryPage => {
+                let ctx = test_ctx();
+                let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+                let seq = ctx
+                    .db
+                    .insert_session_event(
+                        session.session_id,
+                        crate::db::session_log::SessionEventKind::UserMessage,
+                        Some("Build"),
+                        None,
+                        &serde_json::json!({"text": "hello"}),
+                    )
+                    .await
+                    .unwrap();
+                ctx.db
+                    .write(move |conn| {
+                        conn.execute(
+                            "UPDATE session_events SET task_call_id = ?1, label = ?2 WHERE seq = ?3",
+                            rusqlite::params!["task-1", "child", seq],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::ReadSubagentHistoryPage {
+                        session_id: session.session_id,
+                        task_call_id: "task-1".into(),
+                        label: "child".into(),
+                        before_seq: None,
+                        limit: 20,
+                    },
+                )
+                .await
+                .expect("read_subagent_history_page happy");
+                let Response::SubagentHistoryPage { entries, .. } = response else {
+                    panic!("expected SubagentHistoryPage");
+                };
+                assert_eq!(entries.len(), 1);
+                assert!(
+                    matches!(&entries[0], proto::HistoryEntry::User { seq: got, .. } if *got == seq)
+                );
+            }
             Self::SessionLiveStatus => {
                 let ctx = test_ctx();
                 let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -4672,6 +4731,36 @@ impl ReadonlyDispatchCaseKind {
                 } = response
                 else {
                     panic!("expected HistoryPage");
+                };
+                assert_eq!(session_id, unknown_session_id);
+                assert!(entries.is_empty());
+                assert!(!has_more);
+                assert_eq!(oldest_seq, None);
+            }
+            Self::ReadSubagentHistoryPage => {
+                let ctx = test_ctx();
+                let unknown_session_id = Uuid::new_v4();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::ReadSubagentHistoryPage {
+                        session_id: unknown_session_id,
+                        task_call_id: "task-1".into(),
+                        label: "child".into(),
+                        before_seq: None,
+                        limit: 20,
+                    },
+                )
+                .await
+                .expect("unknown subagent history page returns an empty typed page");
+                let Response::SubagentHistoryPage {
+                    session_id,
+                    entries,
+                    has_more,
+                    oldest_seq,
+                    ..
+                } = response
+                else {
+                    panic!("expected SubagentHistoryPage");
                 };
                 assert_eq!(session_id, unknown_session_id);
                 assert!(entries.is_empty());
@@ -7200,6 +7289,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_re
         "list_sessions",
         "list_skills",
         "read_history_page",
+        "read_subagent_history_page",
         "read_session_messages",
         "resource_snapshot",
         "session_live_status",
@@ -7324,6 +7414,19 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 limit: 20,
             },
             kind: "read_history_page",
+            session_id: Some(transcript_session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::ReadSubagentHistoryPage {
+                session_id: transcript_session_id,
+                task_call_id: "task-1".into(),
+                label: "child".into(),
+                before_seq: None,
+                limit: 20,
+            },
+            kind: "read_subagent_history_page",
             session_id: Some(transcript_session_id),
             audit_path: None,
             mutating: false,
@@ -8245,6 +8348,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ListSessions,
         ReadSessionMessages,
         ReadHistoryPage,
+        ReadSubagentHistoryPage,
         SessionLiveStatus,
         ArchiveSession,
         UnarchiveSession,

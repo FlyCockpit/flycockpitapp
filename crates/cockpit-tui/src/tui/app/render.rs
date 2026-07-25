@@ -5430,7 +5430,7 @@ mod slash_popup_full_list_tests {
 
 #[cfg(test)]
 mod render_history_spacing_tests {
-    use super::super::scrollback_page_in::{OlderHistoryMarker, PageRequest};
+    use super::super::scrollback_page_in::{OlderHistoryMarker, PageRequest, PageRequestScope};
     use super::{
         App, ChatCopyTarget, ChatRowKind, ChatRowMeta, ControlChip, HISTORY_RENDER_CACHE_MAX_ROWS,
         HistoryRenderCacheEntry, PinHit, ScrollAnchor, Selection, TranscriptFind,
@@ -5673,7 +5673,7 @@ mod render_history_spacing_tests {
         session_id: uuid::Uuid,
         history: Vec<HistoryEntry>,
     ) {
-        app.apply_subagent_history_result(session_id, "call-1", "default", history);
+        app.apply_subagent_history_result(session_id, "call-1", "default", history, false, None);
     }
 
     fn render_history_no_selection(app: &mut App, width: u16, height: u16) {
@@ -5817,6 +5817,8 @@ mod render_history_spacing_tests {
             "call-1",
             "default",
             vec![user("stale child row")],
+            false,
+            None,
         );
 
         assert!(
@@ -5885,15 +5887,15 @@ mod render_history_spacing_tests {
     fn subagent_view_caps_residency_to_window() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut app, session_id) = open_subagent_app(tmp.path(), running_subagent());
-        let snapshot = (0..(HISTORY_WINDOW_TARGET_ENTRIES as i64 + 5))
+        let page = (5..(HISTORY_WINDOW_TARGET_ENTRIES as i64 + 5))
             .map(sequenced_user)
             .collect();
 
-        apply_default_subagent_history(&mut app, session_id, snapshot);
+        app.apply_subagent_history_result(session_id, "call-1", "default", page, true, Some(5));
 
         assert_eq!(app.history.len(), HISTORY_WINDOW_TARGET_ENTRIES);
         assert!(app.history.has_older());
-        assert_eq!(app.history.older_cursor(), None);
+        assert_eq!(app.history.older_cursor(), Some(5));
         assert_eq!(history_text(&app.history[0]), "window row 5");
         assert_eq!(
             history_text(app.history.last().expect("resident tail")),
@@ -5905,22 +5907,22 @@ mod render_history_spacing_tests {
     fn subagent_view_shows_truncation_indicator_when_capped() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut app, session_id) = open_subagent_app(tmp.path(), docs_subagent());
-        let snapshot = (0..(HISTORY_WINDOW_TARGET_ENTRIES as i64 + 5))
+        let page = (5..(HISTORY_WINDOW_TARGET_ENTRIES as i64 + 5))
             .map(sequenced_user)
             .collect();
 
-        apply_default_subagent_history(&mut app, session_id, snapshot);
+        app.apply_subagent_history_result(session_id, "call-1", "default", page, true, Some(5));
 
         let notice = app
             .active_subagent_view()
             .and_then(|view| view.notice.as_deref())
             .expect("combined notice");
         assert!(notice.contains("read-only"));
-        assert!(notice.contains("/export"));
+        assert!(notice.contains("scroll up to load older messages"));
 
         let rows = visible_buffer_rows(&mut app, 140, 10).join("\n");
         assert!(rows.contains("read-only"));
-        assert!(rows.contains("/export"));
+        assert!(rows.contains("scroll up to load older messages"));
     }
 
     #[test]
@@ -7926,6 +7928,7 @@ mod render_history_spacing_tests {
         app.loading_older = Some(PageRequest {
             id: request_id,
             session_id,
+            scope: PageRequestScope::Main,
         });
     }
 
@@ -7939,6 +7942,33 @@ mod render_history_spacing_tests {
     ) {
         let entries = (start..end).map(sequenced_user).collect::<Vec<_>>();
         app.apply_older_history_page_result(request_id, session_id, entries, has_more, Some(start));
+    }
+
+    fn arm_subagent_page_request(app: &mut App, session_id: uuid::Uuid, request_id: u64) {
+        app.loading_older = Some(PageRequest {
+            id: request_id,
+            session_id,
+            scope: PageRequestScope::Subagent,
+        });
+    }
+
+    fn apply_subagent_page(
+        app: &mut App,
+        session_id: uuid::Uuid,
+        request_id: u64,
+        start: i64,
+        end: i64,
+        has_more: bool,
+    ) {
+        let entries = (start..end).map(sequenced_user).collect::<Vec<_>>();
+        app.apply_subagent_history_page_result(
+            request_id,
+            session_id,
+            ("call-1", "default"),
+            entries,
+            has_more,
+            Some(start),
+        );
     }
 
     #[test]
@@ -8154,6 +8184,88 @@ mod render_history_spacing_tests {
         let rows = buffer_rows(&render_history_buffer(&mut app, 120, 8), 120, 8).join("\n");
 
         assert!(rows.contains("searched loaded messages only"));
+    }
+
+    #[test]
+    fn subagent_page_in_open_fetches_one_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = open_subagent_app(tmp.path(), running_subagent());
+        let page = (401..=1000).map(sequenced_user).collect::<Vec<_>>();
+
+        app.apply_subagent_history_result(session_id, "call-1", "default", page, true, Some(401));
+
+        assert_eq!(app.history.len(), HISTORY_WINDOW_TARGET_ENTRIES);
+        assert!(app.history.has_older());
+        assert_eq!(app.history.older_cursor(), Some(401));
+        let notice = app
+            .active_subagent_view()
+            .and_then(|view| view.notice.as_deref())
+            .unwrap_or_default();
+        assert!(notice.contains("scroll up to load older messages"));
+        assert_eq!(history_text(&app.history[0]), "window row 401");
+    }
+
+    #[tokio::test]
+    async fn subagent_page_in_scroll_fetches_older_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = open_subagent_app(tmp.path(), running_subagent());
+        let page = (401..=1000).map(sequenced_user).collect::<Vec<_>>();
+        app.apply_subagent_history_result(session_id, "call-1", "default", page, true, Some(401));
+        app.startup_background.daemon_socket = Some(tmp.path().join("missing.sock"));
+        app.chat_pinned_to_tail = false;
+        app.chat_scroll_anchor = Some(ScrollAnchor {
+            entry: app.history.id_at(0).unwrap(),
+            entry_position: 0,
+            row_within_entry: 0,
+            screen_row: 0,
+        });
+
+        app.maybe_start_older_history_page_fetch();
+
+        let loading = app.loading_older.expect("subagent request starts");
+        assert_eq!(loading.session_id, session_id);
+        assert_eq!(loading.scope, PageRequestScope::Subagent);
+        assert!(app.async_actions.pending_kinds().contains(
+            &crate::tui::async_action::AsyncActionKind::DaemonRpc("subagent.history.page")
+        ));
+    }
+
+    #[test]
+    fn subagent_page_in_exhausts_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = open_subagent_app(tmp.path(), running_subagent());
+        let page = (401..=1000).map(sequenced_user).collect::<Vec<_>>();
+        app.apply_subagent_history_result(session_id, "call-1", "default", page, true, Some(401));
+        arm_subagent_page_request(&mut app, session_id, 1);
+
+        apply_subagent_page(&mut app, session_id, 1, 1, 401, false);
+
+        assert!(!app.history.has_older());
+        assert_eq!(app.loading_older, None);
+        assert_eq!(app.older_history_marker, OlderHistoryMarker::None);
+        let notice = app
+            .active_subagent_view()
+            .and_then(|view| view.notice.as_deref())
+            .unwrap_or_default();
+        assert!(!notice.contains("scroll up to load older messages"));
+        assert_eq!(history_text(&app.history[0]), "window row 1");
+    }
+
+    #[test]
+    fn subagent_page_in_stale_response_is_discarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = open_subagent_app(tmp.path(), running_subagent());
+        let page = (401..=1000).map(sequenced_user).collect::<Vec<_>>();
+        app.apply_subagent_history_result(session_id, "call-1", "default", page, true, Some(401));
+        let before_len = app.history.len();
+        let before_first = history_text(&app.history[0]).to_string();
+        arm_subagent_page_request(&mut app, session_id, 2);
+
+        apply_subagent_page(&mut app, session_id, 1, 1, 401, true);
+
+        assert_eq!(app.loading_older.expect("newer request remains").id, 2);
+        assert_eq!(app.history.len(), before_len);
+        assert_eq!(history_text(&app.history[0]), before_first);
     }
 
     #[test]

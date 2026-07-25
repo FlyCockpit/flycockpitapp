@@ -4,9 +4,16 @@ use super::*;
 pub(super) const HISTORY_PREFETCH_ROWS: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PageRequestScope {
+    Main,
+    Subagent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PageRequest {
     pub(super) id: u64,
     pub(super) session_id: uuid::Uuid,
+    pub(super) scope: PageRequestScope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -23,19 +30,28 @@ impl App {
     }
 
     pub(super) fn older_history_marker_text(&self) -> Option<String> {
-        if !matches!(self.transcript_view, TranscriptViewMeta::Main) {
-            return None;
-        }
+        let scope = self.active_page_request_scope()?;
         let dots = if self.use_emojis { "⋯" } else { "..." };
-        if self.loading_older.is_some() {
+        if self
+            .loading_older
+            .is_some_and(|loading| loading.scope == scope)
+        {
             return Some(format!("  {dots} loading earlier messages"));
         }
         match self.older_history_marker {
             OlderHistoryMarker::None => None,
-            OlderHistoryMarker::Failed => Some(format!(
-                "  {dots} couldn't load earlier messages - scroll again to retry"
-            )),
-            OlderHistoryMarker::Exhausted => Some(format!("  {dots} beginning of conversation")),
+            OlderHistoryMarker::Failed
+                if scope == PageRequestScope::Main || self.history.has_older() =>
+            {
+                Some(format!(
+                    "  {dots} couldn't load earlier messages - scroll again to retry"
+                ))
+            }
+            OlderHistoryMarker::Failed => None,
+            OlderHistoryMarker::Exhausted if scope == PageRequestScope::Main => {
+                Some(format!("  {dots} beginning of conversation"))
+            }
+            OlderHistoryMarker::Exhausted => None,
         }
     }
 
@@ -50,8 +66,10 @@ impl App {
     }
 
     pub(super) fn maybe_start_older_history_page_fetch(&mut self) {
-        if !matches!(self.transcript_view, TranscriptViewMeta::Main)
-            || !self.history.has_older()
+        let Some(scope) = self.active_page_request_scope() else {
+            return;
+        };
+        if !self.history.has_older()
             || self.loading_older.is_some()
             || !self.anchor_near_oldest_resident_entry()
         {
@@ -77,31 +95,84 @@ impl App {
         self.loading_older = Some(PageRequest {
             id: request_id,
             session_id,
+            scope,
         });
         self.older_history_marker = OlderHistoryMarker::None;
-        self.async_actions.start_blocking(
-            AsyncActionKind::DaemonRpc("history.page"),
-            AsyncActionPolicy::Dedupe(AsyncActionKey::new("history.page")),
-            move || match crate::tui::agent_runner::read_history_page_blocking(
-                &socket,
-                session_id,
-                Some(before_seq),
-                HISTORY_PAGE_ENTRIES as u32,
-            ) {
-                Ok((entries, has_more, oldest_seq)) => Ok(AsyncActionPayload::HistoryPage {
-                    request_id,
-                    session_id,
-                    entries: super::events::wire_history_to_entries(entries),
-                    has_more,
-                    oldest_seq,
-                }),
-                Err(message) => Ok(AsyncActionPayload::HistoryPageError {
-                    request_id,
-                    session_id,
-                    message,
-                }),
-            },
-        );
+        match scope {
+            PageRequestScope::Main => {
+                self.async_actions.start_blocking(
+                    AsyncActionKind::DaemonRpc("history.page"),
+                    AsyncActionPolicy::Dedupe(AsyncActionKey::new("history.page")),
+                    move || match crate::tui::agent_runner::read_history_page_blocking(
+                        &socket,
+                        session_id,
+                        Some(before_seq),
+                        HISTORY_PAGE_ENTRIES as u32,
+                    ) {
+                        Ok((entries, has_more, oldest_seq)) => {
+                            Ok(AsyncActionPayload::HistoryPage {
+                                request_id,
+                                session_id,
+                                entries: super::events::wire_history_to_entries(entries),
+                                has_more,
+                                oldest_seq,
+                            })
+                        }
+                        Err(message) => Ok(AsyncActionPayload::HistoryPageError {
+                            request_id,
+                            session_id,
+                            message,
+                        }),
+                    },
+                );
+            }
+            PageRequestScope::Subagent => {
+                let Some(view) = self.active_subagent_view().cloned() else {
+                    self.loading_older = None;
+                    return;
+                };
+                let task_call_id = view.task_call_id;
+                let label = view.label;
+                self.async_actions.start_blocking(
+                    AsyncActionKind::DaemonRpc("subagent.history.page"),
+                    AsyncActionPolicy::Dedupe(AsyncActionKey::new("subagent.history.page")),
+                    move || match crate::tui::agent_runner::read_subagent_history_page_blocking(
+                        &socket,
+                        session_id,
+                        task_call_id.clone(),
+                        label.clone(),
+                        Some(before_seq),
+                        HISTORY_PAGE_ENTRIES as u32,
+                    ) {
+                        Ok((entries, has_more, oldest_seq)) => {
+                            Ok(AsyncActionPayload::SubagentHistoryPage {
+                                request_id,
+                                session_id,
+                                task_call_id,
+                                label,
+                                entries: super::events::wire_history_to_entries(entries),
+                                has_more,
+                                oldest_seq,
+                            })
+                        }
+                        Err(message) => Ok(AsyncActionPayload::SubagentHistoryPageError {
+                            request_id,
+                            session_id,
+                            task_call_id,
+                            label,
+                            message,
+                        }),
+                    },
+                );
+            }
+        }
+    }
+
+    fn active_page_request_scope(&self) -> Option<PageRequestScope> {
+        match self.transcript_view {
+            TranscriptViewMeta::Main => Some(PageRequestScope::Main),
+            TranscriptViewMeta::Subagent(_) => Some(PageRequestScope::Subagent),
+        }
     }
 
     fn anchor_near_oldest_resident_entry(&mut self) -> bool {
@@ -135,7 +206,10 @@ impl App {
         let Some(loading) = self.loading_older else {
             return;
         };
-        if loading.id != request_id || loading.session_id != session_id {
+        if loading.id != request_id
+            || loading.session_id != session_id
+            || loading.scope != PageRequestScope::Main
+        {
             return;
         }
         if self.current_session_id() != Some(session_id) {
@@ -156,7 +230,10 @@ impl App {
         let Some(loading) = self.loading_older else {
             return;
         };
-        if loading.id != request_id || loading.session_id != session_id {
+        if loading.id != request_id
+            || loading.session_id != session_id
+            || loading.scope != PageRequestScope::Main
+        {
             return;
         }
         if self.current_session_id() != Some(session_id) {

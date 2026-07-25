@@ -54,18 +54,15 @@ impl<'a> IntoIterator for &'a HistoryWindow {
 }
 
 impl HistoryWindow {
-    pub(super) fn from_capped_newest(entries: Vec<HistoryEntry>, cap: usize) -> Self {
-        let len = entries.len();
-        if len <= cap {
-            return entries.into();
-        }
-
-        let skip = len.saturating_sub(cap);
-        let kept: Vec<_> = entries.into_iter().skip(skip).collect();
+    pub(super) fn from_history_page(
+        entries: Vec<HistoryEntry>,
+        older_cursor: Option<i64>,
+        has_older: bool,
+    ) -> Self {
         Self {
-            log: kept.into(),
-            older_cursor: None,
-            has_older: true,
+            log: entries.into(),
+            older_cursor,
+            has_older,
         }
     }
 
@@ -163,7 +160,8 @@ impl HistoryWindow {
         let Some(current_cursor) = self.older_cursor else {
             return false;
         };
-        let Some(newest_page_cursor) = entries.iter().rev().find_map(entry_cursor) else {
+        let Some(newest_page_cursor) = entries.iter().rev().find_map(entry_cursor).or(older_cursor)
+        else {
             return false;
         };
         if newest_page_cursor >= current_cursor {

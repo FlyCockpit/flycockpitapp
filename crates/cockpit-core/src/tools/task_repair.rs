@@ -100,8 +100,10 @@ const DELEGATE_KEYS: &[&str] = &[
     "prompt",
     "mode",
     "model",
+    "context",
     "why",
     "resume_handle",
+    "cwd",
     "grant_tools",
     "todo_ids",
 ];

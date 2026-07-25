@@ -50,6 +50,78 @@ async fn record_task_unknown_agent_rejection(session: &Arc<Session>, agent: &Age
     }
 }
 
+async fn fork_context_refusal(
+    session: &Arc<Session>,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    parent: &Agent,
+    child: &str,
+    prompt: &str,
+    model: &Option<crate::engine::model_roles::DelegationModelSelector>,
+    noninteractive: bool,
+) -> Option<String> {
+    if !crate::engine::tool::Capability::ForkContext.enabled(parent.llm_mode) {
+        return Some(
+            "Error: task context `fork` is only available in frontier LLM mode".to_string(),
+        );
+    }
+    if child != parent.name {
+        return Some(format!(
+            "Error: task context `fork` must target the delegating agent `{}`; got `{child}`",
+            parent.name
+        ));
+    }
+    if model.is_some() {
+        return Some(
+            "Error: task context `fork` cannot specify `model`; omit `model` so the fork keeps the parent model".to_string(),
+        );
+    }
+    if !noninteractive {
+        return Some("Error: task context `fork` must resolve noninteractively; use mode `subagent` or omit interactive routing".to_string());
+    }
+    if prompt_has_redundant_seed_tag(prompt) {
+        return Some(
+            "Error: task context `fork` already inherits the parent transcript; remove @file/@dir/ and /skill seed tags from the steering prompt".to_string(),
+        );
+    }
+    match crate::agents::resolve_with_assistant_db(&session.project_root, child, &session.db).await
+    {
+        Ok(Some(def)) if def.fork_eligible => None,
+        Ok(Some(_)) => Some(format!(
+            "Error: agent `{child}` is not fork eligible; set `forkEligible: true` in its agent frontmatter to allow `task.context=\"fork\"`"
+        )),
+        Ok(None) => {
+            let reachable = crate::engine::builtin::reachable_subagent_names(
+                &parent.name,
+                config,
+                &session.project_root,
+                &session.db,
+            )
+            .await;
+            if reachable.is_empty() {
+                Some(format!(
+                    "Error: unknown agent `{child}`, and no subagents are reachable from `{}`",
+                    parent.name
+                ))
+            } else {
+                Some(format!(
+                    "Error: unknown agent `{child}`. Reachable agents from `{}`: {}",
+                    parent.name,
+                    reachable.join(", ")
+                ))
+            }
+        }
+        Err(err) => Some(format!(
+            "Error: failed to load fork agent `{child}`: {err:#}"
+        )),
+    }
+}
+
+fn prompt_has_redundant_seed_tag(prompt: &str) -> bool {
+    prompt
+        .split_whitespace()
+        .any(|token| token.starts_with('@') || token.starts_with("/skill"))
+}
+
 pub(crate) async fn phase_10_dispatch_one_call(
     agent: &Agent,
     session: &Arc<Session>,
@@ -200,6 +272,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             "`batch[]` entries require `agent` and non-empty `prompt`",
                         ));
                     }
+                    let context = TaskContext::from_value(item.get("context"));
                     let label = item
                         .get("label")
                         .and_then(Value::as_str)
@@ -233,7 +306,8 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
-                    if cwd.is_none()
+                    if context == TaskContext::Fresh
+                        && cwd.is_none()
                         && let Some(message) = crate::engine::builtin::unknown_agent_rejection(
                             &session.project_root,
                             config,
@@ -278,6 +352,18 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    if context == TaskContext::Fork
+                        && let Some(err) = fork_context_refusal(
+                            session, config, agent, child, prompt, &model, true,
+                        )
+                        .await
+                    {
+                        return_structural!(task_refusal(
+                            &tc.id,
+                            tc.call_id.clone(),
+                            format!("batch entry `{label}`: {err}"),
+                        ));
+                    }
                     let remaining_depth = match task_remaining_depth(item) {
                         Ok(depth) => depth,
                         Err(err) => {
@@ -302,6 +388,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         remaining_depth,
                         resume_handle,
                         cwd,
+                        context,
                         granted_tools: task_string_array(item, "grant_tools"),
                         todo_ids: task_todo_ids(item),
                         output_dir,
@@ -350,7 +437,9 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
-                if cwd.is_none()
+                let context = TaskContext::from_value(args.get("context"));
+                if context == TaskContext::Fresh
+                    && cwd.is_none()
                     && let Some(message) = crate::engine::builtin::unknown_agent_rejection(
                         &session.project_root,
                         config,
@@ -377,6 +466,20 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     }
                 };
                 let noninteractive = resolve_interactivity(mode, &child, resume_handle.is_some());
+                if context == TaskContext::Fork
+                    && let Some(err) = fork_context_refusal(
+                        session,
+                        config,
+                        agent,
+                        &child,
+                        &prompt,
+                        &model,
+                        noninteractive,
+                    )
+                    .await
+                {
+                    return_structural!(task_refusal(&tc.id, tc.call_id.clone(), err));
+                }
                 let remaining_depth = match task_remaining_depth(&args) {
                     Ok(depth) => depth,
                     Err(err) => {
@@ -466,6 +569,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     why,
                     resume_handle,
                     cwd,
+                    context,
                     granted_tools,
                     todo_ids,
                     repair_notes,

@@ -165,6 +165,7 @@ fn def_with_normal(
         scan_tool_results: Some(super::default_scan_tool_results(name, mode)),
         goal_verification: super::GoalSettingsOverride::default(),
         permission: None,
+        fork_eligible: false,
         prompt: defensive,
         prompt_variants,
         // Embedded defaults have no on-disk source.
@@ -627,6 +628,14 @@ mod tests {
                 .name,
             "Careful"
         );
+    }
+
+    #[test]
+    fn no_builtin_agent_is_fork_eligible_by_default() {
+        for name in BUILTIN_AGENT_NAMES {
+            let def = embedded_default(name).expect("builtin agent definition");
+            assert!(!def.fork_eligible, "{name} must opt out by default");
+        }
     }
 
     #[test]

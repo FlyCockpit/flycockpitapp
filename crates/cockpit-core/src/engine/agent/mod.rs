@@ -67,7 +67,7 @@ pub(crate) use tool_timeout::dispatch_arc_with_default_timeout;
 use backup::*;
 use gate::*;
 use loop_guard::*;
-use outcome::*;
+pub use outcome::*;
 use text_recovery::*;
 
 /// One built-in or user-defined agent.

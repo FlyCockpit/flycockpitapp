@@ -99,6 +99,10 @@ pub struct AgentDef {
     pub goal_verification: GoalSettingsOverride,
     #[serde(default)]
     pub permission: Option<serde_json::Value>,
+    /// Opt-in guard for `task.context="fork"`. False by default so embedded
+    /// and user-authored agents do not inherit fork eligibility accidentally.
+    #[serde(rename = "forkEligible", default)]
+    pub fork_eligible: bool,
     /// Body of the markdown file (the agent's system prompt). Resolved
     /// through [`AgentDef::resolved_prompt`] / [`AgentDef::resolved_prompt_for`]
     /// rather than read directly so the per-`llm_mode` body variant threads
@@ -664,6 +668,9 @@ impl AgentDef {
         if let Some(perm) = &self.permission {
             fm.insert("permission".into(), serde_yaml::to_value(perm)?);
         }
+        if self.fork_eligible {
+            fm.insert("forkEligible".into(), true.into());
+        }
         let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(fm))?;
         let body = self.prompt.trim_end_matches('\n');
         Ok(format!("---\n{yaml}---\n\n{body}\n"))
@@ -727,6 +734,8 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         goal_verification: GoalSettingsOverride,
         #[serde(default)]
         permission: Option<serde_json::Value>,
+        #[serde(rename = "forkEligible", default)]
+        fork_eligible: bool,
     }
 
     if fm_raw.trim().is_empty() {
@@ -760,6 +769,7 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         scan_tool_results: fm.scan_tool_results,
         goal_verification: fm.goal_verification,
         permission: fm.permission,
+        fork_eligible: fm.fork_eligible,
         // Trim the blank line(s) the frontmatter fence leaves before the
         // body and any trailing newline, so the stored prompt matches the
         // embedded-default form (the composer re-adds a single newline).

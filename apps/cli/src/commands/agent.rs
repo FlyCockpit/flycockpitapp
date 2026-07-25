@@ -61,6 +61,7 @@ fn create(
         scan_tool_results: None,
         goal_verification: cockpit_core::agents::GoalSettingsOverride::default(),
         permission: None,
+        fork_eligible: false,
         prompt: format!("You are the `{name}` Cockpit agent."),
         prompt_variants: std::collections::HashMap::new(),
         source: path.clone(),

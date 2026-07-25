@@ -529,6 +529,7 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
     pub(in crate::engine::driver) why: String,
     pub(in crate::engine::driver) resume_handle: Option<String>,
     pub(in crate::engine::driver) child_cwd: ChildCwd,
+    pub(in crate::engine::driver) context: crate::engine::agent::TaskContext,
     pub(in crate::engine::driver) granted_tools: Vec<String>,
     pub(in crate::engine::driver) todo_ids: Vec<uuid::Uuid>,
     pub(in crate::engine::driver) child_recursion:
@@ -698,6 +699,39 @@ impl Driver {
         Ok((history, delegation_payload_reference_prompt(&row)))
     }
 
+    pub(in crate::engine::driver) async fn current_message_fork_point(&self) -> Option<String> {
+        match self.session.db.list_session_events(self.session.id).await {
+            Ok(events) => events
+                .into_iter()
+                .rev()
+                .find(|event| matches!(event.kind.as_str(), "user_message" | "assistant_message"))
+                .map(|event| event.seq.to_string()),
+            Err(e) => {
+                tracing::warn!(error = %e, "load current message fork point failed");
+                None
+            }
+        }
+    }
+
+    pub(in crate::engine::driver) async fn prepare_fork_task_context(
+        &self,
+    ) -> Result<(Arc<Session>, Vec<Message>)> {
+        let history = self
+            .stack
+            .last()
+            .expect("stack never empty")
+            .history
+            .clone();
+        let fork_point = self.current_message_fork_point().await;
+        let session = crate::session::Session::create_fork(
+            self.session.db.clone(),
+            self.session.id,
+            fork_point,
+        )
+        .context("creating forked task session")?;
+        Ok((Arc::new(session), history))
+    }
+
     pub(in crate::engine::driver) async fn run_single_noninteractive_task_backgroundable(
         &mut self,
         mut task: SingleNoninteractiveTask,
@@ -713,6 +747,7 @@ impl Driver {
             "model": model_selector_json(&task.model),
             "why": &task.why,
             "resume_handle": &task.resume_handle,
+            "context": task.context.as_str(),
             "requested_cwd": task.child_cwd.requested_json(),
             "resolved_cwd": &resolved_cwd_display,
             "todo_ids": &task.todo_ids,
@@ -753,7 +788,11 @@ impl Driver {
             )
             .await
         {
-            Ok(row) => task.brief = delegation_payload_reference_prompt(&row),
+            Ok(row) => {
+                if task.context == crate::engine::agent::TaskContext::Fresh {
+                    task.brief = delegation_payload_reference_prompt(&row);
+                }
+            }
             Err(e) => {
                 tracing::warn!(error = %e, task_call_id, "persist single task delegation job and payload failed");
                 return Ok(Message::tool_result_with_call_id(
@@ -871,6 +910,7 @@ impl Driver {
             why,
             resume_handle,
             child_cwd,
+            context,
             granted_tools,
             todo_ids,
             child_recursion,
@@ -913,27 +953,38 @@ impl Driver {
             });
         }
 
-        let (delegation_payload_history, delivered_brief) = match self
-            .delegation_payload_delivery(&task_call_id, "default", &brief, child_agent != "docs")
-            .await
+        let (delegation_payload_history, delivered_brief) = if context
+            == crate::engine::agent::TaskContext::Fork
         {
-            Ok(delivery) => delivery,
-            Err(e) => {
-                tracing::warn!(error = %e, task_call_id, "task delegation payload delivery failed");
-                return Ok(SingleNoninteractiveCompletion {
-                    child_agent,
-                    task_call_id,
-                    task_function_call_id,
-                    report: DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                    failed: true,
-                    failure: None,
-                    partial_progress: DelegationPartialProgress::default(),
-                    new_handle: None,
-                    snapshot: NoninteractiveDelegationSnapshot::empty(),
-                    shrink: None,
-                    repair_notes,
-                    child_routing: None,
-                });
+            (Vec::new(), brief.clone())
+        } else {
+            match self
+                .delegation_payload_delivery(
+                    &task_call_id,
+                    "default",
+                    &brief,
+                    child_agent != "docs",
+                )
+                .await
+            {
+                Ok(delivery) => delivery,
+                Err(e) => {
+                    tracing::warn!(error = %e, task_call_id, "task delegation payload delivery failed");
+                    return Ok(SingleNoninteractiveCompletion {
+                        child_agent,
+                        task_call_id,
+                        task_function_call_id,
+                        report: DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                        failed: true,
+                        failure: None,
+                        partial_progress: DelegationPartialProgress::default(),
+                        new_handle: None,
+                        snapshot: NoninteractiveDelegationSnapshot::empty(),
+                        shrink: None,
+                        repair_notes,
+                        child_routing: None,
+                    });
+                }
             }
         };
 
@@ -988,6 +1039,7 @@ impl Driver {
                     "trusted_only": self.stack.last().unwrap().agent.model.trusted_only_enabled(),
                     "model_trusted": self.stack.last().unwrap().agent.model.is_trusted(),
                     "routing": routing,
+                    "context": context.as_str(),
                     "remaining_depth": remaining_depth,
                     "resume_handle": resume_handle.clone(),
                     "requested_cwd": child_cwd.requested_json(),
@@ -1011,7 +1063,40 @@ impl Driver {
 
         let llm_mode = self.stack[0].agent.llm_mode;
         let followup_enabled = crate::engine::tool::Capability::FollowupSeed.enabled(llm_mode);
-        let composed_brief = compose_subagent_brief(&delivered_brief, &why);
+        let mut child_session = self.session.clone();
+        let mut fork_prior_history = Vec::new();
+        if context == crate::engine::agent::TaskContext::Fork {
+            match self.prepare_fork_task_context().await {
+                Ok((session, history)) => {
+                    child_session = session;
+                    fork_prior_history = history;
+                }
+                Err(e) => {
+                    return Ok(SingleNoninteractiveCompletion {
+                        child_agent,
+                        task_call_id,
+                        task_function_call_id,
+                        report: format!("Error: failed to create forked task session: {e:#}"),
+                        failed: true,
+                        failure: None,
+                        partial_progress: DelegationPartialProgress::default(),
+                        new_handle: None,
+                        snapshot: NoninteractiveDelegationSnapshot::empty(),
+                        shrink: Some(PendingDelegationShrink {
+                            tracker,
+                            handle: shrink_handle,
+                        }),
+                        repair_notes,
+                        child_routing: None,
+                    });
+                }
+            }
+        }
+        let composed_brief = if context == crate::engine::agent::TaskContext::Fork {
+            delivered_brief.clone()
+        } else {
+            compose_subagent_brief(&delivered_brief, &why)
+        };
         let mut new_handle: Option<String> = None;
         let mut snapshot = NoninteractiveDelegationSnapshot::empty();
         let composed_brief = self
@@ -1151,9 +1236,15 @@ impl Driver {
                             tracing::warn!(error = %e, "record followup reuse event failed");
                         }
                     }
-                    let mut prior_history = prior_history;
+                    let mut prior_history = if context == crate::engine::agent::TaskContext::Fork {
+                        fork_prior_history.clone()
+                    } else {
+                        prior_history
+                    };
                     let mut delivery_history = delegation_payload_history.clone();
-                    if !delivery_history.is_empty() {
+                    if context != crate::engine::agent::TaskContext::Fork
+                        && !delivery_history.is_empty()
+                    {
                         delivery_history.append(&mut prior_history);
                         prior_history = delivery_history;
                     }
@@ -1161,7 +1252,7 @@ impl Driver {
                         child,
                         composed_brief.clone(),
                         prior_history,
-                        self.session.clone(),
+                        child_session.clone(),
                         self.locks.clone(),
                         self.redact.clone(),
                         child_cwd.resolved.clone(),
@@ -2295,6 +2386,7 @@ impl Driver {
                 "label": &entry.label,
                 "child_agent": &entry.child_agent,
                 "model": model_selector_json(&entry.model),
+                "context": entry.context.as_str(),
                 "resume_handle": &entry.resume_handle,
                 "requested_cwd": child_cwd.requested_json(),
                 "resolved_cwd": child_cwd.resolved_display(),
@@ -2338,7 +2430,9 @@ impl Driver {
         {
             Ok(rows) => {
                 for (entry, row) in task.entries.iter_mut().zip(rows.iter()) {
-                    entry.prompt = delegation_payload_reference_prompt(row);
+                    if entry.context == crate::engine::agent::TaskContext::Fresh {
+                        entry.prompt = delegation_payload_reference_prompt(row);
+                    }
                 }
             }
             Err(e) => {
@@ -2549,35 +2643,40 @@ impl Driver {
             let entry_why = why.clone();
             let entry_task_call_id = task_call_id.clone();
             let parent = self.stack.last().unwrap().agent.name.clone();
-            let (delegation_payload_history, delivered_prompt) = match self
-                .delegation_payload_delivery(
-                    &task_call_id,
-                    &entry.label,
-                    &entry.prompt,
-                    entry.child_agent != "docs",
-                )
-                .await
-            {
-                Ok(delivery) => delivery,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        task_call_id,
-                        label = %entry.label,
-                        "batch task delegation payload delivery failed"
-                    );
-                    children.push(BatchChildCompletion {
-                        idx,
-                        label: entry.label,
-                        child_agent: entry.child_agent,
-                        report: DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                        failed: true,
-                        partial_progress: DelegationPartialProgress::default(),
-                        snapshot: NoninteractiveDelegationSnapshot::empty(),
-                    });
-                    continue;
-                }
-            };
+            let (delegation_payload_history, delivered_prompt) =
+                if entry.context == crate::engine::agent::TaskContext::Fork {
+                    (Vec::new(), entry.prompt.clone())
+                } else {
+                    match self
+                        .delegation_payload_delivery(
+                            &task_call_id,
+                            &entry.label,
+                            &entry.prompt,
+                            entry.child_agent != "docs",
+                        )
+                        .await
+                    {
+                        Ok(delivery) => delivery,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                task_call_id,
+                                label = %entry.label,
+                                "batch task delegation payload delivery failed"
+                            );
+                            children.push(BatchChildCompletion {
+                                idx,
+                                label: entry.label,
+                                child_agent: entry.child_agent,
+                                report: DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                                failed: true,
+                                partial_progress: DelegationPartialProgress::default(),
+                                snapshot: NoninteractiveDelegationSnapshot::empty(),
+                            });
+                            continue;
+                        }
+                    }
+                };
             entry.prompt = delivered_prompt;
             let routing = self
                 .stack
@@ -2628,6 +2727,7 @@ impl Driver {
                     "trusted_only": self.stack.last().unwrap().agent.model.trusted_only_enabled(),
                     "model_trusted": self.stack.last().unwrap().agent.model.is_trusted(),
                     "routing": routing,
+                    "context": entry.context.as_str(),
                     "remaining_depth": entry.remaining_depth,
                     "resume_handle": entry.resume_handle.clone(),
                     "requested_cwd": child_cwd.requested_json(),
@@ -2722,7 +2822,30 @@ impl Driver {
                                 &child_routing,
                             )
                             .await;
-                        let mut brief = compose_subagent_brief(&entry.prompt, &entry_why);
+                        let mut child_session = driver.session.clone();
+                        let mut prior_history = delegation_payload_history;
+                        let mut brief = if entry.context == crate::engine::agent::TaskContext::Fork
+                        {
+                            match driver.prepare_fork_task_context().await {
+                                Ok((session, history)) => {
+                                    child_session = session;
+                                    prior_history = history;
+                                    entry.prompt.clone()
+                                }
+                                Err(e) => {
+                                    return (
+                                        idx,
+                                        entry,
+                                        DelegationChildOutcome::failed(format!(
+                                            "Error: failed to create forked task session: {e:#}"
+                                        )),
+                                        snapshot,
+                                    );
+                                }
+                            }
+                        } else {
+                            compose_subagent_brief(&entry.prompt, &entry_why)
+                        };
                         if let Some(output_dir) = &entry.output_dir {
                             brief = format!(
                                 "{brief}\n\nWrite constraint: keep all file writes under `{output_dir}`."
@@ -2742,12 +2865,11 @@ impl Driver {
                             child.llm_mode,
                             &entry.child_agent,
                         );
-                        let prior_history = delegation_payload_history;
                         match run_noninteractive_resumable(
                             child,
                             brief,
                             prior_history,
-                            driver.session.clone(),
+                            child_session,
                             driver.locks.clone(),
                             driver.redact.clone(),
                             child_cwd.resolved.clone(),

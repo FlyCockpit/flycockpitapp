@@ -152,6 +152,10 @@ impl TaskTool {
                     "enum": ["subagent", "subagent_interactive"]
                 },
                 "model": model_selector_schema.clone(),
+                "context": {
+                    "type": "string",
+                    "enum": ["fresh", "fork"]
+                },
                 "why": {
                     "type": "string"
                 },
@@ -192,6 +196,10 @@ impl TaskTool {
                     "description": "Brief"
                 },
                 "model": model_selector_schema.clone(),
+                "context": {
+                    "type": "string",
+                    "enum": ["fresh", "fork"]
+                },
                 "resume_handle": {
                     "type": "string"
                 },
@@ -241,6 +249,7 @@ impl TaskTool {
                 "prompt": delegate_payload["properties"]["prompt"].clone(),
                 "mode": delegate_payload["properties"]["mode"].clone(),
                 "model": delegate_payload["properties"]["model"].clone(),
+                "context": delegate_payload["properties"]["context"].clone(),
                 "why": delegate_payload["properties"]["why"].clone(),
                 "resume_handle": delegate_payload["properties"]["resume_handle"].clone(),
                 "cwd": delegate_payload["properties"]["cwd"].clone(),
@@ -329,7 +338,7 @@ mod tests {
     /// reserializes the cached tool prefix (cache safety). They are optional
     /// (not in `required`).
     #[test]
-    fn schema_carries_followup_fields_in_both_modes_and_optional() {
+    fn task_schema_carries_context_enum_in_both_modes() {
         let tool = TaskTool::with_subagents(&["explore", "builder"]);
         assert!(
             tool.description()
@@ -392,6 +401,29 @@ mod tests {
                 "agent description should mention docs: {agent_desc}"
             );
             assert!(payload_props.contains_key("why"), "missing `why`: {schema}");
+            let context = payload_props.get("context").expect("missing context");
+            assert_eq!(context["type"], "string");
+            let context_enum = context["enum"].as_array().unwrap();
+            assert!(context_enum.iter().any(|value| value == "fresh"));
+            assert!(context_enum.iter().any(|value| value == "fork"));
+            assert!(
+                !payload_props["context"]
+                    .get("default")
+                    .is_some_and(|value| value == "fork"),
+                "fork must not be the schema default: {schema}"
+            );
+            assert!(
+                !payload["items"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == "context"),
+                "batch context must be optional: {schema}"
+            );
+            assert!(
+                payload["items"]["properties"].get("context").is_some(),
+                "batch entry schema carries context: {schema}"
+            );
             assert!(
                 payload_props.contains_key("resume_handle"),
                 "missing `resume_handle`: {schema}"

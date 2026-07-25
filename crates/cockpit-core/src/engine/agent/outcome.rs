@@ -1,5 +1,27 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskContext {
+    Fresh,
+    Fork,
+}
+
+impl TaskContext {
+    pub fn from_value(value: Option<&Value>) -> Self {
+        match value.and_then(Value::as_str).map(str::trim) {
+            Some("fork") => Self::Fork,
+            _ => Self::Fresh,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Fork => "fork",
+        }
+    }
+}
+
 /// Outcome of one [`turn`] call. The driver loops on the result.
 #[derive(Debug)]
 pub enum TurnOutcome {
@@ -55,6 +77,9 @@ pub enum TurnOutcome {
         /// Optional working directory for a noninteractive child. Parsed here
         /// and resolved/validated by the driver before spawn.
         cwd: Option<String>,
+        /// Whether the child starts with a fresh context or a forked copy of
+        /// the delegating parent's transcript.
+        context: TaskContext,
         /// Per-delegation tool grants (`task.grant_tools`, prompt
         /// `parent-granted-tools.md`): extra tools the parent attached to this
         /// one delegation. The driver validates them against the target's role
@@ -164,6 +189,7 @@ pub struct BatchTaskEntry {
     pub remaining_depth: Option<u32>,
     pub resume_handle: Option<String>,
     pub cwd: Option<String>,
+    pub context: TaskContext,
     pub granted_tools: Vec<String>,
     pub todo_ids: Vec<uuid::Uuid>,
     pub output_dir: Option<String>,

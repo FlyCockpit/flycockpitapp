@@ -67,6 +67,24 @@ You are a reviewer. Be terse.\n";
 }
 
 #[test]
+fn agent_def_parses_fork_eligible_frontmatter() {
+    let text = r#"---
+description: Forkable agent.
+mode: subagent
+forkEligible: true
+---
+
+Body.
+"#;
+
+    let def = parse_agent(text, "forker", "forker.md".into()).unwrap();
+
+    assert!(def.fork_eligible);
+    let md = def.to_markdown().unwrap();
+    assert!(md.contains("forkEligible: true"));
+}
+
+#[test]
 fn parse_agent_defaults_mode_to_all() {
     let text = "---\ndescription: x\n---\nbody\n";
     let def = parse_agent(text, "a", "a.md".into()).unwrap();
@@ -228,6 +246,7 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         scan_tool_results: None,
         goal_verification: GoalSettingsOverride::default(),
         permission: None,
+        fork_eligible: false,
         prompt: "body".into(),
         prompt_variants: std::collections::HashMap::new(),
         source: "x.md".into(),

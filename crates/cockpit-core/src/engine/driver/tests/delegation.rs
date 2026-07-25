@@ -47,6 +47,255 @@ fn outcome_tool_result_text(outcome: crate::engine::agent::TurnOutcome) -> Strin
     }
 }
 
+fn write_test_agent(root: &std::path::Path, name: &str, fork_eligible: bool) {
+    let dir = root.join(".cockpit").join("agents");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{name}.md")),
+        format!(
+            "---\ndescription: Test agent.\nmode: subagent\nforkEligible: {fork_eligible}\ntools: []\n---\n\nTest prompt.\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn set_active_agent_name_and_mode(
+    driver: &mut Driver,
+    name: &str,
+    mode: crate::config::extended::LlmMode,
+) {
+    let mut agent = (*driver.stack[0].agent).clone();
+    agent.name = name.to_string();
+    agent.llm_mode = mode;
+    driver.stack[0].agent = std::sync::Arc::new(agent);
+}
+
+fn fork_delegate_args(agent: &str, prompt: &str) -> serde_json::Value {
+    serde_json::json!({
+        "intent": "delegate",
+        "payload": {
+            "agent": agent,
+            "prompt": prompt,
+            "mode": "subagent",
+            "context": "fork"
+        }
+    })
+}
+
+async fn fork_refusal_text(driver: &Driver, args: serde_json::Value) -> String {
+    outcome_tool_result_text(dispatch_task_args(driver, args).await)
+}
+
+#[tokio::test]
+async fn fork_rejected_when_child_differs_from_parent() {
+    let (mut driver, tmp) = test_driver_without_network(8);
+    write_test_agent(tmp.path(), "forker", true);
+    set_active_agent_name_and_mode(
+        &mut driver,
+        "forker",
+        crate::config::extended::LlmMode::Frontier,
+    );
+
+    let body = fork_refusal_text(&driver, fork_delegate_args("explore", "look")).await;
+
+    assert!(
+        body.contains("must target the delegating agent `forker`"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn fork_rejected_with_explicit_model_selector() {
+    let (mut driver, tmp) = test_driver_without_network(8);
+    write_test_agent(tmp.path(), "forker", true);
+    set_active_agent_name_and_mode(
+        &mut driver,
+        "forker",
+        crate::config::extended::LlmMode::Frontier,
+    );
+    let mut args = fork_delegate_args("forker", "look");
+    args["payload"]["model"] = serde_json::json!({
+        "kind": "exact",
+        "selector": "lmstudio:local"
+    });
+
+    let body = fork_refusal_text(&driver, args).await;
+
+    assert!(body.contains("cannot specify `model`"), "{body}");
+}
+
+#[tokio::test]
+async fn fork_rejected_for_non_fork_eligible_agent() {
+    let (mut driver, tmp) = test_driver_without_network(8);
+    write_test_agent(tmp.path(), "forker", false);
+    set_active_agent_name_and_mode(
+        &mut driver,
+        "forker",
+        crate::config::extended::LlmMode::Frontier,
+    );
+
+    let body = fork_refusal_text(&driver, fork_delegate_args("forker", "look")).await;
+
+    assert!(body.contains("is not fork eligible"), "{body}");
+}
+
+#[tokio::test]
+async fn fork_rejected_in_non_frontier_mode() {
+    let (mut driver, tmp) = test_driver_without_network(8);
+    write_test_agent(tmp.path(), "forker", true);
+    set_active_agent_name_and_mode(
+        &mut driver,
+        "forker",
+        crate::config::extended::LlmMode::Normal,
+    );
+
+    let body = fork_refusal_text(&driver, fork_delegate_args("forker", "look")).await;
+
+    assert!(body.contains("only available in frontier"), "{body}");
+}
+
+#[tokio::test]
+async fn fork_rejected_for_interactive_delegation() {
+    let (mut driver, tmp) = test_driver_without_network(8);
+    write_test_agent(tmp.path(), "forker", true);
+    set_active_agent_name_and_mode(
+        &mut driver,
+        "forker",
+        crate::config::extended::LlmMode::Frontier,
+    );
+    let mut args = fork_delegate_args("forker", "look");
+    args["payload"]["mode"] = serde_json::json!("subagent_interactive");
+
+    let body = fork_refusal_text(&driver, args).await;
+
+    assert!(body.contains("must resolve noninteractively"), "{body}");
+}
+
+#[tokio::test]
+async fn fork_rejected_with_redundant_seed_tags() {
+    let (mut driver, tmp) = test_driver_without_network(8);
+    write_test_agent(tmp.path(), "forker", true);
+    set_active_agent_name_and_mode(
+        &mut driver,
+        "forker",
+        crate::config::extended::LlmMode::Frontier,
+    );
+
+    let body = fork_refusal_text(&driver, fork_delegate_args("forker", "read @src/lib.rs")).await;
+
+    assert!(body.contains("remove @file/@dir/ and /skill"), "{body}");
+}
+
+#[tokio::test]
+async fn valid_fork_dispatch_spawns_noninteractive_same_agent() {
+    let (mut driver, tmp) = test_driver_without_network(8);
+    write_test_agent(tmp.path(), "forker", true);
+    set_active_agent_name_and_mode(
+        &mut driver,
+        "forker",
+        crate::config::extended::LlmMode::Frontier,
+    );
+
+    match dispatch_task_args(&driver, fork_delegate_args("forker", "steer")).await {
+        crate::engine::agent::TurnOutcome::SpawnNoninteractive {
+            child_agent,
+            context,
+            model,
+            ..
+        } => {
+            assert_eq!(child_agent, "forker");
+            assert_eq!(context, crate::engine::agent::TaskContext::Fork);
+            assert!(model.is_none());
+        }
+        other => panic!("expected forked noninteractive spawn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn unknown_context_value_defaults_to_fresh() {
+    let (driver, _tmp) = test_driver_without_network(8);
+    let outcome = dispatch_task_args(
+        &driver,
+        serde_json::json!({
+            "intent": "delegate",
+            "payload": {
+                "agent": "explore",
+                "prompt": "look",
+                "mode": "subagent",
+                "context": "mystery"
+            }
+        }),
+    )
+    .await;
+
+    match outcome {
+        crate::engine::agent::TurnOutcome::SpawnNoninteractive { context, .. } => {
+            assert_eq!(context, crate::engine::agent::TaskContext::Fresh);
+        }
+        other => panic!("expected fresh noninteractive spawn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fork_child_seeds_from_parent_transcript() {
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    driver.stack[0].history = vec![
+        Message::user("parent asks"),
+        Message::assistant("parent answers"),
+    ];
+
+    let (_fork_session, history) = driver.prepare_fork_task_context().await.unwrap();
+
+    assert_eq!(history.len(), 2);
+    assert!(format!("{history:?}").contains("parent asks"));
+    assert!(format!("{history:?}").contains("parent answers"));
+}
+
+#[tokio::test]
+async fn fork_child_snapshot_independent_of_parent_drift() {
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    driver.stack[0].history = vec![Message::user("stable parent")];
+
+    let (_fork_session, history) = driver.prepare_fork_task_context().await.unwrap();
+    driver.stack[0].history.push(Message::user("late drift"));
+
+    assert_eq!(history.len(), 1);
+    assert!(format!("{history:?}").contains("stable parent"));
+    assert!(!format!("{history:?}").contains("late drift"));
+}
+
+#[tokio::test]
+async fn fork_of_empty_parent_yields_steering_only() {
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    driver.stack[0].history.clear();
+
+    let (_fork_session, mut history) = driver.prepare_fork_task_context().await.unwrap();
+    history.push(Message::user("steer only"));
+
+    assert_eq!(history.len(), 1);
+    assert!(format!("{history:?}").contains("steer only"));
+}
+
+#[tokio::test]
+async fn fork_child_records_fork_ceiling() {
+    let (driver, _tmp) = test_driver_without_network(8);
+    let seq = driver
+        .session
+        .record_event(
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "persisted parent"}),
+        )
+        .await
+        .unwrap();
+
+    let (fork_session, _history) = driver.prepare_fork_task_context().await.unwrap();
+
+    assert_eq!(fork_session.parent_session_id, Some(driver.session.id));
+    assert_eq!(fork_session.fork_point_turn_id, Some(seq.to_string()));
+}
+
 #[tokio::test]
 async fn task_delegate_unknown_agent_refuses_with_reachable_list() {
     let (driver, _tmp) = test_driver(8);
@@ -238,6 +487,7 @@ async fn resolved_cwd_unknown_agent_refuses_before_load() {
             requested: Some("child".to_string()),
             resolved: child_dir,
         },
+        context: crate::engine::agent::TaskContext::Fresh,
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),

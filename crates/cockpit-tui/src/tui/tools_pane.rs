@@ -347,6 +347,7 @@ mod tests {
             scan_tool_results: None,
             goal_verification: cockpit_core::agents::GoalSettingsOverride::default(),
             permission: None,
+            fork_eligible: false,
             prompt: "body".to_string(),
             prompt_variants: std::collections::HashMap::new(),
             source: tmp.path().join("Build.md"),

@@ -412,6 +412,7 @@ mod grant_tests {
             scan_tool_results: None,
             goal_verification: crate::agents::GoalSettingsOverride::default(),
             permission: None,
+            fork_eligible: false,
             prompt: "body".to_string(),
             prompt_variants: std::collections::HashMap::new(),
             source: std::path::PathBuf::new(),

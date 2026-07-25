@@ -1041,6 +1041,9 @@ pub enum Capability {
     /// Explicit sandbox escalation reruns. Available only to stronger modes;
     /// defensive mode gets the separate human-offer path instead.
     SandboxEscalate,
+    /// Forking the delegating agent's transcript into a noninteractive child.
+    /// Available only to frontier mode.
+    ForkContext,
 }
 
 impl Capability {
@@ -1055,6 +1058,7 @@ impl Capability {
             Capability::FollowupSeed | Capability::SandboxEscalate => {
                 matches!(mode, LlmMode::Normal | LlmMode::Frontier)
             }
+            Capability::ForkContext => matches!(mode, LlmMode::Frontier),
         }
     }
 }
@@ -1351,6 +1355,13 @@ mod capability_tests {
         assert!(Capability::FollowupSeed.enabled(LlmMode::Normal));
         assert!(Capability::FollowupSeed.enabled(LlmMode::Frontier));
         assert!(!Capability::FollowupSeed.enabled(LlmMode::Defensive));
+    }
+
+    #[test]
+    fn fork_context_capability_is_frontier_only() {
+        assert!(!Capability::ForkContext.enabled(LlmMode::Normal));
+        assert!(Capability::ForkContext.enabled(LlmMode::Frontier));
+        assert!(!Capability::ForkContext.enabled(LlmMode::Defensive));
     }
 
     struct RequirementTool {

@@ -1084,6 +1084,8 @@ pub struct PendingRenderState {
     source_len: usize,
     commit_byte: usize,
     committed_lines: Vec<Rc<Line<'static>>>,
+    committed_display_key: Option<(usize, u16)>,
+    committed_display: Vec<Rc<Line<'static>>>,
     rendered_lines: Vec<Line<'static>>,
 }
 
@@ -1091,20 +1093,66 @@ impl PendingRenderState {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+
+    pub fn commit_byte(&self) -> usize {
+        self.commit_byte
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PendingRender {
+    pub committed: Vec<Rc<Line<'static>>>,
+    pub tail: Vec<Line<'static>>,
+}
+
+impl PendingRender {
+    pub fn into_lines(self) -> Vec<Line<'static>> {
+        self.committed
+            .into_iter()
+            .map(|line| line.as_ref().clone())
+            .chain(self.tail)
+            .collect()
+    }
+
+    pub fn lines(&self) -> Vec<Line<'static>> {
+        self.committed
+            .iter()
+            .map(|line| line.as_ref().clone())
+            .chain(self.tail.iter().cloned())
+            .collect()
+    }
+}
+
+impl IntoIterator for PendingRender {
+    type Item = Line<'static>;
+    type IntoIter = std::vec::IntoIter<Line<'static>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_lines().into_iter()
+    }
+}
+
+impl PartialEq<Vec<Line<'static>>> for PendingRender {
+    fn eq(&self, other: &Vec<Line<'static>>) -> bool {
+        self.lines() == *other
+    }
 }
 
 pub fn render_pending_incremental(
     msg: &PendingMsg,
     width: u16,
     state: &mut PendingRenderState,
-) -> Vec<Line<'static>> {
+) -> PendingRender {
     if msg.text.trim().is_empty() {
         state.reset();
-        return Vec::new();
+        return PendingRender::default();
     }
     if !msg.reasoning.trim().is_empty() {
         state.reset();
-        return render_pending(msg, width);
+        return PendingRender {
+            committed: Vec::new(),
+            tail: render_pending(msg, width),
+        };
     }
 
     let body_width = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
@@ -1115,7 +1163,10 @@ pub fn render_pending_incremental(
     }
 
     if state.source_len == msg.text.len() && !state.rendered_lines.is_empty() {
-        return state.rendered_lines.clone();
+        return PendingRender {
+            committed: state.committed_display.clone(),
+            tail: state.rendered_lines.clone(),
+        };
     }
 
     let new_commit = stable_pending_commit_byte(&msg.text);
@@ -1138,24 +1189,46 @@ pub fn render_pending_incremental(
             );
         }
         state.commit_byte = new_commit;
+        state.committed_display_key = None;
     }
 
     let tail = &msg.text[state.commit_byte..];
-    let mut markdown_lines: Vec<Line<'static>> = state
-        .committed_lines
-        .iter()
-        .map(|line| line.as_ref().clone())
-        .collect();
+    if state.committed_display_key != Some((state.commit_byte, width)) {
+        let markdown_lines: Vec<Line<'static>> = state
+            .committed_lines
+            .iter()
+            .map(|line| line.as_ref().clone())
+            .collect();
+        state.committed_display = if markdown_lines.is_empty() {
+            Vec::new()
+        } else {
+            render_pending_markdown_lines(markdown_lines, msg.timestamp, width)
+                .into_iter()
+                .map(Rc::new)
+                .collect()
+        };
+        state.committed_display_key = Some((state.commit_byte, width));
+    }
+
+    let mut tail_markdown_lines: Vec<Line<'static>> = Vec::new();
     if !tail.trim().is_empty() {
-        if state.commit_byte > 0 && !markdown_lines.is_empty() {
-            markdown_lines.push(Line::default());
+        if state.commit_byte > 0 && !state.committed_display.is_empty() {
+            tail_markdown_lines.push(Line::default());
         }
-        markdown_lines.extend(markdown::render_with_width(tail, body_width));
+        tail_markdown_lines.extend(markdown::render_with_width(tail, body_width));
     }
 
     state.source_len = msg.text.len();
-    state.rendered_lines = render_pending_markdown_lines(markdown_lines, msg.timestamp, width);
-    state.rendered_lines.clone()
+    state.rendered_lines = render_pending_tail_lines(
+        tail_markdown_lines,
+        msg.timestamp,
+        width,
+        state.committed_display.is_empty(),
+    );
+    PendingRender {
+        committed: state.committed_display.clone(),
+        tail: state.rendered_lines.clone(),
+    }
 }
 
 fn stable_pending_commit_byte(text: &str) -> usize {
@@ -1266,6 +1339,31 @@ fn render_pending_markdown_lines(
     out.push(render_first_line_with_pin_and_timestamp(first.spans, timestamp, width, None).0);
     out.extend(iter.map(|(line, _)| line));
     out
+}
+
+fn render_pending_tail_lines(
+    markdown_lines: Vec<Line<'static>>,
+    timestamp: DateTime<Local>,
+    width: u16,
+    include_header: bool,
+) -> Vec<Line<'static>> {
+    if include_header {
+        return render_pending_markdown_lines(markdown_lines, timestamp, width);
+    }
+    if markdown_lines.is_empty() {
+        return Vec::new();
+    }
+    let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
+    layout_markdown_message_lines(
+        markdown_lines,
+        body_content_w,
+        0,
+        AGENT_INDENT,
+        Style::default(),
+    )
+    .lines
+    .into_iter()
+    .collect()
 }
 
 /// Render an in-flight pending message: the agent's text as it streams

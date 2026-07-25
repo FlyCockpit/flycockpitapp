@@ -28,7 +28,7 @@ use crate::tui::composer::{
 };
 use crate::tui::geometry::{INPUT_BORDER, MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneGeometry};
 use crate::tui::history::{
-    AGENT_INDENT, HistoryEntry, Rendered, ToolCallState, agent_display_label,
+    AGENT_INDENT, HistoryEntry, PendingRender, Rendered, ToolCallState, agent_display_label,
     format_status_elapsed, render_entry, render_pending_incremental, thinking_dots_padded,
 };
 use crate::tui::theme::{
@@ -66,6 +66,7 @@ thread_local! {
     static GEOMETRY_RECOMPUTED_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FIND_LINES_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FINGERPRINT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PENDING_WRAP_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -92,6 +93,11 @@ pub(crate) fn reset_find_lines_rebuild_count() {
 #[cfg(test)]
 pub(crate) fn reset_fingerprint_call_count() {
     FINGERPRINT_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_pending_wrap_row_count() {
+    PENDING_WRAP_ROWS.with(|rows| rows.set(0));
 }
 
 #[cfg(test)]
@@ -125,6 +131,11 @@ pub(crate) fn fingerprint_call_count() -> usize {
 }
 
 #[cfg(test)]
+pub(crate) fn pending_wrap_row_count() -> usize {
+    PENDING_WRAP_ROWS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
 fn record_materialized_row() {
     MATERIALIZED_ROWS.with(|rows| rows.set(rows.get() + 1));
 }
@@ -147,6 +158,14 @@ fn record_find_lines_rebuild() {
 
 #[cfg(not(test))]
 fn record_find_lines_rebuild() {}
+
+#[cfg(test)]
+fn record_pending_wrap_row() {
+    PENDING_WRAP_ROWS.with(|rows| rows.set(rows.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_pending_wrap_row() {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ChatGeometry {
@@ -2582,14 +2601,14 @@ impl App {
             let cache = self
                 .pending_render_cache
                 .get_or_insert_with(Default::default);
-            let pending_lines = render_pending_incremental(pending, area.width, &mut cache.state);
-            append_uncached_prewrapped_rows(
+            let pending_render = render_pending_incremental(pending, area.width, &mut cache.state);
+            append_pending_render_rows(
+                cache,
+                pending_render,
+                area.width,
                 &mut tail_rows,
                 &mut tail_meta,
                 &mut tail_find_lines,
-                pending_lines,
-                ChatRowMeta::other(),
-                area.width as usize,
             );
         } else {
             self.pending_render_cache = None;
@@ -4171,6 +4190,41 @@ fn append_uncached_prewrapped_rows(
     find_lines.extend(visual_find);
 }
 
+fn append_pending_render_rows(
+    cache: &mut super::PendingRenderCacheEntry,
+    pending_render: PendingRender,
+    width: u16,
+    tail_rows: &mut Vec<Rc<Line<'static>>>,
+    tail_meta: &mut Vec<ChatRowMeta>,
+    tail_find_lines: &mut Vec<String>,
+) {
+    let committed_key = (cache.state.commit_byte(), width);
+    if cache.committed_visual_key != Some(committed_key) {
+        let mut committed_visual = Vec::new();
+        for line in pending_render.committed.iter() {
+            record_pending_wrap_row();
+            for (visual, _, _) in wrap_line_to_visual_rows(line.as_ref().clone(), width as usize) {
+                committed_visual.push(Rc::new(visual));
+            }
+        }
+        cache.committed_visual = committed_visual;
+        cache.committed_visual_key = Some(committed_key);
+    }
+    for line in &cache.committed_visual {
+        tail_find_lines.push(rendered_line_text(line.as_ref()).to_lowercase());
+        tail_rows.push(Rc::clone(line));
+        tail_meta.push(ChatRowMeta::other());
+    }
+    append_uncached_prewrapped_rows(
+        tail_rows,
+        tail_meta,
+        tail_find_lines,
+        pending_render.tail,
+        ChatRowMeta::other(),
+        width as usize,
+    );
+}
+
 fn prewrap_rows_impl<I>(
     lines: I,
     row_meta: &[ChatRowMeta],
@@ -5372,17 +5426,17 @@ mod render_history_spacing_tests {
     use super::{
         App, ChatCopyTarget, ChatRowKind, ChatRowMeta, ControlChip, HISTORY_RENDER_CACHE_MAX_ROWS,
         HistoryRenderCacheEntry, PinHit, ScrollAnchor, Selection, TranscriptFind,
-        affordance_target_for_row, chat_visible_top, extract_selection_plaintext,
-        find_lines_rebuild_count, fingerprint_call_count, geometry_recompute_count,
-        history_entry_render_fingerprint, materialized_row_count, pin_hit_for_visual_row,
-        prewrap_call_count, prewrap_entry_rows, prewrap_row_count, rendered_line_text,
-        reset_find_lines_rebuild_count, reset_fingerprint_call_count,
-        reset_geometry_recompute_count, reset_materialized_row_count, reset_prewrap_counters,
-        wrap_line_to_visual_rows,
+        affordance_target_for_row, append_pending_render_rows, chat_visible_top,
+        extract_selection_plaintext, find_lines_rebuild_count, fingerprint_call_count,
+        geometry_recompute_count, history_entry_render_fingerprint, materialized_row_count,
+        pending_wrap_row_count, pin_hit_for_visual_row, prewrap_call_count, prewrap_entry_rows,
+        prewrap_row_count, rendered_line_text, reset_find_lines_rebuild_count,
+        reset_fingerprint_call_count, reset_geometry_recompute_count, reset_materialized_row_count,
+        reset_pending_wrap_row_count, reset_prewrap_counters, wrap_line_to_visual_rows,
     };
     use crate::tui::app::{
         AffordanceTarget, HISTORY_PAGE_ENTRIES, HISTORY_WINDOW_TARGET_ENTRIES, HistoryEntryId,
-        HistoryLog, SandboxDownNotice, SideConversation,
+        HistoryLog, PendingRenderCacheEntry, SandboxDownNotice, SideConversation,
     };
     use crate::tui::composer::VimMode;
     use crate::tui::history::{
@@ -7003,6 +7057,185 @@ mod render_history_spacing_tests {
         reset_markdown_counters();
         render_history_no_selection(&mut app, 81, 8);
         assert!(markdown_render_call_count() > 0);
+    }
+
+    fn pending_msg(text: String, reasoning: &str) -> PendingMsg {
+        PendingMsg {
+            name: "Build".to_string(),
+            text,
+            reasoning: reasoning.to_string(),
+            timestamp: chrono::Local::now(),
+            started_at: std::time::Instant::now(),
+            text_started_at: Some(std::time::Instant::now()),
+            inside_think: false,
+            body_started: true,
+            tag_partial: String::new(),
+            seq: None,
+            strip_think: true,
+        }
+    }
+
+    fn full_pending_visual_rows(msg: &PendingMsg, width: u16) -> Vec<Line<'static>> {
+        render_pending(msg, width)
+            .into_iter()
+            .flat_map(|line| {
+                wrap_line_to_visual_rows(line, width as usize)
+                    .into_iter()
+                    .map(|(line, _, _)| line)
+            })
+            .collect()
+    }
+
+    fn memoized_pending_visual_rows(
+        msg: &PendingMsg,
+        width: u16,
+        cache: &mut PendingRenderCacheEntry,
+    ) -> (Vec<Line<'static>>, usize, usize) {
+        let pending_render = render_pending_incremental(msg, width, &mut cache.state);
+        let commit_byte = cache.state.commit_byte();
+        let committed_display_lines = pending_render.committed.len();
+        let mut rows = Vec::new();
+        let mut meta = Vec::new();
+        let mut find_lines = Vec::new();
+        append_pending_render_rows(
+            cache,
+            pending_render,
+            width,
+            &mut rows,
+            &mut meta,
+            &mut find_lines,
+        );
+        (
+            rows.into_iter().map(|line| line.as_ref().clone()).collect(),
+            commit_byte,
+            committed_display_lines,
+        )
+    }
+
+    #[test]
+    fn pending_wrap_matches_full_wrap_per_chunk() {
+        let doc = format!(
+            "{}\n\n```rust\n{}",
+            (0..28)
+                .map(|idx| {
+                    format!(
+                        "prefix paragraph {idx} has **bold** terms, `code`, and enough prose to wrap.\n\n"
+                    )
+                })
+                .collect::<String>(),
+            (0..90)
+                .map(|idx| format!("let value_{idx} = compute({idx});\n"))
+                .collect::<String>()
+        );
+        let mut msg = pending_msg(String::new(), "");
+        let mut cache = PendingRenderCacheEntry::default();
+
+        for chunk in doc.as_bytes().chunks(53) {
+            msg.text.push_str(std::str::from_utf8(chunk).unwrap());
+            let (memoized, _, _) = memoized_pending_visual_rows(&msg, 84, &mut cache);
+            let full = full_pending_visual_rows(&msg, 84);
+            assert_eq!(memoized, full, "visual rows diverged after {:?}", msg.text);
+        }
+    }
+
+    #[test]
+    fn pending_wrap_reasoning_falls_back_to_full_render() {
+        let msg = pending_msg(
+            "answer with **markdown** and a wrapped line that should still match".to_string(),
+            "private reasoning",
+        );
+        let mut cache = PendingRenderCacheEntry::default();
+
+        let (memoized, _, committed_display_lines) =
+            memoized_pending_visual_rows(&msg, 72, &mut cache);
+
+        assert_eq!(memoized, full_pending_visual_rows(&msg, 72));
+        assert_eq!(committed_display_lines, 0);
+        assert!(cache.committed_visual.is_empty());
+    }
+
+    #[test]
+    fn pending_wrap_open_fence_does_not_rewrap_committed_prefix() {
+        let prefix = (0..400)
+            .map(|idx| format!("prefix paragraph {idx} is stable before the streamed fence.\n\n"))
+            .collect::<String>();
+        let mut msg = pending_msg(prefix, "");
+        let mut cache = PendingRenderCacheEntry::default();
+        let (memoized, _, _) = memoized_pending_visual_rows(&msg, 88, &mut cache);
+        assert_eq!(memoized, full_pending_visual_rows(&msg, 88));
+        assert!(!cache.committed_visual.is_empty());
+
+        msg.text.push_str("```rust\n");
+        let (memoized, _, _) = memoized_pending_visual_rows(&msg, 88, &mut cache);
+        assert_eq!(memoized, full_pending_visual_rows(&msg, 88));
+
+        reset_pending_wrap_row_count();
+        for chunk in (0..80)
+            .map(|idx| format!("let streamed_{idx} = call({idx});\n"))
+            .collect::<String>()
+            .as_bytes()
+            .chunks(53)
+        {
+            msg.text.push_str(std::str::from_utf8(chunk).unwrap());
+            let (memoized, _, _) = memoized_pending_visual_rows(&msg, 88, &mut cache);
+            assert_eq!(memoized, full_pending_visual_rows(&msg, 88));
+        }
+
+        assert_eq!(pending_wrap_row_count(), 0);
+    }
+
+    #[test]
+    fn pending_wrap_recomputes_committed_once_per_commit_advance() {
+        let doc = (0..36)
+            .map(|idx| {
+                format!(
+                    "paragraph {idx} has **bold** text and enough words to wrap in the transcript pane.\n\n"
+                )
+            })
+            .collect::<String>();
+        let mut msg = pending_msg(String::new(), "");
+        let mut cache = PendingRenderCacheEntry::default();
+        let mut last_commit = 0usize;
+        let mut committed_display_line_bound = 0usize;
+
+        reset_pending_wrap_row_count();
+        for chunk in doc.as_bytes().chunks(53) {
+            msg.text.push_str(std::str::from_utf8(chunk).unwrap());
+            let (memoized, commit_byte, committed_display_lines) =
+                memoized_pending_visual_rows(&msg, 76, &mut cache);
+            assert_eq!(memoized, full_pending_visual_rows(&msg, 76));
+            if commit_byte != last_commit {
+                committed_display_line_bound += committed_display_lines;
+                last_commit = commit_byte;
+            }
+        }
+
+        let wrapped = pending_wrap_row_count();
+        assert!(wrapped > 0);
+        assert!(
+            wrapped <= committed_display_line_bound,
+            "wrapped {wrapped} committed display lines, bound {committed_display_line_bound}"
+        );
+    }
+
+    #[test]
+    fn pending_wrap_invalidates_on_width_change() {
+        let msg = pending_msg(
+            (0..24)
+                .map(|idx| format!("paragraph {idx} has enough stable prose to wrap.\n\n"))
+                .collect(),
+            "",
+        );
+        let mut cache = PendingRenderCacheEntry::default();
+        let (memoized, _, _) = memoized_pending_visual_rows(&msg, 72, &mut cache);
+        assert_eq!(memoized, full_pending_visual_rows(&msg, 72));
+        assert!(!cache.committed_visual.is_empty());
+
+        reset_pending_wrap_row_count();
+        let (memoized, _, _) = memoized_pending_visual_rows(&msg, 96, &mut cache);
+
+        assert_eq!(memoized, full_pending_visual_rows(&msg, 96));
+        assert!(pending_wrap_row_count() > 0);
     }
 
     #[test]

@@ -2584,6 +2584,8 @@ pub(super) struct PrewrappedEntry {
 #[derive(Clone, Default)]
 pub(super) struct PendingRenderCacheEntry {
     pub(super) state: crate::tui::history::PendingRenderState,
+    pub(super) committed_visual: Vec<Rc<Line<'static>>>,
+    pub(super) committed_visual_key: Option<(usize, u16)>,
 }
 
 #[derive(Debug, Clone, Default)]

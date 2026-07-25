@@ -128,6 +128,14 @@ pub async fn check_native_access(
         return Ok(effective);
     }
 
+    if ctx
+        .review_cage
+        .as_ref()
+        .is_some_and(|cage| cage.preauthorizes_package_path(&effective))
+    {
+        return Ok(effective);
+    }
+
     let Some(approver) = ctx.approver.as_ref() else {
         return Err(invalid_input(format!(
             "`{}` is outside the session boundary and cannot be approved in this context",
@@ -589,6 +597,37 @@ mod tests {
         check_native_access(&ctx, &target, SandboxPathAccess::Read)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_cage_native_access_uses_preauthorized_skill_package_root() {
+        let cwd = tempfile::tempdir().unwrap();
+        let skills = tempfile::tempdir().unwrap();
+        let package = skills.path().join("reviewed");
+        std::fs::create_dir_all(&package).unwrap();
+        let mut ctx = crate::tools::common::test_ctx(cwd.path());
+        ctx.review_cage = Some(
+            crate::engine::tool::ReviewCage::skills_review_with_package_roots([package.clone()]),
+        );
+
+        let checked = check_native_access(
+            &ctx,
+            &package.join("references/new.md"),
+            SandboxPathAccess::ReadWrite,
+        )
+        .await
+        .unwrap();
+        assert!(checked.starts_with(&package));
+
+        let err = check_native_access(
+            &ctx,
+            &skills.path().join("other/SKILL.md"),
+            SandboxPathAccess::ReadWrite,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("outside the session boundary"), "{err}");
     }
 
     #[tokio::test]

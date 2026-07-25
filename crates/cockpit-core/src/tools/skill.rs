@@ -95,7 +95,14 @@ impl Tool for SkillTool {
         )
         .await?;
         if let Some(cage) = &ctx.review_cage {
-            cage.record_skill_view(name);
+            let skills =
+                crate::skills::discover_for_session(&ctx.cwd, &extended.skills, &activation)
+                    .unwrap_or_default();
+            if let Some(skill) = crate::skills::find_model_invocable_by_name(&skills, name) {
+                cage.record_skill_package_view(name, crate::skills::package_root(skill));
+            } else {
+                cage.record_skill_view(name);
+            }
         }
         Ok(output)
     }

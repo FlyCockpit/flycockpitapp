@@ -132,6 +132,15 @@ impl Tool for WriteTool {
             &normalized,
         )
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
+        if let Some(validation) = &skill_validation
+            && let Some(cage) = &ctx.review_cage
+            && !cage.skill_package_was_viewed(&validation.package_root)
+        {
+            return Err(crate::engine::tool::invalid_input(format!(
+                "background skill review must load `{}` with `skill` before writing its package files",
+                validation.name
+            )));
+        }
 
         let outcome = if exists {
             write_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?
@@ -635,6 +644,49 @@ mod tests {
             out.contains("[skill] validated note (manifest); catalog refreshed"),
             "{out}"
         );
+    }
+
+    #[tokio::test]
+    async fn caged_skill_write_requires_prior_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package = write_skill_package(
+            tmp.path(),
+            "view-first",
+            &skill_manifest("view-first", "old", "Body"),
+        );
+        let mut ctx = skill_test_ctx(tmp.path());
+        ctx.review_cage = Some(
+            crate::engine::tool::ReviewCage::skills_review_with_package_roots([package.clone()]),
+        );
+        let support = package.join("references").join("guide.md");
+
+        let err = write(&support, "reviewed", &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must load `view-first`"), "{err}");
+        assert!(!support.exists());
+
+        crate::tools::skill::SkillTool
+            .call(serde_json::json!({"name": "view-first"}), &ctx)
+            .await
+            .unwrap();
+        let out = write(&support, "reviewed", &ctx).await.unwrap();
+        assert!(out.contains("[skill] validated view-first"), "{out}");
+        assert_eq!(std::fs::read_to_string(support).unwrap(), "reviewed");
+    }
+
+    #[tokio::test]
+    async fn uncaged_skill_write_does_not_require_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package =
+            write_skill_package(tmp.path(), "plain", &skill_manifest("plain", "old", "Body"));
+        let ctx = skill_test_ctx(tmp.path());
+        let support = package.join("references").join("guide.md");
+
+        write(&support, "foreground", &ctx).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(support).unwrap(), "foreground");
     }
 
     #[tokio::test]

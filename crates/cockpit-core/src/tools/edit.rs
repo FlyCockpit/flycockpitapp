@@ -179,6 +179,15 @@ impl Tool for EditTool {
             &normalized,
         )
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
+        if let Some(validation) = &skill_validation
+            && let Some(cage) = &ctx.review_cage
+            && !cage.skill_package_was_viewed(&validation.package_root)
+        {
+            return Err(crate::engine::tool::invalid_input(format!(
+                "background skill review must load `{}` with `skill` before editing its package files",
+                validation.name
+            )));
+        }
         let outcome = write_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?;
         crate::assistants::identity::record_identity_write(ctx, &path).await?;
         if skill_validation.is_some() {
@@ -654,6 +663,35 @@ mod tests {
         std::fs::read_to_string(&file).unwrap()
     }
 
+    fn skill_manifest(name: &str, description: &str, body: &str) -> String {
+        format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}\n")
+    }
+
+    fn write_skill_package(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let package = root.join(".agents").join("skills").join(name);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("SKILL.md"),
+            skill_manifest(name, "old", "Original body."),
+        )
+        .unwrap();
+        package
+    }
+
+    fn skill_test_ctx(root: &std::path::Path) -> crate::engine::tool::ToolCtx {
+        let mut ctx = crate::tools::common::test_ctx(root);
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.skills.scan_dirs = vec![".agents/skills".to_string()];
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        );
+        ctx
+    }
+
     #[tokio::test]
     async fn edit_without_prior_read_is_rejected_and_names_edit() {
         let tmp = tempfile::tempdir().unwrap();
@@ -709,6 +747,57 @@ mod tests {
         );
         assert!(ctx.locks.holder(&file).is_none());
         assert!(ctx.locks.has_read(&file, &ctx.agent_id, ctx.session.id));
+    }
+
+    #[tokio::test]
+    async fn caged_skill_edit_requires_prior_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package = write_skill_package(tmp.path(), "view-edit");
+        let manifest = package.join("SKILL.md");
+        let mut ctx = skill_test_ctx(tmp.path());
+        ctx.review_cage = Some(
+            crate::engine::tool::ReviewCage::skills_review_with_package_roots([package.clone()]),
+        );
+        ctx.locks
+            .note_read(&manifest, &ctx.agent_id, ctx.session.id)
+            .await;
+
+        let err = EditTool
+            .call(
+                serde_json::json!({
+                    "path": manifest.display().to_string(),
+                    "old_string": "description: old",
+                    "new_string": "description: new",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must load `view-edit`"), "{err}");
+
+        crate::tools::skill::SkillTool
+            .call(serde_json::json!({"name": "view-edit"}), &ctx)
+            .await
+            .unwrap();
+        let out = EditTool
+            .call(
+                serde_json::json!({
+                    "path": manifest.display().to_string(),
+                    "old_string": "description: old",
+                    "new_string": "description: new",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap()
+            .content;
+        assert!(out.contains("[skill] validated view-edit"), "{out}");
+        assert!(
+            std::fs::read_to_string(manifest)
+                .unwrap()
+                .contains("description: new")
+        );
     }
 
     #[tokio::test]

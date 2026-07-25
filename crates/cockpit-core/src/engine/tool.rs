@@ -12,6 +12,7 @@
 //! `BTreeMap<String, Arc<dyn Tool>>`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -183,10 +184,16 @@ pub struct ReviewCage {
     state: Arc<Mutex<ReviewCageState>>,
 }
 
+pub const SKILLS_REVIEW_ALLOWED_TOOLS: [&str; 5] =
+    ["edit", "read", "skill", "skill_manage", "write"];
+pub const SKILLS_REVIEW_MAX_DISPATCHES: u32 = 64;
+
 #[derive(Debug)]
 struct ReviewCageState {
     allowed_tools: HashSet<String>,
     viewed_skills: HashSet<String>,
+    viewed_package_roots: HashSet<PathBuf>,
+    preauthorized_package_roots: Vec<PathBuf>,
     auto_deny_approvals: bool,
     max_dispatches: u32,
     dispatches: u32,
@@ -194,15 +201,21 @@ struct ReviewCageState {
 
 impl ReviewCage {
     pub fn skills_review() -> Self {
+        Self::skills_review_with_package_roots(Vec::new())
+    }
+
+    pub fn skills_review_with_package_roots(roots: impl IntoIterator<Item = PathBuf>) -> Self {
         Self {
             state: Arc::new(Mutex::new(ReviewCageState {
-                allowed_tools: ["skill", "skill_manage"]
+                allowed_tools: SKILLS_REVIEW_ALLOWED_TOOLS
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
                 viewed_skills: HashSet::new(),
+                viewed_package_roots: HashSet::new(),
+                preauthorized_package_roots: roots.into_iter().map(lexical_normalize).collect(),
                 auto_deny_approvals: true,
-                max_dispatches: 16,
+                max_dispatches: SKILLS_REVIEW_MAX_DISPATCHES,
                 dispatches: 0,
             })),
         }
@@ -241,12 +254,60 @@ impl ReviewCage {
             .insert(name.to_string());
     }
 
+    pub fn record_skill_package_view(&self, name: &str, package_root: &Path) {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let package_root = lexical_normalize(package_root);
+        state.viewed_skills.insert(name.to_string());
+        state.viewed_package_roots.insert(package_root.clone());
+        if !state
+            .preauthorized_package_roots
+            .iter()
+            .any(|root| root == &package_root)
+        {
+            state.preauthorized_package_roots.push(package_root);
+        }
+    }
+
     pub fn skill_was_viewed(&self, name: &str) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .viewed_skills
             .contains(name)
+    }
+
+    pub fn skill_package_was_viewed(&self, package_root: &Path) -> bool {
+        let package_root = lexical_normalize(package_root);
+        self.state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .viewed_package_roots
+            .contains(&package_root)
+    }
+
+    pub fn preauthorizes_package_path(&self, path: &Path) -> bool {
+        let path = lexical_normalize(path);
+        self.state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .preauthorized_package_roots
+            .iter()
+            .any(|root| path.starts_with(root) && path != *root)
+    }
+
+    pub fn allowed_tools(&self) -> HashSet<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .allowed_tools
+            .clone()
+    }
+
+    pub fn max_dispatches(&self) -> u32 {
+        self.state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .max_dispatches
     }
 }
 
@@ -256,11 +317,26 @@ fn sorted_csv(values: &HashSet<String>) -> String {
     values.join(", ")
 }
 
+fn lexical_normalize(path: impl AsRef<Path>) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.as_ref().components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod typed_args_tests {
     use super::*;
     use serde::Deserialize;
     use serde_json::json;
+    use std::collections::BTreeSet;
 
     #[derive(Debug, Deserialize)]
     struct GlobArgs {
@@ -286,6 +362,60 @@ mod typed_args_tests {
 
         let parsed: GlobArgs = typed_args(args).unwrap();
         assert_eq!(parsed.pattern, "**/*.rs");
+    }
+
+    #[test]
+    fn skills_review_cage_allowlist_matches_toolbox() {
+        let cage = ReviewCage::skills_review();
+        let allowed: BTreeSet<String> = cage.allowed_tools().into_iter().collect();
+        assert_eq!(
+            allowed,
+            SKILLS_REVIEW_ALLOWED_TOOLS
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn review_cage_preauthorizes_only_skill_package_roots() {
+        let root = PathBuf::from("/tmp/cockpit-skills/example");
+        let sibling = PathBuf::from("/tmp/cockpit-skills/other/SKILL.md");
+        let cage = ReviewCage::skills_review_with_package_roots([root.clone()]);
+
+        assert!(cage.preauthorizes_package_path(&root.join("SKILL.md")));
+        assert!(cage.preauthorizes_package_path(&root.join("references/guide.md")));
+        assert!(!cage.preauthorizes_package_path(&root));
+        assert!(!cage.preauthorizes_package_path(&sibling));
+    }
+
+    #[test]
+    fn review_cage_viewed_package_becomes_preauthorized() {
+        let root = PathBuf::from("/tmp/cockpit-skills/new-skill");
+        let cage = ReviewCage::skills_review();
+
+        assert!(!cage.preauthorizes_package_path(&root.join("SKILL.md")));
+        cage.record_skill_package_view("new-skill", &root);
+        assert!(cage.skill_package_was_viewed(&root));
+        assert!(cage.preauthorizes_package_path(&root.join("SKILL.md")));
+    }
+
+    #[test]
+    fn skills_review_cage_keeps_auto_deny() {
+        assert!(ReviewCage::skills_review().auto_deny_approvals());
+    }
+
+    #[test]
+    fn skills_review_cage_dispatch_cap_is_finite() {
+        let cage = ReviewCage::skills_review();
+        let max = cage.max_dispatches();
+        assert!(max > 16);
+        assert!(max < 1_000);
+        for _ in 0..max {
+            cage.allow_dispatch("skill").unwrap();
+        }
+        let err = cage.allow_dispatch("skill").unwrap_err().to_string();
+        assert!(err.contains(&max.to_string()), "{err}");
     }
 
     #[test]

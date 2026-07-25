@@ -23,10 +23,10 @@ impl Tool for SkillManageTool {
 
     fn defensive_description(&self) -> Option<String> {
         Some(
-            "Create, patch, rewrite, delete, or maintain support files for a reusable skill. Use \
-             `patch` for ordinary SKILL.md changes and reserve `edit` for a complete rewrite. \
-             Every mutation is path-confined, atomically written, and revalidated; a fuzzy \
-             no-match returns a preview so you can correct the call."
+            "Use `skill_manage` only to create a new reusable skill, delete a skill after guarded \
+             consolidation, or remove an obsolete support file. Do not use it to patch, rewrite, \
+             or write package files; instead load the package with `skill`, read the target file, \
+             then call `edit` or `write` on the package path shown by `skill`."
                 .to_string(),
         )
     }
@@ -204,42 +204,6 @@ fn params_schema_for(action: SkillManageAction, defensive: bool) -> Value {
             ],
             ["description", "content"],
         ),
-        SkillManageAction::Patch => object_schema(
-            [
-                property(
-                    "old_string",
-                    "string",
-                    if defensive {
-                        "Exact or fuzzy passage copied from the current SKILL.md"
-                    } else {
-                        "Fuzzy find text"
-                    },
-                ),
-                property(
-                    "new_string",
-                    "string",
-                    "Replacement text; omit or use an empty string to delete the span",
-                ),
-                property(
-                    "replace_all",
-                    "boolean",
-                    "Replace every fuzzy match instead of requiring uniqueness",
-                ),
-            ],
-            ["old_string"],
-        ),
-        SkillManageAction::Edit => object_schema(
-            [property(
-                "content",
-                "string",
-                if defensive {
-                    "Complete replacement SKILL.md including valid YAML frontmatter"
-                } else {
-                    "Complete replacement SKILL.md"
-                },
-            )],
-            ["content"],
-        ),
         SkillManageAction::Delete => object_schema(
             [property(
                 "absorbed_into",
@@ -247,17 +211,6 @@ fn params_schema_for(action: SkillManageAction, defensive: bool) -> Value {
                 "Existing umbrella skill that documents the deleted skill's behavior",
             )],
             ["absorbed_into"],
-        ),
-        SkillManageAction::WriteFile => object_schema(
-            [
-                property(
-                    "path",
-                    "string",
-                    "Support path under references/, templates/, scripts/, or assets/",
-                ),
-                property("content", "string", "Support-file contents"),
-            ],
-            ["path", "content"],
         ),
         SkillManageAction::RemoveFile => object_schema(
             [property(
@@ -491,16 +444,6 @@ mod tests {
         }
     }
 
-    fn edit_value(name: &str, body: &str) -> Value {
-        serde_json::json!({
-            "action": "edit",
-            "name": name,
-            "params": {
-                "content": body
-            }
-        })
-    }
-
     fn delete_value(name: &str) -> Value {
         serde_json::json!({
             "action": "delete",
@@ -511,34 +454,12 @@ mod tests {
         })
     }
 
-    fn write_file_value(name: &str, path: &str, content: &str) -> Value {
-        serde_json::json!({
-            "action": "write_file",
-            "name": name,
-            "params": {
-                "path": path,
-                "content": content
-            }
-        })
-    }
-
     fn remove_file_value(name: &str, path: &str) -> Value {
         serde_json::json!({
             "action": "remove_file",
             "name": name,
             "params": {
                 "path": path
-            }
-        })
-    }
-
-    fn patch_value(name: &str, old: &str, new: &str) -> Value {
-        serde_json::json!({
-            "action": "patch",
-            "name": name,
-            "params": {
-                "old_string": old,
-                "new_string": new
             }
         })
     }
@@ -590,12 +511,7 @@ mod tests {
     fn minimal_args_for(action: SkillManageAction) -> Value {
         match action {
             SkillManageAction::Create => create_value("schema-runtime"),
-            SkillManageAction::Patch => patch_value("schema-runtime", "old", "new"),
-            SkillManageAction::Edit => edit_value("schema-runtime", "content"),
             SkillManageAction::Delete => delete_value("schema-runtime"),
-            SkillManageAction::WriteFile => {
-                write_file_value("schema-runtime", "references/file.md", "content")
-            }
             SkillManageAction::RemoveFile => {
                 remove_file_value("schema-runtime", "references/file.md")
             }
@@ -603,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_a_closed_discriminated_union() {
+    fn skill_manage_advertises_only_retained_actions() {
         for schema in [skill_manage_schema(false), skill_manage_schema(true)] {
             assert_eq!(schema["type"], "object");
             assert_eq!(schema["additionalProperties"], false);
@@ -617,11 +533,7 @@ mod tests {
             );
             assert_eq!(
                 value_string_set(&schema["properties"]["action"]["enum"]),
-                SkillManageAction::ALL
-                    .into_iter()
-                    .map(SkillManageAction::as_str)
-                    .map(str::to_string)
-                    .collect()
+                string_set(&["create", "delete", "remove_file"])
             );
             assert_eq!(params_any_of(&schema).len(), SkillManageAction::ALL.len());
             for arm in params_any_of(&schema) {
@@ -650,20 +562,9 @@ mod tests {
                 &["description", "content"][..],
             ),
             (
-                SkillManageAction::Patch,
-                &["old_string", "new_string", "replace_all"][..],
-                &["old_string"][..],
-            ),
-            (SkillManageAction::Edit, &["content"][..], &["content"][..]),
-            (
                 SkillManageAction::Delete,
                 &["absorbed_into"][..],
                 &["absorbed_into"][..],
-            ),
-            (
-                SkillManageAction::WriteFile,
-                &["path", "content"][..],
-                &["path", "content"][..],
             ),
             (SkillManageAction::RemoveFile, &["path"][..], &["path"][..]),
         ];
@@ -753,6 +654,31 @@ mod tests {
         );
         assert!(error.to_string().contains("params"));
         assert!(!root.join("legacy-flat").exists());
+    }
+
+    #[tokio::test]
+    async fn skill_manage_removed_action_names_replacement_flow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        write_config(tmp.path(), &root, false);
+        let (ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
+
+        for action in ["patch", "edit", "write_file"] {
+            let args = serde_json::json!({
+                "action": action,
+                "name": "retired-action",
+                "params": {}
+            });
+            let error = SkillManageTool.call(args, &ctx).await.unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("retired"), "{message}");
+            assert!(message.contains("skill"), "{message}");
+            assert!(message.contains("read"), "{message}");
+            assert!(
+                message.contains("edit") || message.contains("write"),
+                "{message}"
+            );
+        }
     }
 
     async fn create_seed_skill(cwd: &std::path::Path, root: &std::path::Path, name: &str) {
@@ -855,30 +781,8 @@ mod tests {
                 false,
             ),
             (
-                "patch",
-                patch_value(
-                    "existing-workflow",
-                    "Apply the guarded workflow.",
-                    "mutated by patch",
-                ),
-                "existing-workflow".to_string(),
-                true,
-            ),
-            (
-                "edit",
-                edit_value("existing-workflow", "mutated by edit"),
-                "existing-workflow".to_string(),
-                true,
-            ),
-            (
                 "delete",
                 delete_value("existing-workflow"),
-                "existing-workflow".to_string(),
-                true,
-            ),
-            (
-                "write_file",
-                write_file_value("existing-workflow", "references/new.md", "mutated support"),
                 "existing-workflow".to_string(),
                 true,
             ),
@@ -944,48 +848,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_read_before_write() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        create_foreground_skill(tmp.path(), &root, "view-first").await;
-        let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
-        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
-        ctx.skill_write_origin = crate::skills::manage::SkillWriteOrigin::BackgroundReview;
-
-        let denied = SkillManageTool
-            .call(
-                patch_value(
-                    "view-first",
-                    "Apply the guarded workflow.",
-                    "Apply reviewed steps.",
-                ),
-                &ctx,
-            )
-            .await
-            .unwrap_err();
-        assert!(denied.to_string().contains("must load `view-first`"));
-
-        crate::tools::skill::SkillTool
-            .call(serde_json::json!({"name": "view-first"}), &ctx)
-            .await
-            .unwrap();
-        let output = SkillManageTool
-            .call(
-                patch_value(
-                    "view-first",
-                    "Apply the guarded workflow.",
-                    "Apply reviewed steps.",
-                ),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(output.content.contains("Patched skill"));
-        let body = std::fs::read_to_string(root.join("view-first/SKILL.md")).unwrap();
-        assert!(body.contains("Apply reviewed steps."));
-    }
-
-    #[tokio::test]
     async fn review_writes_background_origin() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
@@ -1004,42 +866,6 @@ mod tests {
                 .unwrap();
         assert!(provenance.contains("\"created_origin\": \"background_review\""));
         assert!(provenance.contains("\"origin\": \"background_review\""));
-    }
-
-    #[tokio::test]
-    async fn review_patches_before_creating() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        create_foreground_skill(tmp.path(), &root, "existing-workflow").await;
-        let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
-        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
-        ctx.skill_write_origin = crate::skills::manage::SkillWriteOrigin::BackgroundReview;
-
-        crate::tools::skill::SkillTool
-            .call(serde_json::json!({"name": "existing-workflow"}), &ctx)
-            .await
-            .unwrap();
-        SkillManageTool
-            .call(
-                patch_value(
-                    "existing-workflow",
-                    "Apply the guarded workflow.",
-                    "Apply the guarded workflow, then document the reusable retry check.",
-                ),
-                &ctx,
-            )
-            .await
-            .unwrap();
-
-        assert!(root.join("existing-workflow/SKILL.md").is_file());
-        assert_eq!(
-            std::fs::read_dir(&root)
-                .unwrap()
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.file_type().is_ok_and(|ty| ty.is_dir()))
-                .count(),
-            1
-        );
     }
 
     #[tokio::test]

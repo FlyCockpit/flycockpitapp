@@ -107,10 +107,12 @@ Review the recent transcript digest and decide whether it taught a reusable,
 assistant-specific procedure worth saving as an Agent Skill.
 
 Hard rules:
-- You may use only `skill` and `skill_manage`.
-- Prefer patching an existing relevant skill before creating a new one.
-- Before patching, editing, deleting, writing a support file, or removing a
-  support file for an existing skill, load that skill with `skill`.
+- You may use only `skill`, `skill_manage`, `read`, `edit`, and `write`.
+- Prefer updating an existing relevant skill before creating a new one.
+- Before deleting or removing a support file for an existing skill, load that
+  skill with `skill`.
+- To change SKILL.md or write support files, first load the skill with `skill`,
+  then use `read` and `edit` or `write` on the package path shown by `skill`.
 - Do not capture one-off facts, secrets, user preferences, project-specific
   paths, transient environment failures, credentials, or anything that depends
   on this machine's current state.
@@ -155,12 +157,16 @@ async fn run_review_turn(
 ) -> Result<Option<String>> {
     let session = scratch_session(&cwd)?;
     let locks = Arc::new(crate::locks::LockManager::from_db(session.db.clone()).await?);
-    let cage = ReviewCage::skills_review();
+    let cage = ReviewCage::skills_review_with_package_roots(review_package_roots(
+        &cwd,
+        &config.extended().skills,
+    ));
+    let max_dispatches = cage.max_dispatches();
     let agent = review_agent_from(root_agent);
     let mut history = Vec::new();
     let mut next_prompt = Message::user(prompt);
 
-    for _ in 0..=16 {
+    for _ in 0..max_dispatches {
         if cancel.is_cancelled() {
             return Ok(None);
         }
@@ -224,8 +230,22 @@ fn review_agent_from(root_agent: Agent) -> Agent {
 
 fn review_tools() -> ToolBox {
     ToolBox::new()
+        .with(Arc::new(crate::tools::edit::EditTool))
+        .with(Arc::new(crate::tools::read::ReadTool))
         .with(Arc::new(crate::tools::skill::SkillTool))
         .with(Arc::new(crate::tools::skill_manage::SkillManageTool))
+        .with(Arc::new(crate::tools::write::WriteTool))
+}
+
+fn review_package_roots(
+    cwd: &std::path::Path,
+    skills: &crate::config::extended::SkillsConfig,
+) -> Vec<std::path::PathBuf> {
+    crate::skills::discover(cwd, skills)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|skill| crate::skills::package_root(&skill).to_path_buf())
+        .collect()
 }
 
 fn recent_history_digest(history: &[Message]) -> String {
@@ -282,11 +302,12 @@ fn scratch_session(cwd: &std::path::Path) -> Result<Arc<crate::session::Session>
     )?))
 }
 
-const REVIEW_SYSTEM: &str = "You are an isolated background skill-review subagent. You may only preserve reusable procedures by using the skill tools. Never ask for approvals.";
+const REVIEW_SYSTEM: &str = "You are an isolated background skill-review subagent. You may preserve reusable procedures with `skill`, `skill_manage`, `read`, `edit`, and `write` only. Never ask for approvals.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[tokio::test]
     async fn review_triggers_at_boundary() {
@@ -332,5 +353,25 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn review_toolbox_is_exactly_the_expected_set() {
+        let toolbox = review_tools();
+        let names: BTreeSet<&str> = toolbox.names().into_iter().collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["edit", "read", "skill", "skill_manage", "write"])
+        );
+    }
+
+    #[test]
+    fn review_prompt_describes_file_tool_flow() {
+        let prompt = build_review_prompt("helper", "Assistant learned a reusable workflow.")
+            .expect("prompt");
+        assert!(prompt.contains("`skill`, `skill_manage`, `read`, `edit`, and `write`"));
+        assert!(prompt.contains("first load the skill with `skill`"));
+        assert!(prompt.contains("use `read` and `edit` or `write`"));
+        assert!(REVIEW_SYSTEM.contains("`read`, `edit`, and `write`"));
     }
 }

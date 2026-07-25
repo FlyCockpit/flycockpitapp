@@ -280,6 +280,7 @@ pub struct SkillPackageTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillPackageWriteValidation {
     pub name: String,
+    pub package_root: PathBuf,
     pub is_manifest: bool,
 }
 
@@ -326,6 +327,7 @@ pub fn validate_skill_package_write(
     }
     Ok(Some(SkillPackageWriteValidation {
         name: target.name,
+        package_root: target.package_root,
         is_manifest: target.is_manifest,
     }))
 }

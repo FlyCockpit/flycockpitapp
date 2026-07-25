@@ -51,6 +51,61 @@ async fn llm_mode_switch_rebuilds_and_triggers_prune() {
 }
 
 #[tokio::test]
+async fn defensive_role_swap_emits_single_cache_break_warning() {
+    use crate::config::extended::LlmMode;
+
+    let (mut driver, _tmp) = test_driver(1);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+
+    driver
+        .run_control(
+            DriverControl::SetLlmMode {
+                mode: Some(LlmMode::Normal),
+                prune_after_switch: false,
+            },
+            &tx,
+        )
+        .await;
+    drain_ready(&mut rx);
+
+    assert_eq!(driver.stack[0].agent.name, "Build");
+    driver.stack[0].history = dup_read_history_big();
+    assert!(
+        !prune::dedup_plan(&driver.stack[0].history).is_empty(),
+        "fixture must start prunable"
+    );
+
+    driver
+        .run_control(
+            DriverControl::SetLlmMode {
+                mode: Some(LlmMode::Defensive),
+                prune_after_switch: true,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(driver.stack[0].agent.name, "Build");
+    assert_eq!(driver.stack[0].agent.llm_mode, LlmMode::Defensive);
+    let events = drain_ready(&mut rx);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TurnEvent::LlmModeChanged { mode } if *mode == LlmMode::Defensive))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TurnEvent::Pruned { .. }))
+            .count(),
+        1,
+        "llm-mode switch should use the existing single prune warning path"
+    );
+}
+
+#[tokio::test]
 async fn llm_mode_noop_does_not_rebuild_or_prune() {
     use crate::config::extended::LlmMode;
 

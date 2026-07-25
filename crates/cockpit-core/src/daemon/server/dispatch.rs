@@ -1908,8 +1908,12 @@ fn read_history_page_conn(
                 .map(|(_, extended)| extended)
         })
         .unwrap_or_default();
-    let root_agent =
-        crate::daemon::session_worker::resolve_root_agent_conn(conn, session_id, &extended_cfg);
+    let root_agent = crate::daemon::session_worker::resolve_root_agent_conn(
+        conn,
+        session_id,
+        &extended_cfg,
+        extended_cfg.llm_mode,
+    );
     crate::engine::rehydrate::history_page_before_conn(
         conn,
         session_id,
@@ -2181,6 +2185,7 @@ pub(super) async fn attach(
                 conn,
                 session_id,
                 &extended_cfg_for_attach,
+                extended_cfg_for_attach.llm_mode,
             );
             let (history, replay_max_seq) = if let Some(since_seq) = since_seq {
                 let replay_max_seq =

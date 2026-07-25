@@ -40,8 +40,8 @@ pub(crate) mod invariants;
 
 pub(crate) use builtin_defs::embedded_internal_default;
 pub use builtin_defs::{
-    BUILTIN_AGENT_NAMES, FALLBACK_PRIMARY, embedded_default, is_builtin_agent, is_builtin_primary,
-    is_hidden_primary, is_removed_primary,
+    BUILTIN_AGENT_NAMES, DEFENSIVE_PRIMARY, FALLBACK_PRIMARY, embedded_default, is_builtin_agent,
+    is_builtin_primary, is_hidden_primary, is_removed_primary, resolve_primary_for_llm_mode,
 };
 pub use invariants::validate_invariants;
 

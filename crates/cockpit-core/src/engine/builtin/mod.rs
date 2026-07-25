@@ -3274,6 +3274,29 @@ mod tests {
     }
 
     #[test]
+    fn defensive_wire_surface_is_smaller_than_normal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut normal_args = test_spawn_args(tmp.path());
+        normal_args.llm_mode = crate::config::extended::LlmMode::Normal;
+        let normal = load("Build", &normal_args).unwrap();
+
+        let mut defensive_args = test_spawn_args(tmp.path());
+        defensive_args.llm_mode = crate::config::extended::LlmMode::Defensive;
+        let defensive = load("Careful", &defensive_args).unwrap();
+
+        let normal_names = normal.tools.names();
+        let defensive_names = defensive.tools.names();
+        assert!(
+            defensive_names.len() <= 10,
+            "Careful direct tools should stay within the small-surface budget: {defensive_names:?}"
+        );
+        assert!(
+            defensive_names.len() < normal_names.len(),
+            "Careful should expose fewer direct tools than normal Build: {defensive_names:?} vs {normal_names:?}"
+        );
+    }
+
+    #[test]
     fn multireview_reaches_harness_tools_through_mcp() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());

@@ -797,16 +797,34 @@ async fn plan_default_stale_session_keeps_plan() {
     // Build through the shared predicate.
     let row = db.create_session("proj", "/proj", "Plan").await.unwrap();
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
+        resolve_root_agent(
+            row.session_id,
+            &db,
+            &cfg_with(D::Build),
+            crate::config::extended::LlmMode::Normal
+        )
+        .await,
         "Plan"
     );
     let swarm = db.create_session("proj", "/proj", "Swarm").await.unwrap();
     assert_eq!(
-        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Build)).await,
+        resolve_root_agent(
+            swarm.session_id,
+            &db,
+            &cfg_with(D::Build),
+            crate::config::extended::LlmMode::Normal
+        )
+        .await,
         "Build"
     );
     assert_eq!(
-        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Plan)).await,
+        resolve_root_agent(
+            swarm.session_id,
+            &db,
+            &cfg_with(D::Plan),
+            crate::config::extended::LlmMode::Normal
+        )
+        .await,
         "Build",
         "removed stored primaries force Build, not the configured default"
     );
@@ -820,13 +838,39 @@ async fn resolve_root_agent_preserves_stored_defensive_primary() {
     let row = db.create_session("proj", "/proj", "Careful").await.unwrap();
 
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
+        resolve_root_agent(
+            row.session_id,
+            &db,
+            &cfg_with(D::Build),
+            crate::config::extended::LlmMode::Normal
+        )
+        .await,
         "Careful"
     );
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Plan)).await,
+        resolve_root_agent(
+            row.session_id,
+            &db,
+            &cfg_with(D::Plan),
+            crate::config::extended::LlmMode::Normal
+        )
+        .await,
         "Careful",
         "stored Careful primary must survive resume instead of falling back to the configured default"
+    );
+}
+
+#[tokio::test]
+async fn resumed_default_named_session_is_not_auto_swapped_in_defensive_mode() {
+    use crate::config::extended::{DefaultPrimaryAgent as D, LlmMode};
+
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let row = db.create_session("proj", "/proj", "Build").await.unwrap();
+
+    assert_eq!(
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build), LlmMode::Defensive).await,
+        "Build",
+        "stored Build is an explicit resume choice and must not auto-select Careful"
     );
 }
 
@@ -838,7 +882,13 @@ async fn roster_trim_removed_primary_notice_is_one_time() {
     let row = db.create_session("proj", "/proj", "Swarm").await.unwrap();
 
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
+        resolve_root_agent(
+            row.session_id,
+            &db,
+            &cfg_with(D::Build),
+            crate::config::extended::LlmMode::Normal
+        )
+        .await,
         "Build"
     );
     let notice = removed_primary_notice(row.session_id, &db, &cfg_with(D::Plan))
@@ -919,7 +969,13 @@ async fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
         .unwrap();
 
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
+        resolve_root_agent(
+            row.session_id,
+            &db,
+            &cfg_with(D::Build),
+            crate::config::extended::LlmMode::Normal
+        )
+        .await,
         "helper-bot"
     );
 }
@@ -934,7 +990,13 @@ async fn resolve_root_agent_deleted_assistant_falls_back_to_default_primary() {
         .unwrap();
 
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
+        resolve_root_agent(
+            row.session_id,
+            &db,
+            &cfg_with(D::Build),
+            crate::config::extended::LlmMode::Normal
+        )
+        .await,
         "Build"
     );
 }
@@ -971,7 +1033,13 @@ async fn assistant_session_root_agent_loads_assistant_definition() {
         .await
         .unwrap();
 
-    let root_agent_name = resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await;
+    let root_agent_name = resolve_root_agent(
+        row.session_id,
+        &db,
+        &cfg_with(D::Build),
+        crate::config::extended::LlmMode::Normal,
+    )
+    .await;
     let root = crate::engine::builtin::load_with_assistant_db_and_tool_surface_override(
         &root_agent_name,
         &test_spawn_args(&cwd),

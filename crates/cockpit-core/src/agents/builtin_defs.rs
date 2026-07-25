@@ -74,6 +74,26 @@ pub fn is_builtin_primary(name: &str) -> bool {
 /// available.
 pub const FALLBACK_PRIMARY: &str = "Build";
 
+/// The builtin primary selected for brand-new default sessions in Defensive
+/// mode.
+pub const DEFENSIVE_PRIMARY: &str = "Careful";
+
+pub fn resolve_primary_for_llm_mode(
+    requested_or_stored: Option<&str>,
+    configured_default: &str,
+    llm_mode: crate::config::extended::LlmMode,
+) -> String {
+    match requested_or_stored.filter(|name| !name.is_empty()) {
+        Some(name) if is_removed_primary(name) => FALLBACK_PRIMARY.to_string(),
+        Some(name) => name.to_string(),
+        None if llm_mode == crate::config::extended::LlmMode::Defensive => {
+            DEFENSIVE_PRIMARY.to_string()
+        }
+        None if is_removed_primary(configured_default) => FALLBACK_PRIMARY.to_string(),
+        None => configured_default.to_string(),
+    }
+}
+
 /// The embedded default [`AgentDef`] for a built-in `name`, or `None`
 /// when `name` is not a built-in. The `prompt` is the same body the
 /// factory functions compose into the system prompt.
@@ -588,6 +608,81 @@ mod tests {
             .filter(|tool| effective_tier(def, tool) != ToolTier::Disabled)
             .cloned()
             .collect()
+    }
+
+    #[test]
+    fn defensive_primary_selected_for_defensive_llm_mode() {
+        assert_eq!(
+            resolve_primary_for_llm_mode(
+                None,
+                FALLBACK_PRIMARY,
+                crate::config::extended::LlmMode::Defensive,
+            ),
+            DEFENSIVE_PRIMARY
+        );
+        assert_eq!(
+            embedded_default(DEFENSIVE_PRIMARY)
+                .expect("defensive primary embedded default")
+                .name,
+            "Careful"
+        );
+    }
+
+    #[test]
+    fn defensive_primary_not_selected_for_normal_or_frontier() {
+        use crate::config::extended::LlmMode;
+
+        let build = embedded_default(FALLBACK_PRIMARY).expect("Build embedded default");
+        for mode in [LlmMode::Normal, LlmMode::Frontier] {
+            let resolved = resolve_primary_for_llm_mode(None, FALLBACK_PRIMARY, mode);
+            let resolved_def = embedded_default(&resolved).expect("resolved embedded default");
+
+            assert_eq!(resolved, FALLBACK_PRIMARY);
+            assert_eq!(resolved_def.tools, build.tools);
+        }
+    }
+
+    #[test]
+    fn defensive_primary_never_overrides_explicit_agent_choice() {
+        use crate::config::extended::LlmMode;
+
+        assert_eq!(
+            resolve_primary_for_llm_mode(Some("Plan"), FALLBACK_PRIMARY, LlmMode::Defensive),
+            "Plan"
+        );
+        assert_eq!(
+            resolve_primary_for_llm_mode(Some("Build"), FALLBACK_PRIMARY, LlmMode::Defensive),
+            "Build"
+        );
+        assert_eq!(
+            resolve_primary_for_llm_mode(
+                Some("custom-primary"),
+                FALLBACK_PRIMARY,
+                LlmMode::Defensive,
+            ),
+            "custom-primary"
+        );
+    }
+
+    #[test]
+    fn defensive_primary_composes_with_experimental_fallback() {
+        use crate::config::extended::LlmMode;
+
+        assert_eq!(
+            resolve_primary_for_llm_mode(Some("Swarm"), FALLBACK_PRIMARY, LlmMode::Defensive),
+            FALLBACK_PRIMARY,
+            "removed stored primaries keep the existing Build fallback"
+        );
+        assert_eq!(
+            resolve_primary_for_llm_mode(None, "Swarm", LlmMode::Normal),
+            FALLBACK_PRIMARY,
+            "removed configured defaults keep the existing Build fallback"
+        );
+        assert_eq!(
+            resolve_primary_for_llm_mode(None, "Swarm", LlmMode::Defensive),
+            DEFENSIVE_PRIMARY,
+            "brand-new Defensive sessions still select the Defensive primary"
+        );
     }
 
     #[test]

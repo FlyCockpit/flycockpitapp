@@ -312,7 +312,7 @@ pub(super) async fn run_worker(
     // force the release default (`Build`).
     let root_agent_name = match session.assistant_name.clone() {
         Some(name) => name,
-        None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
+        None => resolve_root_agent(session_id, &session.db, &extended_cfg, llm_mode).await,
     };
     if session.assistant_name.is_none()
         && let Some(text) =
@@ -709,7 +709,7 @@ pub(super) async fn run_worker(
         grant_store,
         session.db.clone(),
         session_id,
-        initial_active_agent(&extended_cfg),
+        &root_agent_name,
         interrupts.clone(),
     ));
     driver.set_approver(approver);

@@ -464,5 +464,8 @@ pub use handle::{
 };
 pub use helpers::DAEMON_NO_SANDBOX_ENV;
 #[allow(unused_imports)]
-pub(crate) use helpers::{removed_primary_notice, resolve_root_agent, resolve_root_agent_conn};
-pub(crate) use lifecycle::initial_active_agent;
+pub(crate) use helpers::{
+    removed_primary_notice, resolve_new_session_llm_mode, resolve_root_agent,
+    resolve_root_agent_conn,
+};
+pub(crate) use lifecycle::{initial_active_agent, initial_active_agent_for_llm_mode};

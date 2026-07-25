@@ -315,10 +315,15 @@ impl Session {
         *self.model.lock().unwrap() = model;
     }
 
+    pub fn active_agent(&self) -> String {
+        self.active_agent.lock().unwrap().clone()
+    }
+
     pub fn set_active_agent(&self, agent: &str) -> Result<()> {
         if self.stage_pending_row(|row| {
             row.active_agent = agent.to_string();
         }) {
+            *self.active_agent.lock().unwrap() = agent.to_string();
             return Ok(());
         }
         let session_id = self.id;
@@ -333,5 +338,8 @@ impl Session {
                 Ok(())
             })
             .context("persisting active agent")
+            .inspect(|_| {
+                *self.active_agent.lock().unwrap() = agent.to_string();
+            })
     }
 }

@@ -446,15 +446,15 @@ impl SessionRegistry {
             .inner
             .config_source
             .load_with_trust(&project_root, &trust_policy)?;
+        let llm_mode =
+            session_worker::resolve_new_session_llm_mode(&providers_cfg, extended_cfg.llm_mode);
+        let initial_agent =
+            session_worker::initial_active_agent_for_llm_mode(&extended_cfg, llm_mode);
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written. The worker persists it on the first user message.
-        let session = Session::create_deferred(
-            self.inner.db.clone(),
-            project_root,
-            session_worker::initial_active_agent(&extended_cfg),
-        )
-        .context("creating session")?;
+        let session = Session::create_deferred(self.inner.db.clone(), project_root, &initial_agent)
+            .context("creating session")?;
         if let Some(active) = &providers_cfg.active_model {
             session
                 .set_active_model(&active.provider, &active.model)

@@ -248,6 +248,7 @@ impl Session {
             btw_tangent: row.btw_tangent,
             title: Mutex::new(row.title),
             user_renamed: Mutex::new(row.user_renamed),
+            active_agent: Mutex::new(row.active_agent),
             model: Mutex::new(row.model),
             provider: Mutex::new(row.provider),
             session_llm_mode: Mutex::new(row.session_llm_mode),

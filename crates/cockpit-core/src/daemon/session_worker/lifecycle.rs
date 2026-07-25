@@ -236,3 +236,10 @@ pub(super) fn update_live_foreground(
 pub(crate) fn initial_active_agent(cfg: &crate::config::extended::ExtendedConfig) -> &'static str {
     cfg.default_primary_agent.agent_name()
 }
+
+pub(crate) fn initial_active_agent_for_llm_mode(
+    cfg: &crate::config::extended::ExtendedConfig,
+    llm_mode: crate::config::extended::LlmMode,
+) -> String {
+    crate::agents::resolve_primary_for_llm_mode(None, initial_active_agent(cfg), llm_mode)
+}

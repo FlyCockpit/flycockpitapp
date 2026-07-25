@@ -196,6 +196,7 @@ pub struct Session {
     pub btw_tangent: bool,
     title: Mutex<Option<String>>,
     user_renamed: Mutex<bool>,
+    active_agent: Mutex<String>,
     model: Mutex<Option<String>>,
     provider: Mutex<Option<String>>,
     session_llm_mode: Mutex<Option<String>>,

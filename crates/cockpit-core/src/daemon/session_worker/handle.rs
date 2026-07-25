@@ -1337,11 +1337,25 @@ pub fn spawn(
 ) -> (SessionWorkerHandle, tokio::task::JoinHandle<()>) {
     let session_id = session.id;
     // The primary the chrome's active-agent slot opens on. Spawn is sync, so
-    // it uses the persisted assistant when available and otherwise the config
-    // default; the worker re-resolves the stored root agent async at startup.
+    // it uses the session's in-memory active agent, which is hydrated from the
+    // persisted row or the deferred row built on new-session creation. The
+    // worker still re-resolves async at startup for stale removed primaries.
     let initial_agent = match session.assistant_name.clone() {
         Some(name) => name,
-        None => initial_active_agent(extended_cfg).to_string(),
+        None => {
+            let active = session.active_agent();
+            if crate::agents::is_builtin_primary(&active)
+                || crate::agents::is_removed_primary(&active)
+            {
+                crate::agents::resolve_primary_for_llm_mode(
+                    Some(&active),
+                    initial_active_agent(extended_cfg),
+                    extended_cfg.llm_mode,
+                )
+            } else {
+                initial_active_agent(extended_cfg).to_string()
+            }
+        }
     };
     // Resolve the new-session sandbox default (highest wins):
     //   (a) daemon launched `--no-sandbox` → OFF for ALL sessions.

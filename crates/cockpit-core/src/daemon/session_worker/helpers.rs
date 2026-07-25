@@ -126,10 +126,11 @@ pub(crate) async fn resolve_root_agent(
     session_id: Uuid,
     db: &crate::db::Db,
     cfg: &crate::config::extended::ExtendedConfig,
+    llm_mode: crate::config::extended::LlmMode,
 ) -> String {
-    let fallback = initial_active_agent(cfg).to_string();
+    let fallback = initial_active_agent_for_llm_mode(cfg, llm_mode);
     let cfg = cfg.clone();
-    db.read(move |conn| Ok(resolve_root_agent_conn(conn, session_id, &cfg)))
+    db.read(move |conn| Ok(resolve_root_agent_conn(conn, session_id, &cfg, llm_mode)))
         .await
         .unwrap_or(fallback)
 }
@@ -138,8 +139,9 @@ pub(crate) fn resolve_root_agent_conn(
     conn: &Connection,
     session_id: Uuid,
     cfg: &crate::config::extended::ExtendedConfig,
+    llm_mode: crate::config::extended::LlmMode,
 ) -> String {
-    let default_primary = || initial_active_agent(cfg).to_string();
+    let default_primary = || initial_active_agent_for_llm_mode(cfg, llm_mode);
     let Ok(Some(row)) = crate::db::Db::get_session_conn(conn, session_id) else {
         return default_primary();
     };
@@ -160,12 +162,14 @@ pub(crate) fn resolve_root_agent_conn(
         return default_primary();
     }
     let active = row.active_agent;
-    if crate::agents::is_removed_primary(&active) {
-        return crate::agents::FALLBACK_PRIMARY.to_string();
+    if crate::agents::is_builtin_primary(&active) || crate::agents::is_removed_primary(&active) {
+        return crate::agents::resolve_primary_for_llm_mode(
+            Some(&active),
+            initial_active_agent(cfg),
+            llm_mode,
+        );
     }
-    Some(active)
-        .filter(|name| crate::agents::is_builtin_primary(name))
-        .unwrap_or_else(default_primary)
+    default_primary()
 }
 
 pub(crate) async fn removed_primary_notice(
@@ -215,6 +219,16 @@ pub(super) fn resolve_effective_llm_mode(
         return global;
     };
     providers.resolve_mode(&provider, &model, global)
+}
+
+pub(crate) fn resolve_new_session_llm_mode(
+    providers: &crate::config::providers::ProvidersConfig,
+    global: crate::config::extended::LlmMode,
+) -> crate::config::extended::LlmMode {
+    let Some(active) = providers.active_model.as_ref() else {
+        return global;
+    };
+    providers.resolve_mode(&active.provider, &active.model, global)
 }
 
 /// Persist a live `/llm-mode` switch to the layered config so a resume

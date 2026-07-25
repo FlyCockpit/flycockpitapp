@@ -53,10 +53,11 @@ impl Driver {
                 } else {
                     format!("async {} `{}` completed", kind.as_str(), label)
                 };
-                if let Err(e) =
-                    self.session
-                        .db
-                        .raise_interrupt(self.session.id, "schedule", &note, None)
+                if let Err(e) = self
+                    .session
+                    .db
+                    .raise_interrupt(self.session.id, "schedule", &note, None)
+                    .await
                 {
                     tracing::warn!(error = %e, "raising needs_attention on job end failed");
                 }

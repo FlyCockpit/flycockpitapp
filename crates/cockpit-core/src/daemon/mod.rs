@@ -1112,7 +1112,7 @@ async fn run_foreground_inner_with_boot_db(
         None => server::boot(paths.clone(), terminal_factory).await?,
     });
     if resume_all_sessions {
-        resume_all_paused_sessions(&ctx.db)?;
+        resume_all_paused_sessions(&ctx.db).await?;
     }
     timer.phase("boot");
 
@@ -1258,9 +1258,9 @@ fn spawn_force_timer(ctx: std::sync::Arc<server::DaemonContext>, grace: Duration
     });
 }
 
-fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
-    for row in db.paused_session_work_all()? {
-        if let Err(e) = db.mark_paused_session_work_resumed(row.session_id) {
+async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
+    for row in db.paused_session_work_all().await? {
+        if let Err(e) = db.mark_paused_session_work_resumed(row.session_id).await {
             tracing::warn!(
                 error = %e,
                 session_id = %row.session_id,

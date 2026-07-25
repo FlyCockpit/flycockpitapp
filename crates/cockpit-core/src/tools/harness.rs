@@ -408,7 +408,7 @@ impl Tool for HarnessInvokeTool {
         if let Some(approver) = &ctx.approver
             && ctx.session.approval_mode() != ApprovalMode::Yolo
             && !hc.always_allow
-            && !approver.store().is_harness_granted(&harness_name)
+            && !approver.store().is_harness_granted(&harness_name).await
         {
             match approver
                 .approve_harness_invoke(&harness_name, model.as_deref(), policy)
@@ -618,17 +618,20 @@ mod tests {
         hub: Arc<InterruptHub>,
         response: ResolveResponse,
     ) -> tokio::task::JoinHandle<()> {
-        let initial: Vec<uuid::Uuid> = db
-            .list_open_interrupts(session_id)
-            .unwrap()
-            .into_iter()
-            .map(|row| row.interrupt_id)
-            .collect();
         tokio::spawn(async move {
+            let initial: Vec<uuid::Uuid> = db
+                .list_open_interrupts(session_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.interrupt_id)
+                .collect();
             loop {
-                let open = db.list_open_interrupts(session_id).unwrap();
+                let open = db.list_open_interrupts(session_id).await.unwrap();
                 if let Some(row) = open.iter().find(|row| !initial.contains(&row.interrupt_id)) {
-                    db.resolve_interrupt(row.interrupt_id, &response).unwrap();
+                    db.resolve_interrupt(row.interrupt_id, &response)
+                        .await
+                        .unwrap();
                     if hub.resolve(row.interrupt_id, response.clone()) {
                         break;
                     }
@@ -891,7 +894,12 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("harness invocation denied"), "{msg}");
         assert!(!msg.contains("not found on PATH"), "{msg}");
-        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+        assert!(
+            db.list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -915,7 +923,12 @@ mod tests {
         resolver.await.unwrap();
 
         assert_eq!(err.to_string(), NONINTERACTIVE_RUN_DENIAL);
-        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+        assert!(
+            db.list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -933,7 +946,12 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("not found on PATH"), "{msg}");
         assert!(!msg.contains("harness invocation denied"), "{msg}");
-        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+        assert!(
+            db.list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -952,7 +970,12 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("not found on PATH"), "{msg}");
             assert!(!msg.contains("harness invocation denied"), "{msg}");
-            assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+            assert!(
+                db.list_open_interrupts(ctx.session.id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 
@@ -976,6 +999,7 @@ mod tests {
             ctx.session
                 .db
                 .list_open_interrupts(ctx.session.id)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -989,6 +1013,7 @@ mod tests {
         approver
             .store()
             .record_harness("codex", Scope::Session)
+            .await
             .unwrap();
 
         let err = with_trusted_workspace(tmp.path(), async {
@@ -999,7 +1024,12 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("not found on PATH"), "{msg}");
         assert!(!msg.contains("harness invocation denied"), "{msg}");
-        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+        assert!(
+            db.list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

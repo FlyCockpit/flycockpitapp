@@ -359,7 +359,7 @@ impl InterruptHub {
     /// The `question` tool calls this right after persisting the
     /// interrupt and registering the wakeup, so a client can render the
     /// answering dialog.
-    pub fn emit_raised(
+    pub async fn emit_raised(
         &self,
         session_id: Uuid,
         interrupt_id: Uuid,
@@ -367,9 +367,13 @@ impl InterruptHub {
         description: &str,
         questions: InterruptQuestionSet,
     ) {
-        if let (Some(db), Some(owned_session_id)) = (&self.db, self.session_id)
-            && let Ok(open) = db.list_open_interrupts(owned_session_id)
-        {
+        let open = match (&self.db, self.session_id) {
+            (Some(db), Some(owned_session_id)) if owned_session_id == session_id => {
+                db.list_open_interrupts(owned_session_id).await.ok()
+            }
+            _ => None,
+        };
+        if let Some(open) = &open {
             let active = open.first().map(|row| row.interrupt_id);
             if active != Some(interrupt_id) {
                 self.emit_queue_changed(active, open.len().saturating_sub(1));
@@ -377,10 +381,8 @@ impl InterruptHub {
             }
         }
         if let (Some(events), Some(redaction)) = (&self.events, &self.redaction) {
-            let pending_count = self
-                .db
+            let pending_count = open
                 .as_ref()
-                .and_then(|db| db.list_open_interrupts(session_id).ok())
                 .map(|open| open.len().saturating_sub(1))
                 .unwrap_or(0);
             // `send` errors only when there are no subscribers — fine,
@@ -402,11 +404,11 @@ impl InterruptHub {
         }
     }
 
-    pub fn emit_active_from_db(&self) {
+    pub async fn emit_active_from_db(&self) {
         let (Some(db), Some(session_id)) = (&self.db, self.session_id) else {
             return;
         };
-        let Ok(open) = db.list_open_interrupts(session_id) else {
+        let Ok(open) = db.list_open_interrupts(session_id).await else {
             return;
         };
         let Some(active) = open.first() else {
@@ -443,11 +445,11 @@ impl InterruptHub {
         }
     }
 
-    pub fn emit_queue_state(&self) {
+    pub async fn emit_queue_state(&self) {
         let (Some(db), Some(session_id)) = (&self.db, self.session_id) else {
             return;
         };
-        if let Ok(open) = db.list_open_interrupts(session_id) {
+        if let Ok(open) = db.list_open_interrupts(session_id).await {
             self.emit_queue_changed(
                 open.first().map(|row| row.interrupt_id),
                 open.len().saturating_sub(1),
@@ -503,12 +505,20 @@ impl InterruptHub {
         tx.send(InterruptOutcome::Resolved(response)).is_ok()
     }
 
-    pub fn park(&self, interrupt_id: Uuid) -> bool {
+    #[cfg(test)]
+    pub fn has_waiter(&self, interrupt_id: Uuid) -> bool {
+        lock_or_recover(&self.waiters).contains_key(&interrupt_id)
+    }
+
+    pub async fn park(&self, interrupt_id: Uuid) -> bool {
         let parked = self
             .db
             .as_ref()
-            .and_then(|db| db.park_interrupt(interrupt_id).ok())
-            .unwrap_or(false);
+            .map(|db| async move { db.park_interrupt(interrupt_id).await.ok() });
+        let parked = match parked {
+            Some(parked) => parked.await.unwrap_or(false),
+            None => false,
+        };
         let Some(tx) = lock_or_recover(&self.waiters).remove(&interrupt_id) else {
             return parked;
         };
@@ -516,15 +526,18 @@ impl InterruptHub {
         true
     }
 
-    pub fn park_all_registered(&self) -> usize {
+    pub async fn park_all_registered(&self) -> usize {
         let interrupt_ids = {
             let guard = lock_or_recover(&self.waiters);
             guard.keys().copied().collect::<Vec<_>>()
         };
-        interrupt_ids
-            .into_iter()
-            .filter(|interrupt_id| self.park(*interrupt_id))
-            .count()
+        let mut count = 0;
+        for interrupt_id in interrupt_ids {
+            if self.park(interrupt_id).await {
+                count += 1;
+            }
+        }
+        count
     }
 }
 
@@ -606,13 +619,16 @@ pub async fn raise_and_wait(
         return InterruptOutcome::Resolved(response);
     }
     let payload = current_interrupt_park_payload();
-    let interrupt_id = match db.raise_interrupt_questions_with_payload(
-        session_id,
-        agent,
-        description,
-        &set,
-        payload.as_ref(),
-    ) {
+    let interrupt_id = match db
+        .raise_interrupt_questions_with_payload(
+            session_id,
+            agent,
+            description,
+            &set,
+            payload.as_ref(),
+        )
+        .await
+    {
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(error = %e, "{log_label}: raising interrupt failed");
@@ -620,7 +636,9 @@ pub async fn raise_and_wait(
         }
     };
     let pending = interrupts.register(interrupt_id);
-    interrupts.emit_raised(session_id, interrupt_id, agent, description, set);
+    interrupts
+        .emit_raised(session_id, interrupt_id, agent, description, set)
+        .await;
     pending.wait().await
 }
 
@@ -738,13 +756,14 @@ mod tests {
         let set = question_set();
         let id = db
             .raise_interrupt_questions(session.session_id, "a", "first", &set)
+            .await
             .unwrap();
         let pending = hub.register(id);
 
-        assert!(hub.park(id));
+        assert!(hub.park(id).await);
         assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
         assert_eq!(
-            db.get_interrupt(id).unwrap().unwrap().state,
+            db.get_interrupt(id).await.unwrap().unwrap().state,
             crate::db::needs_attention::InterruptState::Parked
         );
     }
@@ -762,6 +781,7 @@ mod tests {
             loop {
                 if let Some(row) = resolver_db
                     .list_open_interrupts(session_id)
+                    .await
                     .unwrap()
                     .into_iter()
                     .next()
@@ -773,6 +793,7 @@ mod tests {
                                 selected_id: "first-live".into(),
                             },
                         )
+                        .await
                         .unwrap();
                     assert!(resolver_hub.resolve(
                         row.interrupt_id,
@@ -840,7 +861,10 @@ mod tests {
             matches!(second, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "second-stored")
         );
         assert_eq!(
-            db.list_open_interrupts(session.session_id).unwrap().len(),
+            db.list_open_interrupts(session.session_id)
+                .await
+                .unwrap()
+                .len(),
             0
         );
     }
@@ -914,7 +938,10 @@ mod tests {
             matches!(first, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "first-stored")
         );
         assert_eq!(
-            db.list_open_interrupts(session.session_id).unwrap().len(),
+            db.list_open_interrupts(session.session_id)
+                .await
+                .unwrap()
+                .len(),
             0
         );
     }
@@ -932,6 +959,7 @@ mod tests {
             loop {
                 if let Some(row) = resolver_db
                     .list_open_interrupts(session_id)
+                    .await
                     .unwrap()
                     .into_iter()
                     .next()
@@ -941,6 +969,7 @@ mod tests {
                     };
                     resolver_db
                         .resolve_interrupt(row.interrupt_id, &response)
+                        .await
                         .unwrap();
                     assert!(resolver_hub.resolve(row.interrupt_id, response));
                     break;
@@ -1012,6 +1041,7 @@ mod tests {
             loop {
                 if let Some(row) = resolver_db
                     .list_open_interrupts(session_id)
+                    .await
                     .unwrap()
                     .into_iter()
                     .next()
@@ -1021,6 +1051,7 @@ mod tests {
                     };
                     resolver_db
                         .resolve_interrupt(row.interrupt_id, &response)
+                        .await
                         .unwrap();
                     assert!(resolver_hub.resolve(row.interrupt_id, response));
                     break;
@@ -1059,7 +1090,10 @@ mod tests {
             matches!(resolved, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "live")
         );
         assert_eq!(
-            db.list_open_interrupts(session.session_id).unwrap().len(),
+            db.list_open_interrupts(session.session_id)
+                .await
+                .unwrap()
+                .len(),
             0
         );
     }
@@ -1072,12 +1106,16 @@ mod tests {
         let set = question_set();
         let first = db
             .raise_interrupt_questions(session.session_id, "a", "first", &set)
+            .await
             .unwrap();
-        hub.emit_raised(session.session_id, first, "a", "first", set.clone());
+        hub.emit_raised(session.session_id, first, "a", "first", set.clone())
+            .await;
         let second = db
             .raise_interrupt_questions(session.session_id, "b", "second", &set)
+            .await
             .unwrap();
-        hub.emit_raised(session.session_id, second, "b", "second", set);
+        hub.emit_raised(session.session_id, second, "b", "second", set)
+            .await;
 
         assert!(matches!(
             events.recv().await.unwrap().event,
@@ -1096,7 +1134,7 @@ mod tests {
             } if interrupt_id == first
         ));
 
-        hub.emit_active_from_db();
+        hub.emit_active_from_db().await;
         assert!(matches!(
             events.recv().await.unwrap().event,
             proto::Event::InterruptQueueChanged {
@@ -1115,8 +1153,9 @@ mod tests {
         ));
 
         db.resolve_interrupt(first, &ResolveResponse::Cancel)
+            .await
             .unwrap();
-        hub.emit_active_from_db();
+        hub.emit_active_from_db().await;
         assert!(matches!(
             events.recv().await.unwrap().event,
             proto::Event::InterruptQueueChanged {
@@ -1143,15 +1182,17 @@ mod tests {
         let set = question_set();
         let first = db
             .raise_interrupt_questions(session.session_id, "a", "first", &set)
+            .await
             .unwrap();
         let second = db
             .raise_interrupt_questions(session.session_id, "b", "second", &set)
+            .await
             .unwrap();
         let pending = hub.register(first);
 
         drop(pending);
 
-        let open = db.list_open_interrupts(session.session_id).unwrap();
+        let open = db.list_open_interrupts(session.session_id).await.unwrap();
         assert_eq!(open.len(), 2);
         assert_eq!(open[0].interrupt_id, first);
         assert_eq!(open[1].interrupt_id, second);
@@ -1169,13 +1210,14 @@ mod tests {
         let (hub, _events) = attached_hub(db.clone(), session.session_id);
         let interrupt_id = db
             .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
+            .await
             .unwrap();
         let pending = hub.register(interrupt_id);
 
-        assert_eq!(hub.park_all_registered(), 1);
+        assert_eq!(hub.park_all_registered().await, 1);
 
         assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
-        let open = db.list_open_interrupts(session.session_id).unwrap();
+        let open = db.list_open_interrupts(session.session_id).await.unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].interrupt_id, interrupt_id);
         assert_eq!(
@@ -1192,14 +1234,16 @@ mod tests {
         let set = question_set();
         let first = db
             .raise_interrupt_questions(session.session_id, "a", "first", &set)
+            .await
             .unwrap();
         let second = db
             .raise_interrupt_questions(session.session_id, "b", "second", &set)
+            .await
             .unwrap();
         let pending = hub.register(second);
         drop(pending);
 
-        let open = db.list_open_interrupts(session.session_id).unwrap();
+        let open = db.list_open_interrupts(session.session_id).await.unwrap();
         assert_eq!(open.len(), 2);
         assert_eq!(open[0].interrupt_id, first);
         assert_eq!(open[1].interrupt_id, second);

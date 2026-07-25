@@ -222,7 +222,7 @@ pub(super) fn is_remote_mutating_request(request: &Request) -> bool {
     proto::command!(command_is_remote_mutating_match, request)
 }
 
-pub(super) fn audit_remote_request(
+pub(super) async fn audit_remote_request(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
     kind: &str,
@@ -237,8 +237,13 @@ pub(super) fn audit_remote_request(
         Some(path) => {
             ctx.db
                 .insert_remote_audit_with_path(&tag, kind, session_id, verdict, Some(path))
+                .await
         }
-        None => ctx.db.insert_remote_audit(&tag, kind, session_id, verdict),
+        None => {
+            ctx.db
+                .insert_remote_audit(&tag, kind, session_id, verdict)
+                .await
+        }
     };
     if let Err(e) = result {
         tracing::warn!(error = %e, principal = %tag, request_kind = kind, "remote request audit write failed");

@@ -262,7 +262,7 @@ async fn standing_reject_gate_block(tool: &str, args: &Value, ctx: &ToolCtx) -> 
     match tool {
         "bash" => {
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
-            let scope = approver.command_standing_reject_scope(command)?;
+            let scope = approver.command_standing_reject_scope(command).await?;
             approver
                 .record_standing_reject_decision("bash", command, scope)
                 .await;
@@ -274,6 +274,7 @@ async fn standing_reject_gate_block(tool: &str, args: &Value, ctx: &ToolCtx) -> 
                 if let Some(scope) = approver
                     .store()
                     .mcp_tool_reject_scope(&invocation.server, &invocation.tool)
+                    .await
                 {
                     let target =
                         crate::approval::store::mcp_tool_key(&invocation.server, &invocation.tool);
@@ -623,6 +624,7 @@ mod safety_gate_tests {
                 .session
                 .db
                 .list_open_interrupts(ctx.session.id)
+                .await
                 .unwrap()
                 .first()
             {
@@ -633,7 +635,7 @@ mod safety_gate_tests {
         panic!("timed out waiting for gate interrupt");
     }
 
-    fn replay_question_from_row(
+    async fn replay_question_from_row(
         ctx: &ToolCtx,
         interrupt_id: uuid::Uuid,
     ) -> crate::engine::interrupt::PreResolvedInterruptQuestion {
@@ -641,6 +643,7 @@ mod safety_gate_tests {
             .session
             .db
             .get_interrupt(interrupt_id)
+            .await
             .unwrap()
             .expect("parked gate row");
         crate::engine::interrupt::PreResolvedInterruptQuestion {
@@ -758,6 +761,7 @@ mod safety_gate_tests {
         approver
             .store()
             .record_command_reject(info, Scope::Session)
+            .await
             .unwrap();
         let (tx, _rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "gh pr create" });
@@ -827,10 +831,12 @@ mod safety_gate_tests {
         approver
             .store()
             .record_command_reject(info, Scope::Session)
+            .await
             .unwrap();
         approver
             .store()
             .record_command(info, info.risk.tier, Scope::Session)
+            .await
             .unwrap();
         let (tx, _rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "gh pr create" });
@@ -877,6 +883,7 @@ mod safety_gate_tests {
         approver
             .store()
             .record_mcp_tool_reject("example", "mutate", Scope::Project)
+            .await
             .unwrap();
         let (tx, _rx) = mpsc::channel(8);
         let args =
@@ -912,6 +919,7 @@ mod safety_gate_tests {
         approver
             .store()
             .record_command_reject(info, Scope::Session)
+            .await
             .unwrap();
         let (tx, _rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "gh pr create" });
@@ -956,6 +964,7 @@ mod safety_gate_tests {
         approver
             .store()
             .record_command_reject(info, Scope::Session)
+            .await
             .unwrap();
         let (tx, _rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "gh pr create" });
@@ -1382,13 +1391,14 @@ mod safety_gate_tests {
             .session
             .db
             .get_interrupt(interrupt_id)
+            .await
             .unwrap()
             .expect("parked gate row");
         assert!(
             row.parked.is_some(),
             "gate interrupt must carry replay payload"
         );
-        assert_eq!(hub.park_all_registered(), 1);
+        assert_eq!(hub.park_all_registered().await, 1);
         assert_eq!(first.await.unwrap(), GateApproval::Parked);
 
         let response = crate::daemon::proto::ResolveResponse::Single {
@@ -1398,9 +1408,10 @@ mod safety_gate_tests {
             ctx.session
                 .db
                 .begin_parked_interrupt_execution(interrupt_id, &response)
+                .await
                 .unwrap()
         );
-        let question = replay_question_from_row(&ctx, interrupt_id);
+        let question = replay_question_from_row(&ctx, interrupt_id).await;
         let replayed = crate::engine::interrupt::with_pre_resolved_interrupt_question(
             interrupt_id,
             response,

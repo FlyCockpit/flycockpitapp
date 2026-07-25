@@ -636,18 +636,17 @@ mod tests {
         let hub = ctx.interrupts.clone();
         let resolver = tokio::spawn(async move {
             let iid = loop {
-                let open = db.list_open_interrupts(session_id).unwrap();
-                if let Some(row) = open.first() {
+                let open = db.list_open_interrupts(session_id).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(
-                iid,
-                crate::daemon::proto::ResolveResponse::Single {
-                    selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
-                }
-            ));
+            let response = crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            };
+            db.resolve_interrupt(iid, &response).await.unwrap();
+            assert!(hub.resolve(iid, response));
         });
         crate::tools::read::ReadTool
             .call(

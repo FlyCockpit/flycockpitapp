@@ -488,7 +488,7 @@ for line in sys.stdin:
         }
     }
 
-    fn host_with_mcp_grant(root: &std::path::Path, server: &str, tool: &str) -> HostContext {
+    async fn host_with_mcp_grant(root: &std::path::Path, server: &str, tool: &str) -> HostContext {
         let (mut ctx, db) = crate::tools::common::test_ctx_with_db(root);
         let store = crate::approval::store::GrantStore::new(
             db.clone(),
@@ -498,6 +498,7 @@ for line in sys.stdin:
         );
         store
             .record_mcp_tool(server, tool, crate::approval::store::Scope::Session)
+            .await
             .unwrap();
         ctx.approver = Some(Arc::new(crate::approval::Approver::new(
             store,
@@ -531,6 +532,7 @@ for line in sys.stdin:
         );
         store
             .record_mcp_tool("off", "t", crate::approval::store::Scope::Session)
+            .await
             .unwrap();
         ctx.approver = Some(Arc::new(crate::approval::Approver::new(
             store,
@@ -553,7 +555,7 @@ for line in sys.stdin:
         let mut cfg = McpConfig::default();
         cfg.servers.insert("fake".into(), stdio_cfg(&script));
         let grant_root = tempfile::tempdir().unwrap();
-        let host = host_with_mcp_grant(grant_root.path(), "fake", "count2");
+        let host = host_with_mcp_grant(grant_root.path(), "fake", "count2").await;
 
         let err = invoke(&cfg, &host, "fake", "count2", Value::Null)
             .await
@@ -572,6 +574,7 @@ for line in sys.stdin:
         let tmp = tempfile::tempdir().unwrap();
         let approvals = Arc::new(AtomicUsize::new(0));
         let host = host_with_mcp_grant(tmp.path(), "githb", "count")
+            .await
             .with_test_external_approval_entered({
                 let approvals = approvals.clone();
                 move |_server, _tool| {

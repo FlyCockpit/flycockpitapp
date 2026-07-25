@@ -482,11 +482,13 @@ mod tests {
         let hub = ctx.interrupts.clone();
         tokio::spawn(async move {
             let iid = loop {
-                if let Some(row) = db.list_open_interrupts(sid).unwrap().first() {
+                let open = db.list_open_interrupts(sid).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
+            db.resolve_interrupt(iid, &response).await.unwrap();
             assert!(hub.resolve(iid, response));
         })
     }
@@ -760,6 +762,7 @@ mod tests {
                 crate::approval::store::Scope::Session,
                 SandboxPathAccess::Read,
             )
+            .await
             .unwrap();
 
         check_native_access(&ctx, &target, SandboxPathAccess::Read)
@@ -854,17 +857,17 @@ mod tests {
         let hub = ctx.interrupts.clone();
         let resolver = tokio::spawn(async move {
             let iid = loop {
-                if let Some(row) = db.list_open_interrupts(sid).unwrap().first() {
+                let open = db.list_open_interrupts(sid).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(
-                iid,
-                ResolveResponse::Single {
-                    selected_id: ID_APPROVE_SESSION.into(),
-                }
-            ));
+            let response = ResolveResponse::Single {
+                selected_id: ID_APPROVE_SESSION.into(),
+            };
+            db.resolve_interrupt(iid, &response).await.unwrap();
+            assert!(hub.resolve(iid, response));
         });
         // First access prompts → granted → allowed.
         check_native_access(&ctx, &target, SandboxPathAccess::Read)
@@ -898,6 +901,7 @@ mod tests {
                 crate::approval::store::Scope::Session,
                 SandboxPathAccess::Read,
             )
+            .await
             .unwrap();
 
         check_native_access(&ctx, &target, SandboxPathAccess::Read)
@@ -927,12 +931,15 @@ mod tests {
         let hub = ctx.interrupts.clone();
         let resolver = tokio::spawn(async move {
             let iid = loop {
-                if let Some(row) = db.list_open_interrupts(sid).unwrap().first() {
+                let open = db.list_open_interrupts(sid).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(iid, ResolveResponse::Cancel));
+            let response = ResolveResponse::Cancel;
+            db.resolve_interrupt(iid, &response).await.unwrap();
+            assert!(hub.resolve(iid, response));
         });
         let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
             .await
@@ -1075,34 +1082,32 @@ mod tests {
         // stage 2 (mirrors the compound-command approval test).
         let resolver = tokio::spawn(async move {
             let iid1 = loop {
-                if let Some(row) = db.list_open_interrupts(sid).unwrap().first() {
+                let open = db.list_open_interrupts(sid).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(
-                iid1,
-                ResolveResponse::Single {
-                    selected_id: ID_GITIGNORE_FILE.into(),
-                }
-            ));
+            let response = ResolveResponse::Single {
+                selected_id: ID_GITIGNORE_FILE.into(),
+            };
+            db.resolve_interrupt(iid1, &response).await.unwrap();
+            assert!(hub.resolve(iid1, response));
             let iid2 = loop {
-                if let Some(row) = db
-                    .list_open_interrupts(sid)
-                    .unwrap()
+                let open = db.list_open_interrupts(sid).await.unwrap();
+                if let Some(row) = open
                     .iter()
-                    .find(|r| r.interrupt_id != iid1)
+                    .find(|r| r.interrupt_id != iid1 && hub.has_waiter(r.interrupt_id))
                 {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(
-                iid2,
-                ResolveResponse::Single {
-                    selected_id: ID_APPROVE_SESSION.into(),
-                }
-            ));
+            let response = ResolveResponse::Single {
+                selected_id: ID_APPROVE_SESSION.into(),
+            };
+            db.resolve_interrupt(iid2, &response).await.unwrap();
+            assert!(hub.resolve(iid2, response));
         });
         let out = check_gitignore_read(&ctx, &tmp.path().join(".env"))
             .await
@@ -1126,17 +1131,17 @@ mod tests {
         let hub = ctx.interrupts.clone();
         let resolver = tokio::spawn(async move {
             let interrupt_id = loop {
-                if let Some(row) = db.list_open_interrupts(sid).unwrap().first() {
+                let open = db.list_open_interrupts(sid).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(
-                interrupt_id,
-                ResolveResponse::Freetext {
-                    text: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
-                },
-            ));
+            let response = ResolveResponse::Freetext {
+                text: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+            };
+            db.resolve_interrupt(interrupt_id, &response).await.unwrap();
+            assert!(hub.resolve(interrupt_id, response));
         });
 
         let out = check_gitignore_read(&ctx, &tmp.path().join(".env"))

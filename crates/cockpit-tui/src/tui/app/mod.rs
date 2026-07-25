@@ -373,9 +373,7 @@ fn startup_daemon_state(
     autostart: cockpit_config::extended::DaemonAutostart,
     db: Option<&cockpit_db::Db>,
 ) -> StartupDaemonState {
-    let notice_seen = db
-        .and_then(|db| db.app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG).ok())
-        .unwrap_or(false);
+    let notice_seen = false;
     match cockpit_core::daemon::DaemonPaths::resolve() {
         Ok(paths) if paths.ephemeral => match cockpit_core::daemon::probe_blocking(&paths) {
             cockpit_core::daemon::DaemonStatus::Running => StartupDaemonState {
@@ -488,8 +486,7 @@ fn daemon_autostart_notice(
     if notice_seen {
         return None;
     }
-    let db = db?;
-    let _ = db.mark_app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG);
+    db?;
     Some(text.to_string())
 }
 
@@ -1619,6 +1616,7 @@ pub struct App {
     pub(super) completed_async_actions: Vec<AsyncActionResult>,
     pub(super) skills_pane_generation: u64,
     startup_background: StartupBackground,
+    startup_daemon_notice: Option<String>,
     /// Last-rendered chat area `Rect`. Used to translate absolute
     /// terminal mouse coordinates into chat-relative coordinates so
     /// click-to-expand works on thinking blocks.
@@ -2929,6 +2927,7 @@ impl App {
                 db: startup_db,
                 started: false,
             },
+            startup_daemon_notice: daemon_state.notice,
             chat_area: None,
             input_area: None,
             suggestion_box_area: None,
@@ -3092,9 +3091,6 @@ impl App {
             keys_overlay: None,
             keyboard_enhancement_active: false,
         };
-        if let Some(notice) = daemon_state.notice {
-            app.show_toast(notice, ToastKind::Info);
-        }
         // First-run convenience: if the daemon prompt doesn't gate
         // startup, open the Add-Provider wizard immediately when no
         // providers are configured. The prompt-resolution branches
@@ -3113,6 +3109,19 @@ impl App {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        if let Some(notice) = self.startup_daemon_notice.take()
+            && let Some(db) = self.startup_background.db.as_ref()
+        {
+            let notice_seen = db
+                .app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG)
+                .await
+                .unwrap_or(false);
+            if !notice_seen {
+                let _ = db.mark_app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG).await;
+                self.show_toast(notice, ToastKind::Info);
+            }
+        }
+
         // The launch banner now renders *inside* the alt screen as the
         // top of the chat pane (see `render_history` / `banner_box`),
         // so we no longer dump it to stdout before entering the alt

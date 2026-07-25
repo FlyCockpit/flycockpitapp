@@ -48,7 +48,7 @@ impl Approver {
         });
         let decision = match choice {
             ApprovalChoice::Approve(Scope::Session) => {
-                if let Err(e) = self.store.record_harness(harness, Scope::Session) {
+                if let Err(e) = self.store.record_harness(harness, Scope::Session).await {
                     tracing::warn!(error = %e, harness, "recording harness session grant failed; applying once");
                     Decision::Allow { scope: Scope::Once }
                 } else {
@@ -108,12 +108,18 @@ mod tests {
             let open = approver
                 .db
                 .list_open_interrupts(approver.session_id)
+                .await
                 .unwrap();
             if let Some(row) = open.first() {
                 let row = row.clone();
+                if !approver.interrupts.has_waiter(row.interrupt_id) {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 approver
                     .db
                     .resolve_interrupt(row.interrupt_id, &response)
+                    .await
                     .unwrap();
                 assert!(
                     approver
@@ -228,7 +234,7 @@ mod tests {
                 scope: Scope::Session
             }
         );
-        assert!(approver.store.is_harness_granted("codex"));
+        assert!(approver.store.is_harness_granted("codex").await);
         let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["tool"], "harness_invoke");
@@ -255,7 +261,7 @@ mod tests {
         .await;
 
         assert_eq!(decision, Decision::Allow { scope: Scope::Once });
-        assert!(!approver.store.is_harness_granted("codex"));
+        assert!(!approver.store.is_harness_granted("codex").await);
         let events = permission_events(&approver).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["decision"], "allow");
@@ -294,7 +300,7 @@ mod tests {
             let approver = approver(tmp.path());
             let (decision, _) = answer(approver.clone(), response).await;
             assert_eq!(decision, expected);
-            assert!(!approver.store.is_harness_granted("codex"));
+            assert!(!approver.store.is_harness_granted("codex").await);
             let events = permission_events(&approver).await;
             assert_eq!(events.len(), 1);
             assert_eq!(events[0]["tool"], "harness_invoke");

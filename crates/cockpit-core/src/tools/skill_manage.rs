@@ -403,14 +403,20 @@ mod tests {
 
         let mut interrupt_id = None;
         for _ in 0..1000 {
-            if let Some(row) = db.list_open_interrupts(ctx.session.id).unwrap().first() {
-                interrupt_id = Some(row.interrupt_id);
-                break;
+            let open = db.list_open_interrupts(ctx.session.id).await.unwrap();
+            if let Some(row) = open
+                .iter()
+                .find(|row| ctx.interrupts.has_waiter(row.interrupt_id))
+            {
+                let row_id = row.interrupt_id;
+                if ctx.interrupts.park_all_registered().await == 1 {
+                    interrupt_id = Some(row_id);
+                    break;
+                }
             }
             tokio::task::yield_now().await;
         }
         let interrupt_id = interrupt_id.expect("skill_manage call did not raise an interrupt");
-        assert_eq!(ctx.interrupts.park_all_registered(), 1);
         let error = task.await.unwrap().unwrap_err();
         assert!(crate::engine::interrupt::is_parked(&error));
         interrupt_id
@@ -427,12 +433,13 @@ mod tests {
         })
     }
 
-    fn replay_question_from_row(
+    async fn replay_question_from_row(
         db: &crate::db::Db,
         interrupt_id: uuid::Uuid,
     ) -> crate::engine::interrupt::PreResolvedInterruptQuestion {
         let row = db
             .get_interrupt(interrupt_id)
+            .await
             .unwrap()
             .expect("parked skill approval row");
         crate::engine::interrupt::PreResolvedInterruptQuestion {
@@ -775,7 +782,7 @@ mod tests {
                 .await;
 
         assert!(!root.join("default-gated/SKILL.md").exists());
-        let question = replay_question_from_row(&db, interrupt_id);
+        let question = replay_question_from_row(&db, interrupt_id).await;
         let output = crate::engine::interrupt::with_pre_resolved_interrupt_question(
             interrupt_id,
             ResolveResponse::Single {
@@ -806,7 +813,12 @@ mod tests {
 
         assert!(output.content.contains("Created skill"));
         assert!(root.join("background-default/SKILL.md").is_file());
-        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+        assert!(
+            db.list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -824,7 +836,12 @@ mod tests {
 
         assert!(output.content.contains("Created skill"));
         assert!(root.join("explicit-direct/SKILL.md").is_file());
-        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+        assert!(
+            db.list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -917,7 +934,12 @@ mod tests {
 
         assert!(output.content.contains("automatically denied"));
         assert!(!root.join("auto-denied/SKILL.md").exists());
-        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+        assert!(
+            db.list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1061,21 +1083,27 @@ mod tests {
         });
 
         let interrupt_id = loop {
-            if let Some(row) = db.list_open_interrupts(ctx.session.id).unwrap().first() {
-                break row.interrupt_id;
+            let open = db.list_open_interrupts(ctx.session.id).await.unwrap();
+            if let Some(row) = open
+                .iter()
+                .find(|row| ctx.interrupts.has_waiter(row.interrupt_id))
+            {
+                let interrupt_id = row.interrupt_id;
+                if ctx.interrupts.park_all_registered().await == 1 {
+                    break interrupt_id;
+                }
             }
             tokio::task::yield_now().await;
         };
-        assert_eq!(ctx.interrupts.park_all_registered(), 1);
         let error = task.await.unwrap().unwrap_err();
         assert!(crate::engine::interrupt::is_parked(&error));
         assert!(!root.join("gated-skill/SKILL.md").exists());
-        let row = db.get_interrupt(interrupt_id).unwrap().unwrap();
+        let row = db.get_interrupt(interrupt_id).await.unwrap().unwrap();
         let parked = row.parked.unwrap();
         assert_eq!(parked.tool, "skill_manage");
         assert_eq!(parked.args, args);
 
-        let question = replay_question_from_row(&db, interrupt_id);
+        let question = replay_question_from_row(&db, interrupt_id).await;
         let output = crate::engine::interrupt::with_pre_resolved_interrupt_question(
             interrupt_id,
             ResolveResponse::Single {

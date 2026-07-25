@@ -2293,8 +2293,10 @@ mod tests {
             loop {
                 if let Some(row) = db
                     .list_open_interrupts(session_id)
+                    .await
                     .unwrap()
-                    .first()
+                    .iter()
+                    .find(|row| hub.has_waiter(row.interrupt_id))
                     .cloned()
                 {
                     return row;
@@ -2332,12 +2334,13 @@ mod tests {
             "{options:?}"
         );
 
-        assert!(hub.resolve(
-            row.interrupt_id,
-            crate::daemon::proto::ResolveResponse::Single {
-                selected_id: crate::approval::ID_APPROVE.to_string(),
-            },
-        ));
+        let response = crate::daemon::proto::ResolveResponse::Single {
+            selected_id: crate::approval::ID_APPROVE.to_string(),
+        };
+        db.resolve_interrupt(row.interrupt_id, &response)
+            .await
+            .unwrap();
+        assert!(hub.resolve(row.interrupt_id, response));
 
         let out = tokio::time::timeout(std::time::Duration::from_secs(2), script)
             .await

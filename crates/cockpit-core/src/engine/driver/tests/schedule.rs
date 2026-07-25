@@ -468,7 +468,7 @@ async fn background_gate_refuse_starts_no_job() {
     driver.session.set_sandbox_enabled(true);
     let mut rx = capture_schedule_events(&mut driver);
     let (approver, _hub) = install_background_approver(&mut driver);
-    grant_background_command(&approver, "printf refused");
+    grant_background_command(&approver, "printf refused").await;
 
     let out = super::super::schedule_dispatch::with_background_sandbox_availability_for_test(
         crate::tools::shell_sandbox::SandboxAvailability::Unavailable {
@@ -519,12 +519,13 @@ fn install_background_approver(
     (approver, hub)
 }
 
-fn grant_background_command(approver: &crate::approval::Approver, command: &str) {
+async fn grant_background_command(approver: &crate::approval::Approver, command: &str) {
     let classification = crate::approval::classify::classify(command);
     for info in classification.simple_commands() {
         approver
             .store()
             .record_command(info, info.risk.tier, crate::approval::store::Scope::Session)
+            .await
             .unwrap();
     }
 }
@@ -553,12 +554,13 @@ async fn resolve_next_interrupt_with_response(
     response: crate::daemon::proto::ResolveResponse,
 ) -> uuid::Uuid {
     let iid = loop {
-        let open = db.list_open_interrupts(sid).unwrap();
-        if let Some(row) = open.first() {
+        let open = db.list_open_interrupts(sid).await.unwrap();
+        if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
             break row.interrupt_id;
         }
         tokio::task::yield_now().await;
     };
+    db.resolve_interrupt(iid, &response).await.unwrap();
     assert!(hub.resolve(iid, response));
     iid
 }

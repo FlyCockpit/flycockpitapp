@@ -66,15 +66,20 @@ async fn learn_respects_write_gate() {
     });
 
     loop {
-        if !db.list_open_interrupts(session_id).unwrap().is_empty() {
+        if !db
+            .list_open_interrupts(session_id)
+            .await
+            .unwrap()
+            .is_empty()
+            && hub.park_all_registered().await == 1
+        {
             break;
         }
         tokio::task::yield_now().await;
     }
-    assert_eq!(hub.park_all_registered(), 1);
     task.await.unwrap().unwrap();
     assert!(!root.join("gated-learn/SKILL.md").exists());
-    let row = db.list_open_interrupts(session_id).unwrap().remove(0);
+    let row = db.list_open_interrupts(session_id).await.unwrap().remove(0);
     let parked = row.parked.unwrap();
     assert_eq!(parked.tool, "skill_manage");
     assert_eq!(parked.call_id, "learn-save");

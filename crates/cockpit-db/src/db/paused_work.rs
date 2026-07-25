@@ -55,11 +55,7 @@ pub struct PausedWorkRow {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn upsert_paused_session_work(
+    pub async fn upsert_paused_session_work(
         &self,
         session_id: Uuid,
         active_agent: &str,
@@ -73,7 +69,7 @@ impl Db {
         let project_root = project_root.to_owned();
         let reason = reason.to_owned();
         let daemon_version = daemon_version.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO paused_session_work (
                     session_id, status, active_agent, project_root, reason,
@@ -101,27 +97,26 @@ impl Db {
             .context("upserting paused session work")?;
             Ok(())
         })
+        .await
     }
 
-    pub fn mark_paused_session_work_resumed(&self, session_id: Uuid) -> Result<bool> {
+    pub async fn mark_paused_session_work_resumed(&self, session_id: Uuid) -> Result<bool> {
         self.resolve_paused_session_work(session_id, PausedWorkStatus::Resumed)
+            .await
     }
 
-    pub fn cancel_paused_session_work(&self, session_id: Uuid) -> Result<bool> {
+    pub async fn cancel_paused_session_work(&self, session_id: Uuid) -> Result<bool> {
         self.resolve_paused_session_work(session_id, PausedWorkStatus::Cancelled)
+            .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn resolve_paused_session_work(
+    async fn resolve_paused_session_work(
         &self,
         session_id: Uuid,
         status: PausedWorkStatus,
     ) -> Result<bool> {
         let now = Utc::now().timestamp();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let changed = conn
                 .execute(
                     "UPDATE paused_session_work
@@ -132,15 +127,13 @@ impl Db {
                 .context("resolving paused session work")?;
             Ok(changed > 0)
         })
+        .await
     }
 
     #[allow(dead_code)]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn paused_session_work(&self, session_id: Uuid) -> Result<Option<PausedWorkRow>> {
-        self.read_blocking(|conn| Self::paused_session_work_conn(conn, session_id))
+    pub async fn paused_session_work(&self, session_id: Uuid) -> Result<Option<PausedWorkRow>> {
+        self.read(move |conn| Self::paused_session_work_conn(conn, session_id))
+            .await
     }
 
     pub fn paused_session_work_conn(
@@ -160,12 +153,8 @@ impl Db {
         .context("reading paused session work")
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn paused_session_work_all(&self) -> Result<Vec<PausedWorkRow>> {
-        self.read_blocking(|conn| {
+    pub async fn paused_session_work_all(&self) -> Result<Vec<PausedWorkRow>> {
+        self.read(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT session_id, status, active_agent, project_root, reason,
@@ -182,6 +171,7 @@ impl Db {
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .context("decoding paused session work")
         })
+        .await
     }
 }
 
@@ -210,6 +200,49 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn db_async_approval_paused_work_roundtrip_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
+
+        db.upsert_paused_session_work(
+            session.session_id,
+            "Build",
+            "/tmp/p",
+            "approval parked",
+            3,
+            "0.1.test",
+        )
+        .await
+        .unwrap();
+
+        let row = db
+            .paused_session_work(session.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.session_id, session.session_id);
+        assert_eq!(row.status, PausedWorkStatus::Paused);
+        assert_eq!(row.reason, "approval parked");
+        assert_eq!(row.pending_tool_count, 3);
+
+        let all = db.paused_session_work_all().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].session_id, session.session_id);
+
+        assert!(
+            db.mark_paused_session_work_resumed(session.session_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.paused_session_work(session.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn paused_work_round_trips_and_resolves_once() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
@@ -222,9 +255,14 @@ mod tests {
             2,
             "0.1.test",
         )
+        .await
         .unwrap();
 
-        let row = db.paused_session_work(session.session_id).unwrap().unwrap();
+        let row = db
+            .paused_session_work(session.session_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.session_id, session.session_id);
         assert_eq!(row.status, PausedWorkStatus::Paused);
         assert_eq!(row.active_agent, "Build");
@@ -232,14 +270,17 @@ mod tests {
 
         assert!(
             db.mark_paused_session_work_resumed(session.session_id)
+                .await
                 .unwrap()
         );
         assert!(
             !db.mark_paused_session_work_resumed(session.session_id)
+                .await
                 .unwrap()
         );
         assert!(
             db.paused_session_work(session.session_id)
+                .await
                 .unwrap()
                 .is_none()
         );

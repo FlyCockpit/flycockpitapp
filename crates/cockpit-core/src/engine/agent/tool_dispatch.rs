@@ -1780,11 +1780,12 @@ mod tests {
         for _ in 0..100 {
             if let Some(row) = db
                 .list_open_interrupts(session_id)
+                .await
                 .unwrap()
                 .into_iter()
                 .next()
             {
-                assert!(interrupts.park(row.interrupt_id));
+                assert!(interrupts.park(row.interrupt_id).await);
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -1827,7 +1828,7 @@ mod tests {
             "parked call wrote a tool_result into history: {history:?}"
         );
 
-        let open = session.db.list_open_interrupts(session.id).unwrap();
+        let open = session.db.list_open_interrupts(session.id).await.unwrap();
         assert_eq!(open.len(), 1);
         let row = &open[0];
         assert_eq!(
@@ -1840,10 +1841,11 @@ mod tests {
         );
     }
 
-    fn parked_interrupt_id(session: &Session) -> Uuid {
+    async fn parked_interrupt_id(session: &Session) -> Uuid {
         session
             .db
             .list_open_interrupts(session.id)
+            .await
             .unwrap()
             .into_iter()
             .find(|row| row.state == crate::db::needs_attention::InterruptState::Parked)
@@ -1851,13 +1853,14 @@ mod tests {
             .expect("parked interrupt row")
     }
 
-    fn parked_replay_question(
+    async fn parked_replay_question(
         session: &Session,
         interrupt_id: Uuid,
     ) -> crate::engine::interrupt::PreResolvedInterruptQuestion {
         let row = session
             .db
             .get_interrupt(interrupt_id)
+            .await
             .unwrap()
             .expect("parked interrupt row");
         crate::engine::interrupt::PreResolvedInterruptQuestion {
@@ -2014,6 +2017,7 @@ mod tests {
             session
                 .db
                 .list_open_interrupts(session.id)
+                .await
                 .unwrap()
                 .is_empty(),
             "placeholder block must not consult a parking safety gate"
@@ -2472,7 +2476,7 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_parked_call_has_no_result(&session, &history, &call.id).await;
 
-        let interrupt_id = parked_interrupt_id(&session);
+        let interrupt_id = parked_interrupt_id(&session).await;
         let response = crate::daemon::proto::ResolveResponse::Single {
             selected_id: "allow".to_string(),
         };
@@ -2480,16 +2484,18 @@ mod tests {
             session
                 .db
                 .begin_parked_interrupt_execution(interrupt_id, &response)
+                .await
                 .unwrap()
         );
         assert!(
             !session
                 .db
                 .begin_parked_interrupt_execution(interrupt_id, &response)
+                .await
                 .unwrap(),
             "duplicate parked answer must not claim execution twice"
         );
-        let question = parked_replay_question(&session, interrupt_id);
+        let question = parked_replay_question(&session, interrupt_id).await;
         crate::engine::interrupt::with_pre_resolved_interrupt_question(
             interrupt_id,
             response,
@@ -2566,7 +2572,7 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_parked_call_has_no_result(&session, &history, &call.id).await;
 
-        let interrupt_id = parked_interrupt_id(&session);
+        let interrupt_id = parked_interrupt_id(&session).await;
         let response = crate::daemon::proto::ResolveResponse::Freetext {
             text: "continue".to_string(),
         };
@@ -2574,16 +2580,18 @@ mod tests {
             session
                 .db
                 .begin_parked_interrupt_execution(interrupt_id, &response)
+                .await
                 .unwrap()
         );
         assert!(
             !session
                 .db
                 .begin_parked_interrupt_execution(interrupt_id, &response)
+                .await
                 .unwrap(),
             "duplicate parked answer must not claim execution twice"
         );
-        let question = parked_replay_question(&session, interrupt_id);
+        let question = parked_replay_question(&session, interrupt_id).await;
         crate::engine::interrupt::with_pre_resolved_interrupt_question(
             interrupt_id,
             response,
@@ -2643,10 +2651,11 @@ mod tests {
         parker.await.unwrap();
 
         assert!(crate::engine::interrupt::is_parked(&err), "{err:#}");
-        let interrupt_id = parked_interrupt_id(&session);
+        let interrupt_id = parked_interrupt_id(&session).await;
         let row = session
             .db
             .get_interrupt(interrupt_id)
+            .await
             .unwrap()
             .expect("parked inner approval row");
         let gate = row
@@ -2869,6 +2878,7 @@ mod tests {
         approver
             .store()
             .record_command_reject(info, crate::approval::store::Scope::Session)
+            .await
             .unwrap();
         let env = DispatchEnv {
             agent: &agent,

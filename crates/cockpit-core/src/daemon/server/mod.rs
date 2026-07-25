@@ -2802,6 +2802,7 @@ where
             paused_sessions: ctx
                 .db
                 .paused_session_work_all()
+                .await
                 .map(|r| r.len())
                 .unwrap_or(0) as u32,
             database_path: ctx

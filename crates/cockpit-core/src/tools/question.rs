@@ -520,7 +520,12 @@ mod tests {
 
         QuestionTool.call(sample_call_args(), &ctx).await.unwrap();
 
-        assert!(db.list_open_interrupts(ctx.session.id).unwrap().is_empty());
+        assert!(
+            db.list_open_interrupts(ctx.session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -665,18 +670,17 @@ mod tests {
 
         // Wait for the interrupt to appear in the DB, then resolve it.
         let iid = loop {
-            let open = db.list_open_interrupts(session_id).unwrap();
-            if let Some(row) = open.first() {
+            let open = db.list_open_interrupts(session_id).await.unwrap();
+            if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                 break row.interrupt_id;
             }
             tokio::task::yield_now().await;
         };
-        assert!(hub.resolve(
-            iid,
-            ResolveResponse::Single {
-                selected_id: "pg".into()
-            }
-        ));
+        let response = ResolveResponse::Single {
+            selected_id: "pg".into(),
+        };
+        db.resolve_interrupt(iid, &response).await.unwrap();
+        assert!(hub.resolve(iid, response));
 
         let out = call.await.unwrap().unwrap();
         assert!(out.content.contains("DB? → Postgres"));

@@ -23,7 +23,7 @@ impl Approver {
         // Standing reject short-circuit (checked before allow). A rejected
         // path auto-denies the out-of-cwd access with no prompt; recorded with
         // the `StandingReject` source so the timeline reflects the reject.
-        if self.store.is_path_rejected(path) {
+        if self.store.is_path_rejected(path).await {
             self.record_permission_decision(
                 "path",
                 &target,
@@ -34,7 +34,7 @@ impl Approver {
             .await;
             return Ok(Decision::Deny);
         }
-        if self.store.is_path_granted_for(path, required) {
+        if self.store.is_path_granted_for(path, required).await {
             let decision = Decision::Allow {
                 scope: Scope::Session,
             };
@@ -74,14 +74,14 @@ impl Approver {
             ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
             ApprovalChoice::GrantPaths(_) => Decision::Deny,
             ApprovalChoice::Approve(scope) => {
-                self.store.record_path(path, scope, required)?;
+                self.store.record_path(path, scope, required).await?;
                 Decision::Allow { scope }
             }
             ApprovalChoice::ApproveAllOnce => Decision::Deny,
             // A persistable path reject: record the standing reject, then deny
             // this access. (`Reject(Once)` is mapped to `Deny` upstream.)
             ApprovalChoice::Reject(scope) => {
-                self.store.record_path_reject(path, scope)?;
+                self.store.record_path_reject(path, scope).await?;
                 Decision::Deny
             }
         };

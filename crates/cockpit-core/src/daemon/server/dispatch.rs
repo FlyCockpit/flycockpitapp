@@ -40,7 +40,8 @@ pub(super) async fn handle_serialized_request(
                 audit_session_id,
                 audit_path.as_deref(),
                 "denied",
-            );
+            )
+            .await;
         }
         return Err(error);
     }
@@ -52,7 +53,8 @@ pub(super) async fn handle_serialized_request(
             audit_session_id,
             audit_path.as_deref(),
             "allowed",
-        );
+        )
+        .await;
     }
     match request {
         Request::Attach {
@@ -295,6 +297,7 @@ pub(super) async fn handle_serialized_request(
             let changed = ctx
                 .db
                 .mark_paused_session_work_resumed(session_id)
+                .await
                 .map_err(internal)?;
             if changed
                 && let Some(att) = state.attached.as_ref()
@@ -312,6 +315,7 @@ pub(super) async fn handle_serialized_request(
             let changed = ctx
                 .db
                 .cancel_paused_session_work(session_id)
+                .await
                 .map_err(internal)?;
             if changed {
                 if let Err(e) = ctx.registry.locks().suspend_session(session_id).await {
@@ -718,6 +722,7 @@ pub(super) async fn handle_serialized_request(
         Request::ShareSession { session_id, shared } => {
             ctx.db
                 .set_session_shared_with_collaborators(session_id, shared)
+                .await
                 .map_err(internal)?;
             Ok(Response::Ack)
         }
@@ -1039,7 +1044,12 @@ pub(super) async fn handle_serialized_request(
             socket_path: ctx.paths.socket.display().to_string(),
             daemon_version: proto::DAEMON_VERSION.to_string(),
             protocol_version: proto::PROTOCOL_VERSION,
-            paused_sessions: ctx.db.paused_session_work_all().map_err(internal)?.len() as u32,
+            paused_sessions: ctx
+                .db
+                .paused_session_work_all()
+                .await
+                .map_err(internal)?
+                .len() as u32,
             database_path: ctx
                 .db
                 .path()
@@ -1225,7 +1235,8 @@ pub(super) async fn handle_concurrent_request(
                 None,
                 audit_path.as_deref(),
                 "denied",
-            );
+            )
+            .await;
         }
         return Err(error);
     }
@@ -1237,7 +1248,8 @@ pub(super) async fn handle_concurrent_request(
             None,
             audit_path.as_deref(),
             "allowed",
-        );
+        )
+        .await;
     }
     #[cfg(test)]
     apply_concurrent_request_test_hook(&request).await;
@@ -1455,7 +1467,12 @@ pub(super) async fn handle_concurrent_request(
             socket_path: ctx.paths.socket.display().to_string(),
             daemon_version: proto::DAEMON_VERSION.to_string(),
             protocol_version: proto::PROTOCOL_VERSION,
-            paused_sessions: ctx.db.paused_session_work_all().map_err(internal)?.len() as u32,
+            paused_sessions: ctx
+                .db
+                .paused_session_work_all()
+                .await
+                .map_err(internal)?
+                .len() as u32,
             database_path: ctx
                 .db
                 .path()
@@ -2118,7 +2135,7 @@ pub(super) async fn attach(
             .await
             .map_err(internal)?;
         att.handle.broadcast_gitignore_allow();
-        att.handle.broadcast_active_interrupt();
+        att.handle.broadcast_active_interrupt().await;
         att.handle.broadcast_sandbox_escalation();
         att.handle.broadcast_sandbox_unavailable_or_probe();
         att.handle.broadcast_config_snapshot();
@@ -2370,31 +2387,23 @@ pub(super) fn stats_range_from_proto(range: proto::StatsRange) -> crate::db::sta
     }
 }
 
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; migrated later in db-async-ops-and-tui-render"
-)]
 pub(super) async fn stats_rollup(
     ctx: &Arc<DaemonContext>,
     project_id: Option<String>,
     range: proto::StatsRange,
     by_role: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let db = ctx.db.clone();
-    let rollup = tokio::task::spawn_blocking(move || {
-        let scope = project_id
-            .map(crate::db::stats::StatsScope::Project)
-            .unwrap_or(crate::db::stats::StatsScope::All);
-        let range = stats_range_from_proto(range);
-        let prices = crate::db::stats::PriceTable::load_default();
-        let now = chrono::Utc::now().timestamp();
-        db.read_blocking(move |conn| {
-            crate::db::stats::rollup(conn, &scope, range, &prices, by_role, now)
-        })
-    })
-    .await
-    .map_err(internal)?
-    .map_err(internal)?;
+    let scope = project_id
+        .map(crate::db::stats::StatsScope::Project)
+        .unwrap_or(crate::db::stats::StatsScope::All);
+    let range = stats_range_from_proto(range);
+    let prices = crate::db::stats::PriceTable::load_default();
+    let now = chrono::Utc::now().timestamp();
+    let rollup = ctx
+        .db
+        .read(move |conn| crate::db::stats::rollup(conn, &scope, range, &prices, by_role, now))
+        .await
+        .map_err(internal)?;
     Ok(Response::StatsRollup { rollup })
 }
 

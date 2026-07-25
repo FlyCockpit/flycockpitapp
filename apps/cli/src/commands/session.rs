@@ -154,6 +154,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
     let db = Db::open_default().context("opening cockpit DB")?;
     let row = db
         .get_interrupt(interrupt_id)
+        .await
         .context("loading interrupt")?
         .ok_or_else(|| anyhow::anyhow!("interrupt {interrupt_id} not found"))?;
     if row.session_id != session_id {
@@ -421,7 +422,7 @@ mod tests {
         }
     }
 
-    fn single_row() -> (Db, Uuid, Uuid) {
+    async fn single_row() -> (Db, Uuid, Uuid) {
         let db = Db::open_in_memory().unwrap();
         let session = Session::create(db.clone(), std::env::temp_dir(), "Build").unwrap();
         let set = InterruptQuestionSet {
@@ -437,6 +438,7 @@ mod tests {
         };
         let interrupt_id = db
             .raise_interrupt_questions(session.id, "Build", "Pick", &set)
+            .await
             .unwrap();
         (db, session.id, interrupt_id)
     }
@@ -465,10 +467,10 @@ mod tests {
         assert!(matches!(response, ResolveResponse::Batch { .. }));
     }
 
-    #[test]
-    fn validates_option_ids_against_pending_question() {
-        let (db, _session_id, interrupt_id) = single_row();
-        let row = db.get_interrupt(interrupt_id).unwrap().unwrap();
+    #[tokio::test]
+    async fn validates_option_ids_against_pending_question() {
+        let (db, _session_id, interrupt_id) = single_row().await;
+        let row = db.get_interrupt(interrupt_id).await.unwrap().unwrap();
         validate_response(
             &row,
             &ResolveResponse::Single {

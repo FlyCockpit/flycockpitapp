@@ -136,7 +136,7 @@ pub(super) fn record_interrupt_decision_event(
         .ok()
 }
 
-pub(super) fn finish_parked_replay_completion(
+pub(super) async fn finish_parked_replay_completion(
     session: &Session,
     event_tx: &EventSender,
     redaction: &SharedRedactionTable,
@@ -149,7 +149,8 @@ pub(super) fn finish_parked_replay_completion(
         Err(error) => {
             let _ = session
                 .db
-                .mark_interrupt_interrupted(completion.interrupt_id);
+                .mark_interrupt_interrupted(completion.interrupt_id)
+                .await;
             tracing::warn!(
                 %error,
                 interrupt_id = %completion.interrupt_id,
@@ -168,7 +169,7 @@ pub(super) fn finish_parked_replay_completion(
                 },
                 NoticeSource::DaemonDirect,
             );
-            interrupts.emit_queue_state();
+            interrupts.emit_queue_state().await;
             return;
         }
     };
@@ -184,6 +185,7 @@ pub(super) fn finish_parked_replay_completion(
     if let Err(error) = session
         .db
         .complete_executing_interrupt(completion.interrupt_id)
+        .await
     {
         tracing::warn!(
             %error,
@@ -208,13 +210,13 @@ pub(super) fn finish_parked_replay_completion(
         outcome,
         crate::engine::driver::ParkedReplayOutcome::ParkedAgain
     ) {
-        interrupts.emit_active_from_db();
+        interrupts.emit_active_from_db().await;
         return;
     }
     if completion.was_active {
-        interrupts.emit_active_from_db();
+        interrupts.emit_active_from_db().await;
     } else {
-        interrupts.emit_queue_state();
+        interrupts.emit_queue_state().await;
     }
 }
 
@@ -308,10 +310,10 @@ pub(super) async fn run_worker(
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to the
     // configured default when it's unset/unknown. Removed stored primaries
     // force the release default (`Build`).
-    let root_agent_name = session
-        .assistant_name
-        .clone()
-        .unwrap_or_else(|| resolve_root_agent(session_id, &session.db, &extended_cfg));
+    let root_agent_name = match session.assistant_name.clone() {
+        Some(name) => name,
+        None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
+    };
     if session.assistant_name.is_none()
         && let Some(text) =
             super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
@@ -821,14 +823,14 @@ pub(super) async fn run_worker(
         );
     }
 
-    match session.db.list_reconcilable_interrupts(session_id) {
+    match session.db.list_reconcilable_interrupts(session_id).await {
         Ok(rows) => {
             for row in rows {
                 match row.state {
                     crate::db::needs_attention::InterruptState::Open
                         if validate_parked_interrupt_payload(&row).is_ok() =>
                     {
-                        if let Err(error) = session.db.park_interrupt(row.interrupt_id) {
+                        if let Err(error) = session.db.park_interrupt(row.interrupt_id).await {
                             tracing::warn!(
                                 %error,
                                 interrupt_id = %row.interrupt_id,
@@ -841,7 +843,10 @@ pub(super) async fn run_worker(
                     crate::db::needs_attention::InterruptState::Open
                     | crate::db::needs_attention::InterruptState::Parked
                     | crate::db::needs_attention::InterruptState::Executing => {
-                        if let Err(error) = session.db.mark_interrupt_interrupted(row.interrupt_id)
+                        if let Err(error) = session
+                            .db
+                            .mark_interrupt_interrupted(row.interrupt_id)
+                            .await
                         {
                             tracing::warn!(
                                 %error,
@@ -986,7 +991,8 @@ pub(super) async fn run_worker(
                     &interrupts,
                     session_id,
                     completion,
-                );
+                )
+                .await;
             }
             WorkerInput::Work(work) => match work {
                 SessionWork::UserMessage {
@@ -1244,10 +1250,11 @@ pub(super) async fn run_worker(
                     interrupt_id,
                     response,
                 } => {
-                    let row = session.db.get_interrupt(interrupt_id).ok().flatten();
+                    let row = session.db.get_interrupt(interrupt_id).await.ok().flatten();
                     let was_active = session
                         .db
                         .list_open_interrupts(session_id)
+                        .await
                         .ok()
                         .and_then(|open| open.first().map(|row| row.interrupt_id))
                         == Some(interrupt_id);
@@ -1260,6 +1267,7 @@ pub(super) async fn run_worker(
                         let claimed = match session
                             .db
                             .begin_parked_interrupt_execution(interrupt_id, &response)
+                            .await
                         {
                             Ok(claimed) => claimed,
                             Err(error) => {
@@ -1268,7 +1276,7 @@ pub(super) async fn run_worker(
                             }
                         };
                         if !claimed {
-                            interrupts.emit_queue_state();
+                            interrupts.emit_queue_state().await;
                             continue;
                         }
                         // Process-boundary lifecycle tests kill the daemon while
@@ -1284,7 +1292,7 @@ pub(super) async fn run_worker(
                             }
                         }
                         let Some(payload) = row.parked.clone() else {
-                            let _ = session.db.mark_interrupt_interrupted(interrupt_id);
+                            let _ = session.db.mark_interrupt_interrupted(interrupt_id).await;
                             send_current_session_event(
                                 &session,
                                 &event_tx,
@@ -1297,7 +1305,7 @@ pub(super) async fn run_worker(
                                 },
                                 NoticeSource::DaemonDirect,
                             );
-                            interrupts.emit_queue_state();
+                            interrupts.emit_queue_state().await;
                             continue;
                         };
                         let Some(questions) = row.questions.clone().or_else(|| {
@@ -1307,7 +1315,7 @@ pub(super) async fn run_worker(
                                 }
                             })
                         }) else {
-                            let _ = session.db.mark_interrupt_interrupted(interrupt_id);
+                            let _ = session.db.mark_interrupt_interrupted(interrupt_id).await;
                             send_current_session_event(
                                 &session,
                                 &event_tx,
@@ -1320,12 +1328,13 @@ pub(super) async fn run_worker(
                                 },
                                 NoticeSource::DaemonDirect,
                             );
-                            interrupts.emit_queue_state();
+                            interrupts.emit_queue_state().await;
                             continue;
                         };
                         let occurrence = match session
                             .db
                             .interrupt_question_occurrence(interrupt_id)
+                            .await
                         {
                             Ok(occurrence) => occurrence,
                             Err(error) => {
@@ -1379,9 +1388,9 @@ pub(super) async fn run_worker(
                         });
                         continue;
                     }
-                    if let Err(e) = session.db.resolve_interrupt(interrupt_id, &response) {
+                    if let Err(e) = session.db.resolve_interrupt(interrupt_id, &response).await {
                         tracing::warn!(error = %e, %interrupt_id, "resolve_interrupt failed");
-                        interrupts.emit_queue_state();
+                        interrupts.emit_queue_state().await;
                         continue;
                     }
                     let seq = decision.as_ref().and_then(|decision| {
@@ -1409,9 +1418,9 @@ pub(super) async fn run_worker(
                     // DB row update above is the only effect.
                     interrupts.resolve(interrupt_id, response);
                     if was_active {
-                        interrupts.emit_active_from_db();
+                        interrupts.emit_active_from_db().await;
                     } else {
-                        interrupts.emit_queue_state();
+                        interrupts.emit_queue_state().await;
                     }
                 }
                 SessionWork::RepairResume { respond_to } => {
@@ -1970,7 +1979,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::Shutdown { pause_for_resume } => {
                     let (active, pending_tool_count) =
-                        shutdown_activity_snapshot(&session, session_id, &interrupts, &live);
+                        shutdown_activity_snapshot(&session, session_id, &interrupts, &live).await;
                     break WorkerStop::Shutdown {
                         pause_for_resume,
                         active,
@@ -1995,32 +2004,41 @@ pub(super) async fn run_worker(
     let _ = forward.await;
     let _ = queue_forward.await;
 
-    if let WorkerStop::Shutdown {
-        pause_for_resume: true,
-        active,
-        pending_tool_count,
-    } = stop
-    {
-        if active
-            && let Err(e) = session.db.upsert_paused_session_work(
-                session_id,
-                &root_agent_name,
-                &project_root.display().to_string(),
-                "daemon shutdown paused active work",
-                pending_tool_count,
-                proto::DAEMON_VERSION,
-            )
-        {
-            tracing::warn!(error = %e, "persisting paused session work failed");
+    match stop {
+        WorkerStop::Shutdown {
+            pause_for_resume: true,
+            active: true,
+            pending_tool_count,
+        } => {
+            if let Err(e) = session
+                .db
+                .upsert_paused_session_work(
+                    session_id,
+                    &root_agent_name,
+                    &project_root.display().to_string(),
+                    "daemon shutdown paused active work",
+                    pending_tool_count,
+                    proto::DAEMON_VERSION,
+                )
+                .await
+            {
+                tracing::warn!(error = %e, "persisting paused session work failed");
+            }
         }
-    } else {
-        // Mark session ended in DB for destructive/explicit worker stops. A
-        // graceful daemon drain keeps the session resumable instead.
-        if let Err(e) = locks.end_session(session_id).await {
-            tracing::warn!(error = %e, "lock cleanup failed during terminal session shutdown");
-        }
-        if let Err(e) = session.end() {
-            tracing::warn!(error = %e, "session.end() failed during shutdown");
+        WorkerStop::Shutdown {
+            pause_for_resume: true,
+            active: false,
+            ..
+        } => {}
+        _ => {
+            // Mark session ended in DB for destructive/explicit worker stops. A
+            // graceful daemon drain keeps the session resumable instead.
+            if let Err(e) = locks.end_session(session_id).await {
+                tracing::warn!(error = %e, "lock cleanup failed during terminal session shutdown");
+            }
+            if let Err(e) = session.end() {
+                tracing::warn!(error = %e, "session.end() failed during shutdown");
+            }
         }
     }
     send_current_event(
@@ -2034,16 +2052,17 @@ pub(super) async fn run_worker(
     tracing::info!(session_id = %session_id, "session worker exited");
 }
 
-pub(super) fn shutdown_activity_snapshot(
+pub(super) async fn shutdown_activity_snapshot(
     session: &Session,
     session_id: Uuid,
     interrupts: &crate::engine::interrupt::InterruptHub,
     live: &LiveState,
 ) -> (bool, i64) {
-    let parked_count = interrupts.park_all_registered();
+    let parked_count = interrupts.park_all_registered().await;
     let pending_tool_count = session
         .db
         .list_open_interrupts(session_id)
+        .await
         .map(|rows| rows.len() as i64)
         .unwrap_or(parked_count as i64);
     let active = {

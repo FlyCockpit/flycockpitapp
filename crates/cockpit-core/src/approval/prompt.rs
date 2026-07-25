@@ -75,7 +75,7 @@ impl Approver {
         let loop_offered = [Scope::Once, Scope::Session, Scope::Project];
 
         // 1. Standing rule wins, at any scope.
-        if let Some(verdict) = self.store.loop_rule(&signature) {
+        if let Some(verdict) = self.store.loop_rule(&signature).await {
             let repeat = match verdict {
                 LoopVerdict::Accept => RepeatDecision::Accept,
                 LoopVerdict::Reject => RepeatDecision::Reject,
@@ -116,7 +116,11 @@ impl Approver {
                 // with no git root) must not strand the call: fall back to
                 // applying the verdict this once and surface the error in
                 // the log rather than aborting the turn.
-                if let Err(e) = self.store.record_loop_rule(&signature, verdict, scope) {
+                if let Err(e) = self
+                    .store
+                    .record_loop_rule(&signature, verdict, scope)
+                    .await
+                {
                     tracing::warn!(error = %e, tool, ?scope, "recording loop-guard rule failed; applying once");
                 }
                 match verdict {

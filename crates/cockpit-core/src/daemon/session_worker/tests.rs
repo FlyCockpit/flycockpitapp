@@ -843,16 +843,16 @@ async fn plan_default_stale_session_keeps_plan() {
     // Build through the shared predicate.
     let row = db.create_session("proj", "/proj", "Plan").await.unwrap();
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)),
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
         "Plan"
     );
     let swarm = db.create_session("proj", "/proj", "Swarm").await.unwrap();
     assert_eq!(
-        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Build)),
+        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Build)).await,
         "Build"
     );
     assert_eq!(
-        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Plan)),
+        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Plan)).await,
         "Build",
         "removed stored primaries force Build, not the configured default"
     );
@@ -866,7 +866,7 @@ async fn roster_trim_removed_primary_notice_is_one_time() {
     let row = db.create_session("proj", "/proj", "Swarm").await.unwrap();
 
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)),
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
         "Build"
     );
     let notice = removed_primary_notice(row.session_id, &db, &cfg_with(D::Plan))
@@ -946,7 +946,7 @@ async fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
         .unwrap();
 
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)),
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
         "helper-bot"
     );
 }
@@ -961,7 +961,7 @@ async fn resolve_root_agent_deleted_assistant_falls_back_to_default_primary() {
         .unwrap();
 
     assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)),
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
         "Build"
     );
 }
@@ -997,7 +997,7 @@ async fn assistant_session_root_agent_loads_assistant_definition() {
         .await
         .unwrap();
 
-    let root_agent_name = resolve_root_agent(row.session_id, &db, &cfg_with(D::Build));
+    let root_agent_name = resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await;
     let root = crate::engine::builtin::load(&root_agent_name, &test_spawn_args(&cwd)).unwrap();
 
     assert_eq!(root.name, "helper-bot");
@@ -1421,15 +1421,17 @@ async fn active_interrupt_hydration_rebroadcasts_with_rehydration_reason() {
     };
     let interrupt_id = db
         .raise_interrupt_questions(session_id, "Build", "context", &set)
+        .await
         .unwrap();
     let _queued = db
         .raise_interrupt_questions(session_id, "Build", "queued", &set)
+        .await
         .unwrap();
     let locks = Arc::new(LockManager::in_memory(db));
     let handle = SessionWorkerHandle::test_handle(Arc::new(session), locks);
 
     let mut rx = handle.subscribe();
-    handle.broadcast_active_interrupt();
+    handle.broadcast_active_interrupt().await;
 
     let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
         .await
@@ -1478,24 +1480,26 @@ async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending
     };
     let open = db
         .raise_interrupt_questions(session_id, "Build", "open", &set)
+        .await
         .unwrap();
     let parked = db
         .raise_interrupt_questions(session_id, "Build", "parked", &set)
+        .await
         .unwrap();
-    assert!(db.park_interrupt(parked).unwrap());
+    assert!(db.park_interrupt(parked).await.unwrap());
 
     let live = LiveState::default();
     let interrupts = crate::engine::interrupt::InterruptHub::detached();
     let (active, pending_tool_count) =
-        shutdown_activity_snapshot(&session, session_id, &interrupts, &live);
+        shutdown_activity_snapshot(&session, session_id, &interrupts, &live).await;
 
     assert!(active, "blocked-only sessions must be paused on shutdown");
     assert_eq!(
         pending_tool_count, 2,
         "paused row count must include both open and already-parked interrupts"
     );
-    assert_eq!(db.list_open_interrupts(session_id).unwrap().len(), 2);
-    assert!(db.get_interrupt(open).unwrap().is_some());
+    assert_eq!(db.list_open_interrupts(session_id).await.unwrap().len(), 2);
+    assert!(db.get_interrupt(open).await.unwrap().is_some());
 }
 
 /// §6.5 de-dupe: the latch fires the broadcast exactly once per condition.

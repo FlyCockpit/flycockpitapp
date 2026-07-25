@@ -942,14 +942,16 @@ fn dangerous_policy_flag_matches(configured: &str, arg: &str) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn command_grant_allowed_by_policy(
+pub(crate) async fn command_grant_allowed_by_policy(
     store: &GrantStore,
     info: &SimpleCommandInfo,
 ) -> bool {
-    command_grant_scope_allowed_by_policy(store, info).is_some()
+    command_grant_scope_allowed_by_policy(store, info)
+        .await
+        .is_some()
 }
 
-pub(crate) fn command_grant_scope_allowed_by_policy(
+pub(crate) async fn command_grant_scope_allowed_by_policy(
     store: &GrantStore,
     info: &SimpleCommandInfo,
 ) -> Option<Scope> {
@@ -960,7 +962,7 @@ pub(crate) fn command_grant_scope_allowed_by_policy(
     let mut info = info.clone();
     apply_dangerous_flag_policy(&mut info, &policy_cfg);
     let policy = approval_policy_for(&info, &policy_cfg);
-    store.command_grant(&info.key).and_then(|grant| {
+    store.command_grant(&info.key).await.and_then(|grant| {
         (grant.scope.within(policy.max_scope) && info.risk.tier <= grant.granted_tier)
             .then_some(grant.scope)
     })
@@ -1596,6 +1598,22 @@ mod tests {
     /// Spawn a background resolver that answers a sequence of prompts in
     /// order: for each `id` in `ids`, it waits for the next not-yet-seen open
     /// interrupt and resolves it with `Single { selected_id: id }`.
+    async fn resolve_waiting_interrupt(
+        db: &crate::db::Db,
+        hub: &std::sync::Arc<InterruptHub>,
+        interrupt_id: uuid::Uuid,
+        response: ResolveResponse,
+    ) {
+        loop {
+            if hub.has_waiter(interrupt_id) {
+                db.resolve_interrupt(interrupt_id, &response).await.unwrap();
+                assert!(hub.resolve(interrupt_id, response));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     fn resolve_sequence(approver: &Approver, ids: &[&'static str]) -> tokio::task::JoinHandle<()> {
         let db = approver.db.clone();
         let session_id = approver.session_id;
@@ -1605,19 +1623,21 @@ mod tests {
             let mut seen: Vec<uuid::Uuid> = Vec::new();
             for id in ids {
                 let iid = loop {
-                    let open = db.list_open_interrupts(session_id).unwrap();
-                    if let Some(row) = open.iter().find(|r| !seen.contains(&r.interrupt_id)) {
+                    let open = db.list_open_interrupts(session_id).await.unwrap();
+                    if let Some(row) = open
+                        .iter()
+                        .find(|r| !seen.contains(&r.interrupt_id) && hub.has_waiter(r.interrupt_id))
+                    {
                         break row.interrupt_id;
                     }
                     tokio::task::yield_now().await;
                 };
                 seen.push(iid);
-                assert!(hub.resolve(
-                    iid,
-                    ResolveResponse::Single {
-                        selected_id: id.to_string(),
-                    }
-                ));
+                let response = ResolveResponse::Single {
+                    selected_id: id.to_string(),
+                };
+                db.resolve_interrupt(iid, &response).await.unwrap();
+                assert!(hub.resolve(iid, response));
             }
         })
     }
@@ -1635,8 +1655,11 @@ mod tests {
             let mut prompts = Vec::new();
             for id in ids {
                 let (iid, prompt) = loop {
-                    let open = db.list_open_interrupts(session_id).unwrap();
-                    if let Some(row) = open.iter().find(|r| !seen.contains(&r.interrupt_id)) {
+                    let open = db.list_open_interrupts(session_id).await.unwrap();
+                    if let Some(row) = open
+                        .iter()
+                        .find(|r| !seen.contains(&r.interrupt_id) && hub.has_waiter(r.interrupt_id))
+                    {
                         let prompt = row
                             .questions
                             .as_ref()
@@ -1652,12 +1675,11 @@ mod tests {
                 };
                 seen.push(iid);
                 prompts.push(prompt);
-                assert!(hub.resolve(
-                    iid,
-                    ResolveResponse::Single {
-                        selected_id: id.to_string(),
-                    }
-                ));
+                let response = ResolveResponse::Single {
+                    selected_id: id.to_string(),
+                };
+                db.resolve_interrupt(iid, &response).await.unwrap();
+                assert!(hub.resolve(iid, response));
             }
             prompts
         })
@@ -1676,7 +1698,7 @@ mod tests {
             let mut questions = Vec::new();
             for id in ids {
                 let (iid, question) = loop {
-                    let open = db.list_open_interrupts(session_id).unwrap();
+                    let open = db.list_open_interrupts(session_id).await.unwrap();
                     if let Some(row) = open.iter().find(|r| !seen.contains(&r.interrupt_id)) {
                         let question = row
                             .questions
@@ -1690,12 +1712,15 @@ mod tests {
                 };
                 seen.push(iid);
                 questions.push(question);
-                assert!(hub.resolve(
+                resolve_waiting_interrupt(
+                    &db,
+                    &hub,
                     iid,
                     ResolveResponse::Single {
                         selected_id: id.to_string(),
-                    }
-                ));
+                    },
+                )
+                .await;
             }
             questions
         })
@@ -1748,14 +1773,18 @@ mod tests {
         assert!(
             approver
                 .store
-                .is_path_granted_for(&path, crate::tools::shell_sandbox::SandboxPathAccess::Read),
+                .is_path_granted_for(&path, crate::tools::shell_sandbox::SandboxPathAccess::Read)
+                .await,
             "session path grant recorded"
         );
         assert!(
-            !approver.store.is_path_granted_for(
-                &path,
-                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
-            ),
+            !approver
+                .store
+                .is_path_granted_for(
+                    &path,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
+                )
+                .await,
             "read grant must not imply write"
         );
     }
@@ -1779,10 +1808,13 @@ mod tests {
         assert_eq!(decision, SandboxEscalationApproval::RunUnconfinedOnce);
         resolver.await.unwrap();
         assert!(
-            !approver.store.is_path_granted_for(
-                &path,
-                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
-            ),
+            !approver
+                .store
+                .is_path_granted_for(
+                    &path,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
+                )
+                .await,
             "run-once must not record durable path grants"
         );
     }
@@ -1862,7 +1894,7 @@ mod tests {
                 subcommand: None,
             },
         ] {
-            assert!(!approver.store.is_command_granted(&key));
+            assert!(!approver.store.is_command_granted(&key).await);
         }
     }
 
@@ -1897,10 +1929,12 @@ mod tests {
         approver
             .store
             .record_command(&info, info.risk.tier, Scope::Session)
+            .await
             .unwrap();
         let grant = approver
             .store
             .command_grant(&info.key)
+            .await
             .expect("session grant recorded");
         assert_eq!(grant.scope, Scope::Session);
         assert_eq!(grant.granted_tier, info.risk.tier);
@@ -1924,6 +1958,7 @@ mod tests {
         approver
             .store
             .record_command(&ordinary, RiskTier::Ordinary, Scope::Session)
+            .await
             .unwrap();
 
         let resolver = resolve_sequence_collecting_prompts(&approver, &[ID_APPROVE_ONCE]);
@@ -1947,10 +1982,11 @@ mod tests {
         approver
             .store
             .record_command(&destructive, RiskTier::Destructive, Scope::Session)
+            .await
             .unwrap();
 
         let ordinary = classify::classify("git push origin main").simple_commands()[0].clone();
-        assert!(command_grant_allowed_by_policy(&approver.store, &ordinary));
+        assert!(command_grant_allowed_by_policy(&approver.store, &ordinary).await);
         // No client is attached; if this prompted it would block.
         let decision = approver
             .approve_command("git push origin main")
@@ -1972,6 +2008,7 @@ mod tests {
         approver
             .store
             .record_command(&ordinary, RiskTier::Ordinary, Scope::Session)
+            .await
             .unwrap();
 
         let resolver = resolve_sequence(&approver, &[ID_APPROVE_SESSION]);
@@ -1990,6 +2027,7 @@ mod tests {
         let grant = approver
             .store
             .command_grant(&ordinary.key)
+            .await
             .expect("grant upgraded");
         assert_eq!(grant.scope, Scope::Session);
         assert_eq!(grant.granted_tier, RiskTier::Destructive);
@@ -2045,6 +2083,7 @@ mod tests {
         approver
             .store
             .record_command(&info, info.risk.tier, Scope::Session)
+            .await
             .unwrap();
         // No client is attached; if this prompted it would block forever.
         // It returns immediately because the grant short-circuits.
@@ -2080,6 +2119,7 @@ mod tests {
         approver
             .store
             .record_command(&info, info.risk.tier, Scope::Session)
+            .await
             .unwrap();
         let decision = approver
             .approve_command("cargo build --release")
@@ -2125,6 +2165,7 @@ mod tests {
         approver
             .store
             .record_command_reject(&info, Scope::Session)
+            .await
             .unwrap();
         // No client attached: this returns immediately because the standing
         // reject short-circuits (it never raises a prompt).
@@ -2170,7 +2211,11 @@ mod tests {
                 risk: Default::default(),
                 span: None,
             };
-            approver.store.record_command_reject(&info, scope).unwrap();
+            approver
+                .store
+                .record_command_reject(&info, scope)
+                .await
+                .unwrap();
 
             let decision = approver.approve_command("gh pr create").await.unwrap();
             assert_eq!(decision, Decision::StandingReject { scope });
@@ -2210,6 +2255,7 @@ mod tests {
         approver
             .store
             .record_command_reject(&info, Scope::Session)
+            .await
             .unwrap();
         let decision = approver
             .approve_command_escalated("cat /etc/secret", 13, "denied".into())
@@ -2235,6 +2281,7 @@ mod tests {
         approver
             .store
             .record_path_reject(&outside, Scope::Session)
+            .await
             .unwrap();
         let decision = approver
             .approve_path(
@@ -2269,8 +2316,8 @@ mod tests {
             program: "gh".into(),
             subcommand: Some("pr".into()),
         };
-        assert!(approver.store.is_command_rejected(&key));
-        assert!(!approver.store.is_command_granted(&key));
+        assert!(approver.store.is_command_rejected(&key).await);
+        assert!(!approver.store.is_command_granted(&key).await);
 
         // A later attempt short-circuits with no prompt (detached hub).
         let again = approver.approve_command("gh pr create").await.unwrap();
@@ -2298,7 +2345,7 @@ mod tests {
             subcommand: Some("pr".into()),
         };
         assert!(
-            !approver.store.is_command_rejected(&key),
+            !approver.store.is_command_rejected(&key).await,
             "once persists nothing"
         );
     }
@@ -2315,13 +2362,13 @@ mod tests {
         let hub = approver.interrupts.clone();
         let resolver = tokio::spawn(async move {
             let iid = loop {
-                let open = db.list_open_interrupts(session_id).unwrap();
-                if let Some(row) = open.first() {
+                let open = db.list_open_interrupts(session_id).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(iid, ResolveResponse::Cancel));
+            resolve_waiting_interrupt(&db, &hub, iid, ResolveResponse::Cancel).await;
         });
         let decision = approver.approve_command("rm file").await.unwrap();
         resolver.await.unwrap();
@@ -2350,18 +2397,21 @@ mod tests {
         let hub = approver.interrupts.clone();
         let resolver = tokio::spawn(async move {
             let iid = loop {
-                let open = db.list_open_interrupts(session_id).unwrap();
+                let open = db.list_open_interrupts(session_id).await.unwrap();
                 if let Some(row) = open.first() {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(
+            resolve_waiting_interrupt(
+                &db,
+                &hub,
                 iid,
                 ResolveResponse::Single {
-                    selected_id: ID_APPROVE_ONCE.to_string()
-                }
-            ));
+                    selected_id: ID_APPROVE_ONCE.to_string(),
+                },
+            )
+            .await;
         });
         let decision = approver
             .approve_package_add(
@@ -2396,13 +2446,13 @@ mod tests {
         let hub = approver.interrupts.clone();
         let resolver = tokio::spawn(async move {
             let iid = loop {
-                let open = db.list_open_interrupts(session_id).unwrap();
-                if let Some(row) = open.first() {
+                let open = db.list_open_interrupts(session_id).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(iid, ResolveResponse::Cancel));
+            resolve_waiting_interrupt(&db, &hub, iid, ResolveResponse::Cancel).await;
         });
         let decision = approver
             .approve_package_add("cargo:tokio", "https://example.invalid/x", "grounded")
@@ -2457,6 +2507,7 @@ mod tests {
         approver
             .store
             .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Session)
+            .await
             .unwrap();
         let decision = approver
             .approve_repeat("read", &input, false)
@@ -2472,12 +2523,12 @@ mod tests {
     }
 
     /// Pull the command-detail off the open interrupt with `iid`.
-    fn open_command_detail(
+    async fn open_command_detail(
         db: &crate::db::Db,
         sid: uuid::Uuid,
         iid: uuid::Uuid,
     ) -> Option<CommandDetail> {
-        let open = db.list_open_interrupts(sid).unwrap();
+        let open = db.list_open_interrupts(sid).await.unwrap();
         let row = open.iter().find(|r| r.interrupt_id == iid)?;
         let set = row.questions.as_ref()?;
         match set.questions.first()? {
@@ -2507,24 +2558,29 @@ mod tests {
             // prompt. `seen` tracks resolved interrupts so we always grab the
             // next new one.
             let mut seen: Vec<uuid::Uuid> = Vec::new();
-            let next_new = |db: &crate::db::Db, seen: &[uuid::Uuid]| -> Option<uuid::Uuid> {
-                let open = db.list_open_interrupts(sid).unwrap();
+            async fn next_new(
+                db: &crate::db::Db,
+                sid: uuid::Uuid,
+                seen: &[uuid::Uuid],
+            ) -> Option<uuid::Uuid> {
+                let open = db.list_open_interrupts(sid).await.unwrap();
                 open.iter()
                     .find(|r| !seen.contains(&r.interrupt_id))
                     .map(|r| r.interrupt_id)
-            };
+            }
 
             // Constituent 1 — approval prompt: step 1 of 2, highlight over
             // "git push origin main".
             let iid = loop {
-                if let Some(i) = next_new(&db, &seen) {
+                if let Some(i) = next_new(&db, sid, &seen).await {
                     break i;
                 }
                 tokio::task::yield_now().await;
             };
             seen.push(iid);
-            let cd =
-                open_command_detail(&db, sid, iid).expect("approval prompt has command_detail");
+            let cd = open_command_detail(&db, sid, iid)
+                .await
+                .expect("approval prompt has command_detail");
             assert_eq!(cd.full_command, cmd);
             assert_eq!((cd.step, cd.step_count), (1, 2));
             let h = cd.highlight.expect("step 1 highlighted");
@@ -2534,24 +2590,28 @@ mod tests {
                 .take((h.end - h.start) as usize)
                 .collect();
             assert_eq!(slice, "git push origin main");
-            assert!(hub.resolve(
+            resolve_waiting_interrupt(
+                &db,
+                &hub,
                 iid,
                 ResolveResponse::Single {
                     selected_id: ID_APPROVE_ONCE.into(),
-                }
-            ));
+                },
+            )
+            .await;
 
             // Constituent 2 — approval prompt: step 2 of 2, highlight over
             // "cargo build".
             let iid2 = loop {
-                if let Some(i) = next_new(&db, &seen) {
+                if let Some(i) = next_new(&db, sid, &seen).await {
                     break i;
                 }
                 tokio::task::yield_now().await;
             };
             seen.push(iid2);
-            let cd2 =
-                open_command_detail(&db, sid, iid2).expect("approval prompt has command_detail");
+            let cd2 = open_command_detail(&db, sid, iid2)
+                .await
+                .expect("approval prompt has command_detail");
             assert_eq!(cd2.full_command, cmd);
             assert_eq!((cd2.step, cd2.step_count), (2, 2));
             let h2 = cd2.highlight.expect("step 2 highlighted");
@@ -2561,12 +2621,15 @@ mod tests {
                 .take((h2.end - h2.start) as usize)
                 .collect();
             assert_eq!(slice2, "cargo build");
-            assert!(hub.resolve(
+            resolve_waiting_interrupt(
+                &db,
+                &hub,
                 iid2,
                 ResolveResponse::Single {
                     selected_id: ID_APPROVE_SESSION.into(),
-                }
-            ));
+                },
+            )
+            .await;
         });
 
         let decision = approver.approve_command(cmd).await.unwrap();
@@ -2579,7 +2642,7 @@ mod tests {
             subcommand: Some("build".into()),
         };
         assert!(
-            approver.store.is_command_granted(&cargo_key),
+            approver.store.is_command_granted(&cargo_key).await,
             "remembered `cargo build` key"
         );
         // The once-approved git push was NOT remembered.
@@ -2588,7 +2651,7 @@ mod tests {
             subcommand: Some("push".into()),
         };
         assert!(
-            !approver.store.is_command_granted(&git_key),
+            !approver.store.is_command_granted(&git_key).await,
             "`git push` was once-only, not stored"
         );
     }
@@ -2617,6 +2680,7 @@ mod tests {
         approver
             .store
             .record_command(&git_info, git_info.risk.tier, Scope::Session)
+            .await
             .unwrap();
 
         let db = approver.db.clone();
@@ -2626,13 +2690,15 @@ mod tests {
         let resolver = tokio::spawn(async move {
             // Approval prompt carries the command-detail and resolves directly.
             let iid = loop {
-                let open = db.list_open_interrupts(sid).unwrap();
+                let open = db.list_open_interrupts(sid).await.unwrap();
                 if let Some(row) = open.first() {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            let cd = open_command_detail(&db, sid, iid).expect("command_detail present");
+            let cd = open_command_detail(&db, sid, iid)
+                .await
+                .expect("command_detail present");
             assert_eq!(cd.full_command, cmd);
             assert_eq!(
                 (cd.step, cd.step_count),
@@ -2641,12 +2707,15 @@ mod tests {
             );
             // Single prompting step → no highlight.
             assert!(cd.highlight.is_none(), "lone prompt is not highlighted");
-            assert!(hub.resolve(
+            resolve_waiting_interrupt(
+                &db,
+                &hub,
                 iid,
                 ResolveResponse::Single {
                     selected_id: ID_APPROVE_ONCE.into(),
-                }
-            ));
+                },
+            )
+            .await;
         });
         let decision = approver.approve_command(cmd).await.unwrap();
         resolver.await.unwrap();
@@ -2666,14 +2735,14 @@ mod tests {
         let cmd = "bash -c 'echo hi'";
         let resolver = tokio::spawn(async move {
             let iid = loop {
-                let open = db.list_open_interrupts(sid).unwrap();
+                let open = db.list_open_interrupts(sid).await.unwrap();
                 if let Some(row) = open.first() {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
             // Wrapper → two once-only verdict options, full command in detail.
-            let open = db.list_open_interrupts(sid).unwrap();
+            let open = db.list_open_interrupts(sid).await.unwrap();
             let set = open[0].questions.as_ref().unwrap();
             match set.questions.first().unwrap() {
                 InterruptQuestion::Single {
@@ -2695,12 +2764,15 @@ mod tests {
                 _ => panic!("expected Single"),
             }
             // Approve once: a wrapper resolves from this single prompt.
-            assert!(hub.resolve(
+            resolve_waiting_interrupt(
+                &db,
+                &hub,
                 iid,
                 ResolveResponse::Single {
                     selected_id: ID_APPROVE.into(),
-                }
-            ));
+                },
+            )
+            .await;
         });
         let decision = approver.approve_command(cmd).await.unwrap();
         resolver.await.unwrap();
@@ -2850,7 +2922,7 @@ mod tests {
             program: "gh".into(),
             subcommand: Some("pr".into()),
         };
-        assert!(approver.store.is_command_granted(&key));
+        assert!(approver.store.is_command_granted(&key).await);
     }
 
     #[tokio::test]
@@ -2862,13 +2934,13 @@ mod tests {
         let hub = approver.interrupts.clone();
         let resolver = tokio::spawn(async move {
             let iid = loop {
-                let open = db.list_open_interrupts(session_id).unwrap();
-                if let Some(row) = open.first() {
+                let open = db.list_open_interrupts(session_id).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(iid, ResolveResponse::Cancel));
+            resolve_waiting_interrupt(&db, &hub, iid, ResolveResponse::Cancel).await;
         });
         let decision = approver.approve_command("rm file").await.unwrap();
         resolver.await.unwrap();
@@ -2889,7 +2961,7 @@ mod tests {
             program: "bash".into(),
             subcommand: None,
         };
-        assert!(!approver.store.is_command_granted(&key));
+        assert!(!approver.store.is_command_granted(&key).await);
     }
 
     #[test]
@@ -3021,6 +3093,7 @@ mod tests {
         approver
             .store
             .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Session)
+            .await
             .unwrap();
         // Headless, but a session always-accept rule applies → accept.
         let decision = approver
@@ -3039,6 +3112,7 @@ mod tests {
         approver
             .store
             .record_loop_rule(&sig, LoopVerdict::Reject, Scope::Session)
+            .await
             .unwrap();
         let decision = approver
             .approve_repeat("bash", &input, false)
@@ -3056,18 +3130,21 @@ mod tests {
         let hub = approver.interrupts.clone();
         let resolver = tokio::spawn(async move {
             let iid = loop {
-                let open = db.list_open_interrupts(session_id).unwrap();
-                if let Some(row) = open.first() {
+                let open = db.list_open_interrupts(session_id).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(
+            resolve_waiting_interrupt(
+                &db,
+                &hub,
                 iid,
                 ResolveResponse::Single {
                     selected_id: crate::approval::ID_LOOP_ACCEPT_ONCE.into(),
-                }
-            ));
+                },
+            )
+            .await;
         });
         let input = serde_json::json!({"path": "z"});
         let decision = approver.approve_repeat("read", &input, true).await.unwrap();
@@ -3075,7 +3152,7 @@ mod tests {
         assert_eq!(decision, RepeatDecision::Accept);
         // Accept-once records no rule: a fresh query still has none.
         let sig = GrantStore::loop_signature("read", &input);
-        assert!(approver.store.loop_rule(&sig).is_none());
+        assert!(approver.store.loop_rule(&sig).await.is_none());
     }
 
     #[tokio::test]
@@ -3087,18 +3164,21 @@ mod tests {
         let hub = approver.interrupts.clone();
         let resolver = tokio::spawn(async move {
             let iid = loop {
-                let open = db.list_open_interrupts(session_id).unwrap();
-                if let Some(row) = open.first() {
+                let open = db.list_open_interrupts(session_id).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                     break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
             };
-            assert!(hub.resolve(
+            resolve_waiting_interrupt(
+                &db,
+                &hub,
                 iid,
                 ResolveResponse::Single {
                     selected_id: crate::approval::ID_LOOP_REJECT_SESSION.into(),
-                }
-            ));
+                },
+            )
+            .await;
         });
         let input = serde_json::json!({"command": "spin"});
         let decision = approver.approve_repeat("bash", &input, true).await.unwrap();
@@ -3108,7 +3188,10 @@ mod tests {
         // (even headless) repeat of the exact signature auto-rejects with
         // no prompt.
         let sig = GrantStore::loop_signature("bash", &input);
-        assert_eq!(approver.store.loop_rule(&sig), Some(LoopVerdict::Reject));
+        assert_eq!(
+            approver.store.loop_rule(&sig).await,
+            Some(LoopVerdict::Reject)
+        );
         let again = approver
             .approve_repeat("bash", &input, false)
             .await

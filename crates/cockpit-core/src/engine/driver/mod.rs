@@ -2690,7 +2690,7 @@ impl Driver {
                             )
                             .await?
                         {
-                            self.acknowledge_interrupted_turns_after_progress();
+                            self.acknowledge_interrupted_turns_after_progress().await;
                             return Ok(());
                         }
                         if primary_rounds_in_chunk >= max_primary_rounds {
@@ -2712,7 +2712,7 @@ impl Driver {
                         next_prompt = np;
                         continue;
                     }
-                    self.acknowledge_interrupted_turns_after_progress();
+                    self.acknowledge_interrupted_turns_after_progress().await;
                     self.maybe_spawn_self_improvement_review(tx);
                     return Ok(());
                 }
@@ -2721,7 +2721,7 @@ impl Driver {
                         next_prompt = np;
                         continue;
                     }
-                    self.acknowledge_interrupted_turns_after_progress();
+                    self.acknowledge_interrupted_turns_after_progress().await;
                     self.maybe_spawn_self_improvement_review(tx);
                     return Ok(());
                 }
@@ -2730,11 +2730,12 @@ impl Driver {
         }
     }
 
-    fn acknowledge_interrupted_turns_after_progress(&self) {
+    async fn acknowledge_interrupted_turns_after_progress(&self) {
         match self
             .session
             .db
             .acknowledge_interrupted_turns(self.session.id)
+            .await
         {
             Ok(0) => {}
             Ok(count) => tracing::debug!(count, "acknowledged interrupted session markers"),
@@ -5372,7 +5373,7 @@ impl Driver {
             .await;
         input_rx.finish(&queue_item_ids).await;
         if result.is_ok() {
-            self.acknowledge_interrupted_turns_after_progress();
+            self.acknowledge_interrupted_turns_after_progress().await;
         }
         result
     }

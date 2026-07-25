@@ -72,8 +72,8 @@ fn daemon_autostart_failure_falls_back_to_modal() {
     assert!(state.notice.is_none());
 }
 
-#[test]
-fn daemon_autostart_notice_shows_once() {
+#[tokio::test]
+async fn daemon_autostart_notice_shows_once() {
     let tmp = tempfile::tempdir().unwrap();
     let db = cockpit_db::Db::open_in_memory().unwrap();
     let first = daemon_not_running_state_with_spawn(
@@ -81,19 +81,26 @@ fn daemon_autostart_notice_shows_once() {
         daemon_paths(&tmp),
         cockpit_config::extended::DaemonAutostart::Private,
         Some(&db),
-        db.app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG).unwrap(),
+        db.app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG)
+            .await
+            .unwrap(),
         || panic!("private mode must not spawn"),
     );
+    assert!(first.notice.is_some());
+    db.mark_app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG)
+        .await
+        .unwrap();
     let second = daemon_not_running_state_with_spawn(
         cockpit_core::daemon::DaemonStatus::NotRunning,
         daemon_paths(&tmp),
         cockpit_config::extended::DaemonAutostart::Private,
         Some(&db),
-        db.app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG).unwrap(),
+        db.app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG)
+            .await
+            .unwrap(),
         || panic!("private mode must not spawn"),
     );
 
-    assert!(first.notice.is_some());
     assert!(second.notice.is_none());
 }
 

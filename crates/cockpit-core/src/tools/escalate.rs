@@ -233,11 +233,15 @@ async fn approval_for_escalation(
         ApprovalMode::Yolo => Ok(EscalationApproval::RunUnconfinedOnce),
         ApprovalMode::Manual => prompt_user(ctx, command, row, grant_offer).await,
         ApprovalMode::Auto => {
-            if let Some((approver, scope)) = ctx.approver.as_ref().and_then(|approver| {
+            let standing_reject = if let Some(approver) = ctx.approver.as_ref() {
                 approver
                     .command_standing_reject_scope(command)
+                    .await
                     .map(|scope| (approver, scope))
-            }) {
+            } else {
+                None
+            };
+            if let Some((approver, scope)) = standing_reject {
                 approver
                     .record_standing_reject_decision("bash", command, scope)
                     .await;
@@ -271,7 +275,7 @@ async fn prompt_user(
     let Some(approver) = ctx.approver.as_ref() else {
         return Ok(EscalationApproval::Deny);
     };
-    if let Some(scope) = approver.command_standing_reject_scope(command) {
+    if let Some(scope) = approver.command_standing_reject_scope(command).await {
         approver
             .record_standing_reject_decision("bash", command, scope)
             .await;
@@ -378,23 +382,17 @@ mod tests {
         hub: Arc<crate::engine::interrupt::InterruptHub>,
         selected_id: &'static str,
     ) -> tokio::task::JoinHandle<()> {
-        let initial: Vec<uuid::Uuid> = db
-            .list_open_interrupts(session_id)
-            .unwrap()
-            .into_iter()
-            .map(|row| row.interrupt_id)
-            .collect();
         tokio::spawn(async move {
             loop {
-                let open = db.list_open_interrupts(session_id).unwrap();
-                if let Some(row) = open.iter().find(|row| !initial.contains(&row.interrupt_id))
-                    && hub.resolve(
-                        row.interrupt_id,
-                        crate::daemon::proto::ResolveResponse::Single {
-                            selected_id: selected_id.to_string(),
-                        },
-                    )
-                {
+                let open = db.list_open_interrupts(session_id).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
+                    let response = crate::daemon::proto::ResolveResponse::Single {
+                        selected_id: selected_id.to_string(),
+                    };
+                    db.resolve_interrupt(row.interrupt_id, &response)
+                        .await
+                        .unwrap();
+                    assert!(hub.resolve(row.interrupt_id, response));
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -449,7 +447,8 @@ mod tests {
         assert!(
             !approver
                 .store()
-                .is_path_granted_for(&offer.paths[0], SandboxPathAccess::ReadWrite),
+                .is_path_granted_for(&offer.paths[0], SandboxPathAccess::ReadWrite)
+                .await,
             "yolo must not record grants"
         );
 
@@ -471,7 +470,8 @@ mod tests {
         assert!(
             approver
                 .store()
-                .is_path_granted_for(&offer.paths[0], SandboxPathAccess::ReadWrite),
+                .is_path_granted_for(&offer.paths[0], SandboxPathAccess::ReadWrite)
+                .await,
             "manual human grant records path"
         );
 
@@ -518,6 +518,7 @@ mod tests {
         approver
             .store()
             .record_command_reject(info, crate::approval::store::Scope::Session)
+            .await
             .unwrap();
 
         let out = EscalateTool

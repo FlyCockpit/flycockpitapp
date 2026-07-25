@@ -118,6 +118,7 @@ async fn read_session_messages_requires_read_access_returns_page_and_does_not_sp
 
     ctx.db
         .set_session_shared_with_collaborators(session.session_id, true)
+        .await
         .unwrap();
     let mut allowed = remote_state_with_grants(vec![grant]);
     let response = handle_request(request, &mut allowed, &ctx)
@@ -177,6 +178,7 @@ async fn read_history_page_requires_read_access_returns_page_and_does_not_spawn_
 
     ctx.db
         .set_session_shared_with_collaborators(session.session_id, true)
+        .await
         .unwrap();
     let mut allowed = remote_state_with_grants(vec![grant]);
     let response = handle_request(request, &mut allowed, &ctx)
@@ -318,7 +320,8 @@ async fn goal_rpc_reads_sets_and_clears() {
 async fn goal_change_is_visible_to_live_worker() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, session_id, _work_rx) = attached_state_with_worker_receiver(&ctx, tmp.path());
+    let (mut state, session_id, _work_rx) =
+        attached_state_with_worker_receiver(&ctx, tmp.path()).await;
     let session = ctx.db.get_session(session_id).await.unwrap().unwrap();
     ctx.db
         .create_session_goal(
@@ -378,7 +381,8 @@ async fn goal_change_is_visible_to_live_worker() {
 async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (state, session_id, mut work_rx) = attached_state_with_worker_receiver(&ctx, tmp.path());
+    let (state, session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, tmp.path()).await;
     let session = ctx.db.get_session(session_id).await.unwrap().unwrap();
     ctx.db
         .create_session_goal(
@@ -1896,7 +1900,7 @@ async fn terminal_requests_require_terminal_scope_and_audit_open_close() {
     .await
     .expect("close succeeds");
 
-    let rows = ctx.db.list_remote_audit().unwrap();
+    let rows = ctx.db.list_remote_audit().await.unwrap();
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].request_kind, "open_terminal");
     assert_eq!(rows[0].verdict, "denied");
@@ -1975,7 +1979,7 @@ async fn remote_fs_mutations_are_audited_with_path() {
     .expect("write succeeds");
     assert!(matches!(response, Response::FsWrite { .. }));
 
-    let rows = ctx.db.list_remote_audit().unwrap();
+    let rows = ctx.db.list_remote_audit().await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].principal, "flycockpit:user-1");
     assert_eq!(rows[0].request_kind, "fs_write");
@@ -2106,12 +2110,11 @@ async fn boot_housekeeping_succeeds_with_empty_task_delegation_tables() {
     assert_eq!(db.reconcile_orphaned_task_delegations().unwrap(), 0);
 }
 
-#[test]
-#[allow(deprecated)]
-fn boot_ephemeral_sweep_continues_after_delete_failure() {
+#[tokio::test]
+async fn boot_ephemeral_sweep_continues_after_delete_failure() {
     let db = Db::open_in_memory().expect("in-memory db");
     let (blocked, removed) = db
-        .write_blocking(|conn| {
+        .write(|conn| {
             let mut blocked =
                 crate::db::Db::build_new_session_row_conn(conn, "p", "/blocked", "Build")?;
             blocked.ephemeral = true;
@@ -2140,31 +2143,30 @@ fn boot_ephemeral_sweep_continues_after_delete_failure() {
             ))?;
             Ok((blocked, removed))
         })
+        .await
         .unwrap();
 
     assert_eq!(sweep_ephemeral_sessions_blocking(&db).unwrap(), 1);
 
     assert!(
-        db.write_blocking(move |conn| crate::db::Db::get_session_conn(conn, blocked.session_id))
+        db.write(move |conn| crate::db::Db::get_session_conn(conn, blocked.session_id))
+            .await
             .unwrap()
             .is_some()
     );
     assert!(
-        db.write_blocking(move |conn| crate::db::Db::get_session_conn(conn, removed.session_id))
+        db.write(move |conn| crate::db::Db::get_session_conn(conn, removed.session_id))
+            .await
             .unwrap()
             .is_none()
     );
 }
 
 #[tokio::test]
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-)]
 async fn retention_tick_runs_one_pass_without_sleep() {
     let db = Db::open_in_memory().expect("in-memory db");
     let session = db.create_session("p", "/x", "Build").await.unwrap();
-    db.write_blocking(move |conn| {
+    db.write(move |conn| {
         conn.execute(
             "UPDATE sessions SET ended_at = 10, last_active_at = 10 WHERE session_id = ?1",
             [session.session_id.to_string()],
@@ -2176,6 +2178,7 @@ async fn retention_tick_runs_one_pass_without_sleep() {
         )?;
         Ok(())
     })
+    .await
     .unwrap();
     let cfg = RetentionConfig {
         payload_window_days: 1,
@@ -2186,7 +2189,7 @@ async fn retention_tick_runs_one_pass_without_sleep() {
     run_retention_tick_db(db.clone(), cfg).await;
 
     let rows: i64 = db
-        .read_blocking(|conn| {
+        .read(move |conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM session_events WHERE session_id = ?1",
                 [session.session_id.to_string()],
@@ -2194,19 +2197,21 @@ async fn retention_tick_runs_one_pass_without_sleep() {
             )
             .context("counting session_events")
         })
+        .await
         .unwrap();
     assert_eq!(rows, 0);
 }
 
-fn attached_state(
+async fn attached_state(
     ctx: &Arc<DaemonContext>,
     project_root: &std::path::Path,
 ) -> (MutableClientState, Uuid) {
-    let (state, session_id, _work_rx) = attached_state_with_worker_receiver(ctx, project_root);
+    let (state, session_id, _work_rx) =
+        attached_state_with_worker_receiver(ctx, project_root).await;
     (state, session_id)
 }
 
-fn attached_state_with_worker_receiver(
+async fn attached_state_with_worker_receiver(
     ctx: &Arc<DaemonContext>,
     project_root: &std::path::Path,
 ) -> (
@@ -2222,7 +2227,7 @@ fn attached_state_with_worker_receiver(
     let project_root = project_root.to_str().unwrap().to_string();
     let session_row = ctx
         .db
-        .write_blocking(move |conn| {
+        .write(move |conn| {
             crate::db::Db::set_workspace_trust_conn(
                 conn,
                 &normalized_root,
@@ -2232,6 +2237,7 @@ fn attached_state_with_worker_receiver(
             let row = crate::db::Db::build_new_session_row_conn(conn, "p", &project_root, "Build")?;
             crate::db::Db::insert_session_row_conn(conn, &row)
         })
+        .await
         .unwrap();
     let session = Arc::new(
         Session::resume(ctx.db.clone(), session_row.session_id)
@@ -2264,7 +2270,7 @@ fn attached_state_with_worker_receiver(
 async fn client_state_split_snapshot_republishes_on_attach_and_detach() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, session_id) = attached_state(&ctx, tmp.path());
+    let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
 
     let attached = state.shared_snapshot();
     assert_eq!(
@@ -2284,7 +2290,7 @@ async fn client_state_split_snapshot_republishes_on_attach_and_detach() {
 async fn client_state_split_handler_holding_a_stale_snapshot_still_scrubs() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     state.principal = remote_principal();
     let table = table_for("stale-secret");
     let mut stale = (*state.shared_snapshot()).clone();
@@ -3269,6 +3275,7 @@ async fn dispatch_authz_request_after(
     if let Some(session_id) = unshare_session_after_prelude {
         ctx.db
             .set_session_shared_with_collaborators(session_id, false)
+            .await
             .expect("revoke shared session before authz matrix request");
     }
 
@@ -3636,7 +3643,7 @@ fn assert_authz_allowed_outcome(
 
 #[cfg(unix)]
 async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: AuthzKnownHole) {
-    let scenario = authz_cross_session_paused_work_scenario(kind, known_hole.level);
+    let scenario = authz_cross_session_paused_work_scenario(kind, known_hole.level).await;
     let result = dispatch_authz_request_after(
         &scenario.ctx,
         scenario.principal,
@@ -3661,6 +3668,7 @@ async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: Aut
                     .ctx
                     .db
                     .paused_session_work(scenario.target_session_id)
+                    .await
                     .unwrap()
                     .is_none(),
                 "{} did not mutate the inaccessible paused-work target for {}",
@@ -3683,9 +3691,10 @@ async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: Aut
 async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+    let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     ctx.db
         .set_session_shared_with_collaborators(session_id, true)
+        .await
         .unwrap();
     ctx.db
         .insert_session_event(
@@ -3732,7 +3741,7 @@ async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSo
 }
 
 #[cfg(unix)]
-fn authz_cross_session_paused_work_scenario(
+async fn authz_cross_session_paused_work_scenario(
     kind: &'static str,
     level: AuthzLevel,
 ) -> AuthzSocketScenario {
@@ -3743,14 +3752,15 @@ fn authz_cross_session_paused_work_scenario(
     std::fs::create_dir_all(&accessible_root).unwrap();
     std::fs::create_dir_all(&target_root).unwrap();
 
-    let (attached_session_id, work_rx) = live_worker_with_receiver(&ctx, &accessible_root);
+    let (attached_session_id, work_rx) = live_worker_with_receiver(&ctx, &accessible_root).await;
     ctx.db
         .set_session_shared_with_collaborators(attached_session_id, true)
+        .await
         .unwrap();
     let target_root_str = target_root.to_str().unwrap().to_string();
     let target_session = ctx
         .db
-        .write_blocking(move |conn| {
+        .write(move |conn| {
             let row = crate::db::Db::build_new_session_row_conn(
                 conn,
                 "target",
@@ -3759,6 +3769,7 @@ fn authz_cross_session_paused_work_scenario(
             )?;
             crate::db::Db::insert_session_row_conn(conn, &row)
         })
+        .await
         .unwrap();
     ctx.db
         .upsert_paused_session_work(
@@ -3769,6 +3780,7 @@ fn authz_cross_session_paused_work_scenario(
             1,
             "test-version",
         )
+        .await
         .unwrap();
 
     AuthzSocketScenario {
@@ -4945,7 +4957,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             .await
             .expect("unknown paused work is typed no-op");
             assert!(matches!(response, Response::Ack));
-            assert!(ctx.db.paused_session_work_all().unwrap().is_empty());
+            assert!(ctx.db.paused_session_work_all().await.unwrap().is_empty());
         }
         "set_goal_status" | "clear_goal" => assert_goal_mutating_malformed(case.kind).await,
         "create_assistant_session" => {
@@ -5123,7 +5135,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
 }
 
 #[cfg(unix)]
-fn live_worker_with_receiver(
+async fn live_worker_with_receiver(
     ctx: &Arc<DaemonContext>,
     project_root: &Path,
 ) -> (Uuid, tokio::sync::mpsc::Receiver<SessionWork>) {
@@ -5135,7 +5147,7 @@ fn live_worker_with_receiver(
     let project_root = project_root.to_str().unwrap().to_string();
     let row = ctx
         .db
-        .write_blocking(move |conn| {
+        .write(move |conn| {
             crate::db::Db::set_workspace_trust_conn(
                 conn,
                 &normalized_root,
@@ -5145,6 +5157,7 @@ fn live_worker_with_receiver(
             let row = crate::db::Db::build_new_session_row_conn(conn, "p", &project_root, "Build")?;
             crate::db::Db::insert_session_row_conn(conn, &row)
         })
+        .await
         .unwrap();
     let session = Arc::new(
         Session::resume(ctx.db.clone(), row.session_id)
@@ -5243,7 +5256,7 @@ fn proto_queue_item(text: &str) -> proto::QueueItem {
 async fn assert_worker_delivery_happy(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+    let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     let request = match kind {
         "send_user_message" => Request::SendUserMessage {
             text: "hello worker".into(),
@@ -5679,7 +5692,7 @@ async fn assert_fs_mutating_malformed(kind: &str) {
 async fn assert_attachment_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+    let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     let png = sample_png();
     let sha = sha256_hex(&png);
     let data = base64::engine::general_purpose::STANDARD.encode(&png);
@@ -5816,7 +5829,7 @@ async fn assert_attachment_mutating_happy(kind: &str) {
 async fn assert_attachment_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+    let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     let prelude = vec![attach_existing_request(session_id, tmp.path())];
     let err = match kind {
         "begin_attachment_upload" => dispatch_matrix_request_after(
@@ -5961,6 +5974,7 @@ async fn assert_paused_work_mutating_happy(kind: &str) {
             1,
             "test-version",
         )
+        .await
         .unwrap();
     let request = match kind {
         "resume_paused_work" => Request::ResumePausedWork {
@@ -5979,6 +5993,7 @@ async fn assert_paused_work_mutating_happy(kind: &str) {
         "resume_paused_work" | "cancel_paused_work" => assert!(
             ctx.db
                 .paused_session_work(session.session_id)
+                .await
                 .unwrap()
                 .is_none()
         ),
@@ -6663,7 +6678,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
         "set_approval_mode" => {
             let ctx = test_ctx();
             let tmp = tempfile::tempdir().unwrap();
-            let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+            let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
             let (response, events) = dispatch_matrix_request_after_collect_events(
                 &ctx,
                 vec![attach_existing_request(session_id, tmp.path())],
@@ -6688,7 +6703,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
         "set_sandbox" => {
             let ctx = test_ctx();
             let tmp = tempfile::tempdir().unwrap();
-            let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+            let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
             let (response, events) = dispatch_matrix_request_after_collect_events(
                 &ctx,
                 vec![attach_existing_request(session_id, tmp.path())],
@@ -6716,7 +6731,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
         "set_sandbox_escalation" => {
             let ctx = test_ctx();
             let tmp = tempfile::tempdir().unwrap();
-            let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+            let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
             let (response, events) = dispatch_matrix_request_after_collect_events(
                 &ctx,
                 vec![attach_existing_request(session_id, tmp.path())],
@@ -6761,7 +6776,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
         "refresh_env" => {
             let ctx = test_ctx();
             let tmp = tempfile::tempdir().unwrap();
-            let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+            let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
             let response = dispatch_matrix_request_after(
                 &ctx,
                 vec![attach_existing_request(session_id, tmp.path())],
@@ -6849,7 +6864,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
         "lsp_control" => {
             let ctx = test_ctx();
             let tmp = tempfile::tempdir().unwrap();
-            let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path());
+            let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
             let (response, events) = dispatch_matrix_request_after_collect_events(
                 &ctx,
                 vec![attach_existing_request(session_id, tmp.path())],
@@ -7155,7 +7170,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
 
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (state, attached_session_id) = attached_state(&ctx, tmp.path());
+    let (state, attached_session_id) = attached_state(&ctx, tmp.path()).await;
     let attach_session_id = Uuid::from_u128(1);
     let transcript_session_id = Uuid::from_u128(2);
     let steer_session_id = Uuid::from_u128(3);
@@ -8279,7 +8294,7 @@ async fn finish_upload_for(
 async fn attachment_upload_consumes_image_refs_exactly_once() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, session_id) = attached_state(&ctx, tmp.path());
+    let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
     let image_ref = finish_upload_for(&mut state, &png).await;
 
@@ -8297,7 +8312,7 @@ async fn attachment_upload_consumes_image_refs_exactly_once() {
 async fn duplicate_image_refs_are_rejected_without_consuming() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, session_id) = attached_state(&ctx, tmp.path());
+    let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
     let image_ref = finish_upload_for(&mut state, &png).await;
 
@@ -8319,8 +8334,8 @@ async fn attachment_ref_is_scoped_to_attached_session() {
     let ctx = test_ctx();
     let tmp_a = tempfile::tempdir().unwrap();
     let tmp_b = tempfile::tempdir().unwrap();
-    let (mut state, session_a) = attached_state(&ctx, tmp_a.path());
-    let (_, session_b) = attached_state(&ctx, tmp_b.path());
+    let (mut state, session_a) = attached_state(&ctx, tmp_a.path()).await;
+    let (_, session_b) = attached_state(&ctx, tmp_b.path()).await;
     let image_ref = finish_upload_for(&mut state, &sample_png()).await;
 
     let err = consume_image_refs(&mut state, session_b, std::slice::from_ref(&image_ref))
@@ -8337,7 +8352,7 @@ async fn attachment_ref_is_scoped_to_attached_session() {
 async fn attachment_upload_rejects_bad_chunk_shapes() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
     let upload_id = begin_upload_for(&mut state, &png);
 
@@ -8356,7 +8371,7 @@ async fn attachment_upload_rejects_bad_chunk_shapes() {
 async fn attachment_finish_rejects_sha_mismatch_and_invalid_png() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
     let upload_id = match begin_attachment_upload(
         &mut state,
@@ -8446,7 +8461,7 @@ async fn attachment_upload_config_clamps_to_protocol_cap_and_warns() {
 
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let byte_len = proto::MAX_SINGLE_IMAGE_BYTES + 1;
     let err = begin_attachment_upload_with_limits(
         &mut state,
@@ -8478,7 +8493,7 @@ async fn attachment_upload_config_below_protocol_cap_binds() {
 
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let err = begin_attachment_upload_with_limits(
         &mut state,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
@@ -8514,7 +8529,7 @@ async fn attachment_upload_config_degenerate_per_upload_bytes_clamps_to_floor() 
 async fn attachment_upload_default_limits_enforce_per_client_count() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
 
     for _ in 0..4 {
@@ -8550,7 +8565,7 @@ async fn attachment_upload_default_limits_enforce_global_count() {
 
     for _ in 0..32 {
         let tmp = tempfile::tempdir().unwrap();
-        let (mut state, _) = attached_state(&ctx, tmp.path());
+        let (mut state, _) = attached_state(&ctx, tmp.path()).await;
         state.upload_accounting = accounting.clone();
         begin_attachment_upload(
             &mut state,
@@ -8565,7 +8580,7 @@ async fn attachment_upload_default_limits_enforce_global_count() {
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let (mut overflow, _) = attached_state(&ctx, tmp.path());
+    let (mut overflow, _) = attached_state(&ctx, tmp.path()).await;
     overflow.upload_accounting = accounting;
     let err = begin_attachment_upload(
         &mut overflow,
@@ -8584,7 +8599,7 @@ async fn attachment_upload_default_limits_enforce_global_count() {
 async fn attachment_upload_limits_enforce_per_client_count_and_per_upload_bytes() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
     let limits = AttachmentUploadLimits {
         per_client_uploads: 2,
@@ -8623,7 +8638,7 @@ async fn attachment_upload_limits_enforce_per_client_count_and_per_upload_bytes(
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("this client"), "{}", err.message);
 
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let err = begin_attachment_upload_with_limits(
         &mut state,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
@@ -8649,8 +8664,8 @@ async fn attachment_upload_limits_enforce_global_count_and_bytes() {
     let ctx = test_ctx();
     let tmp_a = tempfile::tempdir().unwrap();
     let tmp_b = tempfile::tempdir().unwrap();
-    let (mut a, _) = attached_state(&ctx, tmp_a.path());
-    let (mut b, _) = attached_state(&ctx, tmp_b.path());
+    let (mut a, _) = attached_state(&ctx, tmp_a.path()).await;
+    let (mut b, _) = attached_state(&ctx, tmp_b.path()).await;
     b.upload_accounting = a.upload_accounting.clone();
     let png = sample_png();
     let limits = AttachmentUploadLimits {
@@ -8706,7 +8721,7 @@ async fn attachment_upload_limits_enforce_global_count_and_bytes() {
 async fn expired_pending_upload_prune_releases_global_accounting() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
     let upload_id = begin_upload_for(&mut state, &png);
     state
@@ -8754,7 +8769,7 @@ where
 async fn refresh_env_compat_accepts_path_snapshot() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
     let mut vars = HashMap::new();
     vars.insert("OPENAI_API_KEY".to_string(), "sk-new".to_string());
@@ -8780,8 +8795,8 @@ async fn refresh_env_is_scoped_to_attached_session_overlay() {
     let ctx = test_ctx();
     let tmp_a = tempfile::tempdir().unwrap();
     let tmp_b = tempfile::tempdir().unwrap();
-    let (mut state_a, _) = attached_state(&ctx, tmp_a.path());
-    let (mut state_b, _) = attached_state(&ctx, tmp_b.path());
+    let (mut state_a, _) = attached_state(&ctx, tmp_a.path()).await;
+    let (mut state_b, _) = attached_state(&ctx, tmp_b.path()).await;
 
     handle_request(
         Request::RefreshEnv {
@@ -8929,7 +8944,7 @@ fn insert_hung_worker(ctx: &Arc<DaemonContext>, session_id: Uuid) {
 async fn roster_trim_set_agent_rejects_removed_primary() {
     let ctx = test_ctx();
     let tmp = tempfile::TempDir::new().unwrap();
-    let (mut state, session_id) = attached_state(&ctx, tmp.path());
+    let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
 
     let err = handle_request(
         Request::SetAgent {
@@ -8952,7 +8967,7 @@ async fn roster_trim_set_agent_rejects_removed_primary() {
 async fn set_approval_mode_updates_session_and_broadcasts() {
     let ctx = test_ctx();
     let tmp = tempfile::TempDir::new().unwrap();
-    let (mut state, _session_id) = attached_state(&ctx, tmp.path());
+    let (mut state, _session_id) = attached_state(&ctx, tmp.path()).await;
     let mut event_rx = state
         .attached
         .as_ref()
@@ -8988,7 +9003,7 @@ async fn set_approval_mode_updates_session_and_broadcasts() {
 async fn set_sandbox_escalation_updates_session_and_broadcasts() {
     let ctx = test_ctx();
     let tmp = tempfile::TempDir::new().unwrap();
-    let (mut state, _session_id) = attached_state(&ctx, tmp.path());
+    let (mut state, _session_id) = attached_state(&ctx, tmp.path()).await;
     let mut event_rx = state
         .attached
         .as_ref()
@@ -9036,7 +9051,7 @@ async fn set_sandbox_escalation_updates_session_and_broadcasts() {
 async fn set_agent_rejects_non_ownable_subagent_name() {
     let ctx = test_ctx();
     let tmp = tempfile::TempDir::new().unwrap();
-    let (mut state, session_id) = attached_state(&ctx, tmp.path());
+    let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
 
     let err = handle_request(Request::SetAgent { name: "bee".into() }, &mut state, &ctx)
         .await
@@ -9072,7 +9087,7 @@ async fn set_agent_allows_build() {
 async fn list_agents_returns_chat_ownable_primaries() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
     let response = handle_request(Request::ListAgents, &mut state, &ctx)
         .await
@@ -9102,7 +9117,7 @@ async fn list_agents_agrees_with_validate_set_agent() {
         extended,
     ));
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
     let response = handle_request(Request::ListAgents, &mut state, &ctx)
         .await
@@ -9140,7 +9155,7 @@ async fn list_agents_respects_workspace_trust() {
     )
     .unwrap();
     let ctx = test_ctx();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     ctx.db
         .set_workspace_trust(
             tmp.path(),
@@ -9225,7 +9240,7 @@ async fn list_models_returns_resolved_models() {
         crate::config::extended::ExtendedConfig::default(),
     ));
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
     let response = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
         .await
@@ -9284,7 +9299,7 @@ async fn list_models_response_contains_no_secrets() {
         crate::config::extended::ExtendedConfig::default(),
     ));
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
     let response = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
         .await
@@ -9331,7 +9346,7 @@ async fn list_models_respects_workspace_trust() {
     );
     let ctx = test_ctx_with_config_source(source);
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     ctx.db
         .set_workspace_trust(
             tmp.path(),
@@ -9377,7 +9392,7 @@ async fn skill_summary_carries_user_invocable() {
         crate::config::providers::ProvidersConfig::default(),
         extended,
     ));
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
     let response = handle_request(
         Request::ListSkills {
@@ -9409,7 +9424,7 @@ async fn empty_inventories_return_ok_not_error() {
         crate::config::extended::ExtendedConfig::default(),
     ));
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
     let models = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
         .await
@@ -9437,7 +9452,7 @@ async fn empty_inventories_return_ok_not_error() {
 async fn inventory_ordering_is_stable() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
-    let (mut state, _) = attached_state(&ctx, tmp.path());
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
     let first = handle_request(Request::ListAgents, &mut state, &ctx)
         .await

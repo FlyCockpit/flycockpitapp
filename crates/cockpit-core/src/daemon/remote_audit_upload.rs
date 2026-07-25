@@ -186,7 +186,7 @@ async fn sync_once_with_client(
     let state = db
         .remote_audit_upload_state(&credential.server_url, &credential.instance_id)?
         .ok_or_else(|| anyhow!("remote audit upload state missing after upsert"))?;
-    let built = build_batch(db, credential, state.cursor_audit_id, redaction)?;
+    let built = build_batch(db, credential, state.cursor_audit_id, redaction).await?;
     match built {
         BatchBuild::Idle => Ok(RemoteAuditUploadOnceOutcome::Idle),
         BatchBuild::Skipped { cursor_audit_id } => {
@@ -250,13 +250,15 @@ enum BatchBuild {
     },
 }
 
-fn build_batch(
+async fn build_batch(
     db: &Db,
     credential: &StoredFlycockpitCredential,
     cursor_audit_id: i64,
     redaction: &RedactionTable,
 ) -> Result<BatchBuild> {
-    let rows = db.list_remote_audit_after(cursor_audit_id, MAX_BATCH_EVENTS)?;
+    let rows = db
+        .list_remote_audit_after(cursor_audit_id, MAX_BATCH_EVENTS)
+        .await?;
     if rows.is_empty() {
         return Ok(BatchBuild::Idle);
     }
@@ -459,7 +461,7 @@ mod tests {
         (outcome, requests, sleeps, server)
     }
 
-    fn insert_remote(db: &Db, kind: &str, path: Option<&str>) -> i64 {
+    async fn insert_remote(db: &Db, kind: &str, path: Option<&str>) -> i64 {
         let session = db
             .write_blocking(|conn| {
                 crate::db::Db::insert_session_row_conn(
@@ -480,8 +482,10 @@ mod tests {
             "allowed",
             path,
         )
+        .await
         .unwrap();
         db.list_remote_audit_after(0, 10_000)
+            .await
             .unwrap()
             .last()
             .unwrap()
@@ -491,7 +495,7 @@ mod tests {
     #[tokio::test]
     async fn upload_success_advances_cursor_and_uses_bare_rest_body() {
         let db = Db::open_in_memory().unwrap();
-        let audit_id = insert_remote(&db, "send_user_message", None);
+        let audit_id = insert_remote(&db, "send_user_message", None).await;
         let (outcome, requests, _, server) = sync_with_responses(
             &db,
             vec![response(
@@ -525,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn server_error_does_not_advance_cursor() {
         let db = Db::open_in_memory().unwrap();
-        insert_remote(&db, "send_user_message", None);
+        insert_remote(&db, "send_user_message", None).await;
         let (server, _requests) = start_test_server(vec![
             response(500, r#"{"error":"retry"}"#),
             response(500, r#"{"error":"retry"}"#),
@@ -553,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn revocation_does_not_advance_cursor() {
         let db = Db::open_in_memory().unwrap();
-        insert_remote(&db, "send_user_message", None);
+        insert_remote(&db, "send_user_message", None).await;
         let (outcome, _, _, server) =
             sync_with_responses(&db, vec![response(403, r#"{"error":"revoked"}"#)]).await;
         assert_eq!(outcome, RemoteAuditUploadOnceOutcome::Revoked);
@@ -564,15 +568,17 @@ mod tests {
         assert_eq!(state.cursor_audit_id, 0);
     }
 
-    #[test]
-    fn batch_event_cap_is_one_hundred() {
+    #[tokio::test]
+    async fn batch_event_cap_is_one_hundred() {
         let db = Db::open_in_memory().unwrap();
         for _ in 0..101 {
-            insert_remote(&db, "fs_write", None);
+            insert_remote(&db, "fs_write", None).await;
         }
         let credential = credential("http://127.0.0.1:1".to_string());
-        let rows = db.list_remote_audit_after(0, 101).unwrap();
-        let built = build_batch(&db, &credential, 0, &RedactionTable::empty()).unwrap();
+        let rows = db.list_remote_audit_after(0, 101).await.unwrap();
+        let built = build_batch(&db, &credential, 0, &RedactionTable::empty())
+            .await
+            .unwrap();
         match built {
             BatchBuild::Ready {
                 payload,
@@ -587,10 +593,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn redaction_is_applied_to_paths() {
+    #[tokio::test]
+    async fn redaction_is_applied_to_paths() {
         let db = Db::open_in_memory().unwrap();
-        insert_remote(&db, "fs_write", Some("src/project-secret-token.txt"));
+        insert_remote(&db, "fs_write", Some("src/project-secret-token.txt")).await;
         let credential = credential("http://127.0.0.1:1".to_string());
         let tmp = tempfile::TempDir::new().unwrap();
         let config = RedactConfig {
@@ -601,7 +607,7 @@ mod tests {
             ..RedactConfig::default()
         };
         let redaction = RedactionTable::build(&config, tmp.path()).unwrap();
-        let built = build_batch(&db, &credential, 0, &redaction).unwrap();
+        let built = build_batch(&db, &credential, 0, &redaction).await.unwrap();
         match built {
             BatchBuild::Ready { payload, .. } => {
                 let body = payload.to_string();
@@ -612,12 +618,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn poison_row_is_skipped_and_cursor_advances() {
+    #[tokio::test]
+    async fn poison_row_is_skipped_and_cursor_advances() {
         let db = Db::open_in_memory().unwrap();
-        let audit_id = insert_remote(&db, "", None);
+        let audit_id = insert_remote(&db, "", None).await;
         let credential = credential("http://127.0.0.1:1".to_string());
-        let built = build_batch(&db, &credential, 0, &RedactionTable::empty()).unwrap();
+        let built = build_batch(&db, &credential, 0, &RedactionTable::empty())
+            .await
+            .unwrap();
         match built {
             BatchBuild::Skipped { cursor_audit_id } => assert_eq!(cursor_audit_id, audit_id),
             BatchBuild::Idle | BatchBuild::Ready { .. } => panic!("expected skipped row"),

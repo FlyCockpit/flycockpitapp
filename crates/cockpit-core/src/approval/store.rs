@@ -391,13 +391,13 @@ impl GrantStore {
     /// applies to this session (Session, Project, or Global). `Once`
     /// grants are never stored, so they never show up here.
     #[cfg(test)]
-    pub fn is_command_granted(&self, key: &ApprovalKey) -> bool {
-        self.command_grant(key).is_some()
+    pub async fn is_command_granted(&self, key: &ApprovalKey) -> bool {
+        self.command_grant(key).await.is_some()
     }
 
-    pub fn command_grant(&self, key: &ApprovalKey) -> Option<CommandGrant> {
+    pub async fn command_grant(&self, key: &ApprovalKey) -> Option<CommandGrant> {
         let s = key.as_storage_str();
-        if let Some(granted_tier) = self.session_command_grant_tier(&s) {
+        if let Some(granted_tier) = self.session_command_grant_tier(&s).await {
             return Some(CommandGrant {
                 scope: Scope::Session,
                 granted_tier,
@@ -428,13 +428,16 @@ impl GrantStore {
     /// allow query's mirror. A standing reject auto-denies the command
     /// without prompting (`DecisionSource::StandingReject`).
     #[cfg(test)]
-    pub fn is_command_rejected(&self, key: &ApprovalKey) -> bool {
-        self.command_reject_scope(key).is_some()
+    pub async fn is_command_rejected(&self, key: &ApprovalKey) -> bool {
+        self.command_reject_scope(key).await.is_some()
     }
 
-    pub fn command_reject_scope(&self, key: &ApprovalKey) -> Option<Scope> {
+    pub async fn command_reject_scope(&self, key: &ApprovalKey) -> Option<Scope> {
         let s = key.as_storage_str();
-        if self.session_has(GrantKind::Command, &s, Verdict::Reject) {
+        if self
+            .session_has(GrantKind::Command, &s, Verdict::Reject)
+            .await
+        {
             return Some(Scope::Session);
         }
         if self
@@ -452,9 +455,12 @@ impl GrantStore {
         None
     }
 
-    pub fn mcp_tool_grant_scope(&self, server: &str, tool: &str) -> Option<Scope> {
+    pub async fn mcp_tool_grant_scope(&self, server: &str, tool: &str) -> Option<Scope> {
         let key = mcp_tool_key(server, tool);
-        if self.session_has(GrantKind::McpTool, &key, Verdict::Allow) {
+        if self
+            .session_has(GrantKind::McpTool, &key, Verdict::Allow)
+            .await
+        {
             return Some(Scope::Session);
         }
         if self
@@ -472,9 +478,12 @@ impl GrantStore {
         None
     }
 
-    pub fn mcp_tool_reject_scope(&self, server: &str, tool: &str) -> Option<Scope> {
+    pub async fn mcp_tool_reject_scope(&self, server: &str, tool: &str) -> Option<Scope> {
         let key = mcp_tool_key(server, tool);
-        if self.session_has(GrantKind::McpTool, &key, Verdict::Reject) {
+        if self
+            .session_has(GrantKind::McpTool, &key, Verdict::Reject)
+            .await
+        {
             return Some(Scope::Session);
         }
         if self
@@ -492,28 +501,31 @@ impl GrantStore {
         None
     }
 
-    pub fn is_harness_granted(&self, harness: &str) -> bool {
+    pub async fn is_harness_granted(&self, harness: &str) -> bool {
         self.session_has(GrantKind::Harness, harness, Verdict::Allow)
+            .await
     }
 
     #[cfg(test)]
-    fn is_path_granted(&self, path: &Path) -> bool {
+    async fn is_path_granted(&self, path: &Path) -> bool {
         self.is_path_granted_for(path, SandboxPathAccess::Read)
+            .await
     }
 
-    pub fn is_path_granted_for(&self, path: &Path, required: SandboxPathAccess) -> bool {
+    pub async fn is_path_granted_for(&self, path: &Path, required: SandboxPathAccess) -> bool {
         self.effective_path_grant_access(path)
+            .await
             .is_some_and(|access| access >= required)
     }
 
-    pub fn effective_path_grant_access(&self, path: &Path) -> Option<SandboxPathAccess> {
+    pub async fn effective_path_grant_access(&self, path: &Path) -> Option<SandboxPathAccess> {
         let candidate = normalize_path(path, &self.cwd);
         let matches = |stored: &str| path_covers(stored, &candidate);
-        if self.path_reject_matches(matches) {
+        if self.path_reject_matches(matches).await {
             return None;
         }
         let mut access: Option<SandboxPathAccess> = None;
-        for (key, grant_access) in self.path_allow_entries() {
+        for (key, grant_access) in self.path_allow_entries().await {
             if path_covers(&key, &candidate) {
                 access = Some(access.map_or(grant_access, |current| current.max(grant_access)));
             }
@@ -521,10 +533,10 @@ impl GrantStore {
         access
     }
 
-    pub fn effective_path_grants(&self) -> Vec<EffectivePathGrant> {
-        let rejects = self.path_reject_entries();
+    pub async fn effective_path_grants(&self) -> Vec<EffectivePathGrant> {
+        let rejects = self.path_reject_entries().await;
         let mut by_path: BTreeMap<String, SandboxPathAccess> = BTreeMap::new();
-        for (key, access) in self.path_allow_entries() {
+        for (key, access) in self.path_allow_entries().await {
             if rejects
                 .iter()
                 .any(|(reject, _)| paths_overlap(reject, &key))
@@ -559,10 +571,10 @@ impl GrantStore {
     /// Whether a path is **rejected** at any applicable scope — the allow
     /// path query's mirror (same prefix-match semantics). A standing path
     /// reject auto-denies the out-of-cwd access without prompting.
-    pub fn is_path_rejected(&self, path: &Path) -> bool {
+    pub async fn is_path_rejected(&self, path: &Path) -> bool {
         let candidate = normalize_path(path, &self.cwd);
         let matches = |stored: &str| path_covers(stored, &candidate);
-        self.path_reject_matches(matches)
+        self.path_reject_matches(matches).await
     }
 
     /// Record a command-key **allow** grant at `scope`. Rejects wrappers at
@@ -570,7 +582,7 @@ impl GrantStore {
     /// caller shouldn't record it, but rejecting loudly catches misuse.
     /// Clears any standing **reject** for this key across every reachable
     /// scope first (mutual exclusivity), then writes the allow.
-    pub fn record_command(
+    pub async fn record_command(
         &self,
         info: &crate::approval::classify::SimpleCommandInfo,
         tier: RiskTier,
@@ -590,13 +602,14 @@ impl GrantStore {
             None,
             Some(tier),
         )
+        .await
     }
 
     /// Record a command-key **reject** grant at `scope` — the allow
     /// recorder's mirror. Same `Once`/wrapper rules (a wrapper is never
     /// persistable in either polarity). Clears any standing **allow** for
     /// this key across every reachable scope first, then writes the reject.
-    pub fn record_command_reject(
+    pub async fn record_command_reject(
         &self,
         info: &crate::approval::classify::SimpleCommandInfo,
         scope: Scope,
@@ -615,6 +628,7 @@ impl GrantStore {
             None,
             None,
         )
+        .await
     }
 
     /// Record a path **allow** grant at `scope`. Paths are never wrappers,
@@ -623,7 +637,7 @@ impl GrantStore {
     /// checks are stable.
     /// Clears any standing **reject** for this key across reachable scopes
     /// first.
-    pub fn record_path(
+    pub async fn record_path(
         &self,
         path: &Path,
         scope: Scope,
@@ -640,12 +654,13 @@ impl GrantStore {
             Some(access),
             None,
         )
+        .await
     }
 
     /// Record a path **reject** grant at `scope` — the allow recorder's
     /// mirror. Clears any standing **allow** for this key across reachable
     /// scopes first, then writes the reject.
-    pub fn record_path_reject(&self, path: &Path, scope: Scope) -> Result<(), StoreError> {
+    pub async fn record_path_reject(&self, path: &Path, scope: Scope) -> Result<(), StoreError> {
         if scope == Scope::Once {
             return Err(StoreError::OnceNotPersistable);
         }
@@ -657,13 +672,14 @@ impl GrantStore {
             Some(SandboxPathAccess::ReadWrite),
             None,
         )
+        .await
     }
 
     /// Record an external MCP tool **allow** grant at `scope`. The key is
     /// exact `(server, tool)`: arguments are intentionally not part of the
     /// grant, so repeated calls to the same external tool do not prompt per
     /// argument set. `Once` is applied by the caller and never persisted.
-    pub fn record_mcp_tool(
+    pub async fn record_mcp_tool(
         &self,
         server: &str,
         tool: &str,
@@ -680,12 +696,13 @@ impl GrantStore {
             None,
             None,
         )
+        .await
     }
 
     /// Record an external MCP tool **reject** grant at `scope` — the allow
     /// recorder's mirror. Clears any standing allow for the same exact
     /// `(server, tool)` before writing.
-    pub fn record_mcp_tool_reject(
+    pub async fn record_mcp_tool_reject(
         &self,
         server: &str,
         tool: &str,
@@ -702,22 +719,26 @@ impl GrantStore {
             None,
             None,
         )
+        .await
     }
 
     /// Record a configured external harness allow grant for this session.
     /// Durable always-allow is a field on the harness config, not an
     /// `approvals.json` entry, so non-session scopes are rejected.
-    pub fn record_harness(&self, harness: &str, scope: Scope) -> Result<(), StoreError> {
+    pub async fn record_harness(&self, harness: &str, scope: Scope) -> Result<(), StoreError> {
         match scope {
             Scope::Once => Err(StoreError::OnceNotPersistable),
-            Scope::Session => self.record(
-                GrantKind::Harness,
-                harness,
-                Scope::Session,
-                Verdict::Allow,
-                None,
-                None,
-            ),
+            Scope::Session => {
+                self.record(
+                    GrantKind::Harness,
+                    harness,
+                    Scope::Session,
+                    Verdict::Allow,
+                    None,
+                    None,
+                )
+                .await
+            }
             Scope::Project | Scope::Global => Err(StoreError::HarnessSessionScopeOnly),
         }
     }
@@ -764,8 +785,8 @@ impl GrantStore {
     /// Order checked: session → project → global. Within a scope a
     /// `reject` and an `accept` cannot coexist (recording one clears the
     /// other), so the first scope with *any* rule decides.
-    pub fn loop_rule(&self, signature: &str) -> Option<LoopVerdict> {
-        if let Some(v) = self.session_loop_rule(signature) {
+    pub async fn loop_rule(&self, signature: &str) -> Option<LoopVerdict> {
+        if let Some(v) = self.session_loop_rule(signature).await {
             return Some(v);
         }
         if let Some(v) = self
@@ -783,7 +804,7 @@ impl GrantStore {
     /// a signature never carries contradictory rules within one scope.
     /// `Once` is rejected (it is never persisted — the caller acts on a
     /// one-off decision directly).
-    pub fn record_loop_rule(
+    pub async fn record_loop_rule(
         &self,
         signature: &str,
         verdict: LoopVerdict,
@@ -793,6 +814,7 @@ impl GrantStore {
             Scope::Once => Err(StoreError::OnceNotPersistable),
             Scope::Session => self
                 .session_record_loop_rule(signature, verdict)
+                .await
                 .map_err(StoreError::Io),
             Scope::Project => {
                 if self.project_root.is_none() {
@@ -818,53 +840,50 @@ impl GrantStore {
         }
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
-    fn session_loop_rule(&self, signature: &str) -> Option<LoopVerdict> {
+    async fn session_loop_rule(&self, signature: &str) -> Option<LoopVerdict> {
+        let session_id = self.session_id;
+        let signature = signature.to_owned();
         self.db
-            .read_blocking(|conn| {
+            .read(move |conn| {
                 let verdict: Option<String> = conn
                     .query_row(
                         "SELECT rule_verdict FROM loop_guard_rules \
                          WHERE session_id = ?1 AND signature = ?2",
-                        rusqlite::params![self.session_id.to_string(), signature],
+                        rusqlite::params![session_id.to_string(), signature],
                         |row| row.get(0),
                     )
                     .optional()?;
                 Ok(verdict)
             })
+            .await
             .ok()
             .flatten()
             .and_then(|s| parse_verdict(&s))
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
-    fn session_record_loop_rule(&self, signature: &str, verdict: LoopVerdict) -> Result<()> {
+    async fn session_record_loop_rule(&self, signature: &str, verdict: LoopVerdict) -> Result<()> {
         let session_id = self.session_id;
         let signature = signature.to_owned();
-        self.db.write_blocking(move |conn| {
-            // `INSERT OR REPLACE` on the (session_id, signature) primary
-            // key flips an existing opposite verdict in place — no
-            // contradictory pair can persist.
-            conn.execute(
-                "INSERT OR REPLACE INTO loop_guard_rules \
+        self.db
+            .write(move |conn| {
+                // `INSERT OR REPLACE` on the (session_id, signature) primary
+                // key flips an existing opposite verdict in place — no
+                // contradictory pair can persist.
+                conn.execute(
+                    "INSERT OR REPLACE INTO loop_guard_rules \
                  (session_id, signature, rule_verdict, recorded_at) \
                  VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![
-                    session_id.to_string(),
-                    signature,
-                    verdict.as_str(),
-                    now_epoch_seconds()
-                ],
-            )
-            .context("inserting loop_guard_rule")?;
-            Ok(())
-        })
+                    rusqlite::params![
+                        session_id.to_string(),
+                        signature,
+                        verdict.as_str(),
+                        now_epoch_seconds()
+                    ],
+                )
+                .context("inserting loop_guard_rule")?;
+                Ok(())
+            })
+            .await
     }
 
     fn file_record_loop_rule(
@@ -891,7 +910,7 @@ impl GrantStore {
 
     // ---- internals --------------------------------------------------------
 
-    fn record(
+    async fn record(
         &self,
         kind: GrantKind,
         key: &str,
@@ -912,11 +931,13 @@ impl GrantStore {
         // reject of a key allowed at project/global rewrites those files to
         // drop that key's allow (only ever the same key).
         self.clear_key_everywhere(kind, key, verdict.opposite())
+            .await
             .map_err(StoreError::Io)?;
         match scope {
             Scope::Once => Err(StoreError::OnceNotPersistable),
             Scope::Session => self
                 .session_insert(kind, key, verdict, access, risk_tier)
+                .await
                 .map_err(StoreError::Io),
             Scope::Project => {
                 if self.project_root.is_none() {
@@ -949,9 +970,14 @@ impl GrantStore {
     /// resolve (no project root / no global dir) are skipped, never an error.
     /// Each removal is exact-key (commands) or exact-string (paths) — never a
     /// prefix sweep — so it only ever touches the one key being re-recorded.
-    fn clear_key_everywhere(&self, kind: GrantKind, key: &str, verdict: Verdict) -> Result<()> {
+    async fn clear_key_everywhere(
+        &self,
+        kind: GrantKind,
+        key: &str,
+        verdict: Verdict,
+    ) -> Result<()> {
         // Session (always reachable).
-        self.session_remove(kind, key, verdict)?;
+        self.session_remove(kind, key, verdict).await?;
         // Project (only if a root resolves).
         if let Some(dir) = self.project_approvals_dir.as_ref() {
             self.file_remove(dir, kind, key, verdict)?;
@@ -965,66 +991,56 @@ impl GrantStore {
 
     // ---- session scope (SQLite) ------------------------------------------
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
-    fn session_command_grant_tier(&self, key: &str) -> Option<RiskTier> {
+    async fn session_command_grant_tier(&self, key: &str) -> Option<RiskTier> {
+        let session_id = self.session_id;
+        let key = key.to_owned();
         self.db
-            .read_blocking(|conn| {
+            .read(move |conn| {
                 Ok(conn
                     .query_row(
                         "SELECT risk_tier FROM approval_grants \
                      WHERE session_id = ?1 AND grant_kind = 'command' AND grant_key = ?2 \
                        AND verdict = 'allow'",
-                        rusqlite::params![self.session_id.to_string(), key],
+                        rusqlite::params![session_id.to_string(), key],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?)
             })
+            .await
             .ok()
             .flatten()
             .and_then(|tier| RiskTier::from_policy_key(&tier))
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
-    fn session_has(&self, kind: GrantKind, key: &str, verdict: Verdict) -> bool {
+    async fn session_has(&self, kind: GrantKind, key: &str, verdict: Verdict) -> bool {
+        let session_id = self.session_id;
+        let key = key.to_owned();
         self.db
-            .read_blocking(|conn| {
+            .read(move |conn| {
                 let n: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM approval_grants \
                      WHERE session_id = ?1 AND grant_kind = ?2 AND grant_key = ?3 \
                        AND verdict = ?4",
-                    rusqlite::params![
-                        self.session_id.to_string(),
-                        kind.as_str(),
-                        key,
-                        verdict.as_str()
-                    ],
+                    rusqlite::params![session_id.to_string(), kind.as_str(), key, verdict.as_str()],
                     |row| row.get(0),
                 )?;
                 Ok(n > 0)
             })
+            .await
             .unwrap_or(false)
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
-    fn session_path_entries(&self, verdict: Verdict) -> Vec<(String, SandboxPathAccess)> {
+    async fn session_path_entries(&self, verdict: Verdict) -> Vec<(String, SandboxPathAccess)> {
+        let session_id = self.session_id;
         self.db
-            .read_blocking(|conn| {
+            .read(move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT grant_key, access FROM approval_grants \
                      WHERE session_id = ?1 AND grant_kind = 'path' AND verdict = ?2 \
                      ORDER BY grant_key",
                 )?;
                 let rows = stmt.query_map(
-                    rusqlite::params![self.session_id.to_string(), verdict.as_str()],
+                    rusqlite::params![session_id.to_string(), verdict.as_str()],
                     |row| {
                         let key: String = row.get(0)?;
                         let access: Option<String> = row.get(1)?;
@@ -1037,11 +1053,12 @@ impl GrantStore {
                 }
                 Ok(out)
             })
+            .await
             .unwrap_or_default()
     }
 
-    fn path_allow_entries(&self) -> Vec<(String, SandboxPathAccess)> {
-        let mut entries = self.session_path_entries(Verdict::Allow);
+    async fn path_allow_entries(&self) -> Vec<(String, SandboxPathAccess)> {
+        let mut entries = self.session_path_entries(Verdict::Allow).await;
         if let Some(file) = self.project_file() {
             entries.extend(file.paths);
         }
@@ -1051,8 +1068,8 @@ impl GrantStore {
         entries
     }
 
-    fn path_reject_entries(&self) -> Vec<(String, SandboxPathAccess)> {
-        let mut entries = self.session_path_entries(Verdict::Reject);
+    async fn path_reject_entries(&self) -> Vec<(String, SandboxPathAccess)> {
+        let mut entries = self.session_path_entries(Verdict::Reject).await;
         if let Some(file) = self.project_file() {
             entries.extend(file.paths_reject);
         }
@@ -1062,20 +1079,17 @@ impl GrantStore {
         entries
     }
 
-    fn path_reject_matches<F>(&self, matches: F) -> bool
+    async fn path_reject_matches<F>(&self, matches: F) -> bool
     where
         F: Fn(&str) -> bool,
     {
         self.path_reject_entries()
+            .await
             .iter()
             .any(|(key, _)| matches(key))
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
-    fn session_insert(
+    async fn session_insert(
         &self,
         kind: GrantKind,
         key: &str,
@@ -1087,48 +1101,48 @@ impl GrantStore {
         let key = key.to_owned();
         let access = access.map(SandboxPathAccess::storage_str);
         let risk_tier = risk_tier.map(RiskTier::as_str);
-        self.db.write_blocking(move |conn| {
-            // `INSERT OR REPLACE` on the (session_id, grant_kind, grant_key)
-            // primary key flips an existing opposite verdict in place — a key
-            // can never carry both polarities at session scope.
-            conn.execute(
-                "INSERT OR REPLACE INTO approval_grants \
+        self.db
+            .write(move |conn| {
+                // `INSERT OR REPLACE` on the (session_id, grant_kind, grant_key)
+                // primary key flips an existing opposite verdict in place — a key
+                // can never carry both polarities at session scope.
+                conn.execute(
+                    "INSERT OR REPLACE INTO approval_grants \
                  (session_id, grant_kind, grant_key, granted_at, verdict, access, risk_tier) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    session_id.to_string(),
-                    kind.as_str(),
-                    key,
-                    now_epoch_seconds(),
-                    verdict.as_str(),
-                    access,
-                    risk_tier
-                ],
-            )
-            .context("inserting session approval grant")?;
-            Ok(())
-        })
+                    rusqlite::params![
+                        session_id.to_string(),
+                        kind.as_str(),
+                        key,
+                        now_epoch_seconds(),
+                        verdict.as_str(),
+                        access,
+                        risk_tier
+                    ],
+                )
+                .context("inserting session approval grant")?;
+                Ok(())
+            })
+            .await
     }
 
     /// Remove a session-scope grant of `verdict` polarity for an exact
     /// `(kind, key)`. Used to clear the opposite polarity before writing.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
-    fn session_remove(&self, kind: GrantKind, key: &str, verdict: Verdict) -> Result<()> {
+    async fn session_remove(&self, kind: GrantKind, key: &str, verdict: Verdict) -> Result<()> {
         let session_id = self.session_id;
         let key = key.to_owned();
-        self.db.write_blocking(move |conn| {
-            conn.execute(
-                "DELETE FROM approval_grants \
+        self.db
+            .write(move |conn| {
+                conn.execute(
+                    "DELETE FROM approval_grants \
                  WHERE session_id = ?1 AND grant_kind = ?2 AND grant_key = ?3 \
                    AND verdict = ?4",
-                rusqlite::params![session_id.to_string(), kind.as_str(), key, verdict.as_str()],
-            )
-            .context("removing session approval grant")?;
-            Ok(())
-        })
+                    rusqlite::params![session_id.to_string(), kind.as_str(), key, verdict.as_str()],
+                )
+                .context("removing session approval grant")?;
+                Ok(())
+            })
+            .await
     }
 
     // ---- project / global scope (JSON files) ------------------------------
@@ -1609,6 +1623,73 @@ mod tests {
         (store, sid)
     }
 
+    #[tokio::test]
+    async fn db_async_approval_decision_write_is_visible_to_subsequent_gate_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let info = cmd_info("cargo", Some("test"), false);
+
+        store
+            .record_command(&info, RiskTier::Mutating, Scope::Session)
+            .await
+            .unwrap();
+
+        assert!(store.is_command_granted(&info.key).await);
+        assert_eq!(
+            store.command_grant(&info.key).await,
+            Some(CommandGrant {
+                scope: Scope::Session,
+                granted_tier: RiskTier::Mutating,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn db_async_approval_cancelled_decision_write_is_all_or_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let info = cmd_info("cargo", Some("build"), false);
+
+        let cancelled = store.record_command(&info, RiskTier::Ordinary, Scope::Session);
+        drop(cancelled);
+
+        assert_eq!(store.command_grant(&info.key).await, None);
+        assert!(!store.is_command_granted(&info.key).await);
+
+        store
+            .record_command(&info, RiskTier::Ordinary, Scope::Session)
+            .await
+            .unwrap();
+        assert!(store.is_command_granted(&info.key).await);
+    }
+
+    #[tokio::test]
+    async fn db_async_approval_denial_is_never_lost_under_concurrent_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let info = cmd_info("rm", Some("-rf"), false);
+
+        store
+            .record_command_reject(&info, Scope::Session)
+            .await
+            .unwrap();
+
+        let (first, second, third, grant) = tokio::join!(
+            store.command_reject_scope(&info.key),
+            store.command_reject_scope(&info.key),
+            store.is_command_rejected(&info.key),
+            store.command_grant(&info.key),
+        );
+
+        assert_eq!(first, Some(Scope::Session));
+        assert_eq!(second, Some(Scope::Session));
+        assert!(third);
+        assert_eq!(grant, None);
+    }
+
     fn column_type(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<String> {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let rows = stmt.query_map([], |row| {
@@ -1623,24 +1704,25 @@ mod tests {
         anyhow::bail!("missing column {table}.{column}")
     }
 
-    #[test]
-    fn session_grant_then_granted() {
+    #[tokio::test]
+    async fn session_grant_then_granted() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("gh", Some("pr"), false);
-        assert!(!store.is_command_granted(&info.key));
+        assert!(!store.is_command_granted(&info.key).await);
         store
             .record_command(&info, info.risk.tier, Scope::Session)
+            .await
             .unwrap();
-        assert!(store.is_command_granted(&info.key));
+        assert!(store.is_command_granted(&info.key).await);
         // A different subcommand still prompts.
         let other = cmd_info("gh", Some("repo"), false);
-        assert!(!store.is_command_granted(&other.key));
+        assert!(!store.is_command_granted(&other.key).await);
     }
 
-    #[test]
-    fn command_grant_records_and_returns_issue_tier() {
+    #[tokio::test]
+    async fn command_grant_records_and_returns_issue_tier() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
@@ -1649,10 +1731,11 @@ mod tests {
 
         store
             .record_command(&info, info.risk.tier, Scope::Session)
+            .await
             .unwrap();
 
         assert_eq!(
-            store.command_grant(&info.key),
+            store.command_grant(&info.key).await,
             Some(CommandGrant {
                 scope: Scope::Session,
                 granted_tier: RiskTier::Destructive,
@@ -1660,8 +1743,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn approvals_file_commands_serializes_as_tier_map() {
+    #[tokio::test]
+    async fn approvals_file_commands_serializes_as_tier_map() {
         let file = ApprovalsFile {
             commands: BTreeMap::from([(
                 "git push".to_string(),
@@ -1681,8 +1764,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unparseable_persisted_tier_is_treated_as_no_grant() {
+    #[tokio::test]
+    async fn unparseable_persisted_tier_is_treated_as_no_grant() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
@@ -1702,39 +1785,46 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(store.command_grant(&info.key), None);
-        assert!(!store.is_command_granted(&info.key));
+        assert_eq!(store.command_grant(&info.key).await, None);
+        assert!(!store.is_command_granted(&info.key).await);
     }
 
-    #[test]
-    fn command_reject_ignores_invocation_tier() {
+    #[tokio::test]
+    async fn command_reject_ignores_invocation_tier() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let mut info = cmd_info("git", Some("push"), false);
 
-        store.record_command_reject(&info, Scope::Session).unwrap();
+        store
+            .record_command_reject(&info, Scope::Session)
+            .await
+            .unwrap();
         info.risk.tier = RiskTier::Destructive;
 
-        assert_eq!(store.command_reject_scope(&info.key), Some(Scope::Session));
+        assert_eq!(
+            store.command_reject_scope(&info.key).await,
+            Some(Scope::Session)
+        );
     }
 
-    #[test]
-    fn project_grant_covers_subcommand_args_and_persists() {
+    #[tokio::test]
+    async fn project_grant_covers_subcommand_args_and_persists() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, sid) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("gh", Some("pr"), false);
         store
             .record_command(&info, info.risk.tier, Scope::Project)
+            .await
             .unwrap();
 
         // `gh pr create ...` derives the same key → granted, no prompt.
         let create = cmd_info("gh", Some("pr"), false);
-        assert!(store.is_command_granted(&create.key));
+        assert!(store.is_command_granted(&create.key).await);
         // `gh repo ...` is a different key → still prompts.
         let repo = cmd_info("gh", Some("repo"), false);
-        assert!(!store.is_command_granted(&repo.key));
+        assert!(!store.is_command_granted(&repo.key).await);
 
         // Survives reload: a fresh store over the same DB + dirs sees it.
         let db2 = store.db.clone();
@@ -1746,13 +1836,14 @@ mod tests {
         );
         point_project_scope(&mut reloaded, tmp.path(), global.path());
         reloaded.global_dir = Some(global.path().to_path_buf());
-        assert!(reloaded.is_command_granted(&info.key));
+        assert!(reloaded.is_command_granted(&info.key).await);
     }
 
-    #[test]
-    fn project_grant_writes_machine_local_not_repo() {
+    #[tokio::test]
+    async fn project_grant_writes_machine_local_not_repo() {
         let env = tempfile::tempdir().unwrap();
-        let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(env.path());
+        let _home =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
         let project = tempfile::tempdir_in(env.path()).unwrap();
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -1781,6 +1872,7 @@ mod tests {
         let info = cmd_info("gh", Some("pr"), false);
         store
             .record_command(&info, info.risk.tier, Scope::Project)
+            .await
             .unwrap();
 
         assert!(project_dir.join(APPROVALS_FILE).exists());
@@ -1789,8 +1881,8 @@ mod tests {
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
-    #[test]
-    fn repo_side_project_approvals_file_is_ignored_even_when_trusted() {
+    #[tokio::test]
+    async fn repo_side_project_approvals_file_is_ignored_even_when_trusted() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
@@ -1813,21 +1905,20 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!crate::approval::command_grant_allowed_by_policy(
-            &store, &command
-        ));
-        assert!(!store.is_path_granted(&granted_dir.join("token.txt")));
+        assert!(!crate::approval::command_grant_allowed_by_policy(&store, &command).await);
+        assert!(!store.is_path_granted(&granted_dir.join("token.txt")).await);
         assert!(!test_project_dir(&store).join(APPROVALS_FILE).exists());
     }
 
-    #[test]
-    fn global_grant_persists_and_applies() {
+    #[tokio::test]
+    async fn global_grant_persists_and_applies() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("cargo", Some("build"), false);
         store
             .record_command(&info, info.risk.tier, Scope::Global)
+            .await
             .unwrap();
 
         // A *different* project (different root) still sees the global
@@ -1842,12 +1933,12 @@ mod tests {
         );
         point_project_scope(&mut elsewhere, other_project.path(), global.path());
         elsewhere.global_dir = Some(global.path().to_path_buf());
-        assert!(elsewhere.is_command_granted(&info.key));
+        assert!(elsewhere.is_command_granted(&info.key).await);
     }
 
-    #[test]
-    fn ignore_cfg_blocks_project_approval_file_reads_and_writes() {
-        let _env = crate::test_env::lock();
+    #[tokio::test]
+    async fn ignore_cfg_blocks_project_approval_file_reads_and_writes() {
+        let _env = crate::test_env::lock_async().await;
         let tmp = tempfile::tempdir().unwrap();
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -1889,20 +1980,23 @@ mod tests {
         store.global_dir = Some(global.path().to_path_buf());
         let info = cmd_info("cargo", Some("test"), false);
 
-        assert!(!store.is_command_granted(&info.key));
+        assert!(!store.is_command_granted(&info.key).await);
         assert!(matches!(
-            store.record_command(&info, info.risk.tier, Scope::Project),
+            store
+                .record_command(&info, info.risk.tier, Scope::Project)
+                .await,
             Err(StoreError::NoProjectRoot)
         ));
         store
             .record_command(&info, info.risk.tier, Scope::Session)
+            .await
             .unwrap();
-        assert!(store.is_command_granted(&info.key));
+        assert!(store.is_command_granted(&info.key).await);
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
-    #[test]
-    fn wrapper_rejected_at_every_non_once_scope() {
+    #[tokio::test]
+    async fn wrapper_rejected_at_every_non_once_scope() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
@@ -1910,6 +2004,7 @@ mod tests {
         for scope in [Scope::Session, Scope::Project, Scope::Global] {
             let err = store
                 .record_command(&wrapper, wrapper.risk.tier, scope)
+                .await
                 .unwrap_err();
             assert!(
                 matches!(err, StoreError::WrapperNotPersistable(_)),
@@ -1917,57 +2012,57 @@ mod tests {
             );
         }
         // And nothing was written.
-        assert!(!store.is_command_granted(&wrapper.key));
+        assert!(!store.is_command_granted(&wrapper.key).await);
     }
 
-    #[test]
-    fn once_scope_is_never_recorded() {
+    #[tokio::test]
+    async fn once_scope_is_never_recorded() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("ls", None, false);
         assert!(matches!(
-            store.record_command(&info, info.risk.tier, Scope::Once),
+            store
+                .record_command(&info, info.risk.tier, Scope::Once)
+                .await,
             Err(StoreError::OnceNotPersistable)
         ));
-        assert!(!store.is_command_granted(&info.key));
+        assert!(!store.is_command_granted(&info.key).await);
     }
 
-    #[test]
-    fn path_grant_prefix_match() {
+    #[tokio::test]
+    async fn path_grant_prefix_match() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let dir = tmp.path().join("src");
         store
             .record_path(&dir, Scope::Project, SandboxPathAccess::ReadWrite)
+            .await
             .unwrap();
         // A file under the granted dir is covered.
-        assert!(store.is_path_granted(&dir.join("main.rs")));
+        assert!(store.is_path_granted(&dir.join("main.rs")).await);
         // A sibling that shares a string prefix but not a path prefix is
         // NOT covered.
         let sibling = tmp.path().join("src-gen").join("x.rs");
-        assert!(!store.is_path_granted(&sibling));
+        assert!(!store.is_path_granted(&sibling).await);
     }
 
-    #[test]
-    fn path_grant_session_scope() {
+    #[tokio::test]
+    async fn path_grant_session_scope() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let file = tmp.path().join("a/b/c.txt");
-        assert!(!store.is_path_granted(&file));
+        assert!(!store.is_path_granted(&file).await);
         store
             .record_path(&file, Scope::Session, SandboxPathAccess::ReadWrite)
+            .await
             .unwrap();
-        assert!(store.is_path_granted(&file));
+        assert!(store.is_path_granted(&file).await);
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
     async fn path_grant_modes_round_trip_at_each_scope() {
         for scope in [Scope::Session, Scope::Project, Scope::Global] {
             let tmp = tempfile::tempdir().unwrap();
@@ -1976,28 +2071,35 @@ mod tests {
             let dir = tmp.path().join(format!("mode-{scope:?}"));
             store
                 .record_path(&dir, scope, SandboxPathAccess::Read)
+                .await
                 .unwrap();
-            assert!(store.is_path_granted_for(&dir.join("file.txt"), SandboxPathAccess::Read));
             assert!(
-                !store.is_path_granted_for(&dir.join("file.txt"), SandboxPathAccess::ReadWrite),
+                store
+                    .is_path_granted_for(&dir.join("file.txt"), SandboxPathAccess::Read)
+                    .await
+            );
+            assert!(
+                !store
+                    .is_path_granted_for(&dir.join("file.txt"), SandboxPathAccess::ReadWrite)
+                    .await,
                 "read grant must not satisfy read-write at {scope:?}"
             );
 
             match scope {
                 Scope::Session => {
+                    let session_id = store.session_id;
+                    let grant_key = normalize_path(&dir, store.cwd());
                     let access: String = store
                         .db
-                        .read_blocking(|conn| {
+                        .read(move |conn| {
                             Ok(conn.query_row(
                                 "SELECT access FROM approval_grants \
                                  WHERE session_id = ?1 AND grant_kind = 'path' AND grant_key = ?2",
-                                rusqlite::params![
-                                    store.session_id.to_string(),
-                                    normalize_path(&dir, store.cwd())
-                                ],
+                                rusqlite::params![session_id.to_string(), grant_key],
                                 |row| row.get(0),
                             )?)
                         })
+                        .await
                         .unwrap();
                     assert_eq!(access, "read");
                 }
@@ -2017,10 +2119,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
     async fn mcp_tool_grant_round_trips_through_session_and_file_scopes() {
         for scope in [Scope::Session, Scope::Project, Scope::Global] {
             let tmp = tempfile::tempdir().unwrap();
@@ -2030,19 +2128,22 @@ mod tests {
             assert!(
                 store
                     .mcp_tool_grant_scope("external", "search/query")
+                    .await
                     .is_none()
             );
             store
                 .record_mcp_tool("external", "search/query", scope)
+                .await
                 .unwrap();
             assert_eq!(
-                store.mcp_tool_grant_scope("external", "search/query"),
+                store.mcp_tool_grant_scope("external", "search/query").await,
                 Some(scope),
                 "scope {scope:?}"
             );
             assert!(
                 store
                     .mcp_tool_grant_scope("external/search", "query")
+                    .await
                     .is_none(),
                 "escaped key must not collide with a different server/tool split"
             );
@@ -2050,16 +2151,19 @@ mod tests {
             let key = mcp_tool_key("external", "search/query");
             match scope {
                 Scope::Session => {
+                    let session_id = sid;
+                    let key_for_db = key.clone();
                     let (access, risk_tier): (Option<String>, Option<String>) = store
                         .db
-                        .read_blocking(|conn| {
+                        .read(move |conn| {
                             Ok(conn.query_row(
                                 "SELECT access, risk_tier FROM approval_grants \
                                  WHERE session_id = ?1 AND grant_kind = 'mcp_tool' AND grant_key = ?2",
-                                rusqlite::params![sid.to_string(), key],
+                                rusqlite::params![session_id.to_string(), key_for_db],
                                 |row| Ok((row.get(0)?, row.get(1)?)),
                             )?)
                         })
+                        .await
                         .unwrap();
                     assert_eq!(access, None);
                     assert_eq!(risk_tier, None);
@@ -2085,15 +2189,17 @@ mod tests {
             point_project_scope(&mut reloaded, tmp.path(), global.path());
             reloaded.global_dir = Some(global.path().to_path_buf());
             assert_eq!(
-                reloaded.mcp_tool_grant_scope("external", "search/query"),
+                reloaded
+                    .mcp_tool_grant_scope("external", "search/query")
+                    .await,
                 Some(scope),
                 "reload {scope:?}"
             );
         }
     }
 
-    #[test]
-    fn effective_path_grants_use_strongest_access_and_filter_rejects() {
+    #[tokio::test]
+    async fn effective_path_grants_use_strongest_access_and_filter_rejects() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
@@ -2103,21 +2209,26 @@ mod tests {
 
         store
             .record_path(&read_dir, Scope::Session, SandboxPathAccess::Read)
+            .await
             .unwrap();
         store
             .record_path(&read_dir, Scope::Project, SandboxPathAccess::ReadWrite)
+            .await
             .unwrap();
         store
             .record_path(&rw_dir, Scope::Global, SandboxPathAccess::ReadWrite)
+            .await
             .unwrap();
         store
             .record_path(&rejected_dir, Scope::Project, SandboxPathAccess::ReadWrite)
+            .await
             .unwrap();
         store
             .record_path_reject(&rejected_dir, Scope::Session)
+            .await
             .unwrap();
 
-        let grants = store.effective_path_grants();
+        let grants = store.effective_path_grants().await;
         assert!(grants.iter().any(|grant| {
             grant.path == read_dir && grant.access == SandboxPathAccess::ReadWrite
         }));
@@ -2133,13 +2244,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
     async fn approval_timestamp_columns_are_integer() {
         let db = Db::open_in_memory().unwrap();
-        db.read_blocking(|conn| {
+        db.read(|conn| {
             assert_eq!(
                 column_type(conn, "approval_grants", "granted_at")?,
                 "INTEGER"
@@ -2150,14 +2257,11 @@ mod tests {
             );
             Ok(())
         })
+        .await
         .unwrap();
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
     async fn session_approval_records_epoch_integer_timestamp() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
@@ -2170,19 +2274,22 @@ mod tests {
                 RiskTier::Ordinary,
                 Scope::Session,
             )
+            .await
             .unwrap();
 
+        let session_id = store.session_id;
         let (value, sqlite_type): (i64, String) = store
             .db
-            .read_blocking(|conn| {
+            .read(move |conn| {
                 conn.query_row(
                     "SELECT granted_at, typeof(granted_at) FROM approval_grants \
                      WHERE session_id = ?1 AND grant_kind = 'command' AND grant_key = 'grep'",
-                    [store.session_id.to_string()],
+                    [session_id.to_string()],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(Into::into)
             })
+            .await
             .unwrap();
         let after = now_epoch_seconds();
 
@@ -2191,10 +2298,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
     async fn loop_rule_records_epoch_integer_timestamp() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
@@ -2204,19 +2307,23 @@ mod tests {
 
         store
             .record_loop_rule(&signature, LoopVerdict::Accept, Scope::Session)
+            .await
             .unwrap();
 
+        let session_id = store.session_id;
+        let signature_for_db = signature.clone();
         let (value, sqlite_type): (i64, String) = store
             .db
-            .read_blocking(|conn| {
+            .read(move |conn| {
                 conn.query_row(
                     "SELECT recorded_at, typeof(recorded_at) FROM loop_guard_rules \
                      WHERE session_id = ?1 AND signature = ?2",
-                    rusqlite::params![store.session_id.to_string(), signature],
+                    rusqlite::params![session_id.to_string(), signature_for_db],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(Into::into)
             })
+            .await
             .unwrap();
         let after = now_epoch_seconds();
 
@@ -2224,8 +2331,8 @@ mod tests {
         assert!((before..=after).contains(&value));
     }
 
-    #[test]
-    fn relative_path_grants_use_store_cwd_not_process_cwd() {
+    #[tokio::test]
+    async fn relative_path_grants_use_store_cwd_not_process_cwd() {
         let session = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let unrelated_daemon_cwd = tempfile::tempdir().unwrap();
@@ -2237,14 +2344,19 @@ mod tests {
                 Scope::Session,
                 SandboxPathAccess::ReadWrite,
             )
+            .await
             .unwrap();
 
-        assert!(store.is_path_granted(Path::new("src/main.rs")));
-        assert!(!store.is_path_granted(&unrelated_daemon_cwd.path().join("src/main.rs")));
+        assert!(store.is_path_granted(Path::new("src/main.rs")).await);
+        assert!(
+            !store
+                .is_path_granted(&unrelated_daemon_cwd.path().join("src/main.rs"))
+                .await
+        );
     }
 
-    #[test]
-    fn normalize_path_uses_explicit_base_for_relative_paths() {
+    #[tokio::test]
+    async fn normalize_path_uses_explicit_base_for_relative_paths() {
         let session_cwd = Path::new("/session/project");
         let daemon_cwd = Path::new("/daemon/process");
 
@@ -2258,8 +2370,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normalize_path_keeps_absolute_paths_and_lexical_parent_resolution() {
+    #[tokio::test]
+    async fn normalize_path_keeps_absolute_paths_and_lexical_parent_resolution() {
         assert_eq!(
             normalize_path(
                 Path::new("/tmp/project/../file.txt"),
@@ -2273,18 +2385,24 @@ mod tests {
 
     /// A command reject persists and is seen by `is_command_rejected` at each
     /// non-`Once` scope; it survives a reload at the persistent scopes.
-    #[test]
-    fn command_reject_at_each_scope() {
+    #[tokio::test]
+    async fn command_reject_at_each_scope() {
         for scope in [Scope::Session, Scope::Project, Scope::Global] {
             let tmp = tempfile::tempdir().unwrap();
             let global = tempfile::tempdir().unwrap();
             let (store, sid) = test_store(tmp.path(), global.path().to_path_buf());
             let info = cmd_info("gh", Some("pr"), false);
-            assert!(!store.is_command_rejected(&info.key));
-            store.record_command_reject(&info, scope).unwrap();
-            assert!(store.is_command_rejected(&info.key), "scope {scope:?}");
+            assert!(!store.is_command_rejected(&info.key).await);
+            store.record_command_reject(&info, scope).await.unwrap();
+            assert!(
+                store.is_command_rejected(&info.key).await,
+                "scope {scope:?}"
+            );
             // A reject is not an allow.
-            assert!(!store.is_command_granted(&info.key), "scope {scope:?}");
+            assert!(
+                !store.is_command_granted(&info.key).await,
+                "scope {scope:?}"
+            );
 
             // Reload (fresh store over the same DB + dirs) still sees it.
             let mut reloaded = GrantStore::new(
@@ -2295,28 +2413,31 @@ mod tests {
             );
             point_project_scope(&mut reloaded, tmp.path(), global.path());
             reloaded.global_dir = Some(global.path().to_path_buf());
-            assert!(reloaded.is_command_rejected(&info.key), "reload {scope:?}");
+            assert!(
+                reloaded.is_command_rejected(&info.key).await,
+                "reload {scope:?}"
+            );
         }
     }
 
     /// A path reject persists and is seen by `is_path_rejected` (prefix
     /// semantics, same as allow) at each non-`Once` scope.
-    #[test]
-    fn path_reject_at_each_scope() {
+    #[tokio::test]
+    async fn path_reject_at_each_scope() {
         for scope in [Scope::Session, Scope::Project, Scope::Global] {
             let tmp = tempfile::tempdir().unwrap();
             let global = tempfile::tempdir().unwrap();
             let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
             let dir = tmp.path().join("secret");
-            assert!(!store.is_path_rejected(&dir.join("k.txt")));
-            store.record_path_reject(&dir, scope).unwrap();
+            assert!(!store.is_path_rejected(&dir.join("k.txt")).await);
+            store.record_path_reject(&dir, scope).await.unwrap();
             // A file under the rejected dir is covered (prefix match).
             assert!(
-                store.is_path_rejected(&dir.join("k.txt")),
+                store.is_path_rejected(&dir.join("k.txt")).await,
                 "scope {scope:?}"
             );
             assert!(
-                !store.is_path_granted(&dir.join("k.txt")),
+                !store.is_path_granted(&dir.join("k.txt")).await,
                 "scope {scope:?}"
             );
         }
@@ -2325,8 +2446,8 @@ mod tests {
     /// Recording a reject for a key first removes any allow grant for that key
     /// at every reachable scope, and vice-versa — a key is never simultaneously
     /// allowed and rejected after any record call (no-coexistence invariant).
-    #[test]
-    fn reject_and_allow_never_coexist_both_directions() {
+    #[tokio::test]
+    async fn reject_and_allow_never_coexist_both_directions() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
@@ -2336,32 +2457,38 @@ mod tests {
         // reject must clear BOTH the project and the global allow.
         store
             .record_command(&info, info.risk.tier, Scope::Project)
+            .await
             .unwrap();
         store
             .record_command(&info, info.risk.tier, Scope::Global)
+            .await
             .unwrap();
-        assert!(store.is_command_granted(&info.key));
-        store.record_command_reject(&info, Scope::Session).unwrap();
-        assert!(store.is_command_rejected(&info.key));
+        assert!(store.is_command_granted(&info.key).await);
+        store
+            .record_command_reject(&info, Scope::Session)
+            .await
+            .unwrap();
+        assert!(store.is_command_rejected(&info.key).await);
         assert!(
-            !store.is_command_granted(&info.key),
+            !store.is_command_granted(&info.key).await,
             "reject cleared every reachable allow"
         );
 
         // Now allow again at project: the allow must clear the session reject.
         store
             .record_command(&info, info.risk.tier, Scope::Project)
+            .await
             .unwrap();
-        assert!(store.is_command_granted(&info.key));
+        assert!(store.is_command_granted(&info.key).await);
         assert!(
-            !store.is_command_rejected(&info.key),
+            !store.is_command_rejected(&info.key).await,
             "allow cleared the standing reject"
         );
     }
 
     /// The same no-coexistence invariant for path grants.
-    #[test]
-    fn path_reject_and_allow_never_coexist() {
+    #[tokio::test]
+    async fn path_reject_and_allow_never_coexist() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
@@ -2369,60 +2496,78 @@ mod tests {
 
         store
             .record_path(&dir, Scope::Project, SandboxPathAccess::ReadWrite)
+            .await
             .unwrap();
-        assert!(store.is_path_granted(&dir.join("x")));
-        store.record_path_reject(&dir, Scope::Session).unwrap();
-        assert!(store.is_path_rejected(&dir.join("x")));
+        assert!(store.is_path_granted(&dir.join("x")).await);
+        store
+            .record_path_reject(&dir, Scope::Session)
+            .await
+            .unwrap();
+        assert!(store.is_path_rejected(&dir.join("x")).await);
         assert!(
-            !store.is_path_granted(&dir.join("x")),
+            !store.is_path_granted(&dir.join("x")).await,
             "reject cleared allow"
         );
 
         store
             .record_path(&dir, Scope::Global, SandboxPathAccess::ReadWrite)
+            .await
             .unwrap();
-        assert!(store.is_path_granted(&dir.join("x")));
+        assert!(store.is_path_granted(&dir.join("x")).await);
         assert!(
-            !store.is_path_rejected(&dir.join("x")),
+            !store.is_path_rejected(&dir.join("x")).await,
             "allow cleared reject"
         );
     }
 
-    #[test]
-    fn mcp_tool_reject_blocks_without_prompting() {
+    #[tokio::test]
+    async fn mcp_tool_reject_blocks_without_prompting() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
 
         store
             .record_mcp_tool("external", "search", Scope::Project)
+            .await
             .unwrap();
         assert_eq!(
-            store.mcp_tool_grant_scope("external", "search"),
+            store.mcp_tool_grant_scope("external", "search").await,
             Some(Scope::Project)
         );
 
         store
             .record_mcp_tool_reject("external", "search", Scope::Session)
+            .await
             .unwrap();
         assert_eq!(
-            store.mcp_tool_reject_scope("external", "search"),
+            store.mcp_tool_reject_scope("external", "search").await,
             Some(Scope::Session)
         );
-        assert!(store.mcp_tool_grant_scope("external", "search").is_none());
+        assert!(
+            store
+                .mcp_tool_grant_scope("external", "search")
+                .await
+                .is_none()
+        );
 
         store
             .record_mcp_tool("external", "search", Scope::Global)
+            .await
             .unwrap();
         assert_eq!(
-            store.mcp_tool_grant_scope("external", "search"),
+            store.mcp_tool_grant_scope("external", "search").await,
             Some(Scope::Global)
         );
-        assert!(store.mcp_tool_reject_scope("external", "search").is_none());
+        assert!(
+            store
+                .mcp_tool_reject_scope("external", "search")
+                .await
+                .is_none()
+        );
     }
 
-    #[test]
-    fn harness_grant_is_session_scope_only() {
+    #[tokio::test]
+    async fn harness_grant_is_session_scope_only() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
@@ -2435,20 +2580,23 @@ mod tests {
                 .expect_err("unknown grant kind is rejected"),
             "unknown approval class `unknown`; expected command, path, mcp_tool, or harness"
         );
-        assert!(!store.is_harness_granted("claude"));
-        store.record_harness("claude", Scope::Session).unwrap();
-        assert!(store.is_harness_granted("claude"));
+        assert!(!store.is_harness_granted("claude").await);
+        store
+            .record_harness("claude", Scope::Session)
+            .await
+            .unwrap();
+        assert!(store.is_harness_granted("claude").await);
 
         assert!(matches!(
-            store.record_harness("codex", Scope::Once),
+            store.record_harness("codex", Scope::Once).await,
             Err(StoreError::OnceNotPersistable)
         ));
         assert!(matches!(
-            store.record_harness("codex", Scope::Project),
+            store.record_harness("codex", Scope::Project).await,
             Err(StoreError::HarnessSessionScopeOnly)
         ));
         assert!(matches!(
-            store.record_harness("codex", Scope::Global),
+            store.record_harness("codex", Scope::Global).await,
             Err(StoreError::HarnessSessionScopeOnly)
         ));
         assert!(!test_project_dir(&store).join("approvals.json").exists());
@@ -2457,8 +2605,8 @@ mod tests {
 
     /// `Once` is never persisted in either polarity, and a wrapper command can
     /// never be rejected at a persistent scope — identical to the allow rules.
-    #[test]
-    fn reject_once_and_wrapper_rules() {
+    #[tokio::test]
+    async fn reject_once_and_wrapper_rules() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
@@ -2466,57 +2614,57 @@ mod tests {
         // Once → OnceNotPersistable; nothing recorded.
         let info = cmd_info("ls", None, false);
         assert!(matches!(
-            store.record_command_reject(&info, Scope::Once),
+            store.record_command_reject(&info, Scope::Once).await,
             Err(StoreError::OnceNotPersistable)
         ));
-        assert!(!store.is_command_rejected(&info.key));
+        assert!(!store.is_command_rejected(&info.key).await);
 
         // Wrapper → WrapperNotPersistable at every non-Once scope.
         let wrapper = cmd_info("bash", None, true);
         for scope in [Scope::Session, Scope::Project, Scope::Global] {
             assert!(matches!(
-                store.record_command_reject(&wrapper, scope),
+                store.record_command_reject(&wrapper, scope).await,
                 Err(StoreError::WrapperNotPersistable(_))
             ));
         }
-        assert!(!store.is_command_rejected(&wrapper.key));
+        assert!(!store.is_command_rejected(&wrapper.key).await);
 
         // Path reject Once is also never persisted.
         let p = tmp.path().join("p");
         assert!(matches!(
-            store.record_path_reject(&p, Scope::Once),
+            store.record_path_reject(&p, Scope::Once).await,
             Err(StoreError::OnceNotPersistable)
         ));
-        assert!(!store.is_path_rejected(&p));
+        assert!(!store.is_path_rejected(&p).await);
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-approval-and-attention"
-    )]
     async fn tierless_command_allow_rows_are_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("cargo", Some("test"), false);
         let key = info.key.as_storage_str();
-        let inserted = store.db.write_blocking(move |conn| {
-            conn.execute(
-                "INSERT INTO approval_grants \
+        let session_id = store.session_id;
+        let inserted = store
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO approval_grants \
                      (session_id, grant_kind, grant_key, granted_at) \
                      VALUES (?1, 'command', ?2, ?3)",
-                rusqlite::params![store.session_id.to_string(), key, 1_700_000_000_i64],
-            )?;
-            Ok(())
-        });
+                    rusqlite::params![session_id.to_string(), key, 1_700_000_000_i64],
+                )?;
+                Ok(())
+            })
+            .await;
         assert!(inserted.is_err(), "command allow rows must carry risk_tier");
-        assert!(!store.is_command_granted(&info.key));
-        assert!(!store.is_command_rejected(&info.key));
+        assert!(!store.is_command_granted(&info.key).await);
+        assert!(!store.is_command_rejected(&info.key).await);
     }
 
-    #[test]
-    fn unparseable_or_empty_keys_are_just_not_granted() {
+    #[tokio::test]
+    async fn unparseable_or_empty_keys_are_just_not_granted() {
         // The store only answers about keys it's given; an empty/garbage
         // command never produces a key, so the classifier returns no
         // simple commands and the store is never asked → not granted.
@@ -2529,13 +2677,13 @@ mod tests {
             program: "nevergranted".into(),
             subcommand: None,
         };
-        assert!(!store.is_command_granted(&unknown));
+        assert!(!store.is_command_granted(&unknown).await);
     }
 
     // ---- loop-guard rules ------------------------------------------------
 
-    #[test]
-    fn loop_signature_keys_on_tool_and_wire_input() {
+    #[tokio::test]
+    async fn loop_signature_keys_on_tool_and_wire_input() {
         use serde_json::json;
         // Same tool + identical input → identical signature.
         let a = GrantStore::loop_signature("read", &json!({"path": "src/main.rs"}));
@@ -2549,8 +2697,8 @@ mod tests {
         assert_ne!(a, d);
     }
 
-    #[test]
-    fn loop_signature_is_object_key_order_independent() {
+    #[tokio::test]
+    async fn loop_signature_is_object_key_order_independent() {
         use serde_json::json;
         // The model may emit object keys in any order; semantically
         // identical inputs must share a signature.
@@ -2559,33 +2707,36 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    #[test]
-    fn loop_rule_session_record_and_read_round_trip() {
+    #[tokio::test]
+    async fn loop_rule_session_record_and_read_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "x"}));
-        assert!(store.loop_rule(&sig).is_none());
+        assert!(store.loop_rule(&sig).await.is_none());
         store
             .record_loop_rule(&sig, LoopVerdict::Reject, Scope::Session)
+            .await
             .unwrap();
-        assert_eq!(store.loop_rule(&sig), Some(LoopVerdict::Reject));
+        assert_eq!(store.loop_rule(&sig).await, Some(LoopVerdict::Reject));
         // Recording the opposite verdict at the same scope flips it (no
         // contradictory pair persists).
         store
             .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Session)
+            .await
             .unwrap();
-        assert_eq!(store.loop_rule(&sig), Some(LoopVerdict::Accept));
+        assert_eq!(store.loop_rule(&sig).await, Some(LoopVerdict::Accept));
     }
 
-    #[test]
-    fn loop_rule_project_persists_across_sessions() {
+    #[tokio::test]
+    async fn loop_rule_project_persists_across_sessions() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, sid) = test_store(tmp.path(), global.path().to_path_buf());
         let sig = GrantStore::loop_signature("bash", &serde_json::json!({"command": "ls"}));
         store
             .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Project)
+            .await
             .unwrap();
         // A fresh store over the same project dir (a later session) reads
         // the persisted project rule back.
@@ -2598,11 +2749,11 @@ mod tests {
         );
         point_project_scope(&mut reloaded, tmp.path(), global.path());
         reloaded.global_dir = Some(global.path().to_path_buf());
-        assert_eq!(reloaded.loop_rule(&sig), Some(LoopVerdict::Accept));
+        assert_eq!(reloaded.loop_rule(&sig).await, Some(LoopVerdict::Accept));
     }
 
-    #[test]
-    fn loop_rule_session_takes_precedence_over_project() {
+    #[tokio::test]
+    async fn loop_rule_session_takes_precedence_over_project() {
         // A session rule and a project rule for the SAME signature resolve
         // to the session verdict (documented precedence: session > project
         // > global).
@@ -2612,47 +2763,53 @@ mod tests {
         let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "z"}));
         store
             .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Project)
+            .await
             .unwrap();
         store
             .record_loop_rule(&sig, LoopVerdict::Reject, Scope::Session)
+            .await
             .unwrap();
         // Session (reject) wins over project (accept).
-        assert_eq!(store.loop_rule(&sig), Some(LoopVerdict::Reject));
+        assert_eq!(store.loop_rule(&sig).await, Some(LoopVerdict::Reject));
     }
 
-    #[test]
-    fn loop_rule_project_takes_precedence_over_global() {
+    #[tokio::test]
+    async fn loop_rule_project_takes_precedence_over_global() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "q"}));
         store
             .record_loop_rule(&sig, LoopVerdict::Reject, Scope::Global)
+            .await
             .unwrap();
         store
             .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Project)
+            .await
             .unwrap();
         // Project (accept) wins over global (reject).
-        assert_eq!(store.loop_rule(&sig), Some(LoopVerdict::Accept));
+        assert_eq!(store.loop_rule(&sig).await, Some(LoopVerdict::Accept));
     }
 
-    #[test]
-    fn loop_rule_once_scope_is_never_persisted() {
+    #[tokio::test]
+    async fn loop_rule_once_scope_is_never_persisted() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "x"}));
         assert!(matches!(
-            store.record_loop_rule(&sig, LoopVerdict::Accept, Scope::Once),
+            store
+                .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Once)
+                .await,
             Err(StoreError::OnceNotPersistable)
         ));
-        assert!(store.loop_rule(&sig).is_none());
+        assert!(store.loop_rule(&sig).await.is_none());
     }
 
     // ---- management API (`/permissions`) ---------------------------------
 
-    #[test]
-    fn list_managed_grants_groups_by_kind_and_sorts() {
+    #[tokio::test]
+    async fn list_managed_grants_groups_by_kind_and_sorts() {
         let dir = tempfile::tempdir().unwrap();
         // Seed one of each bucket through the normal store write paths so
         // the file shape is exactly what production records.
@@ -2673,6 +2830,7 @@ mod tests {
                 RiskTier::Ordinary,
                 Scope::Project,
             )
+            .await
             .unwrap();
         store
             .record_command(
@@ -2680,6 +2838,7 @@ mod tests {
                 RiskTier::Ordinary,
                 Scope::Project,
             )
+            .await
             .unwrap();
         store
             .record_path(
@@ -2687,10 +2846,12 @@ mod tests {
                 Scope::Project,
                 SandboxPathAccess::ReadWrite,
             )
+            .await
             .unwrap();
         let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "x"}));
         store
             .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Project)
+            .await
             .unwrap();
 
         let grants = list_managed_grants(test_project_dir(&store));
@@ -2714,8 +2875,8 @@ mod tests {
         assert!(!grants.is_empty());
     }
 
-    #[test]
-    fn managed_grants_expose_command_tier() {
+    #[tokio::test]
+    async fn managed_grants_expose_command_tier() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let session =
@@ -2732,6 +2893,7 @@ mod tests {
         info.risk.tier = RiskTier::Destructive;
         store
             .record_command(&info, info.risk.tier, Scope::Project)
+            .await
             .unwrap();
 
         let grants = list_managed_grants(test_project_dir(&store));
@@ -2744,15 +2906,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_managed_grants_missing_file_is_empty() {
+    #[tokio::test]
+    async fn list_managed_grants_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let grants = list_managed_grants(dir.path());
         assert!(grants.is_empty(), "no approvals.json → empty, not an error");
     }
 
-    #[test]
-    fn delete_managed_grant_removes_one_leaves_others() {
+    #[tokio::test]
+    async fn delete_managed_grant_removes_one_leaves_others() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let session =
@@ -2771,6 +2933,7 @@ mod tests {
                 RiskTier::Ordinary,
                 Scope::Project,
             )
+            .await
             .unwrap();
         store
             .record_command(
@@ -2778,6 +2941,7 @@ mod tests {
                 RiskTier::Ordinary,
                 Scope::Project,
             )
+            .await
             .unwrap();
         let project_dir = test_project_dir(&store).to_path_buf();
 
@@ -2793,18 +2957,26 @@ mod tests {
         );
 
         // The removal is durable: a fresh store no longer treats it as granted.
-        assert!(!store.is_command_granted(&ApprovalKey {
-            program: "gh".into(),
-            subcommand: Some("pr".into()),
-        }));
-        assert!(store.is_command_granted(&ApprovalKey {
-            program: "cargo".into(),
-            subcommand: Some("build".into()),
-        }));
+        assert!(
+            !store
+                .is_command_granted(&ApprovalKey {
+                    program: "gh".into(),
+                    subcommand: Some("pr".into()),
+                })
+                .await
+        );
+        assert!(
+            store
+                .is_command_granted(&ApprovalKey {
+                    program: "cargo".into(),
+                    subcommand: Some("build".into()),
+                })
+                .await
+        );
     }
 
-    #[test]
-    fn delete_managed_grant_handles_each_kind() {
+    #[tokio::test]
+    async fn delete_managed_grant_handles_each_kind() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let session =
@@ -2820,14 +2992,17 @@ mod tests {
         let path = dir.path().join("data");
         store
             .record_path(&path, Scope::Project, SandboxPathAccess::ReadWrite)
+            .await
             .unwrap();
         let acc = GrantStore::loop_signature("read", &serde_json::json!({"p": 1}));
         let rej = GrantStore::loop_signature("bash", &serde_json::json!({"c": "x"}));
         store
             .record_loop_rule(&acc, LoopVerdict::Accept, Scope::Project)
+            .await
             .unwrap();
         store
             .record_loop_rule(&rej, LoopVerdict::Reject, Scope::Project)
+            .await
             .unwrap();
 
         let project_dir = test_project_dir(&store).to_path_buf();
@@ -2838,13 +3013,14 @@ mod tests {
         assert!(list_managed_grants(&project_dir).is_empty());
     }
 
-    #[test]
-    fn managed_grants_list_and_revoke_mcp_tools() {
+    #[tokio::test]
+    async fn managed_grants_list_and_revoke_mcp_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         store
             .record_mcp_tool("external", "search", Scope::Project)
+            .await
             .unwrap();
 
         let project_dir = test_project_dir(&store).to_path_buf();
@@ -2855,19 +3031,24 @@ mod tests {
 
         assert!(delete_managed_grant(&project_dir, ManagedGrantKind::McpTool, &key).unwrap());
         assert!(list_managed_grants(&project_dir).is_empty());
-        assert!(store.mcp_tool_grant_scope("external", "search").is_none());
+        assert!(
+            store
+                .mcp_tool_grant_scope("external", "search")
+                .await
+                .is_none()
+        );
     }
 
-    #[test]
-    fn delete_managed_grant_absent_key_is_noop() {
+    #[tokio::test]
+    async fn delete_managed_grant_absent_key_is_noop() {
         let dir = tempfile::tempdir().unwrap();
         // No file at all: deleting an absent key returns false, writes nothing.
         assert!(!delete_managed_grant(dir.path(), ManagedGrantKind::Command, "nope").unwrap());
         assert!(!dir.path().join(APPROVALS_FILE).exists());
     }
 
-    #[test]
-    fn loop_rule_keys_on_exact_signature_not_tool_name() {
+    #[tokio::test]
+    async fn loop_rule_keys_on_exact_signature_not_tool_name() {
         // A rule for one call must NOT cover a different call of the same
         // tool with different args.
         let tmp = tempfile::tempdir().unwrap();
@@ -2877,9 +3058,10 @@ mod tests {
         let sig_b = GrantStore::loop_signature("read", &serde_json::json!({"path": "b"}));
         store
             .record_loop_rule(&sig_a, LoopVerdict::Accept, Scope::Session)
+            .await
             .unwrap();
-        assert_eq!(store.loop_rule(&sig_a), Some(LoopVerdict::Accept));
-        assert!(store.loop_rule(&sig_b).is_none());
+        assert_eq!(store.loop_rule(&sig_a).await, Some(LoopVerdict::Accept));
+        assert!(store.loop_rule(&sig_b).await.is_none());
     }
 
     // ---- live approval-policy reload (approval-policy-live-reload) --------
@@ -2955,8 +3137,8 @@ mod tests {
 
     /// A1: a policy change during a live session is observed by the store
     /// without rebuilding it.
-    #[test]
-    fn grant_store_observes_policy_change_without_rebuild() {
+    #[tokio::test]
+    async fn grant_store_observes_policy_change_without_rebuild() {
         let tmp = tempfile::tempdir().unwrap();
         let (store, cell) = live_policy_store(
             tmp.path(),
@@ -2982,8 +3164,8 @@ mod tests {
 
     /// A2: the accessor performs no disk read per call (asserted with the
     /// existing `load_for_cwd` counter).
-    #[test]
-    fn approval_policy_accessor_does_no_disk_read() {
+    #[tokio::test]
+    async fn approval_policy_accessor_does_no_disk_read() {
         let tmp = tempfile::tempdir().unwrap();
         let (store, _cell) = live_policy_store(tmp.path(), ApprovalPolicyConfig::default());
         crate::config::extended::reset_load_for_cwd_call_count();
@@ -3001,8 +3183,8 @@ mod tests {
     /// `SessionConfigHandle` (fed by the daemon's trust-aware `ConfigSource`
     /// in production), never a bare `load_for_cwd`. Construction and reads
     /// perform no bare disk load.
-    #[test]
-    fn grant_store_policy_resolution_is_trust_aware() {
+    #[tokio::test]
+    async fn grant_store_policy_resolution_is_trust_aware() {
         let tmp = tempfile::tempdir().unwrap();
         let mut policy = ApprovalPolicyConfig::default();
         policy
@@ -3028,8 +3210,8 @@ mod tests {
     /// A4: an in-flight decision captures the policy once at its start and is
     /// not re-evaluated when the policy changes mid-decision; the next
     /// decision observes the new policy.
-    #[test]
-    fn policy_change_does_not_affect_inflight_decision() {
+    #[tokio::test]
+    async fn policy_change_does_not_affect_inflight_decision() {
         let tmp = tempfile::tempdir().unwrap();
         let (store, cell) = live_policy_store(
             tmp.path(),
@@ -3061,8 +3243,8 @@ mod tests {
     /// A5: a malformed policy keeps the last good value and never falls open
     /// to a more permissive outcome. An unrecognized risk-tier key would
     /// silently drop the intended cap (a fall-open) and is therefore rejected.
-    #[test]
-    fn invalid_policy_keeps_last_good_and_does_not_fall_open() {
+    #[tokio::test]
+    async fn invalid_policy_keeps_last_good_and_does_not_fall_open() {
         let tmp = tempfile::tempdir().unwrap();
         // Last good policy tightens ordinary commands to Session (narrower
         // than the built-in default of Global).
@@ -3094,8 +3276,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dangerous_flags_rule_with_bad_tier_keeps_last_good_policy() {
+    #[tokio::test]
+    async fn dangerous_flags_rule_with_bad_tier_keeps_last_good_policy() {
         let tmp = tempfile::tempdir().unwrap();
         let (store, cell) = live_policy_store(
             tmp.path(),
@@ -3120,8 +3302,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dangerous_flags_rule_with_empty_flag_list_keeps_last_good_policy() {
+    #[tokio::test]
+    async fn dangerous_flags_rule_with_empty_flag_list_keeps_last_good_policy() {
         let tmp = tempfile::tempdir().unwrap();
         let (store, cell) = live_policy_store(
             tmp.path(),
@@ -3145,44 +3327,42 @@ mod tests {
     /// A6: grant-file behavior is unchanged — a direct file deletion (as the
     /// permissions pane performs) still propagates to the same live store on
     /// its next check, because grant files are re-read per check.
-    #[test]
-    fn grant_file_changes_still_propagate() {
+    #[tokio::test]
+    async fn grant_file_changes_still_propagate() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("gh", Some("pr"), false);
         store
             .record_command(&info, info.risk.tier, Scope::Project)
+            .await
             .unwrap();
-        assert!(store.is_command_granted(&info.key));
+        assert!(store.is_command_granted(&info.key).await);
 
         // Delete the grant straight from the file, as the permissions pane does.
         let dir = test_project_dir(&store).to_path_buf();
         assert!(delete_managed_grant(&dir, ManagedGrantKind::Command, "gh pr").unwrap());
 
         // The same store sees the deletion on its next check (no rebuild).
-        assert!(!store.is_command_granted(&info.key));
+        assert!(!store.is_command_granted(&info.key).await);
     }
 
     /// A7: approval outcomes are unchanged for a static policy. A Session-scope
     /// grant of an ordinary command is within the default cap (Global) and is
     /// allowed without a prompt; repeated policy reads are stable.
-    #[test]
-    fn approval_outcomes_unchanged_for_static_policy() {
+    #[tokio::test]
+    async fn approval_outcomes_unchanged_for_static_policy() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
         let info = cmd_info("gh", Some("pr"), false);
 
-        assert!(!crate::approval::command_grant_allowed_by_policy(
-            &store, &info
-        ));
+        assert!(!crate::approval::command_grant_allowed_by_policy(&store, &info).await);
         store
             .record_command(&info, info.risk.tier, Scope::Session)
+            .await
             .unwrap();
-        assert!(crate::approval::command_grant_allowed_by_policy(
-            &store, &info
-        ));
+        assert!(crate::approval::command_grant_allowed_by_policy(&store, &info).await);
 
         // The static policy resolves to the same value on every read.
         assert_eq!(store.approval_policy(), store.approval_policy());

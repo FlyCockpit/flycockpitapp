@@ -171,7 +171,7 @@ impl Approver {
                     return Ok(SandboxEscalationApproval::Deny);
                 }
                 for path in &offer.paths {
-                    self.store.record_path(path, scope, offer.access)?;
+                    self.store.record_path(path, scope, offer.access).await?;
                     self.record_permission_decision(
                         "path",
                         &path.display().to_string(),
@@ -228,12 +228,16 @@ impl Approver {
         // `StandingReject` source and an empty offered-scope set (no prompt
         // was raised) so the timeline reflects a reject decision, not a plain
         // deny (§14). A wrapper is never persistable, so it can't be rejected.
-        if let Some(scope) = simple_commands.iter().find_map(|i| {
-            if i.wrapper {
-                return None;
+        let mut standing_reject = None;
+        for info in &simple_commands {
+            if !info.wrapper
+                && let Some(scope) = self.store.command_reject_scope(&info.key).await
+            {
+                standing_reject = Some(scope);
+                break;
             }
-            self.store.command_reject_scope(&i.key)
-        }) {
+        }
+        if let Some(scope) = standing_reject {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "bash",
@@ -252,11 +256,12 @@ impl Approver {
         // its `step` (N). Already-granted constituents are allowed silently
         // and don't advance the step counter — matching the spec's
         // "M = constituents that actually trigger a prompt".
-        let prompting: Vec<(&SimpleCommandInfo, &ApprovalPromptPolicy)> = simple_commands
-            .iter()
-            .zip(policies.iter())
-            .filter(|(info, policy)| self.will_prompt(info, policy))
-            .collect();
+        let mut prompting: Vec<(&SimpleCommandInfo, &ApprovalPromptPolicy)> = Vec::new();
+        for (info, policy) in simple_commands.iter().zip(policies.iter()) {
+            if self.will_prompt(info, policy).await {
+                prompting.push((info, policy));
+            }
+        }
         let step_count = prompting.len() as u32;
 
         // No constituent prompts → the whole chain is already granted at an
@@ -292,7 +297,7 @@ impl Approver {
         let mut step: u32 = 0;
         for (idx, info) in simple_commands.iter().enumerate() {
             let policy = &policies[idx];
-            let prompts = self.will_prompt(info, policy);
+            let prompts = self.will_prompt(info, policy).await;
             if prompts {
                 step += 1;
             }
@@ -407,11 +412,15 @@ impl Approver {
     /// allowed silently: a wrapper (never persistable) always prompts;
     /// otherwise it prompts only when not already granted at a scope and
     /// issue tier that cover this invocation.
-    fn will_prompt(&self, info: &SimpleCommandInfo, policy: &ApprovalPromptPolicy) -> bool {
+    async fn will_prompt(&self, info: &SimpleCommandInfo, policy: &ApprovalPromptPolicy) -> bool {
         info.wrapper
-            || !self.store.command_grant(&info.key).is_some_and(|grant| {
-                grant.scope.within(policy.max_scope) && info.risk.tier <= grant.granted_tier
-            })
+            || !self
+                .store
+                .command_grant(&info.key)
+                .await
+                .is_some_and(|grant| {
+                    grant.scope.within(policy.max_scope) && info.risk.tier <= grant.granted_tier
+                })
     }
 
     /// Decide one simple command: granted → allow; else prompt. `step` /
@@ -430,7 +439,7 @@ impl Approver {
         // persistable in either polarity, so it can never carry a standing
         // reject — only non-wrappers are queried.
         if !info.wrapper
-            && let Some(scope) = self.store.command_reject_scope(&info.key)
+            && let Some(scope) = self.store.command_reject_scope(&info.key).await
         {
             // Auto-deny with no prompt; the caller surfaces the terse guidance
             // error. The `StandingReject` source is recorded by the chain
@@ -439,9 +448,11 @@ impl Approver {
                 scope,
             }));
         }
-        let stored_grant = (!info.wrapper)
-            .then(|| self.store.command_grant(&info.key))
-            .flatten();
+        let stored_grant = if info.wrapper {
+            None
+        } else {
+            self.store.command_grant(&info.key).await
+        };
         if let Some(grant) = stored_grant
             && grant.scope.within(policy.max_scope)
             && info.risk.tier <= grant.granted_tier
@@ -503,7 +514,9 @@ impl Approver {
                 // never reach here at a non-Once scope: the prompt only
                 // offered Once for wrappers. The store rejects it anyway as
                 // a belt-and-braces guard.
-                self.store.record_command(info, info.risk.tier, scope)?;
+                self.store
+                    .record_command(info, info.risk.tier, scope)
+                    .await?;
                 Ok(CommandStepDecision::Decision(Decision::Allow { scope }))
             }
             // `Reject(Once)` is mapped to `Deny` upstream; only a persistable
@@ -513,7 +526,7 @@ impl Approver {
                 if !scope.within(policy.max_scope) {
                     return Ok(CommandStepDecision::Decision(Decision::Deny));
                 }
-                self.store.record_command_reject(info, scope)?;
+                self.store.record_command_reject(info, scope).await?;
                 Ok(CommandStepDecision::Decision(Decision::Deny))
             }
         }

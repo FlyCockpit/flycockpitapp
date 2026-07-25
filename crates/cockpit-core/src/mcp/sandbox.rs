@@ -646,6 +646,7 @@ mod tests {
             loop {
                 if let Some(row) = db
                     .list_open_interrupts(session_id)
+                    .await
                     .unwrap()
                     .first()
                     .cloned()
@@ -658,7 +659,9 @@ mod tests {
         .await
         .expect("approval prompt must be raised");
 
-        db.resolve_interrupt(row.interrupt_id, &response).unwrap();
+        db.resolve_interrupt(row.interrupt_id, &response)
+            .await
+            .unwrap();
         assert!(hub.resolve(row.interrupt_id, response));
         row
     }
@@ -927,6 +930,7 @@ mod tests {
             ctx.config.clone(),
         )
         .record_mcp_tool("external", "echo", crate::approval::store::Scope::Session)
+        .await
         .unwrap();
         let host = HostContext::from_tool_ctx(&ctx);
         let host = host.with_test_external_invoke(|server, tool, args| {
@@ -1107,7 +1111,12 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("\"x\":2"), "{out}");
-        assert!(db.list_open_interrupts(session_id).unwrap().is_empty());
+        assert!(
+            db.list_open_interrupts(session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
         let script = tokio::spawn({
@@ -1166,7 +1175,12 @@ mod tests {
             tmp.path().to_path_buf(),
             ctx.config.clone(),
         );
-        assert!(store.mcp_tool_grant_scope("external", "echo").is_none());
+        assert!(
+            store
+                .mcp_tool_grant_scope("external", "echo")
+                .await
+                .is_none()
+        );
 
         let script = tokio::spawn({
             let cfg = cfg.clone();
@@ -1249,7 +1263,10 @@ mod tests {
 
         assert!(err.to_string().contains("mcp.describe failed"), "{err}");
         assert!(
-            db.list_open_interrupts(session_id).unwrap().is_empty(),
+            db.list_open_interrupts(session_id)
+                .await
+                .unwrap()
+                .is_empty(),
             "describe must not ask for external MCP invoke approval"
         );
     }
@@ -1760,6 +1777,7 @@ for line in sys.stdin:
             ctx.config.clone(),
         )
         .record_mcp_tool("fake", "count", crate::approval::store::Scope::Session)
+        .await
         .unwrap();
         let host = HostContext::from_tool_ctx(&ctx);
         let out = run_with_host("mcp.invoke('fake', 'count', {'count': '3'})", &cfg, &host)

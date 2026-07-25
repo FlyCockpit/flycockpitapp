@@ -3671,6 +3671,7 @@ mod tests {
                 }],
             },
         )
+        .await
         .unwrap();
         db.raise_interrupt_questions(
             parked.session_id,
@@ -3688,6 +3689,7 @@ mod tests {
                 }],
             },
         )
+        .await
         .unwrap();
         let interrupted_id = db
             .raise_interrupt_questions(
@@ -3701,8 +3703,9 @@ mod tests {
                     }],
                 },
             )
+            .await
             .unwrap();
-        db.mark_interrupt_interrupted(interrupted_id).unwrap();
+        db.mark_interrupt_interrupted(interrupted_id).await.unwrap();
 
         let summaries = db
             .list_session_summaries(Some("pid"), None, 100)
@@ -3741,6 +3744,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("pid", "/proj", "builder").await.unwrap();
         db.raise_interrupted_turn(session.session_id, "builder", "forced drain")
+            .await
             .unwrap();
         db.raise_interrupt_questions(
             session.session_id,
@@ -3753,6 +3757,7 @@ mod tests {
                 }],
             },
         )
+        .await
         .unwrap();
 
         let summaries = db

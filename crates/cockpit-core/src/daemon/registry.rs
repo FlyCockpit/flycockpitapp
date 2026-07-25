@@ -905,7 +905,8 @@ impl SessionRegistry {
                             has_schedules,
                             processing,
                             tool_running,
-                        );
+                        )
+                        .await;
                     }
                 }
                 for ah in &abort_handles {
@@ -918,7 +919,7 @@ impl SessionRegistry {
         clean
     }
 
-    fn record_forced_drain_interruption(
+    async fn record_forced_drain_interruption(
         &self,
         handle: &SessionWorkerHandle,
         grace: Duration,
@@ -934,11 +935,16 @@ impl SessionRegistry {
             "scheduled_work"
         };
         let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
-        match self.inner.db.raise_interrupted_turn(
-            handle.session_id,
-            &handle.active_agent_name,
-            "Daemon shutdown interrupted active work",
-        ) {
+        match self
+            .inner
+            .db
+            .raise_interrupted_turn(
+                handle.session_id,
+                &handle.active_agent_name,
+                "Daemon shutdown interrupted active work",
+            )
+            .await
+        {
             Ok(interrupt_id) => {
                 let data = json!({
                     "reason": "daemon_shutdown_grace_expired",

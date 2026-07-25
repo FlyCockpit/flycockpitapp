@@ -1063,8 +1063,8 @@ impl SessionWorkerHandle {
         self.send_work(SessionWork::RepublishQueue).await
     }
 
-    pub fn broadcast_active_interrupt(&self) {
-        let Ok(open) = self.session.db.list_open_interrupts(self.session_id) else {
+    pub async fn broadcast_active_interrupt(&self) {
+        let Ok(open) = self.session.db.list_open_interrupts(self.session_id).await else {
             return;
         };
         let Some(active) = open.first() else {
@@ -1336,14 +1336,13 @@ pub fn spawn(
     config_snapshot: SessionConfigSnapshot,
 ) -> (SessionWorkerHandle, tokio::task::JoinHandle<()>) {
     let session_id = session.id;
-    // The primary the chrome's active-agent slot opens on: the stored agent
-    // (resume) or the configured default (`Auto` unless pinned). The worker
-    // re-derives the same value via `resolve_root_agent` and emits
-    // `PrimarySwapped` on any later swap, so this is purely the start state.
-    let initial_agent = session
-        .assistant_name
-        .clone()
-        .unwrap_or_else(|| resolve_root_agent(session_id, &session.db, extended_cfg));
+    // The primary the chrome's active-agent slot opens on. Spawn is sync, so
+    // it uses the persisted assistant when available and otherwise the config
+    // default; the worker re-resolves the stored root agent async at startup.
+    let initial_agent = match session.assistant_name.clone() {
+        Some(name) => name,
+        None => initial_active_agent(extended_cfg).to_string(),
+    };
     // Resolve the new-session sandbox default (highest wins):
     //   (a) daemon launched `--no-sandbox` → OFF for ALL sessions.
     //   (b) else this client passed `--no-sandbox` → OFF for the

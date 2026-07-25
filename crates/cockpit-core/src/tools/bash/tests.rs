@@ -12,8 +12,8 @@ fn wait_for_file(path: &std::path::Path) {
     panic!("timed out waiting for {}", path.display());
 }
 
-#[test]
-fn build_test_check_commands_get_output_sidecars() {
+#[tokio::test]
+async fn build_test_check_commands_get_output_sidecars() {
     let outcome = ShellOutcome {
         stdout: b"full stdout".to_vec(),
         stderr: b"full stderr".to_vec(),
@@ -59,7 +59,7 @@ async fn bash_truncated_output_carries_retention() {
     let stdout = large_bash_stdout();
     std::fs::write(tmp.path().join("big.txt"), &stdout).unwrap();
     let command = "cat big.txt";
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command);
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
     ctx.session
         .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
 
@@ -89,7 +89,7 @@ async fn bash_truncated_output_carries_retention() {
 async fn bash_large_output_is_bounded_at_pipe() {
     let tmp = tempfile::tempdir().unwrap();
     let command = "yes 0123456789 | head -c 1000000";
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command);
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
     ctx.session
         .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
 
@@ -112,7 +112,7 @@ async fn bash_large_output_is_bounded_at_pipe() {
 async fn bash_untruncated_output_carries_no_retention() {
     let tmp = tempfile::tempdir().unwrap();
     let command = "printf ok";
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command);
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
 
     let output = BashTool::new()
         .call(serde_json::json!({ "command": command }), &ctx)
@@ -123,12 +123,12 @@ async fn bash_untruncated_output_carries_no_retention() {
     assert!(output.truncated_retention.is_none());
 }
 
-#[test]
-fn bash_truncated_output_carries_retention_on_the_container_render_path() {
+#[tokio::test]
+async fn bash_truncated_output_carries_retention_on_the_container_render_path() {
     let tmp = tempfile::tempdir().unwrap();
     let stdout = large_bash_stdout();
     let command = "cat big.txt";
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command);
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
     ctx.session
         .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
     let expected_body = render_output(
@@ -159,8 +159,8 @@ fn bash_truncated_output_carries_retention_on_the_container_render_path() {
     assert!(!retention.partial);
 }
 
-#[test]
-fn bash_description_mentions_cap_and_tmpdir_redirection() {
+#[tokio::test]
+async fn bash_description_mentions_cap_and_tmpdir_redirection() {
     let tool = BashTool::new();
     assert!(tool.description().contains("capped at 8 KB"));
     assert!(tool.description().contains("declare resources"));
@@ -176,8 +176,8 @@ fn bash_description_mentions_cap_and_tmpdir_redirection() {
     assert!(!defensive.contains("diverg"));
 }
 
-#[test]
-fn bash_scrub_overrides_matches_bare_and_camel_secret_names() {
+#[tokio::test]
+async fn bash_scrub_overrides_matches_bare_and_camel_secret_names() {
     let env = std::collections::HashMap::from([
         ("PASSWORD".to_string(), "bare-password-value".to_string()),
         ("apiKey".to_string(), "camel-api-key-value".to_string()),
@@ -193,8 +193,8 @@ fn bash_scrub_overrides_matches_bare_and_camel_secret_names() {
     assert!(!scrubbed.contains("REGION"));
 }
 
-#[test]
-fn jq_shim_is_skipped_only_for_actual_container_runs() {
+#[tokio::test]
+async fn jq_shim_is_skipped_only_for_actual_container_runs() {
     use crate::tools::sandbox_mode::SandboxMode;
 
     assert!(!should_prepare_jq_shim(false, SandboxMode::Container));
@@ -247,7 +247,7 @@ async fn cancel_kills_process_group_promptly() {
     let heartbeat = tmp.path().join("heartbeat");
     let hb = heartbeat.to_string_lossy().to_string();
     let command = format!("( while true; do touch '{hb}'; sleep 0.1; done ) & sleep 30",);
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command);
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command).await;
     let tool = BashTool::new();
 
     let cancel = ctx.cancel.clone();
@@ -385,7 +385,7 @@ async fn compression_enabled_strips_noise_keeps_signal_and_exit() {
             'error[E0382]: borrow of moved value' \
             '   Finished dev in 2.3s'; exit 2";
     let command = format!("cargo build; {script}");
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command);
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command).await;
     ctx.session
         .set_shell_compression(crate::config::extended::ShellCompression::Enabled);
     let tool = BashTool::new();
@@ -430,7 +430,7 @@ async fn compression_disabled_returns_verbatim() {
             'error[E0382]: borrow of moved value' \
             '   Finished dev in 2.3s'";
     let command = format!("cargo build; {script}");
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command);
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), &command).await;
     ctx.session
         .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
     let tool = BashTool::new();
@@ -453,7 +453,7 @@ async fn compression_toggle_changes_output() {
     let tmp = tempfile::tempdir().unwrap();
     let cmd = "cargo build; printf '   Compiling foo v0.1.0\\ndone\\n'";
 
-    let ctx_on = sandbox_off_ctx_with_grant(tmp.path(), cmd);
+    let ctx_on = sandbox_off_ctx_with_grant(tmp.path(), cmd).await;
     ctx_on
         .session
         .set_shell_compression(crate::config::extended::ShellCompression::Enabled);
@@ -462,7 +462,7 @@ async fn compression_toggle_changes_output() {
         .await
         .unwrap();
 
-    let ctx_off = sandbox_off_ctx_with_grant(tmp.path(), cmd);
+    let ctx_off = sandbox_off_ctx_with_grant(tmp.path(), cmd).await;
     ctx_off
         .session
         .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
@@ -490,7 +490,7 @@ async fn compression_toggle_changes_output() {
 #[tokio::test]
 async fn normal_command_completes() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf hello");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf hello").await;
     let tool = BashTool::new();
     let out = tool
         .call(serde_json::json!({ "command": "printf hello" }), &ctx)
@@ -508,7 +508,7 @@ async fn normal_command_completes() {
 #[tokio::test]
 async fn nonzero_exit_sets_structured_exit_code() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "exit 3");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "exit 3").await;
     let tool = BashTool::new();
     let out = tool
         .call(serde_json::json!({ "command": "exit 3" }), &ctx)
@@ -595,21 +595,22 @@ fn note_count(content: &str, field: &str) -> usize {
         .count()
 }
 
-fn grant_command(ctx: &ToolCtx, command: &str, scope: Scope) {
+async fn grant_command(ctx: &ToolCtx, command: &str, scope: Scope) {
     let approver = ctx.approver.as_ref().unwrap();
     let classification = crate::approval::classify::classify(command);
     for info in classification.simple_commands() {
         approver
             .store()
             .record_command(info, info.risk.tier, scope)
+            .await
             .unwrap();
     }
 }
 
-fn sandbox_off_ctx_with_grant(cwd: &std::path::Path, command: &str) -> ToolCtx {
+async fn sandbox_off_ctx_with_grant(cwd: &std::path::Path, command: &str) -> ToolCtx {
     let ctx = ctx_with_store(cwd);
     ctx.session.set_sandbox_enabled(false);
-    grant_command(&ctx, command, Scope::Session);
+    grant_command(&ctx, command, Scope::Session).await;
     ctx
 }
 
@@ -622,8 +623,8 @@ fn scheduler(cpu: u32, memory: u32) -> Arc<crate::engine::resource_scheduler::Re
     ))
 }
 
-#[test]
-fn user_path_grants_merge_into_sandbox_and_container_mount_plan() {
+#[tokio::test]
+async fn user_path_grants_merge_into_sandbox_and_container_mount_plan() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("repo");
     let read_dir = tmp.path().join("read-dir");
@@ -644,6 +645,7 @@ fn user_path_grants_merge_into_sandbox_and_container_mount_plan() {
             Scope::Session,
             crate::tools::shell_sandbox::SandboxPathAccess::Read,
         )
+        .await
         .unwrap();
     store
         .record_path(
@@ -651,12 +653,14 @@ fn user_path_grants_merge_into_sandbox_and_container_mount_plan() {
             Scope::Session,
             crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
         )
+        .await
         .unwrap();
 
     let plan = command_resource_plan_with_user_grants(
         crate::tools::command_resource_profiles::CommandResourcePlan::default(),
         &ctx,
-    );
+    )
+    .await;
     assert!(plan.allow_paths.iter().any(|path| {
         path.kind == "user_grant"
             && path.path == read_dir
@@ -754,7 +758,7 @@ async fn resource_policy_structured_fields_are_conjunctive() {
 #[tokio::test]
 async fn bash_without_effective_resources_bypasses_scheduler() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok").await;
     let out = BashTool::new()
         .call(serde_json::json!({ "command": "printf ok" }), &ctx)
         .await
@@ -767,7 +771,7 @@ async fn bash_without_effective_resources_bypasses_scheduler() {
 async fn bash_resource_over_capacity_returns_model_error() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_scheduler(tmp.path(), scheduler(1, 1));
-    grant_command(&ctx, "printf nope", Scope::Session);
+    grant_command(&ctx, "printf nope", Scope::Session).await;
     let out = BashTool::new()
         .call(
             serde_json::json!({
@@ -802,7 +806,7 @@ async fn bash_queue_timeout_cancels_wait_without_spawning() {
         .await
         .unwrap();
     let ctx = ctx_with_scheduler(tmp.path(), scheduler.clone());
-    grant_command(&ctx, "touch should-not-exist", Scope::Session);
+    grant_command(&ctx, "touch should-not-exist", Scope::Session).await;
     let out = BashTool::new()
         .call(
             serde_json::json!({
@@ -837,7 +841,7 @@ async fn bash_cancel_while_queued_removes_scheduler_request() {
         .await
         .unwrap();
     let ctx = ctx_with_scheduler(tmp.path(), scheduler.clone());
-    grant_command(&ctx, "printf nope", Scope::Session);
+    grant_command(&ctx, "printf nope", Scope::Session).await;
     ctx.cancel.cancel();
     let out = BashTool::new()
         .call(
@@ -857,7 +861,7 @@ async fn bash_cancel_while_queued_removes_scheduler_request() {
 async fn bash_runtime_timeout_starts_after_resource_acquire() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_scheduler(tmp.path(), scheduler(1, 1));
-    grant_command(&ctx, "sleep 2", Scope::Session);
+    grant_command(&ctx, "sleep 2", Scope::Session).await;
     let out = BashTool::new()
         .call(
             serde_json::json!({
@@ -879,7 +883,7 @@ async fn bash_runtime_timeout_starts_after_resource_acquire() {
 #[tokio::test]
 async fn bash_timeout_ms_zero_runs_with_default_and_reports_the_substitution() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok").await;
     let out = BashTool::new()
         .call(
             serde_json::json!({ "command": "printf ok", "timeout_ms": 0 }),
@@ -901,7 +905,7 @@ async fn bash_timeout_ms_zero_runs_with_default_and_reports_the_substitution() {
 #[tokio::test]
 async fn bash_timeout_ms_below_floor_is_raised_and_reported() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok").await;
     let out = BashTool::new()
         .call(
             serde_json::json!({ "command": "printf ok", "timeout_ms": 250 }),
@@ -922,7 +926,7 @@ async fn bash_timeout_ms_below_floor_is_raised_and_reported() {
 #[tokio::test]
 async fn bash_timeout_ms_above_max_is_lowered_and_reported() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok").await;
     let out = BashTool::new()
         .call(
             serde_json::json!({ "command": "printf ok", "timeout_ms": 900000 }),
@@ -943,7 +947,7 @@ async fn bash_timeout_ms_above_max_is_lowered_and_reported() {
 #[tokio::test]
 async fn bash_queue_timeout_ms_zero_is_ignored_and_reported() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok").await;
     let out = BashTool::new()
         .call(
             serde_json::json!({ "command": "printf ok", "queue_timeout_ms": 0 }),
@@ -975,7 +979,7 @@ async fn bash_queue_timeout_ms_zero_is_ignored_and_reported() {
 #[tokio::test]
 async fn bash_timeout_ms_valid_and_absent_emit_no_note() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf ok").await;
     let tool = BashTool::new();
 
     let absent = tool
@@ -1025,12 +1029,16 @@ async fn resolve_next_interrupt_with_response(
     exclude: Option<uuid::Uuid>,
 ) -> uuid::Uuid {
     let iid = loop {
-        let open = db.list_open_interrupts(sid).unwrap();
-        if let Some(row) = open.iter().find(|row| Some(row.interrupt_id) != exclude) {
+        let open = db.list_open_interrupts(sid).await.unwrap();
+        if let Some(row) = open
+            .iter()
+            .find(|row| Some(row.interrupt_id) != exclude && hub.has_waiter(row.interrupt_id))
+        {
             break row.interrupt_id;
         }
         tokio::task::yield_now().await;
     };
+    db.resolve_interrupt(iid, &response).await.unwrap();
     assert!(hub.resolve(iid, response));
     iid
 }
@@ -1048,13 +1056,27 @@ async fn approve_next_path_prompt(ctx: &ToolCtx) {
 
 async fn deny_next_path_prompt(ctx: &ToolCtx) {
     let iid = loop {
-        let open = ctx.session.db.list_open_interrupts(ctx.session.id).unwrap();
-        if let Some(row) = open.first() {
+        let open = ctx
+            .session
+            .db
+            .list_open_interrupts(ctx.session.id)
+            .await
+            .unwrap();
+        if let Some(row) = open
+            .iter()
+            .find(|row| ctx.interrupts.has_waiter(row.interrupt_id))
+        {
             break row.interrupt_id;
         }
         tokio::task::yield_now().await;
     };
-    assert!(ctx.interrupts.resolve(iid, ResolveResponse::Cancel));
+    let response = ResolveResponse::Cancel;
+    ctx.session
+        .db
+        .resolve_interrupt(iid, &response)
+        .await
+        .unwrap();
+    assert!(ctx.interrupts.resolve(iid, response));
 }
 
 #[tokio::test]
@@ -1063,7 +1085,7 @@ async fn bash_child_receives_session_env_overlay() {
     let ctx = ctx_with_store(tmp.path());
     ctx.session.set_sandbox_enabled(false);
     let command = "printf '%s' \"$COCKPIT_REFRESH_TEST_VALUE\"";
-    grant_command(&ctx, command, Scope::Session);
+    grant_command(&ctx, command, Scope::Session).await;
     ctx.env_overlay.write().unwrap().insert(
         "COCKPIT_REFRESH_TEST_VALUE".to_string(),
         "sk-session".to_string(),
@@ -1083,7 +1105,7 @@ async fn bash_child_does_not_receive_aws_access_key_from_parent_env() {
     let ctx = ctx_with_store(tmp.path());
     ctx.session.set_sandbox_enabled(false);
     let command = "printf '%s' \"${AWS_ACCESS_KEY_ID:-scrubbed}\"";
-    grant_command(&ctx, command, Scope::Session);
+    grant_command(&ctx, command, Scope::Session).await;
     env.set_var("AWS_ACCESS_KEY_ID", "AKIATESTSECRET");
     let out = BashTool::new()
         .call(serde_json::json!({ "command": command }), &ctx)
@@ -1093,8 +1115,8 @@ async fn bash_child_does_not_receive_aws_access_key_from_parent_env() {
     assert!(!out.content.contains("AKIATESTSECRET"), "{}", out.content);
 }
 
-#[test]
-fn command_directory_escape_detects_literal_absolute_paths() {
+#[tokio::test]
+async fn command_directory_escape_detects_literal_absolute_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&root).unwrap();
@@ -1110,8 +1132,8 @@ fn command_directory_escape_detects_literal_absolute_paths() {
     );
 }
 
-#[test]
-fn command_directory_escape_detects_relative_path_operands() {
+#[tokio::test]
+async fn command_directory_escape_detects_relative_path_operands() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("project");
     let cwd = root.join("sub");
@@ -1125,8 +1147,8 @@ fn command_directory_escape_detects_relative_path_operands() {
     );
 }
 
-#[test]
-fn command_directory_escape_detects_quoted_relative_path_operands() {
+#[tokio::test]
+async fn command_directory_escape_detects_quoted_relative_path_operands() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("project");
     let cwd = root.join("sub");
@@ -1140,8 +1162,8 @@ fn command_directory_escape_detects_quoted_relative_path_operands() {
     );
 }
 
-#[test]
-fn command_directory_escape_detects_symlink_dotdot_operands() {
+#[tokio::test]
+async fn command_directory_escape_detects_symlink_dotdot_operands() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&root).unwrap();
@@ -1162,8 +1184,8 @@ fn command_directory_escape_detects_symlink_dotdot_operands() {
     );
 }
 
-#[test]
-fn shell_write_targets_detect_redirection_heredoc_tee_and_multiple_files() {
+#[tokio::test]
+async fn shell_write_targets_detect_redirection_heredoc_tee_and_multiple_files() {
     let root = Path::new("/workspace/project");
     assert_eq!(
         shell_write_targets("cat > scratch/staged/x.md <<EOF\nbody\nEOF", root),
@@ -1183,8 +1205,8 @@ fn shell_write_targets_detect_redirection_heredoc_tee_and_multiple_files() {
     );
 }
 
-#[test]
-fn shell_write_targets_ignore_redirect_like_heredoc_body_lines() {
+#[tokio::test]
+async fn shell_write_targets_ignore_redirect_like_heredoc_body_lines() {
     let root = Path::new("/workspace/project");
     assert_eq!(
         shell_write_targets("cat <<EOF\n> /etc/passwd\nEOF", root),
@@ -1203,8 +1225,8 @@ fn shell_write_targets_ignore_redirect_like_heredoc_body_lines() {
     );
 }
 
-#[test]
-fn shell_write_tokens_handle_quoted_and_tab_stripped_heredocs() {
+#[tokio::test]
+async fn shell_write_tokens_handle_quoted_and_tab_stripped_heredocs() {
     assert_eq!(
         shell_write_content_preview_inner("cat <<'EOF' > out.txt\nbody > /\nEOF"),
         ShellWriteContentPreview::Literal("body > /\n".to_string())
@@ -1222,8 +1244,8 @@ fn shell_write_tokens_handle_quoted_and_tab_stripped_heredocs() {
     );
 }
 
-#[test]
-fn shell_write_targets_do_not_fabricate_dynamic_paths() {
+#[tokio::test]
+async fn shell_write_targets_do_not_fabricate_dynamic_paths() {
     let root = Path::new("/workspace/project");
     assert_eq!(
         shell_write_targets(r#"cat > "$OUT""#, root),
@@ -1235,8 +1257,8 @@ fn shell_write_targets_do_not_fabricate_dynamic_paths() {
     );
 }
 
-#[test]
-fn shell_write_content_preview_preserves_literal_words() {
+#[tokio::test]
+async fn shell_write_content_preview_preserves_literal_words() {
     assert_eq!(
         shell_write_content_preview_inner(r#"echo "a > b" > out.txt"#),
         ShellWriteContentPreview::Literal("a > b\n".to_string())
@@ -1255,8 +1277,8 @@ fn shell_write_content_preview_preserves_literal_words() {
     );
 }
 
-#[test]
-fn shell_write_content_preview_keeps_printf_and_dynamic_fallback() {
+#[tokio::test]
+async fn shell_write_content_preview_keeps_printf_and_dynamic_fallback() {
     assert_eq!(
         shell_write_content_preview_inner("printf hello > out.txt"),
         ShellWriteContentPreview::Literal("hello".to_string())
@@ -1275,7 +1297,7 @@ fn shell_write_content_preview_keeps_printf_and_dynamic_fallback() {
 #[tokio::test]
 async fn default_cwd_runs_at_session_root() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "pwd");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "pwd").await;
     let out = BashTool::new()
         .call(serde_json::json!({ "command": "pwd" }), &ctx)
         .await
@@ -1288,7 +1310,7 @@ async fn default_cwd_runs_at_session_root() {
 async fn explicit_inside_cwd_runs() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join("src")).unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "pwd");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "pwd").await;
     let out = BashTool::new()
         .call(serde_json::json!({ "command": "pwd", "cwd": "src" }), &ctx)
         .await
@@ -1336,7 +1358,7 @@ async fn approved_outside_cwd_executes() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     ctx.session.set_sandbox_enabled(false);
-    grant_command(&ctx, "pwd", Scope::Session);
+    grant_command(&ctx, "pwd", Scope::Session).await;
     let parent = tmp.path().parent().unwrap().to_path_buf();
     let approve = {
         let ctx = ctx.clone();
@@ -1355,7 +1377,7 @@ async fn approved_outside_cwd_executes() {
 async fn cd_inside_root_is_allowed() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join("subdir")).unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "cd subdir && pwd");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "cd subdir && pwd").await;
     let out = BashTool::new()
         .call(serde_json::json!({ "command": "cd subdir && pwd" }), &ctx)
         .await
@@ -1425,7 +1447,7 @@ async fn pushd_escape_triggers_approval_before_execution() {
 #[tokio::test]
 async fn dotdot_as_data_is_not_rejected() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf '%s\\n' '../data'");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf '%s\\n' '../data'").await;
     let out = BashTool::new()
         .call(
             serde_json::json!({ "command": "printf '%s\\n' '../data'" }),
@@ -1446,7 +1468,7 @@ async fn command_escalation_preauthorized_returns_scope() {
         None
     );
 
-    grant_command(&ctx, "cargo build --release", Scope::Session);
+    grant_command(&ctx, "cargo build --release", Scope::Session).await;
     assert_eq!(
         command_escalation_preauthorized(&ctx, "cargo build --release").await,
         Some(Scope::Session)
@@ -1466,10 +1488,11 @@ async fn risky_grant_above_policy_cap_does_not_preauthorize_escalation() {
     approver
         .store()
         .record_command(&info, info.risk.tier, Scope::Session)
+        .await
         .unwrap();
 
     assert!(
-        approver.store().is_command_granted(&info.key),
+        approver.store().is_command_granted(&info.key).await,
         "the stored grant exists"
     );
     assert_eq!(
@@ -1523,7 +1546,7 @@ async fn sandbox_meta_records_sandbox_off_state() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     ctx.session.set_sandbox_enabled(false);
-    grant_command(&ctx, "printf hi", Scope::Session);
+    grant_command(&ctx, "printf hi", Scope::Session).await;
     let _guard = set_bash_test_overrides(None, None, [(false, shell_out("hi", "", 0))]);
     let tool = BashTool::new();
     let out = tool
@@ -1546,7 +1569,7 @@ async fn escalation_preauthorized_computed_without_sandbox() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     ctx.session.set_sandbox_enabled(false);
-    grant_command(&ctx, "printf hi", Scope::Session);
+    grant_command(&ctx, "printf hi", Scope::Session).await;
 
     assert_eq!(
         command_escalation_preauthorized(&ctx, "printf hi").await,
@@ -1588,7 +1611,7 @@ async fn sandbox_off_granted_command_runs_without_prompt() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     ctx.session.set_sandbox_enabled(false);
-    grant_command(&ctx, "printf hi", Scope::Session);
+    grant_command(&ctx, "printf hi", Scope::Session).await;
     let _guard = set_bash_test_overrides(None, None, [(false, shell_out("hi", "", 0))]);
 
     let out = BashTool::new()
@@ -1605,6 +1628,7 @@ async fn sandbox_off_granted_command_runs_without_prompt() {
         ctx.session
             .db
             .list_open_interrupts(ctx.session.id)
+            .await
             .unwrap()
             .is_empty(),
         "granted sandbox-off command must not prompt"
@@ -1719,7 +1743,7 @@ async fn granted_command_still_runs_confined() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     let command = "printf hi";
-    grant_command(&ctx, command, Scope::Session);
+    grant_command(&ctx, command, Scope::Session).await;
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
         None,
@@ -1745,7 +1769,7 @@ async fn granted_command_escalates_without_prompting() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     let command = "printf hi";
-    grant_command(&ctx, command, Scope::Session);
+    grant_command(&ctx, command, Scope::Session).await;
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
         Some((13, "sandbox denied".to_string())),
@@ -1770,6 +1794,7 @@ async fn granted_command_escalates_without_prompting() {
         ctx.session
             .db
             .list_open_interrupts(ctx.session.id)
+            .await
             .unwrap()
             .is_empty(),
         "preauthorized escalation must not prompt"
@@ -1834,6 +1859,7 @@ async fn confined_success_never_prompts() {
         ctx.session
             .db
             .list_open_interrupts(ctx.session.id)
+            .await
             .unwrap()
             .is_empty(),
         "confined success must not prompt"
@@ -1903,6 +1929,7 @@ async fn sandbox_unavailable_is_not_turned_into_a_prompt() {
         ctx.session
             .db
             .list_open_interrupts(ctx.session.id)
+            .await
             .unwrap()
             .is_empty(),
         "sandbox-unavailable refusal must not prompt"
@@ -1999,8 +2026,8 @@ async fn confined_failure_names_escalate_in_frontier_mode() {
     assert!(out.content.contains("call_id=\"call-frontier\""));
 }
 
-#[test]
-fn confined_failure_omits_escalate_note_in_defensive_mode() {
+#[tokio::test]
+async fn confined_failure_omits_escalate_note_in_defensive_mode() {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = ctx_with_store(tmp.path());
     ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
@@ -2107,7 +2134,7 @@ async fn confined_success_body_is_unchanged() {
 #[tokio::test]
 async fn unconfined_failure_omits_escalate_note() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf blocked");
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf blocked").await;
     ctx.current_tool_call_id = Some("call-unconfined".to_string());
     ctx.session.set_sandbox_escalation_enabled(true);
     let _guard = set_bash_test_overrides(None, None, [(false, shell_out("", "blocked", 13))]);
@@ -2187,8 +2214,8 @@ async fn sandbox_unavailable_refusal_is_unchanged_in_defensive_mode() {
 }
 
 #[cfg(not(windows))]
-#[test]
-fn sandbox_meta_distinguishes_four_states() {
+#[tokio::test]
+async fn sandbox_meta_distinguishes_four_states() {
     let sandbox_off_granted = crate::engine::tool::SandboxMeta {
         enabled: false,
         confined: false,
@@ -2249,12 +2276,12 @@ fn sandbox_meta_distinguishes_four_states() {
 use crate::daemon::proto::{InterruptQuestion, SandboxEscalation};
 
 /// Pull the sandbox-escalation block off the open interrupt with `iid`.
-fn open_escalation(
+async fn open_escalation(
     db: &crate::db::Db,
     sid: uuid::Uuid,
     iid: uuid::Uuid,
 ) -> Option<SandboxEscalation> {
-    let open = db.list_open_interrupts(sid).unwrap();
+    let open = db.list_open_interrupts(sid).await.unwrap();
     let row = open.iter().find(|r| r.interrupt_id == iid)?;
     let set = row.questions.as_ref()?;
     match set.questions.first()? {
@@ -2280,13 +2307,13 @@ async fn defensive_human_escalation_offer_is_run_once_or_deny_only() {
     let cwd = tmp.path().display().to_string();
     let resolver = tokio::spawn(async move {
         let iid = loop {
-            let open = db.list_open_interrupts(sid).unwrap();
+            let open = db.list_open_interrupts(sid).await.unwrap();
             if let Some(row) = open.first() {
                 break row.interrupt_id;
             }
             tokio::task::yield_now().await;
         };
-        let open = db.list_open_interrupts(sid).unwrap();
+        let open = db.list_open_interrupts(sid).await.unwrap();
         let row = open
             .iter()
             .find(|row| row.interrupt_id == iid)
@@ -2322,12 +2349,11 @@ async fn defensive_human_escalation_offer_is_run_once_or_deny_only() {
         assert_eq!(esc.confined_stderr, "permission denied");
         assert!(esc.suggested_paths.is_empty());
         assert!(esc.suggested_access.is_none());
-        assert!(hub.resolve(
-            iid,
-            crate::daemon::proto::ResolveResponse::Single {
-                selected_id: crate::approval::ID_REJECT.into(),
-            }
-        ));
+        let response = crate::daemon::proto::ResolveResponse::Single {
+            selected_id: crate::approval::ID_REJECT.into(),
+        };
+        db.resolve_interrupt(iid, &response).await.unwrap();
+        assert!(hub.resolve(iid, response));
     });
 
     let decision = defensive_human_escalation_offer(
@@ -2386,18 +2412,17 @@ async fn defensive_human_escalation_offer_auto_prompts_human() {
     let hub = ctx.interrupts.clone();
     let resolver = tokio::spawn(async move {
         let iid = loop {
-            let open = db.list_open_interrupts(sid).unwrap();
-            if let Some(row) = open.first() {
+            let open = db.list_open_interrupts(sid).await.unwrap();
+            if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                 break row.interrupt_id;
             }
             tokio::task::yield_now().await;
         };
-        assert!(hub.resolve(
-            iid,
-            crate::daemon::proto::ResolveResponse::Single {
-                selected_id: crate::approval::ID_ESCALATE_RUN_UNCONFINED_ONCE.into(),
-            }
-        ));
+        let response = crate::daemon::proto::ResolveResponse::Single {
+            selected_id: crate::approval::ID_ESCALATE_RUN_UNCONFINED_ONCE.into(),
+        };
+        db.resolve_interrupt(iid, &response).await.unwrap();
+        assert!(hub.resolve(iid, response));
     });
 
     let out = defensive_human_escalation_offer(
@@ -2435,21 +2460,22 @@ async fn escalate_approve_session_carries_confined_detail_and_records_scope() {
         // The approval prompt carries the distinct escalation block and
         // resolves directly to a scoped action.
         let iid = loop {
-            let open = db.list_open_interrupts(sid).unwrap();
-            if let Some(row) = open.first() {
+            let open = db.list_open_interrupts(sid).await.unwrap();
+            if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                 break row.interrupt_id;
             }
             tokio::task::yield_now().await;
         };
-        let esc = open_escalation(&db, sid, iid).expect("escalation block present");
+        let esc = open_escalation(&db, sid, iid)
+            .await
+            .expect("escalation block present");
         assert_eq!(esc.confined_exit, 13);
         assert!(esc.confined_stderr.contains("Permission denied"));
-        assert!(hub.resolve(
-            iid,
-            crate::daemon::proto::ResolveResponse::Single {
-                selected_id: crate::approval::ID_APPROVE_SESSION.into(),
-            }
-        ));
+        let response = crate::daemon::proto::ResolveResponse::Single {
+            selected_id: crate::approval::ID_APPROVE_SESSION.into(),
+        };
+        db.resolve_interrupt(iid, &response).await.unwrap();
+        assert!(hub.resolve(iid, response));
     });
 
     let decision = approver
@@ -2469,7 +2495,7 @@ async fn escalate_approve_session_carries_confined_detail_and_records_scope() {
         program: "cat".into(),
         subcommand: None,
     };
-    assert!(approver.store().is_command_granted(&key));
+    assert!(approver.store().is_command_granted(&key).await);
 }
 
 /// escalate→DENY: the user rejects the unconfined re-run. The decision
@@ -2488,13 +2514,15 @@ async fn escalate_deny_keeps_confined_failure_and_records_no_scope() {
 
     let resolver = tokio::spawn(async move {
         let iid = loop {
-            let open = db.list_open_interrupts(sid).unwrap();
-            if let Some(row) = open.first() {
+            let open = db.list_open_interrupts(sid).await.unwrap();
+            if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
                 break row.interrupt_id;
             }
             tokio::task::yield_now().await;
         };
-        assert!(hub.resolve(iid, crate::daemon::proto::ResolveResponse::Cancel));
+        let response = crate::daemon::proto::ResolveResponse::Cancel;
+        db.resolve_interrupt(iid, &response).await.unwrap();
+        assert!(hub.resolve(iid, response));
     });
 
     let decision = approver
@@ -2508,7 +2536,7 @@ async fn escalate_deny_keeps_confined_failure_and_records_no_scope() {
         program: "cat".into(),
         subcommand: None,
     };
-    assert!(!approver.store().is_command_granted(&key));
+    assert!(!approver.store().is_command_granted(&key).await);
 }
 
 // NOTE: an end-to-end "runs confined and EPERMs an outside read" test
@@ -2531,7 +2559,7 @@ async fn escalate_deny_keeps_confined_failure_and_records_no_scope() {
 #[tokio::test]
 async fn defensive_cat_appends_read_tip() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), "cat foo.txt");
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), "cat foo.txt").await;
     ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
     let tool = BashTool::new();
     let out = tool
@@ -2554,7 +2582,7 @@ async fn defensive_cat_appends_read_tip() {
 #[tokio::test]
 async fn normal_cat_appends_no_tip() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "cat foo.txt");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "cat foo.txt").await;
     // test_ctx defaults to Normal.
     assert!(matches!(
         ctx.llm_mode,
@@ -2576,7 +2604,7 @@ async fn normal_cat_appends_no_tip() {
 async fn normal_pipeline_with_cat_appends_no_tip() {
     let tmp = tempfile::tempdir().unwrap();
     let command = "printf hi | cat";
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command);
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
     let out = BashTool::new()
         .call(serde_json::json!({ "command": command }), &ctx)
         .await
@@ -2593,7 +2621,7 @@ async fn normal_pipeline_with_cat_appends_no_tip() {
 async fn defensive_pipeline_with_cat_appends_read_tip() {
     let tmp = tempfile::tempdir().unwrap();
     let command = "printf hi | cat";
-    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command);
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
     ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
     let out = BashTool::new()
         .call(serde_json::json!({ "command": command }), &ctx)
@@ -2610,7 +2638,7 @@ async fn defensive_pipeline_with_cat_appends_read_tip() {
 #[tokio::test]
 async fn durable_shell_write_appends_write_hint() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf hello > durable.txt");
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf hello > durable.txt").await;
     let out = BashTool::new()
         .call(
             serde_json::json!({ "command": "printf hello > durable.txt" }),
@@ -2631,7 +2659,7 @@ async fn durable_shell_write_appends_write_hint() {
 #[tokio::test]
 async fn defensive_cat_tip_suppressed_after_read() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), "cat foo.txt");
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), "cat foo.txt").await;
     ctx.llm_mode = crate::config::extended::LlmMode::Defensive;
     // The model already adopted `read` this session (recorded at the
     // dispatch site on a successful read call).
@@ -2652,8 +2680,8 @@ async fn defensive_cat_tip_suppressed_after_read() {
 
 /// exit 0 with both streams empty: the bare `exit: 0` line is preserved
 /// AND the complete-result annotation is appended.
-#[test]
-fn empty_exit_zero_is_annotated_complete() {
+#[tokio::test]
+async fn empty_exit_zero_is_annotated_complete() {
     let out = format_combined("", "", 0, false);
     assert!(out.contains("exit: 0"), "exit line preserved, got: {out}");
     assert!(
@@ -2664,8 +2692,8 @@ fn empty_exit_zero_is_annotated_complete() {
 
 /// Nonzero with both streams empty: annotated, but NEUTRAL — never
 /// labelled "failed"/"error" (grep/diff exit 1 = a valid answer).
-#[test]
-fn empty_nonzero_is_annotated_neutral() {
+#[tokio::test]
+async fn empty_nonzero_is_annotated_neutral() {
     let out = format_combined("", "", 1, false);
     assert!(out.contains("exit: 1"), "exit line preserved, got: {out}");
     assert!(out.contains("no output"), "expected annotation, got: {out}");
@@ -2677,8 +2705,8 @@ fn empty_nonzero_is_annotated_neutral() {
 }
 
 /// Any stdout means it is not the void case — no annotation.
-#[test]
-fn stdout_present_is_not_annotated() {
+#[tokio::test]
+async fn stdout_present_is_not_annotated() {
     let out = format_combined("hi\n", "", 0, false);
     assert!(out.contains("stdout:"), "stdout rendered, got: {out}");
     assert!(
@@ -2688,8 +2716,8 @@ fn stdout_present_is_not_annotated() {
 }
 
 /// Any stderr means it is not the void case — no annotation.
-#[test]
-fn stderr_present_is_not_annotated() {
+#[tokio::test]
+async fn stderr_present_is_not_annotated() {
     let out = format_combined("", "oops\n", 1, false);
     assert!(out.contains("stderr:"), "stderr rendered, got: {out}");
     assert!(
@@ -2699,8 +2727,8 @@ fn stderr_present_is_not_annotated() {
 }
 
 /// The signaled branch keeps its current rendering — never annotated.
-#[test]
-fn signaled_empty_is_not_annotated() {
+#[tokio::test]
+async fn signaled_empty_is_not_annotated() {
     let out = format_combined("", "", 0, true);
     assert!(
         out.contains("exit: signaled"),
@@ -2712,8 +2740,8 @@ fn signaled_empty_is_not_annotated() {
     );
 }
 
-#[test]
-fn missing_binary_diagnostic_names_cockpit_environment() {
+#[tokio::test]
+async fn missing_binary_diagnostic_names_cockpit_environment() {
     let outcome = ShellOutcome {
         stdout: Vec::new(),
         stderr: b"sh: 1: npm: not found\n".to_vec(),
@@ -2739,8 +2767,8 @@ fn missing_binary_diagnostic_names_cockpit_environment() {
     assert!(body.contains("does not establish that it is absent from the host system"));
 }
 
-#[test]
-fn missing_binary_diagnostic_adds_remedy_for_declared_binary_only() {
+#[tokio::test]
+async fn missing_binary_diagnostic_adds_remedy_for_declared_binary_only() {
     let declared = cockpit_command_environment_block_with_requirements(
         "jq . package.json",
         Path::new("/repo"),
@@ -2770,8 +2798,8 @@ fn missing_binary_diagnostic_adds_remedy_for_declared_binary_only() {
     assert!(!undeclared.contains("remedy:"));
 }
 
-#[test]
-fn nonzero_command_diagnostic_includes_attempted_command_and_cwd() {
+#[tokio::test]
+async fn nonzero_command_diagnostic_includes_attempted_command_and_cwd() {
     let outcome = ShellOutcome {
         stdout: Vec::new(),
         stderr: b"tests failed\n".to_vec(),
@@ -2795,8 +2823,8 @@ fn nonzero_command_diagnostic_includes_attempted_command_and_cwd() {
     assert!(body.contains("failure occurred while running in cockpit's command environment"));
 }
 
-#[test]
-fn spawn_error_diagnostic_includes_command_cwd_and_error() {
+#[tokio::test]
+async fn spawn_error_diagnostic_includes_command_cwd_and_error() {
     let error = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
     let body = render_spawn_error("cargo test", Path::new("/repo"), &error, Some(true));
     assert!(body.contains("Error: could not start cockpit shell"));

@@ -131,17 +131,16 @@ pub(super) fn log_seed_tool_drain_failed(session_id: Uuid, error: &anyhow::Error
 /// ([`initial_active_agent`]) when unset/unknown. Shared by [`spawn`] (the
 /// handle's initial chrome slot) and [`run_worker`] (the agent it actually
 /// loads) so both agree.
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; migrated later in db-async-session-log"
-)]
-pub(crate) fn resolve_root_agent(
+pub(crate) async fn resolve_root_agent(
     session_id: Uuid,
     db: &crate::db::Db,
     cfg: &crate::config::extended::ExtendedConfig,
 ) -> String {
-    db.read_blocking(|conn| Ok(resolve_root_agent_conn(conn, session_id, cfg)))
-        .unwrap_or_else(|_| initial_active_agent(cfg).to_string())
+    let fallback = initial_active_agent(cfg).to_string();
+    let cfg = cfg.clone();
+    db.read(move |conn| Ok(resolve_root_agent_conn(conn, session_id, &cfg)))
+        .await
+        .unwrap_or(fallback)
 }
 
 pub(crate) fn resolve_root_agent_conn(

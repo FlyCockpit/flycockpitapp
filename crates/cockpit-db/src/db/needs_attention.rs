@@ -117,11 +117,7 @@ pub struct NeedsAttentionRow {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn raise_interrupt(
+    pub async fn raise_interrupt(
         &self,
         session_id: Uuid,
         agent_id: &str,
@@ -136,7 +132,7 @@ impl Db {
         };
         let agent_id = agent_id.to_owned();
         let description = description.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO needs_attention
                  (interrupt_id, session_id, agent_id, description, question_json, raised_at)
@@ -152,7 +148,8 @@ impl Db {
             )
             .context("inserting needs_attention")?;
             Ok(())
-        })?;
+        })
+        .await?;
         Ok(interrupt_id)
     }
 
@@ -161,7 +158,7 @@ impl Db {
     /// [`InterruptQuestionSet`] stored in `questions_json` (the legacy
     /// `question_json` column stays NULL). Used by the `question` tool.
     #[allow(dead_code)]
-    pub fn raise_interrupt_questions(
+    pub async fn raise_interrupt_questions(
         &self,
         session_id: Uuid,
         agent_id: &str,
@@ -175,13 +172,10 @@ impl Db {
             questions,
             None,
         )
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn raise_interrupt_questions_with_payload(
+    pub async fn raise_interrupt_questions_with_payload(
         &self,
         session_id: Uuid,
         agent_id: &str,
@@ -213,7 +207,7 @@ impl Db {
             .context("serializing parked gate memo")?;
         let agent_id = agent_id.to_owned();
         let description = description.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO needs_attention
                  (interrupt_id, session_id, agent_id, description, questions_json, raised_at,
@@ -236,19 +230,20 @@ impl Db {
             )
             .context("inserting needs_attention (questions)")?;
             Ok(())
-        })?;
+        })
+        .await?;
         Ok(interrupt_id)
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn resolve_interrupt(&self, interrupt_id: Uuid, response: &ResolveResponse) -> Result<()> {
+    pub async fn resolve_interrupt(
+        &self,
+        interrupt_id: Uuid,
+        response: &ResolveResponse,
+    ) -> Result<()> {
         let now = Utc::now().timestamp();
         let response_json =
             serde_json::to_string(response).context("serializing resolve response")?;
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
@@ -262,14 +257,11 @@ impl Db {
             }
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_open_interrupts(&self, session_id: Uuid) -> Result<Vec<NeedsAttentionRow>> {
-        self.read_blocking(|conn| {
+    pub async fn list_open_interrupts(&self, session_id: Uuid) -> Result<Vec<NeedsAttentionRow>> {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT interrupt_id, session_id, agent_id, description,
@@ -290,14 +282,14 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_reconcilable_interrupts(&self, session_id: Uuid) -> Result<Vec<NeedsAttentionRow>> {
-        self.read_blocking(|conn| {
+    pub async fn list_reconcilable_interrupts(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<NeedsAttentionRow>> {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT interrupt_id, session_id, agent_id, description,
@@ -318,14 +310,11 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn get_interrupt(&self, interrupt_id: Uuid) -> Result<Option<NeedsAttentionRow>> {
-        self.read_blocking(|conn| {
+    pub async fn get_interrupt(&self, interrupt_id: Uuid) -> Result<Option<NeedsAttentionRow>> {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT interrupt_id, session_id, agent_id, description,
@@ -344,14 +333,11 @@ impl Db {
                 None => Ok(None),
             }
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn interrupt_question_occurrence(&self, interrupt_id: Uuid) -> Result<usize> {
-        self.read_blocking(move |conn| {
+    pub async fn interrupt_question_occurrence(&self, interrupt_id: Uuid) -> Result<usize> {
+        self.read(move |conn| {
             let (rowid, session_id, agent_id, description, questions_json): (
                 i64,
                 String,
@@ -393,14 +379,11 @@ impl Db {
                 .context("querying interrupt question occurrence")?;
             Ok(count.max(1) as usize)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn park_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
-        self.write_blocking(move |conn| {
+    pub async fn park_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
+        self.write(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
@@ -411,14 +394,11 @@ impl Db {
                 .context("parking needs_attention")?;
             Ok(affected > 0)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn mark_interrupt_interrupted(&self, interrupt_id: Uuid) -> Result<bool> {
-        self.write_blocking(move |conn| {
+    pub async fn mark_interrupt_interrupted(&self, interrupt_id: Uuid) -> Result<bool> {
+        self.write(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
@@ -429,15 +409,12 @@ impl Db {
                 .context("marking needs_attention interrupted")?;
             Ok(affected > 0)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn acknowledge_interrupted_turns(&self, session_id: Uuid) -> Result<usize> {
+    pub async fn acknowledge_interrupted_turns(&self, session_id: Uuid) -> Result<usize> {
         let now = Utc::now().timestamp();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
@@ -448,13 +425,10 @@ impl Db {
                 .context("acknowledging interrupted needs_attention markers")?;
             Ok(affected)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn raise_interrupted_turn(
+    pub async fn raise_interrupted_turn(
         &self,
         session_id: Uuid,
         agent_id: &str,
@@ -464,7 +438,7 @@ impl Db {
         let raised_at = Utc::now().timestamp();
         let agent_id = agent_id.to_owned();
         let description = description.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO needs_attention
                  (interrupt_id, session_id, agent_id, description, state, raised_at)
@@ -479,22 +453,19 @@ impl Db {
             )
             .context("inserting interrupted needs_attention")?;
             Ok(())
-        })?;
+        })
+        .await?;
         Ok(interrupt_id)
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn begin_parked_interrupt_execution(
+    pub async fn begin_parked_interrupt_execution(
         &self,
         interrupt_id: Uuid,
         response: &ResolveResponse,
     ) -> Result<bool> {
         let response_json =
             serde_json::to_string(response).context("serializing parked interrupt response")?;
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
@@ -505,15 +476,12 @@ impl Db {
                 .context("marking parked interrupt executing")?;
             Ok(affected > 0)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn complete_executing_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
+    pub async fn complete_executing_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
         let now = Utc::now().timestamp();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
@@ -524,6 +492,7 @@ impl Db {
                 .context("completing executing interrupt")?;
             Ok(affected > 0)
         })
+        .await
     }
 }
 
@@ -716,6 +685,100 @@ mod tests {
         InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
     };
 
+    fn approval_question_set() -> InterruptQuestionSet {
+        InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Run it?".into(),
+                options: vec![InterruptOption {
+                    id: "yes".into(),
+                    label: "Yes".into(),
+                    description: None,
+                    secondary: false,
+                }],
+                allow_freetext: false,
+                command_detail: None,
+                permission: true,
+                approval_class: None,
+                sandbox_escalation: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn db_async_approval_attention_roundtrip_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let questions = approval_question_set();
+
+        let interrupt_id = db
+            .raise_interrupt_questions(session.session_id, "Build", "approval required", &questions)
+            .await
+            .unwrap();
+
+        let open = db.list_open_interrupts(session.session_id).await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].interrupt_id, interrupt_id);
+        let stored_questions = open[0].questions.as_ref().unwrap();
+        assert_eq!(stored_questions.questions.len(), questions.questions.len());
+
+        db.resolve_interrupt(
+            interrupt_id,
+            &ResolveResponse::Single {
+                selected_id: "yes".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.list_open_interrupts(session.session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let resolved = db.get_interrupt(interrupt_id).await.unwrap().unwrap();
+        assert_eq!(resolved.state, InterruptState::Resolved);
+        assert!(resolved.response.is_some());
+    }
+
+    #[tokio::test]
+    async fn db_async_approval_park_payload_and_flag_are_atomic() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let questions = approval_question_set();
+        let parked = InterruptParkPayload {
+            tool: "bash".into(),
+            args: serde_json::json!({"command": "cargo test"}),
+            call_id: "call-1".into(),
+            resume: InterruptResumeAnchor {
+                agent_id: "Build".into(),
+                call_id: "call-1".into(),
+                provider_call_id: Some("provider-call-1".into()),
+                assistant_seq: Some(42),
+                call_origin: InterruptCallOrigin::Foreground,
+            },
+            gate: Some(InterruptGateMemo {
+                recheck_result: true,
+            }),
+        };
+
+        let interrupt_id = db
+            .raise_interrupt_questions_with_payload(
+                session.session_id,
+                "Build",
+                "parked approval",
+                &questions,
+                Some(&parked),
+            )
+            .await
+            .unwrap();
+
+        let row = db.get_interrupt(interrupt_id).await.unwrap().unwrap();
+        assert_eq!(row.state, InterruptState::Open);
+        assert_eq!(row.parked, Some(parked));
+        assert!(row.questions.is_some());
+    }
+
     #[tokio::test]
     async fn raise_and_resolve_round_trip() {
         let db = Db::open_in_memory().unwrap();
@@ -744,9 +807,10 @@ mod tests {
         };
         let iid = db
             .raise_interrupt(s.session_id, "builder", "paused on something", Some(&q))
+            .await
             .unwrap();
 
-        let open = db.list_open_interrupts(s.session_id).unwrap();
+        let open = db.list_open_interrupts(s.session_id).await.unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].interrupt_id, iid);
 
@@ -756,8 +820,9 @@ mod tests {
                 selected_id: "y".into(),
             },
         )
+        .await
         .unwrap();
-        let open = db.list_open_interrupts(s.session_id).unwrap();
+        let open = db.list_open_interrupts(s.session_id).await.unwrap();
         assert_eq!(open.len(), 0);
     }
 
@@ -845,9 +910,10 @@ mod tests {
         };
         let iid = db
             .raise_interrupt_questions(s.session_id, "builder", "needs input", &set)
+            .await
             .unwrap();
 
-        let open = db.list_open_interrupts(s.session_id).unwrap();
+        let open = db.list_open_interrupts(s.session_id).await.unwrap();
         assert_eq!(open.len(), 1);
         // The batch round-trips in `questions`, not the legacy `question`.
         assert!(open[0].question.is_none());
@@ -864,8 +930,12 @@ mod tests {
                 ],
             },
         )
+        .await
         .unwrap();
-        assert_eq!(db.list_open_interrupts(s.session_id).unwrap().len(), 0);
+        assert_eq!(
+            db.list_open_interrupts(s.session_id).await.unwrap().len(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -901,16 +971,18 @@ mod tests {
                 &set,
                 Some(&payload),
             )
+            .await
             .unwrap();
 
-        let row = db.get_interrupt(iid).unwrap().unwrap();
+        let row = db.get_interrupt(iid).await.unwrap().unwrap();
         assert_eq!(row.state, InterruptState::Open);
         assert_eq!(row.parked.as_ref(), Some(&payload));
 
-        assert!(db.park_interrupt(iid).unwrap());
-        assert!(!db.park_interrupt(iid).unwrap());
+        assert!(db.park_interrupt(iid).await.unwrap());
+        assert!(!db.park_interrupt(iid).await.unwrap());
         assert!(
             db.resolve_interrupt(iid, &ResolveResponse::Freetext { text: "no".into() })
+                .await
                 .is_err()
         );
 
@@ -919,6 +991,7 @@ mod tests {
                 iid,
                 &ResolveResponse::Freetext { text: "yes".into() },
             )
+            .await
             .unwrap()
         );
         assert!(
@@ -928,18 +1001,19 @@ mod tests {
                     text: "again".into()
                 },
             )
+            .await
             .unwrap()
         );
-        let executing = db.get_interrupt(iid).unwrap().unwrap();
+        let executing = db.get_interrupt(iid).await.unwrap().unwrap();
         assert_eq!(executing.state, InterruptState::Executing);
         assert!(matches!(
             executing.response,
             Some(ResolveResponse::Freetext { ref text }) if text == "yes"
         ));
 
-        assert!(db.complete_executing_interrupt(iid).unwrap());
-        assert!(!db.complete_executing_interrupt(iid).unwrap());
-        let resolved = db.get_interrupt(iid).unwrap().unwrap();
+        assert!(db.complete_executing_interrupt(iid).await.unwrap());
+        assert!(!db.complete_executing_interrupt(iid).await.unwrap());
+        let resolved = db.get_interrupt(iid).await.unwrap().unwrap();
         assert_eq!(resolved.state, InterruptState::Resolved);
         assert!(resolved.resolved_at.is_some());
     }
@@ -975,24 +1049,26 @@ mod tests {
                 &set,
                 Some(&payload),
             )
+            .await
             .unwrap();
 
-        assert!(db.park_interrupt(iid).unwrap());
+        assert!(db.park_interrupt(iid).await.unwrap());
         assert!(
             db.begin_parked_interrupt_execution(
                 iid,
                 &ResolveResponse::Freetext { text: "yes".into() },
             )
+            .await
             .unwrap()
         );
-        let reconcilable = db.list_reconcilable_interrupts(s.session_id).unwrap();
+        let reconcilable = db.list_reconcilable_interrupts(s.session_id).await.unwrap();
         assert_eq!(reconcilable.len(), 1);
         assert_eq!(reconcilable[0].state, InterruptState::Executing);
 
-        assert!(db.mark_interrupt_interrupted(iid).unwrap());
-        let row = db.get_interrupt(iid).unwrap().unwrap();
+        assert!(db.mark_interrupt_interrupted(iid).await.unwrap());
+        let row = db.get_interrupt(iid).await.unwrap().unwrap();
         assert_eq!(row.state, InterruptState::Interrupted);
-        assert!(!db.complete_executing_interrupt(iid).unwrap());
+        assert!(!db.complete_executing_interrupt(iid).await.unwrap());
     }
 
     #[tokio::test]
@@ -1001,13 +1077,24 @@ mod tests {
         let s = db.create_session("p", "/x", "builder").await.unwrap();
         let iid = db
             .raise_interrupted_turn(s.session_id, "builder", "forced drain")
+            .await
             .unwrap();
 
-        assert_eq!(db.acknowledge_interrupted_turns(s.session_id).unwrap(), 1);
-        let row = db.get_interrupt(iid).unwrap().unwrap();
+        assert_eq!(
+            db.acknowledge_interrupted_turns(s.session_id)
+                .await
+                .unwrap(),
+            1
+        );
+        let row = db.get_interrupt(iid).await.unwrap().unwrap();
         assert_eq!(row.state, InterruptState::Resolved);
         assert!(row.resolved_at.is_some());
-        assert_eq!(db.acknowledge_interrupted_turns(s.session_id).unwrap(), 0);
+        assert_eq!(
+            db.acknowledge_interrupted_turns(s.session_id)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1016,11 +1103,14 @@ mod tests {
         let s = db.create_session("p", "/x", "builder").await.unwrap();
         let iid = db
             .raise_interrupt(s.session_id, "builder", "x", None)
+            .await
             .unwrap();
         db.resolve_interrupt(iid, &ResolveResponse::Freetext { text: "ok".into() })
+            .await
             .unwrap();
         assert!(
             db.resolve_interrupt(iid, &ResolveResponse::Freetext { text: "ok".into() },)
+                .await
                 .is_err()
         );
     }

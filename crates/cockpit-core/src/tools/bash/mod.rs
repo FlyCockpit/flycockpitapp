@@ -456,7 +456,8 @@ async fn call_bash_inner(
             &profile_introspector,
         ),
         ctx,
-    );
+    )
+    .await;
     let resource_plan = build_resource_plan(
         declared_resources,
         &extended_config.resource_scheduler,
@@ -1347,7 +1348,7 @@ async fn sandbox_availability_for_bash(
         .clone()
 }
 
-fn command_resource_plan_with_user_grants(
+async fn command_resource_plan_with_user_grants(
     mut plan: crate::tools::command_resource_profiles::CommandResourcePlan,
     ctx: &ToolCtx,
 ) -> crate::tools::command_resource_profiles::CommandResourcePlan {
@@ -1358,6 +1359,7 @@ fn command_resource_plan_with_user_grants(
         approver
             .store()
             .effective_path_grants()
+            .await
             .into_iter()
             .map(|grant| crate::tools::shell_sandbox::ExtraSandboxPath {
                 kind: "user_grant".to_string(),
@@ -1387,7 +1389,8 @@ async fn command_escalation_preauthorized(
     }
     let mut narrowest = crate::approval::store::Scope::Global;
     for info in simple {
-        let scope = crate::approval::command_grant_scope_allowed_by_policy(approver.store(), info)?;
+        let scope =
+            crate::approval::command_grant_scope_allowed_by_policy(approver.store(), info).await?;
         if scope.rank() < narrowest.rank() {
             narrowest = scope;
         }

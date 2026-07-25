@@ -22,13 +22,16 @@ impl Approver {
         &self.store
     }
 
-    pub fn command_standing_reject_scope(&self, command: &str) -> Option<Scope> {
+    pub async fn command_standing_reject_scope(&self, command: &str) -> Option<Scope> {
         let classification = crate::approval::classify::classify(command);
-        classification
-            .simple_commands()
-            .iter()
-            .filter(|info| !info.wrapper)
-            .find_map(|info| self.store.command_reject_scope(&info.key))
+        for info in classification.simple_commands() {
+            if !info.wrapper
+                && let Some(scope) = self.store.command_reject_scope(&info.key).await
+            {
+                return Some(scope);
+            }
+        }
+        None
     }
 
     pub async fn record_standing_reject_decision(&self, tool: &str, target: &str, scope: Scope) {
@@ -192,7 +195,7 @@ impl Approver {
     pub async fn approve_mcp_tool(&self, server: &str, tool: &str) -> Result<Decision> {
         let target = crate::approval::store::mcp_tool_key(server, tool);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
-        if let Some(scope) = self.store.mcp_tool_reject_scope(server, tool) {
+        if let Some(scope) = self.store.mcp_tool_reject_scope(server, tool).await {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "mcp_tool",
@@ -204,7 +207,7 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if let Some(scope) = self.store.mcp_tool_grant_scope(server, tool) {
+        if let Some(scope) = self.store.mcp_tool_grant_scope(server, tool).await {
             let decision = Decision::Allow { scope };
             self.record_permission_decision(
                 "mcp_tool",
@@ -240,7 +243,7 @@ impl Approver {
             ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
             ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
             ApprovalChoice::Approve(scope) => {
-                if let Err(e) = self.store.record_mcp_tool(server, tool, scope) {
+                if let Err(e) = self.store.record_mcp_tool(server, tool, scope).await {
                     tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool grant failed; applying once");
                     Decision::Allow { scope: Scope::Once }
                 } else {
@@ -248,7 +251,7 @@ impl Approver {
                 }
             }
             ApprovalChoice::Reject(scope) => {
-                if let Err(e) = self.store.record_mcp_tool_reject(server, tool, scope) {
+                if let Err(e) = self.store.record_mcp_tool_reject(server, tool, scope).await {
                     tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool reject failed; denying once");
                 }
                 Decision::Deny

@@ -16,16 +16,12 @@ pub struct RemoteAuditRow {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_session_shared_with_collaborators(
+    pub async fn set_session_shared_with_collaborators(
         &self,
         session_id: Uuid,
         shared: bool,
     ) -> Result<()> {
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE sessions SET shared_with_collaborators = ?1 WHERE session_id = ?2",
                 params![shared as i64, session_id.to_string()],
@@ -33,9 +29,10 @@ impl Db {
             .context("setting session collaborator sharing")?;
             Ok(())
         })
+        .await
     }
 
-    pub fn insert_remote_audit(
+    pub async fn insert_remote_audit(
         &self,
         principal: &str,
         request_kind: &str,
@@ -43,13 +40,10 @@ impl Db {
         verdict: &str,
     ) -> Result<()> {
         self.insert_remote_audit_with_path(principal, request_kind, session_id, verdict, None)
+            .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn insert_remote_audit_with_path(
+    pub async fn insert_remote_audit_with_path(
         &self,
         principal: &str,
         request_kind: &str,
@@ -62,7 +56,7 @@ impl Db {
         let request_kind = request_kind.to_owned();
         let verdict = verdict.to_owned();
         let path = path.map(str::to_owned);
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO remote_principal_audit
                    (ts_ms, principal, request_kind, session_id, verdict, path)
@@ -79,15 +73,12 @@ impl Db {
             .context("inserting remote principal audit row")?;
             Ok(())
         })
+        .await
     }
 
     #[allow(dead_code)]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_remote_audit(&self) -> Result<Vec<RemoteAuditRow>> {
-        self.read_blocking(|conn| {
+    pub async fn list_remote_audit(&self) -> Result<Vec<RemoteAuditRow>> {
+        self.read(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT audit_id, principal, request_kind, session_id, verdict, path
@@ -125,19 +116,16 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_remote_audit_after(
+    pub async fn list_remote_audit_after(
         &self,
         cursor_audit_id: i64,
         limit: usize,
     ) -> Result<Vec<RemoteAuditRow>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        self.read_blocking(|conn| {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT audit_id, principal, request_kind, session_id, verdict, path
@@ -177,15 +165,15 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 
     #[allow(dead_code)]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn session_shared_with_collaborators(&self, session_id: Uuid) -> Result<Option<bool>> {
-        self.read_blocking(|conn| {
+    pub async fn session_shared_with_collaborators(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<bool>> {
+        self.read(move |conn| {
             conn.query_row(
                 "SELECT shared_with_collaborators FROM sessions WHERE session_id = ?1",
                 [session_id.to_string()],
@@ -194,12 +182,56 @@ impl Db {
             .optional()
             .context("querying session shared flag")
         })
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::db::Db;
+
+    #[tokio::test]
+    async fn db_async_approval_principals_roundtrip_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/tmp/project", "Build")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.session_shared_with_collaborators(session.session_id)
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        db.set_session_shared_with_collaborators(session.session_id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.session_shared_with_collaborators(session.session_id)
+                .await
+                .unwrap(),
+            Some(true)
+        );
+
+        db.insert_remote_audit_with_path(
+            "flycockpit:user-1",
+            "approval_decision",
+            Some(session.session_id),
+            "denied",
+            Some("src/main.rs"),
+        )
+        .await
+        .unwrap();
+
+        let rows = db.list_remote_audit().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].principal, "flycockpit:user-1");
+        assert_eq!(rows[0].request_kind, "approval_decision");
+        assert_eq!(rows[0].session_id, Some(session.session_id));
+        assert_eq!(rows[0].verdict, "denied");
+        assert_eq!(rows[0].path.as_deref(), Some("src/main.rs"));
+    }
 
     #[tokio::test]
     async fn sharing_flag_and_remote_audit_round_trip() {
@@ -211,13 +243,16 @@ mod tests {
 
         assert_eq!(
             db.session_shared_with_collaborators(session.session_id)
+                .await
                 .unwrap(),
             Some(false)
         );
         db.set_session_shared_with_collaborators(session.session_id, true)
+            .await
             .unwrap();
         assert_eq!(
             db.session_shared_with_collaborators(session.session_id)
+                .await
                 .unwrap(),
             Some(true)
         );
@@ -228,8 +263,9 @@ mod tests {
             Some(session.session_id),
             "allowed",
         )
+        .await
         .unwrap();
-        let rows = db.list_remote_audit().unwrap();
+        let rows = db.list_remote_audit().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].audit_id > 0);
         assert_eq!(rows[0].principal, "flycockpit:user-1");
@@ -245,11 +281,15 @@ mod tests {
             "allowed",
             Some("src/main.rs"),
         )
+        .await
         .unwrap();
-        let rows = db.list_remote_audit().unwrap();
+        let rows = db.list_remote_audit().await.unwrap();
         assert!(rows[0].audit_id < rows[1].audit_id);
         assert_eq!(rows[1].path.as_deref(), Some("src/main.rs"));
-        let after_first = db.list_remote_audit_after(rows[0].audit_id, 10).unwrap();
+        let after_first = db
+            .list_remote_audit_after(rows[0].audit_id, 10)
+            .await
+            .unwrap();
         assert_eq!(after_first.len(), 1);
         assert_eq!(after_first[0].audit_id, rows[1].audit_id);
     }

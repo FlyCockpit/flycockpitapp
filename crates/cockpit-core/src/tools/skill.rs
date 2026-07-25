@@ -92,7 +92,8 @@ impl Tool for SkillTool {
             &ctx.env_overlay,
             store.as_ref(),
             Some(&ctx.session.db),
-        )?;
+        )
+        .await?;
         if let Some(cage) = &ctx.review_cage {
             cage.record_skill_view(name);
         }
@@ -104,7 +105,7 @@ impl Tool for SkillTool {
 /// tests can supply an explicit [`ExtendedConfig`] instead of depending
 /// on the host's layered config discovery.
 #[cfg(test)]
-fn load_skill_into_output(
+async fn load_skill_into_output(
     name: &str,
     cwd: &std::path::Path,
     extended: &ExtendedConfig,
@@ -131,10 +132,11 @@ fn load_skill_into_output(
         None,
         None,
     )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_skill_for_session(
+async fn load_skill_for_session(
     name: &str,
     path: Option<&str>,
     cwd: &std::path::Path,
@@ -174,7 +176,7 @@ fn load_skill_for_session(
         let body = crate::skills::load_support_file(skill, std::path::Path::new(path))
             .map_err(|e| invalid_input(format!("loading support file `{path}`: {e}")))?;
         let package_dir = rendered_package_root(skill, redact);
-        record_skill_view(db, skill, name);
+        record_skill_view(db, skill, name).await;
         return Ok(ToolOutput::text(format!(
             "Skill `{name}` support file `{path}` (package directory: {package_dir}):\n\n{body}{setup_note}"
         )));
@@ -182,7 +184,7 @@ fn load_skill_for_session(
 
     let body = crate::skills::load_body(skill)
         .map_err(|e| anyhow::anyhow!("loading skill `{name}`: {e}"))?;
-    record_skill_view(db, skill, name);
+    record_skill_view(db, skill, name).await;
     let package_dir = rendered_package_root(skill, redact);
     let rendered =
         crate::skills::render_body(&body, cwd, extended.skills.auto_bang_commands, redact);
@@ -221,10 +223,12 @@ fn model_invocable_available_list(skills: &[crate::skills::Skill]) -> String {
     }
 }
 
-fn record_skill_view(db: Option<&crate::db::Db>, skill: &crate::skills::Skill, name: &str) {
+async fn record_skill_view(db: Option<&crate::db::Db>, skill: &crate::skills::Skill, name: &str) {
     if let Some(db) = db
         && let Ok(seed) = crate::skills::manage::usage_seed_for_skill(skill)
-        && let Err(error) = db.record_skill_use(seed, true, chrono::Utc::now().timestamp())
+        && let Err(error) = db
+            .record_skill_use(seed, true, chrono::Utc::now().timestamp())
+            .await
     {
         tracing::warn!(error = %error, skill = %name, "recording skill use failed");
     }
@@ -288,8 +292,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn usage_ledger_counts_uses() {
+    #[tokio::test]
+    async fn usage_ledger_counts_uses() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         std::fs::create_dir_all(&scan).unwrap();
@@ -319,6 +323,7 @@ mod tests {
             None,
             Some(&db),
         )
+        .await
         .unwrap();
         load_skill_for_session(
             "ledger",
@@ -331,6 +336,7 @@ mod tests {
             None,
             Some(&db),
         )
+        .await
         .unwrap();
         load_skill_for_session(
             "ledger",
@@ -343,17 +349,18 @@ mod tests {
             None,
             Some(&db),
         )
+        .await
         .unwrap();
 
-        let row = db.get_skill_usage("ledger").unwrap().unwrap();
+        let row = db.get_skill_usage("ledger").await.unwrap().unwrap();
         assert_eq!(row.use_count, 3);
         assert_eq!(row.view_count, 3);
         assert!(row.last_used_at.is_some());
         assert!(row.last_viewed_at.is_some());
     }
 
-    #[test]
-    fn loads_skill_body_by_name() {
+    #[tokio::test]
+    async fn loads_skill_body_by_name() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         std::fs::create_dir_all(&scan).unwrap();
@@ -369,13 +376,14 @@ mod tests {
             &cfg_for(&scan, false),
             &no_redact(tmp.path()),
         )
+        .await
         .unwrap();
         assert!(out.content.contains("Skill `deploy`"));
         assert!(out.content.contains("Run the deploy checklist."));
     }
 
-    #[test]
-    fn skill_body_output_includes_package_directory() {
+    #[tokio::test]
+    async fn skill_body_output_includes_package_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         std::fs::create_dir_all(&scan).unwrap();
@@ -393,6 +401,7 @@ mod tests {
             &cfg_for(&scan, false),
             &no_redact(tmp.path()),
         )
+        .await
         .unwrap();
 
         assert!(out.content.starts_with(&format!(
@@ -402,8 +411,8 @@ mod tests {
         assert!(out.content.contains("Run the deploy checklist."));
     }
 
-    #[test]
-    fn skill_support_file_output_includes_package_directory() {
+    #[tokio::test]
+    async fn skill_support_file_output_includes_package_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         std::fs::create_dir_all(&scan).unwrap();
@@ -429,6 +438,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         assert!(out.content.starts_with(&format!(
@@ -438,8 +448,8 @@ mod tests {
         assert!(out.content.contains("Support details."));
     }
 
-    #[test]
-    fn skill_output_package_directory_is_redacted() {
+    #[tokio::test]
+    async fn skill_output_package_directory_is_redacted() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         std::fs::create_dir_all(&scan).unwrap();
@@ -458,8 +468,9 @@ mod tests {
         };
         let redact = crate::redact::RedactionTable::build(&redaction_cfg, tmp.path()).unwrap();
 
-        let out =
-            load_skill_into_output("deploy", tmp.path(), &cfg_for(&scan, false), &redact).unwrap();
+        let out = load_skill_into_output("deploy", tmp.path(), &cfg_for(&scan, false), &redact)
+            .await
+            .unwrap();
 
         assert!(!out.content.contains(&package_dir.display().to_string()));
         assert!(
@@ -468,8 +479,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unknown_skill_is_invocation_error() {
+    #[tokio::test]
+    async fn unknown_skill_is_invocation_error() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         std::fs::create_dir_all(&scan).unwrap();
@@ -479,6 +490,7 @@ mod tests {
             &cfg_for(&scan, false),
             &no_redact(tmp.path()),
         )
+        .await
         .unwrap_err();
         assert_eq!(
             crate::engine::tool::classify_failure(&err),
@@ -486,8 +498,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn user_only_skill_is_not_loadable_and_not_advertised() {
+    #[tokio::test]
+    async fn user_only_skill_is_not_loadable_and_not_advertised() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         std::fs::create_dir_all(&scan).unwrap();
@@ -510,6 +522,7 @@ mod tests {
             &cfg_for(&scan, false),
             &no_redact(tmp.path()),
         )
+        .await
         .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("user-invocable only"), "got {text}");
@@ -522,14 +535,15 @@ mod tests {
             &cfg_for(&scan, false),
             &no_redact(tmp.path()),
         )
+        .await
         .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("available: visible"), "got {text}");
         assert!(!text.contains("manual"), "got {text}");
     }
 
-    #[test]
-    fn unknown_skill_available_list_is_capped() {
+    #[tokio::test]
+    async fn unknown_skill_available_list_is_capped() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         std::fs::create_dir_all(&scan).unwrap();
@@ -549,6 +563,7 @@ mod tests {
             &cfg_for(&scan, false),
             &no_redact(tmp.path()),
         )
+        .await
         .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("s00"), "got {text}");
@@ -557,8 +572,8 @@ mod tests {
         assert!(text.contains("… (5 more)"), "got {text}");
     }
 
-    #[test]
-    fn defensive_description_matches_the_injected_label() {
+    #[tokio::test]
+    async fn defensive_description_matches_the_injected_label() {
         let tool = SkillTool;
         let description = tool.defensive_description().unwrap();
         assert!(description.contains(crate::skills::MODEL_SKILL_CATALOG_LABEL));
@@ -568,8 +583,8 @@ mod tests {
         assert!(!parameters.contains("system prompt"));
     }
 
-    #[test]
-    fn codex_mode_injects_bang_command_verbatim() {
+    #[tokio::test]
+    async fn codex_mode_injects_bang_command_verbatim() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         std::fs::create_dir_all(&scan).unwrap();
@@ -585,6 +600,7 @@ mod tests {
             &cfg_for(&scan, false),
             &no_redact(tmp.path()),
         )
+        .await
         .unwrap();
         assert!(
             out.content.contains("!`echo SHOULD_NOT_RUN`"),
@@ -593,8 +609,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn claude_mode_runs_bang_command() {
+    #[tokio::test]
+    async fn claude_mode_runs_bang_command() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         std::fs::create_dir_all(&scan).unwrap();
@@ -610,6 +626,7 @@ mod tests {
             &cfg_for(&scan, true),
             &no_redact(tmp.path()),
         )
+        .await
         .unwrap();
         assert!(
             out.content.contains("current: RAN_OK"),
@@ -619,8 +636,8 @@ mod tests {
         assert!(!out.content.contains("!`echo"));
     }
 
-    #[test]
-    fn support_file_loads_through_skill_tool_path() {
+    #[tokio::test]
+    async fn support_file_loads_through_skill_tool_path() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         write_skill(
@@ -646,6 +663,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
         assert!(out.content.contains("Reference body"));
 
@@ -660,6 +678,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap_err();
         assert_eq!(
             crate::engine::tool::classify_failure(&err),
@@ -667,8 +686,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn skill_secret_env_uses_secret_ref_store() {
+    #[tokio::test]
+    async fn skill_secret_env_uses_secret_ref_store() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join("scan");
         write_skill(
@@ -695,6 +714,7 @@ mod tests {
             Some(&store),
             None,
         )
+        .await
         .unwrap();
         assert_eq!(
             overlay

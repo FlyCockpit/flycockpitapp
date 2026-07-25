@@ -1295,98 +1295,115 @@ impl App {
     }
 
     pub(super) fn handle_curator_command(&mut self, args: &str) {
-        let result = (|| -> anyhow::Result<String> {
-            let db = cockpit_db::Db::open_default()?;
-            let db_for_cron_refs = db.clone();
-            let cfg = self.config_snapshot.extended.skills.clone();
-            let curator =
-                cockpit_core::skills::curator::SkillCurator::new(db, self.launch.cwd.clone(), cfg);
-            let mut parts = args.split_whitespace();
-            match parts.next().unwrap_or("status") {
-                "status" => {
-                    let status = curator.status()?;
-                    Ok(format!(
-                        "/curator: {} skills, {} snapshots",
-                        status.skills.len(),
-                        status.snapshots.len()
-                    ))
-                }
-                "run" => {
-                    let mut options = cockpit_core::skills::curator::CuratorRunOptions::default();
-                    for part in parts {
-                        match part {
-                            "--dry-run" => options.dry_run = true,
-                            "--consolidate" => options.consolidate = true,
-                            other => anyhow::bail!("unknown curator run option `{other}`"),
+        let args = args.to_string();
+        let cfg = self.config_snapshot.extended.skills.clone();
+        let cwd = self.launch.cwd.clone();
+        self.async_actions.start(
+            AsyncActionKind::Internal("curator.command"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let db = cockpit_db::Db::open_default().map_err(|e| e.to_string())?;
+                let curator =
+                    cockpit_core::skills::curator::SkillCurator::new(db.clone(), cwd, cfg);
+                let message = async {
+                    let mut parts = args.split_whitespace();
+                    match parts.next().unwrap_or("status") {
+                        "status" => {
+                            let status = curator.status().await?;
+                            Ok(format!(
+                                "/curator: {} skills, {} snapshots",
+                                status.skills.len(),
+                                status.snapshots.len()
+                            ))
                         }
-                    }
-                    let jobs = db_for_cron_refs.blocking_for_sync_cli(|conn| {
-                        cockpit_db::scheduler::list_scheduled_jobs_conn(conn, None)
-                    })?;
-                    let cron_refs =
-                        cockpit_core::skills::curator::cron_referenced_skills_from_jobs(jobs)?;
-                    Ok(format!(
-                        "/curator: {}",
-                        curator.run_with_cron_refs(options, cron_refs)?.summary()
-                    ))
-                }
-                "pin" => {
-                    let name = parts.next().context("usage: /curator pin <name>")?;
-                    curator.pin(name, true)?;
-                    Ok(format!("/curator: pinned {name}"))
-                }
-                "unpin" => {
-                    let name = parts.next().context("usage: /curator unpin <name>")?;
-                    curator.pin(name, false)?;
-                    Ok(format!("/curator: unpinned {name}"))
-                }
-                "restore" => {
-                    let name = parts.next().context("usage: /curator restore <name>")?;
-                    curator.restore(name)?;
-                    Ok(format!("/curator: restored {name}"))
-                }
-                "rollback" => {
-                    let mut list = false;
-                    let mut id: Option<String> = None;
-                    while let Some(part) = parts.next() {
-                        match part {
-                            "--list" => list = true,
-                            "--id" => {
-                                id = Some(
-                                    parts
-                                        .next()
-                                        .context("usage: /curator rollback --id <id>")?
-                                        .to_string(),
-                                );
+                        "run" => {
+                            let mut options =
+                                cockpit_core::skills::curator::CuratorRunOptions::default();
+                            for part in parts {
+                                match part {
+                                    "--dry-run" => options.dry_run = true,
+                                    "--consolidate" => options.consolidate = true,
+                                    other => anyhow::bail!("unknown curator run option `{other}`"),
+                                }
                             }
-                            other => anyhow::bail!("unknown curator rollback option `{other}`"),
+                            let jobs = db
+                                .read(|conn| {
+                                    cockpit_db::scheduler::list_scheduled_jobs_conn(conn, None)
+                                })
+                                .await?;
+                            let cron_refs =
+                                cockpit_core::skills::curator::cron_referenced_skills_from_jobs(
+                                    jobs,
+                                )?;
+                            Ok(format!(
+                                "/curator: {}",
+                                curator
+                                    .run_with_cron_refs(options, cron_refs)
+                                    .await?
+                                    .summary()
+                            ))
                         }
+                        "pin" => {
+                            let name = parts.next().context("usage: /curator pin <name>")?;
+                            curator.pin(name, true).await?;
+                            Ok(format!("/curator: pinned {name}"))
+                        }
+                        "unpin" => {
+                            let name = parts.next().context("usage: /curator unpin <name>")?;
+                            curator.pin(name, false).await?;
+                            Ok(format!("/curator: unpinned {name}"))
+                        }
+                        "restore" => {
+                            let name = parts.next().context("usage: /curator restore <name>")?;
+                            curator.restore(name).await?;
+                            Ok(format!("/curator: restored {name}"))
+                        }
+                        "rollback" => {
+                            let mut list = false;
+                            let mut id: Option<String> = None;
+                            while let Some(part) = parts.next() {
+                                match part {
+                                    "--list" => list = true,
+                                    "--id" => {
+                                        id = Some(
+                                            parts
+                                                .next()
+                                                .context("usage: /curator rollback --id <id>")?
+                                                .to_string(),
+                                        );
+                                    }
+                                    other => {
+                                        anyhow::bail!("unknown curator rollback option `{other}`")
+                                    }
+                                }
+                            }
+                            if list {
+                                let lines = curator
+                                    .snapshots()
+                                    .await?
+                                    .into_iter()
+                                    .map(|s| format!("{} {}", s.id, s.reason))
+                                    .collect::<Vec<_>>();
+                                return Ok(if lines.is_empty() {
+                                    "/curator: no snapshots".to_string()
+                                } else {
+                                    format!("/curator snapshots:\n{}", lines.join("\n"))
+                                });
+                            }
+                            let restored = curator.rollback(id.as_deref()).await?;
+                            Ok(format!("/curator: rolled back to {}", restored.id))
+                        }
+                        _ => Ok(
+                            "/curator: usage status | run [--dry-run] [--consolidate] | pin <name> | unpin <name> | restore <name> | rollback [--list|--id <id>]"
+                                .to_string(),
+                        ),
                     }
-                    if list {
-                        let lines = curator
-                            .snapshots()?
-                            .into_iter()
-                            .map(|s| format!("{} {}", s.id, s.reason))
-                            .collect::<Vec<_>>();
-                        return Ok(if lines.is_empty() {
-                            "/curator: no snapshots".to_string()
-                        } else {
-                            format!("/curator snapshots:\n{}", lines.join("\n"))
-                        });
-                    }
-                    let restored = curator.rollback(id.as_deref())?;
-                    Ok(format!("/curator: rolled back to {}", restored.id))
                 }
-                _ => Ok(
-                    "/curator: usage status | run [--dry-run] [--consolidate] | pin <name> | unpin <name> | restore <name> | rollback [--list|--id <id>]"
-                        .to_string(),
-                ),
-            }
-        })();
-        match result {
-            Ok(message) => self.push_plain(message),
-            Err(error) => self.push_plain(format!("/curator: {error:#}")),
-        }
+                .await
+                .map_err(|e: anyhow::Error| e.to_string())?;
+                Ok(AsyncActionPayload::Text(message))
+            },
+        );
     }
 
     fn handle_goal_command(&mut self, args: &str) {

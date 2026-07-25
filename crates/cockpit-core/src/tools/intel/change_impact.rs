@@ -138,17 +138,17 @@ impl Tool for ChangeImpactTool {
             .ensure_fresh_scoped(freshen_options(ctx, freshen_scope))
             .await?;
         let freshen_report = freshen.report().clone();
-        let dep_edges = index.dep_edges()?;
+        let dep_edges = index.dep_edges().await?;
         // Build import adjacency maps once; each changed file only runs BFS over these maps.
         let (forward_deps, reverse_deps) = dependency_adjacencies(&dep_edges);
-        let centrality = index.centrality_scores()?;
+        let centrality = index.centrality_scores().await?;
         let changed_paths: HashSet<String> = changed.iter().map(|f| f.path.clone()).collect();
         let mut file_symbols: HashMap<String, Vec<SymbolRow>> = HashMap::new();
         for file in &changed {
             if matches!(file.status.as_str(), "D") || file.binary || file.conflicted {
                 continue;
             }
-            let (symbols, _imports, _lang) = index.outline_rows(&file.path)?;
+            let (symbols, _imports, _lang) = index.outline_rows(&file.path).await?;
             file_symbols.insert(file.path.clone(), symbols);
         }
 
@@ -170,14 +170,16 @@ impl Tool for ChangeImpactTool {
             let reverse = filtered_bfs(&reverse_deps, &file.path, depth, path_filter.as_deref());
             let forward = filtered_bfs(&forward_deps, &file.path, depth, path_filter.as_deref());
             let file_score = centrality.get(&file.path).copied().unwrap_or(0.0);
-            let callers = overlapping
-                .iter()
-                .map(|s| memoized_impact_callers(&index, &mut callers_cache, &s.path, s.line).len())
-                .sum::<usize>();
-            let calls = overlapping
-                .iter()
-                .map(|s| memoized_impact_calls(&index, &mut calls_cache, &s.name).len())
-                .sum::<usize>();
+            let mut callers = 0;
+            let mut calls = 0;
+            for s in &overlapping {
+                callers += memoized_impact_callers(&index, &mut callers_cache, &s.path, s.line)
+                    .await
+                    .len();
+                calls += memoized_impact_calls(&index, &mut calls_cache, &s.name)
+                    .await
+                    .len();
+            }
             let risk = risk_for_file(
                 file,
                 &overlapping,
@@ -232,8 +234,9 @@ impl Tool for ChangeImpactTool {
             for symbol in overlapping {
                 let sc = centrality.get(&symbol.path).copied().unwrap_or(0.0);
                 let sym_callers =
-                    memoized_impact_callers(&index, &mut callers_cache, &symbol.path, symbol.line);
-                let sym_calls = memoized_impact_calls(&index, &mut calls_cache, &symbol.name);
+                    memoized_impact_callers(&index, &mut callers_cache, &symbol.path, symbol.line)
+                        .await;
+                let sym_calls = memoized_impact_calls(&index, &mut calls_cache, &symbol.name).await;
                 let sym_risk = risk_for_symbol(
                     &symbol,
                     sc,
@@ -311,6 +314,7 @@ impl Tool for ChangeImpactTool {
         for (sym, _risk, _callers, _calls) in changed_symbols.iter().take(20) {
             for (caller_file, caller_line, caller_symbol) in
                 memoized_impact_callers(&index, &mut callers_cache, &sym.path, sym.line)
+                    .await
                     .into_iter()
                     .take(20)
             {
@@ -335,6 +339,7 @@ impl Tool for ChangeImpactTool {
             }
             for (callee, def_file, def_line) in
                 memoized_impact_calls(&index, &mut calls_cache, &sym.name)
+                    .await
                     .into_iter()
                     .take(20)
             {
@@ -419,7 +424,7 @@ fn filtered_bfs(
         .collect()
 }
 
-fn memoized_impact_callers(
+async fn memoized_impact_callers(
     index: &Index,
     cache: &mut HashMap<(String, i64), CallerRows>,
     path: &str,
@@ -429,12 +434,12 @@ fn memoized_impact_callers(
     if let Some(rows) = cache.get(&key) {
         return rows.clone();
     }
-    let rows = index.impact_callers(path, line).unwrap_or_default();
+    let rows = index.impact_callers(path, line).await.unwrap_or_default();
     cache.insert(key, rows.clone());
     rows
 }
 
-fn memoized_impact_calls(
+async fn memoized_impact_calls(
     index: &Index,
     cache: &mut HashMap<String, CallRows>,
     name: &str,
@@ -442,7 +447,7 @@ fn memoized_impact_calls(
     if let Some(rows) = cache.get(name) {
         return rows.clone();
     }
-    let rows = index.impact_calls(name).unwrap_or_default();
+    let rows = index.impact_calls(name).await.unwrap_or_default();
     cache.insert(name.to_string(), rows.clone());
     rows
 }

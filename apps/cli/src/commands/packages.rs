@@ -17,7 +17,7 @@ pub async fn run(cmd: PackagesCommand) -> Result<()> {
 
 async fn list() -> Result<()> {
     let db = Db::open_default()?;
-    let packages = db.list_packages()?;
+    let packages = db.list_packages().await?;
     if packages.is_empty() {
         println!(
             "No packages registered. Add one with `cockpit packages add` or `cockpit kcl import`."
@@ -58,10 +58,11 @@ async fn add(args: PackagesAddArgs) -> Result<()> {
             &url,
             args.branch.as_deref(),
             shallow,
-        )?;
+        )
+        .await?;
         println!("Registered `{}` (git) at {}", row.identifier, row.path);
     } else if let Some(path) = args.path {
-        let row = crate::packages::add_local(&db, &args.identifier, &path)?;
+        let row = crate::packages::add_local(&db, &args.identifier, &path).await?;
         println!("Registered `{}` (local) at {}", row.identifier, row.path);
     } else {
         bail!("`packages add` needs either `--git <url>` or `--path <dir>`");
@@ -82,9 +83,10 @@ async fn import(args: PackagesImportArgs) -> Result<()> {
     let db = Db::open_default()?;
     let single_package = package.is_some();
     let summary = if let Some(dir) = args.dir {
-        crate::packages::import_package_directory(&db, &cwd, &dir, args.path)?
+        crate::packages::import_package_directory(&db, &cwd, &dir, args.path).await?
     } else if let Some(package_dir) = package {
-        crate::packages::import_package(&db, &cwd, &package_dir, args.id.as_deref(), args.path)?
+        crate::packages::import_package(&db, &cwd, &package_dir, args.id.as_deref(), args.path)
+            .await?
     } else {
         unreachable!("checked above")
     };
@@ -105,7 +107,8 @@ async fn prune(args: PackagesPruneArgs) -> Result<()> {
             days: args.days,
             dry_run: args.dry_run,
         },
-    )?;
+    )
+    .await?;
     print_prune_summary(&report, args.dry_run);
     Ok(())
 }

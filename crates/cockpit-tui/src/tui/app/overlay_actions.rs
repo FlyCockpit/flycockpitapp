@@ -5,10 +5,27 @@ impl App {
     /// slash command and the Ctrl+N keyboard shortcut. The editor mirrors the
     /// composer's vim setting so vim users get vim editing in their scratchpad.
     pub(super) fn open_scratchpad_pane(&mut self) {
-        self.overlay = Overlay::Notes(crate::tui::notes_pane::NotesPane::open(
-            &self.launch.cwd,
-            self.composer.vim_enabled(),
-        ));
+        let pane =
+            crate::tui::notes_pane::NotesPane::open(&self.launch.cwd, self.composer.vim_enabled());
+        let action = pane.initial_load_action();
+        self.overlay = Overlay::Notes(pane);
+        if let Some(action) = action {
+            self.start_notes_db_action(action);
+        }
+    }
+
+    pub(super) fn start_notes_db_action(&mut self, action: crate::tui::notes_pane::NotesDbAction) {
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::Internal("notes.db"),
+            crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
+            async move {
+                action
+                    .run()
+                    .await
+                    .map(crate::tui::async_action::AsyncActionPayload::NotesDb)
+                    .map_err(|e| e.to_string())
+            },
+        );
     }
 
     /// The active TUI context the which-key overlay should describe

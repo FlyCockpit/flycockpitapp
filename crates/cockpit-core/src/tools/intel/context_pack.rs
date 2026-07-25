@@ -97,7 +97,7 @@ impl Tool for ContextPackTool {
             .ensure_fresh_scoped(freshen_options(ctx, freshen_scope.clone()))
             .await?;
         let freshen_report = freshen.report().clone();
-        let mut file_rows = index.context_file_rows()?;
+        let mut file_rows = index.context_file_rows().await?;
         if let Some(scope) = freshen_scope.as_deref() {
             file_rows.retain(|row| path_matches_filter(&row.path, scope));
         }
@@ -121,13 +121,13 @@ impl Tool for ContextPackTool {
             )));
         }
 
-        let centrality = index.centrality_scores()?;
+        let centrality = index.centrality_scores().await?;
         let files = context_file_meta(&file_rows, &fs_files, &centrality);
         let kind = match requested {
             ContextPackKind::Auto => match target {
                 None => ContextPackKind::Overview,
                 Some(t) if resolve_context_path(t, ctx, &files).is_some() => ContextPackKind::Path,
-                Some(t) if !index.symbol_find(t, false, None)?.is_empty() => {
+                Some(t) if !index.symbol_find(t, false, None).await?.is_empty() => {
                     ContextPackKind::Symbol
                 }
                 Some(_) => ContextPackKind::Query,
@@ -138,7 +138,7 @@ impl Tool for ContextPackTool {
         match kind {
             ContextPackKind::Auto => unreachable!("auto is resolved above"),
             ContextPackKind::Overview => {
-                let mut out = context_pack_overview(&index, &files, depth, limit)?;
+                let mut out = context_pack_overview(&index, &files, depth, limit).await?;
                 append_freshen_note(&mut out, &freshen_report);
                 Ok(out)
             }
@@ -151,7 +151,7 @@ impl Tool for ContextPackTool {
                         "path target `{target}` was not found; try `context_pack` without `target` or run `code` with kind `tree`"
                     )));
                 };
-                let mut out = context_pack_path(&index, &files, &rel, depth, limit)?;
+                let mut out = context_pack_path(&index, &files, &rel, depth, limit).await?;
                 append_freshen_note(&mut out, &freshen_report);
                 Ok(out)
             }
@@ -159,7 +159,7 @@ impl Tool for ContextPackTool {
                 let Some(target) = target else {
                     return Err(invalid_input("`target` is required for kind=symbol"));
                 };
-                let mut out = context_pack_symbol(&index, &files, target, depth, limit)?;
+                let mut out = context_pack_symbol(&index, &files, target, depth, limit).await?;
                 append_freshen_note(&mut out, &freshen_report);
                 Ok(out)
             }
@@ -297,7 +297,7 @@ fn resolve_context_path(target: &str, ctx: &ToolCtx, files: &[ContextFileMeta]) 
     None
 }
 
-fn context_pack_overview(
+async fn context_pack_overview(
     index: &Index,
     files: &[ContextFileMeta],
     depth: usize,
@@ -403,7 +403,7 @@ fn context_pack_overview(
     }
 
     writer.writeln("entry candidates:");
-    let entries = entry_candidates(index, limit)?;
+    let entries = entry_candidates(index, limit).await?;
     if entries.is_empty() {
         writer.writeln("  none detected");
     } else {
@@ -414,7 +414,7 @@ fn context_pack_overview(
         }
     }
 
-    let dep_edges = index.dep_edges()?;
+    let dep_edges = index.dep_edges().await?;
     let cycles = import_cycles(&dep_edges);
     writer.writeln(&format!("import cycles: {}", cycles.len()));
     for cycle in cycles.into_iter().take(limit.min(5)) {
@@ -432,7 +432,7 @@ fn context_pack_overview(
     ))
 }
 
-fn context_pack_path(
+async fn context_pack_path(
     index: &Index,
     files: &[ContextFileMeta],
     rel: &str,
@@ -444,8 +444,8 @@ fn context_pack_path(
             "context_pack: path\npath: {rel}\nnot indexed"
         )));
     };
-    let (symbols, imports, language) = index.outline_rows(rel)?;
-    let edges = index.dep_edges()?;
+    let (symbols, imports, language) = index.outline_rows(rel).await?;
+    let edges = index.dep_edges().await?;
     let reverse = reverse_deps(&edges, rel, depth, None);
     let forward = forward_deps(&edges, rel, depth, None);
     let unresolved: Vec<_> = edges
@@ -567,16 +567,16 @@ fn context_pack_path(
     ))
 }
 
-fn context_pack_symbol(
+async fn context_pack_symbol(
     index: &Index,
     files: &[ContextFileMeta],
     target: &str,
     _depth: usize,
     limit: usize,
 ) -> Result<ToolOutput> {
-    let mut hits = index.symbol_find(target, true, None)?;
+    let mut hits = index.symbol_find(target, true, None).await?;
     if hits.is_empty() {
-        hits = index.symbol_find(target, false, None)?;
+        hits = index.symbol_find(target, false, None).await?;
     }
     if hits.is_empty() {
         return Ok(ToolOutput::text(format!(
@@ -610,8 +610,11 @@ fn context_pack_symbol(
     writer.writeln("call context:");
     let mut any = false;
     for s in hits.iter().take(limit.min(5)) {
-        let callers = index.impact_callers(&s.path, s.line).unwrap_or_default();
-        let calls = index.impact_calls(&s.name).unwrap_or_default();
+        let callers = index
+            .impact_callers(&s.path, s.line)
+            .await
+            .unwrap_or_default();
+        let calls = index.impact_calls(&s.name).await.unwrap_or_default();
         if callers.is_empty() && calls.is_empty() {
             continue;
         }
@@ -680,7 +683,7 @@ async fn context_pack_query(
     writer.writeln("context_pack: query");
     writer.writeln(&format!("target: {target}"));
 
-    let mut symbol_hits = index.symbol_find(target, false, None)?;
+    let mut symbol_hits = index.symbol_find(target, false, None).await?;
     let centrality: HashMap<String, f64> = files
         .iter()
         .map(|f| (f.path.clone(), f.centrality))
@@ -699,7 +702,7 @@ async fn context_pack_query(
 
     writer.writeln("identifier hits:");
     let token_hits = if is_identifierish(target) {
-        index.word_hits(target, true)?
+        index.word_hits(target, true).await?
     } else {
         Vec::new()
     };
@@ -741,11 +744,11 @@ async fn context_pack_query(
     ))
 }
 
-fn entry_candidates(index: &Index, limit: usize) -> Result<Vec<SymbolRow>> {
+async fn entry_candidates(index: &Index, limit: usize) -> Result<Vec<SymbolRow>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for name in ["main", "run", "start", "init", "cli"] {
-        for sym in index.symbol_find(name, true, None)? {
+        for sym in index.symbol_find(name, true, None).await? {
             if seen.insert((sym.path.clone(), sym.line, sym.name.clone())) {
                 out.push(sym);
             }

@@ -406,11 +406,11 @@ impl Session {
     /// clears the baseline (NULL) so the feature stays inert for this
     /// session. Best-effort: a failure here must never break session
     /// startup.
-    pub fn snapshot_guidance_baseline(&self, cwd: &std::path::Path) {
+    pub async fn snapshot_guidance_baseline(&self, cwd: &std::path::Path) {
         let baseline = match crate::engine::builtin::load_agent_guidance(cwd) {
             Some((path, body)) => {
                 let hash = crate::engine::guidance_diff::hash_contents(&body);
-                if let Err(e) = self.db.put_guidance_contents(&hash, &body) {
+                if let Err(e) = self.db.put_guidance_contents(&hash, &body).await {
                     tracing::warn!(error = %e, "guidance baseline: storing contents failed");
                     return;
                 }
@@ -427,7 +427,11 @@ impl Session {
         }) {
             return;
         }
-        if let Err(e) = self.db.set_guidance_baseline(self.id, baseline.as_ref()) {
+        if let Err(e) = self
+            .db
+            .set_guidance_baseline(self.id, baseline.as_ref())
+            .await
+        {
             tracing::warn!(error = %e, "guidance baseline: setting baseline failed");
         }
     }
@@ -452,8 +456,8 @@ impl Session {
     /// content-addressed table and **advances the baseline** to the new
     /// `(path, hash)` so the same change is injected exactly once; the next
     /// request diffs from the just-injected version.
-    pub fn guidance_change_injection(&self, cwd: &std::path::Path) -> Option<String> {
-        let baseline = match self.db.guidance_baseline(self.id) {
+    pub async fn guidance_change_injection(&self, cwd: &std::path::Path) -> Option<String> {
+        let baseline = match self.db.guidance_baseline(self.id).await {
             Ok(Some(b)) => b,
             // No baseline stored → feature inert for this session.
             Ok(None) => return None,
@@ -481,13 +485,18 @@ impl Session {
 
         // A genuine in-place edit. Persist the new body (content-addressed,
         // idempotent) and build the injection from the prior stored body.
-        if let Err(e) = self.db.put_guidance_contents(&current_hash, &current_body) {
+        if let Err(e) = self
+            .db
+            .put_guidance_contents(&current_hash, &current_body)
+            .await
+        {
             tracing::warn!(error = %e, "guidance diff: storing new contents failed");
             return None;
         }
         let prior = self
             .db
             .guidance_contents(&baseline.hash)
+            .await
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "guidance diff: reading prior contents failed");
                 None
@@ -501,7 +510,11 @@ impl Session {
             path: current_path,
             hash: current_hash,
         };
-        if let Err(e) = self.db.set_guidance_baseline(self.id, Some(&advanced)) {
+        if let Err(e) = self
+            .db
+            .set_guidance_baseline(self.id, Some(&advanced))
+            .await
+        {
             tracing::warn!(error = %e, "guidance diff: advancing baseline failed");
             // Returning the message anyway would risk re-injecting the same
             // change next turn (baseline not advanced). Skip this injection

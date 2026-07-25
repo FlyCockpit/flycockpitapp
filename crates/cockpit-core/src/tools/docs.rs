@@ -104,7 +104,7 @@ impl Tool for ListPackagesTool {
     }
 
     async fn call(&self, _args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let packages = ctx.session.db.list_packages()?;
+        let packages = ctx.session.db.list_packages().await?;
         if packages.is_empty() {
             return Ok(ToolOutput::text(
                 "No packages registered. Use add-package to clone the dependency's source."
@@ -261,7 +261,7 @@ impl Tool for AddPackageTool {
         let identifier = packages::ecosystem_slug(eco, name);
 
         // Already registered under the ecosystem-prefixed identifier?
-        if let Some(existing) = ctx.session.db.package_by_identifier(&identifier)? {
+        if let Some(existing) = ctx.session.db.package_by_identifier(&identifier).await? {
             self.resolution
                 .record(&existing.identifier, std::path::Path::new(&existing.path));
             return Ok(ToolOutput::text(format!(
@@ -316,6 +316,7 @@ impl Tool for AddPackageTool {
         }
 
         let row = match packages::add_git(&ctx.session.db, &ctx.cwd, &identifier, &repo, None, true)
+            .await
         {
             Ok(row) => row,
             Err(e) => {
@@ -380,6 +381,7 @@ mod tests {
                 shallow: true,
                 prepare_scope: "global".into(),
             })
+            .await
             .unwrap();
         let resolution = DocsResolution::new();
         let tool = ListPackagesTool::new(resolution.clone(), "tokio".into());
@@ -444,6 +446,7 @@ mod tests {
                 shallow: true,
                 prepare_scope: "global".into(),
             })
+            .await
             .unwrap();
 
         let resolution = DocsResolution::new();

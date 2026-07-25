@@ -473,7 +473,7 @@ impl Driver {
                 // re-rooting; a future intentionally-steering skill opts out
                 // via `intentional_steer` and survives.
                 let outgoing = self.stack[0].agent.name.clone();
-                self.strip_abandoned_skill_pairs(&outgoing);
+                self.strip_abandoned_skill_pairs(&outgoing).await;
                 // Per-call tool-call ownership (`cross-agent-tool-call-
                 // annotation.md`): attribute every not-yet-attributed tool call
                 // now in the root history to the OUTGOING agent before re-

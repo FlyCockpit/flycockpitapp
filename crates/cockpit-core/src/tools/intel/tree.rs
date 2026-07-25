@@ -82,7 +82,8 @@ impl Tool for TreeTool {
 
         // Indexed files (with symbol counts) keyed by path.
         let indexed: HashMap<String, (String, i64, Option<i64>, i64)> = index
-            .tree_rows_scoped(filter.as_deref())?
+            .tree_rows_scoped(filter.as_deref())
+            .await?
             .into_iter()
             .map(|(p, lang, size, lines, syms)| (p, (lang, size, lines, syms)))
             .collect();

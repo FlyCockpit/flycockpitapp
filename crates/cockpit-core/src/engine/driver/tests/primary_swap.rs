@@ -301,7 +301,7 @@ async fn stale_tool_owner_ledgers_drop_calls_absent_from_root_history() {
         .tool_call_owner
         .insert("stale".to_string(), "Build".to_string());
 
-    driver.drop_stale_owner_ledgers();
+    driver.drop_stale_owner_ledgers().await;
 
     assert_eq!(
         driver.tool_call_owner.get("live").map(String::as_str),
@@ -338,7 +338,7 @@ async fn stale_skill_pairs_drop_when_call_and_result_leave_root_history() {
         intentional_steer: false,
     });
 
-    driver.drop_stale_owner_ledgers();
+    driver.drop_stale_owner_ledgers().await;
 
     assert_eq!(driver.skill_pairs.len(), 1);
     assert_eq!(driver.skill_pairs[0].call_id, "skill-live");
@@ -363,6 +363,7 @@ async fn persisted_skill_pair_strips_after_resume_swap() {
         .session
         .db
         .save_skill_pair(driver.session.id, "skillslash-resume", "Build", false)
+        .await
         .unwrap();
 
     driver.restore_skill_pairs_after_rehydrate("Build").await;
@@ -380,6 +381,7 @@ async fn persisted_skill_pair_strips_after_resume_swap() {
             .session
             .db
             .list_skill_pairs(driver.session.id)
+            .await
             .unwrap()
             .is_empty(),
         "stripped pair is removed from durable ledger"
@@ -420,6 +422,7 @@ async fn skill_pair_reconstructs_from_history_and_tool_log_when_db_empty() {
         .session
         .db
         .list_skill_pairs(driver.session.id)
+        .await
         .unwrap();
     assert_eq!(rows.len(), 1, "reconstructed row is persisted");
     assert_eq!(rows[0].owner, "Build");
@@ -477,7 +480,7 @@ async fn stale_owner_cleanup_bounds_repeated_removed_calls() {
         .tool_call_owner
         .insert("still-here".to_string(), "Build".to_string());
 
-    driver.drop_stale_owner_ledgers();
+    driver.drop_stale_owner_ledgers().await;
 
     assert_eq!(driver.tool_call_owner.len(), 1);
     assert!(driver.tool_call_owner.contains_key("still-here"));

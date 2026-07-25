@@ -386,6 +386,21 @@ impl App {
                 }
                 Err(e) => self.show_toast(format!("/resources: {e}"), ToastKind::Error),
             },
+            AsyncActionKind::Internal("notes.db") => {
+                if let Overlay::Notes(pane) = &mut self.overlay {
+                    let payload = match result.payload {
+                        Ok(AsyncActionPayload::NotesDb(result)) => Ok(result),
+                        Ok(_) => Err("notes db returned an unexpected response".to_string()),
+                        Err(e) => Err(e),
+                    };
+                    pane.apply_db_result(payload);
+                }
+            }
+            AsyncActionKind::Internal("curator.command") => match result.payload {
+                Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
+                Ok(_) => self.push_plain("/curator: unexpected async response".to_string()),
+                Err(e) => self.push_plain(format!("/curator: {e}")),
+            },
             AsyncActionKind::DaemonRpc("rename") => match result.payload {
                 Ok(AsyncActionPayload::Text(title)) => {
                     self.push_plain(format!("Renamed session to `{title}`"));

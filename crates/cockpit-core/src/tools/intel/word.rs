@@ -62,7 +62,7 @@ impl Tool for WordTool {
             .await?;
         let freshen_report = freshen.report().clone();
 
-        let grouped = index.word_hits(token, ci)?;
+        let grouped = index.word_hits(token, ci).await?;
         if grouped.is_empty() {
             return Ok(ToolOutput::text(format!(
                 "`{token}` not found in the index."

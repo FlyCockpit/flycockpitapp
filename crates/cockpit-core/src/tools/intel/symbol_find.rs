@@ -58,7 +58,7 @@ impl Tool for SymbolFindTool {
             .await?;
         let freshen_report = freshen.report().clone();
 
-        let mut hits = index.symbol_find(name, exact, kind)?;
+        let mut hits = index.symbol_find(name, exact, kind).await?;
         if hits.is_empty() {
             return Ok(ToolOutput::text(format!("No symbol matches `{name}`.")));
         }
@@ -68,7 +68,7 @@ impl Tool for SymbolFindTool {
         // SET of hits is unchanged — only order — so recall is identical to
         // the disabled path.
         if crate::config::extended::resolve_centrality_ranking(&ctx.cwd) {
-            let scores = index.centrality_scores()?;
+            let scores = index.centrality_scores().await?;
             rank_symbol_hits(&mut hits, &scores);
         }
         let mut writer = BudgetedWriter::new(STRUCT_TOKEN_CAP);

@@ -89,8 +89,84 @@ pub struct NotesPane {
 pub enum NotesOutcome {
     /// Stay open.
     Stay,
+    /// Run a notes DB action asynchronously, then apply the result to this pane.
+    Db(NotesDbAction),
     /// Close the dialog and return focus to the composer/transcript.
     Close,
+}
+
+pub struct NotesDbAction {
+    db: Db,
+    project_root: String,
+    kind: NotesDbActionKind,
+}
+
+enum NotesDbActionKind {
+    Load { keep: Option<Uuid> },
+    Save { id: Uuid, content: String },
+    Rename { id: Uuid, name: String },
+    Create { name: String },
+    Delete { id: Uuid },
+}
+
+#[derive(Debug, Clone)]
+pub struct NotesDbResult {
+    notes: Vec<ProjectNote>,
+    keep: Option<Uuid>,
+    enter_edit: bool,
+}
+
+impl NotesDbAction {
+    pub async fn run(self) -> anyhow::Result<NotesDbResult> {
+        let db = self.db;
+        let project_root = self.project_root;
+        match self.kind {
+            NotesDbActionKind::Load { keep } => {
+                let notes = db.list_project_notes(&project_root).await?;
+                Ok(NotesDbResult {
+                    notes,
+                    keep,
+                    enter_edit: false,
+                })
+            }
+            NotesDbActionKind::Save { id, content } => {
+                db.set_project_note_content(id, &content).await?;
+                let notes = db.list_project_notes(&project_root).await?;
+                Ok(NotesDbResult {
+                    notes,
+                    keep: Some(id),
+                    enter_edit: false,
+                })
+            }
+            NotesDbActionKind::Rename { id, name } => {
+                db.rename_project_note(id, &name).await?;
+                let notes = db.list_project_notes(&project_root).await?;
+                Ok(NotesDbResult {
+                    notes,
+                    keep: Some(id),
+                    enter_edit: false,
+                })
+            }
+            NotesDbActionKind::Create { name } => {
+                let note = db.create_project_note(&project_root, &name).await?;
+                let notes = db.list_project_notes(&project_root).await?;
+                Ok(NotesDbResult {
+                    notes,
+                    keep: Some(note.id),
+                    enter_edit: true,
+                })
+            }
+            NotesDbActionKind::Delete { id } => {
+                db.delete_project_note(id).await?;
+                let notes = db.list_project_notes(&project_root).await?;
+                Ok(NotesDbResult {
+                    notes,
+                    keep: None,
+                    enter_edit: false,
+                })
+            }
+        }
+    }
 }
 
 impl NotesPane {
@@ -141,24 +217,22 @@ impl NotesPane {
     }
 
     /// Open the dialog for `cwd`, resolving the project root (git/worktree
-    /// root, falling back to `cwd`) and loading that project's notes. A DB
-    /// failure is surfaced inline rather than refusing to open.
+    /// root, falling back to `cwd`). Loading happens through
+    /// [`Self::initial_load_action`] so the TUI does not block the async
+    /// runtime while opening the pane.
     pub fn open(cwd: &std::path::Path, vim_enabled: bool) -> Self {
         let project_root = cockpit_core::git::find_worktree_root(cwd)
             .unwrap_or_else(|| cwd.to_path_buf())
             .to_string_lossy()
             .into_owned();
-        let (db, notes, status) = match Db::open_default() {
-            Ok(db) => match db.list_project_notes(&project_root) {
-                Ok(notes) => (Some(db), notes, None),
-                Err(e) => (Some(db), Vec::new(), Some(format!("load failed: {e}"))),
-            },
-            Err(e) => (None, Vec::new(), Some(format!("db unavailable: {e}"))),
+        let (db, status) = match Db::open_default() {
+            Ok(db) => (Some(db), Some("loading notes".to_string())),
+            Err(e) => (None, Some(format!("db unavailable: {e}"))),
         };
         Self {
             project_root,
             db,
-            notes,
+            notes: Vec::new(),
             selected: 0,
             mode: Mode::Browsing,
             editor: Composer::new(vim_enabled),
@@ -172,21 +246,24 @@ impl NotesPane {
         }
     }
 
+    pub fn initial_load_action(&self) -> Option<NotesDbAction> {
+        Some(NotesDbAction {
+            db: self.db.clone()?,
+            project_root: self.project_root.clone(),
+            kind: NotesDbActionKind::Load { keep: None },
+        })
+    }
+
     /// Currently-selected note, if any.
     fn current(&self) -> Option<&ProjectNote> {
         self.notes.get(self.selected)
     }
 
-    /// Reload notes from the DB after a mutation, keeping `id` selected when
-    /// it still exists (else clamping).
-    fn reload(&mut self, keep: Option<Uuid>) {
-        let Some(db) = self.db.clone() else {
-            return;
-        };
-        match db.list_project_notes(&self.project_root) {
-            Ok(notes) => {
-                self.notes = notes;
-                if let Some(id) = keep
+    pub fn apply_db_result(&mut self, result: Result<NotesDbResult, String>) {
+        match result {
+            Ok(result) => {
+                self.notes = result.notes;
+                if let Some(id) = result.keep
                     && let Some(idx) = self.notes.iter().position(|n| n.id == id)
                 {
                     self.selected = idx;
@@ -194,10 +271,22 @@ impl NotesPane {
                 if self.selected >= self.notes.len() {
                     self.selected = self.notes.len().saturating_sub(1);
                 }
+                self.mode = Mode::Browsing;
                 self.status = None;
+                if result.enter_edit {
+                    self.enter_edit();
+                }
             }
-            Err(e) => self.status = Some(format!("reload failed: {e}")),
+            Err(e) => self.status = Some(e),
         }
+    }
+
+    fn action(&self, kind: NotesDbActionKind) -> Option<NotesDbAction> {
+        Some(NotesDbAction {
+            db: self.db.clone()?,
+            project_root: self.project_root.clone(),
+            kind,
+        })
     }
 
     /// Begin editing the selected note: load its source into the reused
@@ -215,18 +304,20 @@ impl NotesPane {
 
     /// Persist the editor buffer back to the selected note and return to the
     /// rendered view.
-    fn leave_edit(&mut self) {
-        if let Some(note) = self.current()
-            && let Some(db) = self.db.clone()
-        {
+    fn leave_edit(&mut self) -> NotesOutcome {
+        if let Some(note) = self.current() {
             let id = note.id;
-            if let Err(e) = db.set_project_note_content(id, self.editor.text()) {
-                self.status = Some(format!("save failed: {e}"));
+            let content = self.editor.text().to_string();
+            self.mode = Mode::Browsing;
+            self.view_scroll = 0;
+            if let Some(action) = self.action(NotesDbActionKind::Save { id, content }) {
+                return NotesOutcome::Db(action);
             }
-            self.reload(Some(id));
+            self.status = Some("notes db unavailable".to_string());
         }
         self.mode = Mode::Browsing;
         self.view_scroll = 0;
+        NotesOutcome::Stay
     }
 
     /// Handle a key. Returns the outcome (stay / close).
@@ -333,29 +424,17 @@ impl NotesPane {
                     self.status = Some("name must not be empty".to_string());
                     return NotesOutcome::Stay;
                 }
-                let Some(db) = self.db.clone() else {
+                if self.db.is_none() {
                     self.status = Some("notes db unavailable".to_string());
                     self.mode = Mode::Browsing;
                     return NotesOutcome::Stay;
                 };
-                match for_note {
-                    // Rename an existing note.
-                    Some(id) => match db.rename_project_note(id, &name) {
-                        Ok(_) => {
-                            self.reload(Some(id));
-                            self.mode = Mode::Browsing;
-                        }
-                        Err(e) => self.status = Some(format!("rename failed: {e}")),
-                    },
-                    // Create a new note, then drop straight into editing it.
-                    None => match db.create_project_note(&self.project_root, &name) {
-                        Ok(note) => {
-                            let id = note.id;
-                            self.reload(Some(id));
-                            self.enter_edit();
-                        }
-                        Err(e) => self.status = Some(format!("create failed: {e}")),
-                    },
+                let kind = match for_note {
+                    Some(id) => NotesDbActionKind::Rename { id, name },
+                    None => NotesDbActionKind::Create { name },
+                };
+                if let Some(action) = self.action(kind) {
+                    return NotesOutcome::Db(action);
                 }
             }
             KeyCode::Backspace => {
@@ -372,14 +451,13 @@ impl NotesPane {
     fn handle_confirm_delete_key(&mut self, key: KeyEvent) -> NotesOutcome {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(note) = self.current()
-                    && let Some(db) = self.db.clone()
-                {
+                if let Some(note) = self.current() {
                     let id = note.id;
-                    if let Err(e) = db.delete_project_note(id) {
-                        self.status = Some(format!("delete failed: {e}"));
-                    }
-                    self.reload(None);
+                    self.mode = Mode::Browsing;
+                    if let Some(action) = self.action(NotesDbActionKind::Delete { id }) {
+                        return NotesOutcome::Db(action);
+                    };
+                    self.status = Some("notes db unavailable".to_string());
                 }
                 self.mode = Mode::Browsing;
             }
@@ -395,8 +473,7 @@ impl NotesPane {
         // first drops Insert→Normal, second Esc leaves — matching the
         // composer's "Esc goes to Normal" feel).
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('s')) {
-            self.leave_edit();
-            return NotesOutcome::Stay;
+            return self.leave_edit();
         }
         if matches!(key.code, KeyCode::Esc) {
             use crate::tui::composer::VimMode;
@@ -405,7 +482,7 @@ impl NotesPane {
                 self.editor.handle_vim_key(key);
             } else {
                 // Already in Normal (or vim off): leave edit mode, saving.
-                self.leave_edit();
+                return self.leave_edit();
             }
             return NotesOutcome::Stay;
         }
@@ -688,20 +765,47 @@ mod tests {
         }
     }
 
+    async fn apply_outcome(p: &mut NotesPane, outcome: NotesOutcome) {
+        if let NotesOutcome::Db(action) = outcome {
+            let result = action.run().await.map_err(|e| e.to_string());
+            p.apply_db_result(result);
+        }
+    }
+
+    async fn key(p: &mut NotesPane, code: KeyCode) -> NotesOutcome {
+        let outcome = p.handle_key(press(code));
+        apply_outcome(p, outcome).await;
+        NotesOutcome::Stay
+    }
+
+    async fn ctrl_key(p: &mut NotesPane, code: KeyCode) -> NotesOutcome {
+        let outcome = p.handle_key(ctrl(code));
+        apply_outcome(p, outcome).await;
+        NotesOutcome::Stay
+    }
+
+    async fn reload(p: &mut NotesPane, keep: Option<Uuid>) {
+        let action = p
+            .action(NotesDbActionKind::Load { keep })
+            .expect("test db exists");
+        let result = action.run().await.map_err(|e| e.to_string());
+        p.apply_db_result(result);
+    }
+
     /// The pane's DB handle (always `Some` in tests — built by `pane`).
     fn db(p: &NotesPane) -> &Db {
         p.db.as_ref().unwrap()
     }
 
-    #[test]
-    fn create_note_via_new_row_then_edits() {
+    #[tokio::test]
+    async fn create_note_via_new_row_then_edits() {
         let mut p = pane(false);
         // Empty state: only the `+ new note` row → it's at index 0.
         assert!(matches!(p.mode, Mode::Browsing));
-        p.handle_key(press(KeyCode::Enter)); // activate `+ new note`
+        key(&mut p, KeyCode::Enter).await; // activate `+ new note`
         assert!(matches!(p.mode, Mode::Naming { for_note: None, .. }));
         type_chars(&mut p, "ideas");
-        p.handle_key(press(KeyCode::Enter)); // confirm name
+        key(&mut p, KeyCode::Enter).await; // confirm name
         // Creating drops straight into editing the new note.
         assert!(matches!(p.mode, Mode::Editing));
         assert_eq!(p.notes.len(), 1);
@@ -718,32 +822,32 @@ mod tests {
         assert!(p.notes.is_empty());
     }
 
-    #[test]
-    fn view_edit_toggle_switches_pane_and_persists() {
+    #[tokio::test]
+    async fn view_edit_toggle_switches_pane_and_persists() {
         let mut p = pane(false);
-        let note = db(&p).create_project_note("/proj", "n").unwrap();
-        p.reload(Some(note.id));
+        let note = db(&p).create_project_note("/proj", "n").await.unwrap();
+        reload(&mut p, Some(note.id)).await;
         assert!(matches!(p.mode, Mode::Browsing), "viewing renders markdown");
         // Enter edit mode → raw editable text.
-        p.handle_key(press(KeyCode::Enter));
+        key(&mut p, KeyCode::Enter).await;
         assert!(matches!(p.mode, Mode::Editing));
         type_chars(&mut p, "# Title");
         assert_eq!(p.editor.text(), "# Title");
         // Leave edit mode (Ctrl+S) → re-render + persist.
-        p.handle_key(ctrl(KeyCode::Char('s')));
+        ctrl_key(&mut p, KeyCode::Char('s')).await;
         assert!(matches!(p.mode, Mode::Browsing), "back to rendered view");
         // Content persisted to the DB.
-        let reloaded = db(&p).list_project_notes("/proj").unwrap();
+        let reloaded = db(&p).list_project_notes("/proj").await.unwrap();
         assert_eq!(reloaded[0].content, "# Title");
     }
 
-    #[test]
-    fn rename_and_delete_flow() {
+    #[tokio::test]
+    async fn rename_and_delete_flow() {
         let mut p = pane(false);
-        let note = db(&p).create_project_note("/proj", "old").unwrap();
-        p.reload(Some(note.id));
+        let note = db(&p).create_project_note("/proj", "old").await.unwrap();
+        reload(&mut p, Some(note.id)).await;
         // Rename.
-        p.handle_key(press(KeyCode::Char('r')));
+        key(&mut p, KeyCode::Char('r')).await;
         assert!(matches!(
             p.mode,
             Mode::Naming {
@@ -756,23 +860,23 @@ mod tests {
             p.handle_key(press(KeyCode::Backspace));
         }
         type_chars(&mut p, "fresh");
-        p.handle_key(press(KeyCode::Enter));
+        key(&mut p, KeyCode::Enter).await;
         assert_eq!(p.notes[0].name, "fresh");
         // Delete (confirm).
-        p.handle_key(press(KeyCode::Char('d')));
+        key(&mut p, KeyCode::Char('d')).await;
         assert!(matches!(p.mode, Mode::ConfirmingDelete));
-        p.handle_key(press(KeyCode::Char('y')));
+        key(&mut p, KeyCode::Char('y')).await;
         assert!(p.notes.is_empty());
         assert!(matches!(p.mode, Mode::Browsing));
     }
 
-    #[test]
-    fn delete_cancelled_by_other_key() {
+    #[tokio::test]
+    async fn delete_cancelled_by_other_key() {
         let mut p = pane(false);
-        let note = db(&p).create_project_note("/proj", "keep").unwrap();
-        p.reload(Some(note.id));
-        p.handle_key(press(KeyCode::Char('d')));
-        p.handle_key(press(KeyCode::Char('n'))); // not 'y'
+        let note = db(&p).create_project_note("/proj", "keep").await.unwrap();
+        reload(&mut p, Some(note.id)).await;
+        key(&mut p, KeyCode::Char('d')).await;
+        key(&mut p, KeyCode::Char('n')).await; // not 'y'
         assert_eq!(p.notes.len(), 1, "cancelled delete keeps the note");
         assert!(matches!(p.mode, Mode::Browsing));
     }
@@ -790,19 +894,20 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn editor_reuses_composer_vim_engine() {
+    #[tokio::test]
+    async fn editor_reuses_composer_vim_engine() {
         // Wiring-level check: with vim enabled the editor starts in Normal,
         // `i` enters Insert (via the reused Composer::handle_vim_key), text is
         // inserted, and `dd` (Normal) deletes a line — proving the shared vim
         // machinery is driving the note editor, not a fork.
         let mut p = pane(true);
-        let note = db(&p).create_project_note("/proj", "v").unwrap();
+        let note = db(&p).create_project_note("/proj", "v").await.unwrap();
         db(&p)
             .set_project_note_content(note.id, "alpha\nbeta")
+            .await
             .unwrap();
-        p.reload(Some(note.id));
-        p.handle_key(press(KeyCode::Enter)); // edit
+        reload(&mut p, Some(note.id)).await;
+        key(&mut p, KeyCode::Enter).await; // edit
         assert!(matches!(p.mode, Mode::Editing));
         assert_eq!(
             p.editor.vim_mode(),
@@ -819,26 +924,26 @@ mod tests {
         type_chars(&mut p, "X");
         assert_eq!(p.editor.text(), "Xbeta");
         // Esc returns to Normal (first Esc), second Esc leaves edit + saves.
-        p.handle_key(press(KeyCode::Esc));
+        key(&mut p, KeyCode::Esc).await;
         assert_eq!(p.editor.vim_mode(), VimMode::Normal);
-        p.handle_key(press(KeyCode::Esc));
+        key(&mut p, KeyCode::Esc).await;
         assert!(matches!(p.mode, Mode::Browsing));
         assert_eq!(
-            db(&p).list_project_notes("/proj").unwrap()[0].content,
+            db(&p).list_project_notes("/proj").await.unwrap()[0].content,
             "Xbeta"
         );
     }
 
-    #[test]
-    fn plain_text_editing_when_vim_off() {
+    #[tokio::test]
+    async fn plain_text_editing_when_vim_off() {
         let mut p = pane(false);
-        let note = db(&p).create_project_note("/proj", "p").unwrap();
-        p.reload(Some(note.id));
-        p.handle_key(press(KeyCode::Enter));
+        let note = db(&p).create_project_note("/proj", "p").await.unwrap();
+        reload(&mut p, Some(note.id)).await;
+        key(&mut p, KeyCode::Enter).await;
         // 'i' is just a literal char when vim is off (no mode machinery).
         type_chars(&mut p, "ihello");
         assert_eq!(p.editor.text(), "ihello");
-        p.handle_key(press(KeyCode::Esc)); // vim off → leaves + saves
+        key(&mut p, KeyCode::Esc).await; // vim off → leaves + saves
         assert!(matches!(p.mode, Mode::Browsing));
     }
 
@@ -893,11 +998,11 @@ mod tests {
         assert_eq!(p.editor.text(), "a\nbc");
     }
 
-    #[test]
-    fn paste_in_browsing_is_noop() {
+    #[tokio::test]
+    async fn paste_in_browsing_is_noop() {
         let mut p = pane(false);
-        let note = db(&p).create_project_note("/proj", "n").unwrap();
-        p.reload(Some(note.id));
+        let note = db(&p).create_project_note("/proj", "n").await.unwrap();
+        reload(&mut p, Some(note.id)).await;
 
         p.paste("x");
 

@@ -1139,6 +1139,7 @@ async fn prepare_commits_nothing() {
             .session
             .db
             .take_seed_tools(driver.session.id)
+            .await
             .unwrap()
             .is_empty(),
         "prepare must not persist seed tools"
@@ -1294,11 +1295,13 @@ async fn apply_of_prepared_matches_synchronous_path() {
             .session
             .db
             .take_seed_tools(split_driver.session.id)
+            .await
             .unwrap(),
         sync_driver
             .session
             .db
             .take_seed_tools(sync_driver.session.id)
+            .await
             .unwrap()
     );
 }
@@ -1323,7 +1326,12 @@ async fn compact_end_to_end_unchanged() {
         "history_hash": test_json_hash(&serde_json::to_value(&driver.stack[0].history).unwrap()),
         "compact_ready": compact_ready_without_session_id(ready),
         "session_compacted_hash": test_json_hash(&compact_record_without_session_ids(&driver).await),
-        "seed_tools": driver.session.db.take_seed_tools(driver.session.id).unwrap(),
+        "seed_tools": driver
+            .session
+            .db
+            .take_seed_tools(driver.session.id)
+            .await
+            .unwrap(),
     });
     let expected_handoff = format!(
         "test compact brief\n\n---\n## State appendix (deterministic — runtime ledger)\n\n\n**Files read:**\n- `seed.txt`\n\n\n{}",
@@ -1432,6 +1440,7 @@ async fn apply_ordering_persists_then_runs_seeds_then_emits_ready() {
         .session
         .db
         .take_seed_tools(driver.session.id)
+        .await
         .unwrap();
     assert_eq!(persisted_seeds.len(), 1);
     let db_events = driver

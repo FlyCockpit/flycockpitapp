@@ -124,18 +124,20 @@ impl SkillCurator {
         }
     }
 
-    pub fn status(&self) -> Result<CuratorStatus> {
-        self.sync_discovered()?;
+    pub async fn status(&self) -> Result<CuratorStatus> {
+        self.sync_discovered().await?;
         Ok(CuratorStatus {
             skills: self
                 .db
-                .list_skill_usage()?
+                .list_skill_usage()
+                .await?
                 .into_iter()
                 .map(CuratorSkillStatus::from)
                 .collect(),
             snapshots: self
                 .db
-                .list_skill_curator_snapshots()?
+                .list_skill_curator_snapshots()
+                .await?
                 .into_iter()
                 .map(CuratorSnapshotStatus::from)
                 .collect(),
@@ -144,15 +146,15 @@ impl SkillCurator {
 
     pub async fn run(&self, options: CuratorRunOptions) -> Result<CuratorRunReport> {
         let cron_refs = cron_referenced_skills(&self.db).await?;
-        self.run_with_cron_refs(options, cron_refs)
+        self.run_with_cron_refs(options, cron_refs).await
     }
 
-    pub fn run_with_cron_refs(
+    pub async fn run_with_cron_refs(
         &self,
         options: CuratorRunOptions,
         cron_refs: HashSet<String>,
     ) -> Result<CuratorRunReport> {
-        self.sync_discovered()?;
+        self.sync_discovered().await?;
         let now = self.clock.now();
         let discovered = self.discovered_with_metadata()?;
         let mut report = CuratorRunReport {
@@ -170,7 +172,8 @@ impl SkillCurator {
         for discovered in discovered {
             let row = self
                 .db
-                .get_skill_usage(&discovered.name)?
+                .get_skill_usage(&discovered.name)
+                .await?
                 .context("discovered skill missing usage row")?;
             match transition_for(
                 &row,
@@ -197,14 +200,14 @@ impl SkillCurator {
         }
 
         if options.consolidate || self.config.consolidate {
-            report.consolidation = Some(consolidation_prompt(&self.db)?);
+            report.consolidation = Some(consolidation_prompt(&self.db).await?);
         }
 
         let will_mutate = !options.dry_run
             && (!changes.is_empty()
                 || report.consolidation.as_ref().is_some_and(|s| !s.is_empty()));
         if will_mutate {
-            report.snapshot_id = Some(self.snapshot("curator-run")?.id);
+            report.snapshot_id = Some(self.snapshot("curator-run").await?.id);
         }
 
         if !options.dry_run {
@@ -212,21 +215,25 @@ impl SkillCurator {
                 match state {
                     SkillUsageState::Active => {
                         self.db
-                            .set_skill_usage_state(&row.name, state, None, None, now)?;
+                            .set_skill_usage_state(&row.name, state, None, None, now)
+                            .await?;
                     }
                     SkillUsageState::Stale => {
                         self.db
-                            .set_skill_usage_state(&row.name, state, None, None, now)?;
+                            .set_skill_usage_state(&row.name, state, None, None, now)
+                            .await?;
                     }
                     SkillUsageState::Archived => {
                         let archive_path = self.archive_skill(&row, now)?;
-                        self.db.set_skill_usage_state(
-                            &row.name,
-                            state,
-                            Some(archive_path.display().to_string()),
-                            Some(now),
-                            now,
-                        )?;
+                        self.db
+                            .set_skill_usage_state(
+                                &row.name,
+                                state,
+                                Some(archive_path.display().to_string()),
+                                Some(now),
+                                now,
+                            )
+                            .await?;
                     }
                 }
             }
@@ -235,20 +242,22 @@ impl SkillCurator {
         Ok(report)
     }
 
-    pub fn pin(&self, name: &str, pinned: bool) -> Result<()> {
-        self.sync_discovered()?;
-        if self.db.get_skill_usage(name)?.is_none() {
+    pub async fn pin(&self, name: &str, pinned: bool) -> Result<()> {
+        self.sync_discovered().await?;
+        if self.db.get_skill_usage(name).await?.is_none() {
             bail!("unknown skill `{name}`");
         }
         self.db
             .set_skill_usage_pinned(name, pinned, self.clock.now())
+            .await
     }
 
-    pub fn restore(&self, name: &str) -> Result<()> {
-        self.snapshot("restore")?;
+    pub async fn restore(&self, name: &str) -> Result<()> {
+        self.snapshot("restore").await?;
         let row = self
             .db
-            .get_skill_usage(name)?
+            .get_skill_usage(name)
+            .await?
             .with_context(|| format!("unknown skill `{name}`"))?;
         let archive_path = row
             .archive_path
@@ -281,14 +290,15 @@ impl SkillCurator {
         })?;
         self.db
             .set_skill_usage_state(name, SkillUsageState::Active, None, None, self.clock.now())
+            .await
     }
 
-    pub fn snapshot(&self, reason: &str) -> Result<CuratorSnapshotStatus> {
+    pub async fn snapshot(&self, reason: &str) -> Result<CuratorSnapshotStatus> {
         let now = self.clock.now();
         let id = format!("{now}-{}", uuid::Uuid::new_v4());
         let dir = snapshot_root(&self.db, &self.cwd).join(&id);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let ledger = serde_json::to_vec_pretty(&self.db.list_skill_usage()?)?;
+        let ledger = serde_json::to_vec_pretty(&self.db.list_skill_usage().await?)?;
         std::fs::write(dir.join(SNAPSHOT_LEDGER_FILE), ledger)
             .with_context(|| format!("writing {}", dir.join(SNAPSHOT_LEDGER_FILE).display()))?;
         for root in super::resolve_scan_dirs(&self.cwd, &self.config) {
@@ -299,8 +309,9 @@ impl SkillCurator {
             copy_dir_recursive(&root, &dir.join(root_name))?;
         }
         self.db
-            .insert_skill_curator_snapshot(&id, &dir.display().to_string(), reason, now)?;
-        self.enforce_snapshot_retention()?;
+            .insert_skill_curator_snapshot(&id, &dir.display().to_string(), reason, now)
+            .await?;
+        self.enforce_snapshot_retention().await?;
         Ok(CuratorSnapshotStatus {
             id,
             path: dir.display().to_string(),
@@ -309,18 +320,19 @@ impl SkillCurator {
         })
     }
 
-    pub fn snapshots(&self) -> Result<Vec<CuratorSnapshotStatus>> {
+    pub async fn snapshots(&self) -> Result<Vec<CuratorSnapshotStatus>> {
         Ok(self
             .db
-            .list_skill_curator_snapshots()?
+            .list_skill_curator_snapshots()
+            .await?
             .into_iter()
             .map(CuratorSnapshotStatus::from)
             .collect())
     }
 
-    pub fn rollback(&self, id: Option<&str>) -> Result<CuratorSnapshotStatus> {
-        let before = self.snapshot("rollback-before")?;
-        let snapshots = self.db.list_skill_curator_snapshots()?;
+    pub async fn rollback(&self, id: Option<&str>) -> Result<CuratorSnapshotStatus> {
+        let before = self.snapshot("rollback-before").await?;
+        let snapshots = self.db.list_skill_curator_snapshots().await?;
         let target = match id {
             Some(id) => snapshots
                 .into_iter()
@@ -332,16 +344,16 @@ impl SkillCurator {
                 .context("no previous skill curator snapshot to roll back to")?,
         };
         restore_snapshot_to_roots(Path::new(&target.path), &self.cwd, &self.config)?;
-        if !restore_snapshot_ledger(&self.db, Path::new(&target.path))? {
-            self.sync_discovered()?;
+        if !restore_snapshot_ledger(&self.db, Path::new(&target.path)).await? {
+            self.sync_discovered().await?;
         }
         Ok(CuratorSnapshotStatus::from(target))
     }
 
-    fn sync_discovered(&self) -> Result<()> {
+    async fn sync_discovered(&self) -> Result<()> {
         let now = self.clock.now();
         for discovered in self.discovered_with_metadata()? {
-            self.db.ensure_skill_usage(discovered.seed, now)?;
+            self.db.ensure_skill_usage(discovered.seed, now).await?;
         }
         Ok(())
     }
@@ -383,8 +395,8 @@ impl SkillCurator {
         Ok(target)
     }
 
-    fn enforce_snapshot_retention(&self) -> Result<()> {
-        let snapshots = self.db.list_skill_curator_snapshots()?;
+    async fn enforce_snapshot_retention(&self) -> Result<()> {
+        let snapshots = self.db.list_skill_curator_snapshots().await?;
         if snapshots.len() <= SNAPSHOT_RETENTION {
             return Ok(());
         }
@@ -399,6 +411,7 @@ impl SkillCurator {
         }
         self.db
             .delete_skill_curator_snapshot_rows(stale.into_iter().map(|s| s.id).collect())
+            .await
     }
 }
 
@@ -495,9 +508,10 @@ fn collect_skill_references(value: &serde_json::Value, out: &mut HashSet<String>
     }
 }
 
-fn consolidation_prompt(db: &Db) -> Result<String> {
+async fn consolidation_prompt(db: &Db) -> Result<String> {
     let skills = db
-        .list_skill_usage()?
+        .list_skill_usage()
+        .await?
         .into_iter()
         .filter(|row| row.created_by == SkillCreatedBy::Background && !row.pinned)
         .map(|row| format!("- {} ({})", row.name, row.state.as_str()))
@@ -618,7 +632,7 @@ fn restore_snapshot_to_roots(snapshot: &Path, cwd: &Path, cfg: &SkillsConfig) ->
     Ok(())
 }
 
-fn restore_snapshot_ledger(db: &Db, snapshot: &Path) -> Result<bool> {
+async fn restore_snapshot_ledger(db: &Db, snapshot: &Path) -> Result<bool> {
     let ledger = snapshot.join(SNAPSHOT_LEDGER_FILE);
     if !ledger.is_file() {
         return Ok(false);
@@ -627,7 +641,7 @@ fn restore_snapshot_ledger(db: &Db, snapshot: &Path) -> Result<bool> {
         &std::fs::read(&ledger).with_context(|| format!("reading {}", ledger.display()))?,
     )
     .with_context(|| format!("parsing {}", ledger.display()))?;
-    db.restore_skill_usage_rows(rows)?;
+    db.restore_skill_usage_rows(rows).await?;
     Ok(true)
 }
 
@@ -777,8 +791,10 @@ mod tests {
         .unwrap();
         let clock = FixedClock::new(now);
         let c = curator(db.clone(), tmp.path(), cfg(&root), clock.clone());
-        c.status().unwrap();
-        db.set_skill_usage_pinned("pinned", true, now).unwrap();
+        c.status().await.unwrap();
+        db.set_skill_usage_pinned("pinned", true, now)
+            .await
+            .unwrap();
         let report = c
             .run(CuratorRunOptions {
                 dry_run: false,
@@ -798,15 +814,23 @@ mod tests {
             assert!(report.skipped.contains(&skipped.to_string()), "{report:?}");
         }
         assert_eq!(
-            db.get_skill_usage("fresh").unwrap().unwrap().state,
+            db.get_skill_usage("fresh").await.unwrap().unwrap().state,
             SkillUsageState::Active
         );
         assert_eq!(
-            db.get_skill_usage("old-stale").unwrap().unwrap().state,
+            db.get_skill_usage("old-stale")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             SkillUsageState::Stale
         );
         assert_eq!(
-            db.get_skill_usage("old-archive").unwrap().unwrap().state,
+            db.get_skill_usage("old-archive")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             SkillUsageState::Archived
         );
 
@@ -818,13 +842,18 @@ mod tests {
             created_at: now - STALE_AFTER_SECONDS - 1,
             pinned: false,
         };
-        db.record_skill_use(seed, true, now + 1).unwrap();
+        db.record_skill_use(seed, true, now + 1).await.unwrap();
         db.set_skill_usage_state("old-stale", SkillUsageState::Stale, None, None, now + 1)
+            .await
             .unwrap();
         let report = c.run(CuratorRunOptions::default()).await.unwrap();
         assert!(report.reactivated.contains(&"old-stale".to_string()));
         assert_eq!(
-            db.get_skill_usage("old-stale").unwrap().unwrap().state,
+            db.get_skill_usage("old-stale")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             SkillUsageState::Active
         );
     }
@@ -893,8 +922,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn curator_snapshot_rollback() {
+    #[tokio::test]
+    async fn curator_snapshot_rollback() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let now = 10_000_000;
@@ -902,8 +931,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let clock = FixedClock::new(now);
         let c = curator(db.clone(), tmp.path(), cfg(&root), clock.clone());
-        c.status().unwrap();
-        let snap = c.snapshot("manual").unwrap();
+        c.status().await.unwrap();
+        let snap = c.snapshot("manual").await.unwrap();
         std::fs::write(root.join("keep/SKILL.md"), "changed").unwrap();
         db.set_skill_usage_state(
             "keep",
@@ -912,20 +941,22 @@ mod tests {
             Some(now + 1),
             now + 1,
         )
+        .await
         .unwrap();
         clock.set(now + 1);
 
-        let restored = c.rollback(Some(&snap.id)).unwrap();
+        let restored = c.rollback(Some(&snap.id)).await.unwrap();
 
         assert_eq!(restored.id, snap.id);
         let body = std::fs::read_to_string(root.join("keep/SKILL.md")).unwrap();
         assert!(body.contains("description: test skill"));
         assert_eq!(
-            db.get_skill_usage("keep").unwrap().unwrap().state,
+            db.get_skill_usage("keep").await.unwrap().unwrap().state,
             SkillUsageState::Active
         );
         assert!(
             c.snapshots()
+                .await
                 .unwrap()
                 .iter()
                 .any(|s| s.reason == "rollback-before")

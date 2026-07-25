@@ -19,11 +19,7 @@ pub struct SkillPairRow {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn save_skill_pair(
+    pub async fn save_skill_pair(
         &self,
         session_id: Uuid,
         call_id: &str,
@@ -33,7 +29,7 @@ impl Db {
         let now = chrono::Utc::now().timestamp();
         let call_id = call_id.to_owned();
         let owner = owner.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO skill_pairs
                     (session_id, call_id, owner, intentional_steer, created_at, updated_at)
@@ -53,14 +49,11 @@ impl Db {
             .context("upserting skill_pair")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_skill_pairs(&self, session_id: Uuid) -> Result<Vec<SkillPairRow>> {
-        self.read_blocking(|conn| {
+    pub async fn list_skill_pairs(&self, session_id: Uuid) -> Result<Vec<SkillPairRow>> {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT call_id, owner, intentional_steer
@@ -84,13 +77,10 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn delete_skill_pairs<I, S>(&self, session_id: Uuid, call_ids: I) -> Result<usize>
+    pub async fn delete_skill_pairs<I, S>(&self, session_id: Uuid, call_ids: I) -> Result<usize>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -102,7 +92,7 @@ impl Db {
         if ids.is_empty() {
             return Ok(0);
         }
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin skill_pair delete")?;
@@ -120,6 +110,7 @@ impl Db {
             tx.commit().context("commit skill_pair delete")?;
             Ok(deleted)
         })
+        .await
     }
 }
 
@@ -132,12 +123,14 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").await.unwrap();
         db.save_skill_pair(s.session_id, "skillslash-1", "Build", false)
+            .await
             .unwrap();
         db.save_skill_pair(s.session_id, "skillslash-2", "Plan", true)
+            .await
             .unwrap();
 
         assert_eq!(
-            db.list_skill_pairs(s.session_id).unwrap(),
+            db.list_skill_pairs(s.session_id).await.unwrap(),
             vec![
                 SkillPairRow {
                     call_id: "skillslash-1".into(),
@@ -154,10 +147,11 @@ mod tests {
 
         assert_eq!(
             db.delete_skill_pairs(s.session_id, ["skillslash-1"])
+                .await
                 .unwrap(),
             1
         );
-        let remaining = db.list_skill_pairs(s.session_id).unwrap();
+        let remaining = db.list_skill_pairs(s.session_id).await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].call_id, "skillslash-2");
     }

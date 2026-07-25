@@ -747,6 +747,7 @@ async fn intel_walk_shared_walker_filters_consistent() {
     index.ensure_fresh().await.unwrap();
     let tree_paths = index
         .tree_rows()
+        .await
         .unwrap()
         .into_iter()
         .map(|(path, _, _, _, _)| path)
@@ -1466,7 +1467,7 @@ async fn search_ranking_is_noop_without_existing_index_scores() {
     assert_eq!(ranked.content, unranked.content);
     let index = crate::intel::Index::new(ctx.session.db.clone(), tmp.path().to_path_buf());
     assert!(
-        index.tree_rows().unwrap().is_empty(),
+        index.tree_rows().await.unwrap().is_empty(),
         "search ranking must not build the index just to rank results"
     );
 }

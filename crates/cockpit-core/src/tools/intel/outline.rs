@@ -61,7 +61,7 @@ impl Tool for OutlineTool {
             .await?;
         let freshen_report = freshen.report().clone();
 
-        let (symbols, imports, language) = index.outline_rows(&rel)?;
+        let (symbols, imports, language) = index.outline_rows(&rel).await?;
         let mut writer = BudgetedWriter::new(STRUCT_TOKEN_CAP);
 
         // Grammarless / not-indexed language → regex fallback (never errors).

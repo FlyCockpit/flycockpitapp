@@ -2597,61 +2597,63 @@ pub(super) async fn curator_request(
     } else {
         None
     };
-    let result = tokio::task::spawn_blocking(move || -> Result<proto::CuratorResult> {
-        crate::config::trust::with_workspace_trust_policy(trust_policy, || {
-            let curator =
-                crate::skills::curator::SkillCurator::new(db, project_root, extended.skills);
-            match action {
-                proto::CuratorAction::Status => Ok(proto::CuratorResult::Status {
-                    status: curator_status_to_proto(curator.status()?),
-                }),
-                proto::CuratorAction::Run {
-                    dry_run,
-                    consolidate,
-                } => Ok(proto::CuratorResult::Run {
-                    report: curator_run_report_to_proto(curator.run_with_cron_refs(
-                        crate::skills::curator::CuratorRunOptions {
-                            dry_run,
-                            consolidate,
-                        },
-                        run_cron_refs.context("scheduler skill references not loaded")?,
-                    )?),
-                }),
-                proto::CuratorAction::Pin { name } => {
-                    curator.pin(&name, true)?;
-                    Ok(proto::CuratorResult::Pinned { name, pinned: true })
-                }
-                proto::CuratorAction::Unpin { name } => {
-                    curator.pin(&name, false)?;
-                    Ok(proto::CuratorResult::Pinned {
-                        name,
-                        pinned: false,
+    let result = crate::config::trust::scope_workspace_trust_policy(trust_policy, async move {
+        let curator = crate::skills::curator::SkillCurator::new(db, project_root, extended.skills);
+        let result: Result<proto::CuratorResult> = match action {
+            proto::CuratorAction::Status => Ok(proto::CuratorResult::Status {
+                status: curator_status_to_proto(curator.status().await?),
+            }),
+            proto::CuratorAction::Run {
+                dry_run,
+                consolidate,
+            } => Ok(proto::CuratorResult::Run {
+                report: curator_run_report_to_proto(
+                    curator
+                        .run_with_cron_refs(
+                            crate::skills::curator::CuratorRunOptions {
+                                dry_run,
+                                consolidate,
+                            },
+                            run_cron_refs.context("scheduler skill references not loaded")?,
+                        )
+                        .await?,
+                ),
+            }),
+            proto::CuratorAction::Pin { name } => {
+                curator.pin(&name, true).await?;
+                Ok(proto::CuratorResult::Pinned { name, pinned: true })
+            }
+            proto::CuratorAction::Unpin { name } => {
+                curator.pin(&name, false).await?;
+                Ok(proto::CuratorResult::Pinned {
+                    name,
+                    pinned: false,
+                })
+            }
+            proto::CuratorAction::Restore { name } => {
+                curator.restore(&name).await?;
+                Ok(proto::CuratorResult::Restored { name })
+            }
+            proto::CuratorAction::Rollback { list, id } => {
+                if list {
+                    Ok(proto::CuratorResult::Snapshots {
+                        snapshots: curator
+                            .snapshots()
+                            .await?
+                            .into_iter()
+                            .map(curator_snapshot_to_proto)
+                            .collect(),
+                    })
+                } else {
+                    Ok(proto::CuratorResult::RolledBack {
+                        snapshot: curator_snapshot_to_proto(curator.rollback(id.as_deref()).await?),
                     })
                 }
-                proto::CuratorAction::Restore { name } => {
-                    curator.restore(&name)?;
-                    Ok(proto::CuratorResult::Restored { name })
-                }
-                proto::CuratorAction::Rollback { list, id } => {
-                    if list {
-                        Ok(proto::CuratorResult::Snapshots {
-                            snapshots: curator
-                                .snapshots()?
-                                .into_iter()
-                                .map(curator_snapshot_to_proto)
-                                .collect(),
-                        })
-                    } else {
-                        Ok(proto::CuratorResult::RolledBack {
-                            snapshot: curator_snapshot_to_proto(curator.rollback(id.as_deref())?),
-                        })
-                    }
-                }
             }
-        })
+        };
+        result
     })
     .await
-    .map_err(internal)?
     .map_err(|error| ErrorPayload {
         code: ErrorCode::BadRequest,
         message: error.to_string(),

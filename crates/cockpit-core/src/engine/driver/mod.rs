@@ -4411,7 +4411,7 @@ impl Driver {
     /// Pruned/elided tool results keep their assistant `ToolCall` structure, so
     /// ownership survives ordinary result-body elision but disappears after a
     /// compact/history rebuild removes the call entirely.
-    fn drop_stale_owner_ledgers(&mut self) {
+    async fn drop_stale_owner_ledgers(&mut self) {
         if self.tool_call_owner.is_empty() && self.skill_pairs.is_empty() {
             return;
         }
@@ -4451,7 +4451,8 @@ impl Driver {
             }
             keep
         });
-        self.delete_persisted_skill_pairs(stale_skill_pair_ids.iter());
+        self.delete_persisted_skill_pairs(stale_skill_pair_ids.iter())
+            .await;
     }
 
     /// Switch the active `llm_mode` live (`/llm-mode`). Rebuilds the
@@ -4967,7 +4968,7 @@ impl Driver {
                 let after = shrunk.len();
                 self.stack.last_mut().expect("stack never empty").history = shrunk;
                 if self.stack.len() == 1 {
-                    self.drop_stale_owner_ledgers();
+                    self.drop_stale_owner_ledgers().await;
                 }
                 tracing::info!(
                     before,

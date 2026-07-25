@@ -449,7 +449,7 @@ impl Driver {
         // write there to avoid clobbering the root ledger.
         if depth == 1 {
             self.persist_prune_ledger();
-            self.drop_stale_owner_ledgers();
+            self.drop_stale_owner_ledgers().await;
         }
 
         let _ = tx
@@ -1157,7 +1157,7 @@ impl Driver {
 
         // 5. Reset the foreground model context in place.
         self.stack.last_mut().expect("stack never empty").history = prepared.history.clone();
-        self.drop_stale_owner_ledgers();
+        self.drop_stale_owner_ledgers().await;
         #[cfg(test)]
         self.trace_compaction_apply("live_history_swapped");
 
@@ -1167,6 +1167,7 @@ impl Driver {
             .session
             .db
             .set_seed_tools(self.session.id, &prepared.seed_tools)
+            .await
         {
             tracing::warn!(error = %e, "compact: persisting seed tools failed");
         } else {

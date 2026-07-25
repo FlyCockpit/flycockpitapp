@@ -335,7 +335,7 @@ impl<'a> SkillMutationService<'a> {
         self
     }
 
-    pub fn apply(&self, args: &SkillManageArgs) -> Result<SkillMutationResult> {
+    pub async fn apply(&self, args: &SkillManageArgs) -> Result<SkillMutationResult> {
         if args.name != args.name.trim() || !managed_skill_name_valid(&args.name) {
             bail!("skill name must match ^[a-z0-9][a-z0-9._-]*$ and contain at most 64 characters");
         }
@@ -343,12 +343,12 @@ impl<'a> SkillMutationService<'a> {
             SkillManageAction::Create => self.create(args),
             SkillManageAction::Patch => self.patch(args),
             SkillManageAction::Edit => self.edit(args),
-            SkillManageAction::Delete => self.delete(args),
+            SkillManageAction::Delete => self.delete(args).await,
             SkillManageAction::WriteFile => self.write_file(args),
             SkillManageAction::RemoveFile => self.remove_file(args),
         }?;
         if result.changed {
-            if let Err(error) = self.record_usage(args) {
+            if let Err(error) = self.record_usage(args).await {
                 tracing::warn!(
                     error = %error,
                     skill = %args.name,
@@ -446,14 +446,15 @@ impl<'a> SkillMutationService<'a> {
         Ok(changed(format!("Rewrote skill `{}`", args.name)))
     }
 
-    fn delete(&self, args: &SkillManageArgs) -> Result<SkillMutationResult> {
+    async fn delete(&self, args: &SkillManageArgs) -> Result<SkillMutationResult> {
         let target = self.resolve_target(&args.name)?;
         if target.pinned {
             bail!("pinned skill `{}` may not be deleted by tools", args.name);
         }
         if let Some(db) = self.db
             && db
-                .get_skill_usage(&args.name)?
+                .get_skill_usage(&args.name)
+                .await?
                 .is_some_and(|row| row.pinned)
         {
             bail!("pinned skill `{}` may not be deleted by tools", args.name);
@@ -663,7 +664,7 @@ impl<'a> SkillMutationService<'a> {
         atomic_write(&package.join(PROVENANCE_FILE), &bytes)
     }
 
-    fn record_usage(&self, args: &SkillManageArgs) -> Result<()> {
+    async fn record_usage(&self, args: &SkillManageArgs) -> Result<()> {
         let Some(db) = self.db else {
             return Ok(());
         };
@@ -675,13 +676,13 @@ impl<'a> SkillMutationService<'a> {
         let now = chrono::Utc::now().timestamp();
         match args.action {
             SkillManageAction::Create => {
-                db.ensure_skill_usage(seed, now)?;
+                db.ensure_skill_usage(seed, now).await?;
             }
             SkillManageAction::Patch
             | SkillManageAction::Edit
             | SkillManageAction::WriteFile
             | SkillManageAction::RemoveFile => {
-                db.record_skill_patch(seed, now)?;
+                db.record_skill_patch(seed, now).await?;
             }
             SkillManageAction::Delete => {}
         }
@@ -1062,26 +1063,26 @@ mod tests {
         root.join(name).join("SKILL.md")
     }
 
-    #[test]
-    fn consolidation_delete_guard() {
+    #[tokio::test]
+    async fn consolidation_delete_guard() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let cfg = config(&root);
         let svc = service(tmp.path(), &cfg);
-        svc.apply(&create_args("umbrella")).unwrap();
-        svc.apply(&create_args("specific")).unwrap();
+        svc.apply(&create_args("umbrella")).await.unwrap();
+        svc.apply(&create_args("specific")).await.unwrap();
 
         let mut bare = create_args("specific");
         bare.action = SkillManageAction::Delete;
         bare.description = None;
         bare.content = None;
-        let err = svc.apply(&bare).unwrap_err();
+        let err = svc.apply(&bare).await.unwrap_err();
         assert!(err.to_string().contains("absorbed_into"));
         assert!(root.join("specific/SKILL.md").is_file());
 
         let mut still_invalid = bare.clone();
         still_invalid.absorbed_into = Some("umbrella".to_string());
-        let err = svc.apply(&still_invalid).unwrap_err();
+        let err = svc.apply(&still_invalid).await.unwrap_err();
         assert!(err.to_string().contains("must reference absorbed skill"));
         assert!(root.join("specific/SKILL.md").is_file());
 
@@ -1092,25 +1093,25 @@ mod tests {
         forward.old_string = Some("Follow these steps.".to_string());
         forward.new_string =
             Some("Follow these steps.\nForward absorbed skill: specific.".to_string());
-        svc.apply(&forward).unwrap();
+        svc.apply(&forward).await.unwrap();
 
         let mut valid = bare;
         valid.absorbed_into = Some("umbrella".to_string());
-        let out = svc.apply(&valid).unwrap();
+        let out = svc.apply(&valid).await.unwrap();
         assert!(out.message.contains("consolidation into `umbrella`"));
         assert!(!root.join("specific").exists());
         assert!(root.join("umbrella/SKILL.md").is_file());
     }
 
-    #[test]
-    fn db_pinned_skill_delete_is_blocked() {
+    #[tokio::test]
+    async fn db_pinned_skill_delete_is_blocked() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let cfg = config(&root);
         let db = crate::db::Db::open_in_memory().unwrap();
         let svc = service(tmp.path(), &cfg).with_db(&db);
-        svc.apply(&create_args("umbrella")).unwrap();
-        svc.apply(&create_args("pinned-db")).unwrap();
+        svc.apply(&create_args("umbrella")).await.unwrap();
+        svc.apply(&create_args("pinned-db")).await.unwrap();
 
         let mut forward = create_args("umbrella");
         forward.action = SkillManageAction::Patch;
@@ -1119,27 +1120,29 @@ mod tests {
         forward.old_string = Some("Follow these steps.".to_string());
         forward.new_string =
             Some("Follow these steps.\nForward absorbed skill: pinned-db.".to_string());
-        svc.apply(&forward).unwrap();
-        db.set_skill_usage_pinned("pinned-db", true, 100).unwrap();
+        svc.apply(&forward).await.unwrap();
+        db.set_skill_usage_pinned("pinned-db", true, 100)
+            .await
+            .unwrap();
 
         let mut delete = create_args("pinned-db");
         delete.action = SkillManageAction::Delete;
         delete.description = None;
         delete.content = None;
         delete.absorbed_into = Some("umbrella".to_string());
-        let err = svc.apply(&delete).unwrap_err();
+        let err = svc.apply(&delete).await.unwrap_err();
         assert!(err.to_string().contains("pinned skill"));
         assert!(root.join("pinned-db/SKILL.md").is_file());
     }
 
-    #[test]
-    fn skill_manage_ops_roundtrip() {
+    #[tokio::test]
+    async fn skill_manage_ops_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let cfg = config(&root);
         let svc = service(tmp.path(), &cfg);
 
-        svc.apply(&create_args("roundtrip")).unwrap();
+        svc.apply(&create_args("roundtrip")).await.unwrap();
         assert!(manifest(&root, "roundtrip").is_file());
 
         let mut write = create_args("roundtrip");
@@ -1147,7 +1150,7 @@ mod tests {
         write.description = None;
         write.content = Some("support".to_string());
         write.path = Some("references/guide.md".to_string());
-        svc.apply(&write).unwrap();
+        svc.apply(&write).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("roundtrip/references/guide.md")).unwrap(),
             "support"
@@ -1159,7 +1162,7 @@ mod tests {
         patch.content = None;
         patch.old_string = Some("Follow these steps.".to_string());
         patch.new_string = Some("Follow the revised steps.".to_string());
-        svc.apply(&patch).unwrap();
+        svc.apply(&patch).await.unwrap();
 
         let mut edit = create_args("roundtrip");
         edit.action = SkillManageAction::Edit;
@@ -1168,7 +1171,7 @@ mod tests {
             "---\nname: roundtrip\ndescription: Rewritten workflow\n---\n\nEntirely new body.\n"
                 .to_string(),
         );
-        svc.apply(&edit).unwrap();
+        svc.apply(&edit).await.unwrap();
         assert!(
             std::fs::read_to_string(manifest(&root, "roundtrip"))
                 .unwrap()
@@ -1178,10 +1181,10 @@ mod tests {
         let mut remove = write.clone();
         remove.action = SkillManageAction::RemoveFile;
         remove.content = None;
-        svc.apply(&remove).unwrap();
+        svc.apply(&remove).await.unwrap();
         assert!(!root.join("roundtrip/references/guide.md").exists());
 
-        svc.apply(&create_args("roundtrip-umbrella")).unwrap();
+        svc.apply(&create_args("roundtrip-umbrella")).await.unwrap();
         let mut forward = create_args("roundtrip-umbrella");
         forward.action = SkillManageAction::Patch;
         forward.description = None;
@@ -1189,25 +1192,25 @@ mod tests {
         forward.old_string = Some("Follow these steps.".to_string());
         forward.new_string =
             Some("Follow these steps.\nForward absorbed skill: roundtrip.".to_string());
-        svc.apply(&forward).unwrap();
+        svc.apply(&forward).await.unwrap();
         let mut delete = create_args("roundtrip");
         delete.action = SkillManageAction::Delete;
         delete.description = None;
         delete.content = None;
         delete.absorbed_into = Some("roundtrip-umbrella".to_string());
-        svc.apply(&delete).unwrap();
+        svc.apply(&delete).await.unwrap();
         assert!(!root.join("roundtrip").exists());
     }
 
-    #[test]
-    fn patch_fuzzy_match() {
+    #[tokio::test]
+    async fn patch_fuzzy_match() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let cfg = config(&root);
         let svc = service(tmp.path(), &cfg);
         let mut create = create_args("fuzzy");
         create.content = Some("Steps:\n    - alpha\n    - beta\n".to_string());
-        svc.apply(&create).unwrap();
+        svc.apply(&create).await.unwrap();
 
         let mut patch = create_args("fuzzy");
         patch.action = SkillManageAction::Patch;
@@ -1215,7 +1218,7 @@ mod tests {
         patch.content = None;
         patch.old_string = Some("Steps:\n- alpha\n- beta".to_string());
         patch.new_string = Some("Steps:\n- alpha\n- gamma".to_string());
-        svc.apply(&patch).unwrap();
+        svc.apply(&patch).await.unwrap();
         assert!(
             std::fs::read_to_string(manifest(&root, "fuzzy"))
                 .unwrap()
@@ -1223,15 +1226,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn patch_replace_all_uses_non_overlapping_spans() {
+    #[tokio::test]
+    async fn patch_replace_all_uses_non_overlapping_spans() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let cfg = config(&root);
         let svc = service(tmp.path(), &cfg);
         let mut create = create_args("replace-all");
         create.content = Some("aaaa tail".to_string());
-        svc.apply(&create).unwrap();
+        svc.apply(&create).await.unwrap();
 
         let mut patch = create_args("replace-all");
         patch.action = SkillManageAction::Patch;
@@ -1240,19 +1243,19 @@ mod tests {
         patch.old_string = Some("aa".to_string());
         patch.new_string = Some(String::new());
         patch.replace_all = true;
-        svc.apply(&patch).unwrap();
+        svc.apply(&patch).await.unwrap();
         let raw = std::fs::read_to_string(manifest(&root, "replace-all")).unwrap();
         assert!(raw.contains("tail"));
         assert!(!raw.contains("aaaa"));
     }
 
-    #[test]
-    fn patch_no_match_hint() {
+    #[tokio::test]
+    async fn patch_no_match_hint() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let cfg = config(&root);
         let svc = service(tmp.path(), &cfg);
-        svc.apply(&create_args("hint")).unwrap();
+        svc.apply(&create_args("hint")).await.unwrap();
         let before = std::fs::read_to_string(manifest(&root, "hint")).unwrap();
         let mut patch = create_args("hint");
         patch.action = SkillManageAction::Patch;
@@ -1260,7 +1263,7 @@ mod tests {
         patch.content = None;
         patch.old_string = Some("not present".to_string());
         patch.new_string = Some("replacement".to_string());
-        let result = svc.apply(&patch).unwrap();
+        let result = svc.apply(&patch).await.unwrap();
         assert!(!result.changed);
         assert!(result.message.contains("preview"));
         assert!(result.message.contains("retry"));
@@ -1270,13 +1273,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn patch_preserves_frontmatter_or_refuses() {
+    #[tokio::test]
+    async fn patch_preserves_frontmatter_or_refuses() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let cfg = config(&root);
         let svc = service(tmp.path(), &cfg);
-        svc.apply(&create_args("guarded")).unwrap();
+        svc.apply(&create_args("guarded")).await.unwrap();
         let path = manifest(&root, "guarded");
         let before = std::fs::read_to_string(&path).unwrap();
         let mut patch = create_args("guarded");
@@ -1285,25 +1288,25 @@ mod tests {
         patch.content = None;
         patch.old_string = Some("name: guarded".to_string());
         patch.new_string = Some("name:".to_string());
-        let error = svc.apply(&patch).unwrap_err().to_string();
+        let error = svc.apply(&patch).await.unwrap_err().to_string();
         assert!(error.contains("original SKILL.md left intact"), "{error}");
         assert_eq!(std::fs::read_to_string(path).unwrap(), before);
     }
 
-    #[test]
-    fn skill_file_path_allowlist() {
+    #[tokio::test]
+    async fn skill_file_path_allowlist() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let cfg = config(&root);
         let svc = service(tmp.path(), &cfg);
-        svc.apply(&create_args("paths")).unwrap();
+        svc.apply(&create_args("paths")).await.unwrap();
         for invalid in ["notes/file.md", "references/../SKILL.md", "/tmp/file"] {
             let mut args = create_args("paths");
             args.action = SkillManageAction::WriteFile;
             args.description = None;
             args.content = Some("bad".to_string());
             args.path = Some(invalid.to_string());
-            assert!(svc.apply(&args).is_err(), "accepted {invalid}");
+            assert!(svc.apply(&args).await.is_err(), "accepted {invalid}");
         }
         assert!(!root.join("paths/notes/file.md").exists());
 
@@ -1319,7 +1322,7 @@ mod tests {
             through_parent_link.description = None;
             through_parent_link.content = Some("bad".to_string());
             through_parent_link.path = Some("references/escape.md".to_string());
-            assert!(svc.apply(&through_parent_link).is_err());
+            assert!(svc.apply(&through_parent_link).await.is_err());
             assert!(!outside.join("escape.md").exists());
 
             std::fs::remove_file(root.join("paths/references")).unwrap();
@@ -1328,13 +1331,13 @@ mod tests {
             std::fs::write(&outside_file, "safe").unwrap();
             symlink(&outside_file, root.join("paths/references/target.md")).unwrap();
             through_parent_link.path = Some("references/target.md".to_string());
-            assert!(svc.apply(&through_parent_link).is_err());
+            assert!(svc.apply(&through_parent_link).await.is_err());
             assert_eq!(std::fs::read_to_string(outside_file).unwrap(), "safe");
         }
     }
 
-    #[test]
-    fn skill_protection_rules() {
+    #[tokio::test]
+    async fn skill_protection_rules() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let external = tmp.path().join("external");
@@ -1343,7 +1346,7 @@ mod tests {
             .push(external.to_string_lossy().into_owned());
         let svc = service(tmp.path(), &cfg);
 
-        svc.apply(&create_args("pinned")).unwrap();
+        svc.apply(&create_args("pinned")).await.unwrap();
         let mut provenance = read_provenance(&root.join("pinned")).unwrap().unwrap();
         provenance.pinned = true;
         atomic_write(
@@ -1355,16 +1358,16 @@ mod tests {
         delete.action = SkillManageAction::Delete;
         delete.description = None;
         delete.content = None;
-        assert!(svc.apply(&delete).is_err());
+        assert!(svc.apply(&delete).await.is_err());
         let mut patch = delete.clone();
         patch.action = SkillManageAction::Patch;
         patch.old_string = Some("Follow these steps.".to_string());
         patch.new_string = Some("Still pinned but patchable.".to_string());
-        svc.apply(&patch).unwrap();
+        svc.apply(&patch).await.unwrap();
 
         let mut frontmatter_pinned = create_args("frontmatter-pinned");
         frontmatter_pinned.content = Some("Pinned body.".to_string());
-        svc.apply(&frontmatter_pinned).unwrap();
+        svc.apply(&frontmatter_pinned).await.unwrap();
         let pinned_path = manifest(&root, "frontmatter-pinned");
         let raw = std::fs::read_to_string(&pinned_path).unwrap().replacen(
             "description: \"Reusable workflow\"",
@@ -1379,12 +1382,12 @@ mod tests {
             "---\nname: frontmatter-pinned\ndescription: Still pinned\n---\n\nUpdated body.\n"
                 .to_string(),
         );
-        svc.apply(&strip_pin).unwrap();
+        svc.apply(&strip_pin).await.unwrap();
         let mut delete_stripped = create_args("frontmatter-pinned");
         delete_stripped.action = SkillManageAction::Delete;
         delete_stripped.description = None;
         delete_stripped.content = None;
-        assert!(svc.apply(&delete_stripped).is_err());
+        assert!(svc.apply(&delete_stripped).await.is_err());
 
         std::fs::write(
             root.join("frontmatter-pinned").join(PROVENANCE_FILE),
@@ -1395,7 +1398,7 @@ mod tests {
         let mut corrupt_patch = patch.clone();
         corrupt_patch.name = "frontmatter-pinned".to_string();
         corrupt_patch.old_string = Some("Updated body.".to_string());
-        assert!(svc.apply(&corrupt_patch).is_err());
+        assert!(svc.apply(&corrupt_patch).await.is_err());
         assert_eq!(
             std::fs::read_to_string(&pinned_path).unwrap(),
             before_corrupt
@@ -1410,11 +1413,11 @@ mod tests {
         let mut external_patch = patch.clone();
         external_patch.name = "shared".to_string();
         external_patch.old_string = Some("Read only.".to_string());
-        assert!(svc.apply(&external_patch).is_err());
+        assert!(svc.apply(&external_patch).await.is_err());
 
         let mut bundled = create_args("bundled");
         bundled.content = Some("Bundled body.".to_string());
-        svc.apply(&bundled).unwrap();
+        svc.apply(&bundled).await.unwrap();
         let path = manifest(&root, "bundled");
         let raw = std::fs::read_to_string(&path).unwrap().replacen(
             "description: \"Reusable workflow\"",
@@ -1424,11 +1427,11 @@ mod tests {
         atomic_write(&path, raw.as_bytes()).unwrap();
         let mut bundled_patch = patch;
         bundled_patch.name = "bundled".to_string();
-        assert!(svc.apply(&bundled_patch).is_err());
+        assert!(svc.apply(&bundled_patch).await.is_err());
     }
 
-    #[test]
-    fn skill_write_invalidates_cache() {
+    #[tokio::test]
+    async fn skill_write_invalidates_cache() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let cfg = config(&root);
@@ -1437,6 +1440,7 @@ mod tests {
         let before = super::super::catalog_generation();
         service(tmp.path(), &cfg)
             .apply(&create_args("generation"))
+            .await
             .unwrap();
         assert!(super::super::catalog_generation() > before);
         assert!(!super::super::catalog_cache_contains(tmp.path(), &cfg));
@@ -1448,13 +1452,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn skill_write_records_origin() {
+    #[tokio::test]
+    async fn skill_write_records_origin() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let cfg = config(&root);
         service(tmp.path(), &cfg)
             .apply(&create_args("foreground"))
+            .await
             .unwrap();
         let foreground = read_provenance(&root.join("foreground")).unwrap().unwrap();
         assert_eq!(foreground.created_origin, SkillWriteOrigin::Foreground);
@@ -1463,6 +1468,7 @@ mod tests {
         SkillMutationService::new(tmp.path(), &cfg)
             .with_origin(SkillWriteOrigin::BackgroundReview)
             .apply(&create_args("background"))
+            .await
             .unwrap();
         let background = read_provenance(&root.join("background")).unwrap().unwrap();
         assert_eq!(
@@ -1490,6 +1496,7 @@ mod tests {
         SkillMutationService::new(tmp.path(), &cfg)
             .with_origin(SkillWriteOrigin::BackgroundReview)
             .apply(&patch)
+            .await
             .unwrap();
         let preexisting = read_provenance(&preexisting).unwrap().unwrap();
         assert_eq!(preexisting.created_origin, SkillWriteOrigin::Foreground);

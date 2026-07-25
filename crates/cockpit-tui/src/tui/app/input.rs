@@ -552,6 +552,10 @@ impl App {
                     crate::tui::notes_pane::NotesOutcome::Stay => {
                         self.overlay = Overlay::Notes(pane);
                     }
+                    crate::tui::notes_pane::NotesOutcome::Db(action) => {
+                        self.overlay = Overlay::Notes(pane);
+                        self.start_notes_db_action(action);
+                    }
                 }
                 return false;
             }

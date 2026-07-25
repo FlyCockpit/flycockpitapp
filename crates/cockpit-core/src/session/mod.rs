@@ -1857,11 +1857,15 @@ mod tests {
     #[tokio::test]
     async fn snapshot_records_baseline_and_contents() {
         let (s, tmp, _path) = guidance_session("RULE A\nRULE B\n");
-        s.snapshot_guidance_baseline(tmp.path());
-        let baseline = s.db.guidance_baseline(s.id).unwrap().expect("baseline set");
+        s.snapshot_guidance_baseline(tmp.path()).await;
+        let baseline =
+            s.db.guidance_baseline(s.id)
+                .await
+                .unwrap()
+                .expect("baseline set");
         assert!(baseline.path.ends_with("AGENTS.md"));
         // The content-addressed table holds the exact body.
-        let stored = s.db.guidance_contents(&baseline.hash).unwrap();
+        let stored = s.db.guidance_contents(&baseline.hash).await.unwrap();
         assert_eq!(stored.as_deref(), Some("RULE A\nRULE B\n"));
         // Hash matches the pure hasher over the body.
         assert_eq!(
@@ -1878,11 +1882,15 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create_deferred(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
 
-        s.snapshot_guidance_baseline(tmp.path());
+        s.snapshot_guidance_baseline(tmp.path()).await;
         assert!(db.get_session(s.id).await.unwrap().is_none());
 
         s.persist_if_needed().unwrap();
-        let baseline = s.db.guidance_baseline(s.id).unwrap().expect("baseline set");
+        let baseline =
+            s.db.guidance_baseline(s.id)
+                .await
+                .unwrap()
+                .expect("baseline set");
         assert_eq!(baseline.path, path.display().to_string());
         assert_eq!(
             baseline.hash,
@@ -1898,17 +1906,18 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create_deferred(db, tmp.path().to_path_buf(), "Build").unwrap();
 
-        s.snapshot_guidance_baseline(tmp.path());
+        s.snapshot_guidance_baseline(tmp.path()).await;
         s.persist_if_needed().unwrap();
         std::fs::write(&path, "line one\nline TWO\nline three\n").unwrap();
 
         let msg = s
             .guidance_change_injection(tmp.path())
+            .await
             .expect("deferred baseline should inject after persist");
         assert!(msg.contains("changed since this conversation began"));
         assert!(msg.contains("line TWO"), "updated guidance missing: {msg}");
         assert!(
-            s.guidance_change_injection(tmp.path()).is_none(),
+            s.guidance_change_injection(tmp.path()).await.is_none(),
             "same change should be idempotent"
         );
     }
@@ -1916,16 +1925,26 @@ mod tests {
     #[tokio::test]
     async fn resumed_session_guidance_baseline_still_updates() {
         let (s, tmp, path) = guidance_session("v1\n");
-        s.snapshot_guidance_baseline(tmp.path());
+        s.snapshot_guidance_baseline(tmp.path()).await;
         let resumed = Session::resume(s.db.clone(), s.id)
             .unwrap()
             .expect("session should resume");
 
         std::fs::write(&path, "v2\n").unwrap();
-        resumed.snapshot_guidance_baseline(tmp.path());
-        assert!(resumed.guidance_change_injection(tmp.path()).is_none());
+        resumed.snapshot_guidance_baseline(tmp.path()).await;
+        assert!(
+            resumed
+                .guidance_change_injection(tmp.path())
+                .await
+                .is_none()
+        );
         std::fs::write(&path, "v3\n").unwrap();
-        assert!(resumed.guidance_change_injection(tmp.path()).is_some());
+        assert!(
+            resumed
+                .guidance_change_injection(tmp.path())
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -1933,19 +1952,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
-        s.snapshot_guidance_baseline(tmp.path());
-        assert_eq!(s.db.guidance_baseline(s.id).unwrap(), None);
+        s.snapshot_guidance_baseline(tmp.path()).await;
+        assert_eq!(s.db.guidance_baseline(s.id).await.unwrap(), None);
         // And no injection ever fires for such a session.
-        assert!(s.guidance_change_injection(tmp.path()).is_none());
+        assert!(s.guidance_change_injection(tmp.path()).await.is_none());
     }
 
     #[tokio::test]
     async fn in_place_edit_injects_unified_diff_then_is_idempotent() {
         let (s, tmp, path) =
             guidance_session("line one\nline two\nline three\nline four\nline five\n");
-        s.snapshot_guidance_baseline(tmp.path());
+        s.snapshot_guidance_baseline(tmp.path()).await;
         // No change yet → no injection.
-        assert!(s.guidance_change_injection(tmp.path()).is_none());
+        assert!(s.guidance_change_injection(tmp.path()).await.is_none());
 
         // Edit one line in place.
         std::fs::write(
@@ -1955,6 +1974,7 @@ mod tests {
         .unwrap();
         let msg = s
             .guidance_change_injection(tmp.path())
+            .await
             .expect("a change should inject");
         assert!(
             msg.contains("changed since this conversation began"),
@@ -1966,7 +1986,7 @@ mod tests {
         // Idempotent: the same content does not re-inject (baseline
         // advanced to the edited body).
         assert!(
-            s.guidance_change_injection(tmp.path()).is_none(),
+            s.guidance_change_injection(tmp.path()).await.is_none(),
             "the same change must not re-inject"
         );
 
@@ -1979,6 +1999,7 @@ mod tests {
         .unwrap();
         let msg2 = s
             .guidance_change_injection(tmp.path())
+            .await
             .expect("a further change should inject");
         assert!(msg2.contains("+ line FOUR"), "second diff: {msg2}");
         // It diffs from the previously-injected version, so the first edit
@@ -1989,11 +2010,12 @@ mod tests {
     #[tokio::test]
     async fn near_total_rewrite_injects_full_contents_not_a_diff() {
         let (s, tmp, path) = guidance_session("alpha\nbeta\ngamma\ndelta\nepsilon\n");
-        s.snapshot_guidance_baseline(tmp.path());
+        s.snapshot_guidance_baseline(tmp.path()).await;
         // Rewrite every line.
         std::fs::write(&path, "ALPHA\nBETA\nGAMMA\nDELTA\nEPSILON\n").unwrap();
         let msg = s
             .guidance_change_injection(tmp.path())
+            .await
             .expect("a change should inject");
         // Full-contents fallback: the new lines appear verbatim with no
         // `+ ` diff prefixes.
@@ -2011,25 +2033,25 @@ mod tests {
     #[tokio::test]
     async fn deleted_file_injects_nothing_and_does_not_error() {
         let (s, tmp, path) = guidance_session("RULES\n");
-        s.snapshot_guidance_baseline(tmp.path());
+        s.snapshot_guidance_baseline(tmp.path()).await;
         std::fs::remove_file(&path).unwrap();
         // Out of scope: deletion is not an in-place change. No injection,
         // no error, and the baseline is left intact.
-        assert!(s.guidance_change_injection(tmp.path()).is_none());
-        assert!(s.db.guidance_baseline(s.id).unwrap().is_some());
+        assert!(s.guidance_change_injection(tmp.path()).await.is_none());
+        assert!(s.db.guidance_baseline(s.id).await.unwrap().is_some());
     }
 
     #[tokio::test]
     async fn switched_file_injects_nothing() {
         // Start with AGENTS.md as the resolved file.
         let (s, tmp, agents) = guidance_session("AGENTS RULES\n");
-        s.snapshot_guidance_baseline(tmp.path());
+        s.snapshot_guidance_baseline(tmp.path()).await;
         // Delete AGENTS.md and add a project guidance — a *different* file now
         // wins. Out of scope: the baseline path no longer matches, so no
         // injection even though guidance content "changed".
         std::fs::remove_file(&agents).unwrap();
         std::fs::write(tmp.path().join("project guidance"), "CLAUDE RULES\n").unwrap();
-        assert!(s.guidance_change_injection(tmp.path()).is_none());
+        assert!(s.guidance_change_injection(tmp.path()).await.is_none());
     }
 
     #[tokio::test]
@@ -2038,13 +2060,13 @@ mod tests {
         // current file as the new baseline, so a post-snapshot edit diffs
         // from the latest body.
         let (s, tmp, path) = guidance_session("v1\n");
-        s.snapshot_guidance_baseline(tmp.path());
+        s.snapshot_guidance_baseline(tmp.path()).await;
         std::fs::write(&path, "v2\n").unwrap();
-        s.snapshot_guidance_baseline(tmp.path());
+        s.snapshot_guidance_baseline(tmp.path()).await;
         // Baseline is now v2 → editing to v2 again is a no-op.
-        assert!(s.guidance_change_injection(tmp.path()).is_none());
+        assert!(s.guidance_change_injection(tmp.path()).await.is_none());
         // Editing to v3 injects, diffed from v2.
         std::fs::write(&path, "v3\n").unwrap();
-        assert!(s.guidance_change_injection(tmp.path()).is_some());
+        assert!(s.guidance_change_injection(tmp.path()).await.is_some());
     }
 }

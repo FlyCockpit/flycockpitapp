@@ -75,7 +75,8 @@ impl Tool for SkillManageTool {
         let result = SkillMutationService::new(&ctx.cwd, &extended.skills)
             .with_origin(ctx.skill_write_origin)
             .with_db(&ctx.session.db)
-            .apply(&args)?;
+            .apply(&args)
+            .await?;
         Ok(ToolOutput::text(result.message))
     }
 }

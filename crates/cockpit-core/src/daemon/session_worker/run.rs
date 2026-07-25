@@ -467,7 +467,7 @@ pub(super) async fn run_worker(
     // checks it on every outbound request. Recomputed on each worker spawn
     // (fresh or resumed) because `builtin::build` re-composes the system
     // block from the current file each time.
-    session.snapshot_guidance_baseline(&project_root);
+    session.snapshot_guidance_baseline(&project_root).await;
 
     let (queue_update_tx, queue_update_rx) =
         watch::channel::<Vec<crate::engine::message::QueuedUserMessage>>(Vec::new());
@@ -917,7 +917,7 @@ pub(super) async fn run_worker(
     // double-seed. So skip seeds when rehydration produced a history; the
     // seed rows are taken (drained) regardless so they never re-fire on a
     // later resume (idempotent).
-    match session.db.take_seed_tools(session_id) {
+    match session.db.take_seed_tools(session_id).await {
         Ok(seeds)
             if !seeds.is_empty()
                 && rehydrated.is_none()

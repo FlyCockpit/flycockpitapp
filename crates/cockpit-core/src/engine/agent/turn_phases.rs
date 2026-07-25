@@ -693,7 +693,7 @@ pub(crate) async fn run_turn(
     // same. Gated to the session root: subagents inject their own current
     // guidance once when their first model turn starts. The baseline advances
     // on inject, so each distinct change is injected exactly once.
-    if is_root && let Some(message) = session.guidance_change_injection(&cwd) {
+    if is_root && let Some(message) = session.guidance_change_injection(&cwd).await {
         inject_live_project_guidance_change(history, &cwd, &config, redact.clone(), tx, &message)
             .await;
     }

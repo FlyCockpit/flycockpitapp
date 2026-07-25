@@ -1549,7 +1549,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         let tmp = TempDir::new().unwrap();
         let project_bundle = tmp.path().join(".cockpit/knowledge");
         write_bundle(&project_bundle);
-        let session = test_session(tmp.path());
+        let session = test_session(tmp.path()).await;
         let extended = ExtendedConfig {
             project_knowledge: true,
             ..Default::default()
@@ -1584,7 +1584,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         let _env = crate::test_env::lock_async().await;
         crate::config::trust::clear_runtime_policy_for_tests();
         let tmp = TempDir::new().unwrap();
-        let session = test_session(tmp.path());
+        let session = test_session(tmp.path()).await;
         let base = crate::engine::tool::ToolBox::new();
         assert!(
             !with_memory_search_if_attached(
@@ -1625,14 +1625,10 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
     async fn main_db_has_no_vectors() {
         let tmp = TempDir::new().unwrap();
         let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
-        db.read_blocking(|conn| {
+        db.read(|conn| {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE lower(name) LIKE '%vector%'
@@ -1648,6 +1644,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             assert!(err.to_string().contains("no such function"));
             Ok(())
         })
+        .await
         .unwrap();
     }
 
@@ -1655,12 +1652,11 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         results.iter().map(|r| r.concept_id.clone()).collect()
     }
 
-    #[allow(deprecated)]
-    fn test_session(root: &Path) -> Session {
+    async fn test_session(root: &Path) -> Session {
         let db = crate::db::Db::open(&root.join("cockpit.db")).unwrap();
         let project_root = root.to_str().unwrap().to_string();
         let row = db
-            .write_blocking(move |conn| {
+            .write(move |conn| {
                 let row = crate::db::Db::build_new_session_row_conn(
                     conn,
                     "project",
@@ -1669,6 +1665,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
                 )?;
                 crate::db::Db::insert_session_row_conn(conn, &row)
             })
+            .await
             .unwrap();
         Session::resume(db, row.session_id).unwrap().unwrap()
     }

@@ -34,12 +34,9 @@ impl Db {
     /// Every note for `project_root`, ordered by sidebar `position` (stable
     /// authoring order, independent of name/timestamps). Empty when the
     /// project has no notes yet.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_project_notes(&self, project_root: &str) -> Result<Vec<ProjectNote>> {
-        self.read_blocking(|conn| {
+    pub async fn list_project_notes(&self, project_root: &str) -> Result<Vec<ProjectNote>> {
+        let project_root = project_root.to_owned();
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, project_root, name, content
@@ -49,7 +46,7 @@ impl Db {
                 )
                 .context("preparing list_project_notes")?;
             let rows = stmt
-                .query_map([&project_root], |row| {
+                .query_map([project_root], |row| {
                     let id: String = row.get(0)?;
                     Ok((
                         id,
@@ -72,6 +69,7 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 
     /// Create a new note in `project_root` with `name` and empty content.
@@ -79,11 +77,7 @@ impl Db {
     /// A duplicate name is disambiguated by appending ` (2)`, ` (3)`, … so
     /// the create always succeeds with a unique, non-empty name. Returns the
     /// stored note (with its final, possibly-suffixed name).
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn create_project_note(&self, project_root: &str, name: &str) -> Result<ProjectNote> {
+    pub async fn create_project_note(&self, project_root: &str, name: &str) -> Result<ProjectNote> {
         let base = name.trim();
         if base.is_empty() {
             anyhow::bail!("note name must not be empty");
@@ -92,7 +86,7 @@ impl Db {
         let id = Uuid::new_v4();
         let project_root = project_root.to_owned();
         let name = base.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let unique = disambiguate_name(conn, &project_root, &name, None)?;
             // Append after any existing notes for stable sidebar order.
             let next_pos: i64 = conn
@@ -116,18 +110,15 @@ impl Db {
                 content: String::new(),
             })
         })
+        .await
     }
 
     /// Overwrite a note's markdown `content`. No-op (Ok) if the note id
     /// doesn't exist. Bumps `updated_at`.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_project_note_content(&self, id: Uuid, content: &str) -> Result<()> {
+    pub async fn set_project_note_content(&self, id: Uuid, content: &str) -> Result<()> {
         let now = Utc::now().timestamp();
         let content = content.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE project_notes SET content = ?1, updated_at = ?2 WHERE id = ?3",
                 params![content, now, id.to_string()],
@@ -135,6 +126,7 @@ impl Db {
             .context("updating project_note content")?;
             Ok(())
         })
+        .await
     }
 
     /// Rename a note. The new name is required non-empty (trimmed); a blank
@@ -142,18 +134,14 @@ impl Db {
     /// is disambiguated by suffixing (skipping the note being renamed).
     /// Returns the final, possibly-suffixed name. Errors if the note id
     /// doesn't exist.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn rename_project_note(&self, id: Uuid, name: &str) -> Result<String> {
+    pub async fn rename_project_note(&self, id: Uuid, name: &str) -> Result<String> {
         let base = name.trim();
         if base.is_empty() {
             anyhow::bail!("note name must not be empty");
         }
         let now = Utc::now().timestamp();
         let name = base.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let project_root: Option<String> = conn
                 .query_row(
                     "SELECT project_root FROM project_notes WHERE id = ?1",
@@ -172,19 +160,17 @@ impl Db {
             .context("renaming project_note")?;
             Ok(unique)
         })
+        .await
     }
 
     /// Delete a note by id. No-op (Ok) if it doesn't exist.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn delete_project_note(&self, id: Uuid) -> Result<()> {
-        self.write_blocking(move |conn| {
+    pub async fn delete_project_note(&self, id: Uuid) -> Result<()> {
+        self.write(move |conn| {
             conn.execute("DELETE FROM project_notes WHERE id = ?1", [id.to_string()])
                 .context("deleting project_note")?;
             Ok(())
         })
+        .await
     }
 }
 
@@ -230,13 +216,13 @@ mod tests {
     const ROOT: &str = "/home/u/proj";
     const OTHER: &str = "/home/u/other";
 
-    #[test]
-    fn create_list_round_trip() {
+    #[tokio::test]
+    async fn create_list_round_trip() {
         let db = Db::open_in_memory().unwrap();
-        assert!(db.list_project_notes(ROOT).unwrap().is_empty());
-        let a = db.create_project_note(ROOT, "ideas").unwrap();
-        let b = db.create_project_note(ROOT, "todo").unwrap();
-        let notes = db.list_project_notes(ROOT).unwrap();
+        assert!(db.list_project_notes(ROOT).await.unwrap().is_empty());
+        let a = db.create_project_note(ROOT, "ideas").await.unwrap();
+        let b = db.create_project_note(ROOT, "todo").await.unwrap();
+        let notes = db.list_project_notes(ROOT).await.unwrap();
         assert_eq!(notes.len(), 2);
         // Position order: creation order preserved.
         assert_eq!(notes[0].name, "ideas");
@@ -246,48 +232,49 @@ mod tests {
         assert_eq!(notes[0].content, "");
     }
 
-    #[test]
-    fn content_persists_and_updates() {
+    #[tokio::test]
+    async fn content_persists_and_updates() {
         let db = Db::open_in_memory().unwrap();
-        let n = db.create_project_note(ROOT, "scratch").unwrap();
+        let n = db.create_project_note(ROOT, "scratch").await.unwrap();
         db.set_project_note_content(n.id, "# Heading\n\nbody")
+            .await
             .unwrap();
-        let got = &db.list_project_notes(ROOT).unwrap()[0];
+        let got = &db.list_project_notes(ROOT).await.unwrap()[0];
         assert_eq!(got.content, "# Heading\n\nbody");
-        db.set_project_note_content(n.id, "replaced").unwrap();
-        let got = &db.list_project_notes(ROOT).unwrap()[0];
+        db.set_project_note_content(n.id, "replaced").await.unwrap();
+        let got = &db.list_project_notes(ROOT).await.unwrap()[0];
         assert_eq!(got.content, "replaced");
     }
 
-    #[test]
-    fn notes_are_scoped_by_project_root() {
+    #[tokio::test]
+    async fn notes_are_scoped_by_project_root() {
         let db = Db::open_in_memory().unwrap();
-        db.create_project_note(ROOT, "a").unwrap();
-        db.create_project_note(OTHER, "b").unwrap();
-        let here = db.list_project_notes(ROOT).unwrap();
-        let there = db.list_project_notes(OTHER).unwrap();
+        db.create_project_note(ROOT, "a").await.unwrap();
+        db.create_project_note(OTHER, "b").await.unwrap();
+        let here = db.list_project_notes(ROOT).await.unwrap();
+        let there = db.list_project_notes(OTHER).await.unwrap();
         assert_eq!(here.len(), 1);
         assert_eq!(there.len(), 1);
         assert_eq!(here[0].name, "a");
         assert_eq!(there[0].name, "b");
     }
 
-    #[test]
-    fn persists_across_sessions_same_db_file() {
+    #[tokio::test]
+    async fn persists_across_sessions_same_db_file() {
         // "Across sessions" = separate Db handles to the same on-disk file.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cockpit.db");
         let id;
         {
             let db = Db::open(&path).unwrap();
-            let n = db.create_project_note(ROOT, "persistent").unwrap();
-            db.set_project_note_content(n.id, "kept").unwrap();
+            let n = db.create_project_note(ROOT, "persistent").await.unwrap();
+            db.set_project_note_content(n.id, "kept").await.unwrap();
             id = n.id;
         }
         // Fresh handle — a different "session" in the same project.
         {
             let db = Db::open(&path).unwrap();
-            let notes = db.list_project_notes(ROOT).unwrap();
+            let notes = db.list_project_notes(ROOT).await.unwrap();
             assert_eq!(notes.len(), 1);
             assert_eq!(notes[0].id, id);
             assert_eq!(notes[0].name, "persistent");
@@ -295,64 +282,85 @@ mod tests {
         }
     }
 
-    #[test]
-    fn blank_name_rejected_on_create_and_rename() {
+    #[tokio::test]
+    async fn blank_name_rejected_on_create_and_rename() {
         let db = Db::open_in_memory().unwrap();
-        assert!(db.create_project_note(ROOT, "").is_err());
-        assert!(db.create_project_note(ROOT, "   ").is_err());
-        let n = db.create_project_note(ROOT, "real").unwrap();
-        assert!(db.rename_project_note(n.id, "").is_err());
-        assert!(db.rename_project_note(n.id, "  ").is_err());
+        assert!(db.create_project_note(ROOT, "").await.is_err());
+        assert!(db.create_project_note(ROOT, "   ").await.is_err());
+        let n = db.create_project_note(ROOT, "real").await.unwrap();
+        assert!(db.rename_project_note(n.id, "").await.is_err());
+        assert!(db.rename_project_note(n.id, "  ").await.is_err());
         // Name is trimmed.
-        let t = db.create_project_note(ROOT, "  spaced  ").unwrap();
+        let t = db.create_project_note(ROOT, "  spaced  ").await.unwrap();
         assert_eq!(t.name, "spaced");
     }
 
-    #[test]
-    fn duplicate_name_disambiguated() {
+    #[tokio::test]
+    async fn duplicate_name_disambiguated() {
         let db = Db::open_in_memory().unwrap();
-        let a = db.create_project_note(ROOT, "notes").unwrap();
-        let b = db.create_project_note(ROOT, "notes").unwrap();
-        let c = db.create_project_note(ROOT, "notes").unwrap();
+        let a = db.create_project_note(ROOT, "notes").await.unwrap();
+        let b = db.create_project_note(ROOT, "notes").await.unwrap();
+        let c = db.create_project_note(ROOT, "notes").await.unwrap();
         assert_eq!(a.name, "notes");
         assert_eq!(b.name, "notes (2)");
         assert_eq!(c.name, "notes (3)");
         // All three coexist.
-        assert_eq!(db.list_project_notes(ROOT).unwrap().len(), 3);
+        assert_eq!(db.list_project_notes(ROOT).await.unwrap().len(), 3);
     }
 
-    #[test]
-    fn rename_and_collision_disambiguation() {
+    #[tokio::test]
+    async fn rename_and_collision_disambiguation() {
         let db = Db::open_in_memory().unwrap();
-        let a = db.create_project_note(ROOT, "alpha").unwrap();
-        let b = db.create_project_note(ROOT, "beta").unwrap();
+        let a = db.create_project_note(ROOT, "alpha").await.unwrap();
+        let b = db.create_project_note(ROOT, "beta").await.unwrap();
         // Rename b → alpha collides with a → suffixed.
-        let final_name = db.rename_project_note(b.id, "alpha").unwrap();
+        let final_name = db.rename_project_note(b.id, "alpha").await.unwrap();
         assert_eq!(final_name, "alpha (2)");
         // Renaming a note to its own current name is a no-op (no suffix).
-        let same = db.rename_project_note(a.id, "alpha").unwrap();
+        let same = db.rename_project_note(a.id, "alpha").await.unwrap();
         assert_eq!(same, "alpha");
         // A clean rename keeps the requested name.
-        let renamed = db.rename_project_note(a.id, "gamma").unwrap();
+        let renamed = db.rename_project_note(a.id, "gamma").await.unwrap();
         assert_eq!(renamed, "gamma");
     }
 
-    #[test]
-    fn rename_missing_note_errors() {
+    #[tokio::test]
+    async fn rename_missing_note_errors() {
         let db = Db::open_in_memory().unwrap();
-        assert!(db.rename_project_note(Uuid::new_v4(), "x").is_err());
+        assert!(db.rename_project_note(Uuid::new_v4(), "x").await.is_err());
     }
 
-    #[test]
-    fn delete_removes_note() {
+    #[tokio::test]
+    async fn delete_removes_note() {
         let db = Db::open_in_memory().unwrap();
-        let a = db.create_project_note(ROOT, "a").unwrap();
-        let b = db.create_project_note(ROOT, "b").unwrap();
-        db.delete_project_note(a.id).unwrap();
-        let notes = db.list_project_notes(ROOT).unwrap();
+        let a = db.create_project_note(ROOT, "a").await.unwrap();
+        let b = db.create_project_note(ROOT, "b").await.unwrap();
+        db.delete_project_note(a.id).await.unwrap();
+        let notes = db.list_project_notes(ROOT).await.unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].id, b.id);
         // Deleting a missing id is a no-op.
-        db.delete_project_note(Uuid::new_v4()).unwrap();
+        db.delete_project_note(Uuid::new_v4()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn db_async_intel_project_notes_roundtrip_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let note = db.create_project_note(ROOT, "runbook").await.unwrap();
+
+        db.set_project_note_content(note.id, "async notes")
+            .await
+            .unwrap();
+        let final_name = db.rename_project_note(note.id, "ops").await.unwrap();
+        let notes = db.list_project_notes(ROOT).await.unwrap();
+
+        assert_eq!(final_name, "ops");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, note.id);
+        assert_eq!(notes[0].name, "ops");
+        assert_eq!(notes[0].content, "async notes");
+
+        db.delete_project_note(note.id).await.unwrap();
+        assert!(db.list_project_notes(ROOT).await.unwrap().is_empty());
     }
 }

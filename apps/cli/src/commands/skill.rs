@@ -20,7 +20,7 @@ async fn run_curator(cmd: SkillCuratorCommand) -> Result<()> {
     let curator = SkillCurator::new(db, cwd, cfg);
     match cmd {
         SkillCuratorCommand::Status => {
-            let status = curator.status()?;
+            let status = curator.status().await?;
             if status.skills.is_empty() {
                 println!("no skills in usage ledger");
             } else {
@@ -61,23 +61,23 @@ async fn run_curator(cmd: SkillCuratorCommand) -> Result<()> {
             Ok(())
         }
         SkillCuratorCommand::Pin { name } => {
-            curator.pin(&name, true)?;
+            curator.pin(&name, true).await?;
             println!("pinned {name}");
             Ok(())
         }
         SkillCuratorCommand::Unpin { name } => {
-            curator.pin(&name, false)?;
+            curator.pin(&name, false).await?;
             println!("unpinned {name}");
             Ok(())
         }
         SkillCuratorCommand::Restore { name } => {
-            curator.restore(&name)?;
+            curator.restore(&name).await?;
             println!("restored {name}");
             Ok(())
         }
         SkillCuratorCommand::Rollback(SkillCuratorRollbackArgs { list, id }) => {
             if list {
-                for snapshot in curator.snapshots()? {
+                for snapshot in curator.snapshots().await? {
                     println!(
                         "{}  created_at={}  reason={}  path={}",
                         snapshot.id, snapshot.created_at, snapshot.reason, snapshot.path
@@ -85,7 +85,7 @@ async fn run_curator(cmd: SkillCuratorCommand) -> Result<()> {
                 }
                 return Ok(());
             }
-            let restored = curator.rollback(id.as_deref())?;
+            let restored = curator.rollback(id.as_deref()).await?;
             println!("rolled back to {}", restored.id);
             Ok(())
         }

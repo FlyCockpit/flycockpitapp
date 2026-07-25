@@ -67,7 +67,7 @@ impl Tool for DepsTool {
             .await?;
         let freshen_report = freshen.report().clone();
 
-        let edges = index.dep_edges()?;
+        let edges = index.dep_edges().await?;
         // forward: importer → importee; reverse: importee → importer.
         let mut forward: HashMap<&str, Vec<&str>> = HashMap::new();
         let mut reverse: HashMap<&str, Vec<&str>> = HashMap::new();

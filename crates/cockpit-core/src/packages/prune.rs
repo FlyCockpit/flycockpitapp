@@ -1,12 +1,12 @@
 use super::*;
 
-pub fn prune_package_clones(
+pub async fn prune_package_clones(
     db: &Db,
     cwd: &Path,
     options: &PackagePruneOptions,
 ) -> Result<PackagePruneReport> {
     let clone_root = clone_dir(cwd)?;
-    let rows = db.list_packages()?;
+    let rows = db.list_packages().await?;
     let cutoff = chrono::Utc::now().timestamp() - i64::from(options.days) * 24 * 60 * 60;
     prune_package_clones_in_dir(&rows, &clone_root, cutoff, options.dry_run)
 }

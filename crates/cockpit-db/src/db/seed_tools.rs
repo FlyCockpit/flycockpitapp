@@ -26,22 +26,18 @@ pub struct SeedTool {
 impl Db {
     /// Persist the seed-tool plan for a (new) session, in order. Replaces
     /// any existing rows for that session id.
-    pub fn set_seed_tools(&self, session_id: Uuid, seeds: &[SeedTool]) -> Result<()> {
-        self.set_seed_tools_inner(session_id, seeds, None)
+    pub async fn set_seed_tools(&self, session_id: Uuid, seeds: &[SeedTool]) -> Result<()> {
+        self.set_seed_tools_inner(session_id, seeds, None).await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn set_seed_tools_inner(
+    async fn set_seed_tools_inner(
         &self,
         session_id: Uuid,
         seeds: &[SeedTool],
         #[cfg_attr(not(test), allow(unused_variables))] fail_after_inserts: Option<usize>,
     ) -> Result<()> {
         let seeds = seeds.to_vec();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin set_seed_tools tx")?;
@@ -66,24 +62,21 @@ impl Db {
             tx.commit().context("commit set_seed_tools tx")?;
             Ok(())
         })
+        .await
     }
 
     /// Drain the seed-tool plan for a session: return it in order, then
     /// delete the rows so it never re-fires. Empty vec when none.
-    pub fn take_seed_tools(&self, session_id: Uuid) -> Result<Vec<SeedTool>> {
-        self.take_seed_tools_inner(session_id, false)
+    pub async fn take_seed_tools(&self, session_id: Uuid) -> Result<Vec<SeedTool>> {
+        self.take_seed_tools_inner(session_id, false).await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn take_seed_tools_inner(
+    async fn take_seed_tools_inner(
         &self,
         session_id: Uuid,
         #[cfg_attr(not(test), allow(unused_variables))] fail_after_delete: bool,
     ) -> Result<Vec<SeedTool>> {
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin take_seed_tools tx")?;
@@ -127,21 +120,23 @@ impl Db {
             tx.commit().context("commit take_seed_tools tx")?;
             Ok(out)
         })
+        .await
     }
 
     #[cfg(test)]
-    fn set_seed_tools_fail_after_inserts(
+    async fn set_seed_tools_fail_after_inserts(
         &self,
         session_id: Uuid,
         seeds: &[SeedTool],
         fail_after_inserts: usize,
     ) -> Result<()> {
         self.set_seed_tools_inner(session_id, seeds, Some(fail_after_inserts))
+            .await
     }
 
     #[cfg(test)]
-    fn take_seed_tools_fail_after_delete(&self, session_id: Uuid) -> Result<Vec<SeedTool>> {
-        self.take_seed_tools_inner(session_id, true)
+    async fn take_seed_tools_fail_after_delete(&self, session_id: Uuid) -> Result<Vec<SeedTool>> {
+        self.take_seed_tools_inner(session_id, true).await
     }
 }
 
@@ -157,12 +152,8 @@ mod tests {
         }
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn stored_seed_tools(db: &Db, session_id: Uuid) -> Vec<SeedTool> {
-        db.read_blocking(|conn| {
+    async fn stored_seed_tools(db: &Db, session_id: Uuid) -> Vec<SeedTool> {
+        db.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT tool, args_json FROM seed_tools
@@ -181,6 +172,7 @@ mod tests {
                 .unwrap();
             Ok(rows.map(|r| r.unwrap()).collect())
         })
+        .await
         .unwrap()
     }
 
@@ -189,15 +181,15 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
         let seeds = vec![seed("read", "/a.rs"), seed("code", "/b.rs")];
-        db.set_seed_tools(s.session_id, &seeds).unwrap();
+        db.set_seed_tools(s.session_id, &seeds).await.unwrap();
 
-        let taken = db.take_seed_tools(s.session_id).unwrap();
+        let taken = db.take_seed_tools(s.session_id).await.unwrap();
         assert_eq!(taken.len(), 2);
         assert_eq!(taken[0].tool, "read");
         assert_eq!(taken[1].tool, "code");
 
         // Draining deletes — a second take is empty.
-        let again = db.take_seed_tools(s.session_id).unwrap();
+        let again = db.take_seed_tools(s.session_id).await.unwrap();
         assert!(again.is_empty());
     }
 
@@ -206,7 +198,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
         let original = vec![seed("read", "/a.rs"), seed("code", "/b.rs")];
-        db.set_seed_tools(s.session_id, &original).unwrap();
+        db.set_seed_tools(s.session_id, &original).await.unwrap();
 
         let replacement = vec![
             seed("read", "/new-a.rs"),
@@ -215,10 +207,11 @@ mod tests {
         ];
         let err = db
             .set_seed_tools_fail_after_inserts(s.session_id, &replacement, 1)
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("injected set_seed_tools failure"), "{err}");
-        assert_eq!(stored_seed_tools(&db, s.session_id), original);
+        assert_eq!(stored_seed_tools(&db, s.session_id).await, original);
     }
 
     #[tokio::test]
@@ -226,10 +219,11 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
         db.set_seed_tools(s.session_id, &[seed("read", "/a.rs")])
+            .await
             .unwrap();
 
-        db.set_seed_tools(s.session_id, &[]).unwrap();
-        assert!(stored_seed_tools(&db, s.session_id).is_empty());
+        db.set_seed_tools(s.session_id, &[]).await.unwrap();
+        assert!(stored_seed_tools(&db, s.session_id).await.is_empty());
     }
 
     #[tokio::test]
@@ -237,31 +231,28 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
         let seeds = vec![seed("read", "/a.rs"), seed("code", "/b.rs")];
-        db.set_seed_tools(s.session_id, &seeds).unwrap();
+        db.set_seed_tools(s.session_id, &seeds).await.unwrap();
 
         let err = db
             .take_seed_tools_fail_after_delete(s.session_id)
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("injected take_seed_tools failure"), "{err}");
-        assert_eq!(stored_seed_tools(&db, s.session_id), seeds);
+        assert_eq!(stored_seed_tools(&db, s.session_id).await, seeds);
 
-        let retry = db.take_seed_tools(s.session_id).unwrap();
+        let retry = db.take_seed_tools(s.session_id).await.unwrap();
         assert_eq!(retry.len(), 2);
         assert_eq!(retry[0].tool, "read");
         assert_eq!(retry[1].tool, "code");
-        assert!(db.take_seed_tools(s.session_id).unwrap().is_empty());
+        assert!(db.take_seed_tools(s.session_id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn malformed_args_json_still_drains_as_null_compatibly() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute(
                 "INSERT INTO seed_tools (session_id, seq, tool, args_json)
                  VALUES (?1, 0, 'read', '{malformed')",
@@ -270,12 +261,13 @@ mod tests {
             .unwrap();
             Ok(())
         })
+        .await
         .unwrap();
 
-        let taken = db.take_seed_tools(s.session_id).unwrap();
+        let taken = db.take_seed_tools(s.session_id).await.unwrap();
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].tool, "read");
         assert_eq!(taken[0].args, serde_json::Value::Null);
-        assert!(db.take_seed_tools(s.session_id).unwrap().is_empty());
+        assert!(db.take_seed_tools(s.session_id).await.unwrap().is_empty());
     }
 }

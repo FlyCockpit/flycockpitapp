@@ -19,7 +19,7 @@ pub(in crate::tools::intel) async fn call_impact_section(
         .await?;
     let freshen_report = freshen.report().clone();
 
-    let targets = index.impact_targets(name, path.as_deref(), kind)?;
+    let targets = index.impact_targets(name, path.as_deref(), kind).await?;
     if targets.is_empty() {
         return Ok(ToolOutput::text(format!("No symbol matches `{name}`.")));
     }
@@ -28,7 +28,7 @@ pub(in crate::tools::intel) async fn call_impact_section(
     // When the name still resolves to multiple definitions, report
     // each target's context separately (most-central first) so the
     // model isn't forced to disambiguate up front.
-    let scores = index.centrality_scores()?;
+    let scores = index.centrality_scores().await?;
     let mut targets = targets;
     targets.sort_by(|a, b| {
         let ma = crate::intel::callgraph::rank_multiplier(scores.get(&a.0).copied().unwrap_or(0.0));
@@ -37,10 +37,11 @@ pub(in crate::tools::intel) async fn call_impact_section(
     });
 
     let multi = targets.len() > 1;
-    let calls = matches!(section, ImpactSection::Calls)
-        .then(|| index.impact_calls(name))
-        .transpose()?
-        .unwrap_or_default();
+    let calls = if matches!(section, ImpactSection::Calls) {
+        index.impact_calls(name).await?
+    } else {
+        Vec::new()
+    };
     for (tpath, tline, tkind) in &targets {
         if multi {
             writer.writeln(&format!("=== {name} ({tkind}) at {tpath}:{tline} ==="));
@@ -49,7 +50,7 @@ pub(in crate::tools::intel) async fn call_impact_section(
         }
 
         if matches!(section, ImpactSection::Callers) {
-            let callers = index.impact_callers(tpath, *tline)?;
+            let callers = index.impact_callers(tpath, *tline).await?;
             if callers.is_empty() {
                 writer.writeln("Callers: none");
             } else {

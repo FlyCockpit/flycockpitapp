@@ -96,7 +96,7 @@ pub fn ecosystem_slug(eco: Ecosystem, name: &str) -> String {
 
 /// Register a Local package: an absolute on-disk `path`, no clone. The
 /// identifier defaults to the path's final component when not given.
-pub fn add_local(db: &Db, identifier: &str, path: &Path) -> Result<PackageRow> {
+pub async fn add_local(db: &Db, identifier: &str, path: &Path) -> Result<PackageRow> {
     let canonical = std::fs::canonicalize(path)
         .with_context(|| format!("resolving local package path `{}`", path.display()))?;
     if !canonical.is_dir() {
@@ -112,6 +112,7 @@ pub fn add_local(db: &Db, identifier: &str, path: &Path) -> Result<PackageRow> {
         shallow: false,
         prepare_scope: "global".to_string(),
     })
+    .await
 }
 
 /// Register a Git package: shallow-clone `url` (unless `shallow` is
@@ -122,7 +123,7 @@ pub fn add_local(db: &Db, identifier: &str, path: &Path) -> Result<PackageRow> {
 ///
 /// `branch` is recorded so a future `cockpit packages update` can pull
 /// the right ref; when `Some`, the clone is restricted to that branch.
-pub fn add_git(
+pub async fn add_git(
     db: &Db,
     cwd: &Path,
     identifier: &str,
@@ -130,7 +131,7 @@ pub fn add_git(
     branch: Option<&str>,
     shallow: bool,
 ) -> Result<PackageRow> {
-    add_git_with_prepare_scope(db, cwd, identifier, url, branch, shallow, "global")
+    add_git_with_prepare_scope(db, cwd, identifier, url, branch, shallow, "global").await
 }
 
 #[derive(Debug, Clone)]
@@ -380,8 +381,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn add_git_dedupes_by_source_url() {
+    #[tokio::test]
+    async fn add_git_dedupes_by_source_url() {
         let db = Db::open_in_memory().unwrap();
         // Pre-register a repo with a known on-disk path (no real clone).
         db.upsert_package(&NewPackage {
@@ -394,6 +395,7 @@ mod tests {
             shallow: true,
             prepare_scope: "global".into(),
         })
+        .await
         .unwrap();
         // Adding a second identifier for the same URL must reuse the path
         // and NOT attempt a clone (the URL is unreachable; a clone would
@@ -407,13 +409,14 @@ mod tests {
             None,
             true,
         )
+        .await
         .unwrap();
         assert_eq!(row.path, "/existing/clone");
         assert_eq!(row.identifier, "second");
     }
 
-    #[test]
-    fn add_git_rejects_invalid_identifier_before_dedupe_db_write() {
+    #[tokio::test]
+    async fn add_git_rejects_invalid_identifier_before_dedupe_db_write() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_package(&NewPackage {
             identifier: "first".into(),
@@ -425,6 +428,7 @@ mod tests {
             shallow: true,
             prepare_scope: "global".into(),
         })
+        .await
         .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
@@ -436,12 +440,13 @@ mod tests {
             None,
             true,
         )
+        .await
         .unwrap_err()
         .to_string();
 
         assert!(err.contains("invalid package identifier `..`"), "{err}");
         assert!(
-            db.package_by_identifier("..").unwrap().is_none(),
+            db.package_by_identifier("..").await.unwrap().is_none(),
             "invalid identifier must not be inserted even when source URL dedupes"
         );
     }
@@ -471,11 +476,7 @@ mod tests {
         }
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    fn register_package_with_timestamp(
+    async fn register_package_with_timestamp(
         db: &Db,
         identifier: &str,
         source_type: SourceType,
@@ -493,9 +494,10 @@ mod tests {
             shallow: true,
             prepare_scope: "global".into(),
         })
+        .await
         .unwrap();
         let identifier = identifier.to_owned();
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute(
                 "UPDATE packages SET updated_at = ?1 WHERE identifier = ?2",
                 rusqlite::params![updated_at, identifier],
@@ -503,11 +505,12 @@ mod tests {
             .unwrap();
             Ok(())
         })
+        .await
         .unwrap();
     }
 
-    fn package_rows(db: &Db) -> Vec<PackageRow> {
-        db.list_packages().unwrap()
+    async fn package_rows(db: &Db) -> Vec<PackageRow> {
+        db.list_packages().await.unwrap()
     }
 
     fn write_bytes(path: &Path, bytes: &[u8]) {
@@ -515,34 +518,34 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    #[test]
-    fn prune_deletes_stale_git_clone_under_clone_dir_and_keeps_row() {
+    #[tokio::test]
+    async fn prune_deletes_stale_git_clone_under_clone_dir_and_keeps_row() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let clone_root = tmp.path().join("clones");
         let clone = clone_root.join("tokio");
         write_bytes(&clone.join("src/lib.rs"), b"hello");
-        register_package_with_timestamp(&db, "tokio", SourceType::Git, &clone, 10);
+        register_package_with_timestamp(&db, "tokio", SourceType::Git, &clone, 10).await;
 
-        let report = prune_package_clones_in_dir(&package_rows(&db), &clone_root, 100, false)
+        let report = prune_package_clones_in_dir(&package_rows(&db).await, &clone_root, 100, false)
             .expect("prune");
 
         assert_eq!(report.deleted.len(), 1);
         assert_eq!(report.bytes_reclaimed(), 5);
         assert!(!clone.exists());
-        assert!(db.package_by_identifier("tokio").unwrap().is_some());
+        assert!(db.package_by_identifier("tokio").await.unwrap().is_some());
     }
 
-    #[test]
-    fn prune_skips_fresh_git_clone() {
+    #[tokio::test]
+    async fn prune_skips_fresh_git_clone() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let clone_root = tmp.path().join("clones");
         let clone = clone_root.join("fresh");
         write_bytes(&clone.join("README.md"), b"fresh");
-        register_package_with_timestamp(&db, "fresh", SourceType::Git, &clone, 200);
+        register_package_with_timestamp(&db, "fresh", SourceType::Git, &clone, 200).await;
 
-        let report = prune_package_clones_in_dir(&package_rows(&db), &clone_root, 100, false)
+        let report = prune_package_clones_in_dir(&package_rows(&db).await, &clone_root, 100, false)
             .expect("prune");
 
         assert!(report.deleted.is_empty());
@@ -550,17 +553,17 @@ mod tests {
         assert!(clone.exists());
     }
 
-    #[test]
-    fn prune_shared_clone_only_when_every_row_is_stale() {
+    #[tokio::test]
+    async fn prune_shared_clone_only_when_every_row_is_stale() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let clone_root = tmp.path().join("clones");
         let clone = clone_root.join("shared");
         write_bytes(&clone.join("Cargo.toml"), b"shared");
-        register_package_with_timestamp(&db, "stale", SourceType::Git, &clone, 10);
-        register_package_with_timestamp(&db, "fresh", SourceType::Git, &clone, 200);
+        register_package_with_timestamp(&db, "stale", SourceType::Git, &clone, 10).await;
+        register_package_with_timestamp(&db, "fresh", SourceType::Git, &clone, 200).await;
 
-        let report = prune_package_clones_in_dir(&package_rows(&db), &clone_root, 100, false)
+        let report = prune_package_clones_in_dir(&package_rows(&db).await, &clone_root, 100, false)
             .expect("prune");
 
         assert!(report.deleted.is_empty());
@@ -568,16 +571,16 @@ mod tests {
         assert!(clone.exists());
     }
 
-    #[test]
-    fn prune_skips_local_path_packages() {
+    #[tokio::test]
+    async fn prune_skips_local_path_packages() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let clone_root = tmp.path().join("clones");
         let local = clone_root.join("local");
         write_bytes(&local.join("package.json"), b"{}");
-        register_package_with_timestamp(&db, "local", SourceType::Local, &local, 10);
+        register_package_with_timestamp(&db, "local", SourceType::Local, &local, 10).await;
 
-        let report = prune_package_clones_in_dir(&package_rows(&db), &clone_root, 100, false)
+        let report = prune_package_clones_in_dir(&package_rows(&db).await, &clone_root, 100, false)
             .expect("prune");
 
         assert!(report.deleted.is_empty());
@@ -585,17 +588,17 @@ mod tests {
         assert!(local.exists());
     }
 
-    #[test]
-    fn prune_skips_git_paths_outside_clone_dir() {
+    #[tokio::test]
+    async fn prune_skips_git_paths_outside_clone_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let clone_root = tmp.path().join("clones");
         std::fs::create_dir_all(&clone_root).unwrap();
         let outside = tmp.path().join("elsewhere/repo");
         write_bytes(&outside.join("README.md"), b"outside");
-        register_package_with_timestamp(&db, "outside", SourceType::Git, &outside, 10);
+        register_package_with_timestamp(&db, "outside", SourceType::Git, &outside, 10).await;
 
-        let report = prune_package_clones_in_dir(&package_rows(&db), &clone_root, 100, false)
+        let report = prune_package_clones_in_dir(&package_rows(&db).await, &clone_root, 100, false)
             .expect("prune");
 
         assert!(report.deleted.is_empty());
@@ -603,33 +606,33 @@ mod tests {
         assert!(outside.exists());
     }
 
-    #[test]
-    fn prune_dry_run_reports_without_deleting() {
+    #[tokio::test]
+    async fn prune_dry_run_reports_without_deleting() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let clone_root = tmp.path().join("clones");
         let clone = clone_root.join("dry-run");
         write_bytes(&clone.join("README.md"), b"dry");
-        register_package_with_timestamp(&db, "dry-run", SourceType::Git, &clone, 10);
+        register_package_with_timestamp(&db, "dry-run", SourceType::Git, &clone, 10).await;
 
-        let report =
-            prune_package_clones_in_dir(&package_rows(&db), &clone_root, 100, true).expect("prune");
+        let report = prune_package_clones_in_dir(&package_rows(&db).await, &clone_root, 100, true)
+            .expect("prune");
 
         assert_eq!(report.deleted.len(), 1);
         assert_eq!(report.bytes_reclaimed(), 3);
         assert!(clone.exists());
     }
 
-    #[test]
-    fn prune_missing_clone_is_already_pruned_not_failure() {
+    #[tokio::test]
+    async fn prune_missing_clone_is_already_pruned_not_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let clone_root = tmp.path().join("clones");
         std::fs::create_dir_all(&clone_root).unwrap();
         let missing = clone_root.join("missing");
-        register_package_with_timestamp(&db, "missing", SourceType::Git, &missing, 10);
+        register_package_with_timestamp(&db, "missing", SourceType::Git, &missing, 10).await;
 
-        let report = prune_package_clones_in_dir(&package_rows(&db), &clone_root, 100, false)
+        let report = prune_package_clones_in_dir(&package_rows(&db).await, &clone_root, 100, false)
             .expect("prune");
 
         assert!(report.deleted.is_empty());
@@ -663,17 +666,23 @@ mod tests {
         assert_eq!(derive_package_identifier(&fallback), "fallback-name");
     }
 
-    #[test]
-    fn import_package_path_registers_exact_local_directory() {
+    #[tokio::test]
+    async fn import_package_path_registers_exact_local_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let package = tmp.path().join("private");
         write_file(&package.join("package.json"), r#"{"name":"private-core"}"#);
 
-        let summary = import_package(&db, tmp.path(), &package, None, true).unwrap();
+        let summary = import_package(&db, tmp.path(), &package, None, true)
+            .await
+            .unwrap();
         assert_eq!(summary.imported, 1);
         assert_eq!(summary.deduped, 0);
-        let row = db.package_by_identifier("private-core").unwrap().unwrap();
+        let row = db
+            .package_by_identifier("private-core")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.source_type, SourceType::Local);
         assert_eq!(
             row.path,
@@ -684,8 +693,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn import_package_git_uses_remote_and_dedupes_without_source_path() {
+    #[tokio::test]
+    async fn import_package_git_uses_remote_and_dedupes_without_source_path() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let package = tmp.path().join("tokio");
@@ -701,32 +710,37 @@ mod tests {
             shallow: true,
             prepare_scope: "global".into(),
         })
+        .await
         .unwrap();
 
-        let summary = import_package(&db, tmp.path(), &package, None, false).unwrap();
+        let summary = import_package(&db, tmp.path(), &package, None, false)
+            .await
+            .unwrap();
         assert_eq!(summary.imported, 0);
         assert_eq!(summary.deduped, 1);
-        let row = db.package_by_identifier("tokio").unwrap().unwrap();
+        let row = db.package_by_identifier("tokio").await.unwrap().unwrap();
         assert_eq!(row.source_type, SourceType::Git);
         assert_eq!(row.path, "/cockpit/owned/tokio");
         assert_ne!(row.path, package.to_string_lossy());
     }
 
-    #[test]
-    fn import_package_git_without_remote_suggests_path() {
+    #[tokio::test]
+    async fn import_package_git_without_remote_suggests_path() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let package = tmp.path().join("no-remote");
         init_git_repo(&package, None);
 
-        let summary = import_package(&db, tmp.path(), &package, None, false).unwrap();
+        let summary = import_package(&db, tmp.path(), &package, None, false)
+            .await
+            .unwrap();
         assert_eq!(summary.imported, 0);
         assert_eq!(summary.failed(), 1);
         assert!(summary.failures[0].reason.contains("pass `--path`"));
     }
 
-    #[test]
-    fn import_directory_path_mode_imports_dirs_and_skips_files() {
+    #[tokio::test]
+    async fn import_directory_path_mode_imports_dirs_and_skips_files() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let root = tmp.path().join("deps");
@@ -737,16 +751,18 @@ mod tests {
         write_file(&root.join("b/package.json"), r#"{"name":"b-pkg"}"#);
         write_file(&root.join("README.md"), "not a package dir");
 
-        let summary = import_package_directory(&db, tmp.path(), &root, true).unwrap();
+        let summary = import_package_directory(&db, tmp.path(), &root, true)
+            .await
+            .unwrap();
         assert_eq!(summary.imported, 2);
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.failed(), 0);
-        assert!(db.package_by_identifier("a-crate").unwrap().is_some());
-        assert!(db.package_by_identifier("b-pkg").unwrap().is_some());
+        assert!(db.package_by_identifier("a-crate").await.unwrap().is_some());
+        assert!(db.package_by_identifier("b-pkg").await.unwrap().is_some());
     }
 
-    #[test]
-    fn import_directory_git_mode_skips_non_git_and_dedupes_remote() {
+    #[tokio::test]
+    async fn import_directory_git_mode_skips_non_git_and_dedupes_remote() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let root = tmp.path().join("deps");
@@ -768,9 +784,12 @@ mod tests {
             shallow: true,
             prepare_scope: "global".into(),
         })
+        .await
         .unwrap();
 
-        let summary = import_package_directory(&db, tmp.path(), &root, false).unwrap();
+        let summary = import_package_directory(&db, tmp.path(), &root, false)
+            .await
+            .unwrap();
         assert_eq!(summary.imported, 0);
         assert_eq!(summary.deduped, 1);
         assert_eq!(summary.skipped, 2);
@@ -779,8 +798,8 @@ mod tests {
         assert!(summary.warnings.iter().any(|w| w.contains("non-directory")));
     }
 
-    #[test]
-    fn manifest_import_preserves_prepare_scope_and_defaults() {
+    #[tokio::test]
+    async fn manifest_import_preserves_prepare_scope_and_defaults() {
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.json");
         let clone_dir = tmp.path().join("packages");
@@ -791,7 +810,7 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(clone_dir.join("pkg-a/.git")).unwrap();
         std::fs::create_dir_all(clone_dir.join("pkg-b/.git")).unwrap();
-        let config_override = crate::test_env::lock();
+        let config_override = crate::test_env::lock_async().await;
         config_override.set_cockpit_config(&config_path);
 
         let db = Db::open_in_memory().unwrap();
@@ -820,22 +839,24 @@ mod tests {
                 ]
             }"#,
         )
+        .await
         .unwrap();
 
         assert!(matches!(result, KclImport::Imported(2)));
-        let a = db.package_by_identifier("pkg-a").unwrap().unwrap();
+        let a = db.package_by_identifier("pkg-a").await.unwrap().unwrap();
         assert_eq!(a.prepare_scope, "branch");
         assert!(a.shallow);
-        let b = db.package_by_identifier("pkg-b").unwrap().unwrap();
+        let b = db.package_by_identifier("pkg-b").await.unwrap().unwrap();
         assert_eq!(b.prepare_scope, "global");
         assert!(!b.shallow);
     }
 
-    #[test]
-    fn manifest_import_rejects_unknown_version_and_scope() {
+    #[tokio::test]
+    async fn manifest_import_rejects_unknown_version_and_scope() {
         let db = Db::open_in_memory().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let version_err = import_kcl_manifest(&db, tmp.path(), r#"{"version": 2, "packages": []}"#)
+            .await
             .unwrap_err()
             .to_string();
         assert!(version_err.contains("unsupported `kcl packages export` manifest version 2"));
@@ -855,20 +876,21 @@ mod tests {
                 }]
             }"#,
         )
+        .await
         .unwrap_err()
         .to_string();
         assert!(scope_err.contains("invalid package prepare_scope `workspace`"));
-        assert!(db.package_by_identifier("pkg").unwrap().is_none());
+        assert!(db.package_by_identifier("pkg").await.unwrap().is_none());
     }
 
-    #[test]
-    fn legacy_import_missing_kcl_db_is_clean() {
+    #[tokio::test]
+    async fn legacy_import_missing_kcl_db_is_clean() {
         // Point XDG_DATA_HOME at an empty dir so kcl.db is absent.
         let tmp = tempfile::tempdir().unwrap();
-        let env = crate::test_env::lock();
+        let env = crate::test_env::lock_async().await;
         env.set_var("XDG_DATA_HOME", tmp.path());
         let db = Db::open_in_memory().unwrap();
-        let result = import_from_legacy_kcl_db(&db).unwrap();
+        let result = import_from_legacy_kcl_db(&db).await.unwrap();
         assert!(matches!(result, KclImport::NoKclDb(_)));
     }
 }

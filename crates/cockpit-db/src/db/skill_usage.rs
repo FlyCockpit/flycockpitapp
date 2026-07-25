@@ -92,13 +92,13 @@ pub struct SkillCuratorSnapshotRow {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn ensure_skill_usage(&self, seed: SkillUsageSeed, now: i64) -> Result<SkillUsageRow> {
+    pub async fn ensure_skill_usage(
+        &self,
+        seed: SkillUsageSeed,
+        now: i64,
+    ) -> Result<SkillUsageRow> {
         let name = seed.name.clone();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO skill_usage (
                     name, source_path, created_by, use_count, view_count,
@@ -123,20 +123,17 @@ impl Db {
             skill_usage_by_name_conn(conn, &name)?
                 .ok_or_else(|| anyhow::anyhow!("skill usage row missing after upsert"))
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn record_skill_use(
+    pub async fn record_skill_use(
         &self,
         seed: SkillUsageSeed,
         viewed: bool,
         now: i64,
     ) -> Result<SkillUsageRow> {
         let name = seed.name.clone();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO skill_usage (
                     name, source_path, created_by, use_count, view_count,
@@ -174,15 +171,16 @@ impl Db {
             skill_usage_by_name_conn(conn, &name)?
                 .ok_or_else(|| anyhow::anyhow!("skill usage row missing after use"))
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn record_skill_patch(&self, seed: SkillUsageSeed, now: i64) -> Result<SkillUsageRow> {
+    pub async fn record_skill_patch(
+        &self,
+        seed: SkillUsageSeed,
+        now: i64,
+    ) -> Result<SkillUsageRow> {
         let name = seed.name.clone();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO skill_usage (
                     name, source_path, created_by, use_count, view_count,
@@ -210,23 +208,17 @@ impl Db {
             skill_usage_by_name_conn(conn, &name)?
                 .ok_or_else(|| anyhow::anyhow!("skill usage row missing after patch"))
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn get_skill_usage(&self, name: &str) -> Result<Option<SkillUsageRow>> {
+    pub async fn get_skill_usage(&self, name: &str) -> Result<Option<SkillUsageRow>> {
         let name = name.to_string();
-        self.read_blocking(move |conn| skill_usage_by_name_conn(conn, &name))
+        self.read(move |conn| skill_usage_by_name_conn(conn, &name))
+            .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_skill_usage(&self) -> Result<Vec<SkillUsageRow>> {
-        self.read_blocking(|conn| {
+    pub async fn list_skill_usage(&self) -> Result<Vec<SkillUsageRow>> {
+        self.read(|conn| {
             let mut stmt = conn
                 .prepare("SELECT * FROM skill_usage ORDER BY state, name")
                 .context("preparing skill usage list")?;
@@ -235,15 +227,12 @@ impl Db {
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .context("reading skill usage rows")
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_skill_usage_pinned(&self, name: &str, pinned: bool, now: i64) -> Result<()> {
+    pub async fn set_skill_usage_pinned(&self, name: &str, pinned: bool, now: i64) -> Result<()> {
         let name = name.to_string();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE skill_usage SET pinned = ?2, updated_at = ?3 WHERE name = ?1",
                 params![name, if pinned { 1_i64 } else { 0_i64 }, now],
@@ -251,13 +240,10 @@ impl Db {
             .context("updating skill pin")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_skill_usage_state(
+    pub async fn set_skill_usage_state(
         &self,
         name: &str,
         state: SkillUsageState,
@@ -266,7 +252,7 @@ impl Db {
         now: i64,
     ) -> Result<()> {
         let name = name.to_string();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE skill_usage
                  SET state = ?2, archive_path = ?3, archived_at = ?4, updated_at = ?5
@@ -276,14 +262,11 @@ impl Db {
             .context("updating skill usage state")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn restore_skill_usage_rows(&self, rows: Vec<SkillUsageRow>) -> Result<()> {
-        self.write_blocking(move |conn| {
+    pub async fn restore_skill_usage_rows(&self, rows: Vec<SkillUsageRow>) -> Result<()> {
+        self.write(move |conn| {
             let mut stmt = conn.prepare(
                 "INSERT INTO skill_usage (
                         name, source_path, archive_path, created_by, use_count, view_count,
@@ -330,13 +313,10 @@ impl Db {
             }
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn insert_skill_curator_snapshot(
+    pub async fn insert_skill_curator_snapshot(
         &self,
         id: &str,
         path: &str,
@@ -346,7 +326,7 @@ impl Db {
         let id = id.to_string();
         let path = path.to_string();
         let reason = reason.to_string();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO skill_curator_snapshots (id, path, reason, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -355,14 +335,11 @@ impl Db {
             .context("recording skill curator snapshot")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_skill_curator_snapshots(&self) -> Result<Vec<SkillCuratorSnapshotRow>> {
-        self.read_blocking(|conn| {
+    pub async fn list_skill_curator_snapshots(&self) -> Result<Vec<SkillCuratorSnapshotRow>> {
+        self.read(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, path, reason, created_at
@@ -382,14 +359,11 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("reading skill curator snapshots")
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn delete_skill_curator_snapshot_rows(&self, ids: Vec<String>) -> Result<()> {
-        self.write_blocking(move |conn| {
+    pub async fn delete_skill_curator_snapshot_rows(&self, ids: Vec<String>) -> Result<()> {
+        self.write(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin skill curator snapshot cleanup")?;
@@ -406,6 +380,7 @@ impl Db {
                 .context("commit skill curator snapshot cleanup")?;
             Ok(())
         })
+        .await
     }
 }
 
@@ -451,8 +426,8 @@ fn skill_usage_from_row(row: &Row<'_>) -> rusqlite::Result<SkillUsageRow> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn skill_usage_round_trip_counts_uses() {
+    #[tokio::test]
+    async fn skill_usage_round_trip_counts_uses() {
         let db = Db::open_in_memory().unwrap();
         let seed = SkillUsageSeed {
             name: "deploy".into(),
@@ -462,8 +437,8 @@ mod tests {
             pinned: false,
         };
 
-        let first = db.record_skill_use(seed.clone(), true, 200).unwrap();
-        let second = db.record_skill_use(seed, true, 300).unwrap();
+        let first = db.record_skill_use(seed.clone(), true, 200).await.unwrap();
+        let second = db.record_skill_use(seed, true, 300).await.unwrap();
 
         assert_eq!(first.use_count, 1);
         assert_eq!(second.use_count, 2);
@@ -471,5 +446,40 @@ mod tests {
         assert_eq!(second.last_used_at, Some(300));
         assert_eq!(second.last_viewed_at, Some(300));
         assert_eq!(second.state, SkillUsageState::Active);
+    }
+
+    #[tokio::test]
+    async fn db_async_intel_skill_usage_roundtrip_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let seed = SkillUsageSeed {
+            name: "ledger".into(),
+            source_path: "/tmp/ledger/SKILL.md".into(),
+            created_by: SkillCreatedBy::Foreground,
+            created_at: 10,
+            pinned: true,
+        };
+
+        let ensured = db.ensure_skill_usage(seed.clone(), 20).await.unwrap();
+        let used = db.record_skill_use(seed.clone(), true, 30).await.unwrap();
+        let patched = db.record_skill_patch(seed, 40).await.unwrap();
+        db.set_skill_usage_state(
+            "ledger",
+            SkillUsageState::Stale,
+            Some("/tmp/archive/ledger".into()),
+            Some(50),
+            50,
+        )
+        .await
+        .unwrap();
+
+        let fetched = db.get_skill_usage("ledger").await.unwrap().unwrap();
+        let listed = db.list_skill_usage().await.unwrap();
+
+        assert_eq!(ensured.name, "ledger");
+        assert_eq!(used.use_count, 1);
+        assert_eq!(patched.patch_count, 1);
+        assert_eq!(fetched.state, SkillUsageState::Stale);
+        assert_eq!(fetched.archive_path.as_deref(), Some("/tmp/archive/ledger"));
+        assert_eq!(listed, vec![fetched]);
     }
 }

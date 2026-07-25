@@ -78,6 +78,7 @@ pub enum AsyncActionPayload {
     },
     ProviderUsage(Vec<cockpit_core::providers::usage::ProviderUsageSnapshot>),
     Skills(crate::tui::skills_pane::SkillsPaneFetchResult),
+    NotesDb(crate::tui::notes_pane::NotesDbResult),
     PasteTokenCount {
         block_id: u64,
         tokens: usize,

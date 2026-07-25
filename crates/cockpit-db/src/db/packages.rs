@@ -60,7 +60,7 @@ impl FromStr for SourceType {
 }
 
 /// One registered package.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRow {
     pub id: Uuid,
     pub identifier: String,
@@ -120,12 +120,9 @@ pub struct NewPackage {
 
 impl Db {
     /// Look a package up by its canonical `identifier`.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn package_by_identifier(&self, identifier: &str) -> Result<Option<PackageRow>> {
-        self.read_blocking(|conn| {
+    pub async fn package_by_identifier(&self, identifier: &str) -> Result<Option<PackageRow>> {
+        let identifier = identifier.to_string();
+        self.read(move |conn| {
             conn.query_row(
                 "SELECT * FROM packages WHERE identifier = ?1",
                 params![identifier],
@@ -134,16 +131,14 @@ impl Db {
             .optional()
             .context("query package_by_identifier")
         })
+        .await
     }
 
     /// Look a Git package up by its `source_url` — the repo-dedupe key.
     /// Returns the first match (a monorepo cloned once is reused).
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn package_by_source_url(&self, source_url: &str) -> Result<Option<PackageRow>> {
-        self.read_blocking(|conn| {
+    pub async fn package_by_source_url(&self, source_url: &str) -> Result<Option<PackageRow>> {
+        let source_url = source_url.to_string();
+        self.read(move |conn| {
             conn.query_row(
                 "SELECT * FROM packages WHERE source_url = ?1 ORDER BY created_at LIMIT 1",
                 params![source_url],
@@ -152,15 +147,12 @@ impl Db {
             .optional()
             .context("query package_by_source_url")
         })
+        .await
     }
 
     /// Every registered package, alphabetical by identifier.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_packages(&self) -> Result<Vec<PackageRow>> {
-        self.read_blocking(|conn| {
+    pub async fn list_packages(&self) -> Result<Vec<PackageRow>> {
+        self.read(|conn| {
             let mut stmt = conn
                 .prepare("SELECT * FROM packages ORDER BY identifier")
                 .context("preparing list_packages")?;
@@ -173,34 +165,28 @@ impl Db {
             }
             Ok(out)
         })
+        .await
     }
 
     /// Insert `pkg`, or update the existing row with the same
     /// `identifier`. Idempotent on `identifier`; returns the resolved
     /// row. Concurrent callers adding the same identifier converge on
     /// one row (the UNIQUE constraint + upsert serialize them).
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn upsert_package(&self, pkg: &NewPackage) -> Result<PackageRow> {
+    pub async fn upsert_package(&self, pkg: &NewPackage) -> Result<PackageRow> {
         let now = Utc::now().timestamp();
         let pkg = pkg.clone();
-        self.write_blocking(move |conn| upsert_package_inner(conn, &pkg, now))
+        self.write(move |conn| upsert_package_inner(conn, &pkg, now))
+            .await
     }
 
     /// Insert `pkg` only if no row with its `identifier` exists yet.
     /// Returns `(row, inserted)` — `inserted = false` means the existing
     /// row was kept untouched. This is the import primitive: it never
     /// overwrites a row cockpit already has.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn insert_package_if_absent(&self, pkg: &NewPackage) -> Result<(PackageRow, bool)> {
+    pub async fn insert_package_if_absent(&self, pkg: &NewPackage) -> Result<(PackageRow, bool)> {
         let now = Utc::now().timestamp();
         let pkg = pkg.clone();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             if let Some(existing) = conn
                 .query_row(
                     "SELECT * FROM packages WHERE identifier = ?1",
@@ -215,6 +201,7 @@ impl Db {
             let row = insert_package_inner(conn, &pkg, now)?;
             Ok((row, true))
         })
+        .await
     }
 }
 
@@ -317,55 +304,98 @@ mod tests {
         }
     }
 
-    #[test]
-    fn insert_and_lookup_by_identifier() {
+    #[tokio::test]
+    async fn insert_and_lookup_by_identifier() {
         let db = Db::open_in_memory().unwrap();
         let row = db
             .upsert_package(&sample(
                 "cargo:tokio",
                 Some("https://github.com/tokio-rs/tokio"),
             ))
+            .await
             .unwrap();
         assert_eq!(row.identifier, "cargo:tokio");
         assert_eq!(row.source_type, SourceType::Git);
-        let got = db.package_by_identifier("cargo:tokio").unwrap().unwrap();
+        let got = db
+            .package_by_identifier("cargo:tokio")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.id, row.id);
         assert!(got.shallow);
         assert_eq!(got.prepare_scope, "global");
     }
 
-    #[test]
-    fn upsert_is_idempotent_on_identifier() {
+    #[tokio::test]
+    async fn upsert_is_idempotent_on_identifier() {
         let db = Db::open_in_memory().unwrap();
-        let a = db.upsert_package(&sample("tokio", Some("u1"))).unwrap();
-        let b = db.upsert_package(&sample("tokio", Some("u1"))).unwrap();
+        let a = db
+            .upsert_package(&sample("tokio", Some("u1")))
+            .await
+            .unwrap();
+        let b = db
+            .upsert_package(&sample("tokio", Some("u1")))
+            .await
+            .unwrap();
         assert_eq!(a.id, b.id, "same identifier must reuse the same row id");
-        assert_eq!(db.list_packages().unwrap().len(), 1);
+        assert_eq!(db.list_packages().await.unwrap().len(), 1);
     }
 
-    #[test]
-    fn lookup_by_source_url_dedupes_repo() {
+    #[tokio::test]
+    async fn lookup_by_source_url_dedupes_repo() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_package(&sample("crate-a", Some("https://repo")))
+            .await
             .unwrap();
-        let hit = db.package_by_source_url("https://repo").unwrap();
+        let hit = db.package_by_source_url("https://repo").await.unwrap();
         assert!(hit.is_some());
-        assert!(db.package_by_source_url("https://other").unwrap().is_none());
+        assert!(
+            db.package_by_source_url("https://other")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
-    #[test]
-    fn insert_if_absent_never_overwrites() {
+    #[tokio::test]
+    async fn insert_if_absent_never_overwrites() {
         let db = Db::open_in_memory().unwrap();
-        let (first, inserted) = db.insert_package_if_absent(&sample("x", None)).unwrap();
+        let (first, inserted) = db
+            .insert_package_if_absent(&sample("x", None))
+            .await
+            .unwrap();
         assert!(inserted);
         // Second call with a different path must keep the original row.
         let mut other = sample("x", None);
         other.path = "/different".to_string();
         other.prepare_scope = "branch".to_string();
-        let (second, inserted2) = db.insert_package_if_absent(&other).unwrap();
+        let (second, inserted2) = db.insert_package_if_absent(&other).await.unwrap();
         assert!(!inserted2);
         assert_eq!(second.id, first.id);
         assert_eq!(second.path, "/clones/x");
         assert_eq!(second.prepare_scope, "global");
+    }
+
+    #[tokio::test]
+    async fn db_async_intel_packages_roundtrip_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let pkg = sample("cargo:anyhow", Some("https://github.com/dtolnay/anyhow"));
+        let inserted = db.upsert_package(&pkg).await.unwrap();
+
+        let by_identifier = db
+            .package_by_identifier("cargo:anyhow")
+            .await
+            .unwrap()
+            .unwrap();
+        let by_source = db
+            .package_by_source_url("https://github.com/dtolnay/anyhow")
+            .await
+            .unwrap()
+            .unwrap();
+        let listed = db.list_packages().await.unwrap();
+
+        assert_eq!(by_identifier.id, inserted.id);
+        assert_eq!(by_source.id, inserted.id);
+        assert_eq!(listed, vec![by_identifier]);
     }
 }

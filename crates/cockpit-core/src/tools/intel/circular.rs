@@ -38,7 +38,7 @@ impl Tool for CircularTool {
             .ensure_fresh_scoped(freshen_options(ctx, None))
             .await?;
         let freshen_report = freshen.report().clone();
-        let edges = index.dep_edges()?;
+        let edges = index.dep_edges().await?;
 
         // Build the resolved graph (importee NOT NULL).
         let mut nodes: Vec<String> = Vec::new();

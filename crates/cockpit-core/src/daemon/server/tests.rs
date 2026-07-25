@@ -1163,6 +1163,7 @@ async fn curator_rpc_performs_curation() {
     assert!(
         ctx.db
             .get_skill_usage("curated")
+            .await
             .unwrap()
             .expect("skill usage row")
             .pinned
@@ -1194,7 +1195,7 @@ async fn curator_rpc_failure_leaves_skills_unchanged() {
     )
     .await
     .expect("seed curator status");
-    let before = ctx.db.list_skill_usage().unwrap();
+    let before = ctx.db.list_skill_usage().await.unwrap();
 
     let err = handle_request(
         Request::Curator {
@@ -1210,7 +1211,7 @@ async fn curator_rpc_failure_leaves_skills_unchanged() {
     .expect_err("unknown skill rejects");
 
     assert_eq!(err.code, ErrorCode::BadRequest);
-    assert_eq!(ctx.db.list_skill_usage().unwrap(), before);
+    assert_eq!(ctx.db.list_skill_usage().await.unwrap(), before);
     assert!(skill_root.join("curated").join("SKILL.md").is_file());
 }
 
@@ -6268,6 +6269,7 @@ async fn assert_curator_mutating_happy() {
     assert!(
         ctx.db
             .get_skill_usage("matrix-skill")
+            .await
             .unwrap()
             .expect("skill usage row")
             .pinned

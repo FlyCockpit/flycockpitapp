@@ -788,63 +788,54 @@ impl Index {
 
     /// All known files for `tree`, ordered by path. Large files are indexed
     /// for visibility but carry no stored line count.
-    pub fn tree_rows(&self) -> Result<Vec<TreeRow>> {
-        self.tree_rows_scoped(None)
+    pub async fn tree_rows(&self) -> Result<Vec<TreeRow>> {
+        self.tree_rows_scoped(None).await
     }
 
     /// All known files for `tree` within an optional path prefix, ordered by path.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    pub fn tree_rows_scoped(&self, scope: Option<&str>) -> Result<Vec<TreeRow>> {
+    pub async fn tree_rows_scoped(&self, scope: Option<&str>) -> Result<Vec<TreeRow>> {
         let root_key = self.root_key.clone();
         let scope = normalize_scope(scope);
         self.db
-            .read_blocking(move |conn| Ok(tree_rows_query(conn, &root_key, scope.as_deref())?))
+            .read(move |conn| Ok(tree_rows_query(conn, &root_key, scope.as_deref())?))
+            .await
     }
 
     /// All indexed files with metadata needed by `context_pack`, ordered by path.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    pub fn context_file_rows(&self) -> Result<Vec<FileMetaRow>> {
+    pub async fn context_file_rows(&self) -> Result<Vec<FileMetaRow>> {
         let root_key = self.root_key.clone();
-        self.db.read_blocking(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT f.path, f.language, f.size, f.lines, COUNT(s.name), f.mtime_ns \
+        self.db
+            .read(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT f.path, f.language, f.size, f.lines, COUNT(s.name), f.mtime_ns \
                  FROM intel_files f \
                  LEFT JOIN intel_symbols s ON s.root = f.root AND s.path = f.path \
                  WHERE f.root = ?1 \
                  GROUP BY f.root, f.path, f.language, f.size, f.lines, f.mtime_ns \
                  ORDER BY f.path",
-            )?;
-            let rows = stmt
-                .query_map([&root_key], |r| {
-                    Ok(FileMetaRow {
-                        path: r.get(0)?,
-                        language: r.get(1)?,
-                        size: r.get(2)?,
-                        lines: r.get(3)?,
-                        symbols: r.get(4)?,
-                        mtime_ns: r.get(5)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+                )?;
+                let rows = stmt
+                    .query_map([&root_key], |r| {
+                        Ok(FileMetaRow {
+                            path: r.get(0)?,
+                            language: r.get(1)?,
+                            size: r.get(2)?,
+                            lines: r.get(3)?,
+                            symbols: r.get(4)?,
+                            mtime_ns: r.get(5)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
     }
 
     /// Symbols + imports for one file, ordered by line (for `outline`).
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    pub fn outline_rows(&self, rel: &str) -> Result<OutlineData> {
+    pub async fn outline_rows(&self, rel: &str) -> Result<OutlineData> {
         let root_key = self.root_key.clone();
         let rel_owned = rel.to_string();
-        self.db.read_blocking(|conn| {
+        self.db.read(move |conn| {
             let language: Option<String> = conn
                 .query_row(
                     "SELECT language FROM intel_files WHERE root = ?1 AND path = ?2",
@@ -869,15 +860,12 @@ impl Index {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok((symbols, imports, language.unwrap_or_default()))
         })
+        .await
     }
 
     /// Find symbols by name. `exact` toggles `=` vs prefix `LIKE`;
     /// optional `kind` filters by symbol kind.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    pub fn symbol_find(
+    pub async fn symbol_find(
         &self,
         name: &str,
         exact: bool,
@@ -886,143 +874,136 @@ impl Index {
         let root_key = self.root_key.clone();
         let name = name.to_string();
         let kind = kind.map(|s| s.to_string());
-        self.db.read_blocking(|conn| {
-            let base = "SELECT path, name, kind, line, end_line, parent, visibility, signature \
+        self.db
+            .read(move |conn| {
+                let base = "SELECT path, name, kind, line, end_line, parent, visibility, signature \
                  FROM intel_symbols WHERE root = ?1 AND ";
-            if exact {
-                let sql = format!(
-                    "{base} name = ?2 {} ORDER BY path, line",
-                    kind_clause(&kind, 3)
-                );
-                let rows = run_symbol_query(conn, &sql, &root_key, &name, kind.as_deref())?;
-                Ok(rows)
-            } else {
-                // Prefix match; escape LIKE metacharacters.
-                let pattern = format!("{}%", escape_like(&name));
-                let sql = format!(
-                    "{base} name LIKE ?2 ESCAPE '\\' {} ORDER BY path, line",
-                    kind_clause(&kind, 3)
-                );
-                let rows = run_symbol_query(conn, &sql, &root_key, &pattern, kind.as_deref())?;
-                Ok(rows)
-            }
-        })
+                if exact {
+                    let sql = format!(
+                        "{base} name = ?2 {} ORDER BY path, line",
+                        kind_clause(&kind, 3)
+                    );
+                    let rows = run_symbol_query(conn, &sql, &root_key, &name, kind.as_deref())?;
+                    Ok(rows)
+                } else {
+                    // Prefix match; escape LIKE metacharacters.
+                    let pattern = format!("{}%", escape_like(&name));
+                    let sql = format!(
+                        "{base} name LIKE ?2 ESCAPE '\\' {} ORDER BY path, line",
+                        kind_clause(&kind, 3)
+                    );
+                    let rows = run_symbol_query(conn, &sql, &root_key, &pattern, kind.as_deref())?;
+                    Ok(rows)
+                }
+            })
+            .await
     }
 
     /// Identifier occurrences for `word`, grouped by file. `case_insensitive`
     /// matches with `COLLATE NOCASE`.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    pub fn word_hits(
+    pub async fn word_hits(
         &self,
         token: &str,
         case_insensitive: bool,
     ) -> Result<Vec<(String, Vec<i64>)>> {
         let root_key = self.root_key.clone();
         let token = token.to_string();
-        self.db.read_blocking(|conn| {
-            let sql = if case_insensitive {
-                "SELECT path, line FROM intel_identifiers \
+        self.db
+            .read(move |conn| {
+                let sql = if case_insensitive {
+                    "SELECT path, line FROM intel_identifiers \
                  WHERE root = ?1 AND token = ?2 COLLATE NOCASE ORDER BY path, line"
-            } else {
-                "SELECT path, line FROM intel_identifiers \
+                } else {
+                    "SELECT path, line FROM intel_identifiers \
                  WHERE root = ?1 AND token = ?2 ORDER BY path, line"
-            };
-            let mut stmt = conn.prepare(sql)?;
-            let rows = stmt
-                .query_map(rusqlite::params![root_key, token], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut grouped: Vec<(String, Vec<i64>)> = Vec::new();
-            for (path, line) in rows {
-                match grouped.last_mut() {
-                    Some((p, lines)) if *p == path => lines.push(line),
-                    _ => grouped.push((path, vec![line])),
+                };
+                let mut stmt = conn.prepare(sql)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![root_key, token], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut grouped: Vec<(String, Vec<i64>)> = Vec::new();
+                for (path, line) in rows {
+                    match grouped.last_mut() {
+                        Some((p, lines)) if *p == path => lines.push(line),
+                        _ => grouped.push((path, vec![line])),
+                    }
                 }
-            }
-            Ok(grouped)
-        })
+                Ok(grouped)
+            })
+            .await
     }
 
     /// All dependency edges for the project (`deps` / `circular`).
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    pub fn dep_edges(&self) -> Result<Vec<DepEdge>> {
+    pub async fn dep_edges(&self) -> Result<Vec<DepEdge>> {
         let root_key = self.root_key.clone();
-        self.db.read_blocking(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT importer, importee, raw_target, line FROM intel_deps \
+        self.db
+            .read(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT importer, importee, raw_target, line FROM intel_deps \
                  WHERE root = ?1 ORDER BY importer, line",
-            )?;
-            let rows = stmt
-                .query_map([&root_key], |r| {
-                    Ok(DepEdge {
-                        importer: r.get(0)?,
-                        importee: r.get(1)?,
-                        raw_target: r.get(2)?,
-                        line: r.get(3)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+                )?;
+                let rows = stmt
+                    .query_map([&root_key], |r| {
+                        Ok(DepEdge {
+                            importer: r.get(0)?,
+                            importee: r.get(1)?,
+                            raw_target: r.get(2)?,
+                            line: r.get(3)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
     }
 
     /// The materialized per-file centrality scores for this project
     /// (`callgraph::load_centrality`). An absent/empty table yields an
     /// empty map, which the ranking treats as no signal (unranked order).
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    pub fn centrality_scores(&self) -> Result<HashMap<String, f64>> {
+    pub async fn centrality_scores(&self) -> Result<HashMap<String, f64>> {
         let root_key = self.root_key.clone();
-        self.db.write_blocking(move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE;")
-                .context("locking intel centrality generation")?;
-            let result = (|| {
-                let content_generation = load_or_initialize_content_generation(conn, &root_key)?;
-                let built_generation = load_centrality_built_generation(conn, &root_key)?;
-                if built_generation != Some(content_generation) {
-                    record_recompute_centrality(&root_key);
-                    callgraph::recompute_centrality_at_generation(
-                        conn,
-                        &root_key,
-                        content_generation,
-                    )?;
-                }
-                Ok(callgraph::load_centrality(conn, &root_key)?)
-            })();
-            match result {
-                Ok(scores) => {
-                    if let Err(err) = conn.execute_batch("COMMIT;") {
+        self.db
+            .write(move |conn| {
+                conn.execute_batch("BEGIN IMMEDIATE;")
+                    .context("locking intel centrality generation")?;
+                let result = (|| {
+                    let content_generation =
+                        load_or_initialize_content_generation(conn, &root_key)?;
+                    let built_generation = load_centrality_built_generation(conn, &root_key)?;
+                    if built_generation != Some(content_generation) {
+                        record_recompute_centrality(&root_key);
+                        callgraph::recompute_centrality_at_generation(
+                            conn,
+                            &root_key,
+                            content_generation,
+                        )?;
+                    }
+                    Ok(callgraph::load_centrality(conn, &root_key)?)
+                })();
+                match result {
+                    Ok(scores) => {
+                        if let Err(err) = conn.execute_batch("COMMIT;") {
+                            let _ = conn.execute_batch("ROLLBACK;");
+                            Err(err).context("committing intel centrality transaction")
+                        } else {
+                            Ok(scores)
+                        }
+                    }
+                    Err(err) => {
                         let _ = conn.execute_batch("ROLLBACK;");
-                        Err(err).context("committing intel centrality transaction")
-                    } else {
-                        Ok(scores)
+                        Err(err)
                     }
                 }
-                Err(err) => {
-                    let _ = conn.execute_batch("ROLLBACK;");
-                    Err(err)
-                }
-            }
-        })
+            })
+            .await
     }
 
     /// Resolve `name` (+ optional `path`/`kind` disambiguators, matching
     /// `symbol_find`'s exact-match conventions) to the target symbol(s)
     /// for the `impact` tool, returning each as `(path, line, kind)`.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    pub fn impact_targets(
+    pub async fn impact_targets(
         &self,
         name: &str,
         path: Option<&str>,
@@ -1032,34 +1013,37 @@ impl Index {
         let name = name.to_string();
         let path = path.map(|s| s.to_string());
         let kind = kind.map(|s| s.to_string());
-        self.db.read_blocking(|conn| {
-            let mut sql = String::from(
-                "SELECT path, line, kind FROM intel_symbols WHERE root = ?1 AND name = ?2",
-            );
-            let mut params: Vec<Box<dyn rusqlite::ToSql>> =
-                vec![Box::new(root_key.clone()), Box::new(name.clone())];
-            if let Some(p) = &path {
-                params.push(Box::new(p.clone()));
-                sql.push_str(&format!(" AND path = ?{}", params.len()));
-            }
-            if let Some(k) = &kind {
-                params.push(Box::new(k.clone()));
-                sql.push_str(&format!(" AND kind = ?{}", params.len()));
-            }
-            sql.push_str(" ORDER BY path, line");
-            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map(param_refs.as_slice(), |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+        self.db
+            .read(move |conn| {
+                let mut sql = String::from(
+                    "SELECT path, line, kind FROM intel_symbols WHERE root = ?1 AND name = ?2",
+                );
+                let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+                    vec![Box::new(root_key.clone()), Box::new(name.clone())];
+                if let Some(p) = &path {
+                    params.push(Box::new(p.clone()));
+                    sql.push_str(&format!(" AND path = ?{}", params.len()));
+                }
+                if let Some(k) = &kind {
+                    params.push(Box::new(k.clone()));
+                    sql.push_str(&format!(" AND kind = ?{}", params.len()));
+                }
+                sql.push_str(" ORDER BY path, line");
+                let param_refs: Vec<&dyn rusqlite::ToSql> =
+                    params.iter().map(|b| b.as_ref()).collect();
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt
+                    .query_map(param_refs.as_slice(), |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
     }
 
     /// Callers of `target` for the `impact` tool: every `intel_callsites`
@@ -1067,18 +1051,14 @@ impl Index {
     /// definition) to `(target_path, target_line)`. Returns
     /// `(caller_file, caller_line, caller_symbol)`. Ambiguous/unresolved
     /// callsites and denylisted names are omitted (never guessed).
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    pub fn impact_callers(
+    pub async fn impact_callers(
         &self,
         target_path: &str,
         target_line: i64,
     ) -> Result<Vec<(String, i64, Option<String>)>> {
         let root_key = self.root_key.clone();
         let target_path = target_path.to_string();
-        self.db.read_blocking(|conn| {
+        self.db.read(move |conn| {
             // Only callsites naming `target` can possibly resolve to it —
             // restrict by the (root, callee_name) index. The target's own
             // name is what an incoming call writes.
@@ -1112,6 +1092,7 @@ impl Index {
             }
             Ok(out)
         })
+        .await
     }
 
     /// Outgoing calls from `target`'s body for the `impact` tool: every
@@ -1119,39 +1100,41 @@ impl Index {
     /// resolved **high-precision** (exactly one definition) to its callee.
     /// Returns `(callee_name, def_file, def_line)`. Ambiguous/unresolved
     /// callees and denylisted names are omitted.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    pub fn impact_calls(&self, target_name: &str) -> Result<Vec<(String, String, i64)>> {
+    pub async fn impact_calls(&self, target_name: &str) -> Result<Vec<(String, String, i64)>> {
         let root_key = self.root_key.clone();
         let target_name = target_name.to_string();
-        self.db.read_blocking(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT callee_name, callee_kind FROM intel_callsites \
+        self.db
+            .read(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT callee_name, callee_kind FROM intel_callsites \
                  WHERE root = ?1 AND caller_symbol = ?2 ORDER BY callee_name",
-            )?;
-            let rows = stmt
-                .query_map(rusqlite::params![root_key, target_name], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut out = Vec::new();
-            let mut seen: HashSet<(String, String, i64)> = HashSet::new();
-            for (callee_name, callee_kind) in rows {
-                let defs =
-                    callgraph::resolve_defs(conn, &root_key, &callee_name, callee_kind.as_deref())?;
-                if defs.len() == 1 {
-                    let (def_file, def_line) = defs.into_iter().next().unwrap();
-                    let row = (callee_name.clone(), def_file, def_line);
-                    if seen.insert(row.clone()) {
-                        out.push(row);
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![root_key, target_name], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut out = Vec::new();
+                let mut seen: HashSet<(String, String, i64)> = HashSet::new();
+                for (callee_name, callee_kind) in rows {
+                    let defs = callgraph::resolve_defs(
+                        conn,
+                        &root_key,
+                        &callee_name,
+                        callee_kind.as_deref(),
+                    )?;
+                    if defs.len() == 1 {
+                        let (def_file, def_line) = defs.into_iter().next().unwrap();
+                        let row = (callee_name.clone(), def_file, def_line);
+                        if seen.insert(row.clone()) {
+                            out.push(row);
+                        }
                     }
                 }
-            }
-            out.sort();
-            Ok(out)
-        })
+                out.sort();
+                Ok(out)
+            })
+            .await
     }
 }
 
@@ -1988,81 +1971,70 @@ mod tests {
         assert_eq!(parsed.lines, Some(3));
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    fn count_rows(db: &Db, table: &str, root_key: &str, path: &str) -> i64 {
-        db.read_blocking(|conn| {
+    async fn count_rows(db: &Db, table: &str, root_key: &str, path: &str) -> i64 {
+        let table = table.to_string();
+        let root_key = root_key.to_string();
+        let path = path.to_string();
+        db.read(move |conn| {
             let sql = format!("SELECT COUNT(*) FROM {table} WHERE root = ?1 AND path = ?2");
             Ok(conn.query_row(&sql, rusqlite::params![root_key, path], |r| r.get(0))?)
         })
+        .await
         .unwrap()
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    fn stored_index_logic_version(db: &Db, root_key: &str) -> i64 {
-        db.read_blocking(|conn| {
+    async fn stored_index_logic_version(db: &Db, root_key: &str) -> i64 {
+        let root_key = root_key.to_string();
+        db.read(move |conn| {
             Ok(conn.query_row(
                 "SELECT value FROM intel_meta WHERE root = ?1 AND key = 'index_logic_version'",
                 [root_key],
                 |r| r.get(0),
             )?)
         })
+        .await
         .unwrap()
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    fn stored_content_generation(db: &Db, root_key: &str) -> Option<i64> {
-        db.read_blocking(|conn| load_meta_generation(conn, root_key, INTEL_CONTENT_GENERATION_KEY))
+    async fn stored_content_generation(db: &Db, root_key: &str) -> Option<i64> {
+        let root_key = root_key.to_string();
+        db.read(move |conn| load_meta_generation(conn, &root_key, INTEL_CONTENT_GENERATION_KEY))
+            .await
             .unwrap()
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    fn stored_centrality_built_generation(db: &Db, root_key: &str) -> Option<i64> {
-        db.read_blocking(|conn| {
-            load_meta_generation(conn, root_key, CENTRALITY_BUILT_GENERATION_KEY)
-        })
-        .unwrap()
+    async fn stored_centrality_built_generation(db: &Db, root_key: &str) -> Option<i64> {
+        let root_key = root_key.to_string();
+        db.read(move |conn| load_meta_generation(conn, &root_key, CENTRALITY_BUILT_GENERATION_KEY))
+            .await
+            .unwrap()
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    fn indexed_language(db: &Db, root_key: &str, path: &str) -> String {
-        db.read_blocking(|conn| {
+    async fn indexed_language(db: &Db, root_key: &str, path: &str) -> String {
+        let root_key = root_key.to_string();
+        let path = path.to_string();
+        db.read(move |conn| {
             Ok(conn.query_row(
                 "SELECT language FROM intel_files WHERE root = ?1 AND path = ?2",
                 params![root_key, path],
                 |r| r.get(0),
             )?)
         })
+        .await
         .unwrap()
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db-async-intel-and-knowledge"
-    )]
-    fn indexed_paths(db: &Db, root_key: &str) -> Vec<String> {
+    async fn indexed_paths(db: &Db, root_key: &str) -> Vec<String> {
+        let root_key = root_key.to_string();
         let mut paths = db
-            .read_blocking(|conn| {
+            .read(move |conn| {
                 let mut stmt =
                     conn.prepare("SELECT path FROM intel_files WHERE root = ?1 ORDER BY path")?;
                 Ok(stmt
                     .query_map([root_key], |r| r.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?)
             })
+            .await
             .unwrap();
         paths.sort();
         paths
@@ -2083,14 +2055,129 @@ mod tests {
         let index = Index::new(db.clone(), root.clone());
         index.ensure_fresh().await.unwrap();
 
-        let rust = index.symbol_find("Foo", true, None).unwrap();
+        let rust = index.symbol_find("Foo", true, None).await.unwrap();
         assert_eq!(rust.len(), 1, "expected Rust struct Foo");
-        let py = index.symbol_find("Qux", true, None).unwrap();
+        let py = index.symbol_find("Qux", true, None).await.unwrap();
         assert_eq!(py.len(), 1, "expected Python class Qux");
 
-        let tree = index.tree_rows().unwrap();
+        let tree = index.tree_rows().await.unwrap();
         assert!(tree.iter().any(|(p, _, _, _, _)| p == "src/lib.rs"));
         assert!(tree.iter().any(|(p, _, _, _, _)| p == "app.py"));
+    }
+
+    #[tokio::test]
+    async fn db_async_intel_index_pass_uses_async_api_end_to_end() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(
+            &root,
+            "src/lib.rs",
+            "pub struct Widget;\npub fn render() {}\n",
+        );
+
+        let index = Index::new(db, root);
+        let report = index.ensure_fresh().await.unwrap();
+        let symbols = index.symbol_find("Widget", true, None).await.unwrap();
+
+        assert!(
+            report.indexed > 0,
+            "cancelled pass must not mark the unwritten tail fresh"
+        );
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].path, "src/lib.rs");
+    }
+
+    #[tokio::test]
+    async fn db_async_intel_read_tools_return_expected_rows_through_async_api() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(
+            &root,
+            "src/lib.rs",
+            "pub fn target() {}\npub fn caller() { target(); }\n",
+        );
+
+        let index = Index::new(db, root);
+        index.ensure_fresh().await.unwrap();
+
+        let tree = index.tree_rows().await.unwrap();
+        let (outline, imports, language) = index.outline_rows("src/lib.rs").await.unwrap();
+        let hits = index.word_hits("target", false).await.unwrap();
+        let targets = index
+            .impact_targets("target", Some("src/lib.rs"), Some("function"))
+            .await
+            .unwrap();
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(language, "rust");
+        assert!(imports.is_empty());
+        assert!(outline.iter().any(|row| row.name == "target"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn db_async_intel_freshness_metadata_written_after_chunks() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        for i in 0..(CHUNK + 1) {
+            write_file(&root, &format!("src/file_{i:03}.rs"), "pub fn item() {}\n");
+        }
+        let root_key = root.to_string_lossy().into_owned();
+
+        let index = Index::new(db.clone(), root);
+        let cancel = CancellationToken::new();
+        let cancel_after_first = cancel.clone();
+        let err = index
+            .ensure_fresh_scoped(FreshenOptions::default().with_cancel(cancel).with_observer(
+                move |progress| {
+                    if progress.done >= CHUNK {
+                        cancel_after_first.cancel();
+                    }
+                },
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(err.is::<IntelFreshenCancelled>());
+        assert_eq!(indexed_paths(&db, &root_key).await.len(), CHUNK);
+
+        let report = index.ensure_fresh().await.unwrap();
+
+        assert!(
+            report.indexed > 0,
+            "cancelled pass must not mark the unwritten tail fresh"
+        );
+        assert!(stored_content_generation(&db, &root_key).await.is_some());
+        assert_eq!(indexed_paths(&db, &root_key).await.len(), CHUNK + 1);
+    }
+
+    #[tokio::test]
+    async fn db_async_intel_session_write_completes_during_index_pass() {
+        clear_freshness_cache();
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        for i in 0..(CHUNK + 1) {
+            write_file(&root, &format!("src/file_{i:03}.rs"), "pub fn item() {}\n");
+        }
+        let index = Index::new(db.clone(), root);
+
+        let index_task = tokio::spawn(async move { index.ensure_fresh().await });
+        let session = db
+            .create_session("project", "/tmp/project", "Build")
+            .await
+            .unwrap();
+        let report = index_task.await.unwrap().unwrap();
+
+        assert_eq!(session.project_id, "project");
+        assert_eq!(report.indexed, CHUNK + 1);
     }
 
     #[tokio::test]
@@ -2112,9 +2199,13 @@ mod tests {
             disk.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
             vec!["a/one.rs"]
         );
-        assert_eq!(index.symbol_find("one", true, None).unwrap().len(), 1);
+        assert_eq!(index.symbol_find("one", true, None).await.unwrap().len(), 1);
         assert!(
-            index.symbol_find("two", true, None).unwrap().is_empty(),
+            index
+                .symbol_find("two", true, None)
+                .await
+                .unwrap()
+                .is_empty(),
             "scoped refresh must not index files outside the scoped subtree"
         );
     }
@@ -2133,7 +2224,7 @@ mod tests {
         index.ensure_fresh().await.unwrap();
 
         assert_eq!(
-            indexed_paths(&db, &root.to_string_lossy()),
+            indexed_paths(&db, &root.to_string_lossy()).await,
             vec!["src/z.rs"],
             "built-in exclusions should prune node_modules and target"
         );
@@ -2154,7 +2245,7 @@ mod tests {
         index.ensure_fresh().await.unwrap();
 
         assert_eq!(
-            indexed_paths(&db, &root.to_string_lossy()),
+            indexed_paths(&db, &root.to_string_lossy()).await,
             vec!["node_modules/x.js", "src/z.rs"],
             "configured exclude_dirs replaces the built-in list"
         );
@@ -2188,7 +2279,7 @@ mod tests {
             vec!["node_modules/pkg/index.js"]
         );
         assert_eq!(
-            indexed_paths(&db, &root.to_string_lossy()),
+            indexed_paths(&db, &root.to_string_lossy()).await,
             vec!["node_modules/pkg/index.js"],
             "explicit scope root inside an excluded dir is walked, nested excluded dirs are pruned"
         );
@@ -2213,7 +2304,7 @@ mod tests {
         let index = Index::new(db.clone(), root.clone());
 
         index.ensure_fresh().await.unwrap();
-        assert_eq!(indexed_paths(&db, &root_key), vec!["src/z.rs"]);
+        assert_eq!(indexed_paths(&db, &root_key).await, vec!["src/z.rs"]);
         assert_eq!(walks.load(Ordering::SeqCst), 1);
 
         index
@@ -2226,7 +2317,7 @@ mod tests {
             "an unscoped cache pruned by exclusions must not satisfy an explicit excluded scope"
         );
         assert_eq!(
-            indexed_paths(&db, &root_key),
+            indexed_paths(&db, &root_key).await,
             vec!["node_modules/pkg/index.js", "src/z.rs"]
         );
 
@@ -2255,7 +2346,7 @@ mod tests {
             .ensure_fresh()
             .await
             .unwrap();
-        assert_eq!(indexed_paths(&db, &root_key), vec!["src/z.rs"]);
+        assert_eq!(indexed_paths(&db, &root_key).await, vec!["src/z.rs"]);
 
         Index::new(db.clone(), root)
             .with_exclude_dirs(vec![])
@@ -2268,7 +2359,7 @@ mod tests {
             "changing exclude_dirs must not reuse the previous policy's cache"
         );
         assert_eq!(
-            indexed_paths(&db, &root_key),
+            indexed_paths(&db, &root_key).await,
             vec!["node_modules/pkg/index.js", "src/z.rs"]
         );
 
@@ -2298,7 +2389,7 @@ mod tests {
         assert_eq!(report.discovered, 30);
         assert!(report.truncated);
         assert_eq!(
-            indexed_paths(&db, &root.to_string_lossy()),
+            indexed_paths(&db, &root.to_string_lossy()).await,
             (0..10)
                 .map(|i| format!("top_{i:02}.rs"))
                 .collect::<Vec<_>>(),
@@ -2329,7 +2420,7 @@ mod tests {
         let report = capped.ensure_fresh().await.unwrap();
         assert!(report.truncated);
         assert_eq!(walks.load(Ordering::SeqCst), 1);
-        assert_eq!(indexed_paths(&db, &root_key), vec!["a.rs"]);
+        assert_eq!(indexed_paths(&db, &root_key).await, vec!["a.rs"]);
 
         capped
             .ensure_fresh_scoped(crate::intel::FreshenOptions::scoped("deep"))
@@ -2340,7 +2431,10 @@ mod tests {
             2,
             "truncated unscoped freshen must not satisfy later scoped freshen from cache"
         );
-        assert_eq!(indexed_paths(&db, &root_key), vec!["a.rs", "deep/b.rs"]);
+        assert_eq!(
+            indexed_paths(&db, &root_key).await,
+            vec!["a.rs", "deep/b.rs"]
+        );
 
         set_test_walk_counter(None, None);
         clear_freshness_cache();
@@ -2364,7 +2458,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is::<IntelFreshenCancelled>());
-        assert!(indexed_paths(&db, &root_key).is_empty());
+        assert!(indexed_paths(&db, &root_key).await.is_empty());
 
         let cancel = CancellationToken::new();
         let cancel_after_first = cancel.clone();
@@ -2379,7 +2473,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is::<IntelFreshenCancelled>());
-        let indexed = indexed_paths(&db, &root_key);
+        let indexed = indexed_paths(&db, &root_key).await;
         assert_eq!(
             indexed.len(),
             CHUNK,
@@ -2435,11 +2529,15 @@ mod tests {
             .unwrap();
 
         assert!(
-            index.symbol_find("one", true, None).unwrap().is_empty(),
+            index
+                .symbol_find("one", true, None)
+                .await
+                .unwrap()
+                .is_empty(),
             "deleted file inside the scoped subtree should be removed"
         );
         assert_eq!(
-            index.symbol_find("two", true, None).unwrap().len(),
+            index.symbol_find("two", true, None).await.unwrap().len(),
             1,
             "scoped refresh must not delete indexed rows outside the subtree"
         );
@@ -2463,6 +2561,7 @@ mod tests {
         assert!(
             index
                 .dep_edges()
+                .await
                 .unwrap()
                 .iter()
                 .any(|edge| edge.importer == "src/app.ts"
@@ -2484,6 +2583,7 @@ mod tests {
         assert!(
             index
                 .dep_edges()
+                .await
                 .unwrap()
                 .iter()
                 .any(|edge| edge.importer == "src/app.ts"
@@ -2511,7 +2611,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            index.dep_edges().unwrap().iter().any(|edge| {
+            index.dep_edges().await.unwrap().iter().any(|edge| {
                 edge.importer == "src/app.ts"
                     && edge.raw_target == "../shared/util"
                     && edge.importee.is_none()
@@ -2525,6 +2625,7 @@ mod tests {
         assert!(
             index
                 .dep_edges()
+                .await
                 .unwrap()
                 .iter()
                 .any(|edge| edge.importer == "src/app.ts"
@@ -2546,7 +2647,7 @@ mod tests {
         let index = Index::new(db, root);
         index.ensure_fresh().await.unwrap();
 
-        let rows = index.tree_rows_scoped(Some("src")).unwrap();
+        let rows = index.tree_rows_scoped(Some("src")).await.unwrap();
         assert_eq!(
             rows.iter()
                 .map(|(path, _, _, _, _)| path.as_str())
@@ -2556,6 +2657,7 @@ mod tests {
         assert!(
             index
                 .tree_rows_scoped(Some("tests"))
+                .await
                 .unwrap()
                 .iter()
                 .all(|(path, _, _, _, _)| path.starts_with("tests/"))
@@ -2645,10 +2747,10 @@ mod tests {
         let index = Index::new(db.clone(), root.clone());
         index.ensure_fresh().await.unwrap();
 
-        let stored_version = stored_index_logic_version(&db, &root_key);
+        let stored_version = stored_index_logic_version(&db, &root_key).await;
         assert_eq!(stored_version, INTEL_INDEX_LOGIC_VERSION);
         assert_eq!(
-            indexed_language(&db, &root_key, "Dockerfile.dev"),
+            indexed_language(&db, &root_key, "Dockerfile.dev").await,
             "dockerfile"
         );
 
@@ -2665,7 +2767,7 @@ mod tests {
         clear_freshness_cache();
         index.ensure_fresh().await.unwrap();
         assert_eq!(
-            indexed_language(&db, &root_key, "Dockerfile.dev"),
+            indexed_language(&db, &root_key, "Dockerfile.dev").await,
             "unknown",
             "matching logic version should preserve unchanged rows"
         );
@@ -2683,10 +2785,10 @@ mod tests {
         clear_freshness_cache();
         index.ensure_fresh().await.unwrap();
         assert_eq!(
-            indexed_language(&db, &root_key, "Dockerfile.dev"),
+            indexed_language(&db, &root_key, "Dockerfile.dev").await,
             "dockerfile"
         );
-        let stored_version = stored_index_logic_version(&db, &root_key);
+        let stored_version = stored_index_logic_version(&db, &root_key).await;
         assert_eq!(stored_version, INTEL_INDEX_LOGIC_VERSION);
     }
 
@@ -2707,11 +2809,11 @@ mod tests {
         index_a.ensure_fresh().await.unwrap();
         index_b.ensure_fresh().await.unwrap();
         assert_eq!(
-            stored_index_logic_version(&db, &root_key_a),
+            stored_index_logic_version(&db, &root_key_a).await,
             INTEL_INDEX_LOGIC_VERSION
         );
         assert_eq!(
-            stored_index_logic_version(&db, &root_key_b),
+            stored_index_logic_version(&db, &root_key_b).await,
             INTEL_INDEX_LOGIC_VERSION
         );
 
@@ -2734,20 +2836,20 @@ mod tests {
         clear_freshness_cache();
         index_a.ensure_fresh().await.unwrap();
         assert_eq!(
-            indexed_language(&db, &root_key_a, "Dockerfile.dev"),
+            indexed_language(&db, &root_key_a, "Dockerfile.dev").await,
             "dockerfile"
         );
         assert_eq!(
-            stored_index_logic_version(&db, &root_key_a),
+            stored_index_logic_version(&db, &root_key_a).await,
             INTEL_INDEX_LOGIC_VERSION
         );
         assert_eq!(
-            indexed_language(&db, &root_key_b, "Dockerfile.dev"),
+            indexed_language(&db, &root_key_b, "Dockerfile.dev").await,
             "unknown",
             "root A reindex must not rewrite root B rows"
         );
         assert_eq!(
-            stored_index_logic_version(&db, &root_key_b),
+            stored_index_logic_version(&db, &root_key_b).await,
             INTEL_INDEX_LOGIC_VERSION + 1,
             "root A version write must not satisfy root B"
         );
@@ -2755,11 +2857,11 @@ mod tests {
         clear_freshness_cache();
         index_b.ensure_fresh().await.unwrap();
         assert_eq!(
-            indexed_language(&db, &root_key_b, "Dockerfile.dev"),
+            indexed_language(&db, &root_key_b, "Dockerfile.dev").await,
             "dockerfile"
         );
         assert_eq!(
-            stored_index_logic_version(&db, &root_key_b),
+            stored_index_logic_version(&db, &root_key_b).await,
             INTEL_INDEX_LOGIC_VERSION
         );
     }
@@ -2781,7 +2883,10 @@ mod tests {
         let bare = Index::new(db.clone(), root.clone());
         bare.ensure_fresh().await.unwrap();
         assert!(
-            bare.symbol_find("gen", true, None).unwrap().is_empty(),
+            bare.symbol_find("gen", true, None)
+                .await
+                .unwrap()
+                .is_empty(),
             "gitignored file must not index by default"
         );
 
@@ -2790,12 +2895,15 @@ mod tests {
             Index::with_allowlist(db.clone(), root.clone(), vec!["generated/".to_string()]);
         allowed.ensure_fresh().await.unwrap();
         assert_eq!(
-            allowed.symbol_find("gen", true, None).unwrap().len(),
+            allowed.symbol_find("gen", true, None).await.unwrap().len(),
             1,
             "allowlisted gitignored file must index"
         );
         // The tracked file still indexes too.
-        assert_eq!(allowed.symbol_find("keep", true, None).unwrap().len(), 1);
+        assert_eq!(
+            allowed.symbol_find("keep", true, None).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2809,7 +2917,7 @@ mod tests {
 
         let index = Index::new(db.clone(), root.clone());
         index.ensure_fresh().await.unwrap();
-        assert_eq!(count_rows(&db, "intel_symbols", &root_key, "a.rs"), 1);
+        assert_eq!(count_rows(&db, "intel_symbols", &root_key, "a.rs").await, 1);
 
         // Edit a.rs (add a symbol) then DELETE b.rs.
         write_file(&root, "a.rs", "pub fn alpha() {}\npub fn alpha2() {}\n");
@@ -2818,10 +2926,10 @@ mod tests {
         index.ensure_fresh().await.unwrap();
 
         // b.rs: no stale file or symbol rows.
-        assert_eq!(count_rows(&db, "intel_files", &root_key, "b.rs"), 0);
-        assert_eq!(count_rows(&db, "intel_symbols", &root_key, "b.rs"), 0);
+        assert_eq!(count_rows(&db, "intel_files", &root_key, "b.rs").await, 0);
+        assert_eq!(count_rows(&db, "intel_symbols", &root_key, "b.rs").await, 0);
         // a.rs: re-indexed to 2 symbols.
-        assert_eq!(count_rows(&db, "intel_symbols", &root_key, "a.rs"), 2);
+        assert_eq!(count_rows(&db, "intel_symbols", &root_key, "a.rs").await, 2);
     }
 
     #[tokio::test]
@@ -2835,7 +2943,7 @@ mod tests {
         index.ensure_fresh().await.unwrap();
 
         // No callsite to `target` yet → lib.rs has zero in-degree weight.
-        let before = index.centrality_scores().unwrap();
+        let before = index.centrality_scores().await.unwrap();
         let before_score = before.get("lib.rs").copied().unwrap_or(0.0);
         assert_eq!(before_score, 0.0, "no calls yet, got {before:?}");
 
@@ -2849,7 +2957,7 @@ mod tests {
         index.ensure_fresh().await.unwrap();
 
         // Centrality now reflects the new edge — no stale zero.
-        let after = index.centrality_scores().unwrap();
+        let after = index.centrality_scores().await.unwrap();
         let after_score = after.get("lib.rs").copied().unwrap_or(0.0);
         assert!(
             after_score > before_score,
@@ -2868,6 +2976,7 @@ mod tests {
         index.ensure_fresh().await.unwrap();
         let with_caller = index
             .centrality_scores()
+            .await
             .unwrap()
             .get("lib.rs")
             .copied()
@@ -2880,6 +2989,7 @@ mod tests {
         index.ensure_fresh().await.unwrap();
         let after = index
             .centrality_scores()
+            .await
             .unwrap()
             .get("lib.rs")
             .copied()
@@ -2900,14 +3010,14 @@ mod tests {
 
         let recomputes = Arc::new(AtomicUsize::new(0));
         set_test_recompute_counter(Some(root_key.clone()), Some(recomputes.clone()));
-        let before = index.centrality_scores().unwrap();
+        let before = index.centrality_scores().await.unwrap();
         assert_eq!(recomputes.load(Ordering::SeqCst), 1);
 
         write_file(&root, "caller.rs", "pub fn caller() {\n    target();\n}\n");
         clear_freshness_cache();
         index.ensure_fresh().await.unwrap();
 
-        let after = index.centrality_scores().unwrap();
+        let after = index.centrality_scores().await.unwrap();
         assert_eq!(recomputes.load(Ordering::SeqCst), 2);
         assert_ne!(before, after);
         assert!(
@@ -2927,7 +3037,9 @@ mod tests {
         write_file(&root, "x.rs", body);
         let index = Index::new(db.clone(), root.clone());
         index.ensure_fresh().await.unwrap();
-        let before = stored_content_generation(&db, &root_key).expect("generation exists");
+        let before = stored_content_generation(&db, &root_key)
+            .await
+            .expect("generation exists");
 
         let write_root_key = root_key.clone();
         db.write(move |conn| {
@@ -2942,7 +3054,10 @@ mod tests {
         clear_freshness_cache();
         index.ensure_fresh().await.unwrap();
 
-        assert_eq!(stored_content_generation(&db, &root_key), Some(before));
+        assert_eq!(
+            stored_content_generation(&db, &root_key).await,
+            Some(before)
+        );
     }
 
     #[tokio::test]
@@ -2963,14 +3078,14 @@ mod tests {
         let recomputes = Arc::new(AtomicUsize::new(0));
         set_test_recompute_counter(Some(root_key.clone()), Some(recomputes.clone()));
         let second = Index::new(db.clone(), root.clone());
-        let first_scores = first.centrality_scores().unwrap();
-        let second_scores = second.centrality_scores().unwrap();
+        let first_scores = first.centrality_scores().await.unwrap();
+        let second_scores = second.centrality_scores().await.unwrap();
 
         assert_eq!(recomputes.load(Ordering::SeqCst), 1);
         assert_eq!(first_scores, second_scores);
         assert_eq!(
-            stored_centrality_built_generation(&db, &root_key),
-            stored_content_generation(&db, &root_key)
+            stored_centrality_built_generation(&db, &root_key).await,
+            stored_content_generation(&db, &root_key).await
         );
         set_test_recompute_counter(None, None);
     }
@@ -2990,33 +3105,33 @@ mod tests {
         let index_b = Index::new(db.clone(), root_b.clone());
         index_a.ensure_fresh().await.unwrap();
         index_b.ensure_fresh().await.unwrap();
-        index_a.centrality_scores().unwrap();
-        index_b.centrality_scores().unwrap();
-        assert_eq!(stored_content_generation(&db, &root_key_a), Some(1));
-        assert_eq!(stored_content_generation(&db, &root_key_b), Some(1));
+        index_a.centrality_scores().await.unwrap();
+        index_b.centrality_scores().await.unwrap();
+        assert_eq!(stored_content_generation(&db, &root_key_a).await, Some(1));
+        assert_eq!(stored_content_generation(&db, &root_key_b).await, Some(1));
         assert_eq!(
-            stored_centrality_built_generation(&db, &root_key_a),
-            stored_content_generation(&db, &root_key_a)
+            stored_centrality_built_generation(&db, &root_key_a).await,
+            stored_content_generation(&db, &root_key_a).await
         );
         assert_eq!(
-            stored_centrality_built_generation(&db, &root_key_b),
-            stored_content_generation(&db, &root_key_b)
+            stored_centrality_built_generation(&db, &root_key_b).await,
+            stored_content_generation(&db, &root_key_b).await
         );
 
         write_file(&root_a, "a2.rs", "pub fn a2() { a(); }\n");
         clear_freshness_cache();
         index_a.ensure_fresh().await.unwrap();
 
-        assert_eq!(stored_content_generation(&db, &root_key_a), Some(2));
-        assert_eq!(stored_content_generation(&db, &root_key_b), Some(1));
+        assert_eq!(stored_content_generation(&db, &root_key_a).await, Some(2));
+        assert_eq!(stored_content_generation(&db, &root_key_b).await, Some(1));
         assert_ne!(
-            stored_centrality_built_generation(&db, &root_key_a),
-            stored_content_generation(&db, &root_key_a),
+            stored_centrality_built_generation(&db, &root_key_a).await,
+            stored_content_generation(&db, &root_key_a).await,
             "root A should be stale after its write"
         );
         assert_eq!(
-            stored_centrality_built_generation(&db, &root_key_b),
-            stored_content_generation(&db, &root_key_b),
+            stored_centrality_built_generation(&db, &root_key_b).await,
+            stored_content_generation(&db, &root_key_b).await,
             "root A writes must not make root B stale"
         );
     }
@@ -3031,7 +3146,9 @@ mod tests {
         write_file(&root, "other/b.rs", "pub fn b() {}\n");
         let index = Index::new(db.clone(), root.clone());
         index.ensure_fresh().await.unwrap();
-        let before = stored_content_generation(&db, &root_key).expect("generation exists");
+        let before = stored_content_generation(&db, &root_key)
+            .await
+            .expect("generation exists");
 
         write_file(&root, "src/c.rs", "pub fn c() { a(); }\n");
         clear_freshness_cache();
@@ -3040,7 +3157,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stored_content_generation(&db, &root_key), Some(before + 1));
+        assert_eq!(
+            stored_content_generation(&db, &root_key).await,
+            Some(before + 1)
+        );
     }
 
     #[tokio::test]
@@ -3053,7 +3173,7 @@ mod tests {
         index.ensure_fresh().await.unwrap();
         // Second pass with no changes must not error or duplicate rows.
         index.ensure_fresh().await.unwrap();
-        let hits = index.symbol_find("x", true, None).unwrap();
+        let hits = index.symbol_find("x", true, None).await.unwrap();
         assert_eq!(hits.len(), 1);
     }
 }

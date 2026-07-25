@@ -42,7 +42,7 @@ impl From<crate::db::skill_pairs::SkillPairRow> for SkillPair {
 /// orphaned tool call or unanswered result). The ledger entries for the
 /// stripped pairs are dropped; a steering pair (none today) is retained.
 impl Driver {
-    pub(in crate::engine::driver) fn strip_abandoned_skill_pairs(&mut self, owner: &str) {
+    pub(in crate::engine::driver) async fn strip_abandoned_skill_pairs(&mut self, owner: &str) {
         let ids: std::collections::HashSet<String> = self
             .skill_pairs
             .iter()
@@ -56,7 +56,7 @@ impl Driver {
         history.retain(|msg| !message_references_call_id(msg, &ids));
         self.skill_pairs
             .retain(|p| p.intentional_steer || p.owner != owner);
-        self.delete_persisted_skill_pairs(ids.iter());
+        self.delete_persisted_skill_pairs(ids.iter()).await;
     }
 
     /// Restore the persisted skill-pair ownership ledger after model-history
@@ -78,6 +78,7 @@ impl Driver {
             .session
             .db
             .list_skill_pairs(self.session.id)
+            .await
             .map(|rows| rows.into_iter().map(SkillPair::from).collect())
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "loading skill-pair ownership failed");
@@ -93,12 +94,17 @@ impl Driver {
                 .await;
             inferred.retain(|pair| !known.contains(&pair.call_id));
             for pair in &inferred {
-                if let Err(e) = self.session.db.save_skill_pair(
-                    self.session.id,
-                    &pair.call_id,
-                    &pair.owner,
-                    pair.intentional_steer,
-                ) {
+                if let Err(e) = self
+                    .session
+                    .db
+                    .save_skill_pair(
+                        self.session.id,
+                        &pair.call_id,
+                        &pair.owner,
+                        pair.intentional_steer,
+                    )
+                    .await
+                {
                     tracing::warn!(error = %e, call_id = %pair.call_id, "persisting reconstructed skill-pair ownership failed");
                 }
             }
@@ -139,7 +145,7 @@ impl Driver {
         pairs
     }
 
-    pub(in crate::engine::driver) fn delete_persisted_skill_pairs<'a, I>(&self, call_ids: I)
+    pub(in crate::engine::driver) async fn delete_persisted_skill_pairs<'a, I>(&self, call_ids: I)
     where
         I: IntoIterator<Item = &'a String>,
     {
@@ -147,7 +153,12 @@ impl Driver {
         if ids.is_empty() {
             return;
         }
-        if let Err(e) = self.session.db.delete_skill_pairs(self.session.id, ids) {
+        if let Err(e) = self
+            .session
+            .db
+            .delete_skill_pairs(self.session.id, ids)
+            .await
+        {
             tracing::warn!(error = %e, "deleting persisted skill-pair ownership failed");
         }
     }
@@ -958,10 +969,11 @@ impl Driver {
             owner: agent.name.clone(),
             intentional_steer: false,
         });
-        if let Err(e) =
-            self.session
-                .db
-                .save_skill_pair(self.session.id, &call_id, &agent.name, false)
+        if let Err(e) = self
+            .session
+            .db
+            .save_skill_pair(self.session.id, &call_id, &agent.name, false)
+            .await
         {
             tracing::warn!(error = %e, "persisting skill-pair ownership failed");
         }

@@ -3,7 +3,7 @@ use super::*;
 /// Import one local directory as either a Git-managed package (default) or
 /// an exact local/path package (`as_path`). Git imports read metadata from the
 /// source checkout but store a Cockpit-owned clone path.
-pub fn import_package(
+pub async fn import_package(
     db: &Db,
     cwd: &Path,
     package_dir: &Path,
@@ -11,7 +11,7 @@ pub fn import_package(
     as_path: bool,
 ) -> Result<PackageImportSummary> {
     let mut summary = PackageImportSummary::default();
-    match import_one(db, cwd, package_dir, id, as_path) {
+    match import_one(db, cwd, package_dir, id, as_path).await {
         Ok(outcome) => summary.add_outcome(outcome),
         Err(err) => summary.failures.push(PackageImportFailure {
             path: package_dir.to_path_buf(),
@@ -23,7 +23,7 @@ pub fn import_package(
 
 /// Import immediate child directories from `dir`. This intentionally does not
 /// recurse; non-directories and non-Git children are skipped with warnings.
-pub fn import_package_directory(
+pub async fn import_package_directory(
     db: &Db,
     cwd: &Path,
     dir: &Path,
@@ -67,7 +67,7 @@ pub fn import_package_directory(
             ));
             continue;
         }
-        match import_one(db, cwd, &path, None, as_path) {
+        match import_one(db, cwd, &path, None, as_path).await {
             Ok(outcome) => summary.add_outcome(outcome),
             Err(err) => summary.failures.push(PackageImportFailure {
                 path,
@@ -78,7 +78,7 @@ pub fn import_package_directory(
     Ok(summary)
 }
 
-fn import_one(
+async fn import_one(
     db: &Db,
     cwd: &Path,
     package_dir: &Path,
@@ -89,7 +89,7 @@ fn import_one(
         .map(str::to_string)
         .unwrap_or_else(|| derive_package_identifier(package_dir));
     if as_path {
-        add_local(db, &identifier, package_dir)?;
+        add_local(db, &identifier, package_dir).await?;
         return Ok(PackageImportOutcome::Imported);
     }
 
@@ -106,8 +106,8 @@ fn import_one(
         )
     })?;
     let branch = git_current_branch(package_dir);
-    let deduped = db.package_by_source_url(&remote)?.is_some();
-    add_git(db, cwd, &identifier, &remote, branch.as_deref(), true)?;
+    let deduped = db.package_by_source_url(&remote).await?.is_some();
+    add_git(db, cwd, &identifier, &remote, branch.as_deref(), true).await?;
     Ok(if deduped {
         PackageImportOutcome::Deduped
     } else {
@@ -216,7 +216,7 @@ fn git_current_branch(path: &Path) -> Option<String> {
     }
 }
 
-pub(super) fn add_git_with_prepare_scope(
+pub(super) async fn add_git_with_prepare_scope(
     db: &Db,
     cwd: &Path,
     identifier: &str,
@@ -229,19 +229,21 @@ pub(super) fn add_git_with_prepare_scope(
     let (dir, dest) = clone_destination(cwd, identifier)?;
 
     // Repo dedupe: reuse an existing clone for the same URL.
-    if let Some(existing) = db.package_by_source_url(url)? {
-        return db.upsert_package(&NewPackage {
-            identifier: identifier.to_string(),
-            display_name: identifier.to_string(),
-            source_type: SourceType::Git,
-            source_url: Some(url.to_string()),
-            source_branch: branch
-                .map(str::to_string)
-                .or(existing.source_branch.clone()),
-            path: existing.path.clone(),
-            shallow: existing.shallow,
-            prepare_scope: prepare_scope.to_string(),
-        });
+    if let Some(existing) = db.package_by_source_url(url).await? {
+        return db
+            .upsert_package(&NewPackage {
+                identifier: identifier.to_string(),
+                display_name: identifier.to_string(),
+                source_type: SourceType::Git,
+                source_url: Some(url.to_string()),
+                source_branch: branch
+                    .map(str::to_string)
+                    .or(existing.source_branch.clone()),
+                path: existing.path.clone(),
+                shallow: existing.shallow,
+                prepare_scope: prepare_scope.to_string(),
+            })
+            .await;
     }
 
     std::fs::create_dir_all(&dir)
@@ -250,16 +252,18 @@ pub(super) fn add_git_with_prepare_scope(
     // Concurrency: if the destination already holds a clone (a racing
     // caller got there first), reuse it rather than re-cloning.
     if dest.join(".git").is_dir() {
-        return db.upsert_package(&NewPackage {
-            identifier: identifier.to_string(),
-            display_name: identifier.to_string(),
-            source_type: SourceType::Git,
-            source_url: Some(url.to_string()),
-            source_branch: branch.map(str::to_string),
-            path: dest.to_string_lossy().into_owned(),
-            shallow,
-            prepare_scope: prepare_scope.to_string(),
-        });
+        return db
+            .upsert_package(&NewPackage {
+                identifier: identifier.to_string(),
+                display_name: identifier.to_string(),
+                source_type: SourceType::Git,
+                source_url: Some(url.to_string()),
+                source_branch: branch.map(str::to_string),
+                path: dest.to_string_lossy().into_owned(),
+                shallow,
+                prepare_scope: prepare_scope.to_string(),
+            })
+            .await;
     }
 
     git_clone(url, &dest, branch, shallow)
@@ -275,6 +279,7 @@ pub(super) fn add_git_with_prepare_scope(
         shallow,
         prepare_scope: prepare_scope.to_string(),
     })
+    .await
 }
 
 /// Import packages from kcl's registry that cockpit doesn't already have.
@@ -288,11 +293,11 @@ pub(super) fn add_git_with_prepare_scope(
 /// Dedupe matches the registry's own: by `identifier`, and additionally
 /// by `source_url` for Git packages (so a repo cockpit already tracks
 /// under a different identifier isn't re-imported).
-pub fn import_from_kcl(db: &Db, cwd: &Path) -> Result<KclImport> {
+pub async fn import_from_kcl(db: &Db, cwd: &Path) -> Result<KclImport> {
     if let Some(manifest) = export_kcl_packages()? {
-        return import_kcl_manifest(db, cwd, &manifest);
+        return import_kcl_manifest(db, cwd, &manifest).await;
     }
-    import_from_legacy_kcl_db(db)
+    import_from_legacy_kcl_db(db).await
 }
 
 fn export_kcl_packages() -> Result<Option<String>> {
@@ -309,7 +314,7 @@ fn export_kcl_packages() -> Result<Option<String>> {
         .map(Some)
 }
 
-pub(super) fn import_kcl_manifest(db: &Db, cwd: &Path, manifest: &str) -> Result<KclImport> {
+pub(super) async fn import_kcl_manifest(db: &Db, cwd: &Path, manifest: &str) -> Result<KclImport> {
     let manifest: KclPackageManifest =
         serde_json::from_str(manifest).context("parsing `kcl packages export` manifest")?;
     if manifest.version != 1 {
@@ -322,10 +327,10 @@ pub(super) fn import_kcl_manifest(db: &Db, cwd: &Path, manifest: &str) -> Result
     let mut added = 0u32;
     for entry in manifest.packages {
         validate_prepare_scope(&entry.prepare_scope)?;
-        if db.package_by_identifier(&entry.identifier)?.is_some() {
+        if db.package_by_identifier(&entry.identifier).await?.is_some() {
             continue;
         }
-        if db.package_by_source_url(&entry.git)?.is_some() {
+        if db.package_by_source_url(&entry.git).await?.is_some() {
             continue;
         }
         add_git_with_prepare_scope(
@@ -336,7 +341,8 @@ pub(super) fn import_kcl_manifest(db: &Db, cwd: &Path, manifest: &str) -> Result
             entry.branch.as_deref(),
             entry.shallow,
             &entry.prepare_scope,
-        )?;
+        )
+        .await?;
         added += 1;
     }
     Ok(KclImport::Imported(added))
@@ -353,7 +359,7 @@ pub(super) fn default_prepare_scope() -> String {
     "global".to_string()
 }
 
-pub(super) fn import_from_legacy_kcl_db(db: &Db) -> Result<KclImport> {
+pub(super) async fn import_from_legacy_kcl_db(db: &Db) -> Result<KclImport> {
     let kcl_db_path = kcl_db_path()?;
     if !kcl_db_path.exists() {
         return Ok(KclImport::NoKclDb(kcl_db_path));
@@ -394,16 +400,16 @@ pub(super) fn import_from_legacy_kcl_db(db: &Db) -> Result<KclImport> {
     for row in rows {
         let pkg = row.context("decoding kcl package row")?;
         // Skip if we already have this identifier, or (for Git) this repo.
-        if db.package_by_identifier(&pkg.identifier)?.is_some() {
+        if db.package_by_identifier(&pkg.identifier).await?.is_some() {
             continue;
         }
         if pkg.source_type == SourceType::Git
             && let Some(url) = &pkg.source_url
-            && db.package_by_source_url(url)?.is_some()
+            && db.package_by_source_url(url).await?.is_some()
         {
             continue;
         }
-        let (_, inserted) = db.insert_package_if_absent(&pkg)?;
+        let (_, inserted) = db.insert_package_if_absent(&pkg).await?;
         if inserted {
             added += 1;
         }

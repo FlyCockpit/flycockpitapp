@@ -18,7 +18,7 @@ pub async fn run(cmd: KclCommand) -> Result<()> {
 async fn import() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let db = Db::open_default()?;
-    match import_from_kcl(&db, &cwd)? {
+    match import_from_kcl(&db, &cwd).await? {
         KclImport::Imported(n) => {
             println!("Imported {n} package(s) from kcl.");
         }

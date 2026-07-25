@@ -8,7 +8,6 @@ import {
   reconcileRecordedUserMessage,
   reduceNativeSessionEvent,
   removeOptimisticUserMessage,
-  resolveResponseForInterrupt,
   warnNativeSessionEvent,
 } from "./session-events";
 
@@ -283,45 +282,6 @@ describe("native session event helpers", () => {
         "1",
       ),
     ).toEqual([{ id: "assistant:11", kind: "assistant_text", seq: 11, text: "still here" }]);
-  });
-
-  it("maps minimal interrupt answers to ResolveResponse variants", () => {
-    expect(
-      resolveResponseForInterrupt(
-        {
-          kind: "single",
-          data: {
-            prompt: "Approve?",
-            options: [{ id: "approve_once", label: "Approve once" }],
-            permission: true,
-          },
-        },
-        "approve",
-        "",
-      ),
-    ).toEqual({ kind: "single", data: { selected_id: "approve_once" } });
-
-    expect(
-      resolveResponseForInterrupt(
-        { kind: "freetext", data: { prompt: "Why?" } },
-        "answer",
-        "because",
-      ),
-    ).toEqual({ kind: "freetext", data: { text: "because" } });
-
-    expect(
-      resolveResponseForInterrupt(
-        {
-          kind: "single",
-          data: {
-            prompt: "Approve?",
-            options: [{ id: "approve_once", label: "Approve once" }],
-          },
-        },
-        "deny",
-        "",
-      ),
-    ).toEqual({ kind: "cancel" });
   });
 
   it("adds and resolves interrupt events", () => {

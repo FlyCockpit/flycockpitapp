@@ -4,7 +4,6 @@ import {
   eventEnvelopeSchema,
   type HistoryEntry,
   type InterruptQuestion,
-  type ResolveResponse,
 } from "@flycockpit/cockpit-protocol";
 import { daemonStateReducer, emptyNativeDaemonState, type NativeDaemonState } from "./daemon-state";
 import {
@@ -84,8 +83,6 @@ export type NativeAttachRuntimeState = {
   activeModel: ActiveModelState | null;
   llmMode: string | null;
 };
-
-export type InterruptResolutionAction = "approve" | "deny" | "answer";
 
 const pendingAssistantId = "assistant:pending";
 const pendingUserPrefix = "user:pending:";
@@ -546,19 +543,4 @@ export function reduceNativeSessionEvent(
 
 export function warnNativeSessionEvent(result: NativeSessionEventResult) {
   if (result.warning) console.warn(result.warning);
-}
-
-export function resolveResponseForInterrupt(
-  question: InterruptQuestion,
-  action: InterruptResolutionAction,
-  answer: string,
-): ResolveResponse {
-  if (action === "deny") return { kind: "cancel" };
-  if (question.kind === "freetext") return { kind: "freetext", data: { text: answer } };
-  if (question.kind === "multi") {
-    const selected = question.data.options[0]?.id;
-    return selected ? { kind: "multi", data: { selected_ids: [selected] } } : { kind: "cancel" };
-  }
-  const selected = question.data.options[0]?.id;
-  return selected ? { kind: "single", data: { selected_id: selected } } : { kind: "cancel" };
 }

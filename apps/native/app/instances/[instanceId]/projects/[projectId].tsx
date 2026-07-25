@@ -1,4 +1,4 @@
-import type { HistoryEntry, SessionSummary } from "@flycockpit/cockpit-protocol";
+import type { HistoryEntry, InterruptOption, SessionSummary } from "@flycockpit/cockpit-protocol";
 import * as Clipboard from "expo-clipboard";
 import * as ImagePicker from "expo-image-picker";
 import { useLocalSearchParams } from "expo-router";
@@ -15,16 +15,26 @@ import {
 } from "@/utils/daemon-state";
 import { activeModelView } from "@/utils/inference-failure-view";
 import {
+  type InterruptSelection,
+  type InterruptView,
+  interruptView,
+  type RiskTone,
+  resolveFromSelection,
+} from "@/utils/interrupt-view";
+import {
   appendOptimisticUserMessage,
-  type InterruptResolutionAction,
   type NativeHistoryEntry,
   nativeAttachRuntimeState,
   reduceNativeSessionEvent,
   removeOptimisticUserMessage,
-  resolveResponseForInterrupt,
   toNativeHistoryEntry,
   warnNativeSessionEvent,
 } from "@/utils/session-events";
+
+type InterruptDraft = {
+  text: string;
+  selectedIds: string[];
+};
 
 function formatSessionTitle(session: SessionSummary) {
   return session.title || session.short_id || session.session_id;
@@ -70,7 +80,7 @@ export default function ProjectSessions() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(initialSession ?? null);
   const [history, setHistory] = useState<NativeHistoryEntry[]>([]);
   const [message, setMessage] = useState("");
-  const [answer, setAnswer] = useState("");
+  const [interruptDrafts, setInterruptDrafts] = useState<Record<string, InterruptDraft>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [daemonState, setDaemonState] = useState(emptyNativeDaemonState);
@@ -239,7 +249,24 @@ export default function ProjectSessions() {
     }
   };
 
-  const resolveInterrupt = async (interruptId: string, resolution: InterruptResolutionAction) => {
+  const setInterruptText = (interruptId: string, text: string) => {
+    setInterruptDrafts((current) => ({
+      ...current,
+      [interruptId]: { text, selectedIds: current[interruptId]?.selectedIds ?? [] },
+    }));
+  };
+
+  const toggleInterruptSelection = (interruptId: string, optionId: string) => {
+    setInterruptDrafts((current) => {
+      const draft = current[interruptId] ?? { text: "", selectedIds: [] };
+      const selectedIds = draft.selectedIds.includes(optionId)
+        ? draft.selectedIds.filter((id) => id !== optionId)
+        : [...draft.selectedIds, optionId];
+      return { ...current, [interruptId]: { ...draft, selectedIds } };
+    });
+  };
+
+  const resolveInterrupt = async (interruptId: string, selection: InterruptSelection) => {
     if (!client || !selectedSessionId) return;
     const interrupt = unresolvedInterrupts.find(
       (entry) => entry.kind === "interrupt" && entry.interrupt.interruptId === interruptId,
@@ -250,9 +277,12 @@ export default function ProjectSessions() {
     try {
       await client.resolveInterrupt(
         interruptId,
-        resolveResponseForInterrupt(interrupt.interrupt.question, resolution, answer),
+        resolveFromSelection(interrupt.interrupt.question, selection),
       );
-      setAnswer("");
+      setInterruptDrafts((current) => {
+        const { [interruptId]: _resolved, ...remaining } = current;
+        return remaining;
+      });
     } catch (resolveError) {
       setError(
         resolveError instanceof Error ? resolveError.message : "Could not resolve interrupt.",
@@ -333,39 +363,17 @@ export default function ProjectSessions() {
           <Text className="text-foreground text-xl font-semibold">Transcript</Text>
           {unresolvedInterrupts.map((entry) =>
             entry.kind === "interrupt" ? (
-              <Surface
+              <InterruptCard
                 key={entry.id}
-                variant="secondary"
-                className="p-4 rounded-lg border border-warning"
-              >
-                <Text className="text-foreground font-semibold">{entry.interrupt.title}</Text>
-                {entry.interrupt.body ? (
-                  <Text className="text-muted text-sm mt-2">{entry.interrupt.body}</Text>
-                ) : null}
-                {entry.interrupt.kind === "question" ? (
-                  <TextField className="mt-3">
-                    <Input value={answer} onChangeText={setAnswer} placeholder="Answer" />
-                  </TextField>
-                ) : null}
-                <View className="flex-row gap-2 mt-3">
-                  {entry.interrupt.kind === "approval" ? (
-                    <>
-                      <Button
-                        onPress={() => resolveInterrupt(entry.interrupt.interruptId, "approve")}
-                      >
-                        <Button.Label>Approve</Button.Label>
-                      </Button>
-                      <Button onPress={() => resolveInterrupt(entry.interrupt.interruptId, "deny")}>
-                        <Button.Label>Deny</Button.Label>
-                      </Button>
-                    </>
-                  ) : (
-                    <Button onPress={() => resolveInterrupt(entry.interrupt.interruptId, "answer")}>
-                      <Button.Label>Answer</Button.Label>
-                    </Button>
-                  )}
-                </View>
-              </Surface>
+                entry={entry}
+                busy={busy}
+                draft={
+                  interruptDrafts[entry.interrupt.interruptId] ?? { text: "", selectedIds: [] }
+                }
+                onTextChange={setInterruptText}
+                onToggleSelection={toggleInterruptSelection}
+                onResolve={resolveInterrupt}
+              />
             ) : null,
           )}
 
@@ -433,6 +441,370 @@ export default function ProjectSessions() {
       ) : null}
     </Container>
   );
+}
+
+type InterruptHistoryEntry = Extract<NativeHistoryEntry, { kind: "interrupt" }>;
+
+function InterruptCard({
+  entry,
+  busy,
+  draft,
+  onTextChange,
+  onToggleSelection,
+  onResolve,
+}: {
+  entry: InterruptHistoryEntry;
+  busy: boolean;
+  draft: InterruptDraft;
+  onTextChange: (interruptId: string, text: string) => void;
+  onToggleSelection: (interruptId: string, optionId: string) => void;
+  onResolve: (interruptId: string, selection: InterruptSelection) => void;
+}) {
+  const interruptId = entry.interrupt.interruptId;
+  const view = interruptView(entry.interrupt.question);
+
+  return (
+    <Surface variant="secondary" className="p-4 rounded-lg border border-warning">
+      <Text className="text-warning text-xs mb-1">{entry.interrupt.kind}</Text>
+      <Text className="text-foreground font-semibold">{view.prompt}</Text>
+      {entry.interrupt.body && !hasCommandDetail(view) ? (
+        <Text className="text-muted text-sm mt-2">{entry.interrupt.body}</Text>
+      ) : null}
+
+      {view.kind === "single" ? (
+        <SingleInterruptControls
+          interruptId={interruptId}
+          view={view}
+          busy={busy}
+          draft={draft}
+          onTextChange={onTextChange}
+          onResolve={onResolve}
+        />
+      ) : null}
+
+      {view.kind === "multi" ? (
+        <MultiInterruptControls
+          interruptId={interruptId}
+          view={view}
+          busy={busy}
+          draft={draft}
+          onTextChange={onTextChange}
+          onToggleSelection={onToggleSelection}
+          onResolve={onResolve}
+        />
+      ) : null}
+
+      {view.kind === "freetext" ? (
+        <View className="mt-3 gap-3">
+          <TextField>
+            <Input
+              value={draft.text}
+              onChangeText={(text) => onTextChange(interruptId, text)}
+              placeholder="Answer"
+              secureTextEntry={view.masked}
+            />
+          </TextField>
+          <View className="flex-row flex-wrap gap-2">
+            <Button
+              onPress={() => onResolve(interruptId, { kind: "freetext", text: draft.text })}
+              isDisabled={busy}
+            >
+              <Button.Label>Answer</Button.Label>
+            </Button>
+            <Button onPress={() => onResolve(interruptId, { kind: "cancel" })} isDisabled={busy}>
+              <Button.Label>Decline</Button.Label>
+            </Button>
+          </View>
+        </View>
+      ) : null}
+    </Surface>
+  );
+}
+
+function SingleInterruptControls({
+  interruptId,
+  view,
+  busy,
+  draft,
+  onTextChange,
+  onResolve,
+}: {
+  interruptId: string;
+  view: Extract<InterruptView, { kind: "single" }>;
+  busy: boolean;
+  draft: InterruptDraft;
+  onTextChange: (interruptId: string, text: string) => void;
+  onResolve: (interruptId: string, selection: InterruptSelection) => void;
+}) {
+  return (
+    <View className="mt-3 gap-3">
+      <CommandDetailBlock view={view} />
+
+      <OptionGroup
+        options={view.primaryOptions}
+        busy={busy}
+        onPress={(option) => onResolve(interruptId, { kind: "single", selectedId: option.id })}
+      />
+
+      {view.commandDetail?.scopeOptions.length ? (
+        <View className="gap-2">
+          <Text className="text-muted text-xs">Grant scope</Text>
+          <OptionGroup
+            options={view.commandDetail.scopeOptions}
+            busy={busy}
+            onPress={(option) => onResolve(interruptId, { kind: "single", selectedId: option.id })}
+          />
+        </View>
+      ) : null}
+
+      {view.sandboxEscalation ? <SandboxEscalationBlock view={view} /> : null}
+
+      {view.secondaryOptions.length ? (
+        <View className="gap-2">
+          <Text className="text-muted text-xs">Additional access</Text>
+          <OptionGroup
+            options={view.secondaryOptions}
+            busy={busy}
+            onPress={(option) => onResolve(interruptId, { kind: "single", selectedId: option.id })}
+          />
+        </View>
+      ) : null}
+
+      {view.freeText ? (
+        <View className="gap-2">
+          <TextField>
+            <Input
+              value={draft.text}
+              onChangeText={(text) => onTextChange(interruptId, text)}
+              placeholder="Custom answer"
+            />
+          </TextField>
+          <Button
+            onPress={() => onResolve(interruptId, { kind: "freetext", text: draft.text })}
+            isDisabled={busy}
+          >
+            <Button.Label>Answer</Button.Label>
+          </Button>
+        </View>
+      ) : null}
+
+      <Button onPress={() => onResolve(interruptId, { kind: "cancel" })} isDisabled={busy}>
+        <Button.Label>Decline</Button.Label>
+      </Button>
+    </View>
+  );
+}
+
+function MultiInterruptControls({
+  interruptId,
+  view,
+  busy,
+  draft,
+  onTextChange,
+  onToggleSelection,
+  onResolve,
+}: {
+  interruptId: string;
+  view: Extract<InterruptView, { kind: "multi" }>;
+  busy: boolean;
+  draft: InterruptDraft;
+  onTextChange: (interruptId: string, text: string) => void;
+  onToggleSelection: (interruptId: string, optionId: string) => void;
+  onResolve: (interruptId: string, selection: InterruptSelection) => void;
+}) {
+  return (
+    <View className="mt-3 gap-3">
+      <MultiOptionGroup
+        options={view.primaryOptions}
+        selectedIds={draft.selectedIds}
+        busy={busy}
+        onToggle={(optionId) => onToggleSelection(interruptId, optionId)}
+      />
+
+      {view.secondaryOptions.length ? (
+        <View className="gap-2">
+          <Text className="text-muted text-xs">Additional choices</Text>
+          <MultiOptionGroup
+            options={view.secondaryOptions}
+            selectedIds={draft.selectedIds}
+            busy={busy}
+            onToggle={(optionId) => onToggleSelection(interruptId, optionId)}
+          />
+        </View>
+      ) : null}
+
+      {view.freeText ? (
+        <TextField>
+          <Input
+            value={draft.text}
+            onChangeText={(text) => onTextChange(interruptId, text)}
+            placeholder="Custom answer"
+          />
+        </TextField>
+      ) : null}
+
+      <View className="flex-row flex-wrap gap-2">
+        <Button
+          onPress={() => onResolve(interruptId, { kind: "multi", selectedIds: draft.selectedIds })}
+          isDisabled={busy || draft.selectedIds.length === 0}
+        >
+          <Button.Label>Submit choices</Button.Label>
+        </Button>
+        {view.freeText ? (
+          <Button
+            onPress={() => onResolve(interruptId, { kind: "freetext", text: draft.text })}
+            isDisabled={busy}
+          >
+            <Button.Label>Answer</Button.Label>
+          </Button>
+        ) : null}
+        <Button onPress={() => onResolve(interruptId, { kind: "cancel" })} isDisabled={busy}>
+          <Button.Label>Decline</Button.Label>
+        </Button>
+      </View>
+    </View>
+  );
+}
+
+function MultiOptionGroup({
+  options,
+  selectedIds,
+  busy,
+  onToggle,
+}: {
+  options: InterruptOption[];
+  selectedIds: string[];
+  busy: boolean;
+  onToggle: (optionId: string) => void;
+}) {
+  if (options.length === 0) return null;
+  return (
+    <View className="gap-2">
+      {options.map((option) => {
+        const selected = selectedIds.includes(option.id);
+        return (
+          <View key={option.id} className="gap-1">
+            <Button onPress={() => onToggle(option.id)} isDisabled={busy}>
+              <Button.Label>{selected ? `Selected: ${option.label}` : option.label}</Button.Label>
+            </Button>
+            {option.description ? (
+              <Text className="text-muted text-xs">{option.description}</Text>
+            ) : null}
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
+function OptionGroup({
+  options,
+  busy,
+  onPress,
+}: {
+  options: Array<InterruptOption | { id: string; label: string; description?: string }>;
+  busy: boolean;
+  onPress: (option: InterruptOption | { id: string; label: string; description?: string }) => void;
+}) {
+  if (options.length === 0) return null;
+  return (
+    <View className="gap-2">
+      {options.map((option) => (
+        <View key={option.id} className="gap-1">
+          <Button onPress={() => onPress(option)} isDisabled={busy}>
+            <Button.Label>{option.label}</Button.Label>
+          </Button>
+          {option.description ? (
+            <Text className="text-muted text-xs">{option.description}</Text>
+          ) : null}
+        </View>
+      ))}
+    </View>
+  );
+}
+
+function CommandDetailBlock({ view }: { view: Extract<InterruptView, { kind: "single" }> }) {
+  const command = view.commandDetail;
+  if (!command) return null;
+
+  return (
+    <View className="gap-2">
+      <View className="flex-row flex-wrap items-center gap-2">
+        <Chip variant="secondary" color={riskChipColor(command.risk.tone)}>
+          <Chip.Label>{command.risk.label}</Chip.Label>
+        </Chip>
+        {view.approvalClassLabel ? (
+          <Chip variant="secondary" color="default">
+            <Chip.Label>{view.approvalClassLabel}</Chip.Label>
+          </Chip>
+        ) : null}
+        <Text className="text-muted text-xs">{command.stepLabel}</Text>
+      </View>
+      <Text className="text-foreground text-sm">{command.fullCommand}</Text>
+      {command.cwd ? <Text className="text-muted text-xs">cwd: {command.cwd}</Text> : null}
+      {command.reasons.length ? (
+        <Text className="text-muted text-xs">reasons: {command.reasons.join(", ")}</Text>
+      ) : null}
+      {command.affectedTargets.length ? (
+        <Text className="text-muted text-xs">affected: {command.affectedTargets.join(", ")}</Text>
+      ) : null}
+      {command.policyCap ? (
+        <Text className="text-muted text-xs">policy cap: {command.policyCap}</Text>
+      ) : null}
+      {command.nativeToolHints.length ? (
+        <Text className="text-muted text-xs">hints: {command.nativeToolHints.join(", ")}</Text>
+      ) : null}
+      {command.writeContent ? (
+        <Surface variant="secondary" className="p-3 rounded-lg">
+          <Text className="text-muted text-xs mb-1">
+            write content{command.writeContent.dynamic ? " (dynamic)" : ""}
+          </Text>
+          <Text className="text-foreground text-xs">
+            {command.writeContent.preview}
+            {command.writeContent.truncated ? "..." : ""}
+          </Text>
+        </Surface>
+      ) : null}
+    </View>
+  );
+}
+
+function SandboxEscalationBlock({ view }: { view: Extract<InterruptView, { kind: "single" }> }) {
+  const escalation = view.sandboxEscalation;
+  if (!escalation) return null;
+
+  return (
+    <Surface variant="secondary" className="p-3 rounded-lg border border-warning">
+      <Text className="text-warning text-xs mb-1">Sandbox escalation</Text>
+      <Text className="text-muted text-xs">exit: {escalation.confinedExit}</Text>
+      <Text className="text-muted text-xs">
+        stderr: {escalation.confinedStderrPreview}
+        {escalation.confinedStderrTruncated ? "..." : ""}
+      </Text>
+      {escalation.suggestedPaths.length ? (
+        <Text className="text-muted text-xs">paths: {escalation.suggestedPaths.join(", ")}</Text>
+      ) : null}
+      {escalation.suggestedAccess ? (
+        <Text className="text-muted text-xs">access: {escalation.suggestedAccess}</Text>
+      ) : null}
+      {escalation.denial ? (
+        <Text className="text-muted text-xs">
+          denial: {escalation.denial.confidence}, {escalation.denial.evidenceCount} evidence
+        </Text>
+      ) : null}
+    </Surface>
+  );
+}
+
+function hasCommandDetail(view: InterruptView) {
+  return view.kind === "single" && !!view.commandDetail;
+}
+
+function riskChipColor(tone: RiskTone): "default" | "success" | "warning" | "danger" {
+  if (tone === "low") return "success";
+  if (tone === "medium") return "warning";
+  if (tone === "high" || tone === "critical") return "danger";
+  return "default";
 }
 
 function TranscriptEntry({ entry }: { entry: NativeHistoryEntry }) {

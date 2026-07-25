@@ -949,10 +949,15 @@ pub(crate) async fn run_turn(
         })
     });
     if let Err(e) = session
-        .record_event(
+        .record_event_with_model_frame(
             crate::db::session_log::SessionEventKind::InferenceRequest,
             Some(&agent.name),
             Some(&call_id.to_string()),
+            crate::session::SessionEventModelFrame {
+                provider_id: model.provider_id(),
+                model_id: model.model_id_ref(),
+                config: &config,
+            },
             &serde_json::json!({
                 "usage": usage_json,
                 "routing": model.routing_metadata_json(None),
@@ -1318,10 +1323,15 @@ pub(crate) async fn run_turn(
             }
         }
         let seq = match session
-            .record_event(
+            .record_event_with_model_frame(
                 crate::db::session_log::SessionEventKind::AssistantMessage,
                 Some(&agent.name),
                 Some(&call_id.to_string()),
+                crate::session::SessionEventModelFrame {
+                    provider_id: model.provider_id(),
+                    model_id: model.model_id_ref(),
+                    config: &config,
+                },
                 &event_data,
             )
             .await

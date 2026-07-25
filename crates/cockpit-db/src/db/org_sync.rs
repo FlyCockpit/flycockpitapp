@@ -232,7 +232,8 @@ impl Db {
         self.read_blocking(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label, data_json
+                    "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label,
+                            origin_principal, provider_id, model_id, llm_mode, model_trust, data_json
                        FROM session_events
                       WHERE seq > ?1
                       ORDER BY seq ASC
@@ -257,7 +258,13 @@ impl Db {
                             call_id: row.get("call_id").map_err(anyhow::Error::from)?,
                             task_call_id: row.get("task_call_id").map_err(anyhow::Error::from)?,
                             label: row.get("label").map_err(anyhow::Error::from)?,
-                            origin_principal: None,
+                            origin_principal: row
+                                .get("origin_principal")
+                                .map_err(anyhow::Error::from)?,
+                            provider_id: row.get("provider_id").map_err(anyhow::Error::from)?,
+                            model_id: row.get("model_id").map_err(anyhow::Error::from)?,
+                            llm_mode: row.get("llm_mode").map_err(anyhow::Error::from)?,
+                            model_trust: row.get("model_trust").map_err(anyhow::Error::from)?,
                             data,
                         })
                     })())

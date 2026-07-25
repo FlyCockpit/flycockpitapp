@@ -1058,10 +1058,11 @@ impl Driver {
     ) {
         if let Err(e) = self
             .session
-            .record_event(
+            .record_event_with_config(
                 crate::db::session_log::SessionEventKind::SubagentRouting,
                 Some(child_agent),
                 Some(task_call_id),
+                &self.config,
                 &subagent_routing_event_data(child_agent, task_call_id, label, routing),
             )
             .await

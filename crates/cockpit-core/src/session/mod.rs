@@ -43,7 +43,9 @@ mod gitignore;
 mod lifecycle;
 mod recording;
 pub(crate) use recording::notice_severity;
-pub use recording::{ModelSwitchAudit, ModelSwitchOutcome, ModelSwitchTrigger};
+pub use recording::{
+    ModelSwitchAudit, ModelSwitchOutcome, ModelSwitchTrigger, SessionEventModelFrame,
+};
 mod title;
 mod toggles;
 

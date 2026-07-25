@@ -589,6 +589,10 @@ CREATE TABLE session_events (
     reasoning TEXT
         GENERATED ALWAYS AS (json_extract(data_json, '$.reasoning')) VIRTUAL,
     origin_principal TEXT,                         -- remote principal attribution
+    provider_id TEXT,                              -- authoring model provider id, NULL for model-less events
+    model_id TEXT,                                 -- authoring model id, NULL for model-less events
+    llm_mode TEXT,                                 -- authoring LLM mode, NULL for model-less events
+    model_trust TEXT,                              -- write-time resolved model trust, NULL for model-less events
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
@@ -598,6 +602,9 @@ CREATE INDEX idx_sevents_task_child  ON session_events (session_id, task_call_id
   WHERE task_call_id IS NOT NULL;
 CREATE INDEX idx_sevents_origin_principal ON session_events (origin_principal)
   WHERE origin_principal IS NOT NULL;
+-- History trust filters scan one session in seq order while excluding trusted-authored rows.
+CREATE INDEX idx_sevents_session_trust_seq ON session_events (session_id, model_trust, seq)
+  WHERE model_trust IS NOT NULL;
 
 -- Large compaction records spill out of the inline event JSON as one canonical
 -- payload (brief + handoff + serialized tail). The `session_compacted` event

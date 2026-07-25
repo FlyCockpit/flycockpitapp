@@ -5284,6 +5284,7 @@ mod subagent_observe_tests {
                 origin_principal: None,
                 task_call_id: Some("task-a"),
                 label: Some("default"),
+                ..Default::default()
             },
             &json!({ "text": "brief a" }),
         )
@@ -5298,6 +5299,7 @@ mod subagent_observe_tests {
                 origin_principal: None,
                 task_call_id: Some("task-b"),
                 label: Some("default"),
+                ..Default::default()
             },
             &json!({ "text": "brief b" }),
         )
@@ -5312,6 +5314,7 @@ mod subagent_observe_tests {
                 origin_principal: None,
                 task_call_id: Some("task-a"),
                 label: Some("default"),
+                ..Default::default()
             },
             &json!({ "text": "answer a", "reasoning": "ra" }),
         )
@@ -5326,6 +5329,7 @@ mod subagent_observe_tests {
                 origin_principal: None,
                 task_call_id: Some("task-b"),
                 label: Some("default"),
+                ..Default::default()
             },
             &json!({ "text": "answer b", "reasoning": "rb" }),
         )
@@ -5379,6 +5383,7 @@ mod subagent_observe_tests {
                 origin_principal: None,
                 task_call_id: Some("task-child"),
                 label: Some("default"),
+                ..Default::default()
             },
             &json!({ "text": "hidden child", "reasoning": "" }),
         )

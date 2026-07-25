@@ -203,6 +203,10 @@ pub struct SessionEventContext<'a> {
     pub origin_principal: Option<&'a str>,
     pub task_call_id: Option<&'a str>,
     pub label: Option<&'a str>,
+    pub provider_id: Option<&'a str>,
+    pub model_id: Option<&'a str>,
+    pub llm_mode: Option<&'a str>,
+    pub model_trust: Option<&'a str>,
 }
 
 /// A row read back from `session_events`.
@@ -217,6 +221,10 @@ pub struct SessionEventRow {
     pub task_call_id: Option<String>,
     pub label: Option<String>,
     pub origin_principal: Option<String>,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    pub llm_mode: Option<String>,
+    pub model_trust: Option<String>,
     pub data: Value,
 }
 
@@ -385,6 +393,10 @@ impl Db {
                 origin_principal,
                 task_call_id: None,
                 label: None,
+                provider_id: None,
+                model_id: None,
+                llm_mode: None,
+                model_trust: None,
             },
             data,
         )
@@ -407,6 +419,10 @@ impl Db {
         let task_call_id = context.task_call_id.map(str::to_owned);
         let label = context.label.map(str::to_owned);
         let origin_principal = context.origin_principal.map(str::to_owned);
+        let provider_id = context.provider_id.map(str::to_owned);
+        let model_id = context.model_id.map(str::to_owned);
+        let llm_mode = context.llm_mode.map(str::to_owned);
+        let model_trust = context.model_trust.map(str::to_owned);
         self.write(move |conn| {
             Self::insert_session_event_json_conn(
                 conn,
@@ -418,6 +434,10 @@ impl Db {
                     origin_principal: origin_principal.as_deref(),
                     task_call_id: task_call_id.as_deref(),
                     label: label.as_deref(),
+                    provider_id: provider_id.as_deref(),
+                    model_id: model_id.as_deref(),
+                    llm_mode: llm_mode.as_deref(),
+                    model_trust: model_trust.as_deref(),
                 },
                 ts_ms,
                 &data_json,
@@ -439,8 +459,9 @@ impl Db {
     ) -> Result<i64> {
         conn.execute(
             "INSERT INTO session_events
-             (session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal, data_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal,
+              provider_id, model_id, llm_mode, model_trust, data_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 session_id.to_string(),
                 ts_ms,
@@ -450,6 +471,10 @@ impl Db {
                 context.task_call_id,
                 context.label,
                 context.origin_principal,
+                context.provider_id,
+                context.model_id,
+                context.llm_mode,
+                context.model_trust,
                 data_json,
             ],
         )
@@ -470,7 +495,8 @@ impl Db {
     ) -> Result<Vec<SessionEventRow>> {
         let mut stmt = conn
             .prepare(
-                "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal, data_json
+                "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label,
+                        origin_principal, provider_id, model_id, llm_mode, model_trust, data_json
                    FROM session_events
                   WHERE session_id = ?1
                   ORDER BY seq ASC",
@@ -495,7 +521,8 @@ impl Db {
     ) -> Result<Vec<SessionEventRow>> {
         let mut stmt = conn
             .prepare(
-                "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal, data_json
+                "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label,
+                        origin_principal, provider_id, model_id, llm_mode, model_trust, data_json
                    FROM session_events
                   WHERE session_id = ?1 AND seq > ?2
                   ORDER BY seq ASC",
@@ -535,7 +562,8 @@ impl Db {
         let fetch_limit = i64::from(limit) + 1;
         let mut stmt = conn
             .prepare(
-                "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal, data_json
+                "SELECT seq, session_id, ts_ms, type, agent, call_id, task_call_id, label,
+                        origin_principal, provider_id, model_id, llm_mode, model_trust, data_json
                    FROM session_events
                   WHERE session_id = ?1
                     AND (?2 IS NULL OR seq < ?3)
@@ -661,6 +689,10 @@ struct RawSessionEventRow {
     task_call_id: Option<String>,
     label: Option<String>,
     origin_principal: Option<String>,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+    llm_mode: Option<String>,
+    model_trust: Option<String>,
     data_json: String,
 }
 
@@ -675,6 +707,10 @@ fn raw_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSessionEventRow
         task_call_id: row.get("task_call_id")?,
         label: row.get("label")?,
         origin_principal: row.get("origin_principal")?,
+        provider_id: row.get("provider_id")?,
+        model_id: row.get("model_id")?,
+        llm_mode: row.get("llm_mode")?,
+        model_trust: row.get("model_trust")?,
         data_json: row.get("data_json")?,
     })
 }
@@ -739,6 +775,10 @@ fn decode_event_row(row: RawSessionEventRow) -> Result<SessionEventRow> {
         task_call_id: row.task_call_id,
         label: row.label,
         origin_principal: row.origin_principal,
+        provider_id: row.provider_id,
+        model_id: row.model_id,
+        llm_mode: row.llm_mode,
+        model_trust: row.model_trust,
         data,
     })
 }
@@ -809,6 +849,128 @@ mod tests {
         assert_eq!(events[1].kind, "assistant_message");
         assert_eq!(events[1].call_id.as_deref(), Some("call-1"));
         assert_eq!(events[1].data, second);
+    }
+
+    #[tokio::test]
+    async fn session_event_provenance_schema_columns_and_index_exist() {
+        let db = Db::open_in_memory().unwrap();
+        let columns = db
+            .read(|conn| {
+                let mut stmt = conn.prepare("PRAGMA table_info(session_events)")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>("name")?,
+                        row.get::<_, String>("type")?,
+                        row.get::<_, i64>("notnull")?,
+                    ))
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            })
+            .await
+            .unwrap();
+
+        for name in ["provider_id", "model_id", "llm_mode", "model_trust"] {
+            assert!(
+                columns
+                    .iter()
+                    .any(|(column, ty, notnull)| column == name && ty == "TEXT" && *notnull == 0),
+                "missing nullable TEXT column {name}"
+            );
+        }
+
+        let index_sql: Option<String> = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_sevents_session_trust_seq'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        let index_sql = index_sql.unwrap();
+        assert!(index_sql.contains("session_id, model_trust, seq"));
+        assert!(index_sql.contains("model_trust IS NOT NULL"));
+    }
+
+    #[tokio::test]
+    async fn session_event_provenance_context_roundtrips_through_all_event_readers() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let seq = db
+            .insert_session_event_with_context(
+                session.session_id,
+                SessionEventKind::AssistantMessage,
+                Some("Build"),
+                Some("call-1"),
+                SessionEventContext {
+                    origin_principal: Some("principal-1"),
+                    task_call_id: Some("task-1"),
+                    label: Some("label-1"),
+                    provider_id: Some("openai"),
+                    model_id: Some("gpt-5"),
+                    llm_mode: Some("frontier"),
+                    model_trust: Some("trusted"),
+                },
+                &json!({"text": "hello"}),
+            )
+            .await
+            .unwrap();
+
+        let all = db.list_session_events(session.session_id).await.unwrap();
+        let since = db
+            .read(move |conn| Db::list_session_events_since_conn(conn, session.session_id, seq - 1))
+            .await
+            .unwrap();
+        let before = db
+            .list_session_events_before(session.session_id, Some(seq + 1), 10)
+            .await
+            .unwrap()
+            .events;
+
+        for rows in [all, since, before] {
+            let event = rows.into_iter().next().unwrap();
+            assert_eq!(event.seq, seq);
+            assert_eq!(event.origin_principal.as_deref(), Some("principal-1"));
+            assert_eq!(event.task_call_id.as_deref(), Some("task-1"));
+            assert_eq!(event.label.as_deref(), Some("label-1"));
+            assert_eq!(event.provider_id.as_deref(), Some("openai"));
+            assert_eq!(event.model_id.as_deref(), Some("gpt-5"));
+            assert_eq!(event.llm_mode.as_deref(), Some("frontier"));
+            assert_eq!(event.model_trust.as_deref(), Some("trusted"));
+        }
+    }
+
+    #[tokio::test]
+    async fn session_event_provenance_convenience_insert_writes_nulls() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        db.insert_session_event_with_origin(
+            session.session_id,
+            SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            Some("principal-1"),
+            &json!({"text": "hello"}),
+        )
+        .await
+        .unwrap();
+
+        let event = db
+            .list_session_events(session.session_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(event.origin_principal.as_deref(), Some("principal-1"));
+        assert_eq!(event.provider_id, None);
+        assert_eq!(event.model_id, None);
+        assert_eq!(event.llm_mode, None);
+        assert_eq!(event.model_trust, None);
     }
 
     #[tokio::test]
@@ -1517,6 +1679,10 @@ mod tests {
                 task_call_id: None,
                 label: None,
                 origin_principal: None,
+                provider_id: None,
+                model_id: None,
+                llm_mode: None,
+                model_trust: None,
                 data_json: serde_json::to_string(&json!({"text": "before"})).unwrap(),
             },
             RawSessionEventRow {
@@ -1529,6 +1695,10 @@ mod tests {
                 task_call_id: None,
                 label: None,
                 origin_principal: None,
+                provider_id: None,
+                model_id: None,
+                llm_mode: None,
+                model_trust: None,
                 data_json: serde_json::to_string(&json!({"text": "still committed"})).unwrap(),
             },
             RawSessionEventRow {
@@ -1541,6 +1711,10 @@ mod tests {
                 task_call_id: None,
                 label: None,
                 origin_principal: None,
+                provider_id: None,
+                model_id: None,
+                llm_mode: None,
+                model_trust: None,
                 data_json: "{\"text\":".to_string(),
             },
         ])

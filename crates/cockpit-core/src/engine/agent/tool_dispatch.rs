@@ -373,10 +373,15 @@ pub(crate) async fn execute_ordinary_call(
         });
         match env
             .session
-            .record_event(
+            .record_event_with_model_frame(
                 crate::db::session_log::SessionEventKind::ToolCallStarted,
                 Some(&env.agent.name),
                 Some(&tc.id),
+                crate::session::SessionEventModelFrame {
+                    provider_id: env.model.provider_id(),
+                    model_id: env.model.model_id_ref(),
+                    config: &env.ctx.config,
+                },
                 &start_data,
             )
             .await
@@ -852,17 +857,35 @@ pub(crate) async fn execute_ordinary_call(
     if let Some(reason) = rejection_reason
         && let Err(e) = env
             .session
-            .record_tool_rejected(&env.agent.name, &tc.id, resolved_name, reason)
+            .record_event_with_model_frame(
+                crate::db::session_log::SessionEventKind::ToolRejected,
+                Some(&env.agent.name),
+                Some(&tc.id),
+                crate::session::SessionEventModelFrame {
+                    provider_id: env.model.provider_id(),
+                    model_id: env.model.model_id_ref(),
+                    config: &env.ctx.config,
+                },
+                &serde_json::json!({
+                    "tool": resolved_name,
+                    "reason": reason,
+                }),
+            )
             .await
     {
         tracing::warn!(error = %e, tool = %resolved_name, "record tool_rejected event failed");
     }
     let tool_call_seq = match env
         .session
-        .record_event(
+        .record_event_with_model_frame(
             crate::db::session_log::SessionEventKind::ToolCall,
             Some(&env.agent.name),
             Some(&tc.id),
+            crate::session::SessionEventModelFrame {
+                provider_id: env.model.provider_id(),
+                model_id: env.model.model_id_ref(),
+                config: &env.ctx.config,
+            },
             &event_data,
         )
         .await
@@ -944,10 +967,15 @@ pub(crate) async fn execute_ordinary_call(
         }
         if let Err(e) = env
             .session
-            .record_event(
+            .record_event_with_model_frame(
                 crate::db::session_log::SessionEventKind::ToolCallCompleted,
                 Some(&env.agent.name),
                 Some(&tc.id),
+                crate::session::SessionEventModelFrame {
+                    provider_id: env.model.provider_id(),
+                    model_id: env.model.model_id_ref(),
+                    config: &env.ctx.config,
+                },
                 &completed_data,
             )
             .await

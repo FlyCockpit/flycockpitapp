@@ -38,6 +38,62 @@ impl ModelSwitchOutcome {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SessionEventProvenance {
+    provider_id: String,
+    model_id: String,
+    llm_mode: crate::config::extended::LlmMode,
+    model_trust: crate::config::providers::ModelTrust,
+}
+
+#[derive(Clone, Copy)]
+pub struct SessionEventModelFrame<'a> {
+    pub provider_id: &'a str,
+    pub model_id: &'a str,
+    pub config: &'a crate::daemon::session_worker::SessionConfigHandle,
+}
+
+impl SessionEventProvenance {
+    fn context_fields(&self) -> (&str, &str, &str, &str) {
+        (
+            self.provider_id.as_str(),
+            self.model_id.as_str(),
+            self.llm_mode.as_str(),
+            model_trust_as_str(self.model_trust),
+        )
+    }
+}
+
+fn model_trust_as_str(trust: crate::config::providers::ModelTrust) -> &'static str {
+    match trust {
+        crate::config::providers::ModelTrust::Trusted => "trusted",
+        crate::config::providers::ModelTrust::Untrusted => "untrusted",
+    }
+}
+
+fn event_kind_is_model_authored(kind: crate::db::session_log::SessionEventKind) -> bool {
+    use crate::db::session_log::SessionEventKind;
+    matches!(
+        kind,
+        SessionEventKind::AssistantMessage
+            | SessionEventKind::InferenceRequest
+            | SessionEventKind::ToolCall
+            | SessionEventKind::ToolCallStarted
+            | SessionEventKind::ToolCallCompleted
+            | SessionEventKind::SubagentSpawned
+            | SessionEventKind::SubagentRouting
+            | SessionEventKind::SubagentReport
+            | SessionEventKind::SessionCompacted
+            | SessionEventKind::ToolRejected
+            | SessionEventKind::PrimarySwap
+            | SessionEventKind::InferenceFailure
+            | SessionEventKind::FailedTurnRecovery
+            | SessionEventKind::SkillAutoSelect
+            | SessionEventKind::AutoPruneDiagnostic
+            | SessionEventKind::GoalProgressDiagnostic
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ModelSwitchAudit<'a> {
     pub from_provider: Option<&'a str>,
@@ -50,6 +106,91 @@ pub struct ModelSwitchAudit<'a> {
 }
 
 impl Session {
+    fn session_event_provenance_for(
+        &self,
+        kind: crate::db::session_log::SessionEventKind,
+        frame: Option<SessionEventModelFrame<'_>>,
+        data: &Value,
+    ) -> Option<SessionEventProvenance> {
+        if !event_kind_is_model_authored(kind) {
+            return None;
+        }
+        let provider_id = frame
+            .map(|frame| frame.provider_id.to_string())
+            .or_else(|| {
+                data.get("provider")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .or_else(|| self.active_provider())?;
+        let model_id = frame
+            .map(|frame| frame.model_id.to_string())
+            .or_else(|| {
+                data.get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .or_else(|| self.active_model())?;
+        let snapshot = frame.map(|frame| frame.config.snapshot())?;
+        let llm_mode =
+            snapshot
+                .providers
+                .resolve_mode(&provider_id, &model_id, snapshot.extended.llm_mode);
+        let model_trust = snapshot.providers.resolve_trust(&provider_id, &model_id);
+        Some(SessionEventProvenance {
+            provider_id,
+            model_id,
+            llm_mode,
+            model_trust,
+        })
+    }
+
+    pub async fn record_event_with_model_frame(
+        &self,
+        kind: crate::db::session_log::SessionEventKind,
+        agent: Option<&str>,
+        call_id: Option<&str>,
+        frame: SessionEventModelFrame<'_>,
+        data: &Value,
+    ) -> Result<i64> {
+        self.record_event_with_origin_and_frame(kind, agent, call_id, None, Some(frame), data)
+            .await
+    }
+
+    pub async fn record_event_with_config(
+        &self,
+        kind: crate::db::session_log::SessionEventKind,
+        agent: Option<&str>,
+        call_id: Option<&str>,
+        config: &crate::daemon::session_worker::SessionConfigHandle,
+        data: &Value,
+    ) -> Result<i64> {
+        let active_provider = self.active_provider();
+        let active_model = self.active_model();
+        let provider_id = data
+            .get("provider")
+            .and_then(Value::as_str)
+            .or(active_provider.as_deref())
+            .context("model-authored event has no provider frame")?;
+        let model_id = data
+            .get("model")
+            .and_then(Value::as_str)
+            .or(active_model.as_deref())
+            .context("model-authored event has no model frame")?;
+        self.record_event_with_model_frame(
+            kind,
+            agent,
+            call_id,
+            SessionEventModelFrame {
+                provider_id,
+                model_id,
+                config,
+            },
+            data,
+        )
+        .await
+    }
+
     /// Append one tool-call audit row to the §15b table.
     pub async fn record_tool_call(&self, row: ToolCallRow) -> Result<()> {
         let provider = self.active_provider().unwrap_or_default();
@@ -392,7 +533,24 @@ impl Session {
         origin_principal: Option<&str>,
         data: &Value,
     ) -> Result<i64> {
+        self.record_event_with_origin_and_frame(kind, agent, call_id, origin_principal, None, data)
+            .await
+    }
+
+    async fn record_event_with_origin_and_frame(
+        &self,
+        kind: crate::db::session_log::SessionEventKind,
+        agent: Option<&str>,
+        call_id: Option<&str>,
+        origin_principal: Option<&str>,
+        frame: Option<SessionEventModelFrame<'_>>,
+        data: &Value,
+    ) -> Result<i64> {
         let lineage = current_session_event_lineage();
+        let provenance = self.session_event_provenance_for(kind, frame, data);
+        let provenance_fields = provenance
+            .as_ref()
+            .map(SessionEventProvenance::context_fields);
         self.db
             .insert_session_event_with_context(
                 self.id,
@@ -403,6 +561,10 @@ impl Session {
                     origin_principal,
                     task_call_id: lineage.as_ref().map(|l| l.task_call_id.as_str()),
                     label: lineage.as_ref().map(|l| l.label.as_str()),
+                    provider_id: provenance_fields.map(|fields| fields.0),
+                    model_id: provenance_fields.map(|fields| fields.1),
+                    llm_mode: provenance_fields.map(|fields| fields.2),
+                    model_trust: provenance_fields.map(|fields| fields.3),
                 },
                 data,
             )
@@ -769,5 +931,162 @@ mod notice_tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["severity"], "info");
         assert_eq!(events[0].data["source"], "engine_turn");
+    }
+}
+
+#[cfg(test)]
+mod session_event_provenance_tests {
+    use super::*;
+    use crate::db::Db;
+    use serde_json::json;
+    use std::path::Path;
+
+    fn write_provider(root: &Path, provider: &str, model: &str, trust: &str, mode: &str) {
+        let cockpit = root.join(".cockpit");
+        let providers = cockpit.join("providers");
+        std::fs::create_dir_all(&providers).unwrap();
+        std::fs::write(cockpit.join("config.json"), r#"{"llm_mode":"defensive"}"#).unwrap();
+        std::fs::write(
+            providers.join(format!("{provider}.json")),
+            serde_json::json!({
+                "url": "https://example.test/v1",
+                "models": [{
+                    "id": model,
+                    "trust": trust,
+                    "mode": mode,
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_event_provenance_stamps_model_authored_and_model_less_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_provider(tmp.path(), "openai", "gpt-5", "trusted", "frontier");
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+        session.set_active_model("openai", "gpt-5").unwrap();
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+
+        session
+            .record_event_with_model_frame(
+                crate::db::session_log::SessionEventKind::AssistantMessage,
+                Some("Build"),
+                Some("call-1"),
+                SessionEventModelFrame {
+                    provider_id: "openai",
+                    model_id: "gpt-5",
+                    config: &config,
+                },
+                &json!({"text": "model text"}),
+            )
+            .await
+            .unwrap();
+        session
+            .record_event(
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "user text"}),
+            )
+            .await
+            .unwrap();
+        session
+            .record_notice(Some("Build"), "Background refresh finished.", "engine")
+            .await
+            .unwrap();
+
+        let events = session.db.list_session_events(session.id).await.unwrap();
+        assert_eq!(events[0].provider_id.as_deref(), Some("openai"));
+        assert_eq!(events[0].model_id.as_deref(), Some("gpt-5"));
+        assert_eq!(events[0].llm_mode.as_deref(), Some("frontier"));
+        assert_eq!(events[0].model_trust.as_deref(), Some("trusted"));
+        for event in &events[1..] {
+            assert_eq!(event.provider_id, None);
+            assert_eq!(event.model_id, None);
+            assert_eq!(event.llm_mode, None);
+            assert_eq!(event.model_trust, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_event_provenance_prefers_event_frame_model_over_root_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_provider(tmp.path(), "root", "root-model", "untrusted", "defensive");
+        write_provider(tmp.path(), "child", "child-model", "trusted", "normal");
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+        session.set_active_model("root", "root-model").unwrap();
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+
+        session
+            .record_event_with_config(
+                crate::db::session_log::SessionEventKind::SubagentRouting,
+                Some("history"),
+                Some("task-1"),
+                &config,
+                &json!({
+                    "child_agent": "history",
+                    "task_call_id": "task-1",
+                    "label": "default",
+                    "provider": "child",
+                    "model": "child-model",
+                }),
+            )
+            .await
+            .unwrap();
+
+        let event = session
+            .db
+            .list_session_events(session.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(event.provider_id.as_deref(), Some("child"));
+        assert_eq!(event.model_id.as_deref(), Some("child-model"));
+        assert_eq!(event.llm_mode.as_deref(), Some("normal"));
+        assert_eq!(event.model_trust.as_deref(), Some("trusted"));
+    }
+
+    #[tokio::test]
+    async fn session_event_provenance_materializes_trust_at_write_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_provider(tmp.path(), "openai", "gpt-5", "trusted", "frontier");
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+        session.set_active_model("openai", "gpt-5").unwrap();
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+
+        session
+            .record_event_with_model_frame(
+                crate::db::session_log::SessionEventKind::AssistantMessage,
+                Some("Build"),
+                None,
+                SessionEventModelFrame {
+                    provider_id: "openai",
+                    model_id: "gpt-5",
+                    config: &config,
+                },
+                &json!({"text": "before config change"}),
+            )
+            .await
+            .unwrap();
+        write_provider(tmp.path(), "openai", "gpt-5", "untrusted", "defensive");
+
+        let event = session
+            .db
+            .list_session_events(session.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(event.model_trust.as_deref(), Some("trusted"));
+        assert_eq!(event.llm_mode.as_deref(), Some("frontier"));
     }
 }

@@ -1,4 +1,18 @@
+use super::history_window::{HISTORY_WINDOW_TARGET_ENTRIES, HistoryWindow};
 use super::*;
+
+fn subagent_view_notice(read_only: bool, truncated: bool) -> Option<String> {
+    let mut parts = Vec::new();
+    if read_only {
+        parts.push("This subagent is read-only.".to_string());
+    }
+    if truncated {
+        parts.push(format!(
+            "Showing the most recent {HISTORY_WINDOW_TARGET_ENTRIES} messages - older subagent history is not loaded (use /export for the full transcript)."
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
 
 impl App {
     fn capture_transcript_view(&mut self) -> StoredTranscriptView {
@@ -87,11 +101,7 @@ impl App {
             finished,
             countdown_started: None,
             countdown_cancelled: true,
-            notice: if read_only && outcome.is_none() {
-                Some("This subagent is read-only.".to_string())
-            } else {
-                None
-            },
+            notice: subagent_view_notice(read_only && outcome.is_none(), false),
         };
 
         let previous = self.capture_transcript_view();
@@ -172,7 +182,12 @@ impl App {
         if view.task_call_id != task_call_id || view.label != label {
             return;
         }
-        self.history = history.into();
+        let window = HistoryWindow::from_capped_newest(history, HISTORY_WINDOW_TARGET_ENTRIES);
+        let truncated = window.has_older();
+        self.history = window;
+        if let Some(view) = self.active_subagent_view_mut() {
+            view.notice = subagent_view_notice(view.read_only && !view.finished, truncated);
+        }
         self.history_render_versions = std::collections::HashMap::new();
         self.history_render_fingerprints = std::collections::HashMap::new();
         self.history_render_cache_clear();

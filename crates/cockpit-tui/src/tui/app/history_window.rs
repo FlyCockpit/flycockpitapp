@@ -1,6 +1,6 @@
 use std::ops::{Deref, Index, IndexMut};
 
-use super::{App, DirtyScan, HistoryEntry, HistoryLog, TranscriptViewMeta};
+use super::{App, DirtyScan, HistoryEntry, HistoryLog};
 
 pub(in crate::tui) const HISTORY_WINDOW_TARGET_ENTRIES: usize = 600;
 pub(in crate::tui) const HISTORY_PAGE_ENTRIES: usize = 200;
@@ -54,6 +54,21 @@ impl<'a> IntoIterator for &'a HistoryWindow {
 }
 
 impl HistoryWindow {
+    pub(super) fn from_capped_newest(entries: Vec<HistoryEntry>, cap: usize) -> Self {
+        let len = entries.len();
+        if len <= cap {
+            return entries.into();
+        }
+
+        let skip = len.saturating_sub(cap);
+        let kept: Vec<_> = entries.into_iter().skip(skip).collect();
+        Self {
+            log: kept.into(),
+            older_cursor: None,
+            has_older: true,
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn older_cursor(&self) -> Option<i64> {
         self.older_cursor
@@ -168,7 +183,7 @@ impl HistoryWindow {
 
 impl App {
     pub(super) fn enforce_history_window(&mut self) -> bool {
-        if !matches!(self.transcript_view, TranscriptViewMeta::Main) || !self.chat_pinned_to_tail {
+        if !self.chat_pinned_to_tail {
             return false;
         }
         if !self.history.trim_front_to_target() {

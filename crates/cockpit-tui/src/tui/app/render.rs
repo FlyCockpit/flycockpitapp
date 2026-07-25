@@ -5499,6 +5499,41 @@ mod render_history_spacing_tests {
         }
     }
 
+    fn docs_subagent() -> HistoryEntry {
+        HistoryEntry::Subagent {
+            parent: "Build".to_string(),
+            child: "docs".to_string(),
+            task_call_id: "call-1".to_string(),
+            label: "default".to_string(),
+            trusted_only: false,
+            model_trusted: true,
+            routing: SubagentRoutingChips::default(),
+            spawned_at: std::time::Instant::now(),
+            outcome: None,
+            expanded: false,
+        }
+    }
+
+    fn open_subagent_app(root: &std::path::Path, entry: HistoryEntry) -> (App, uuid::Uuid) {
+        let mut app = App::new(Some(root), false);
+        app.daemon_prompt = None;
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        let session_id = uuid::Uuid::new_v4();
+        app.history.push(entry);
+        assert!(app.open_subagent_view_for_history_index(0));
+        app.launch.session_id = Some(session_id);
+        (app, session_id)
+    }
+
+    fn apply_default_subagent_history(
+        app: &mut App,
+        session_id: uuid::Uuid,
+        history: Vec<HistoryEntry>,
+    ) {
+        app.apply_subagent_history_result(session_id, "call-1", "default", history);
+    }
+
     fn render_history_no_selection(app: &mut App, width: u16, height: u16) {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -5678,6 +5713,171 @@ mod render_history_spacing_tests {
                 ..
             }) if outcome.report == "done"
         ));
+    }
+
+    #[test]
+    fn subagent_view_small_transcript_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = open_subagent_app(tmp.path(), running_subagent());
+        let snapshot = (0..8).map(sequenced_user).collect::<Vec<_>>();
+
+        apply_default_subagent_history(&mut app, session_id, snapshot.clone());
+        let capped_rows = visible_buffer_rows(&mut app, 80, 8);
+
+        let (mut control, _) = open_subagent_app(tmp.path(), running_subagent());
+        control.history = snapshot.into();
+        let uncapped_rows = visible_buffer_rows(&mut control, 80, 8);
+
+        assert_eq!(capped_rows, uncapped_rows);
+        assert_eq!(app.history.len(), 8);
+        assert!(!app.history.has_older());
+        assert_eq!(app.history.older_cursor(), None);
+        assert_eq!(
+            app.active_subagent_view()
+                .and_then(|view| view.notice.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn subagent_view_caps_residency_to_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = open_subagent_app(tmp.path(), running_subagent());
+        let snapshot = (0..(HISTORY_WINDOW_TARGET_ENTRIES as i64 + 5))
+            .map(sequenced_user)
+            .collect();
+
+        apply_default_subagent_history(&mut app, session_id, snapshot);
+
+        assert_eq!(app.history.len(), HISTORY_WINDOW_TARGET_ENTRIES);
+        assert!(app.history.has_older());
+        assert_eq!(app.history.older_cursor(), None);
+        assert_eq!(history_text(&app.history[0]), "window row 5");
+        assert_eq!(
+            history_text(app.history.last().expect("resident tail")),
+            "window row 604"
+        );
+    }
+
+    #[test]
+    fn subagent_view_shows_truncation_indicator_when_capped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = open_subagent_app(tmp.path(), docs_subagent());
+        let snapshot = (0..(HISTORY_WINDOW_TARGET_ENTRIES as i64 + 5))
+            .map(sequenced_user)
+            .collect();
+
+        apply_default_subagent_history(&mut app, session_id, snapshot);
+
+        let notice = app
+            .active_subagent_view()
+            .and_then(|view| view.notice.as_deref())
+            .expect("combined notice");
+        assert!(notice.contains("read-only"));
+        assert!(notice.contains("/export"));
+
+        let rows = visible_buffer_rows(&mut app, 140, 10).join("\n");
+        assert!(rows.contains("read-only"));
+        assert!(rows.contains("/export"));
+    }
+
+    #[test]
+    fn subagent_view_window_survives_round_trip_and_nesting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = window_history_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+        app.daemon_prompt = None;
+        let session_id = uuid::Uuid::new_v4();
+        app.history.push(running_subagent());
+
+        render_history_no_selection(&mut app, 80, 6);
+        let main_len = app.history.len();
+        let main_cursor = app.history.older_cursor();
+        let main_has_older = app.history.has_older();
+        let subagent_idx = app.history.len() - 1;
+
+        assert!(app.open_subagent_view_for_history_index(subagent_idx));
+        app.launch.session_id = Some(session_id);
+        let mut first_child = (0..(HISTORY_WINDOW_TARGET_ENTRIES as i64 + 5))
+            .map(sequenced_user)
+            .collect::<Vec<_>>();
+        first_child.push(running_subagent());
+        apply_default_subagent_history(&mut app, session_id, first_child);
+        render_history_no_selection(&mut app, 80, 6);
+        app.set_chat_scroll_offset_from_interaction(4);
+        let child_len = app.history.len();
+        let child_first = history_text(&app.history[0]).to_string();
+        let child_cursor = app.history.older_cursor();
+        let child_has_older = app.history.has_older();
+        let child_offset = app.chat_scroll_offset;
+        let nested_idx = app.history.len() - 1;
+
+        app.launch.session_id = None;
+        assert!(app.open_subagent_view_for_history_index(nested_idx));
+        app.launch.session_id = Some(session_id);
+        apply_default_subagent_history(&mut app, session_id, (0..8).map(sequenced_user).collect());
+        assert_eq!(app.history.len(), 8);
+        assert!(app.return_from_subagent_view());
+
+        assert_eq!(app.history.len(), child_len);
+        assert_eq!(history_text(&app.history[0]), child_first);
+        assert_eq!(app.history.older_cursor(), child_cursor);
+        assert_eq!(app.history.has_older(), child_has_older);
+        assert_eq!(app.chat_scroll_offset, child_offset);
+        assert!(matches!(
+            app.history.last(),
+            Some(HistoryEntry::Subagent { .. })
+        ));
+
+        assert!(app.return_from_subagent_view());
+        assert_eq!(app.history.len(), main_len);
+        assert_eq!(app.history.older_cursor(), main_cursor);
+        assert_eq!(app.history.has_older(), main_has_older);
+        assert!(matches!(
+            app.history.last(),
+            Some(HistoryEntry::Subagent { .. })
+        ));
+    }
+
+    #[test]
+    fn subagent_view_streaming_trims_front_when_pinned_to_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, session_id) = open_subagent_app(tmp.path(), running_subagent());
+        apply_default_subagent_history(
+            &mut app,
+            session_id,
+            (0..HISTORY_WINDOW_TARGET_ENTRIES as i64)
+                .map(sequenced_user)
+                .collect(),
+        );
+
+        app.history
+            .extend(((HISTORY_WINDOW_TARGET_ENTRIES as i64)..=800).map(sequenced_user));
+        render_history_no_selection(&mut app, 80, 6);
+
+        assert_eq!(app.history.len(), HISTORY_WINDOW_TARGET_ENTRIES);
+        assert!(app.history.has_older());
+        assert_eq!(history_text(&app.history[0]), "window row 201");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut scrolled_app, session_id) = open_subagent_app(tmp.path(), running_subagent());
+        apply_default_subagent_history(
+            &mut scrolled_app,
+            session_id,
+            (0..HISTORY_WINDOW_TARGET_ENTRIES as i64)
+                .map(sequenced_user)
+                .collect(),
+        );
+        scrolled_app.chat_pinned_to_tail = false;
+        scrolled_app.chat_scroll_offset = 4;
+        scrolled_app
+            .history
+            .extend(((HISTORY_WINDOW_TARGET_ENTRIES as i64)..=800).map(sequenced_user));
+        render_history_no_selection(&mut scrolled_app, 80, 6);
+
+        assert_eq!(scrolled_app.history.len(), 801);
     }
 
     fn render_history_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {

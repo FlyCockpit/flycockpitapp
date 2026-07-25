@@ -2567,9 +2567,9 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             last_error,
         },
         DaemonDraining { forced } => TurnEvent::DaemonDraining { forced },
-        // The blocked-`readlock` waiting indicator
-        // (`readlock-wait-and-lock-expiry.md`): surfaced so the app's chrome
-        // shows/clears the transient "waiting for lock" indicator.
+        // The waiting-for-lock indicator (`readlock-wait-and-lock-expiry.md`
+        // historical prompt slug): surfaced so the app's chrome shows/clears
+        // the transient "waiting for lock" indicator.
         WaitingForLock {
             path,
             holder_agent,

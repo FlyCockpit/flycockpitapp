@@ -25,8 +25,8 @@ pub struct TuiConfig {
     /// instead of the P-51.
     #[serde(default)]
     pub banner: BannerConfig,
-    /// How `edit` / `editunlock` (and, later, `write` /
-    /// `writeunlock`) tool calls render their changes in the history
+    /// How `edit` / `edit` (and, later, `write` /
+    /// `write`) tool calls render their changes in the history
     /// pane. SideBySide degrades to Inline when the terminal is
     /// narrower than 80 columns.
     #[serde(default)]

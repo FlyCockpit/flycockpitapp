@@ -533,7 +533,7 @@
               "end": 7,
               "start": 0
             },
-            "native_tool_hints": ["use writeunlock"],
+            "native_tool_hints": ["use write"],
             "offered_scopes": ["once", "session"],
             "policy_cap": "session",
             "remembered_key": "echo",
@@ -576,7 +576,7 @@
                   "end": 7,
                   "start": 0
                 },
-                "native_tool_hints": ["use writeunlock"],
+                "native_tool_hints": ["use write"],
                 "offered_scopes": ["once", "session"],
                 "policy_cap": "session",
                 "remembered_key": "echo",

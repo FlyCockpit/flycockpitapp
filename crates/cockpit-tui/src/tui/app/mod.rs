@@ -1446,10 +1446,9 @@ pub struct App {
     /// `render_entry` call so the renderer can pick the markdown path
     /// per kind of entry.
     pub(super) markdown_opts: MarkdownOpts,
-    /// How `edit` / `editunlock` tool calls render in history
-    /// (`tui.diff_style`). The narrow-terminal degradation from
-    /// side-by-side → inline is per-render, computed from the
-    /// rendered pane width.
+    /// How `edit` tool calls render in history (`tui.diff_style`). The
+    /// narrow-terminal degradation from side-by-side → inline is per-render,
+    /// computed from the rendered pane width.
     pub(super) diff_style: DiffStyle,
     /// `tui.use_emojis`. Threaded into the history renderers so tool-call
     /// boxes (and other glyphs) pick emoji vs. text-only labels.
@@ -2021,12 +2020,13 @@ pub struct App {
     /// reliably) so a turn the user watched finish stays subtle.
     pub(super) last_user_interaction: Instant,
     /// Transient "waiting for lock" chrome indicator
-    /// (`readlock-wait-and-lock-expiry.md`). `Some((path, holder))` while a
-    /// `readlock` in this session is blocked on a lock another agent/session
-    /// holds; cleared when the wait ends (lock acquired or cancelled). Driven
-    /// by the daemon's per-session `WaitingForLock` start/clear broadcast and
-    /// rendered alongside the fixed chrome, like the `☕` glyph — never
-    /// displacing a fixed slot. Never enters history or any inference request.
+    /// (`readlock-wait-and-lock-expiry.md` historical prompt slug).
+    /// `Some((path, holder))` while a write/edit implicit acquire in this
+    /// session is blocked on a lock another agent/session holds; cleared when
+    /// the wait ends (lock acquired or cancelled). Driven by the daemon's
+    /// per-session `WaitingForLock` start/clear broadcast and rendered
+    /// alongside the fixed chrome, like the `☕` glyph — never displacing a
+    /// fixed slot. Never enters history or any inference request.
     pub(super) waiting_for_lock: Option<(String, String)>,
     /// Persistent sandbox-down remedy notice (`implementation notes` §6.5).
     /// `Some(remedy)` while the shell sandbox can't initialize: rendered as a
@@ -2500,9 +2500,9 @@ fn post_desktop_notification(summary: &str) {
     });
 }
 
-/// Args cached at `ToolStart` for an `edit` / `editunlock` call so the
-/// matching `ToolEnd` can build a `HistoryEntry::Diff`. We don't keep
-/// the whole `Value` because we only need three fields.
+/// Args cached at `ToolStart` for an `edit` call so the matching `ToolEnd` can
+/// build a `HistoryEntry::Diff`. We don't keep the whole `Value` because we
+/// only need three fields.
 #[derive(Debug, Clone)]
 struct PendingEditArgs {
     path: String,

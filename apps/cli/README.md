@@ -332,7 +332,7 @@ At a high level:
 - `src/tui/` implements the terminal UI, slash commands, settings, panes, dialogs, and embedded PTY views.
 - `src/daemon/` owns session workers, lifecycle, RPC, LSP, sleep prevention, and long-running state.
 - `src/engine/` runs agents, prompts, scheduling, pruning, retries, safety gates, compaction, and tool repair.
-- `src/tools/` implements model-callable tools such as `bash`, `read`, `readlock`, `writeunlock`, `editunlock`, `task`, `mcp`, `schedule`, `todo`, and code-intelligence tools.
+- `src/tools/` implements model-callable tools such as `bash`, `read`, `read`, `write`, `edit`, `task`, `mcp`, `schedule`, `todo`, and code-intelligence tools.
 - `src/agents/` defines built-in and user-overridable agent roles.
 - `src/config/` resolves layered config, provider entries, workspace trust, and Cockpit-specific settings.
 - `src/db/` is the SQLite persistence layer and migration set.

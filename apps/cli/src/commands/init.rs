@@ -3,7 +3,7 @@
 //! Mirrors opencode's `/init`: runs an agent (the normal `Build` →
 //! `builder` delegation path, single-writer) that explores the project and
 //! writes a concise, genuinely-useful instructions file at the target.
-//! The write goes through the real `writeunlock` tool path — never a
+//! The write goes through the real `write` tool path — never a
 //! canned template.
 //!
 //! Deliberately does **not** touch `config.json` or set up

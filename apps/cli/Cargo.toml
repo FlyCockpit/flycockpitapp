@@ -252,7 +252,7 @@ tree-sitter-c = { workspace = true }
 tree-sitter-cpp = { workspace = true }
 rayon = { workspace = true }
 firecrawl = { workspace = true }
-# In-process JSONC syntax validation for writeunlock/editunlock data files.
+# In-process JSONC syntax validation for write/edit data files.
 jsonc-parser = { workspace = true }
 
 # Linux-only: logind `handle-lid-switch` inhibitor lock for

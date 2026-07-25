@@ -1103,7 +1103,7 @@ mod tests {
                 "qwen",
                 1000,
                 "builder",
-                "editunlock",
+                "edit",
                 Some("a.rs"),
                 Recovery::ShapeRepair {
                     stage: "wrap_bare_string",
@@ -1177,7 +1177,7 @@ mod tests {
             r.recovery
                 .by_tool
                 .iter()
-                .any(|t| t.tool == "editunlock" && t.recovered == 2)
+                .any(|t| t.tool == "edit" && t.recovered == 2)
         );
     }
 
@@ -1480,7 +1480,7 @@ mod tests {
             "qwen",
             1000,
             "builder",
-            "editunlock",
+            "edit",
             Some("a.rs"),
             Recovery::ShapeRepair {
                 stage: "wrap_bare_string",
@@ -1540,7 +1540,7 @@ mod tests {
             r.recovery
                 .by_tool
                 .iter()
-                .any(|row| row.tool == "editunlock" && row.recovered == 1)
+                .any(|row| row.tool == "edit" && row.recovered == 1)
         );
         assert!(r.recovery.by_stage.iter().any(|row| {
             row.recovery_kind == "shape_repair"

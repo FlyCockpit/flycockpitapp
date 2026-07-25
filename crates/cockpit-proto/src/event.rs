@@ -1305,8 +1305,8 @@ pub enum Event {
         items: Vec<PausedWorkSummary>,
     },
 
-    /// A `readlock` in this session is blocked waiting on a lock held by
-    /// another agent/session, or that wait just ended
+    /// A write/edit implicit acquire in this session is blocked waiting on a
+    /// lock held by another agent/session, or that wait just ended
     /// (implementation note). Per-session
     /// (`session_id`-scoped): the attached TUI shows a transient indicator
     /// — `` waiting for lock on `{path}` (held by `{holder_agent}`) `` —

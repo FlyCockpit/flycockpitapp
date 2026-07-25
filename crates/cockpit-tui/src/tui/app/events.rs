@@ -1436,8 +1436,9 @@ impl App {
                 holder_agent,
                 waiting,
             } => {
-                // Transient chrome indicator (`readlock-wait-and-lock-expiry.md`):
-                // a `readlock` is blocked on a contended lock. Show the
+                // Transient chrome indicator (`readlock-wait-and-lock-expiry.md`
+                // historical prompt slug):
+                // a write/edit implicit acquire is blocked on a contended lock. Show the
                 // path + holder alongside the fixed chrome (like the ☕
                 // glyph); clear it when the wait ends (acquired or cancelled).
                 self.waiting_for_lock = if waiting {
@@ -1762,7 +1763,13 @@ fn backup_failure_reason(error_class: &cockpit_core::engine::model::InferenceErr
 /// but the engine doesn't surface pre-write content yet — see
 /// [`crate::tui::diff`]).
 fn is_write_tool(tool: &str) -> bool {
-    matches!(tool, "write" | "writeunlock")
+    matches!(
+        tool,
+        "write"
+            // Historical display only: pre-rename persisted sessions used this
+            // retired verb name in tool-call rows.
+            | "writeunlock"
+    )
 }
 
 #[cfg(test)]

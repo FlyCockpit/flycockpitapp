@@ -119,7 +119,8 @@ fn command_capability_unavailable_raises_persistent_copyable_notice() {
     assert_eq!(app.history.len(), history_len_before);
 }
 
-/// The waiting-for-lock chrome state (`readlock-wait-and-lock-expiry.md`):
+/// The waiting-for-lock chrome state (`readlock-wait-and-lock-expiry.md`
+/// historical prompt slug):
 /// a `WaitingForLock { waiting: true }` event sets the transient state with
 /// the path + holder, the `waiting: false` clear removes it, and neither
 /// touches the transcript (purely client-side chrome).

@@ -3378,10 +3378,10 @@ mod tests {
         }
     }
 
-    /// The `WaitingForLock` event (`readlock-wait-and-lock-expiry.md`) is a
-    /// per-session transient: it carries `session_id`, the contended `path`,
-    /// the `holder_agent`, and the `waiting` start/clear flag, and survives a
-    /// wire roundtrip intact.
+    /// The `WaitingForLock` event (`readlock-wait-and-lock-expiry.md`
+    /// historical prompt slug) is a per-session transient: it carries
+    /// `session_id`, the contended `path`, the `holder_agent`, and the
+    /// `waiting` start/clear flag, and survives a wire roundtrip intact.
     #[test]
     fn waiting_for_lock_event_roundtrips() {
         let sid = Uuid::new_v4();

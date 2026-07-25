@@ -92,7 +92,7 @@ pub struct ExtendedConfig {
     pub agent_dirs: Vec<PathBuf>,
 
     /// Gitignore-style glob patterns that re-permit otherwise-gitignored
-    /// paths for the `read`/`readlock` tools and re-include them in the
+    /// paths for the `read`/`read` tools and re-include them in the
     /// discovery surfaces (intel index + `@`-tag popup) — the read-allowlist
     /// (implementation note). Project-scoped: writes target
     /// the nearest project `.cockpit/config.json`, and the effective list at

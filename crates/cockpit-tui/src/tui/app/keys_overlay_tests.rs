@@ -380,17 +380,11 @@ fn orphan_tool_end_renders_standalone_success_line() {
 }
 
 #[test]
-fn read_and_readlock_tool_end_store_captured_output_but_unlock_does_not() {
+fn read_tool_end_stores_captured_output_but_unlock_does_not() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app(&tmp);
     for (call_id, tool, path, output) in [
         ("read-call", "read", "src/main.rs", "1|fn main() {}"),
-        (
-            "readlock-call",
-            "readlock",
-            "src/lib.rs",
-            "1|pub fn lib() {}",
-        ),
         ("unlock-call", "unlock", "src/lib.rs", "SHOULD_NOT_STORE"),
     ] {
         app.apply_event(cockpit_core::engine::agent::TurnEvent::ToolStart {
@@ -417,17 +411,12 @@ fn read_and_readlock_tool_end_store_captured_output_but_unlock_does_not() {
         .iter()
         .find(|call| call.call_id == "read-call")
         .unwrap();
-    let readlock = calls
-        .iter()
-        .find(|call| call.call_id == "readlock-call")
-        .unwrap();
     let unlock = calls
         .iter()
         .find(|call| call.call_id == "unlock-call")
         .unwrap();
 
     assert_eq!(read.output, "1|fn main() {}");
-    assert_eq!(readlock.output, "1|pub fn lib() {}");
     assert!(unlock.output.is_empty());
 }
 

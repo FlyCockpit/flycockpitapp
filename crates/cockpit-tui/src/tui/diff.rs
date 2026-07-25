@@ -1,4 +1,4 @@
-//! Diff rendering for `edit` / `editunlock` tool calls.
+//! Diff rendering for `edit` tool calls.
 //!
 //! Three modes (config `tui.diff_style`):
 //!
@@ -16,8 +16,8 @@
 //! large unchanged regions don't drown out the meaningful changes
 //! (the limit is [`CONTEXT_LINES`]).
 //!
-//! `write` / `writeunlock` diffs are deferred — the tool doesn't
-//! currently surface the pre-write file content to the TUI.
+//! `write` diffs are deferred — the tool doesn't currently surface the
+//! pre-write file content to the TUI.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -54,7 +54,7 @@ const COL_SEPARATOR: &str = " │ ";
 /// indent the existing `Plain` history entries use.
 const LEFT_INDENT: &str = "  ";
 
-/// Render an `edit` / `editunlock` tool call as a diff.
+/// Render an `edit` tool call as a diff.
 ///
 /// `width` is the chat-pane width in terminal columns; the side-by-side
 /// renderer uses it to size the two columns. `path` is the edited
@@ -91,11 +91,34 @@ pub fn render_diff(
 }
 
 fn effective_style(tool: &str, style: DiffStyle) -> DiffStyle {
-    if matches!(tool, "write" | "writeunlock") && matches!(style, DiffStyle::SideBySide) {
+    if is_write_diff_tool(tool) && matches!(style, DiffStyle::SideBySide) {
         DiffStyle::Inline
     } else {
         style
     }
+}
+
+fn is_write_diff_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "write"
+            // Historical display only: pre-rename persisted sessions used this
+            // retired verb name in tool-call rows.
+            | "writeunlock"
+    )
+}
+
+#[cfg(test)]
+fn is_diff_renderable_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "edit"
+            // Historical display only: pre-rename persisted sessions used
+            // retired verb names in tool-call rows.
+            | "editunlock"
+            | "write"
+            | "writeunlock"
+    )
 }
 
 /// Diff header: `[glyph] label: path (+N −M)`. The glyph + label come
@@ -554,7 +577,16 @@ mod tests {
     }
 
     #[test]
-    fn write_tools_force_inline_even_when_side_by_side_is_enabled() {
+    fn diff_renderer_accepts_new_and_historical_write_names() {
+        // Historical display only: include pre-rename persisted tool-call names.
+        for tool in ["write", "edit", "writeunlock", "editunlock"] {
+            assert!(
+                is_diff_renderable_tool(tool),
+                "{tool} should be diff-renderable for current or historical rows"
+            );
+        }
+
+        // Historical display only: include the pre-rename write tool name.
         for tool in ["write", "writeunlock"] {
             let lines = render_diff(
                 tool,

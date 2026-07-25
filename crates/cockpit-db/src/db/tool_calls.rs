@@ -867,7 +867,7 @@ mod tests {
             .await
             .unwrap();
         db.insert_tool_call(&mk(
-            "editunlock",
+            "edit",
             300,
             false,
             Recovery::EditCascade {

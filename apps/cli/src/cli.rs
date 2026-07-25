@@ -949,7 +949,7 @@ pub struct FailedCallsArgs {
     /// Only failures within the last N days. Default: 7.
     #[arg(long, default_value_t = 7)]
     pub days: u32,
-    /// Only this tool name (e.g. `editunlock`, `bash`).
+    /// Only this tool name (e.g. `edit`, `bash`).
     #[arg(long)]
     pub tool: Option<String>,
     /// Only this model id.

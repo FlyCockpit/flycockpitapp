@@ -314,10 +314,10 @@ pub fn caffeinate_glyph_spans(active: bool) -> Vec<Span<'static>> {
 }
 
 /// Transient "waiting for lock" indicator
-/// (`readlock-wait-and-lock-expiry.md`). Rendered **only** while a `readlock`
-/// in this session is blocked on a lock another agent/session holds —
-/// additive to the fixed chrome (cwd + branch + context + active agent,
-/// GOALS §1a), never displacing a slot, the same pattern as the `☕`
+/// (`readlock-wait-and-lock-expiry.md` historical prompt slug). Rendered
+/// **only** while a write/edit implicit acquire in this session is blocked on a
+/// lock another agent/session holds — additive to the fixed chrome (cwd +
+/// branch + context + active agent, GOALS §1a), never displacing a slot, the same pattern as the `☕`
 /// caffeinate glyph. Names the contended path (basename, to stay compact)
 /// and the holding agent; clears when the wait ends (lock acquired or
 /// cancelled). Yellow reads as "blocked, waiting" without the red of an

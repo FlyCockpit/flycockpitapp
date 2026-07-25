@@ -3907,8 +3907,9 @@ impl App {
         // by daemon-broadcast state. Additive to the fixed cwd + branch chrome
         // (GOALS §1a) — never displaces it, the same pattern as the ☕ glyph.
         // Transient "waiting for lock" indicator
-        // (`readlock-wait-and-lock-expiry.md`) leads the right-hand chrome
-        // while a `readlock` is blocked on a contended lock. Additive — never
+        // (`readlock-wait-and-lock-expiry.md` historical prompt slug) leads
+        // the right-hand chrome
+        // while a write/edit implicit acquire is blocked on a contended lock. Additive — never
         // displaces a fixed slot, the same pattern as the ☕ glyph.
         let mut right = chrome::waiting_for_lock_spans(self.waiting_for_lock.as_ref());
         right.extend(chrome::side_glyph_spans(self.side_conversation.is_some()));
@@ -4950,11 +4951,17 @@ fn wrap_ghost_line_chunks(
     out
 }
 
-/// True for tools that take an `old_string` / `new_string` pair we
-/// can render as a diff. `write` / `writeunlock` aren't in here yet
-/// because the engine doesn't surface the pre-write file content.
+/// True for tools that take an `old_string` / `new_string` pair we can render
+/// as a diff. `write` is not in here because the engine doesn't surface the
+/// pre-write file content.
 pub(super) fn is_edit_tool(tool: &str) -> bool {
-    matches!(tool, "edit" | "editunlock")
+    matches!(
+        tool,
+        "edit"
+            // Historical display only: pre-rename persisted sessions used this
+            // retired verb name in tool-call rows.
+            | "editunlock"
+    )
 }
 
 /// Approximate row count for a `Diff` entry, used by the chat-pane

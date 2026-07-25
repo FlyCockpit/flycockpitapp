@@ -188,23 +188,22 @@ pub enum HistoryEntry {
         /// write failed for this turn.
         seq: Option<i64>,
     },
-    /// Completed `edit` / `editunlock` tool call. Rendered as a diff
-    /// per `tui.diff_style` (side-by-side / inline / hidden). Stored
-    /// instead of a `Plain` line so the renderer can re-flow if the
-    /// pane width changes mid-session and re-pick side-by-side vs.
-    /// inline.
+    /// Completed `edit` tool call. Rendered as a diff per `tui.diff_style`
+    /// (side-by-side / inline / hidden). Stored instead of a `Plain` line so
+    /// the renderer can re-flow if the pane width changes mid-session and
+    /// re-pick side-by-side vs. inline.
     Diff {
         tool: String,
         path: String,
         old: String,
         new: String,
     },
-    /// A run of consecutive boxable tool calls (read, readlock, unlock,
-    /// bash, webfetch, …) rendered inside a light-grey rounded sidebar.
-    /// Diff tools (edit/editunlock), write tools, and subagent calls
-    /// break the run, so a box never holds them. When every call is
-    /// collapsed, the box shows at most [`TOOLBOX_VISIBLE`] calls with an
-    /// internal scroll. Clicking a call expands only that call.
+    /// A run of consecutive boxable tool calls (read, unlock, bash,
+    /// webfetch, …) rendered inside a light-grey rounded sidebar. Diff tools
+    /// (`edit`), write tools, and subagent calls break the run, so a box never
+    /// holds them. When every call is collapsed, the box shows at most
+    /// [`TOOLBOX_VISIBLE`] calls with an internal scroll. Clicking a call
+    /// expands only that call.
     ToolBox {
         calls: Vec<ToolCall>,
         /// Topmost visible call when no individual call is expanded.
@@ -216,10 +215,9 @@ pub enum HistoryEntry {
         follow: bool,
     },
     /// A standalone tool call rendered as one styled line outside any
-    /// box. Used for `write` / `writeunlock`: conceptually diffs that
-    /// break the box, but the engine doesn't surface pre-write file
-    /// content yet (see [`crate::tui::diff`]), so they render as a
-    /// one-liner until that lands.
+    /// box. Used for `write`: conceptually diffs that break the box, but the
+    /// engine doesn't surface pre-write file content yet (see
+    /// [`crate::tui::diff`]), so they render as a one-liner until that lands.
     ToolLine {
         call_id: String,
         tool: String,
@@ -337,8 +335,8 @@ pub fn classify_subagent_status(child: &str, report: &str, failed: bool) -> Opti
         "changed",
         "created",
         "updated",
-        "writeunlock",
-        "editunlock",
+        "writeunlock", // Historical report text from pre-rename sessions.
+        "editunlock",  // Historical report text from pre-rename sessions.
         "files changed",
         "files modified",
     ]
@@ -2439,16 +2437,22 @@ fn tool_state_style(state: ToolCallState) -> Style {
     }
 }
 
-/// Tools whose output is worth showing when a box is expanded. `read` and
-/// `readlock` show their captured, capped tool output so the user can inspect
-/// exactly what the model saw; `unlock` remains input-only. Public so the event
-/// handler can avoid storing outputs it will never display.
+/// Tools whose output is worth showing when a box is expanded. `read` shows its
+/// captured, capped tool output so the user can inspect exactly what the model
+/// saw; `unlock` remains input-only. Public so the event handler can avoid
+/// storing outputs it will never display.
 pub fn tool_shows_output(tool: &str) -> bool {
     !matches!(tool, "unlock")
 }
 
 fn tool_uses_read_output_renderer(tool: &str) -> bool {
-    matches!(tool, "read" | "readlock")
+    matches!(
+        tool,
+        "read"
+            // Historical display only: pre-rename persisted sessions used this
+            // retired verb name in tool-call rows.
+            | "readlock"
+    )
 }
 
 /// Spans for one tool-call line: `[glyph] label: summary`, the label

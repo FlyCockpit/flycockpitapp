@@ -1,4 +1,4 @@
-//! Tree-sitter-backed display highlighting for captured read/readlock output.
+//! Tree-sitter-backed display highlighting for captured read output.
 
 #[cfg(test)]
 use std::cell::Cell;

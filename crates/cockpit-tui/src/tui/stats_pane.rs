@@ -876,7 +876,7 @@ mod tests {
         ];
         rollup.recovery.by_tool = vec![RecoveryToolRow {
             model: "qwen".into(),
-            tool: "editunlock".into(),
+            tool: "edit".into(),
             calls: 2,
             recovered: 2,
             hard_fail: 0,
@@ -898,7 +898,7 @@ mod tests {
         }];
         rollup.recovery.hard_fail_shapes = vec![HardFailShapeRow {
             llm_mode: "normal".into(),
-            tool: "editunlock".into(),
+            tool: "edit".into(),
             shape_fingerprint: "shape-a".into(),
             count: 1,
         }];
@@ -907,7 +907,7 @@ mod tests {
         // Collapsed: drilldown rows absent.
         let collapsed = render_text(&pane, 80);
         assert!(!collapsed.contains("by tool"));
-        assert!(!collapsed.contains("editunlock"));
+        assert!(!collapsed.contains("edit"));
         assert!(collapsed.contains("By LLM mode"));
         assert!(collapsed.contains("normal"));
 
@@ -916,7 +916,7 @@ mod tests {
         assert!(pane.expanded[0]);
         let expanded = render_text(&pane, 80);
         assert!(expanded.contains("by tool"));
-        assert!(expanded.contains("editunlock"));
+        assert!(expanded.contains("edit"));
         assert!(expanded.contains("shape_repair / wrap_bare_string"));
         assert!(expanded.contains("hard-fail shapes (top 20)"));
         assert!(expanded.contains("shape-a"));

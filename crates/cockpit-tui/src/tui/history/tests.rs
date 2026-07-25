@@ -1668,7 +1668,7 @@ fn agent_no_pin_when_control_hidden() {
 }
 
 #[test]
-fn glyph_label_keeps_collapsed_lock_tool_names() {
+fn tool_glyph_label_keeps_collapsed_lock_tool_names() {
     assert_eq!(tool_glyph_label("read", true).1, "read");
     assert_eq!(tool_glyph_label("write", true).1, "write");
     assert_eq!(tool_glyph_label("edit", true).1, "edit");
@@ -1678,6 +1678,74 @@ fn glyph_label_keeps_collapsed_lock_tool_names() {
     // A glyph only appears when emojis are enabled.
     assert!(tool_glyph_label("bash", false).0.is_empty());
     assert!(!tool_glyph_label("bash", true).0.is_empty());
+}
+
+#[test]
+fn historical_lock_verb_tool_calls_still_render() {
+    // Historical display only: pre-rename persisted sessions used retired verb
+    // names in tool-call rows. This does not make those names dispatchable.
+    assert_eq!(tool_glyph_label("readlock", true).1, "read");
+    assert_eq!(tool_glyph_label("writeunlock", true).1, "write");
+    assert_eq!(tool_glyph_label("editunlock", true).1, "edit");
+    assert_eq!(tool_glyph_label("readlock", false).1, "readlock");
+    assert_eq!(tool_glyph_label("writeunlock", false).1, "writeunlock");
+    assert_eq!(tool_glyph_label("editunlock", false).1, "editunlock");
+
+    let mut historical_read = mk_call("readlock", "g.ts", ToolCallState::Success);
+    historical_read.expanded = true;
+    historical_read.output = "1|const value = 1;".into();
+    let toolbox = render_toolbox(&[historical_read], 0, true, 80, false, &no_elided());
+    let toolbox_text = rendered_text(&toolbox).join("\n");
+    assert!(toolbox_text.contains("readlock: g.ts"), "{toolbox_text}");
+    assert!(
+        toolbox_text.contains("1|const value = 1;"),
+        "{toolbox_text}"
+    );
+
+    let write_line = HistoryEntry::ToolLine {
+        call_id: "w".to_string(),
+        tool: "writeunlock".to_string(),
+        summary: "src/lib.rs".to_string(),
+        state: ToolCallState::Success,
+    };
+    let rendered_write = render_entry(
+        &write_line,
+        80,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        true,
+        &no_elided(),
+        0,
+        None,
+    );
+    assert!(
+        line_text(&rendered_write.lines[0]).contains("write: src/lib.rs"),
+        "{:?}",
+        rendered_text(&rendered_write)
+    );
+
+    let edit_diff = HistoryEntry::Diff {
+        tool: "editunlock".to_string(),
+        path: "src/lib.rs".to_string(),
+        old: "old\n".to_string(),
+        new: "new\n".to_string(),
+    };
+    let rendered_edit = render_entry(
+        &edit_diff,
+        80,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::Inline,
+        true,
+        &no_elided(),
+        0,
+        None,
+    );
+    let edit_text = rendered_text(&rendered_edit).join("\n");
+    assert!(edit_text.contains("edit: src/lib.rs"), "{edit_text}");
+    assert!(edit_text.contains("- old"), "{edit_text}");
+    assert!(edit_text.contains("+ new"), "{edit_text}");
 }
 
 /// Every emoji glyph in the tool-glyph path must be a reliably-wide,
@@ -1777,33 +1845,22 @@ fn toolbox_processing_call_is_yellow() {
 }
 
 #[test]
-fn toolbox_expanded_shows_read_and_readlock_output_but_not_unlock_output() {
+fn toolbox_expanded_shows_read_output_but_not_unlock_output() {
     let mut bash = mk_call("bash", "ls", ToolCallState::Success);
     bash.expanded = true;
     bash.output = "file_a\nfile_b".into();
     let mut read = mk_call("read", "f.rs", ToolCallState::Success);
     read.expanded = true;
     read.output = "1|fn main() {}".into();
-    let mut readlock = mk_call("readlock", "g.ts", ToolCallState::Success);
-    readlock.expanded = true;
-    readlock.output = "1|const value = 1;".into();
     let mut unlock = mk_call("unlock", "f.rs", ToolCallState::Success);
     unlock.expanded = true;
     unlock.output = "SHOULD_NOT_SHOW".into();
 
-    let r = render_toolbox(
-        &[bash, read, readlock, unlock],
-        0,
-        true,
-        80,
-        false,
-        &no_elided(),
-    );
+    let r = render_toolbox(&[bash, read, unlock], 0, true, 80, false, &no_elided());
     let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
     assert!(joined.contains("file_a") && joined.contains("file_b"));
     assert!(joined.contains("1|fn main() {}"));
-    assert!(joined.contains("1|const value = 1;"));
     assert!(!joined.contains("SHOULD_NOT_SHOW"));
 }
 

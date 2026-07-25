@@ -2991,7 +2991,7 @@ mod tests {
             risk_tier: Some("destructive".to_string()),
             risk_reasons: vec!["removes files".to_string()],
             affected_targets: vec!["foo".to_string()],
-            native_tool_hints: vec!["Use `writeunlock` for durable writes.".to_string()],
+            native_tool_hints: vec!["Use `write` for durable writes.".to_string()],
             offered_scopes: vec!["once".to_string()],
             policy_cap: Some("once".to_string()),
         });
@@ -3000,7 +3000,7 @@ mod tests {
         assert!(text.contains("reasons: removes files"), "{text}");
         assert!(text.contains("affected: foo"), "{text}");
         assert!(text.contains("scope cap: once"), "{text}");
-        assert!(text.contains("hint: Use `writeunlock`"), "{text}");
+        assert!(text.contains("hint: Use `write`"), "{text}");
     }
 
     #[test]

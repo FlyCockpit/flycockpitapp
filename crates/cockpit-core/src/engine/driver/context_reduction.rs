@@ -1008,6 +1008,7 @@ impl Driver {
         if let Ok(overview) = self.session.db.task_todo_overview(self.session.id, 24) {
             appendix.task_overview = compact::render_task_todo_overview(&overview);
         }
+        let history_agent_available = self.history_agent_available_for_compaction_nudge();
 
         // 3. Seed-tools (read-only/idempotent; re-executed, not replayed).
         let seeds = compact::derive_seed_tools(&calls);
@@ -1038,7 +1039,7 @@ impl Driver {
                 self.draft_brief(tx, &tail_message_seqs, filtered_history.clone())
                     .await
             };
-            let handoff = compact::assemble_handoff(&brief, &appendix);
+            let handoff = compact::assemble_handoff(&brief, &appendix, history_agent_available);
             let plan = match compact::plan_compacted_history(
                 &filtered_history,
                 &handoff,
@@ -1098,6 +1099,13 @@ impl Driver {
             seed_tools: seeds,
             compressed_entries,
         })
+    }
+
+    fn history_agent_available_for_compaction_nudge(&self) -> bool {
+        crate::agents::resolve_with_assistant_db(&self.cwd, "history", &self.session.db)
+            .ok()
+            .flatten()
+            .is_some_and(|def| crate::agents::is_builtin_agent("history") && def.mode.is_subagent())
     }
 
     /// Commit a prepared compaction without drafting. This remains a

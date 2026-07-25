@@ -828,6 +828,15 @@ fn default_functions() -> Vec<BuiltinFunction> {
             Arc::new(context_usage),
         ),
     ];
+    for tool in [
+        Arc::new(crate::tools::session_search::SessionSearchTool) as Arc<dyn Tool>,
+        Arc::new(crate::tools::session_read::SessionReadTool),
+        Arc::new(crate::tools::session_search::SessionLineageSearchTool),
+    ] {
+        if let Ok(func) = ToolOutputBuiltinAdapter::new(tool).into_function() {
+            funcs.push(func);
+        }
+    }
     register_test_builtin(&mut funcs);
     funcs
 }
@@ -1829,6 +1838,32 @@ mod tests {
                 func.descriptor(LlmMode::Normal),
                 "`{}` descriptor drifted between Frontier and Normal",
                 func.name
+            );
+        }
+    }
+
+    #[test]
+    fn history_agent_tools_are_default_cockpit_mcp_functions() {
+        let registry = default_registry();
+        for name in ["session_search", "session_read", "session_lineage_search"] {
+            let func = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} should be a cockpit builtin function"));
+            assert_eq!(func.name, name);
+            assert!(
+                ToolOutputBuiltinAdapter::new(match name {
+                    "session_search" => {
+                        Arc::new(crate::tools::session_search::SessionSearchTool) as Arc<dyn Tool>
+                    }
+                    "session_read" => Arc::new(crate::tools::session_read::SessionReadTool),
+                    "session_lineage_search" => {
+                        Arc::new(crate::tools::session_search::SessionLineageSearchTool)
+                    }
+                    _ => unreachable!(),
+                })
+                .into_function()
+                .is_ok(),
+                "{name} must register without an approval seam"
             );
         }
     }

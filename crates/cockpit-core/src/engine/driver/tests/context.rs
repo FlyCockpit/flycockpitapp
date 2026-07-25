@@ -1305,24 +1305,28 @@ async fn compact_end_to_end_unchanged() {
         "session_compacted_hash": test_json_hash(&compact_record_without_session_ids(&driver).await),
         "seed_tools": driver.session.db.take_seed_tools(driver.session.id).unwrap(),
     });
+    let expected_handoff = format!(
+        "test compact brief\n\n---\n## State appendix (deterministic — runtime ledger)\n\n\n**Files read:**\n- `seed.txt`\n\n\n{}",
+        crate::engine::compact::HISTORY_AGENT_NUDGE
+    );
     assert_eq!(
         snapshot,
         serde_json::json!({
-            "history_hash": "65d18b105ca8eaeeff47dd54350fd23e9ccc86159cb7008f36256ccc091f4cc5",
+            "history_hash": "5318a4b4dde3cc277a99f810021196a63087eb935f0003b798e9b6afece0f0b7",
             "compact_ready": {
                 "brief": "test compact brief",
-                "handoff": "test compact brief\n\n---\n## State appendix (deterministic — runtime ledger)\n\n\n**Files read:**\n- `seed.txt`\n",
+                "handoff": expected_handoff,
                 "seed_tool_count": 1,
                 "seed_tool_tokens": 6,
                 "source": "manual",
                 "tail_kept": 2,
                 "tail_trimmed": 0,
-                "tokens_after": 2268,
+                "tokens_after": 2339,
                 "tokens_before": 3642,
                 "trigger_ctx_pct": null,
                 "turns_summarized": 0,
             },
-            "session_compacted_hash": "cdf178122d0b96c3193a3925fa068715fd16ea65f249e1aa1218ead546a7b7c3",
+            "session_compacted_hash": "f74c1f05ff41cc8fd9356322c0fb3312ef102a0de278f651d72d325b2792f6bc",
             "seed_tools": [
                 {
                     "args": {
@@ -1558,7 +1562,7 @@ async fn auto_compact_fires_at_threshold_once() {
     use crate::config::providers::{CacheMode, ContextConfig};
     let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
-    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
+    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 240);
     let fixture_model = driver.stack[0].agent.model.clone();
     let mut build = crate::engine::builtin::load("Build", &driver.spawn_args(true)).unwrap();
     build.model = fixture_model;
@@ -1595,7 +1599,7 @@ async fn auto_compact_fires_at_threshold_once() {
         .await
         .unwrap();
 
-    // 50% < 60 → no compact.
+    // 25% < 60 → no compact.
     driver
         .session
         .record_usage(
@@ -1614,13 +1618,13 @@ async fn auto_compact_fires_at_threshold_once() {
         "below 60% no compact"
     );
 
-    // 65% ≥ 60 → compact fires once.
+    // The cumulative usage is now above 60%, so compact fires once.
     driver
         .session
         .record_usage(
             uuid::Uuid::new_v4(),
             crate::tokens::TokenUsage {
-                input_tokens: 65,
+                input_tokens: 160,
                 output_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -1642,7 +1646,7 @@ async fn auto_compact_fires_at_threshold_once() {
     let seed_start = events
         .iter()
         .position(|ev| matches!(ev, TurnEvent::ToolStart { tool, .. } if tool == "read"))
-        .expect("seed read starts without a user follow-up");
+        .unwrap_or_else(|| panic!("seed read starts without a user follow-up: {events:?}"));
     let seed_end = events
         .iter()
         .position(|ev| matches!(ev, TurnEvent::ToolEnd { tool, output, .. } if tool == "read" && output.contains("seed body")))

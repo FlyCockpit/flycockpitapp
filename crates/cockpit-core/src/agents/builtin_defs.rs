@@ -27,6 +27,7 @@ pub const BUILTIN_AGENT_NAMES: &[&str] = &[
     "Build",
     "builder",
     "explore",
+    "history",
     "deepthink",
     "scout",
     "Plan",
@@ -69,6 +70,7 @@ pub fn embedded_default(name: &str) -> Option<AgentDef> {
         "Build" => Some(build_def()),
         "builder" => Some(builder_def()),
         "explore" => Some(explore_def()),
+        "history" => Some(history_def()),
         "deepthink" => Some(deepthink_def()),
         "scout" => Some(scout_def()),
         "Plan" => Some(plan_def()),
@@ -294,6 +296,28 @@ fn explore_def() -> AgentDef {
     )
 }
 
+/// `history` — read-only recall worker, leaf in the invocation tree. It uses
+/// trust-filtered history tools in its own context and returns a short report.
+fn history_def() -> AgentDef {
+    let mut def = def_with_normal(
+        "history",
+        "Read-only recall worker; searches prior sessions and compaction lineage, then reports relevant excerpts.",
+        AgentMode::Subagent,
+        &[
+            "read",
+            "session_search",
+            "session_read",
+            "session_lineage_search",
+        ],
+        crate::engine::builtin::HISTORY_PROMPT,
+        Some(crate::engine::builtin::HISTORY_PROMPT_NORMAL),
+    );
+    for tool in ["session_search", "session_read", "session_lineage_search"] {
+        def.tool_tiers.insert(tool.to_string(), ToolTier::Builtin);
+    }
+    def
+}
+
 /// `deepthink` — optional tool-free reasoning worker. It receives only its
 /// standalone task prompt plus explicit seeds, then returns structured
 /// analysis.
@@ -477,4 +501,44 @@ fn docs_answerer_def() -> AgentDef {
         },
     );
     def
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_agent_def_is_subagent_read_only_and_builtin_tiered() {
+        let def = embedded_default("history").expect("history embedded default");
+        assert_eq!(def.name, "history");
+        assert_eq!(def.mode, AgentMode::Subagent);
+        assert!(BUILTIN_AGENT_NAMES.contains(&"history"));
+
+        let tools = def.tools.as_ref().expect("history has explicit tools");
+        for tool in [
+            "read",
+            "session_search",
+            "session_read",
+            "session_lineage_search",
+        ] {
+            assert!(tools.iter().any(|name| name == tool), "{tool} missing");
+        }
+        for forbidden in [
+            "task",
+            "spawn",
+            "handoff",
+            "readlock",
+            "writeunlock",
+            "editunlock",
+            "unlock",
+        ] {
+            assert!(
+                !tools.iter().any(|name| name == forbidden),
+                "{forbidden} must not be granted"
+            );
+        }
+        for tool in ["session_search", "session_read", "session_lineage_search"] {
+            assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Builtin));
+        }
+    }
 }

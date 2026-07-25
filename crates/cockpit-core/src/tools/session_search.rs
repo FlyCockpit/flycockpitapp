@@ -179,6 +179,18 @@ impl Tool for SessionLineageSearchTool {
         "Search the current session's compaction lineage, including compacted predecessors and the current session"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Search the current session's persisted history lineage, including compacted \
+             predecessor sessions and the current session, for a keyword or phrase. Use this \
+             when a detail may have been summarized away by compaction. It returns bounded \
+             snippets and can also scan bounded tool-call event JSON; follow up with \
+             `session_read` only for a specific session/topic you need. This is recall of \
+             stored conversation history, not a code search."
+                .to_string(),
+        )
+    }
+
     fn effect(&self) -> ToolEffect {
         ToolEffect::ReadOnly
     }

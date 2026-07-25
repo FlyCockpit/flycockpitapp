@@ -62,6 +62,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("schedule"),
     ToolTimeoutSafety::abandon_safe("search"),
     ToolTimeoutSafety::abandon_safe("seed"),
+    ToolTimeoutSafety::abandon_safe("session_lineage_search"),
     ToolTimeoutSafety::abandon_safe("session_read"),
     ToolTimeoutSafety::abandon_safe("session_search"),
     ToolTimeoutSafety::abandon_safe("skill"),

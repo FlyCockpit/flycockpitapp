@@ -202,7 +202,7 @@ fn tool_family(name: &str) -> &'static str {
         | "defer_to_orchestrator"
         | "schedule"
         | "start_build" => "coordination",
-        "session_search" | "session_read" | "todo" | "goal" => "memory",
+        "session_search" | "session_read" | "session_lineage_search" | "todo" | "goal" => "memory",
         "skill" | "skill_manage" | "mcp" => "extensions",
         "grep" | "glob" => "sandbox",
         _ => "other",

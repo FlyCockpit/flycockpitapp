@@ -91,6 +91,8 @@ pub(crate) const BUILDER_PROMPT_NORMAL: &str = include_str!("builder.normal.md")
 pub(crate) const BUILDER_PROMPT_FRONTIER: &str = include_str!("builder.frontier.md");
 pub(crate) const EXPLORE_PROMPT: &str = include_str!("explore.md");
 pub(crate) const EXPLORE_PROMPT_NORMAL: &str = include_str!("explore.normal.md");
+pub(crate) const HISTORY_PROMPT: &str = include_str!("history.md");
+pub(crate) const HISTORY_PROMPT_NORMAL: &str = include_str!("history.normal.md");
 pub(crate) const DEEPTHINK_PROMPT: &str = include_str!("deepthink.md");
 pub(crate) const SCOUT_PROMPT: &str = include_str!("scout.md");
 pub(crate) const SCOUT_PROMPT_NORMAL: &str = include_str!("scout.normal.md");
@@ -394,7 +396,13 @@ fn with_tiered_recall_tools(
         return Ok(tb);
     }
     let grant_has_mcp = grant.iter().any(|tool| tool == "mcp");
-    for name in ["session_search", "session_read", "todo", "goal"] {
+    for name in [
+        "session_search",
+        "session_read",
+        "session_lineage_search",
+        "todo",
+        "goal",
+    ] {
         if is_assistant
             && !grant_has_mcp
             && !grant.iter().any(|tool| tool == name)
@@ -475,6 +483,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "harness_invoke",
         "session_search",
         "session_read",
+        "session_lineage_search",
         "todo",
         "goal",
         "readlock",
@@ -647,6 +656,12 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Session",
+            name: "session_lineage_search",
+            summary: "Search the current session's compaction lineage.",
+            condition: Some("interactive sessions"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
             name: "tool_result_retrieve",
             summary: "Retrieve an elided tool result.",
             condition: Some("internal recovery"),
@@ -803,6 +818,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::plan_doc::StartBuildTool),
         Arc::new(tools::session_search::SessionSearchTool),
         Arc::new(tools::session_read::SessionReadTool),
+        Arc::new(tools::session_search::SessionLineageSearchTool),
         Arc::new(tools::todo::TodoTool),
         Arc::new(tools::tool_result_retrieve::ToolResultRetrieveTool),
         Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
@@ -872,6 +888,9 @@ fn materialize_tool_by_name(
         "harness_invoke" => tb.with(Arc::new(tools::harness::HarnessInvokeTool)),
         "session_search" => tb.with(Arc::new(tools::session_search::SessionSearchTool)),
         "session_read" => tb.with(Arc::new(tools::session_read::SessionReadTool)),
+        "session_lineage_search" => {
+            tb.with(Arc::new(tools::session_search::SessionLineageSearchTool))
+        }
         "spawn" => tb.with(Arc::new(tools::spawn::SpawnTool::for_depth(
             args.swarm_depth,
             args.swarm_max_depth,
@@ -1213,6 +1232,7 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "harness_invoke",
             "session_search",
             "session_read",
+            "session_lineage_search",
             "goal",
             "lsp",
         ],
@@ -1221,6 +1241,7 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "harness_invoke",
             "session_search",
             "session_read",
+            "session_lineage_search",
             "goal",
             "lsp",
         ],
@@ -1238,7 +1259,12 @@ fn default_disabled_tools_for(name: &str) -> &'static [&'static str] {
 }
 
 fn default_assistant_discoverable_tools() -> &'static [&'static str] {
-    &["session_search", "session_read", "goal"]
+    &[
+        "session_search",
+        "session_read",
+        "session_lineage_search",
+        "goal",
+    ]
 }
 
 fn effective_tool_tier(
@@ -1656,6 +1682,7 @@ fn default_assistant_tools() -> Vec<String> {
             "mcp",
             "session_search",
             "session_read",
+            "session_lineage_search",
             "goal",
             "skill_manage",
         ]
@@ -1764,7 +1791,7 @@ fn unknown_agent_rejection_with_resolver(
 /// The bundled reachable subagent set for `Plan` plus any user-authored
 /// custom subagent (`mode` `subagent`/`all`).
 fn plan_subagents(cwd: &Path) -> Vec<String> {
-    let mut out: Vec<String> = vec!["explore".to_string()];
+    let mut out: Vec<String> = vec!["explore".to_string(), "history".to_string()];
     append_custom_subagents(&mut out, cwd);
     out
 }
@@ -1783,6 +1810,7 @@ fn build_subagents(
     let mut out: Vec<String> = vec![
         "builder".to_string(),
         "explore".to_string(),
+        "history".to_string(),
         "docs".to_string(),
     ];
     if computer_subagent_reachable(config, cwd) {
@@ -1992,6 +2020,12 @@ pub fn builder(args: &SpawnArgs) -> Agent {
 /// tool in the primary agent's history.
 pub fn explore(args: &SpawnArgs) -> Agent {
     embedded_agent("explore", args)
+}
+
+/// `history` — read-only recall worker. It searches prior sessions and
+/// compaction lineage in its own context, then returns a short report.
+pub fn history(args: &SpawnArgs) -> Agent {
+    embedded_agent("history", args)
 }
 
 /// `deepthink` — optional tool-free reasoning worker. It is intentionally a
@@ -2454,11 +2488,75 @@ mod tests {
     }
 
     #[test]
+    fn history_agent_def_is_read_only_leaf_with_builtin_history_tools() {
+        use crate::agents::{AgentMode, ToolTier};
+
+        let def = crate::agents::embedded_default("history").expect("history embedded default");
+        assert_eq!(def.name, "history");
+        assert_eq!(def.mode, AgentMode::Subagent);
+
+        let tools = def.tools.as_ref().expect("history has explicit tools");
+        for tool in [
+            "read",
+            "session_search",
+            "session_read",
+            "session_lineage_search",
+        ] {
+            assert!(tools.iter().any(|name| name == tool), "{tool} missing");
+        }
+        for forbidden in [
+            "task",
+            "spawn",
+            "handoff",
+            "bash",
+            "readlock",
+            "writeunlock",
+            "editunlock",
+            "unlock",
+        ] {
+            assert!(
+                !tools.iter().any(|name| name == forbidden),
+                "{forbidden} must not be on history"
+            );
+        }
+        for tool in ["session_search", "session_read", "session_lineage_search"] {
+            assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Builtin));
+        }
+        crate::agents::validate_invariants(&def).expect("history def is invariant-valid");
+    }
+
+    #[test]
+    fn history_agent_has_first_class_history_tools_and_short_report_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let agent = load("history", &args).unwrap();
+        let names = agent.tools.names();
+
+        for tool in ["session_search", "session_read", "session_lineage_search"] {
+            assert!(
+                names.contains(&tool),
+                "{tool} should be a first-class history tool: {names:?}"
+            );
+        }
+        assert!(!names.contains(&"task"), "history must remain a leaf");
+        assert!(
+            agent.role_prompt.contains("Return a short report")
+                || agent.role_prompt.contains("return only the useful excerpt"),
+            "history prompt must bound the task result"
+        );
+        assert!(
+            agent.role_prompt.contains("Do not paste raw transcripts")
+                || agent.role_prompt.contains("avoid dumping transcripts"),
+            "history prompt must forbid raw transcript dumps"
+        );
+    }
+
+    #[test]
     fn bundled_agents_without_defer_to_orchestrator_stay_without_it() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
 
-        for name in ["bee", "scout", "deepthink", "Build", "Plan"] {
+        for name in ["history", "bee", "scout", "deepthink", "Build", "Plan"] {
             let agent = load(name, &args).unwrap();
             assert!(
                 !agent.tools.names().contains(&"defer_to_orchestrator"),
@@ -2489,6 +2587,7 @@ mod tests {
         for (name, factory) in [
             ("builder", builder as fn(&SpawnArgs) -> Agent),
             ("explore", explore as fn(&SpawnArgs) -> Agent),
+            ("history", history as fn(&SpawnArgs) -> Agent),
         ] {
             let loaded = load(name, &args).unwrap();
             let factory_agent = factory(&args);
@@ -2716,6 +2815,7 @@ mod tests {
             "harness_invoke",
             "session_search",
             "session_read",
+            "session_lineage_search",
             "goal",
         ] {
             assert!(
@@ -2852,7 +2952,12 @@ mod tests {
         assert!(names.contains(&"skill_manage"), "{names:?}");
         assert!(names.contains(&"mcp"), "{names:?}");
         let host = host_for_agent(&agent, tmp.path());
-        for tool in ["session_search", "session_read", "goal"] {
+        for tool in [
+            "session_search",
+            "session_read",
+            "session_lineage_search",
+            "goal",
+        ] {
             assert!(
                 !names.contains(&tool),
                 "{tool} should not be directly injected"
@@ -2892,7 +2997,12 @@ mod tests {
             !discoverable.is_empty() && names.contains(&"mcp"),
             "discoverable tools {discoverable:?} must be reachable through `mcp`"
         );
-        for tool in ["session_search", "session_read", "goal"] {
+        for tool in [
+            "session_search",
+            "session_read",
+            "session_lineage_search",
+            "goal",
+        ] {
             assert!(
                 discoverable.iter().any(|name| name == tool),
                 "{tool} should be discoverable through monty: {discoverable:?}"
@@ -4154,6 +4264,7 @@ mod tests {
         let names = known_agent_tool_names();
         assert!(names.contains(&"todo"));
         assert!(names.contains(&"goal"));
+        assert!(names.contains(&"session_lineage_search"));
         for removed in [
             format!("todo_{}", "read"),
             format!("create_{}", "goal"),
@@ -4165,7 +4276,7 @@ mod tests {
                 "{removed} should not be grantable"
             );
         }
-        for name in ["todo", "goal"] {
+        for name in ["todo", "goal", "session_lineage_search"] {
             let tb = materialize_tool_by_name(ToolBox::new(), name, None, &args).unwrap();
             assert_eq!(tb.names(), vec![name]);
         }
@@ -4543,7 +4654,7 @@ mod tests {
                 .iter()
                 .map(|value| value.as_str().expect("string enum value"))
                 .collect();
-        assert_eq!(enum_values, vec!["explore", "docs"]);
+        assert_eq!(enum_values, vec!["explore", "history", "docs"]);
     }
 
     #[test]

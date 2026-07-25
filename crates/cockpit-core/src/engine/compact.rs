@@ -335,11 +335,22 @@ pub fn brief_prompt(override_prompt: Option<&str>) -> String {
         .to_string()
 }
 
+pub const HISTORY_AGENT_NUDGE: &str = "Note: information summarized away in this handoff is not lost - the full prior conversation, tool output, and every compacted predecessor session remain on disk. If you need a detail that is not in this brief, invoke the `history` agent via `task` to search and retrieve it rather than guessing or asking the user to repeat themselves.";
+
 /// Assemble the full review-ready handoff: model brief + deterministic
 /// appendix. (Seed-tools are surfaced separately; they re-execute, they
 /// aren't part of the prose.)
-pub fn assemble_handoff(brief: &str, appendix: &StateAppendix) -> String {
-    format!("{}{}", brief.trim(), appendix.render())
+pub fn assemble_handoff(
+    brief: &str,
+    appendix: &StateAppendix,
+    history_agent_available: bool,
+) -> String {
+    let mut handoff = format!("{}{}", brief.trim(), appendix.render());
+    if history_agent_available {
+        handoff.push_str("\n\n");
+        handoff.push_str(HISTORY_AGENT_NUDGE);
+    }
+    handoff
 }
 
 /// One deterministic post-compaction history plan. The handoff remains the
@@ -756,10 +767,33 @@ mod tests {
             files_read: vec!["/a.rs".into()],
             ..Default::default()
         };
-        let h = assemble_handoff("Continue the refactor.", &appendix);
+        let h = assemble_handoff("Continue the refactor.", &appendix, false);
         assert!(h.starts_with("Continue the refactor."));
         assert!(h.contains("State appendix"));
         assert!(h.contains("/a.rs"));
+        assert!(!h.contains(HISTORY_AGENT_NUDGE));
+    }
+
+    #[test]
+    fn history_nudge_appended_when_history_agent_available() {
+        let appendix = StateAppendix {
+            files_read: vec!["/a.rs".into()],
+            ..Default::default()
+        };
+        let h = assemble_handoff("Continue the refactor.", &appendix, true);
+
+        assert!(h.contains("State appendix"));
+        assert!(h.ends_with(HISTORY_AGENT_NUDGE));
+        assert!(h.contains("`history` agent via `task`"));
+    }
+
+    #[test]
+    fn history_nudge_omitted_when_history_agent_unavailable() {
+        let appendix = StateAppendix::default();
+        let h = assemble_handoff("Continue the refactor.", &appendix, false);
+
+        assert!(!h.contains(HISTORY_AGENT_NUDGE));
+        assert!(!h.contains("`history` agent via `task`"));
     }
 
     #[test]
@@ -819,6 +853,7 @@ mod tests {
         assert_eq!(brief_prompt(Some(custom)), custom);
         // Verbatim — not appended to the default.
         assert!(!brief_prompt(Some(custom)).contains("deterministic appendix"));
+        assert!(!brief_prompt(Some(custom)).contains("`history` agent"));
     }
 
     fn exchanges(count: usize, body: &str) -> Vec<Message> {

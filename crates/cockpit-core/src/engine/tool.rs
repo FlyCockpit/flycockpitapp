@@ -2479,6 +2479,7 @@ mod llm_mode_tests {
             ("schedule", ToolEffect::Dynamic),
             ("search", ToolEffect::Dynamic),
             ("seed", ToolEffect::Dynamic),
+            ("session_lineage_search", ToolEffect::ReadOnly),
             ("session_read", ToolEffect::ReadOnly),
             ("session_search", ToolEffect::ReadOnly),
             ("skill", ToolEffect::Dynamic),

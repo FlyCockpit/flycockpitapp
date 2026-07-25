@@ -7,13 +7,10 @@
 //! Layout:
 //!
 //! - [`bash`] — process spawn, output capping, env scrub.
-//! - [`read`] — snapshot read (no lock). Used by `Build`
-//!   for shallow inspection and by `builder` for non-mutating context
-//!   reads.
-//! - [`readlock`] — acquire-and-read (plan §4.1).
-//! - [`writeunlock`] — write-and-release.
+//! - [`read`] — snapshot read used for inspection and pre-write freshness.
+//! - [`write`] — write-and-release.
 //! - [`unlock`] — release without write.
-//! - [`editunlock`] — cascade-based search/replace (plan §13b).
+//! - [`edit`] — cascade-based search/replace (plan §13b).
 //! - [`task`] — structural; the engine intercepts this name.
 //! - [`todo`] — durable task-backed todo state.
 
@@ -24,7 +21,7 @@ pub mod data_syntax;
 pub mod defer;
 pub mod delegation_payload_retrieve;
 pub mod docs;
-pub mod editunlock;
+pub mod edit;
 pub mod escalate;
 pub mod glob;
 pub mod goal;
@@ -39,7 +36,6 @@ pub mod mcp_tool;
 pub mod plan_doc;
 pub mod question;
 pub mod read;
-pub mod readlock;
 pub mod return_tool;
 pub mod sandbox;
 pub mod sandbox_mode;
@@ -59,6 +55,6 @@ pub mod todo;
 pub mod tool_result_retrieve;
 pub mod unlock;
 pub mod web;
-pub mod writeunlock;
+pub mod write;
 
 pub mod common;

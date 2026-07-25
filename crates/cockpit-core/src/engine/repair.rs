@@ -16,7 +16,7 @@
 //!
 //! Letting the validator complain first means the *schema* is the prior:
 //! repair budget is spent only at the paths that actually disagreed, and
-//! a `writeunlock` whose `content` happens to be JSON-shaped is never
+//! a `write` whose `content` happens to be JSON-shaped is never
 //! rewritten because the schema never complained about it.
 //!
 //! ## The catalog (order is load-bearing)

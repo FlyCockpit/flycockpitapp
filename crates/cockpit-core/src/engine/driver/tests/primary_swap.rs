@@ -286,9 +286,7 @@ async fn swap_marker_does_not_leak_into_user_transcript() {
 #[tokio::test]
 async fn stale_tool_owner_ledgers_drop_calls_absent_from_root_history() {
     let (mut driver, _t) = test_driver(1);
-    driver.stack[0]
-        .history
-        .push(tool_call_turn("live", "editunlock"));
+    driver.stack[0].history.push(tool_call_turn("live", "edit"));
     driver.stack[0]
         .history
         .push(Message::tool_result_with_call_id(
@@ -502,16 +500,14 @@ async fn absent_tool_calls_annotated_naming_the_maker_present_tools_untouched() 
     assert_eq!(driver.active_agent(), "Build");
     // `Build` is the authority for which tool A actually held.
     assert!(
-        driver.stack[0].agent.tools.get("editunlock").is_some(),
+        driver.stack[0].agent.tools.get("edit").is_some(),
         "Build holds the write tool"
     );
     assert!(driver.stack[0].agent.tools.get("read").is_some());
 
     // A (`Build`) makes a write call and a read call, each answered.
     push_user_turn(&mut driver, "edit the file then read it");
-    driver.stack[0]
-        .history
-        .push(tool_call_turn("w1", "editunlock"));
+    driver.stack[0].history.push(tool_call_turn("w1", "edit"));
     driver.stack[0]
         .history
         .push(Message::tool_result_with_call_id(
@@ -528,12 +524,12 @@ async fn absent_tool_calls_annotated_naming_the_maker_present_tools_untouched() 
             "file contents",
         ));
 
-    // Swap to `Plan` (read-only — lacks `editunlock`). No annotation yet —
+    // Swap to `Plan` (read-only — lacks `edit`). No annotation yet —
     // deferred to the next message.
     driver.swap_primary("Plan", &tx).await;
     assert_eq!(driver.active_agent(), "Plan");
     assert!(
-        driver.stack[0].agent.tools.get("editunlock").is_none(),
+        driver.stack[0].agent.tools.get("edit").is_none(),
         "Plan lacks the write tool"
     );
     assert!(
@@ -547,7 +543,9 @@ async fn absent_tool_calls_annotated_naming_the_maker_present_tools_untouched() 
     // The write call carries the attribution note naming A (`Build`) and T.
     let w = tool_result_text_for(&driver, "w1");
     assert!(
-        w.contains("[Called by `Build`, which had the `editunlock` tool. You (`Plan`) do not have this tool.]"),
+        w.contains(
+            "[Called by `Build`, which had the `edit` tool. You (`Plan`) do not have this tool.]"
+        ),
         "absent-tool call annotated with maker + tool + new identity: {w:?}"
     );
     assert!(
@@ -579,9 +577,7 @@ async fn annotation_attributes_each_call_to_its_actual_maker() {
     reroot_real(&mut driver, "Build");
 
     // A (`Build`) makes a write call.
-    driver.stack[0]
-        .history
-        .push(tool_call_turn("b1", "editunlock"));
+    driver.stack[0].history.push(tool_call_turn("b1", "edit"));
     driver.stack[0]
         .history
         .push(Message::tool_result_with_call_id(
@@ -591,9 +587,7 @@ async fn annotation_attributes_each_call_to_its_actual_maker() {
         ));
 
     // A second write call is still attributed to Build before the read-only swap.
-    driver.stack[0]
-        .history
-        .push(tool_call_turn("s1", "writeunlock"));
+    driver.stack[0].history.push(tool_call_turn("s1", "write"));
     driver.stack[0]
         .history
         .push(Message::tool_result_with_call_id(
@@ -608,12 +602,12 @@ async fn annotation_attributes_each_call_to_its_actual_maker() {
 
     let b = tool_result_text_for(&driver, "b1");
     assert!(
-        b.contains("[Called by `Build`, which had the `editunlock` tool."),
+        b.contains("[Called by `Build`, which had the `edit` tool."),
         "the first write call is attributed to `Build`: {b:?}"
     );
     let s = tool_result_text_for(&driver, "s1");
     assert!(
-        s.contains("[Called by `Build`, which had the `writeunlock` tool."),
+        s.contains("[Called by `Build`, which had the `write` tool."),
         "the second write call is attributed to `Build`: {s:?}"
     );
 }
@@ -673,9 +667,7 @@ async fn read_only_agent_cannot_reissue_annotated_write_tool() {
     let (mut driver, _t) = test_driver(1);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     reroot_real(&mut driver, "Build");
-    driver.stack[0]
-        .history
-        .push(tool_call_turn("w1", "writeunlock"));
+    driver.stack[0].history.push(tool_call_turn("w1", "write"));
     driver.stack[0]
         .history
         .push(Message::tool_result_with_call_id(
@@ -690,8 +682,8 @@ async fn read_only_agent_cannot_reissue_annotated_write_tool() {
     // Annotation present (the guarantee).
     assert!(tool_result_text_for(&driver, "w1").contains("You (`Plan`) do not have this tool."));
     // And `Plan`'s surface genuinely holds no write tool to re-issue.
-    assert!(driver.stack[0].agent.tools.get("writeunlock").is_none());
-    assert!(driver.stack[0].agent.tools.get("editunlock").is_none());
+    assert!(driver.stack[0].agent.tools.get("write").is_none());
+    assert!(driver.stack[0].agent.tools.get("edit").is_none());
 }
 
 /// Part 2 (implementation note, the `myj42m`

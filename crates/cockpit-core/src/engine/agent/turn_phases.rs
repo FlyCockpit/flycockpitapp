@@ -1399,9 +1399,9 @@ pub(crate) async fn run_turn(
         mcp_builtin_registry: active_tools.mcp_builtin_registry(),
         has_tree: agent.tools.get("code").is_some(),
         has_bash: agent.tools.get("bash").is_some(),
-        // The blocked-`readlock` waiting indicator routes its
+        // The blocked-`read` waiting indicator routes its
         // `WaitingForLock` start/clear pair back through this same turn
-        // event stream (`readlock-wait-and-lock-expiry.md`).
+        // event stream (`read-wait-and-lock-expiry.md`).
         events: Some(tx.clone()),
         lsp,
         resource_scheduler,

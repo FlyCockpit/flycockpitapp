@@ -10,7 +10,7 @@
 //!    with **no escalation prompt**. This path must never gain one.
 //!
 //! 2. [`check_native_access`] — the **escalate-on-miss** path the native
-//!    cockpit tools (`read`, `readlock`, `editunlock`, `writeunlock`,
+//!    cockpit tools (`read`, `edit`, `write`,
 //!    the intel/`search` tools) use (sandboxing part 2). A target inside
 //!    cwd or the session tmp dir is allowed silently; one outside
 //!    consults part 1's path-grant store and, if not granted, raises
@@ -147,9 +147,9 @@ pub async fn check_native_access(
     }
 }
 
-// ---- gitignore read-allowlist gate (read/readlock only) ------------------
+// ---- gitignore read-allowlist gate (read only) ------------------
 
-/// Gate a `read`/`readlock` of `resolved` on gitignore status
+/// Gate a `read` of `resolved` on gitignore status
 /// (implementation note). Returns `Ok(None)` to let the
 /// read proceed, or `Ok(Some(refusal))` — a **non-fatal** [`ToolOutput`] the
 /// tool returns verbatim — when the read is refused (defensive against weak

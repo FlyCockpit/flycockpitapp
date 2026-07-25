@@ -7,7 +7,7 @@
 //! superset re-read of the whole file) escape it — yet the overlapping lines
 //! are redundant: the newer read carries the current version of them.
 //!
-//! This module computes, for the `read`/`readlock` tool-result bodies of one
+//! This module computes, for the `read` tool-result bodies of one
 //! canonical file, which older bodies' line sub-ranges are **fully covered**
 //! by a newer read of the same file, and rewrites the older body to elide
 //! exactly those lines while keeping its non-overlapping remainder. The
@@ -53,7 +53,7 @@ pub const OVERLAP_REASON: &str = "overlapping read superseded";
 /// in overlap-merge. Only these — the other snapshot tools
 /// (`outline`/`symbol_find`/… ) keep the unchanged whole-body exact-identity
 /// dedup.
-const READ_TOOLS: &[&str] = &["read", "readlock"];
+const READ_TOOLS: &[&str] = &["read"];
 
 fn is_read_tool(name: &str) -> bool {
     READ_TOOLS.contains(&name)
@@ -328,6 +328,7 @@ pub fn overlap_marker_line() -> String {
 mod tests {
     use super::*;
     use crate::engine::message::{Message, ToolCall};
+    use crate::engine::tool::{Tool, ToolEffect};
     use rig::OneOrMany;
     use rig::message::{AssistantContent, ToolResult, ToolResultContent};
     use serde_json::json;
@@ -379,6 +380,18 @@ mod tests {
         );
         // A content line that merely starts with a digit but no separator.
         assert_eq!(numbered_line_no("3 blind mice"), None);
+    }
+
+    #[test]
+    fn read_tools_list_matches_registered_read_tools() {
+        let read = crate::tools::read::ReadTool;
+
+        assert_eq!(READ_TOOLS, ["read"]);
+        assert_eq!(read.name(), "read");
+        assert_eq!(read.effect(), ToolEffect::ReadOnly);
+        assert!(is_read_tool(read.name()));
+        assert!(!is_read_tool("write"));
+        assert!(!is_read_tool("edit"));
     }
 
     #[test]

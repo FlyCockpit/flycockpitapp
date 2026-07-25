@@ -181,7 +181,7 @@ pub fn build_appendix(
 
     for call in calls {
         match call.tool.as_str() {
-            "read" | "readlock" => {
+            "read" => {
                 if let Some(p) = call
                     .path
                     .clone()
@@ -190,7 +190,7 @@ pub fn build_appendix(
                     files_read.insert(p);
                 }
             }
-            "write" | "writeunlock" | "edit" | "editunlock" => {
+            "write" | "edit" => {
                 if let Some(p) = call
                     .path
                     .clone()

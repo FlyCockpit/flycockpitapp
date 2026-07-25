@@ -1,4 +1,4 @@
-//! `unlock` — release a held lock without writing.
+//! `unlock` — recover from a held lock without writing.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,16 +16,16 @@ impl Tool for UnlockTool {
     }
 
     fn description(&self) -> &str {
-        "Release a `readlock` without writing; use `writeunlock` or `editunlock` when you want to save"
+        "Recovery-only: release a stuck held file lock without writing; normal `write`/`edit` calls unlock automatically"
     }
 
     fn defensive_description(&self) -> Option<String> {
         Some(
-            "Release a lock you took with `readlock` WITHOUT saving any changes — use this when \
-             you decided not to edit the file after all, so the lock doesn't stay held. If you \
-             DO want to save changes, use `writeunlock` or `editunlock` instead (they release \
-             the lock as part of saving); `unlock` discards nothing on disk but throws away the \
-             right to write that you were holding."
+            "Recovery-only lock cleanup. Use `unlock` when a prior failed, interrupted, or \
+             abandoned tool call left this agent holding a file lock and you need to free it \
+             without changing the file. Do not use it as part of the normal edit flow: \
+             `write` and `edit` acquire and release their lock automatically. `unlock` writes \
+             nothing and discards no on-disk changes."
                 .to_string(),
         )
     }
@@ -74,7 +74,7 @@ mod tests {
     use crate::engine::repair::{self, ALIASES_KEY, PATH_KIND_KEY, PRIMARY_FIELD_KEY};
     use crate::engine::tool::Tool;
     use crate::tools::common::test_ctx;
-    use crate::tools::readlock::ReadlockTool;
+    use crate::tools::read::ReadTool;
 
     fn path_aliases(schema: &Value) -> Vec<String> {
         schema["properties"]["path"][ALIASES_KEY]
@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn unlock_schema_carries_path_annotations() {
-        let readlock = ReadlockTool;
+        let read = ReadTool;
         let unlock = UnlockTool;
         for schema in [
             unlock.parameters(),
@@ -95,7 +95,7 @@ mod tests {
         ] {
             assert_eq!(schema[PRIMARY_FIELD_KEY], "path");
             assert_eq!(schema["properties"]["path"][PATH_KIND_KEY], "path");
-            assert_eq!(path_aliases(&schema), path_aliases(&readlock.parameters()));
+            assert_eq!(path_aliases(&schema), path_aliases(&read.parameters()));
         }
     }
 
@@ -137,5 +137,20 @@ mod tests {
 
         assert!(ctx.locks.holder(&file).is_none());
         assert!(output.content.contains("locked.txt"), "{output:?}");
+    }
+
+    #[test]
+    fn unlock_is_recovery_only_in_descriptions() {
+        let tool = UnlockTool;
+        let description = tool.description();
+        let defensive = tool.defensive_description().expect("defensive description");
+
+        for text in [description, defensive.as_str()] {
+            assert!(text.contains("Recovery-only"), "{text}");
+            assert!(text.contains("write") && text.contains("edit"), "{text}");
+            assert!(text.contains("automatically"), "{text}");
+            assert!(!text.contains("decided not to edit"), "{text}");
+            assert!(!text.contains("normal edit flow: use `unlock`"), "{text}");
+        }
     }
 }

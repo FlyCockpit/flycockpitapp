@@ -321,10 +321,10 @@ fn known_tool_schemas() -> BTreeMap<String, Value> {
 
     let all: Vec<Box<dyn Tool>> = vec![
         Box::new(tools::read::ReadTool),
-        Box::new(tools::readlock::ReadlockTool),
-        Box::new(tools::writeunlock::WriteunlockTool),
+        Box::new(tools::read::ReadTool),
+        Box::new(tools::write::WriteTool),
         Box::new(tools::unlock::UnlockTool),
-        Box::new(tools::editunlock::EditunlockTool),
+        Box::new(tools::edit::EditTool),
         Box::new(tools::bash::BashTool::new()),
         Box::new(tools::intel::CodeTool),
         Box::new(tools::intel::GraphTool),
@@ -348,7 +348,7 @@ fn classify_tool(name: &str) -> ToolCategory {
         "bash" => ToolCategory::Shell,
         "task" | "spawn" | "handoff" => ToolCategory::Delegation,
         "question" | "mcp" => ToolCategory::ApprovalRequiring,
-        "readlock" | "writeunlock" | "editunlock" | "unlock" => ToolCategory::WriteOrLockCapable,
+        "write" | "edit" | "unlock" => ToolCategory::WriteOrLockCapable,
         _ => ToolCategory::Unknown,
     }
 }

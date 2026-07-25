@@ -556,7 +556,7 @@ mod tests {
         let (ctx, _) = assistant_tool_ctx(project.path(), home.path(), SoulEditMode::HumanOnly);
         let original = std::fs::read_to_string(soul_path(home.path())).unwrap();
 
-        let out = crate::tools::writeunlock::WriteunlockTool
+        let out = crate::tools::write::WriteTool
             .call(
                 serde_json::json!({
                     "path": soul_path(home.path()).display().to_string(),
@@ -585,7 +585,7 @@ mod tests {
         let (ctx, _) =
             assistant_tool_ctx(project.path(), home.path(), SoulEditMode::ApproveProposals);
 
-        let out = crate::tools::writeunlock::WriteunlockTool
+        let out = crate::tools::write::WriteTool
             .call(
                 serde_json::json!({
                     "path": soul_path(home.path()).display().to_string(),
@@ -624,7 +624,7 @@ mod tests {
             ctx.interrupts.clone(),
         ));
         ctx.approver = Some(approver);
-        crate::tools::readlock::ReadlockTool
+        crate::tools::read::ReadTool
             .call(
                 serde_json::json!({"path": user_path(home.path()).display().to_string()}),
                 &ctx,
@@ -649,7 +649,7 @@ mod tests {
                 }
             ));
         });
-        crate::tools::readlock::ReadlockTool
+        crate::tools::read::ReadTool
             .call(
                 serde_json::json!({"path": user_path(home.path()).display().to_string()}),
                 &ctx,
@@ -657,7 +657,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = crate::tools::writeunlock::WriteunlockTool
+        let out = crate::tools::write::WriteTool
             .call(
                 serde_json::json!({
                     "path": user_path(home.path()).display().to_string(),
@@ -692,7 +692,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let (ctx, _) = assistant_tool_ctx(project.path(), home.path(), SoulEditMode::Autonomous);
-        crate::tools::readlock::ReadlockTool
+        crate::tools::read::ReadTool
             .call(
                 serde_json::json!({"path": soul_path(home.path()).display().to_string()}),
                 &ctx,
@@ -700,7 +700,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = crate::tools::writeunlock::WriteunlockTool
+        let out = crate::tools::write::WriteTool
             .call(
                 serde_json::json!({
                     "path": soul_path(home.path()).display().to_string(),

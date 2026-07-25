@@ -1,4 +1,4 @@
-//! `writeunlock` — create or overwrite the file with `content` and release the lock.
+//! `write` — create or overwrite the file with `content` and release the lock.
 //!
 //! Pre-write invariant (plan §3c): existing files require that the agent has
 //! read the file in this session, OR holds the lock. Missing files may be
@@ -14,16 +14,16 @@ use serde_json::Value;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args};
 use crate::tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release};
 
-pub struct WriteunlockTool;
+pub struct WriteTool;
 
 #[async_trait]
-impl Tool for WriteunlockTool {
+impl Tool for WriteTool {
     fn name(&self) -> &str {
-        "writeunlock"
+        "write"
     }
 
     fn description(&self) -> &str {
-        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted); locking is automatic, so no separate lock call is needed before writing; existing files require prior read/readlock; prefer `editunlock` for small changes"
+        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted); locking is automatic, so no separate lock call is needed before writing; existing files require prior read; prefer `edit` for small changes"
     }
 
     fn defensive_description(&self) -> Option<String> {
@@ -32,11 +32,11 @@ impl Tool for WriteunlockTool {
              do not call a separate lock tool before writing. \
              `content` must be the complete new file from first line to last — anything you omit \
              is deleted, so include every line you want to keep, not just your changes. Use \
-             `writeunlock` for new files or full rewrites; existing files require prior \
-             read/readlock, or the write is rejected to guard against blind overwrites. Missing \
+             `write` for new files or full rewrites; existing files require prior \
+             read, or the write is rejected to guard against blind overwrites. Missing \
              parent directories are created for new files after path-access checks pass. For a \
              small change to a large file prefer \
-             `editunlock` (targeted search/replace) so you don't have to restate the whole file. \
+             `edit` (targeted search/replace) so you don't have to restate the whole file. \
              New-file creation does not grant permission for later blind overwrites."
                 .to_string(),
         )
@@ -66,7 +66,7 @@ impl Tool for WriteunlockTool {
 
     fn presentation(&self, args: &Value) -> ToolPresentation {
         let (summary, full_input) = path_or_readable_args(args);
-        ToolPresentation::with_parts(Some("🔓"), "writeunlock", summary, full_input)
+        ToolPresentation::with_parts(Some("🔓"), "write", summary, full_input)
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -178,7 +178,7 @@ fn create_new_and_release(
     create_file(path, bytes).map_err(|err| {
         if err.kind() == std::io::ErrorKind::AlreadyExists {
             anyhow::anyhow!(
-                "cannot create `{}` — file now exists; readlock it before overwriting",
+                "cannot create `{}` — file now exists; read it before overwriting",
                 path.display()
             )
         } else {
@@ -225,7 +225,7 @@ mod tests {
     use crate::engine::agent::TurnEvent;
     use crate::engine::tool::{ToolFailKind, classify_failure};
     use crate::tools::common::{LOCK_BOOKKEEPING_ADVISORY, test_ctx, test_ctx_with_db};
-    use crate::tools::readlock::ReadlockTool;
+    use crate::tools::read::ReadTool;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -377,9 +377,9 @@ mod tests {
         }
     }
 
-    async fn writeunlock(path: &Path, content: &str, ctx: &ToolCtx) -> anyhow::Result<String> {
+    async fn write(path: &Path, content: &str, ctx: &ToolCtx) -> anyhow::Result<String> {
         crate::config::trust::scope_workspace_trust_policy(trusted_policy(&ctx.cwd), async {
-            Ok(WriteunlockTool
+            Ok(WriteTool
                 .call(
                     serde_json::json!({
                         "path": path.display().to_string(),
@@ -393,14 +393,9 @@ mod tests {
         .await
     }
 
-    async fn editunlock(
-        path: &Path,
-        old: &str,
-        new: &str,
-        ctx: &ToolCtx,
-    ) -> anyhow::Result<String> {
+    async fn edit(path: &Path, old: &str, new: &str, ctx: &ToolCtx) -> anyhow::Result<String> {
         crate::config::trust::scope_workspace_trust_policy(trusted_policy(&ctx.cwd), async {
-            Ok(crate::tools::editunlock::EditunlockTool
+            Ok(crate::tools::edit::EditTool
                 .call(
                     serde_json::json!({
                         "path": path.display().to_string(),
@@ -416,11 +411,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writeunlock_creates_new_file_without_prior_read() {
+    async fn write_creates_new_file_without_prior_read() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
 
-        WriteunlockTool
+        WriteTool
             .call(
                 serde_json::json!({"path": "created.md", "content": "hello\n"}),
                 &ctx,
@@ -435,7 +430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writeunlock_rejects_invalid_skill_manifest() {
+    async fn write_rejects_invalid_skill_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         let original = skill_manifest("bad", "d", "Body");
         let package = write_skill_package(tmp.path(), "bad", &original);
@@ -443,7 +438,7 @@ mod tests {
         let manifest = package.join("SKILL.md");
         note_read(&ctx, &manifest);
 
-        let err = writeunlock(&manifest, "no frontmatter\n", &ctx)
+        let err = write(&manifest, "no frontmatter\n", &ctx)
             .await
             .unwrap_err();
         assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
@@ -454,7 +449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writeunlock_rejects_skill_manifest_rename() {
+    async fn write_rejects_skill_manifest_rename() {
         let tmp = tempfile::tempdir().unwrap();
         let original = skill_manifest("stable", "d", "Body");
         let package = write_skill_package(tmp.path(), "stable", &original);
@@ -462,7 +457,7 @@ mod tests {
         let manifest = package.join("SKILL.md");
         note_read(&ctx, &manifest);
 
-        let err = writeunlock(&manifest, &skill_manifest("renamed", "d", "Body"), &ctx)
+        let err = write(&manifest, &skill_manifest("renamed", "d", "Body"), &ctx)
             .await
             .unwrap_err()
             .to_string();
@@ -472,7 +467,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writeunlock_support_file_rule_matrix() {
+    async fn write_support_file_rule_matrix() {
         let tmp = tempfile::tempdir().unwrap();
         let package = write_skill_package(
             tmp.path(),
@@ -481,13 +476,13 @@ mod tests {
         );
         let ctx = skill_test_ctx(tmp.path());
 
-        let err = writeunlock(&package.join("notes").join("a.md"), "x", &ctx)
+        let err = write(&package.join("notes").join("a.md"), "x", &ctx)
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("support file must be under one of"), "{err}");
 
-        let err = writeunlock(
+        let err = write(
             &package.join("references").join("..").join("escape.md"),
             "x",
             &ctx,
@@ -497,7 +492,7 @@ mod tests {
         .to_string();
         assert!(err.contains("parent traversal"), "{err}");
 
-        let err = writeunlock(
+        let err = write(
             &package.join("references").join("large.md"),
             &"x".repeat(100_001),
             &ctx,
@@ -545,13 +540,13 @@ mod tests {
         for (name, package, expected, manifest) in packages {
             let skill_md = package.join("SKILL.md");
             note_read(&ctx, &skill_md);
-            let write_err = writeunlock(&skill_md, &skill_manifest(name, "new", "Body"), &ctx)
+            let write_err = write(&skill_md, &skill_manifest(name, "new", "Body"), &ctx)
                 .await
                 .unwrap_err()
                 .to_string();
             assert!(write_err.contains(expected), "{write_err}");
 
-            let edit_err = editunlock(&skill_md, "description: d", "description: new", &ctx)
+            let edit_err = edit(&skill_md, "description: d", "description: new", &ctx)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -562,7 +557,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn writeunlock_refuses_symlinked_skill_target() {
+    async fn write_refuses_symlinked_skill_target() {
         let tmp = tempfile::tempdir().unwrap();
         let package =
             write_skill_package(tmp.path(), "links", &skill_manifest("links", "d", "Body"));
@@ -575,10 +570,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         note_read(&ctx, &link);
 
-        let err = writeunlock(&link, "new", &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = write(&link, "new", &ctx).await.unwrap_err().to_string();
 
         assert!(err.contains("may not traverse symlinks"), "{err}");
         assert_eq!(std::fs::read_to_string(real).unwrap(), "old");
@@ -586,7 +578,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn writeunlock_validates_outside_symlink_to_skill_target() {
+    async fn write_validates_outside_symlink_to_skill_target() {
         let tmp = tempfile::tempdir().unwrap();
         let original = skill_manifest("outside-link", "d", "Body");
         let package = write_skill_package(tmp.path(), "outside-link", &original);
@@ -596,9 +588,7 @@ mod tests {
         std::os::unix::fs::symlink(&manifest, &link).unwrap();
         note_read(&ctx, &manifest);
 
-        let err = writeunlock(&link, "not frontmatter\n", &ctx)
-            .await
-            .unwrap_err();
+        let err = write(&link, "not frontmatter\n", &ctx).await.unwrap_err();
 
         assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
         let err = err.to_string();
@@ -619,7 +609,7 @@ mod tests {
         assert_eq!(discovered[0].frontmatter.description, "old");
         let before = crate::skills::catalog_generation();
 
-        writeunlock(&manifest, &skill_manifest("valid", "new", "Body"), &ctx)
+        write(&manifest, &skill_manifest("valid", "new", "Body"), &ctx)
             .await
             .unwrap();
 
@@ -637,7 +627,7 @@ mod tests {
         let manifest = package.join("SKILL.md");
         note_read(&ctx, &manifest);
 
-        let out = writeunlock(&manifest, &skill_manifest("note", "new", "Body"), &ctx)
+        let out = write(&manifest, &skill_manifest("note", "new", "Body"), &ctx)
             .await
             .unwrap();
 
@@ -656,9 +646,9 @@ mod tests {
         let manifest = package.join("SKILL.md");
         note_read(&ctx, &manifest);
 
-        let err = writeunlock(&manifest, "broken", &ctx).await.unwrap_err();
+        let err = write(&manifest, "broken", &ctx).await.unwrap_err();
         assert!(err.to_string().contains("YAML frontmatter"), "{err}");
-        let out = writeunlock(&manifest, &skill_manifest("retry", "new", "Body"), &ctx)
+        let out = write(&manifest, &skill_manifest("retry", "new", "Body"), &ctx)
             .await
             .unwrap();
 
@@ -676,7 +666,7 @@ mod tests {
         let ctx = test_ctx(tmp.path());
         let before = crate::skills::catalog_generation();
 
-        let out = writeunlock(&tmp.path().join("plain.md"), "hello", &ctx)
+        let out = write(&tmp.path().join("plain.md"), "hello", &ctx)
             .await
             .unwrap();
 
@@ -694,7 +684,7 @@ mod tests {
         let ctx = test_ctx(tmp.path());
         let file = tmp.path().join("created.md");
 
-        WriteunlockTool
+        WriteTool
             .call(
                 serde_json::json!({"path": "created.md", "content": "hello\n"}),
                 &ctx,
@@ -708,15 +698,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_readlock_then_new_file_writeunlock_creates_file() {
+    async fn missing_read_then_new_file_write_creates_file() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
 
-        let _ = ReadlockTool
+        let _ = ReadTool
             .call(serde_json::json!({"path": "later.md"}), &ctx)
             .await;
 
-        WriteunlockTool
+        WriteTool
             .call(
                 serde_json::json!({"path": "later.md", "content": "created\n"}),
                 &ctx,
@@ -735,12 +725,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_file_without_prior_readlock_is_rejected() {
+    async fn existing_file_without_prior_read_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("existing.md"), "old\n").unwrap();
         let ctx = test_ctx(tmp.path());
 
-        let err = WriteunlockTool
+        let err = WriteTool
             .call(
                 serde_json::json!({"path": "existing.md", "content": "new\n"}),
                 &ctx,
@@ -749,8 +739,8 @@ mod tests {
             .unwrap_err();
 
         let msg = err.to_string();
-        assert!(msg.contains("readlock it first"), "{msg}");
-        assert!(msg.contains("retry writeunlock"), "{msg}");
+        assert!(msg.contains("read it first"), "{msg}");
+        assert!(msg.contains("retry write"), "{msg}");
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("existing.md")).unwrap(),
             "old\n"
@@ -758,11 +748,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_file_writeunlock_creates_missing_parent_directories() {
+    async fn new_file_write_creates_missing_parent_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
 
-        WriteunlockTool
+        WriteTool
             .call(
                 serde_json::json!({"path": "nested/deep/file.txt", "content": "body"}),
                 &ctx,
@@ -781,7 +771,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
 
-        WriteunlockTool
+        WriteTool
             .call(
                 serde_json::json!({"path": "created.md", "content": "first\n"}),
                 &ctx,
@@ -789,7 +779,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = WriteunlockTool
+        let err = WriteTool
             .call(
                 serde_json::json!({"path": "created.md", "content": "second\n"}),
                 &ctx,
@@ -798,8 +788,8 @@ mod tests {
             .unwrap_err();
 
         let msg = err.to_string();
-        assert!(msg.contains("readlock it first"), "{msg}");
-        assert!(msg.contains("retry writeunlock"), "{msg}");
+        assert!(msg.contains("read it first"), "{msg}");
+        assert!(msg.contains("retry write"), "{msg}");
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("created.md")).unwrap(),
             "first\n"
@@ -815,7 +805,7 @@ mod tests {
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
         assert!(ctx.locks.holder(&file).is_none());
 
-        WriteunlockTool
+        WriteTool
             .call(
                 serde_json::json!({"path": "existing.md", "content": "new\n"}),
                 &ctx,
@@ -838,7 +828,7 @@ mod tests {
             .acquire(&file, &ctx.agent_id, ctx.session.id)
             .unwrap();
 
-        WriteunlockTool
+        WriteTool
             .call(
                 serde_json::json!({"path": "existing.md", "content": "new\n"}),
                 &ctx,
@@ -862,7 +852,7 @@ mod tests {
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
         std::fs::write(&file, "changed\n").unwrap();
 
-        let err = WriteunlockTool
+        let err = WriteTool
             .call(
                 serde_json::json!({"path": "existing.md", "content": "new\n"}),
                 &ctx,
@@ -872,7 +862,7 @@ mod tests {
 
         let msg = err.to_string();
         assert!(msg.contains("changed on disk since you read it"), "{msg}");
-        assert!(msg.contains("readlock it again"), "{msg}");
+        assert!(msg.contains("read it again"), "{msg}");
         assert_eq!(classify_failure(&err), ToolFailKind::Invocation);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "changed\n");
         assert!(ctx.locks.holder(&file).is_none());
@@ -889,14 +879,7 @@ mod tests {
             .unwrap();
         let guard = ctx
             .locks
-            .begin_write_after_wait(
-                &path,
-                &ctx.agent_id,
-                ctx.session.id,
-                "writeunlock",
-                true,
-                false,
-            )
+            .begin_write_after_wait(&path, &ctx.agent_id, ctx.session.id, "write", true, false)
             .unwrap();
 
         let err = create_new_and_release(&path, b"new\n", guard, |path, _| {
@@ -911,7 +894,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("file now exists; readlock it before overwriting"),
+                .contains("file now exists; read it before overwriting"),
             "{err}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "raced\n");
@@ -927,7 +910,7 @@ mod tests {
         std::fs::write(&stale, "old\n").unwrap();
         ctx.locks.note_read(&stale, &ctx.agent_id, ctx.session.id);
         std::fs::write(&stale, "changed\n").unwrap();
-        let err = WriteunlockTool
+        let err = WriteTool
             .call(
                 serde_json::json!({"path": "stale.md", "content": "new\n"}),
                 &ctx,
@@ -941,7 +924,7 @@ mod tests {
         assert!(ctx.locks.holder(&stale).is_none());
 
         let outside = tmp.path().parent().unwrap().join("outside-write-denied.md");
-        let err = WriteunlockTool
+        let err = WriteTool
             .call(
                 serde_json::json!({
                     "path": outside.display().to_string(),
@@ -961,7 +944,7 @@ mod tests {
         let identity_home = tempfile::tempdir().unwrap();
         let identity_ctx = identity_refusal_ctx(identity_home.path());
         let soul = crate::assistants::identity::soul_path(identity_home.path());
-        let out = WriteunlockTool
+        let out = WriteTool
             .call(
                 serde_json::json!({
                     "path": soul.display().to_string(),
@@ -977,7 +960,7 @@ mod tests {
         let blocked_parent = tmp.path().join("not-a-dir");
         std::fs::write(&blocked_parent, "file blocks directory creation").unwrap();
         let target = blocked_parent.join("child.txt");
-        let err = WriteunlockTool
+        let err = WriteTool
             .call(
                 serde_json::json!({
                     "path": "not-a-dir/child.txt",
@@ -992,12 +975,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_file_writeunlock_reports_parent_not_directory() {
+    async fn new_file_write_reports_parent_not_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
         std::fs::write(tmp.path().join("blocked"), "file blocks directory").unwrap();
 
-        let err = WriteunlockTool
+        let err = WriteTool
             .call(
                 serde_json::json!({"path": "blocked/file.md", "content": "body"}),
                 &ctx,
@@ -1009,7 +992,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writeunlock_reports_success_when_release_persist_fails() {
+    async fn write_reports_success_when_release_persist_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let (ctx, db) = test_ctx_with_db(tmp.path());
         let file = tmp.path().join("existing.json");
@@ -1017,7 +1000,7 @@ mod tests {
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
         fail_lock_state_deletes(&db);
 
-        let out = WriteunlockTool
+        let out = WriteTool
             .call(
                 serde_json::json!({"path": "existing.json", "content": "{\"ok\":true}\n"}),
                 &ctx,
@@ -1073,7 +1056,7 @@ mod tests {
             .note_read(&file, &ctx_b.agent_id, ctx_b.session.id);
         fail_lock_state_deletes(&db);
 
-        let out = WriteunlockTool
+        let out = WriteTool
             .call(
                 serde_json::json!({"path": "shared.md", "content": "writer a\n"}),
                 &ctx_a,
@@ -1086,7 +1069,7 @@ mod tests {
         );
         assert!(ctx_a.locks.holder(&file).is_none());
 
-        let err = WriteunlockTool
+        let err = WriteTool
             .call(
                 serde_json::json!({"path": "shared.md", "content": "writer b\n"}),
                 &ctx_b,
@@ -1116,7 +1099,7 @@ mod tests {
         let file_for_release = file.clone();
 
         let handle = tokio::spawn(async move {
-            WriteunlockTool
+            WriteTool
                 .call(
                     serde_json::json!({"path": "busy.md", "content": "new\n"}),
                     &ctx,
@@ -1174,7 +1157,7 @@ mod tests {
         let file_for_release = file.clone();
 
         let handle = tokio::spawn(async move {
-            WriteunlockTool
+            WriteTool
                 .call(
                     serde_json::json!({"path": "busy.md", "content": "new\n"}),
                     &ctx,
@@ -1197,7 +1180,7 @@ mod tests {
             .expect("cancel resolves promptly")
             .expect("join")
             .unwrap_err();
-        assert!(err.to_string().contains("writeunlock cancelled"), "{err}");
+        assert!(err.to_string().contains("write cancelled"), "{err}");
 
         let clear = rx.recv().await.expect("waiting clear event");
         assert!(matches!(
@@ -1214,10 +1197,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writeunlock_json_syntax_notes_are_advisory() {
+    async fn write_json_syntax_notes_are_advisory() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
-        let out = WriteunlockTool
+        let out = WriteTool
             .call(
                 serde_json::json!({"path": "bad.json", "content": "{\n"}),
                 &ctx,
@@ -1238,10 +1221,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writeunlock_json_success_note() {
+    async fn write_json_success_note() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
-        let out = WriteunlockTool
+        let out = WriteTool
             .call(
                 serde_json::json!({"path": "ok.json", "content": "{}\n"}),
                 &ctx,

@@ -225,7 +225,7 @@ pub(super) fn partial_progress_from_history(history: &[Message]) -> DelegationPa
             };
             let tool = tc.function.name.as_str();
             match tool {
-                "read" | "readlock" => {
+                "read" => {
                     if let Some(path) = crate::engine::compact::arg_path(&tc.function.arguments) {
                         files_read.insert(path.clone());
                         last_action = Some(format!("{} `{}`", tool, path));
@@ -233,7 +233,7 @@ pub(super) fn partial_progress_from_history(history: &[Message]) -> DelegationPa
                         last_action = Some(tool.to_string());
                     }
                 }
-                "write" | "writeunlock" | "edit" | "editunlock" | "unlock" => {
+                "write" | "edit" | "unlock" => {
                     if let Some(path) = crate::engine::compact::arg_path(&tc.function.arguments) {
                         let hash = crate::engine::compact::arg_hash(&tc.function.arguments)
                             .or_else(|| {

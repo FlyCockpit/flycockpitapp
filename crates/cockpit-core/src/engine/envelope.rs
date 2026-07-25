@@ -144,7 +144,7 @@ impl Envelope {
 /// Derive the host-authored `files_changed` ledger from a subagent's own
 /// in-memory frame (`history`) — the precise, frame-scoped source of truth,
 /// independent of DB write timing. Walks the child's assistant turns for
-/// `writeunlock`/`editunlock`/`unlock` tool calls (the single-writer mutate
+/// `write`/`edit`/`unlock` tool calls (the single-writer mutate
 /// set), pulls the path from each call's arguments, and the content hash from
 /// the call's arguments or its matching tool-result output header. Reuses the
 /// `compact.rs` file-edit ledger ([`super::compact::record_edit`]) so the
@@ -164,10 +164,7 @@ pub fn files_changed_from_history(history: &[Message]) -> Vec<FileEdit> {
             let AssistantContent::ToolCall(tc) = part else {
                 continue;
             };
-            if !matches!(
-                tc.function.name.as_str(),
-                "writeunlock" | "editunlock" | "unlock"
-            ) {
+            if !matches!(tc.function.name.as_str(), "write" | "edit" | "unlock") {
                 continue;
             }
             let Some(path) = super::compact::arg_path(&tc.function.arguments) else {
@@ -234,7 +231,7 @@ mod tests {
                 id: id.to_string(),
                 call_id: None,
                 function: ToolFunction {
-                    name: "writeunlock".to_string(),
+                    name: "write".to_string(),
                     arguments: json!({ "path": path }),
                 },
                 signature: None,

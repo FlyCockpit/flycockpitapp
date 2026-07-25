@@ -1,4 +1,4 @@
-//! `editunlock` — search/replace with the §13b cascade, then release the lock.
+//! `edit` — search/replace with the §13b cascade, then release the lock.
 //!
 //! Eight-stage cascade per plan §13b, in order:
 //!   1. Exact match.
@@ -34,16 +34,16 @@ use crate::db::tool_calls::Recovery;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args};
 use crate::tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release};
 
-pub struct EditunlockTool;
+pub struct EditTool;
 
 #[async_trait]
-impl Tool for EditunlockTool {
+impl Tool for EditTool {
     fn name(&self) -> &str {
-        "editunlock"
+        "edit"
     }
 
     fn description(&self) -> &str {
-        "Replace `old_string` with `new_string`; locking is automatic, so no separate lock call is needed before writing; use `writeunlock` for full rewrites"
+        "Replace `old_string` with `new_string`; locking is automatic, so no separate lock call is needed before writing; existing files require prior read; use `write` for full rewrites"
     }
 
     fn defensive_description(&self) -> Option<String> {
@@ -56,7 +56,7 @@ impl Tool for EditunlockTool {
              match cascade); copy it verbatim from a recent read, and include enough surrounding \
              context that it appears EXACTLY once, or the edit is rejected as ambiguous. To \
              change every occurrence on purpose, set `replace_all`. Existing files still require \
-             a prior read/readlock so the tool can reject stale edits. To delete text, make \
+             a prior read so the tool can reject stale edits. To delete text, make \
              `new_string` empty."
                 .to_string(),
         )
@@ -90,7 +90,7 @@ impl Tool for EditunlockTool {
 
     fn presentation(&self, args: &Value) -> ToolPresentation {
         let (summary, full_input) = path_or_readable_args(args);
-        ToolPresentation::with_parts(Some("🔓"), "editunlock", summary, full_input)
+        ToolPresentation::with_parts(Some("🔓"), "edit", summary, full_input)
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -636,7 +636,7 @@ mod tests {
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
 
-        EditunlockTool
+        EditTool
             .call(
                 serde_json::json!({
                     "path": "edit.txt",
@@ -653,13 +653,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn editunlock_without_prior_read_is_rejected_and_names_editunlock() {
+    async fn edit_without_prior_read_is_rejected_and_names_edit() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("edit.txt");
         std::fs::write(&file, "old\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
 
-        let err = EditunlockTool
+        let err = EditTool
             .call(
                 serde_json::json!({
                     "path": "edit.txt",
@@ -672,9 +672,9 @@ mod tests {
             .unwrap_err();
 
         let msg = err.to_string();
-        assert!(msg.contains("readlock it first"), "{msg}");
-        assert!(msg.contains("retry editunlock"), "{msg}");
-        assert!(!msg.contains("retry writeunlock"), "{msg}");
+        assert!(msg.contains("read it first"), "{msg}");
+        assert!(msg.contains("retry edit"), "{msg}");
+        assert!(!msg.contains("retry write"), "{msg}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
     }
 
@@ -687,7 +687,7 @@ mod tests {
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
         assert!(ctx.locks.holder(&file).is_none());
 
-        EditunlockTool
+        EditTool
             .call(
                 serde_json::json!({
                     "path": "edit.txt",
@@ -708,7 +708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn editunlock_validates_post_replace_skill_manifest() {
+    async fn edit_validates_post_replace_skill_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         let cockpit = tmp.path().join(".cockpit");
         std::fs::create_dir_all(&cockpit).unwrap();
@@ -734,7 +734,7 @@ mod tests {
             mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         };
         let err = crate::config::trust::scope_workspace_trust_policy(policy, async {
-            EditunlockTool
+            EditTool
                 .call(
                     serde_json::json!({
                         "path": path.display().to_string(),
@@ -761,7 +761,7 @@ mod tests {
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
 
-        let err = EditunlockTool
+        let err = EditTool
             .call(
                 serde_json::json!({
                     "path": "edit.txt",
@@ -855,7 +855,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
 
-        let err = EditunlockTool
+        let err = EditTool
             .call(
                 serde_json::json!({
                     "path": "missing.txt",
@@ -876,7 +876,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
 
-        let err = EditunlockTool
+        let err = EditTool
             .call(
                 serde_json::json!({
                     "path": "missing.txt",
@@ -900,7 +900,7 @@ mod tests {
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
 
-        EditunlockTool
+        EditTool
             .call(
                 serde_json::json!({
                     "path": "delete.txt",
@@ -920,7 +920,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn editunlock_reports_success_when_release_persist_fails() {
+    async fn edit_reports_success_when_release_persist_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("edit.txt");
         std::fs::write(&file, "alpha beta gamma\n").unwrap();
@@ -928,7 +928,7 @@ mod tests {
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
         fail_lock_state_deletes(&db);
 
-        let out = EditunlockTool
+        let out = EditTool
             .call(
                 serde_json::json!({
                     "path": "edit.txt",
@@ -956,14 +956,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn editunlock_toml_syntax_notes_are_advisory() {
+    async fn edit_toml_syntax_notes_are_advisory() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("Cargo.toml");
         std::fs::write(&file, "[package]\nname = \"ok\"\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
 
-        let out = EditunlockTool
+        let out = EditTool
             .call(
                 serde_json::json!({
                     "path": "Cargo.toml",
@@ -987,14 +987,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn editunlock_toml_success_note() {
+    async fn edit_toml_success_note() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("Cargo.toml");
         std::fs::write(&file, "[package]\nname = \"old\"\n").unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.locks.note_read(&file, &ctx.agent_id, ctx.session.id);
 
-        let out = EditunlockTool
+        let out = EditTool
             .call(
                 serde_json::json!({
                     "path": "Cargo.toml",

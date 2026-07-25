@@ -61,7 +61,7 @@ impl LockManager {
     /// at suspend time, reacquire the lock iff the on-disk hash still
     /// matches the snapshot. Files whose content changed (or were
     /// deleted) are dropped from the snapshot — the agent must
-    /// `readlock` them again before writing.
+    /// `read` them again before writing.
     ///
     /// Returns the paths that were successfully reacquired.
     pub fn resume_agent(&self, agent: &str, session: Uuid) -> Result<Vec<PathBuf>> {
@@ -83,7 +83,7 @@ impl LockManager {
                 _ => {
                     // File changed while the agent was inactive — drop
                     // the read record so a later write must explicitly
-                    // readlock again (no silent re-grant on stale
+                    // read again (no silent re-grant on stale
                     // content).
                     let mut state = crate::sync::lock_or_recover(&self.inner);
                     if let Some(reads) = state.read_tracker.get_mut(&key) {
@@ -192,7 +192,7 @@ impl LockManager {
     /// session-scoped analogue of [`Self::suspend_agent`]. Read-records are
     /// left intact so the §3c invariant still applies on reacquire. Persists
     /// each release and wakes blocked [`Self::acquire_wait`] waiters so a lock
-    /// freed here lets a cross-session `readlock` proceed.
+    /// freed here lets a cross-session `read` proceed.
     ///
     /// Returns the paths that were released, in canonical form.
     pub fn suspend_session(&self, session: Uuid) -> Result<Vec<PathBuf>> {
@@ -271,7 +271,7 @@ impl LockManager {
     /// holder iff the on-disk hash still matches the snapshot **and** no other
     /// holder took the path meanwhile. Drifted/taken paths are dropped from the
     /// snapshot and their §3c read-record invalidated, so a later write must
-    /// `readlock` again.
+    /// `read` again.
     ///
     /// Called from the reattach path (implementation note)
     /// — the session-scoped analogue of [`Self::resume_agent`]. A no-op (empty
@@ -295,7 +295,7 @@ impl LockManager {
                 Some(now) if now == *expected => to_reacquire.push((path.clone(), agent.clone())),
                 _ => {
                     // File changed (or was deleted) while detached — drop the
-                    // read record so a later write must explicitly readlock
+                    // read record so a later write must explicitly read
                     // again (no silent re-grant on stale content).
                     let mut state = crate::sync::lock_or_recover(&self.inner);
                     if let Some(reads) = state.read_tracker.get_mut(&(session, agent.clone())) {
@@ -312,7 +312,7 @@ impl LockManager {
             for (path, agent) in &to_reacquire {
                 // Another (session, agent) might have grabbed it while we were
                 // detached. If so, skip — that holder wins — and drop this
-                // session's read record so its later write must readlock again.
+                // session's read record so its later write must read again.
                 if state.held.contains_key(path) {
                     if let Some(reads) = state.read_tracker.get_mut(&(session, agent.clone())) {
                         reads.remove(path);

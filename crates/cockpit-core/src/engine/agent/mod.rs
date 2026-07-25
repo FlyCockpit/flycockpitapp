@@ -404,9 +404,8 @@ fn truncated_tool_result_is_retrievable(tool: &str) -> bool {
     !matches!(
         tool,
         "read"
-            | "readlock"
-            | "writeunlock"
-            | "editunlock"
+            | "write"
+            | "edit"
             | "unlock"
             | "tool_result_retrieve"
             | "delegation_payload_retrieve"
@@ -1809,9 +1808,9 @@ mod compressed_tool_result_tests {
     fn retrieve_tools_are_not_retrievable() {
         for tool in [
             "read",
-            "readlock",
-            "writeunlock",
-            "editunlock",
+            "read",
+            "write",
+            "edit",
             "unlock",
             "tool_result_retrieve",
             "delegation_payload_retrieve",

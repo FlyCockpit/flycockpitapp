@@ -632,14 +632,14 @@ pub enum TurnEvent {
     /// case (work was aborted — a truncated turn isn't a clean finish).
     DaemonDraining { forced: bool },
 
-    /// A `readlock` is blocked waiting on a lock another agent/session
+    /// A `read` is blocked waiting on a lock another agent/session
     /// holds (implementation note). A transient,
     /// UI-only start/clear pair: `waiting == true` when the wait begins,
     /// `false` when it ends (lock acquired or wait cancelled). The TUI
     /// shows a transient indicator naming the contended `path` + the
     /// `holder_agent`, alongside the fixed chrome like the `☕` glyph —
     /// never displacing a fixed slot. Never enters the model's context (the
-    /// blocked-then-acquired `readlock` returns its normal read output).
+    /// blocked-then-acquired `read` returns its normal read output).
     WaitingForLock {
         path: String,
         holder_agent: String,

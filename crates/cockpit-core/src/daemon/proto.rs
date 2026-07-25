@@ -609,8 +609,8 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
         // graceful-shutdown path directly (`server::request_shutdown`); the
         // engine never emits it. This arm is for exhaustiveness only.
         TurnEvent::DaemonDraining { .. } => vec![],
-        // A blocked/unblocked `readlock` (`readlock-wait-and-lock-expiry.md`):
-        // emitted by the `readlock` tool through the per-turn event stream;
+        // A blocked/unblocked `read` (`read-wait-and-lock-expiry.md`):
+        // emitted by the `read` tool through the per-turn event stream;
         // forwarded verbatim, scoped to this session so only its attached
         // clients show the transient waiting indicator.
         TurnEvent::WaitingForLock {

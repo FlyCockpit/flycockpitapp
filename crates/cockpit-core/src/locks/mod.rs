@@ -14,13 +14,13 @@
 //!   2. The agent that holds the lock can write to it.
 //!   3. Writing a file the agent has never `read[lock]`ed in this
 //!      session fails loudly — the §3c write-existing-file guard.
-//!   4. Tool-acquired write locks release when `writeunlock` / `editunlock`
+//!   4. Tool-acquired write locks release when `write` / `edit`
 //!      exits; pre-existing holds release on `unlock`.
 //!
 //! Contention + liveness (implementation note):
 //!
 //!   - [`LockManager::acquire_wait`] is the **async** waiting acquire:
-//!     `readlock` blocks on a busy path until the holder releases (by
+//!     `read` blocks on a busy path until the holder releases (by
 //!     `*unlock`, subagent-pop release, idle-expiry, or session-detach)
 //!     then acquires. Internal callers (`resume_agent`, suspend/resume)
 //!     keep the synchronous [`LockManager::acquire`], which skips-on-
@@ -73,7 +73,7 @@ const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquireWait {
     /// The lock is now held by the caller (acquired immediately or after
-    /// waiting). `readlock` proceeds to read.
+    /// waiting). `read` proceeds to read.
     Acquired,
     /// The wait was cancelled (ctrl+C on the per-turn token) before the
     /// lock came free. Nothing was acquired; no waiter is left registered.

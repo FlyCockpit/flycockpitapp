@@ -3141,11 +3141,11 @@ async fn tandem_validation_applies_bash_session_boundary_without_running() {
 #[tokio::test]
 async fn tandem_validation_classifies_write_and_lock_capable_tools() {
     let request = request_with_tools(vec![tool_def(
-        "writeunlock",
-        crate::tools::writeunlock::WriteunlockTool.parameters(),
+        "write",
+        crate::tools::write::WriteTool.parameters(),
     )]);
     let response = json!([
-        {"type": "tool_use", "name": "writeunlock", "input": {"path": "src/lib.rs", "content": "x"}},
+        {"type": "tool_use", "name": "write", "input": {"path": "src/lib.rs", "content": "x"}},
     ]);
 
     let rows = validations(&request, &response);

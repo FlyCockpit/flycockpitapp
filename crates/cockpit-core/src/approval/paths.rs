@@ -96,7 +96,7 @@ impl Approver {
         Ok(decision)
     }
 
-    /// Two-stage approval for a gitignored `read`/`readlock`
+    /// Two-stage approval for a gitignored `read`
     /// (implementation note). Stage 1 picks the glob
     /// **shape** — this exact file, its parent directory, or reject; stage 2
     /// (only on an approval) picks **persistence** — once / session / project.

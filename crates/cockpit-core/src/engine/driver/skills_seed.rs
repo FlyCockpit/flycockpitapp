@@ -205,8 +205,8 @@ impl Driver {
             mcp_builtin_registry: agent.tools.mcp_builtin_registry(),
             has_tree: agent.tools.get("code").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
-            // Route a blocked `readlock`'s waiting indicator through this
-            // run's turn-event stream (`readlock-wait-and-lock-expiry.md`).
+            // Route a blocked `read`'s waiting indicator through this
+            // run's turn-event stream (`read-wait-and-lock-expiry.md`).
             events: Some(tx.clone()),
             lsp: None,
             resource_scheduler: self.resource_scheduler.clone(),
@@ -511,8 +511,8 @@ impl Driver {
             mcp_builtin_registry: child.tools.mcp_builtin_registry(),
             has_tree: child.tools.get("code").is_some(),
             has_bash: child.tools.get("bash").is_some(),
-            // Route a blocked `readlock`'s waiting indicator through this
-            // run's turn-event stream (`readlock-wait-and-lock-expiry.md`).
+            // Route a blocked `read`'s waiting indicator through this
+            // run's turn-event stream (`read-wait-and-lock-expiry.md`).
             events: tx.cloned(),
             lsp: None,
             resource_scheduler: self.resource_scheduler.clone(),
@@ -593,8 +593,8 @@ impl Driver {
             mcp_builtin_registry: agent.tools.mcp_builtin_registry(),
             has_tree: agent.tools.get("code").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
-            // Route a blocked `readlock`'s waiting indicator through this
-            // run's turn-event stream (`readlock-wait-and-lock-expiry.md`).
+            // Route a blocked `read`'s waiting indicator through this
+            // run's turn-event stream (`read-wait-and-lock-expiry.md`).
             events: Some(tx.clone()),
             lsp: None,
             resource_scheduler: self.resource_scheduler.clone(),
@@ -794,8 +794,8 @@ impl Driver {
             mcp_builtin_registry: agent.tools.mcp_builtin_registry(),
             has_tree: agent.tools.get("code").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
-            // Route a blocked `readlock`'s waiting indicator through this
-            // run's turn-event stream (`readlock-wait-and-lock-expiry.md`).
+            // Route a blocked `read`'s waiting indicator through this
+            // run's turn-event stream (`read-wait-and-lock-expiry.md`).
             events: Some(tx.clone()),
             lsp: None,
             resource_scheduler: self.resource_scheduler.clone(),

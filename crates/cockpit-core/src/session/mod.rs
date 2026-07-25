@@ -292,7 +292,7 @@ pub struct Session {
     gitignore_session_allow: Mutex<Vec<String>>,
     /// Session-scoped reject-memory: the resolved target paths a user
     /// **declined** to allow this session (implementation note).
-    /// A retried `read`/`readlock` of a remembered path gets the same refusal
+    /// A retried `read` of a remembered path gets the same refusal
     /// with no re-prompt (avoids prompt thrash). In-memory only — never
     /// persisted; there is no user-facing denylist.
     gitignore_session_reject: Mutex<std::collections::HashSet<String>>,

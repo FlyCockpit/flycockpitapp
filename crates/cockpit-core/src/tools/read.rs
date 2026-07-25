@@ -1,8 +1,8 @@
 //! `read` — snapshot read with no lock.
 //!
-//! Used by `Build` for shallow inspection and by `builder`
-//! for read-only context. Lock-acquiring reads go through
-//! [`crate::tools::readlock`]. Both share output format + caps.
+//! Used by `Build` for shallow inspection and by `builder` for context before
+//! editing. There is no model-facing lock-acquiring read tool; `write` and
+//! `edit` acquire and release their write lock automatically.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -25,7 +25,7 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Snapshot-read a file with no lock; use `readlock` before `writeunlock`/`editunlock` when you intend to edit"
+        "Snapshot-read a file with no lock; use `read` before `write`/`edit` when you intend to edit"
     }
 
     fn effect(&self) -> ToolEffect {
@@ -36,7 +36,7 @@ impl Tool for ReadTool {
         Some(
             "After `code` kind `tree` or `search` shows a file exists, `read` it — do NOT `cat`/`head`/`tail` \
              it; `read` returns line-numbered, budgeted output (it does NOT lock — to edit, \
-             `readlock` first). Before calling this, be sure the path is REAL: only read a file \
+             `read` first). Before calling this, be sure the path is REAL: only read a file \
              you have already seen in a `code` tree, `search`, or bash result. Do NOT guess \
              conventional names like `README`, `LICENSE`, `CONTRIBUTING`, `CODE_OF_CONDUCT` — \
              many repos don't have them, and a read on a path that doesn't exist burns a whole \
@@ -95,7 +95,7 @@ impl Tool for ReadTool {
                 crate::tools::shell_sandbox::SandboxPathAccess::Read,
             )
             .await?;
-            // Gitignore read-allowlist gate (read/readlock only): a gitignored,
+            // Gitignore read-allowlist gate (read only): a gitignored,
             // un-allowlisted path raises the two-stage approval; a refusal is a
             // non-fatal tool result the model sees, never a crash.
             if let Some(refusal) =
@@ -119,12 +119,11 @@ pub(crate) enum ReadOutcome {
     NoContent(ToolOutput),
 }
 
-/// Shared implementation for `read` and `readlock`. The locking variant
-/// acquires the lock first, then calls this. Both produce identical
-/// output and real reads mark the file as read in the lock manager's
-/// read-tracker (so a subsequent `writeunlock` is permitted).
-pub(crate) fn read_impl(args: Value, ctx: &ToolCtx, was_locked: bool) -> Result<ToolOutput> {
-    match read_impl_outcome(args, ctx, was_locked)? {
+/// Shared implementation for snapshot reads. Real reads mark the file as read
+/// in the lock manager's read-tracker, so a subsequent `write` or `edit` is
+/// permitted without exposing a separate lock-acquire tool.
+pub(crate) fn read_impl(args: Value, ctx: &ToolCtx, _was_locked: bool) -> Result<ToolOutput> {
+    match read_impl_outcome(args, ctx, false)? {
         ReadOutcome::Content(out) | ReadOutcome::NoContent(out) => Ok(out),
     }
 }
@@ -132,10 +131,10 @@ pub(crate) fn read_impl(args: Value, ctx: &ToolCtx, was_locked: bool) -> Result<
 pub(crate) fn read_impl_with_path(
     args: Value,
     ctx: &ToolCtx,
-    was_locked: bool,
+    _was_locked: bool,
     path: PathBuf,
 ) -> Result<ToolOutput> {
-    match read_impl_outcome_with_path(args, ctx, was_locked, path, |path| std::fs::read(path))? {
+    match read_impl_outcome_with_path(args, ctx, false, path, |path| std::fs::read(path))? {
         ReadOutcome::Content(out) | ReadOutcome::NoContent(out) => Ok(out),
     }
 }
@@ -237,12 +236,6 @@ pub(crate) fn read_impl_outcome_with_path(
     }
 
     let mut prelude = String::new();
-    if was_locked {
-        prelude.push_str(&format!(
-            "Note: lock acquired on `{}`; release with writeunlock / editunlock / unlock.\n",
-            path.display()
-        ));
-    }
     if default_offset && default_limit && slice.truncated {
         prelude.push_str(
             "Note: `limit` defaulted to 2000; pass both `offset` and `limit` to override.\n",
@@ -317,7 +310,7 @@ fn read_range(
     path: &std::path::Path,
     args: Value,
     ctx: &ToolCtx,
-    was_locked: bool,
+    _was_locked: bool,
 ) -> Result<ToolOutput> {
     let start = args
         .get("start_line")
@@ -351,13 +344,7 @@ fn read_range(
     }
     let end = end.min(total);
     let header = format!("[hash={hash12} total_lines={total} returned={start}-{end}]\n");
-    let mut prelude = String::new();
-    if was_locked {
-        prelude.push_str(&format!(
-            "Note: lock acquired on `{}`; release with writeunlock / editunlock / unlock.\n",
-            path.display()
-        ));
-    }
+    let prelude = String::new();
     if slice.truncated {
         let mut tail = slice.numbered;
         tail.push_str(&truncation_marker(slice.next_offset));

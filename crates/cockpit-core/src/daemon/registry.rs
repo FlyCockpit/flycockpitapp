@@ -619,7 +619,7 @@ impl SessionRegistry {
     /// session has no release snapshot (a fresh session, or a still-attached
     /// one a second client is joining), since `resume_session` consumes the
     /// snapshot the detach edge left. Best-effort: a failed reacquire is logged
-    /// — the agent must `readlock` again, never a crash on attach.
+    /// — the agent must `read` again, never a crash on attach.
     fn resume_session_locks(&self, session_id: Uuid) {
         let locks = self.inner.locks.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1017,7 +1017,7 @@ impl SessionRegistry {
     }
 
     /// The single daemon-wide lock manager. Exposed so the daemon's
-    /// periodic lock sweeper (`readlock-wait-and-lock-expiry.md`) can call
+    /// periodic lock sweeper (`read-wait-and-lock-expiry.md`) can call
     /// [`crate::locks::LockManager::sweep_expired`] — there is one authority,
     /// shared with every worker.
     pub fn locks(&self) -> Arc<LockManager> {

@@ -49,7 +49,7 @@ impl LockManager {
     ///
     /// The **synchronous, skip-on-conflict** variant: internal callers that
     /// must not block (resume/reacquire paths) and the lock-manager test
-    /// surface use it; `readlock` uses [`Self::acquire_wait`] instead. Its
+    /// surface use it; `read` uses [`Self::acquire_wait`] instead. Its
     /// conflict-message string is load-bearing for those internal callers —
     /// do not change it (implementation note).
     #[allow(dead_code)]
@@ -179,7 +179,7 @@ impl LockManager {
         Ok(None)
     }
 
-    /// **Async, waiting** acquire — the variant `readlock` uses. If the
+    /// **Async, waiting** acquire — the variant `read` uses. If the
     /// path is free (or already this `(session, agent)`'s) it acquires
     /// immediately, exactly like [`Self::acquire`]. If a *different*
     /// `(session, agent)` holds it, this blocks until the lock is released
@@ -217,7 +217,7 @@ impl LockManager {
     /// Waiting acquire for write tools. It uses the same waiter/cancel/timeout
     /// machinery as [`Self::acquire_wait`] but deliberately does not refresh
     /// the caller's read record; the write guard must validate the read hash
-    /// captured by an earlier `read`/`readlock`.
+    /// captured by an earlier `read`.
     pub async fn acquire_wait_without_read<F>(
         &self,
         path: &Path,
@@ -298,7 +298,7 @@ impl LockManager {
                     let context = self.wait_context(&waiter_key);
                     self.clear_waiter(&waiter_key);
                     bail!(
-                        "lock wait timed out after {}s{context}. Work on something else and retry this path later instead of immediately re-issuing the same readlock.",
+                        "lock wait timed out after {}s{context}. Work on something else and retry this path later instead of immediately re-issuing the same read.",
                         LOCK_WAIT_TIMEOUT.as_secs()
                     );
                 }
@@ -402,7 +402,7 @@ impl LockManager {
         };
 
         if !actually_reclaimed.is_empty() {
-            // A blocked `readlock` on a reclaimed path now proceeds.
+            // A blocked `read` on a reclaimed path now proceeds.
             self.notify.notify_waiters();
         }
         Ok(actually_reclaimed)
@@ -449,7 +449,7 @@ impl LockManager {
     }
 
     /// Release `path` held by `(session, agent)` and drop its §3c read-record.
-    /// Used when a `readlock` acquired the lock but produced no file bytes, so
+    /// Used when a `read` acquired the lock but produced no file bytes, so
     /// neither the lock nor the implicit read grant should survive. Idempotent.
     pub fn release_and_drop_read(&self, path: &Path, agent: &str, session: Uuid) -> Result<()> {
         let canon = canonicalize(path);
@@ -484,7 +484,7 @@ impl LockManager {
     /// in-memory hold to drop even when `lock_release` persistence fails.
     ///
     /// This intentionally does not weaken [`Self::release`]'s persist-first
-    /// invariant. It is for `writeunlock`/`editunlock` only, where reporting a
+    /// invariant. It is for `write`/`edit` only, where reporting a
     /// landed write as a plain failure and leaving memory locked would be the
     /// more dangerous inconsistency. Defensive owner surprises are treated as
     /// nothing to release so a landed write is never converted to an error.
@@ -531,7 +531,7 @@ impl LockManager {
     /// Record a successful read by `agent` in `session`. Acquisition
     /// already calls this internally; non-locking reads (the `read`
     /// tool exposed to `Build`) call it explicitly so a
-    /// subsequent `writeunlock` is permitted.
+    /// subsequent `write` is permitted.
     pub fn note_read(&self, path: &Path, agent: &str, session: Uuid) {
         let canon = canonicalize(path);
         let read_hash = file_hash(&canon);
@@ -549,7 +549,7 @@ impl LockManager {
         }
     }
 
-    /// True if `agent` in `session` has `read`/`readlock`ed `path`.
+    /// True if `agent` in `session` has read `path`.
     /// Used by the write tools to enforce §3c.
     // §3c write-guard query; retained for the lock-manager API surface.
     #[allow(dead_code)]
@@ -608,7 +608,7 @@ impl LockManager {
                     match read_hash {
                         None => {
                             return Err(crate::engine::tool::invalid_input(
-                                ValidationCorrection::write_requires_readlock(&canon, tool_name)
+                                ValidationCorrection::write_requires_read(&canon, tool_name)
                                     .model_message(),
                             ));
                         }
@@ -678,7 +678,7 @@ impl LockManager {
                             .and_then(|s| s.get(&canon).copied());
                         match read_hash {
                             None => Err(crate::engine::tool::invalid_input(
-                                ValidationCorrection::write_requires_readlock(&canon, tool_name)
+                                ValidationCorrection::write_requires_read(&canon, tool_name)
                                     .model_message(),
                             )),
                             Some(Some(expected)) if file_hash(&canon) == Some(expected) => Ok(()),
@@ -757,7 +757,7 @@ impl LockManager {
     /// in this session). Returns `Ok(())` if the write is permitted.
     #[allow(dead_code)]
     pub fn check_write_permitted(&self, path: &Path, agent: &str, session: Uuid) -> Result<()> {
-        self.check_write_permitted_for_tool(path, agent, session, "writeunlock")
+        self.check_write_permitted_for_tool(path, agent, session, "write")
     }
 
     #[allow(dead_code)]
@@ -783,7 +783,7 @@ impl LockManager {
                     .and_then(|s| s.get(&canon).copied());
                 match read_hash {
                     None => Err(crate::engine::tool::invalid_input(
-                        ValidationCorrection::write_requires_readlock(&canon, tool_name)
+                        ValidationCorrection::write_requires_read(&canon, tool_name)
                             .model_message(),
                     )),
                     Some(Some(expected)) if file_hash(&canon) == Some(expected) => Ok(()),
@@ -798,7 +798,7 @@ impl LockManager {
 
 fn stale_read_message(path: &Path) -> String {
     format!(
-        "cannot write `{}`: it changed on disk since you read it — readlock it again, re-check the current contents, and redo your edit",
+        "cannot write `{}`: it changed on disk since you read it — read it again, re-check the current contents, and redo your edit",
         path.display()
     )
 }

@@ -16,9 +16,9 @@ impl ValidationCorrection {
         }
     }
 
-    pub fn write_requires_readlock(path: &std::path::Path, tool_name: &str) -> Self {
+    pub fn write_requires_read(path: &std::path::Path, tool_name: &str) -> Self {
         Self::new(format!(
-            "cannot write existing file `{}`: readlock it first, then retry {tool_name}",
+            "cannot write existing file `{}`: read it first, then retry {tool_name}",
             path.display()
         ))
     }

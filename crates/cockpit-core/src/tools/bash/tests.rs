@@ -2608,7 +2608,7 @@ async fn defensive_pipeline_with_cat_appends_read_tip() {
 }
 
 #[tokio::test]
-async fn durable_shell_write_appends_writeunlock_hint() {
+async fn durable_shell_write_appends_write_hint() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = sandbox_off_ctx_with_grant(tmp.path(), "printf hello > durable.txt");
     let out = BashTool::new()

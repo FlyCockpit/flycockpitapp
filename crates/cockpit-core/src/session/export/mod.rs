@@ -333,11 +333,11 @@ fn tool_state_str(hard_fail: bool) -> &'static str {
 }
 
 fn is_edit_tool(tool: &str) -> bool {
-    matches!(tool, "edit" | "editunlock")
+    tool == "edit"
 }
 
 fn is_write_tool(tool: &str) -> bool {
-    matches!(tool, "write" | "writeunlock")
+    tool == "write"
 }
 
 fn extract_edit_args(args: &Value) -> Option<(&str, &str, &str)> {

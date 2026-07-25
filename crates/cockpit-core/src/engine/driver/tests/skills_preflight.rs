@@ -280,10 +280,10 @@ async fn prefill_child_seeds_never_executes_a_write_seed() {
     let (driver, tmp) = test_driver(8);
     let child = child_with_read_write_tools(&driver.stack[0].agent.clone());
     let target = tmp.path().join("must_not_exist.txt");
-    // A write seed (even though the child holds `writeunlock`): rejected at
+    // A write seed (even though the child holds `write`): rejected at
     // the read-only gate, never dispatched.
     let seeds = vec![SeedTool {
-        tool: "writeunlock".into(),
+        tool: "write".into(),
         args: serde_json::json!({ "path": target.to_string_lossy(), "content": "x" }),
     }];
     let (prefix, _truncated) = driver

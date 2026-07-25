@@ -174,7 +174,7 @@ pub(crate) async fn execute_ordinary_call(
         }
     }
 
-    // Liveness refresh (`readlock-wait-and-lock-expiry.md`): every tool
+    // Liveness refresh (`read-wait-and-lock-expiry.md`): every tool
     // call by this `(session, agent)` pushes back the idle-expiry
     // deadline of the locks it holds, so an agent legitimately mid-task
     // never loses a lock to the sweeper. One central refresh here, not
@@ -507,7 +507,7 @@ pub(crate) async fn execute_ordinary_call(
     // the shape that would have matched at stage 1:
     //
     //   - §13c tool recovery: a tool returns a recovery + canonical args
-    //     (today only `editunlock`); this is authoritative because it
+    //     (today only `edit`); this is authoritative because it
     //     derives the canonical form from the tool's *own execution* on
     //     already-repaired args. When present it supersedes everything —
     //     it sets the row's `wire_input_json` AND the in-history args.

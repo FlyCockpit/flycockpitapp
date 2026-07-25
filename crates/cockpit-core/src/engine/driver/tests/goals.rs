@@ -62,7 +62,7 @@ async fn goal_mutating_action_and_context_delta_reset_progress_counters() {
 
     record_goal_tool_event(
         &driver,
-        "writeunlock",
+        "write",
         serde_json::json!({"path": "src/lib.rs", "content": "changed"}),
     )
     .await;

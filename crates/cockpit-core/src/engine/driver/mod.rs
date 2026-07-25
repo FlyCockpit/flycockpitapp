@@ -3600,7 +3600,7 @@ impl Driver {
             return false;
         };
         match tool {
-            "writeunlock" | "editunlock" => true,
+            "write" | "edit" => true,
             "bash" => data
                 .get("wire_input")
                 .or_else(|| data.get("original_input"))
@@ -6143,7 +6143,7 @@ impl Driver {
                     // child takes over. If the parent ever resumes (the
                     // child pops via TurnOutcome::Done above), the
                     // matching-hash files can come back without a re-
-                    // readlock round-trip.
+                    // read round-trip.
                     if let Some(parent) = self.stack.last()
                         && let Err(e) = self
                             .locks

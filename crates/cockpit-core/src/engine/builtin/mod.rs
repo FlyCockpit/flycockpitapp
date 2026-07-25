@@ -364,9 +364,9 @@ fn with_lsp_nav(tb: ToolBox) -> ToolBox {
 /// multiple write-capable agents (`Build`/`builder`/`Swarm`/`bee`) coexist on
 /// disjoint paths while a same-path write is serialized/rejected.
 fn with_write_tools(tb: ToolBox) -> ToolBox {
-    tb.with(Arc::new(crate::tools::readlock::ReadlockTool))
-        .with(Arc::new(crate::tools::writeunlock::WriteunlockTool))
-        .with(Arc::new(crate::tools::editunlock::EditunlockTool))
+    tb.with(Arc::new(crate::tools::read::ReadTool))
+        .with(Arc::new(crate::tools::write::WriteTool))
+        .with(Arc::new(crate::tools::edit::EditTool))
         .with(Arc::new(crate::tools::unlock::UnlockTool))
 }
 
@@ -486,9 +486,8 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "session_lineage_search",
         "todo",
         "goal",
-        "readlock",
-        "writeunlock",
-        "editunlock",
+        "write",
+        "edit",
         "unlock",
         "grep",
         "glob",
@@ -542,26 +541,20 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Locks",
-            name: "readlock",
-            summary: "Acquire a read lock on a project path.",
+            name: "write",
+            summary: "Write files with automatic daemon-arbitrated locking.",
             condition: None,
         },
         BuiltinToolInventoryItem {
             family: "Locks",
-            name: "writeunlock",
-            summary: "Write while releasing daemon-arbitrated file locks.",
-            condition: None,
-        },
-        BuiltinToolInventoryItem {
-            family: "Locks",
-            name: "editunlock",
-            summary: "Edit while releasing daemon-arbitrated file locks.",
+            name: "edit",
+            summary: "Edit files with automatic daemon-arbitrated locking.",
             condition: None,
         },
         BuiltinToolInventoryItem {
             family: "Locks",
             name: "unlock",
-            summary: "Release held file locks.",
+            summary: "Recover by releasing a stuck held file lock.",
             condition: None,
         },
         BuiltinToolInventoryItem {
@@ -783,10 +776,9 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
     use crate::tools;
     vec![
         Arc::new(tools::read::ReadTool),
-        Arc::new(tools::readlock::ReadlockTool),
-        Arc::new(tools::writeunlock::WriteunlockTool),
+        Arc::new(tools::write::WriteTool),
         Arc::new(tools::unlock::UnlockTool),
-        Arc::new(tools::editunlock::EditunlockTool),
+        Arc::new(tools::edit::EditTool),
         Arc::new(tools::bash::BashTool::new()),
         Arc::new(tools::escalate::EscalateTool),
         Arc::new(tools::intel::ContextPackTool),
@@ -855,9 +847,8 @@ fn materialize_tool_by_name(
         "read" => tb.with(Arc::new(tools::read::ReadTool)),
         "bash" => tb.with(Arc::new(tools::bash::BashTool::new())),
         "escalate" => tb.with(Arc::new(tools::escalate::EscalateTool)),
-        "readlock" => tb.with(Arc::new(tools::readlock::ReadlockTool)),
-        "writeunlock" => tb.with(Arc::new(tools::writeunlock::WriteunlockTool)),
-        "editunlock" => tb.with(Arc::new(tools::editunlock::EditunlockTool)),
+        "write" => tb.with(Arc::new(tools::write::WriteTool)),
+        "edit" => tb.with(Arc::new(tools::edit::EditTool)),
         "unlock" => tb.with(Arc::new(tools::unlock::UnlockTool)),
         "context_pack" => tb.with(Arc::new(tools::intel::ContextPackTool)),
         "code" => tb.with(Arc::new(tools::intel::CodeTool)),
@@ -2516,14 +2507,7 @@ mod tests {
             assert!(tools.iter().any(|name| name == tool), "{tool} missing");
         }
         for forbidden in [
-            "task",
-            "spawn",
-            "handoff",
-            "bash",
-            "readlock",
-            "writeunlock",
-            "editunlock",
-            "unlock",
+            "task", "spawn", "handoff", "bash", "write", "edit", "unlock",
         ] {
             assert!(
                 !tools.iter().any(|name| name == forbidden),
@@ -2842,9 +2826,8 @@ mod tests {
         for tool in [
             "read",
             "bash",
-            "readlock",
-            "writeunlock",
-            "editunlock",
+            "write",
+            "edit",
             "unlock",
             "search",
             "code",
@@ -3591,7 +3574,7 @@ mod tests {
 
     #[test]
     fn configured_custom_tools_cannot_collide_with_reserved_native_names() {
-        for name in ["read", "readlock", "task", "handoff", "seed"] {
+        for name in ["read", "write", "edit", "unlock", "task", "handoff", "seed"] {
             let tmp = tempfile::tempdir().unwrap();
             write_project_config(
                 tmp.path(),
@@ -3603,6 +3586,30 @@ mod tests {
             };
             assert!(err.contains(name), "{err}");
             assert!(err.contains("reserved cockpit tool name"), "{err}");
+        }
+    }
+
+    #[test]
+    fn builtin_agent_prompts_contain_no_retired_lock_verbs() {
+        // Deliberate retired-name coverage for the lock tool collapse.
+        const RETIRED_LOCK_VERBS: &[&str] = &["readlock", "writeunlock", "editunlock"];
+        let prompts = [
+            ("builder", BUILDER_PROMPT),
+            ("builder.normal", BUILDER_PROMPT_NORMAL),
+            ("builder.frontier", BUILDER_PROMPT_FRONTIER),
+            ("bee", BEE_PROMPT),
+            ("bee.normal", BEE_PROMPT_NORMAL),
+            ("bee.frontier", BEE_PROMPT_FRONTIER),
+            ("build.frontier", BUILD_PROMPT_FRONTIER),
+        ];
+
+        for (name, prompt) in prompts {
+            for retired in RETIRED_LOCK_VERBS {
+                assert!(
+                    !prompt.contains(retired),
+                    "{name} prompt still names retired lock verb `{retired}`"
+                );
+            }
         }
     }
 
@@ -3669,7 +3676,6 @@ mod tests {
             "task",
             "add-package",
             "list-packages",
-            "readlock",
             "write",
             "edit",
         ] {
@@ -4683,9 +4689,9 @@ mod tests {
 
         for needle in [
             "may directly make small local edits",
-            "`readlock(path, offset?, limit?)`",
-            "`writeunlock(path, content)`",
-            "`editunlock(path, old_string, new_string, replace_all?)`",
+            "`read(path, offset?, limit?)`",
+            "`write(path, content)`",
+            "`edit(path, old_string, new_string, replace_all?)`",
             "`unlock(path)`",
             "Delegate when the change needs broad search",
             "run the relevant build/test/check command",
@@ -4960,17 +4966,7 @@ mod tests {
         assert_eq!(agent.name, "bee");
         let names = agent.tools.names();
         for t in [
-            "read",
-            "bash",
-            "readlock",
-            "writeunlock",
-            "editunlock",
-            "unlock",
-            "code",
-            "search",
-            "skill",
-            "task",
-            "spawn",
+            "read", "bash", "write", "edit", "unlock", "code", "search", "skill", "task", "spawn",
             "return",
         ] {
             assert!(names.contains(&t), "bee missing `{t}`: {names:?}");

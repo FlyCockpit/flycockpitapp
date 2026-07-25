@@ -204,7 +204,7 @@ pub fn apply_tool_surface_override(
 
 fn tool_family(name: &str) -> &'static str {
     match name {
-        "read" | "readlock" | "writeunlock" | "editunlock" | "unlock" => "files",
+        "read" | "write" | "edit" | "unlock" => "files",
         "context_pack" | "code" | "graph" | "search" | "change_impact" | "lsp" => "code intel",
         "bash" | "escalate" | "harness_list" | "harness_invoke" => "execution",
         "task"

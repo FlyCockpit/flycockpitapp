@@ -158,9 +158,8 @@ fn build_def() -> AgentDef {
             "change_impact",
             "lsp",
             // write/lock set (arbitrated by the lock authority)
-            "readlock",
-            "writeunlock",
-            "editunlock",
+            "write",
+            "edit",
             "unlock",
             "schedule",
             "question",
@@ -221,10 +220,9 @@ fn builder_def() -> AgentDef {
         AgentMode::Subagent,
         &[
             "read",
-            "readlock",
-            "writeunlock",
+            "write",
             "unlock",
-            "editunlock",
+            "edit",
             "bash",
             // full intel (GOALS §21)
             "context_pack",
@@ -400,9 +398,8 @@ fn bee_def() -> AgentDef {
         AgentMode::Subagent,
         &[
             "read",
-            "readlock",
-            "writeunlock",
-            "editunlock",
+            "write",
+            "edit",
             "unlock",
             "bash",
             // full intel (GOALS §21)
@@ -523,15 +520,7 @@ mod tests {
         ] {
             assert!(tools.iter().any(|name| name == tool), "{tool} missing");
         }
-        for forbidden in [
-            "task",
-            "spawn",
-            "handoff",
-            "readlock",
-            "writeunlock",
-            "editunlock",
-            "unlock",
-        ] {
+        for forbidden in ["task", "spawn", "handoff", "write", "edit", "unlock"] {
             assert!(
                 !tools.iter().any(|name| name == forbidden),
                 "{forbidden} must not be granted"

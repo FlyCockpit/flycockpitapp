@@ -7,7 +7,7 @@
 //! tree filtered" but not "is this *one* path ignored". This module provides
 //! that single-path predicate over the same `ignore`-crate machinery, plus the
 //! per-project allowlist (gitignore-style globs) that re-permits a gitignored
-//! path for the `read`/`readlock` tools and the two discovery surfaces.
+//! path for the `read` tool and the two discovery surfaces.
 //!
 //! A path is **permitted** when it is *not* gitignored, **or** it matches the
 //! effective allowlist. The gate evaluates against the *resolved target* path

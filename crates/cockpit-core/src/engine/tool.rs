@@ -169,19 +169,11 @@ pub fn known_tool_presentation(tool: &str, args: &Value) -> ToolPresentation {
     match tool {
         "bash" => tools::bash::BashTool::new().presentation(args),
         "read" => tools::read::ReadTool.presentation(args),
-        "readlock" => tools::readlock::ReadlockTool.presentation(args),
         "unlock" => tools::unlock::UnlockTool.presentation(args),
-        "writeunlock" => tools::writeunlock::WriteunlockTool.presentation(args),
-        "editunlock" => tools::editunlock::EditunlockTool.presentation(args),
+        "write" => tools::write::WriteTool.presentation(args),
+        "edit" => tools::edit::EditTool.presentation(args),
         "websearch" => tools::web::WebSearchTool.presentation(args),
         "webfetch" => tools::web::WebFetchTool.presentation(args),
-        // Legacy restored rows may carry the pre-unlock display names. They
-        // are not current Tool implementors, so keep their old presentation
-        // through the same display-neutral data path.
-        "write" | "edit" => {
-            let (summary, full_input) = path_or_readable_args(args);
-            ToolPresentation::with_parts(Some("📝"), tool, summary, full_input)
-        }
         _ => ToolPresentation::default_for(tool, args),
     }
 }
@@ -798,7 +790,7 @@ pub struct ToolCtx {
     /// blocks can surface a transient client indicator without inventing a
     /// second broadcast authority — it routes through the same seam the turn
     /// loop uses (implementation note). Today only
-    /// `readlock` uses it, to emit the `WaitingForLock` start/clear pair while
+    /// `read` uses it, to emit the `WaitingForLock` start/clear pair while
     /// blocked on a contended lock. `None` in test / seed-tool / headless
     /// contexts with no client fan-out — emitting is then a silent no-op.
     pub events: Option<tokio::sync::mpsc::Sender<crate::engine::agent::TurnEvent>>,
@@ -1848,12 +1840,10 @@ mod llm_mode_tests {
 
     #[test]
     fn description_quality_rewrites_pin_load_bearing_clauses() {
-        let writeunlock = tool_by_name("writeunlock")
-            .description()
-            .to_ascii_lowercase();
-        assert!(writeunlock.contains("complete new contents"));
-        assert!(writeunlock.contains("omitted lines are deleted"));
-        assert!(writeunlock.contains("editunlock"));
+        let write = tool_by_name("write").description().to_ascii_lowercase();
+        assert!(write.contains("complete new contents"));
+        assert!(write.contains("omitted lines are deleted"));
+        assert!(write.contains("edit"));
 
         let graph = tool_by_name("graph").description().to_ascii_lowercase();
         let change_impact = tool_by_name("change_impact")
@@ -1921,11 +1911,10 @@ mod llm_mode_tests {
                 &["search", "code", "graph", "change_impact", "read"],
             ),
             ("change_impact", &["graph", "code", "search"]),
-            ("read", &["readlock", "writeunlock", "editunlock"]),
-            ("readlock", &["writeunlock", "editunlock", "unlock"]),
-            ("writeunlock", &["readlock", "editunlock"]),
-            ("editunlock", &["writeunlock", "unlock"]),
-            ("unlock", &["readlock", "writeunlock", "editunlock"]),
+            ("read", &["write", "edit"]),
+            ("write", &["read", "edit"]),
+            ("edit", &["read", "write"]),
+            ("unlock", &["write", "edit"]),
             ("plan_read", &["plan_edit", "plan_write", "todo", "goal"]),
             ("plan_write", &["plan_edit", "todo", "goal"]),
             ("plan_edit", &["plan_read", "plan_write"]),
@@ -2250,7 +2239,7 @@ mod llm_mode_tests {
                 let budget = match tool.name() {
                     "bash" => 400,
                     "schedule" => 280,
-                    "writeunlock" => 240,
+                    "write" => 240,
                     _ => 200,
                 };
                 assert!(
@@ -2456,7 +2445,7 @@ mod llm_mode_tests {
             ("context_pack", ToolEffect::Dynamic),
             ("defer_to_orchestrator", ToolEffect::Dynamic),
             ("delegation_payload_retrieve", ToolEffect::Dynamic),
-            ("editunlock", ToolEffect::Dynamic),
+            ("edit", ToolEffect::Dynamic),
             ("escalate", ToolEffect::Dynamic),
             ("goal", ToolEffect::Dynamic),
             ("graph", ToolEffect::ReadOnly),
@@ -2474,7 +2463,6 @@ mod llm_mode_tests {
             ("plan_write", ToolEffect::Dynamic),
             ("question", ToolEffect::Dynamic),
             ("read", ToolEffect::ReadOnly),
-            ("readlock", ToolEffect::Dynamic),
             ("return", ToolEffect::Dynamic),
             ("schedule", ToolEffect::Dynamic),
             ("search", ToolEffect::Dynamic),
@@ -2492,7 +2480,7 @@ mod llm_mode_tests {
             ("unlock", ToolEffect::Dynamic),
             ("webfetch", ToolEffect::Dynamic),
             ("websearch", ToolEffect::Dynamic),
-            ("writeunlock", ToolEffect::Dynamic),
+            ("write", ToolEffect::Dynamic),
         ];
         let expected: BTreeMap<String, _> = expected
             .into_iter()

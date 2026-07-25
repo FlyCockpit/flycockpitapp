@@ -214,7 +214,7 @@ fn write_tools_are_role_driven_not_name_bound() {
     // upheld by the lock manager keyed by `(session, agent)`, not by a name
     // check at load. So a non-`builder` agent granting a write tool now
     // validates — its concurrent writes are arbitrated path-granular.
-    let def = def_with_tools("custom-writer", &["read", "writeunlock"]);
+    let def = def_with_tools("custom-writer", &["read", "write"]);
     assert!(
         validate_invariants(&def).is_ok(),
         "any write-capable agent may hold write/lock tools"
@@ -285,13 +285,13 @@ fn tool_tier_validation_rejects_non_granted_structural_and_lock_write() {
     assert!(msg.contains("`question`"), "{msg}");
     assert!(msg.contains("structural"), "{msg}");
 
-    let mut lock_write = def_with_tools("writer", &["read", "writeunlock"]);
+    let mut lock_write = def_with_tools("writer", &["read", "write"]);
     lock_write
         .tool_tiers
-        .insert("writeunlock".to_string(), ToolTier::Discoverable);
+        .insert("write".to_string(), ToolTier::Discoverable);
     let err = validate_invariants(&lock_write).unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("`writeunlock`"), "{msg}");
+    assert!(msg.contains("`write`"), "{msg}");
     assert!(msg.contains("write/lock"), "{msg}");
 }
 

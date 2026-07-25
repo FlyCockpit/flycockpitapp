@@ -660,7 +660,7 @@ mod safety_gate_tests {
         assert!(!is_gated_tool("webfetch"));
         assert!(!is_gated_tool("websearch"));
         assert!(!is_gated_tool("read"));
-        assert!(!is_gated_tool("editunlock"));
+        assert!(!is_gated_tool("edit"));
         assert!(!is_gated_tool("search"));
         assert!(!is_gated_tool("task"));
 

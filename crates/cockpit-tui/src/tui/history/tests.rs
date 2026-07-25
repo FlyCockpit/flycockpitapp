@@ -1668,15 +1668,13 @@ fn agent_no_pin_when_control_hidden() {
 }
 
 #[test]
-fn glyph_label_collapses_lock_variants_only_with_emoji() {
-    // Emoji on: the lock/unlock emoji carries the lock state, so the
-    // label collapses to the base verb.
-    assert_eq!(tool_glyph_label("readlock", true).1, "read");
-    assert_eq!(tool_glyph_label("writeunlock", true).1, "write");
+fn glyph_label_keeps_collapsed_lock_tool_names() {
+    assert_eq!(tool_glyph_label("read", true).1, "read");
+    assert_eq!(tool_glyph_label("write", true).1, "write");
+    assert_eq!(tool_glyph_label("edit", true).1, "edit");
     assert_eq!(tool_glyph_label("unlock", true).1, "unlock");
-    // Emoji off: keep the full tool name so the lock state is legible.
-    assert_eq!(tool_glyph_label("readlock", false).1, "readlock");
-    assert_eq!(tool_glyph_label("writeunlock", false).1, "writeunlock");
+    assert_eq!(tool_glyph_label("read", false).1, "read");
+    assert_eq!(tool_glyph_label("write", false).1, "write");
     // A glyph only appears when emojis are enabled.
     assert!(tool_glyph_label("bash", false).0.is_empty());
     assert!(!tool_glyph_label("bash", true).0.is_empty());
@@ -1689,16 +1687,7 @@ fn glyph_label_collapses_lock_variants_only_with_emoji() {
 #[test]
 fn tool_glyphs_are_vs16_free_and_width_two() {
     // Every tool whose row carries an emoji glyph.
-    for tool in [
-        "bash",
-        "read",
-        "readlock",
-        "unlock",
-        "write",
-        "writeunlock",
-        "edit",
-        "editunlock",
-    ] {
+    for tool in ["bash", "read", "unlock", "write", "edit"] {
         let (glyph, _label) = tool_glyph_label(tool, /* emojis */ true);
         // The glyph is emitted with a trailing space; the emoji itself
         // is everything before it.
@@ -1733,16 +1722,7 @@ fn collapsed_tool_summary_fits_pane_for_every_tool() {
     // A long mixed-width summary so truncation is always exercised.
     let summary = "src/some/very/long/path/with/wide/字符/segments/that/overflow.rs".repeat(4);
     for width in [24usize, 40, 80, 120] {
-        for tool in [
-            "bash",
-            "read",
-            "readlock",
-            "unlock",
-            "write",
-            "writeunlock",
-            "edit",
-            "editunlock",
-        ] {
+        for tool in ["bash", "read", "unlock", "write", "edit"] {
             let call = mk_call(tool, &summary, ToolCallState::Success);
             // Mirror render_toolbox's collapsed row: indent 2 (sidebar
             // glyph + space), then glyph + bold label + ": " + summary.

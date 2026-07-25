@@ -857,7 +857,7 @@ async fn write_capable_followup_reacquires_locks_hash_matched() {
 
 /// No stale write when the worktree changed under a reawakened builder: a
 /// drifted file is NOT reacquired and its §3c read record is dropped, so a
-/// write is refused until the builder re-reads (`readlock`) it.
+/// write is refused until the builder re-reads (`read`) it.
 #[tokio::test]
 async fn write_capable_followup_forces_reread_on_drift() {
     let (driver, tmp) = test_driver(8);

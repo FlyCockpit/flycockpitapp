@@ -326,7 +326,7 @@ fn plan_rooted_driver() -> (Driver, tempfile::TempDir) {
     (driver, tmp)
 }
 
-/// An assistant turn carrying a single `writeunlock` tool call on `path`.
+/// An assistant turn carrying a single `write` tool call on `path`.
 fn write_turn(call_id: &str, path: &str) -> Message {
     use crate::engine::message::AssistantContent;
     use rig::OneOrMany;
@@ -337,7 +337,7 @@ fn write_turn(call_id: &str, path: &str) -> Message {
             id: call_id.to_string(),
             call_id: None,
             function: ToolFunction {
-                name: "writeunlock".to_string(),
+                name: "write".to_string(),
                 arguments: serde_json::json!({ "path": path }),
             },
             signature: None,
@@ -1162,16 +1162,14 @@ fn seed_batch_task_delegation(driver: &Driver, task_call_id: &str, labels: &[&st
 // `inject_seeds`: re-execute read-only seeds in the CHILD's cwd and
 // prepend native tool-call/result pairs to the child's initial history.
 
-/// A child agent holding `read` + `code` (read-only) and `writeunlock`
+/// A child agent holding `read` + `code` (read-only) and `write`
 /// (write) — enough to assert read-only seeds execute, a write seed is
 /// never executed, and a failed read is surfaced (not aborted).
 fn child_with_read_write_tools(agent: &Arc<Agent>) -> Agent {
     let tools = crate::engine::tool::ToolBox::new()
         .with(std::sync::Arc::new(crate::tools::read::ReadTool))
         .with(std::sync::Arc::new(crate::tools::intel::CodeTool))
-        .with(std::sync::Arc::new(
-            crate::tools::writeunlock::WriteunlockTool,
-        ));
+        .with(std::sync::Arc::new(crate::tools::write::WriteTool));
     Agent {
         name: "explore".into(),
         system: agent.system.clone(),

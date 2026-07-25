@@ -1923,7 +1923,7 @@ pub(super) const LOCK_SWEEP_POLL: std::time::Duration = std::time::Duration::fro
 /// (implementation note). On each tick it asks the
 /// single lock authority to reclaim any lock whose holder has been idle
 /// past [`crate::locks::LOCK_IDLE_TIMEOUT`] — releasing it, invalidating the
-/// §3c read-record, persisting the release, and waking blocked `readlock`
+/// §3c read-record, persisting the release, and waking blocked `read`
 /// waiters so they proceed. Modeled on [`spawn_until_idle_watcher`]; runs
 /// for the daemon's lifetime and exits when the daemon drains.
 pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) {

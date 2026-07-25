@@ -59,7 +59,7 @@ pub const REASON_TOOL_RESULT_CONDENSED: &str = "tool result condensed";
 
 const PRUNE_BOUNDARY_CONDENSE_TOOLS: &[&str] = &["bash"];
 const PRUNE_BOUNDARY_CONDENSE_EXCLUDED_TOOLS: &[&str] =
-    &["read", "readlock", "writeunlock", "editunlock", "unlock"];
+    &["read", "read", "write", "edit", "unlock"];
 
 fn is_snapshot_tool(name: &str) -> bool {
     SNAPSHOT_TOOLS.contains(&name)
@@ -344,7 +344,7 @@ pub fn dedup_plan(history: &[Message]) -> DedupPlan {
     let exact_targeted: std::collections::HashSet<String> =
         targets.iter().map(|t| t.target_call_id.clone()).collect();
     // The overlap module restricts to its own read-class tools (`read`/
-    // `readlock`); this closure only extracts the `path` arg, so a `readlock`
+    // `read`); this closure only extracts the `path` arg, so a `read`
     // read participates in overlap-merge too (it isn't a snapshot tool for the
     // exact-identity pass, but its body is line-numbered identically).
     let overlap = overlap::overlap_targets(history, &|_tool, args| arg_canonical_path(args));
@@ -369,7 +369,7 @@ fn cached_tokens_saved(target: &ElisionTarget) -> usize {
     before.saturating_sub(after)
 }
 
-/// The canonical file path a `read`/`readlock` call addressed, from its `path`
+/// The canonical file path a `read` call addressed, from its `path`
 /// argument. Used to group overlapping reads of the same file even when the
 /// `offset`/`limit` differ. Returns `None` when no `path` is present.
 fn arg_canonical_path(args: &serde_json::Value) -> Option<String> {
@@ -1686,7 +1686,7 @@ mod tests {
 
     #[test]
     fn prune_boundary_never_condenses_excluded_file_tools() {
-        for tool in ["read", "readlock", "writeunlock", "editunlock", "unlock"] {
+        for tool in ["read", "read", "write", "edit", "unlock"] {
             let history = vec![
                 assistant_call(
                     "c1",

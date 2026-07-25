@@ -42,7 +42,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MIN_TIMEOUT_MS: u64 = 1_000;
 const MIN_QUEUE_TIMEOUT_MS: u64 = 1_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
-pub(crate) const SHELL_WRITE_NATIVE_TOOL_HINT: &str = "Use `writeunlock` to create or rewrite files; shell redirection is for commands whose output you inspect, not files you intend to keep.";
+pub(crate) const SHELL_WRITE_NATIVE_TOOL_HINT: &str = "Use `write` to create or rewrite files; shell redirection is for commands whose output you inspect, not files you intend to keep.";
 const UNCONFINED_COMMAND_DENIAL: &str =
     "Error: `bash` was not run: unconfined command approval was denied.";
 
@@ -96,7 +96,7 @@ impl BashTool {
              build/test logs to a file under the session temp dir (`$TMPDIR`/`$TMP`/`$TEMP`) \
              unless the user explicitly wants a persistent workspace artifact, then inspect \
              focused slices or searches from that file. Never edit a file you intend to keep via bash — use \
-             `readlock`+`writeunlock`/`editunlock`."
+             `read`+`write`/`edit`."
                 .to_string();
 
         Self {

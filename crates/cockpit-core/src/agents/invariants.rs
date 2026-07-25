@@ -41,7 +41,7 @@ use super::ToolTier;
 /// agents coexist on disjoint paths while a same-path write is
 /// serialized/rejected. Sourced from the `builder` factory's tool surface in
 /// [`crate::engine::builtin`].
-pub const LOCK_WRITE_TOOLS: &[&str] = &["readlock", "writeunlock", "editunlock", "unlock"];
+pub const LOCK_WRITE_TOOLS: &[&str] = &["write", "edit", "unlock"];
 
 /// The docs-answerer-only sandboxed search tools (Docs.2). Never
 /// grantable to a user agent — they exist solely so the docs answerer can
@@ -105,6 +105,17 @@ pub fn known_tool_names() -> &'static [&'static str] {
     crate::engine::builtin::known_agent_tool_names()
 }
 
+fn retired_lock_verb_replacement(tool: &str) -> Option<&'static str> {
+    // Deliberate retired-name diagnostics for pre-collapse configs; keep in
+    // sync with the lock-protocol-collapse-to-edit-write prompt.
+    match tool {
+        "readlock" => Some("read"),
+        "writeunlock" => Some("write"),
+        "editunlock" => Some("edit"),
+        _ => None,
+    }
+}
+
 /// Validate a per-delegation **tool grant** (prompt `parent-granted-tools.md`):
 /// a parent attaching extra tools to a single `task` delegation. Each granted
 /// name is checked against the **same** core invariants a user-authored
@@ -129,6 +140,11 @@ pub fn validate_grant(
 ) -> Result<()> {
     let known = known_tool_names();
     for tool in grant {
+        if let Some(replacement) = retired_lock_verb_replacement(tool) {
+            bail!(
+                "delegation to `{target_name}` granted retired lock tool `{tool}`; use `{replacement}` instead"
+            );
+        }
         if !known.contains(&tool.as_str()) {
             bail!("delegation to `{target_name}` granted unknown tool `{tool}`");
         }
@@ -193,6 +209,12 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
     // the name is known; an inert key there is harmless (it lands on the box
     // only if a matching tool is present at construction).
     for tool in def.tool_descriptions.keys() {
+        if let Some(replacement) = retired_lock_verb_replacement(tool) {
+            bail!(
+                "agent `{}` overrides retired lock tool `{tool}`; use `{replacement}` instead",
+                def.name
+            );
+        }
         if !known.contains(&tool.as_str()) {
             bail!(
                 "agent `{}` overrides the description of unknown tool `{tool}`",
@@ -211,6 +233,12 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
     }
 
     for (tool, tier) in &def.tool_tiers {
+        if let Some(replacement) = retired_lock_verb_replacement(tool) {
+            bail!(
+                "agent `{}` tiers retired lock tool `{tool}`; use `{replacement}` instead",
+                def.name
+            );
+        }
         if !known.contains(&tool.as_str()) && *tier != ToolTier::Disabled {
             bail!("agent `{}` tiers unknown tool `{tool}`", def.name);
         }
@@ -247,6 +275,12 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
 
     for tool in tools {
         // Unknown tool name.
+        if let Some(replacement) = retired_lock_verb_replacement(tool) {
+            bail!(
+                "agent `{}` requests retired lock tool `{tool}`; use `{replacement}` instead",
+                def.name
+            );
+        }
         if !known.contains(&tool.as_str()) {
             bail!("agent `{}` requests unknown tool `{tool}`", def.name);
         }
@@ -266,11 +300,7 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
             );
         }
         if matches!(def.name.as_str(), "scout" | "Multireview")
-            && (LOCK_WRITE_TOOLS.contains(&tool.as_str())
-                || matches!(
-                    tool.as_str(),
-                    "write" | "edit" | "writeunlock" | "editunlock"
-                ))
+            && LOCK_WRITE_TOOLS.contains(&tool.as_str())
         {
             bail!(
                 "agent `{}` must stay read-only and may not hold write/lock tool `{tool}`",
@@ -392,10 +422,10 @@ mod grant_tests {
     /// never silently honored. Name-agnostic (no hard-coded writer name).
     #[test]
     fn rejects_write_lock_grant_to_any_target() {
-        let err = validate_grant("explore", AgentMode::Subagent, &g(&["writeunlock"]))
+        let err = validate_grant("explore", AgentMode::Subagent, &g(&["write"]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("writeunlock"), "{err}");
+        assert!(err.contains("write"), "{err}");
         assert!(err.contains("base definition"), "{err}");
         // Rejected regardless of the target name (not a `builder`-name check).
         assert!(
@@ -441,6 +471,25 @@ mod grant_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn agent_def_naming_retired_lock_verb_names_replacement() {
+        // Deliberate retired-name coverage for the tool collapse diagnostics.
+        for (retired, replacement) in [
+            ("readlock", "read"),
+            ("writeunlock", "write"),
+            ("editunlock", "edit"),
+        ] {
+            let def = tiered_def("legacy-writer", &[retired], retired, ToolTier::Builtin);
+            let err = validate_invariants(&def)
+                .expect_err("retired lock tool name must be rejected")
+                .to_string();
+
+            assert!(err.contains(retired), "{err}");
+            assert!(err.contains(replacement), "{err}");
+            assert!(err.contains("retired lock tool"), "{err}");
+        }
     }
 
     #[test]

@@ -529,7 +529,7 @@ fn suspend_resume_serializes_two_writers_in_a_tree() {
 /// Hash-mismatch on resume forces a re-read before write for an arbitrary
 /// writer: if the file drifted while the writer was suspended, resume does
 /// not reacquire and the §3c read record is dropped, so a later write must
-/// `readlock` again.
+/// `read` again.
 #[test]
 fn hash_mismatch_on_resume_forces_reread_for_any_writer() {
     let tmp = TempDir::new().unwrap();
@@ -597,11 +597,9 @@ async fn write_guard_serializes_two_read_but_unlocked_writers() {
     lm.note_read(&p, "writer-b", sid_b);
     assert!(lm.holder(&p).is_none());
 
-    let guard = lm
-        .begin_write(&p, "writer-a", sid_a, "writeunlock")
-        .unwrap();
+    let guard = lm.begin_write(&p, "writer-a", sid_a, "write").unwrap();
     let err = lm
-        .begin_write(&p, "writer-b", sid_b, "writeunlock")
+        .begin_write(&p, "writer-b", sid_b, "write")
         .unwrap_err()
         .to_string();
 
@@ -639,7 +637,7 @@ async fn concurrent_writers_on_same_path_serialize_under_implicit_locking() {
         AcquireWait::Acquired
     );
     let guard_a = lm
-        .begin_write_after_wait(&a, "writer-a", sid_a, "writeunlock", true, true)
+        .begin_write_after_wait(&a, "writer-a", sid_a, "write", true, true)
         .unwrap();
     assert_eq!(
         lm.acquire_wait_without_read(&b, "writer-b", sid_b, &cancel, noop_on_wait)
@@ -648,7 +646,7 @@ async fn concurrent_writers_on_same_path_serialize_under_implicit_locking() {
         AcquireWait::Acquired
     );
     let guard_b = lm
-        .begin_write_after_wait(&b, "writer-b", sid_b, "writeunlock", true, true)
+        .begin_write_after_wait(&b, "writer-b", sid_b, "write", true, true)
         .unwrap();
     assert_eq!(lm.holder(&a), Some((sid_a, "writer-a".to_string())));
     assert_eq!(lm.holder(&b), Some((sid_b, "writer-b".to_string())));
@@ -664,7 +662,7 @@ async fn concurrent_writers_on_same_path_serialize_under_implicit_locking() {
         AcquireWait::Acquired
     );
     let guard_a = lm
-        .begin_write_after_wait(&shared, "writer-a", sid_a, "writeunlock", true, true)
+        .begin_write_after_wait(&shared, "writer-a", sid_a, "write", true, true)
         .unwrap();
 
     let lm_b = lm.clone();
@@ -693,7 +691,7 @@ async fn concurrent_writers_on_same_path_serialize_under_implicit_locking() {
         AcquireWait::Acquired
     );
     let err = lm
-        .begin_write_after_wait(&shared, "writer-b", sid_b, "writeunlock", true, true)
+        .begin_write_after_wait(&shared, "writer-b", sid_b, "write", true, true)
         .unwrap_err();
     assert!(
         err.to_string()
@@ -718,18 +716,14 @@ async fn sequential_read_record_writers_second_write_rejected_as_stale() {
     lm.note_read(&p, "writer-a", sid_a);
     lm.note_read(&p, "writer-b", sid_b);
 
-    let guard = lm
-        .begin_write(&p, "writer-a", sid_a, "writeunlock")
-        .unwrap();
+    let guard = lm.begin_write(&p, "writer-a", sid_a, "write").unwrap();
     fs::write(&p, "writer-a landed").unwrap();
     assert!(guard.release_after_write());
 
-    let err = lm
-        .begin_write(&p, "writer-b", sid_b, "writeunlock")
-        .unwrap_err();
+    let err = lm.begin_write(&p, "writer-b", sid_b, "write").unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("changed on disk since you read it"), "{msg}");
-    assert!(msg.contains("readlock it again"), "{msg}");
+    assert!(msg.contains("read it again"), "{msg}");
     assert!(msg.contains("redo your edit"), "{msg}");
     assert!(lm.holder(&p).is_none());
 }
@@ -743,7 +737,7 @@ fn read_record_write_allowed_when_file_unchanged() {
     let lm = LockManager::in_memory(db);
     lm.note_read(&p, "builder", sid);
 
-    let guard = lm.begin_write(&p, "builder", sid, "writeunlock").unwrap();
+    let guard = lm.begin_write(&p, "builder", sid, "write").unwrap();
 
     assert_eq!(lm.holder(&p), Some((sid, "builder".to_string())));
     drop(guard);
@@ -760,7 +754,7 @@ fn lock_holder_write_skips_staleness_check() {
     lm.acquire(&p, "builder", sid).unwrap();
     fs::write(&p, "external change").unwrap();
 
-    let guard = lm.begin_write(&p, "builder", sid, "writeunlock").unwrap();
+    let guard = lm.begin_write(&p, "builder", sid, "write").unwrap();
 
     assert_eq!(lm.holder(&p), Some((sid, "builder".to_string())));
     drop(guard);
@@ -785,11 +779,11 @@ fn unknown_read_hash_rejects_write() {
     }
 
     let err = lm
-        .begin_write(&p, "builder", sid, "writeunlock")
+        .begin_write(&p, "builder", sid, "write")
         .unwrap_err()
         .to_string();
 
-    assert!(err.contains("readlock it again"), "{err}");
+    assert!(err.contains("read it again"), "{err}");
     assert!(err.contains("redo your edit"), "{err}");
 }
 
@@ -803,9 +797,7 @@ fn stale_write_rejection_is_invocation_kind() {
     lm.note_read(&p, "builder", sid);
     fs::write(&p, "new").unwrap();
 
-    let err = lm
-        .begin_write(&p, "builder", sid, "writeunlock")
-        .unwrap_err();
+    let err = lm.begin_write(&p, "builder", sid, "write").unwrap_err();
 
     assert_eq!(
         crate::engine::tool::classify_failure(&err),
@@ -822,12 +814,8 @@ fn write_guard_rejections_classify_as_invocation() {
     let lm = LockManager::in_memory(db);
     lm.acquire(&held, "holder", sid).unwrap();
 
-    let busy_begin = lm
-        .begin_write(&held, "other", sid, "writeunlock")
-        .unwrap_err();
-    let unread_begin = lm
-        .begin_write(&unread, "other", sid, "writeunlock")
-        .unwrap_err();
+    let busy_begin = lm.begin_write(&held, "other", sid, "write").unwrap_err();
+    let unread_begin = lm.begin_write(&unread, "other", sid, "write").unwrap_err();
     let busy_check = lm.check_write_permitted(&held, "other", sid).unwrap_err();
     let unread_check = lm.check_write_permitted(&unread, "other", sid).unwrap_err();
 
@@ -852,15 +840,13 @@ fn read_hash_round_trips_through_lock_reads() {
     }
 
     let restored = LockManager::from_db(db.clone()).unwrap();
-    let guard = restored
-        .begin_write(&p, "builder", sid, "writeunlock")
-        .unwrap();
+    let guard = restored.begin_write(&p, "builder", sid, "write").unwrap();
     drop(guard);
 
     let restored = LockManager::from_db(db).unwrap();
     fs::write(&p, "v2").unwrap();
     let err = restored
-        .begin_write(&p, "builder", sid, "writeunlock")
+        .begin_write(&p, "builder", sid, "write")
         .unwrap_err()
         .to_string();
     assert!(err.contains("changed on disk since you read it"), "{err}");
@@ -878,9 +864,7 @@ fn missing_path_spellings_normalize_to_existing_parent() {
     let lm = LockManager::in_memory(db);
 
     lm.note_read(&direct, "builder", sid);
-    let guard = lm
-        .begin_write(&dotted, "builder", sid, "writeunlock")
-        .unwrap();
+    let guard = lm.begin_write(&dotted, "builder", sid, "write").unwrap();
 
     assert_eq!(lm.holder(&direct), Some((sid, "builder".to_string())));
     assert_eq!(lm.holder(&dotted), Some((sid, "builder".to_string())));
@@ -906,7 +890,7 @@ fn missing_path_canonicalization_matches_boundary_helper_through_symlink_dotdot(
     assert_eq!(expected, outside_parent.path().join("new.txt"));
 }
 
-// ── Waiter queue + idle-expiry (`readlock-wait-and-lock-expiry.md`) ──
+// ── Waiter queue + idle-expiry (`read-wait-and-lock-expiry.md`) ──
 
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -1640,7 +1624,7 @@ fn resume_session_reacquires_unchanged_file() {
 }
 
 /// A file changed while the session was detached is NOT reacquired and its
-/// §3c read-record is invalidated (a later write must `readlock` again).
+/// §3c read-record is invalidated (a later write must `read` again).
 #[test]
 fn resume_session_skips_changed_file_and_invalidates_read() {
     let tmp = TempDir::new().unwrap();
@@ -1661,7 +1645,7 @@ fn resume_session_skips_changed_file_and_invalidates_read() {
 
 /// A path taken by another `(session, agent)` while detached is NOT
 /// reacquired on resume, and the detached session's read-record for it is
-/// dropped so its later write must `readlock` again.
+/// dropped so its later write must `read` again.
 #[tokio::test]
 async fn resume_session_skips_taken_file_and_invalidates_read() {
     let tmp = TempDir::new().unwrap();

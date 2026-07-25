@@ -1170,13 +1170,13 @@ mod tests {
         fs::create_dir_all(&agents_dir).unwrap();
         fs::write(
             agents_dir.join("mine.md"),
-            "---\ndescription: mine\ntools: [read, question, writeunlock]\n---\nbody\n",
+            "---\ndescription: mine\ntools: [read, question, write]\n---\nbody\n",
         )
         .unwrap();
         let mut d = agents_dialog(&tmp);
         focus(&mut d, "mine");
         d.handle_key(press(KeyCode::Enter));
-        for tool in ["question", "writeunlock"] {
+        for tool in ["question", "write"] {
             focus_tool(&mut d, tool);
             let mut observed = Vec::new();
             for _ in 0..4 {

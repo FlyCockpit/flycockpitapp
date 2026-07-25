@@ -1178,10 +1178,10 @@ async fn run_foreground_inner_with_boot_db(
         None
     };
 
-    // Idle-lock sweeper (`readlock-wait-and-lock-expiry.md`): the single
+    // Idle-lock sweeper (`read-wait-and-lock-expiry.md`): the single
     // daemon-internal periodic task that reclaims locks whose holder has
     // gone idle past the 5-minute threshold, so a hung/abandoned holder
-    // can't block a waiting `readlock` forever.
+    // can't block a waiting `read` forever.
     server::spawn_lock_sweeper(ctx.clone());
     let org_sync_task = org_sync::spawn_background(ctx.clone());
     let remote_audit_upload_task = remote_audit_upload::spawn_background(ctx.clone());

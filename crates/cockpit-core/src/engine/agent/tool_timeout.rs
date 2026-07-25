@@ -14,7 +14,7 @@ const TOOL_ABANDON_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Checked-in tool timeout and abandon-safety inventory for production tools.
 ///
-/// Cancel-aware native tools: `bash`, `readlock`, and the native `webfetch` /
+/// Cancel-aware native tools: `bash` and the native `webfetch` /
 /// `websearch` implementations override `Tool::honors_dispatch_cancel`; after
 /// cancellation the dispatcher gives only those concrete tool objects a short
 /// grace window to run their own cleanup before abandoning them. Custom command
@@ -24,7 +24,7 @@ const TOOL_ABANDON_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// and can also invoke cockpit-native tools; nested native invokes route through
 /// this dispatcher helper again once reached, so they get their own independent
 /// timeout while the outer `mcp` wrapper still caps the whole sandbox run.
-/// Human-blocking unbounded tools: `escalate`, `question`, `readlock`.
+/// Human-blocking unbounded tools: `escalate`, `question`.
 /// Every other listed tool is abandon-safe under the dispatcher-level drop
 /// contract and uses the global timeout unless an override is added. Dynamic
 /// custom command tools are also covered by the total default lookup; their
@@ -38,7 +38,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("context_pack"),
     ToolTimeoutSafety::abandon_safe("defer_to_orchestrator"),
     ToolTimeoutSafety::abandon_safe("delegation_payload_retrieve"),
-    ToolTimeoutSafety::abandon_safe("editunlock"),
+    ToolTimeoutSafety::abandon_safe("edit"),
     ToolTimeoutSafety::human_blocking("escalate"),
     ToolTimeoutSafety::abandon_safe("glob"),
     ToolTimeoutSafety::abandon_safe("goal"),
@@ -57,7 +57,6 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("plan_write"),
     ToolTimeoutSafety::human_blocking("question"),
     ToolTimeoutSafety::abandon_safe("read"),
-    ToolTimeoutSafety::human_blocking_honors_cancel("readlock"),
     ToolTimeoutSafety::abandon_safe("return"),
     ToolTimeoutSafety::abandon_safe("schedule"),
     ToolTimeoutSafety::abandon_safe("search"),
@@ -75,7 +74,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("unlock"),
     ToolTimeoutSafety::web_backend_dependent("webfetch"),
     ToolTimeoutSafety::web_backend_dependent("websearch"),
-    ToolTimeoutSafety::abandon_safe("writeunlock"),
+    ToolTimeoutSafety::abandon_safe("write"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +82,6 @@ enum ToolAbandonSafety {
     HonorsCancel,
     NestedDispatchOrOwnedTransport,
     HumanBlocking,
-    HumanBlockingHonorsCancel,
     AbandonSafe,
     WebBackendDependent,
 }
@@ -106,13 +104,6 @@ impl ToolTimeoutSafety {
         Self {
             name,
             safety: ToolAbandonSafety::HumanBlocking,
-        }
-    }
-
-    const fn human_blocking_honors_cancel(name: &'static str) -> Self {
-        Self {
-            name,
-            safety: ToolAbandonSafety::HumanBlockingHonorsCancel,
         }
     }
 
@@ -158,17 +149,11 @@ impl Default for ToolTimeoutPolicy {
             ("question", None),
             // `escalate` waits for a human approval decision.
             ("escalate", None),
-            // `readlock` may wait for a human or peer to release a file lock.
-            ("readlock", None),
         ]);
         let documented_unbounded = TOOL_TIMEOUT_SAFETY
             .iter()
             .filter_map(|entry| {
-                matches!(
-                    entry.safety,
-                    ToolAbandonSafety::HumanBlocking | ToolAbandonSafety::HumanBlockingHonorsCancel
-                )
-                .then_some(entry.name)
+                matches!(entry.safety, ToolAbandonSafety::HumanBlocking).then_some(entry.name)
             })
             .collect::<BTreeSet<_>>();
         debug_assert_eq!(
@@ -1010,11 +995,7 @@ mod tests {
         let documented = TOOL_TIMEOUT_SAFETY
             .iter()
             .filter_map(|entry| {
-                matches!(
-                    entry.safety,
-                    ToolAbandonSafety::HumanBlocking | ToolAbandonSafety::HumanBlockingHonorsCancel
-                )
-                .then_some(entry.name)
+                matches!(entry.safety, ToolAbandonSafety::HumanBlocking).then_some(entry.name)
             })
             .collect::<BTreeSet<_>>();
 

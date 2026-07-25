@@ -34,7 +34,7 @@ const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sand
      printed output is captured and returned as a fallback. The sandbox has no filesystem, \
      network, or environment access.";
 
-pub(crate) fn turn_start_advert_message(
+pub(crate) async fn turn_start_advert_message(
     _toolbox: &ToolBox,
     session: &crate::session::Session,
 ) -> Option<String> {
@@ -42,6 +42,7 @@ pub(crate) fn turn_start_advert_message(
     if session
         .db
         .current_session_goal(session.id, false)
+        .await
         .ok()
         .flatten()
         .is_some()
@@ -299,8 +300,8 @@ mod tests {
         assert_eq!(plain.truncated, with_children.truncated);
     }
 
-    #[test]
-    fn advert_compact_follows_goal_state() {
+    #[tokio::test]
+    async fn advert_compact_follows_goal_state() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());
         let toolbox = ToolBox::new().with(Arc::new(McpTool));
@@ -314,13 +315,24 @@ mod tests {
                 None,
                 None,
             )
+            .await
             .unwrap();
-        let message = turn_start_advert_message(&toolbox, &ctx.session).unwrap();
+        let message = turn_start_advert_message(&toolbox, &ctx.session)
+            .await
+            .unwrap();
         assert!(message.contains("request_compact"), "{message}");
         assert!(message.contains("context_usage"), "{message}");
 
-        ctx.session.db.clear_session_goal(ctx.session.id).unwrap();
-        assert!(turn_start_advert_message(&toolbox, &ctx.session).is_none());
+        ctx.session
+            .db
+            .clear_session_goal(ctx.session.id)
+            .await
+            .unwrap();
+        assert!(
+            turn_start_advert_message(&toolbox, &ctx.session)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

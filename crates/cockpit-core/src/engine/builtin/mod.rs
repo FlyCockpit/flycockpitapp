@@ -1346,10 +1346,41 @@ pub fn load_with_tool_surface_override(
         // Not a built-in and no file on disk: unknown agent.
         bail!("unknown agent `{name}`");
     };
-    if let Some(selection) = tool_surface_override {
-        crate::agents::apply_tool_surface_override(&mut def, selection)?;
+    load_resolved_def(name, args, tool_surface_override, &mut def)
+}
+
+pub async fn load_with_assistant_db_and_tool_surface_override(
+    name: &str,
+    args: &SpawnArgs,
+    db: &crate::db::Db,
+    tool_surface_override: Option<&crate::agents::ToolSurfaceSelection>,
+) -> Result<Agent> {
+    validate_configured_custom_tools(&args.config)?;
+    if matches!(name, "docs" | "docs-resolver" | "docs-answerer") {
+        bail!(
+            "`{name}` is a pipeline stage routed by the driver; load() should be unreachable for it"
+        );
     }
-    let mut agent = agent_from_def(&def, args)?;
+    if name == "computer" {
+        return computer(args);
+    }
+
+    let Some(mut def) = crate::agents::resolve_with_assistant_db(&args.cwd, name, db).await? else {
+        bail!("unknown agent `{name}`");
+    };
+    load_resolved_def(name, args, tool_surface_override, &mut def)
+}
+
+fn load_resolved_def(
+    name: &str,
+    args: &SpawnArgs,
+    tool_surface_override: Option<&crate::agents::ToolSurfaceSelection>,
+    def: &mut crate::agents::AgentDef,
+) -> Result<Agent> {
+    if let Some(selection) = tool_surface_override {
+        crate::agents::apply_tool_surface_override(def, selection)?;
+    }
+    let mut agent = agent_from_def(def, args)?;
 
     // Per-delegation tool grants (prompt `parent-granted-tools.md`): append the
     // parent's granted tools onto the just-built base surface, for this run
@@ -1362,7 +1393,7 @@ pub fn load_with_tool_surface_override(
         let is_assistant = args.assistant_identity_prefix.is_some()
             && crate::agents::embedded_default(&def.name).is_none();
         for grant in &args.granted_tools {
-            if effective_tool_tier(&def, grant, is_assistant) == crate::agents::ToolTier::Disabled {
+            if effective_tool_tier(def, grant, is_assistant) == crate::agents::ToolTier::Disabled {
                 bail!(
                     "delegation to `{name}` may not grant tool `{grant}` because `{name}` tiers it as `disabled`"
                 );
@@ -1729,55 +1760,37 @@ fn reachable_subagents(
     out
 }
 
-pub(crate) fn reachable_subagent_names(
+pub(crate) async fn reachable_subagent_names(
     parent_agent: &str,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     cwd: &Path,
     assistant_db: &crate::db::Db,
 ) -> Vec<String> {
-    match crate::agents::resolve_with_assistant_db(cwd, parent_agent, assistant_db) {
+    match crate::agents::resolve_with_assistant_db(cwd, parent_agent, assistant_db).await {
         Ok(Some(def)) => reachable_subagents(&def, config, cwd),
         Ok(None) | Err(_) => Vec::new(),
     }
 }
 
-pub(crate) fn unknown_agent_rejection(
+pub(crate) async fn unknown_agent_rejection(
     cwd: &Path,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     parent_agent: &str,
     child_agent: &str,
     assistant_db: &crate::db::Db,
-) -> Option<String> {
-    unknown_agent_rejection_with_resolver(
-        cwd,
-        config,
-        parent_agent,
-        child_agent,
-        assistant_db,
-        |cwd, child_agent| crate::agents::resolve_with_assistant_db(cwd, child_agent, assistant_db),
-    )
-}
-
-fn unknown_agent_rejection_with_resolver(
-    cwd: &Path,
-    config: &crate::daemon::session_worker::SessionConfigHandle,
-    parent_agent: &str,
-    child_agent: &str,
-    assistant_db: &crate::db::Db,
-    resolve: impl FnOnce(&Path, &str) -> Result<Option<crate::agents::AgentDef>>,
 ) -> Option<String> {
     if child_agent == "docs" {
         return None;
     }
     if child_agent != parent_agent && !matches!(child_agent, "docs-resolver" | "docs-answerer") {
-        match resolve(cwd, child_agent) {
+        match crate::agents::resolve_with_assistant_db(cwd, child_agent, assistant_db).await {
             Ok(Some(_)) => return None,
             Ok(None) => {}
             Err(_) => return None,
         }
     }
 
-    let reachable = reachable_subagent_names(parent_agent, config, cwd, assistant_db);
+    let reachable = reachable_subagent_names(parent_agent, config, cwd, assistant_db).await;
     if reachable.is_empty() {
         Some(format!(
             "unknown agent `{child_agent}`, and no subagents are reachable from `{parent_agent}`. Re-issue `task` with a reachable agent name."
@@ -3266,14 +3279,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unknown_agent_rejection_lists_bundled_reachable_set() {
+    #[tokio::test]
+    async fn unknown_agent_rejection_lists_bundled_reachable_set() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         let db = test_assistant_db();
 
-        let message =
-            unknown_agent_rejection(tmp.path(), &args.config, "Build", "missing", &db).unwrap();
+        let message = unknown_agent_rejection(tmp.path(), &args.config, "Build", "missing", &db)
+            .await
+            .unwrap();
 
         assert!(message.contains("unknown agent `missing`"), "{message}");
         assert!(
@@ -3285,8 +3299,8 @@ mod tests {
         assert!(message.contains("docs"), "{message}");
     }
 
-    #[test]
-    fn unknown_agent_rejection_includes_custom_subagents() {
+    #[tokio::test]
+    async fn unknown_agent_rejection_includes_custom_subagents() {
         let tmp = tempfile::tempdir().unwrap();
         let agents_dir = tmp.path().join(".cockpit/agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
@@ -3298,14 +3312,15 @@ mod tests {
         let args = test_spawn_args(tmp.path());
         let db = test_assistant_db();
 
-        let message =
-            unknown_agent_rejection(tmp.path(), &args.config, "Build", "missing", &db).unwrap();
+        let message = unknown_agent_rejection(tmp.path(), &args.config, "Build", "missing", &db)
+            .await
+            .unwrap();
 
         assert!(message.contains("my-reviewer"), "{message}");
     }
 
-    #[test]
-    fn unknown_agent_rejection_is_none_for_valid_agent() {
+    #[tokio::test]
+    async fn unknown_agent_rejection_is_none_for_valid_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let agents_dir = tmp.path().join(".cockpit/agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
@@ -3328,6 +3343,7 @@ mod tests {
         .unwrap();
         let db = test_assistant_db();
         db.upsert_assistant("helper-bot", assistant_home.to_str().unwrap(), "{}", "hash")
+            .await
             .unwrap();
         let args = test_spawn_args(tmp.path());
 
@@ -3340,20 +3356,23 @@ mod tests {
             "helper-bot",
         ] {
             assert!(
-                unknown_agent_rejection(tmp.path(), &args.config, "Build", name, &db).is_none(),
+                unknown_agent_rejection(tmp.path(), &args.config, "Build", name, &db)
+                    .await
+                    .is_none(),
                 "{name}"
             );
         }
     }
 
-    #[test]
-    fn unknown_agent_rejection_refuses_parent_agent_name() {
+    #[tokio::test]
+    async fn unknown_agent_rejection_refuses_parent_agent_name() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         let db = test_assistant_db();
 
-        let message =
-            unknown_agent_rejection(tmp.path(), &args.config, "Build", "Build", &db).unwrap();
+        let message = unknown_agent_rejection(tmp.path(), &args.config, "Build", "Build", &db)
+            .await
+            .unwrap();
 
         assert!(message.contains("unknown agent `Build`"), "{message}");
         assert!(
@@ -3366,29 +3385,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unknown_agent_rejection_refuses_docs_pipeline_stages() {
+    #[tokio::test]
+    async fn unknown_agent_rejection_refuses_docs_pipeline_stages() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         let db = test_assistant_db();
 
         for name in ["docs-resolver", "docs-answerer"] {
             let message = unknown_agent_rejection(tmp.path(), &args.config, "Build", name, &db)
+                .await
                 .expect("internal docs stages are not task targets");
             assert!(message.contains(name), "{message}");
             assert!(message.contains("builder"), "{message}");
         }
-        assert!(unknown_agent_rejection(tmp.path(), &args.config, "Build", "docs", &db).is_none());
+        assert!(
+            unknown_agent_rejection(tmp.path(), &args.config, "Build", "docs", &db)
+                .await
+                .is_none()
+        );
     }
 
-    #[test]
-    fn unknown_agent_rejection_degrades_with_empty_reachable_set() {
+    #[tokio::test]
+    async fn unknown_agent_rejection_degrades_with_empty_reachable_set() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         let db = test_assistant_db();
 
         let message =
             unknown_agent_rejection(tmp.path(), &args.config, "locked-parent", "missing", &db)
+                .await
                 .unwrap();
 
         assert!(message.contains("unknown agent `missing`"), "{message}");
@@ -4898,7 +4923,8 @@ mod tests {
             &session,
             tmp.path(),
             &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
-        );
+        )
+        .await;
         let names = toolbox.names();
 
         assert!(!names.contains(&"task"), "{names:?}");
@@ -4922,7 +4948,8 @@ mod tests {
             &session,
             tmp.path(),
             &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
-        );
+        )
+        .await;
         let names = toolbox.names();
 
         assert!(names.contains(&"task"), "{names:?}");
@@ -4949,7 +4976,8 @@ mod tests {
             &session,
             tmp.path(),
             &crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
-        );
+        )
+        .await;
         let names = toolbox.names();
 
         assert!(!names.contains(&"task"), "{names:?}");

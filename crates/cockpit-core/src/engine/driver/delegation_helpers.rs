@@ -307,7 +307,7 @@ pub(super) fn extract_todo_delta(report: &str) -> Option<serde_json::Value> {
 /// resolving the target's own name + mode so the single-writer / spawn-only /
 /// primary-only rules are evaluated for that agent. A resolution failure is
 /// itself a clear error — the grant is never silently honored.
-pub(super) fn grant_rejection(
+pub(super) async fn grant_rejection(
     cwd: &std::path::Path,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     parent_agent: &str,
@@ -321,7 +321,9 @@ pub(super) fn grant_rejection(
         parent_agent,
         child_agent,
         assistant_db,
-    ) {
+    )
+    .await
+    {
         return Some(format!("Error: {message}"));
     }
     if grant.is_empty() {
@@ -337,7 +339,9 @@ pub(super) fn grant_rejection(
         cwd,
         child_agent,
         assistant_db,
-    ) {
+    )
+    .await
+    {
         Ok(Some(def)) => (def.name, def.mode),
         Ok(None) => {
             return Some(format!(

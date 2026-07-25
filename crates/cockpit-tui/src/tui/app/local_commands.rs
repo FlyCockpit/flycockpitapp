@@ -345,8 +345,10 @@ impl App {
             return;
         };
         match cockpit_db::Db::open_default().and_then(|db| {
-            db.refresh_session_goal_usage(session_id)?;
-            db.current_session_goal(session_id, false)
+            db.blocking_for_sync_cli(move |conn| {
+                cockpit_db::Db::refresh_session_goal_usage_conn(conn, session_id)?;
+                cockpit_db::Db::current_session_goal_conn(conn, session_id, false)
+            })
         }) {
             Ok(Some(goal)) => {
                 let budget = goal
@@ -382,9 +384,11 @@ impl App {
             });
             return;
         };
-        match cockpit_db::Db::open_default()
-            .and_then(|db| db.set_session_goal_status(session_id, status))
-        {
+        match cockpit_db::Db::open_default().and_then(|db| {
+            db.blocking_for_sync_cli(move |conn| {
+                cockpit_db::Db::set_session_goal_status_conn(conn, session_id, status)
+            })
+        }) {
             Ok(goal) => self.push_plain(format!("{label}: goal is now {}.", goal.status.as_str())),
             Err(e) => self.history.push(HistoryEntry::CommandError {
                 line: format!("{label}: {e:#}"),

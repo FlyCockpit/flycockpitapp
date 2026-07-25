@@ -3336,6 +3336,7 @@ mod tests {
                 &session,
                 crate::config::extended::LlmMode::Normal
             )
+            .await
             .names()
             .contains(&"tool_result_retrieve")
         );

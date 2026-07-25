@@ -13,6 +13,7 @@ async fn goal_read_only_turns_count_as_no_progress_after_bound() {
             None,
             None,
         )
+        .await
         .unwrap();
     driver.goal_progress_last_seq = driver.latest_session_event_seq().await;
 
@@ -55,6 +56,7 @@ async fn goal_mutating_action_and_context_delta_reset_progress_counters() {
             None,
             None,
         )
+        .await
         .unwrap();
     driver.goal_progress_last_seq = driver.latest_session_event_seq().await;
     driver.goal_turns_since_mutating_action = 4;
@@ -94,15 +96,18 @@ async fn delegation_brief_todo_block_omits_append_note_instruction() {
         .session
         .db
         .create_task_todo(driver.session.id, "ship child task", 0)
+        .await
         .unwrap();
 
-    let brief = driver.assign_todos_to_task(
-        "Do the task.".to_string(),
-        &[todo.id],
-        "call-1",
-        "label",
-        "builder",
-    );
+    let brief = driver
+        .assign_todos_to_task(
+            "Do the task.".to_string(),
+            &[todo.id],
+            "call-1",
+            "label",
+            "builder",
+        )
+        .await;
 
     assert!(brief.contains("Assigned todos (durable state):"));
     assert!(!brief.contains("append_note"));
@@ -116,15 +121,18 @@ async fn delegation_brief_todo_block_keeps_todo_delta_instruction() {
         .session
         .db
         .create_task_todo(driver.session.id, "ship child task", 0)
+        .await
         .unwrap();
 
-    let brief = driver.assign_todos_to_task(
-        "Do the task.".to_string(),
-        &[todo.id],
-        "call-1",
-        "label",
-        "builder",
-    );
+    let brief = driver
+        .assign_todos_to_task(
+            "Do the task.".to_string(),
+            &[todo.id],
+            "call-1",
+            "label",
+            "builder",
+        )
+        .await;
 
     assert!(brief.contains("fenced `todo_delta` JSON object"));
     assert!(brief.contains("\"todos\""));
@@ -144,6 +152,7 @@ async fn goal_prose_without_tools_counts_as_no_progress_subset() {
             None,
             None,
         )
+        .await
         .unwrap();
     driver.goal_progress_last_seq = driver.latest_session_event_seq().await;
     driver
@@ -173,6 +182,7 @@ async fn goal_no_progress_intervention_waits_for_budget_cap() {
             None,
             None,
         )
+        .await
         .unwrap();
     driver.goal_no_tool_idle_count = 5;
     driver.goal_turns_since_mutating_action = GOAL_NO_PROGRESS_NUDGE_BOUND;
@@ -181,6 +191,7 @@ async fn goal_no_progress_intervention_waits_for_budget_cap() {
         .session
         .db
         .current_session_goal(driver.session.id, false)
+        .await
         .unwrap()
         .unwrap();
     assert!(
@@ -214,11 +225,13 @@ async fn goal_no_progress_intervention_waits_for_budget_cap() {
         .session
         .db
         .refresh_session_goal_usage(driver.session.id)
+        .await
         .unwrap();
     let capped = driver
         .session
         .db
         .current_session_goal(driver.session.id, false)
+        .await
         .unwrap()
         .unwrap();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
@@ -229,7 +242,7 @@ async fn goal_no_progress_intervention_waits_for_budget_cap() {
 
     assert!(driver.goal_idle_intervention_pending);
     assert_eq!(
-        driver.take_idle_reason(),
+        driver.take_idle_reason().await,
         crate::engine::IdleReason::NeedsIntervention {
             code: "agent_failed_to_progress_budget_exhausted".to_string()
         }
@@ -258,6 +271,7 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
             None,
             Some(1),
         )
+        .await
         .unwrap();
     driver
         .session
@@ -283,6 +297,7 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
         .session
         .db
         .refresh_session_goal_usage(driver.session.id)
+        .await
         .unwrap();
     let (queue_updates_tx, _queue_updates_rx) = tokio::sync::watch::channel(Vec::new());
     let input_queue = crate::engine::message::UserSubmissionQueue::new(queue_updates_tx);
@@ -294,7 +309,7 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
         .unwrap();
 
     assert_eq!(
-        driver.take_idle_reason(),
+        driver.take_idle_reason().await,
         crate::engine::IdleReason::BudgetLimited
     );
 }
@@ -312,6 +327,7 @@ async fn stalled_goal_token_budget_exhaustion_needs_intervention() {
             None,
             Some(10),
         )
+        .await
         .unwrap();
     driver.goal_turns_since_mutating_action = GOAL_NO_PROGRESS_NUDGE_BOUND;
     driver.goal_turns_since_goal_context_delta = GOAL_NO_PROGRESS_NUDGE_BOUND;
@@ -339,6 +355,7 @@ async fn stalled_goal_token_budget_exhaustion_needs_intervention() {
         .session
         .db
         .refresh_session_goal_usage(driver.session.id)
+        .await
         .unwrap();
     let (queue_updates_tx, _queue_updates_rx) = tokio::sync::watch::channel(Vec::new());
     let input_queue = crate::engine::message::UserSubmissionQueue::new(queue_updates_tx);
@@ -351,7 +368,7 @@ async fn stalled_goal_token_budget_exhaustion_needs_intervention() {
 
     assert!(driver.goal_idle_intervention_pending);
     assert_eq!(
-        driver.take_idle_reason(),
+        driver.take_idle_reason().await,
         crate::engine::IdleReason::NeedsIntervention {
             code: "agent_failed_to_progress_budget_exhausted".to_string()
         }
@@ -371,6 +388,7 @@ async fn goal_usage_limit_failure_pauses_goal_and_arms_backoff() {
             None,
             None,
         )
+        .await
         .unwrap();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
     let failure = crate::engine::model::InferenceFailure {
@@ -389,6 +407,7 @@ async fn goal_usage_limit_failure_pauses_goal_and_arms_backoff() {
         .session
         .db
         .current_session_goal(driver.session.id, false)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -396,11 +415,11 @@ async fn goal_usage_limit_failure_pauses_goal_and_arms_backoff() {
         crate::db::session_goals::GoalStatus::UsageLimited
     );
     assert_eq!(
-        driver.take_idle_reason(),
+        driver.take_idle_reason().await,
         crate::engine::IdleReason::UsageLimited
     );
     let mut watchdog = None;
-    driver.refresh_goal_watchdog(&mut watchdog);
+    driver.refresh_goal_watchdog(&mut watchdog).await;
     assert!(watchdog.is_some(), "usage_limited goal should arm backoff");
     match rx.try_recv().expect("usage-limit notice should emit") {
         TurnEvent::Notice { text } => {
@@ -423,6 +442,7 @@ async fn goal_usage_limit_watchdog_auto_resumes_to_active() {
             None,
             None,
         )
+        .await
         .unwrap();
     driver
         .session
@@ -434,9 +454,10 @@ async fn goal_usage_limit_watchdog_auto_resumes_to_active() {
             None,
             Some("provider usage or rate limit reached"),
         )
+        .await
         .unwrap();
 
-    let action = driver.goal_usage_limit_watchdog_action().unwrap();
+    let action = driver.goal_usage_limit_watchdog_action().await.unwrap();
 
     assert_eq!(action, GoalUsageLimitWatchdogAction::AutoResume);
     assert_eq!(driver.goal_usage_limit_auto_resume_attempts, 1);
@@ -444,6 +465,7 @@ async fn goal_usage_limit_watchdog_auto_resumes_to_active() {
         .session
         .db
         .current_session_goal(driver.session.id, false)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(goal.status, crate::db::session_goals::GoalStatus::Active);
@@ -462,6 +484,7 @@ async fn persistent_goal_usage_limit_requires_manual_resume_after_bound() {
             None,
             None,
         )
+        .await
         .unwrap();
     driver.goal_usage_limit_auto_resume_attempts = GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
@@ -481,6 +504,7 @@ async fn persistent_goal_usage_limit_requires_manual_resume_after_bound() {
         .session
         .db
         .current_session_goal(driver.session.id, false)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -488,13 +512,13 @@ async fn persistent_goal_usage_limit_requires_manual_resume_after_bound() {
         crate::db::session_goals::GoalStatus::UsageLimited
     );
     assert_eq!(
-        driver.take_idle_reason(),
+        driver.take_idle_reason().await,
         crate::engine::IdleReason::NeedsIntervention {
             code: GOAL_USAGE_LIMIT_INTERVENTION_CODE.to_string()
         }
     );
     let mut watchdog = None;
-    driver.refresh_goal_watchdog(&mut watchdog);
+    driver.refresh_goal_watchdog(&mut watchdog).await;
     assert!(
         watchdog.is_none(),
         "bounded usage-limit exhaustion should not re-arm auto-resume"
@@ -512,7 +536,7 @@ async fn ordinary_non_goal_idle_reason_is_completed() {
     let (mut driver, _tmp) = test_driver(1);
 
     assert_eq!(
-        driver.take_idle_reason(),
+        driver.take_idle_reason().await,
         crate::engine::IdleReason::Completed
     );
 }
@@ -530,12 +554,14 @@ async fn goal_idle_intervention_idle_reason_carries_code() {
             None,
             None,
         )
+        .await
         .unwrap();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
     let goal = driver
         .session
         .db
         .current_session_goal(driver.session.id, false)
+        .await
         .unwrap()
         .unwrap();
 
@@ -544,7 +570,7 @@ async fn goal_idle_intervention_idle_reason_carries_code() {
         .await;
 
     assert_eq!(
-        driver.take_idle_reason(),
+        driver.take_idle_reason().await,
         crate::engine::IdleReason::NeedsIntervention {
             code: "agent_failed_to_progress_budget_exhausted".to_string()
         }
@@ -564,6 +590,7 @@ async fn goal_continue_only_maintenance_events_emits_diagnostic_and_keeps_latch(
             None,
             None,
         )
+        .await
         .unwrap();
     driver.goal_idle_intervention_pending = true;
     let anchor = driver.latest_session_event_seq().await;
@@ -661,6 +688,7 @@ async fn goal_continue_progress_accepts_goal_status_update() {
             None,
             None,
         )
+        .await
         .unwrap();
     let anchor = driver.latest_session_event_seq().await;
     driver
@@ -677,6 +705,7 @@ async fn goal_continue_progress_accepts_goal_status_update() {
         .session
         .db
         .current_session_goal(driver.session.id, true)
+        .await
         .unwrap();
     driver
         .session
@@ -688,6 +717,7 @@ async fn goal_continue_progress_accepts_goal_status_update() {
             None,
             None,
         )
+        .await
         .unwrap();
 
     assert!(
@@ -709,6 +739,7 @@ async fn failed_turn_recovery_records_retry_context_and_progress() {
             None,
             None,
         )
+        .await
         .unwrap();
     driver.stack[0]
         .history

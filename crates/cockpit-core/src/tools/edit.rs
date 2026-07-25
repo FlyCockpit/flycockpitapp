@@ -180,7 +180,7 @@ impl Tool for EditTool {
         )
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
         let outcome = write_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?;
-        crate::assistants::identity::record_identity_write(ctx, &path)?;
+        crate::assistants::identity::record_identity_write(ctx, &path).await?;
         if skill_validation.is_some() {
             crate::skills::invalidate_catalog_cache(&ctx.cwd, &config.skills);
         }

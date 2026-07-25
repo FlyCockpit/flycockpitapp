@@ -523,6 +523,19 @@ impl Db {
         self.read_blocking_unguarded(f)
     }
 
+    /// Blocking write access for synchronous TUI input edges.
+    ///
+    /// TUI input handlers are synchronous but may need to persist settings
+    /// after local file writes. Async application code should still use
+    /// [`Self::write`].
+    pub fn blocking_write_for_sync_ui<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.write_blocking_unguarded(f)
+    }
+
     /// Blocking write access for synchronous event fanout callbacks.
     ///
     /// This is intentionally narrower than [`Self::blocking_for_sync_cli`]:

@@ -76,11 +76,7 @@ const OPEN_STATUS_VALUES: [&str; 5] = [
 ];
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn create_session_goal(
+    pub async fn create_session_goal(
         &self,
         session_id: Uuid,
         project_id: &str,
@@ -102,7 +98,7 @@ impl Db {
         let project_id = project_id.to_owned();
         let objective = objective.to_owned();
         let context = context.map(str::to_owned);
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let open_statuses = open_status_placeholders(2);
             let existing_params = bind_session_and_open_statuses(session_id.to_string());
             let existing_param_refs = param_refs(&existing_params);
@@ -139,63 +135,19 @@ impl Db {
             .context("inserting session_goal")?;
             load_goal(conn, session_id, id)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn current_session_goal(
+    pub async fn current_session_goal(
         &self,
         session_id: Uuid,
         mark_read: bool,
     ) -> Result<Option<SessionGoal>> {
-        let now = Utc::now().timestamp();
-        self.write_blocking(move |conn| {
-            let open_statuses = open_status_placeholders(2);
-            let goal_params = bind_session_and_open_statuses(session_id.to_string());
-            let goal_param_refs = param_refs(&goal_params);
-            let goal = conn
-                .query_row(
-                    &format!(
-                        "SELECT id, session_id, project_id, objective, context, status, token_budget,
-                            tokens_used, blocked_attempts, last_read_at, created_at, updated_at
-                     FROM session_goals
-                     WHERE session_id = ?1
-                       AND status IN ({open_statuses})
-                     ORDER BY CASE status
-                         WHEN 'active' THEN 0
-                         WHEN 'paused' THEN 1
-                         WHEN 'blocked' THEN 2
-                         WHEN 'budget_limited' THEN 3
-                         WHEN 'usage_limited' THEN 4
-                     END, updated_at DESC
-                     LIMIT 1"
-                    ),
-                    goal_param_refs.as_slice(),
-                    decode_goal,
-                )
-                .optional()
-                .context("loading current session goal")?;
-            if mark_read && let Some(goal) = &goal {
-                conn.execute(
-                    "UPDATE session_goals SET last_read_at = ?1 WHERE id = ?2",
-                    params![now, goal.id.to_string()],
-                )
-                .context("marking goal read")?;
-                let mut goal = goal.clone();
-                goal.last_read_at = Some(now);
-                return Ok(Some(goal));
-            }
-            Ok(goal)
-        })
+        self.write(move |conn| Db::current_session_goal_conn(conn, session_id, mark_read))
+            .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn update_session_goal(
+    pub async fn update_session_goal(
         &self,
         session_id: Uuid,
         status: GoalStatus,
@@ -207,7 +159,7 @@ impl Db {
         let evidence = evidence.map(str::to_owned);
         let blocker = blocker.map(str::to_owned);
         let context_delta = context_delta.map(str::to_owned);
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let mut goal = current_goal_required(conn, session_id)?;
             match status {
                 GoalStatus::Complete => {
@@ -271,42 +223,15 @@ impl Db {
                 conn, session_id, goal.id,
             )?))
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn clear_session_goal(&self, session_id: Uuid) -> Result<bool> {
-        self.write_blocking(move |conn| {
-            let now = Utc::now().timestamp();
-            let open_statuses = open_status_placeholders(3);
-            let mut bind: Vec<Box<dyn rusqlite::ToSql>> =
-                vec![Box::new(now), Box::new(session_id.to_string())];
-            for status in OPEN_STATUS_VALUES.iter() {
-                bind.push(Box::new(*status));
-            }
-            let bind_refs = param_refs(&bind);
-            let changed = conn
-                .execute(
-                    &format!(
-                        "UPDATE session_goals
-                        SET status = 'complete', updated_at = ?1
-                      WHERE session_id = ?2
-                        AND status IN ({open_statuses})"
-                    ),
-                    bind_refs.as_slice(),
-                )
-                .context("clearing session goal")?;
-            Ok(changed > 0)
-        })
+    pub async fn clear_session_goal(&self, session_id: Uuid) -> Result<bool> {
+        self.write(move |conn| Db::clear_session_goal_conn(conn, session_id))
+            .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn set_session_goal_status(
+    pub async fn set_session_goal_status(
         &self,
         session_id: Uuid,
         status: GoalStatus,
@@ -314,43 +239,122 @@ impl Db {
         if !matches!(status, GoalStatus::Active | GoalStatus::Paused) {
             anyhow::bail!("set_session_goal_status supports active or paused");
         }
-        let now = Utc::now().timestamp();
-        self.write_blocking(move |conn| {
-            let goal = current_goal_required(conn, session_id)?;
-            conn.execute(
-                "UPDATE session_goals SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                params![status.as_str(), now, goal.id.to_string()],
-            )
-            .context("setting session goal status")?;
-            load_goal(conn, session_id, goal.id)
-        })
+        self.write(move |conn| Db::set_session_goal_status_conn(conn, session_id, status))
+            .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn refresh_session_goal_usage(&self, session_id: Uuid) -> Result<()> {
-        self.write_blocking(move |conn| {
-            let open_statuses = open_status_placeholders(2);
-            let bind = bind_session_and_open_statuses(session_id.to_string());
-            let bind_refs = param_refs(&bind);
+    pub async fn refresh_session_goal_usage(&self, session_id: Uuid) -> Result<()> {
+        self.write(move |conn| Db::refresh_session_goal_usage_conn(conn, session_id))
+            .await
+    }
+
+    pub fn current_session_goal_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        mark_read: bool,
+    ) -> Result<Option<SessionGoal>> {
+        let now = Utc::now().timestamp();
+        let open_statuses = open_status_placeholders(2);
+        let goal_params = bind_session_and_open_statuses(session_id.to_string());
+        let goal_param_refs = param_refs(&goal_params);
+        let goal = conn
+            .query_row(
+                &format!(
+                    "SELECT id, session_id, project_id, objective, context, status, token_budget,
+                        tokens_used, blocked_attempts, last_read_at, created_at, updated_at
+                 FROM session_goals
+                 WHERE session_id = ?1
+                   AND status IN ({open_statuses})
+                 ORDER BY CASE status
+                     WHEN 'active' THEN 0
+                     WHEN 'paused' THEN 1
+                     WHEN 'blocked' THEN 2
+                     WHEN 'budget_limited' THEN 3
+                     WHEN 'usage_limited' THEN 4
+                 END, updated_at DESC
+                 LIMIT 1"
+                ),
+                goal_param_refs.as_slice(),
+                decode_goal,
+            )
+            .optional()
+            .context("loading current session goal")?;
+        if mark_read && let Some(goal) = &goal {
             conn.execute(
+                "UPDATE session_goals SET last_read_at = ?1 WHERE id = ?2",
+                params![now, goal.id.to_string()],
+            )
+            .context("marking goal read")?;
+            let mut goal = goal.clone();
+            goal.last_read_at = Some(now);
+            return Ok(Some(goal));
+        }
+        Ok(goal)
+    }
+
+    pub fn clear_session_goal_conn(conn: &rusqlite::Connection, session_id: Uuid) -> Result<bool> {
+        let now = Utc::now().timestamp();
+        let open_statuses = open_status_placeholders(3);
+        let mut bind: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(now), Box::new(session_id.to_string())];
+        for status in OPEN_STATUS_VALUES.iter() {
+            bind.push(Box::new(*status));
+        }
+        let bind_refs = param_refs(&bind);
+        let changed = conn
+            .execute(
                 &format!(
                     "UPDATE session_goals
-                    SET tokens_used = COALESCE((
-                        SELECT SUM(input_tokens + output_tokens)
-                        FROM inference_calls
-                        WHERE session_id = session_goals.session_id
-                    ), 0)
-                  WHERE session_id = ?1
+                    SET status = 'complete', updated_at = ?1
+                  WHERE session_id = ?2
                     AND status IN ({open_statuses})"
                 ),
                 bind_refs.as_slice(),
             )
-            .context("refreshing goal token usage")?;
-            Ok(())
-        })
+            .context("clearing session goal")?;
+        Ok(changed > 0)
+    }
+
+    pub fn set_session_goal_status_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        status: GoalStatus,
+    ) -> Result<SessionGoal> {
+        if !matches!(status, GoalStatus::Active | GoalStatus::Paused) {
+            anyhow::bail!("set_session_goal_status supports active or paused");
+        }
+        let now = Utc::now().timestamp();
+        let goal = current_goal_required(conn, session_id)?;
+        conn.execute(
+            "UPDATE session_goals SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status.as_str(), now, goal.id.to_string()],
+        )
+        .context("setting session goal status")?;
+        load_goal(conn, session_id, goal.id)
+    }
+
+    pub fn refresh_session_goal_usage_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+    ) -> Result<()> {
+        let open_statuses = open_status_placeholders(2);
+        let bind = bind_session_and_open_statuses(session_id.to_string());
+        let bind_refs = param_refs(&bind);
+        conn.execute(
+            &format!(
+                "UPDATE session_goals
+                SET tokens_used = COALESCE((
+                    SELECT SUM(input_tokens + output_tokens)
+                    FROM inference_calls
+                    WHERE session_id = session_goals.session_id
+                ), 0)
+              WHERE session_id = ?1
+                AND status IN ({open_statuses})"
+            ),
+            bind_refs.as_slice(),
+        )
+        .context("refreshing goal token usage")?;
+        Ok(())
     }
 }
 
@@ -467,6 +471,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
         let err = db
             .update_session_goal(
@@ -476,10 +481,13 @@ mod tests {
                 None,
                 None,
             )
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("goal(action=\"get\")"));
-        db.current_session_goal(session.session_id, true).unwrap();
+        db.current_session_goal(session.session_id, true)
+            .await
+            .unwrap();
         let out = db
             .update_session_goal(
                 session.session_id,
@@ -488,8 +496,41 @@ mod tests {
                 None,
                 None,
             )
+            .await
             .unwrap();
         assert!(matches!(out, GoalUpdateOutcome::Updated(g) if g.status == GoalStatus::Complete));
+    }
+
+    #[tokio::test]
+    async fn db_async_delegation_goals_roundtrip_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("p", "/tmp/goal-test", "Build")
+            .await
+            .unwrap();
+        let goal = db
+            .create_session_goal(
+                session.session_id,
+                &session.project_id,
+                "ship async goals",
+                None,
+                Some(100),
+            )
+            .await
+            .unwrap();
+        assert_eq!(goal.status, GoalStatus::Active);
+
+        db.set_session_goal_status(session.session_id, GoalStatus::Paused)
+            .await
+            .unwrap();
+        let current = db
+            .current_session_goal(session.session_id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.objective, "ship async goals");
+        assert_eq!(current.status, GoalStatus::Paused);
+        assert!(current.last_read_at.is_some());
     }
 
     #[tokio::test]
@@ -506,6 +547,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
         for expected in 1..BLOCK_ATTEMPTS_REQUIRED {
             let out = db
@@ -516,6 +558,7 @@ mod tests {
                     Some("waiting"),
                     None,
                 )
+                .await
                 .unwrap();
             assert!(
                 matches!(out, GoalUpdateOutcome::BlockAttempt { attempts, .. } if attempts == expected)
@@ -529,6 +572,7 @@ mod tests {
                 Some("waiting"),
                 None,
             )
+            .await
             .unwrap();
         assert!(matches!(out, GoalUpdateOutcome::Updated(g) if g.status == GoalStatus::Blocked));
     }
@@ -547,8 +591,11 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
-        db.current_session_goal(session.session_id, true).unwrap();
+        db.current_session_goal(session.session_id, true)
+            .await
+            .unwrap();
         db.update_session_goal(
             session.session_id,
             GoalStatus::Complete,
@@ -556,10 +603,12 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         assert!(
             db.current_session_goal(session.session_id, false)
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -579,8 +628,11 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
-        db.current_session_goal(session.session_id, true).unwrap();
+        db.current_session_goal(session.session_id, true)
+            .await
+            .unwrap();
         db.update_session_goal(
             session.session_id,
             GoalStatus::Complete,
@@ -588,6 +640,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         let next = db
@@ -598,6 +651,7 @@ mod tests {
                 None,
                 None,
             )
+            .await
             .unwrap();
         assert_eq!(next.objective, "second goal");
         assert_eq!(next.status, GoalStatus::Active);
@@ -617,6 +671,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         let err = db
@@ -627,6 +682,7 @@ mod tests {
                 None,
                 None,
             )
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("open goal"));

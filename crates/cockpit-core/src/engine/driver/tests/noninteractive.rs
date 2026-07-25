@@ -258,7 +258,7 @@ fn write_delegated_model_config_with_backup(
     );
 }
 
-fn seed_task_payload(driver: &Driver, task_call_id: &str, label: &str, child_agent: &str) {
+async fn seed_task_payload(driver: &Driver, task_call_id: &str, label: &str, child_agent: &str) {
     driver
         .persist_delegation_payload(
             task_call_id,
@@ -268,6 +268,7 @@ fn seed_task_payload(driver: &Driver, task_call_id: &str, label: &str, child_age
             child_agent,
             &format!("{label} prompt"),
         )
+        .await
         .unwrap();
 }
 
@@ -414,8 +415,8 @@ fn noninteractive_single_spawn_amends_with_child_routing() {
                 .block_on(async {
                     let (mut driver, _tmp) = test_driver(8);
                     write_delegated_model_config(&mut driver, &["local", "child-single"]);
-                    seed_task_delegation(&driver, "task-single-routing", "default");
-                    seed_task_payload(&driver, "task-single-routing", "default", "explore");
+                    seed_task_delegation(&driver, "task-single-routing", "default").await;
+                    seed_task_payload(&driver, "task-single-routing", "default", "explore").await;
                     let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
                     let completion = driver
                         .execute_single_noninteractive_task(
@@ -491,8 +492,8 @@ async fn delegated_child_succeeds_via_fallback_chain_and_export_records_it() {
                         &primary_url,
                         &backup_url,
                     );
-                    seed_task_delegation(&driver, "task-single-fallback", "default");
-                    seed_task_payload(&driver, "task-single-fallback", "default", "explore");
+                    seed_task_delegation(&driver, "task-single-fallback", "default").await;
+                    seed_task_payload(&driver, "task-single-fallback", "default", "explore").await;
                     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
 
                     let completion = driver
@@ -586,9 +587,9 @@ async fn delegated_child_succeeds_via_fallback_chain_and_export_records_it() {
 async fn noninteractive_batch_spawn_amends_each_child_routing() {
     let (mut driver, _tmp) = test_driver(8);
     write_delegated_model_config(&mut driver, &["local", "child-first", "child-second"]);
-    seed_batch_task_delegation(&driver, "task-batch-routing", &["first", "second"]);
-    seed_task_payload(&driver, "task-batch-routing", "first", "explore");
-    seed_task_payload(&driver, "task-batch-routing", "second", "scout");
+    seed_batch_task_delegation(&driver, "task-batch-routing", &["first", "second"]).await;
+    seed_task_payload(&driver, "task-batch-routing", "first", "explore").await;
+    seed_task_payload(&driver, "task-batch-routing", "second", "scout").await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
     let task = BatchNoninteractiveTask {
         entries: vec![
@@ -759,7 +760,7 @@ async fn whole_job_cancel_releases_aborted_child_locks() {
     let (mut driver, tmp) = test_driver(8);
     let path = tmp.path().join("held.rs");
     std::fs::write(&path, "fn main() {}\n").unwrap();
-    seed_task_delegation(&driver, "task-lock", "default");
+    seed_task_delegation(&driver, "task-lock", "default").await;
     driver.noninteractive_delegations.register_running(
         "task-lock",
         "default",
@@ -826,11 +827,12 @@ async fn inline_background_completion_error_keeps_original_task_pairing() {
 #[tokio::test]
 async fn backgrounded_completion_error_becomes_async_failed_result_once() {
     let (mut driver, _tmp) = test_driver(8);
-    seed_task_delegation(&driver, "task-bg-error", "default");
+    seed_task_delegation(&driver, "task-bg-error", "default").await;
     driver
         .session
         .db
         .background_task_delegation_child("task-bg-error", "default")
+        .await
         .unwrap();
     driver.noninteractive_delegations.register_running(
         "task-bg-error",
@@ -891,12 +893,13 @@ async fn backgrounded_completion_error_becomes_async_failed_result_once() {
 #[tokio::test]
 async fn backgrounded_batch_completion_delivers_one_mixed_status_payload() {
     let (mut driver, _tmp) = test_driver(8);
-    seed_batch_task_delegation(&driver, "task-mixed", &["first", "second", "third"]);
+    seed_batch_task_delegation(&driver, "task-mixed", &["first", "second", "third"]).await;
     for label in ["first", "second", "third"] {
         driver
             .session
             .db
             .background_task_delegation_child("task-mixed", label)
+            .await
             .unwrap();
         driver.noninteractive_delegations.register_running(
             "task-mixed",
@@ -979,7 +982,7 @@ async fn backgrounded_batch_completion_delivers_one_mixed_status_payload() {
 #[tokio::test]
 async fn background_single_completion_does_not_apply_stale_shrink() {
     let (mut driver, _tmp) = test_driver(8);
-    seed_task_delegation(&driver, "task-single", "default");
+    seed_task_delegation(&driver, "task-single", "default").await;
     driver
         .noninteractive_delegations
         .background_on_user_input("task-single", "default");
@@ -1046,7 +1049,7 @@ async fn noninteractive_single_inline_result_shape_is_unchanged() {
 #[tokio::test]
 async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_result() {
     let (mut driver, _tmp) = test_driver(8);
-    seed_task_delegation(&driver, "task-single", "default");
+    seed_task_delegation(&driver, "task-single", "default").await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let result = driver
         .finalize_single_noninteractive_task(
@@ -1118,6 +1121,7 @@ async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_r
         .session
         .db
         .list_task_delegation_children(driver.session.id)
+        .await
         .unwrap()
         .into_iter()
         .find(|row| row.task_call_id == "task-single" && row.label == "default")
@@ -1132,7 +1136,7 @@ async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_r
 #[tokio::test]
 async fn noninteractive_report_stamps_child_model() {
     let (mut driver, _tmp) = test_driver(8);
-    seed_task_delegation(&driver, "task-single-child-report", "default");
+    seed_task_delegation(&driver, "task-single-child-report", "default").await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let result = driver
         .finalize_single_noninteractive_task(
@@ -1195,8 +1199,8 @@ async fn noninteractive_report_stamps_child_model() {
 async fn noninteractive_batch_report_stamps_child_model() {
     let (mut driver, _tmp) = test_driver(8);
     write_delegated_model_config(&mut driver, &["local", "batch-child-report"]);
-    seed_batch_task_delegation(&driver, "task-batch-child-report", &["first"]);
-    seed_task_payload(&driver, "task-batch-child-report", "first", "explore");
+    seed_batch_task_delegation(&driver, "task-batch-child-report", &["first"]).await;
+    seed_task_payload(&driver, "task-batch-child-report", "first", "explore").await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
     let task = BatchNoninteractiveTask {
         entries: vec![batch_entry(
@@ -1257,8 +1261,8 @@ async fn noninteractive_batch_report_stamps_child_model() {
 #[tokio::test]
 async fn docs_pipeline_emits_no_routing_amend() {
     let (mut driver, _tmp) = test_driver(8);
-    seed_task_delegation(&driver, "task-docs-routing", "default");
-    seed_task_payload(&driver, "task-docs-routing", "default", "docs");
+    seed_task_delegation(&driver, "task-docs-routing", "default").await;
+    seed_task_payload(&driver, "task-docs-routing", "default", "docs").await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
     let completion = driver
         .execute_single_noninteractive_task(
@@ -1306,8 +1310,8 @@ async fn docs_pipeline_emits_no_routing_amend() {
 #[tokio::test]
 async fn unknown_agent_refusal_emits_no_spawn_or_amend_but_still_reports() {
     let (mut driver, _tmp) = test_driver(8);
-    seed_task_delegation(&driver, "task-load-failure", "default");
-    seed_task_payload(&driver, "task-load-failure", "default", "missing-agent");
+    seed_task_delegation(&driver, "task-load-failure", "default").await;
+    seed_task_payload(&driver, "task-load-failure", "default", "missing-agent").await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
     let completion = driver
         .execute_single_noninteractive_task(
@@ -1595,7 +1599,7 @@ async fn host_failure_sentinel_matches_only_host_error_shape() {
 #[tokio::test]
 async fn task_control_orphan_list_status_cancel_and_refuse_live_actions() {
     let (mut driver, _tmp) = test_driver(8);
-    seed_task_delegation(&driver, "task-orphan", "default");
+    seed_task_delegation(&driver, "task-orphan", "default").await;
 
     let list = driver
         .dispatch_task_control(TaskControlAction::List, None, None, None)
@@ -1678,6 +1682,7 @@ async fn task_control_orphan_list_status_cancel_and_refuse_live_actions() {
         .session
         .db
         .list_task_delegation_children(driver.session.id)
+        .await
         .unwrap();
     assert_eq!(
         rows[0].status,
@@ -1688,7 +1693,7 @@ async fn task_control_orphan_list_status_cancel_and_refuse_live_actions() {
 #[tokio::test]
 async fn task_control_live_registry_entry_keeps_happy_path() {
     let (mut driver, _tmp) = test_driver(8);
-    seed_task_delegation(&driver, "task-live", "default");
+    seed_task_delegation(&driver, "task-live", "default").await;
     driver.noninteractive_delegations.register_running(
         "task-live",
         "default",
@@ -1763,6 +1768,7 @@ async fn task_control_live_registry_entry_keeps_happy_path() {
         .session
         .db
         .list_task_delegation_children(driver.session.id)
+        .await
         .unwrap();
     assert_eq!(
         rows[0].status,
@@ -1771,23 +1777,20 @@ async fn task_control_live_registry_entry_keeps_happy_path() {
 }
 
 #[tokio::test]
-#[expect(
-    deprecated,
-    reason = "db-async-foundation bridge; migrated later in db-async-delegation-and-scheduler"
-)]
 async fn task_query_reports_db_and_none_sources() {
     let (mut driver, _tmp) = test_driver(8);
-    seed_task_delegation(&driver, "task-db", "default");
+    seed_task_delegation(&driver, "task-db", "default").await;
     driver
         .session
         .db
-        .write_blocking(move |conn| {
+        .write(move |conn| {
             conn.execute(
                 "UPDATE task_delegation_children SET report = 'db report' WHERE task_call_id = 'task-db' AND label = 'default'",
                 [],
             )?;
             Ok::<_, anyhow::Error>(())
         })
+        .await
         .unwrap();
     driver.noninteractive_delegations.register_running(
         "task-db",
@@ -1810,7 +1813,7 @@ async fn task_query_reports_db_and_none_sources() {
     assert_eq!(db_json["report"], "db report");
     assert_eq!(db_json["report_available"], true);
 
-    seed_task_delegation(&driver, "task-none", "default");
+    seed_task_delegation(&driver, "task-none", "default").await;
     driver.noninteractive_delegations.register_running(
         "task-none",
         "default",

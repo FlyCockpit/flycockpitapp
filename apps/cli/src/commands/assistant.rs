@@ -17,9 +17,9 @@ pub async fn run(
 ) -> Result<()> {
     match cmd {
         AssistantCommand::New(args) => new(args).await,
-        AssistantCommand::List => list(),
-        AssistantCommand::Show { name } => show(&name),
-        AssistantCommand::Delete(args) => delete(args),
+        AssistantCommand::List => list().await,
+        AssistantCommand::Show { name } => show(&name).await,
+        AssistantCommand::Delete(args) => delete(args).await,
         AssistantCommand::Chat { name } => chat(&name, no_sandbox, launch_start).await,
         AssistantCommand::Learn(args) => crate::commands::learn::run(args, no_sandbox).await,
     }
@@ -44,9 +44,9 @@ async fn new(args: AssistantNewArgs) -> Result<()> {
     Ok(())
 }
 
-fn list() -> Result<()> {
+async fn list() -> Result<()> {
     let db = Db::open_default().context("opening cockpit DB")?;
-    let rows = db.list_assistants().context("listing assistants")?;
+    let rows = db.list_assistants().await.context("listing assistants")?;
     if rows.is_empty() {
         println!("no assistants");
         return Ok(());
@@ -65,10 +65,11 @@ fn list() -> Result<()> {
     Ok(())
 }
 
-fn show(name: &str) -> Result<()> {
+async fn show(name: &str) -> Result<()> {
     let db = Db::open_default().context("opening cockpit DB")?;
     let row = db
         .get_assistant(name)
+        .await
         .with_context(|| format!("loading assistant `{name}`"))?
         .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
     let def = crate::assistants::load_from_row(&row)?;
@@ -87,10 +88,11 @@ fn show(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn delete(args: AssistantDeleteArgs) -> Result<()> {
+async fn delete(args: AssistantDeleteArgs) -> Result<()> {
     let db = Db::open_default().context("opening cockpit DB")?;
     let row = db
         .get_assistant(&args.name)
+        .await
         .with_context(|| format!("loading assistant `{}`", args.name))?
         .ok_or_else(|| anyhow::anyhow!("assistant `{}` not found", args.name))?;
     if !args.yes {
@@ -106,7 +108,7 @@ fn delete(args: AssistantDeleteArgs) -> Result<()> {
             return Ok(());
         }
     }
-    db.delete_assistant(&args.name)?;
+    db.delete_assistant(&args.name).await?;
     println!(
         "deleted assistant `{}`; home directory left intact: {}",
         args.name, row.home_dir
@@ -120,6 +122,7 @@ async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Re
     let db = Db::open_default().context("opening cockpit DB")?;
     let row = db
         .get_assistant(name)
+        .await
         .with_context(|| format!("loading assistant `{name}`"))?
         .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
     crate::assistants::load_from_row(&row)
@@ -177,7 +180,7 @@ impl TerminalActionHandler for AssistantNewAction {
                 return Ok(());
             }
             let spec = spec_from_wizard(&self.name, self.home_dir.clone(), run)?;
-            let row = create_assistant(&self.db, spec)?;
+            let row = create_assistant(&self.db, spec).await?;
             io.write_line(&format!(
                 "Created assistant `{}` at {}",
                 row.name, row.home_dir
@@ -193,8 +196,8 @@ mod tests {
     use crate::agents::AgentMode;
     use crate::wizard::WizardAnswer;
 
-    #[test]
-    fn assistant_crud_roundtrip() {
+    #[tokio::test]
+    async fn assistant_crud_roundtrip() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let home = temp.path().join("assistants").join("helper-bot");
@@ -211,19 +214,20 @@ mod tests {
                 home_dir: home.clone(),
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(row.name, "helper-bot");
         assert!(home.join("assistant.md").is_file());
-        assert_eq!(db.list_assistants().unwrap().len(), 1);
+        assert_eq!(db.list_assistants().await.unwrap().len(), 1);
 
         let def = crate::assistants::load_from_row(&row).unwrap();
         assert_eq!(def.agent.model.as_deref(), Some("openai/gpt-5.5"));
         assert_eq!(def.agent.tools.as_deref(), Some(&["read".to_string()][..]));
     }
 
-    #[test]
-    fn delete_preserves_home_dir() {
+    #[tokio::test]
+    async fn delete_preserves_home_dir() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let home = temp.path().join("assistants").join("helper-bot");
@@ -240,10 +244,11 @@ mod tests {
                 home_dir: home.clone(),
             },
         )
+        .await
         .unwrap();
 
-        assert!(db.delete_assistant("helper-bot").unwrap());
-        assert!(db.get_assistant("helper-bot").unwrap().is_none());
+        assert!(db.delete_assistant("helper-bot").await.unwrap());
+        assert!(db.get_assistant("helper-bot").await.unwrap().is_none());
         assert!(
             home.is_dir(),
             "delete must leave the assistant home directory intact"

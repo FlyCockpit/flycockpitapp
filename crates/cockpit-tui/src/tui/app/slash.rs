@@ -1297,6 +1297,7 @@ impl App {
     pub(super) fn handle_curator_command(&mut self, args: &str) {
         let result = (|| -> anyhow::Result<String> {
             let db = cockpit_db::Db::open_default()?;
+            let db_for_cron_refs = db.clone();
             let cfg = self.config_snapshot.extended.skills.clone();
             let curator =
                 cockpit_core::skills::curator::SkillCurator::new(db, self.launch.cwd.clone(), cfg);
@@ -1319,7 +1320,15 @@ impl App {
                             other => anyhow::bail!("unknown curator run option `{other}`"),
                         }
                     }
-                    Ok(format!("/curator: {}", curator.run(options)?.summary()))
+                    let jobs = db_for_cron_refs.blocking_for_sync_cli(|conn| {
+                        cockpit_db::scheduler::list_scheduled_jobs_conn(conn, None)
+                    })?;
+                    let cron_refs =
+                        cockpit_core::skills::curator::cron_referenced_skills_from_jobs(jobs)?;
+                    Ok(format!(
+                        "/curator: {}",
+                        curator.run_with_cron_refs(options, cron_refs)?.summary()
+                    ))
                 }
                 "pin" => {
                     let name = parts.next().context("usage: /curator pin <name>")?;
@@ -1401,9 +1410,11 @@ impl App {
                     self.push_plain("/goal clear: no active session.".to_string());
                     return;
                 };
-                match cockpit_db::Db::open_default()
-                    .and_then(|db| db.clear_session_goal(session_id))
-                {
+                match cockpit_db::Db::open_default().and_then(|db| {
+                    db.blocking_for_sync_cli(move |conn| {
+                        cockpit_db::Db::clear_session_goal_conn(conn, session_id)
+                    })
+                }) {
                     Ok(true) => self.push_plain("/goal clear: cleared current goal.".to_string()),
                     Ok(false) => self.push_plain("/goal clear: no open goal.".to_string()),
                     Err(e) => self.history.push(HistoryEntry::CommandError {
@@ -1641,8 +1652,11 @@ impl App {
             return;
         }
         let session = match cockpit_db::Db::open_default().and_then(|db| {
+            let name_for_row = name.to_string();
             let row = db
-                .get_assistant(name)?
+                .blocking_for_sync_cli(move |conn| {
+                    cockpit_db::Db::get_assistant_conn(conn, &name_for_row)
+                })?
                 .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
             cockpit_core::assistants::load_from_row(&row)?;
             let name_for_lookup = name.to_string();

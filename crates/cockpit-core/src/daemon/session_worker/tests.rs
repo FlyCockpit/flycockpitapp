@@ -318,6 +318,7 @@ async fn steer_side_channel_stores_raw_and_stamps_origin() {
                 todo_ids_json: None,
             }],
         )
+        .await
         .unwrap();
     let cfg = crate::config::extended::RedactConfig {
         denylist: vec!["secret-user-steer-token".to_string()],
@@ -332,7 +333,8 @@ async fn steer_side_channel_stores_raw_and_stamps_origin() {
         "alpha".to_string(),
         "please use secret-user-steer-token".to_string(),
         "local:tester".to_string(),
-    );
+    )
+    .await;
 
     assert_eq!(result.status, proto::DelegationSteerStatus::Queued);
     assert_eq!(result.origin_principal.as_deref(), Some("local:tester"));
@@ -340,6 +342,7 @@ async fn steer_side_channel_stores_raw_and_stamps_origin() {
     let steers = session
         .db
         .drain_task_delegation_steers("task-live", "alpha")
+        .await
         .unwrap();
     assert_eq!(steers.len(), 1);
     assert_eq!(steers[0].origin_principal, "local:tester");
@@ -369,10 +372,12 @@ async fn steer_side_channel_rejects_non_running_child_without_enqueue() {
                 todo_ids_json: None,
             }],
         )
+        .await
         .unwrap();
     session
         .db
         .cancel_task_delegation_child("task-done", "default")
+        .await
         .unwrap();
 
     let result = steer_delegation_side_channel(
@@ -382,7 +387,8 @@ async fn steer_side_channel_rejects_non_running_child_without_enqueue() {
         "default".to_string(),
         "continue".to_string(),
         "local:tester".to_string(),
-    );
+    )
+    .await;
 
     assert_eq!(result.status, proto::DelegationSteerStatus::NotSteerable);
     assert!(result.message.contains("cancelled"), "{result:?}");
@@ -390,6 +396,7 @@ async fn steer_side_channel_rejects_non_running_child_without_enqueue() {
         session
             .db
             .drain_task_delegation_steers("task-done", "default")
+            .await
             .unwrap()
             .is_empty()
     );
@@ -939,6 +946,7 @@ async fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
     use crate::config::extended::DefaultPrimaryAgent as D;
     let db = crate::db::Db::open_in_memory().unwrap();
     db.upsert_assistant("helper-bot", "/tmp/helper-bot", "{}", "hash")
+        .await
         .unwrap();
     let row = db
         .create_assistant_session("proj", "/proj", "helper-bot", "helper-bot")
@@ -991,6 +999,7 @@ async fn assistant_session_root_agent_loads_assistant_definition() {
             home_dir: tmp.path().join("assistants/helper-bot"),
         },
     )
+    .await
     .unwrap();
     let row = db
         .create_assistant_session("proj", cwd.to_str().unwrap(), "helper-bot", "helper-bot")
@@ -998,7 +1007,14 @@ async fn assistant_session_root_agent_loads_assistant_definition() {
         .unwrap();
 
     let root_agent_name = resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await;
-    let root = crate::engine::builtin::load(&root_agent_name, &test_spawn_args(&cwd)).unwrap();
+    let root = crate::engine::builtin::load_with_assistant_db_and_tool_surface_override(
+        &root_agent_name,
+        &test_spawn_args(&cwd),
+        &db,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(root.name, "helper-bot");
     assert!(root.role_prompt.contains("ASSISTANT_DEFINITION_MARKER"));

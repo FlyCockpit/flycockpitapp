@@ -119,7 +119,7 @@ pub fn load_from_row(row: &AssistantRow) -> Result<AssistantDef> {
     load_from_home(&row.name, Path::new(&row.home_dir))
 }
 
-pub fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<AssistantRow> {
+pub async fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<AssistantRow> {
     validate_assistant_name(&spec.name)?;
     if spec.description.trim().is_empty() {
         bail!("assistant description is required");
@@ -164,6 +164,7 @@ pub fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<AssistantR
         &config_json,
         &content_hash,
     )
+    .await
 }
 
 pub fn descriptor() -> WizardDescriptor {

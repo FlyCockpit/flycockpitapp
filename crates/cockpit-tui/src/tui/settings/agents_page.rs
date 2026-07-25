@@ -211,7 +211,7 @@ fn assistant_rows() -> Vec<AgentRow> {
     let Ok(db) = cockpit_core::db::Db::open(&path) else {
         return Vec::new();
     };
-    let Ok(rows) = db.list_assistants() else {
+    let Ok(rows) = db.blocking_read_for_sync_ui(cockpit_core::db::Db::list_assistants_conn) else {
         return Vec::new();
     };
     rows.into_iter()
@@ -627,12 +627,19 @@ impl SettingsCx {
             && path.exists()
             && let Ok(db) = cockpit_core::db::Db::open(&path)
         {
-            let _ = db.upsert_assistant(
-                &detail.name,
-                &home_dir.to_string_lossy(),
-                config_json,
-                &cockpit_core::assistants::markdown_content_hash(&markdown),
-            );
+            let name = detail.name.clone();
+            let home_dir = home_dir.to_string_lossy().into_owned();
+            let config_json = config_json.clone();
+            let content_hash = cockpit_core::assistants::markdown_content_hash(&markdown);
+            let _ = db.blocking_write_for_sync_ui(move |conn| {
+                cockpit_core::db::Db::upsert_assistant_conn(
+                    conn,
+                    &name,
+                    &home_dir,
+                    &config_json,
+                    &content_hash,
+                )
+            });
         }
         detail.original_text = markdown;
         detail.status = Some(match cleanup_notice {
@@ -1064,6 +1071,12 @@ mod tests {
             guard.set_var("XDG_DATA_HOME", path);
             Self { _guard: guard }
         }
+
+        async fn new_async(path: &std::path::Path) -> Self {
+            let guard = cockpit_test_support::TestEnvGuard::lock().await;
+            guard.set_var("XDG_DATA_HOME", path);
+            Self { _guard: guard }
+        }
     }
 
     fn focus_tool(d: &mut SettingsDialog, name: &str) {
@@ -1298,10 +1311,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn agents_page_assistant_rows_are_editable() {
+    #[tokio::test]
+    async fn agents_page_assistant_rows_are_editable() {
         let tmp = TempDir::new().unwrap();
-        let _xdg = XdgDataEnv::new(&tmp.path().join("xdg"));
+        let _xdg = XdgDataEnv::new_async(&tmp.path().join("xdg")).await;
         let db = cockpit_core::db::Db::open_default().unwrap();
         let home = tmp.path().join("assistants/helper-bot");
         cockpit_core::assistants::create_assistant(
@@ -1317,6 +1330,7 @@ mod tests {
                 home_dir: home.clone(),
             },
         )
+        .await
         .unwrap();
         let mut d = agents_dialog(&tmp);
         focus(&mut d, "helper-bot");

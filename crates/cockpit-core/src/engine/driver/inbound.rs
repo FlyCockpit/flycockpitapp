@@ -76,6 +76,7 @@ impl Driver {
             &self.cwd,
             &self.config,
         )
+        .await
         .names()
         .into_iter()
         .map(str::to_string)

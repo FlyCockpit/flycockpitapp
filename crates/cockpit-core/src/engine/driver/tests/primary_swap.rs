@@ -1143,10 +1143,12 @@ async fn rehydrate_handle_persist_round_trip() {
     ];
     let handle = driver
         .persist_subagent_handle("explore", &history, Some(tmp.path()), None)
+        .await
         .expect("a handle is minted");
     // Enabled (normal-mode gate passed) + matching agent → rehydrated.
     let got = driver
         .rehydrate_handle(&handle, "explore", Some(tmp.path()), true)
+        .await
         .expect("rehydrates");
     assert_eq!(got.len(), history.len());
 }
@@ -1158,6 +1160,7 @@ async fn rehydrate_handle_unknown_is_stale_error() {
     let (driver, tmp) = test_driver(8);
     let err = driver
         .rehydrate_handle("sub-does-not-exist", "explore", Some(tmp.path()), true)
+        .await
         .unwrap_err();
     assert!(err.contains("resume_handle"), "{err}");
     assert!(err.contains("fresh"), "{err}");
@@ -1172,11 +1175,13 @@ async fn rehydrate_handle_disabled_in_defensive() {
     let history = vec![Message::user("q")];
     let handle = driver
         .persist_subagent_handle("explore", &history, Some(tmp.path()), None)
+        .await
         .unwrap();
     // `followup_enabled = false` models the defensive gate
     // (`Capability::FollowupSeed.enabled(Defensive) == false`).
     let err = driver
         .rehydrate_handle(&handle, "explore", Some(tmp.path()), false)
+        .await
         .unwrap_err();
     assert!(err.contains("fresh"), "{err}");
 }
@@ -1188,11 +1193,13 @@ async fn rehydrate_handle_wrong_agent_is_stale() {
     let (driver, tmp) = test_driver(8);
     let handle = driver
         .persist_subagent_handle("explore", &[Message::user("q")], Some(tmp.path()), None)
+        .await
         .unwrap();
     // Re-querying as `docs` against an `explore` handle → stale (and docs
     // never mints one anyway, so this is the only outcome it can hit).
     let err = driver
         .rehydrate_handle(&handle, "docs", Some(tmp.path()), true)
+        .await
         .unwrap_err();
     assert!(err.contains("fresh"), "{err}");
 }
@@ -1206,10 +1213,12 @@ async fn rehydrate_handle_wrong_cwd_is_stale() {
     std::fs::create_dir(&other).unwrap();
     let handle = driver
         .persist_subagent_handle("explore", &[Message::user("q")], Some(&original), None)
+        .await
         .unwrap();
 
     let err = driver
         .rehydrate_handle(&handle, "explore", Some(&other), true)
+        .await
         .unwrap_err();
     assert!(err.contains("fresh"), "{err}");
 }

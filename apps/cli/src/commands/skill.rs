@@ -45,10 +45,12 @@ async fn run_curator(cmd: SkillCuratorCommand) -> Result<()> {
             dry_run,
             consolidate,
         }) => {
-            let report = curator.run(CuratorRunOptions {
-                dry_run,
-                consolidate,
-            })?;
+            let report = curator
+                .run(CuratorRunOptions {
+                    dry_run,
+                    consolidate,
+                })
+                .await?;
             println!("{}", report.summary());
             if let Some(snapshot) = report.snapshot_id {
                 println!("snapshot={snapshot}");

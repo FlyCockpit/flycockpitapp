@@ -724,6 +724,7 @@ async fn persist_reuses_existing_handle_on_followup() {
     let (driver, tmp) = test_driver(8);
     let h1 = driver
         .persist_subagent_handle("explore", &[Message::user("q1")], Some(tmp.path()), None)
+        .await
         .unwrap();
     let h2 = driver
         .persist_subagent_handle(
@@ -732,11 +733,13 @@ async fn persist_reuses_existing_handle_on_followup() {
             Some(tmp.path()),
             Some(&h1),
         )
+        .await
         .unwrap();
     assert_eq!(h1, h2, "a follow-up keeps the same handle");
     // The transcript was refreshed (upsert) to the longer history.
     let got = driver
         .rehydrate_handle(&h2, "explore", Some(tmp.path()), true)
+        .await
         .unwrap();
     assert_eq!(got.len(), 2);
 }
@@ -757,10 +760,12 @@ async fn builder_followup_persist_and_rehydrate_round_trip() {
     ];
     let handle = driver
         .persist_subagent_handle("builder", &history, Some(tmp.path()), None)
+        .await
         .expect("a builder handle is minted");
     // Stored under the `builder` agent name; re-querying as `builder` rehydrates.
     let got = driver
         .rehydrate_handle(&handle, "builder", Some(tmp.path()), true)
+        .await
         .expect("builder rehydrates");
     assert_eq!(got.len(), history.len());
     // Re-querying that handle under a DIFFERENT agent name is stale (the
@@ -768,6 +773,7 @@ async fn builder_followup_persist_and_rehydrate_round_trip() {
     assert!(
         driver
             .rehydrate_handle(&handle, "explore", Some(tmp.path()), true)
+            .await
             .is_err()
     );
 }
@@ -784,6 +790,7 @@ async fn builder_followup_refreshes_handle_idempotently() {
             Some(tmp.path()),
             None,
         )
+        .await
         .unwrap();
     let h2 = driver
         .persist_subagent_handle(
@@ -792,11 +799,13 @@ async fn builder_followup_refreshes_handle_idempotently() {
             Some(tmp.path()),
             Some(&h1),
         )
+        .await
         .unwrap();
     assert_eq!(h1, h2);
     assert_eq!(
         driver
             .rehydrate_handle(&h2, "builder", Some(tmp.path()), true)
+            .await
             .unwrap()
             .len(),
         2

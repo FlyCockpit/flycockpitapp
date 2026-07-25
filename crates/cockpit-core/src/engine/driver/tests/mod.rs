@@ -1110,7 +1110,7 @@ fn cold_ready_test_shrink(shrunk: Vec<Message>) -> PendingDelegationShrink {
     }
 }
 
-fn seed_task_delegation(driver: &Driver, task_call_id: &str, label: &str) {
+async fn seed_task_delegation(driver: &Driver, task_call_id: &str, label: &str) {
     driver
         .session
         .db
@@ -1130,10 +1130,11 @@ fn seed_task_delegation(driver: &Driver, task_call_id: &str, label: &str) {
                 todo_ids_json: None,
             }],
         )
+        .await
         .unwrap();
 }
 
-fn seed_batch_task_delegation(driver: &Driver, task_call_id: &str, labels: &[&str]) {
+async fn seed_batch_task_delegation(driver: &Driver, task_call_id: &str, labels: &[&str]) {
     let children = labels
         .iter()
         .map(|label| crate::db::task_delegations::DelegationChildInit {
@@ -1157,6 +1158,7 @@ fn seed_batch_task_delegation(driver: &Driver, task_call_id: &str, labels: &[&st
             None,
             &children,
         )
+        .await
         .unwrap();
 }
 

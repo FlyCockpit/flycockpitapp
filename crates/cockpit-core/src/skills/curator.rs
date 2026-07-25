@@ -11,10 +11,10 @@ use crate::config::extended::SkillsConfig;
 use crate::daemon::proto::{
     MissedRunPolicy, ScheduledJobCreate, ScheduledJobPayload, ScheduledJobSchedule,
 };
-use crate::db::Db;
 use crate::db::skill_usage::{
     SkillCreatedBy, SkillCuratorSnapshotRow, SkillUsageRow, SkillUsageState,
 };
+use crate::db::{Db, scheduler::ScheduledJobRow};
 
 use super::manage::{SkillLifecycleMetadata, lifecycle_metadata_for_skill, usage_seed_for_skill};
 
@@ -142,11 +142,19 @@ impl SkillCurator {
         })
     }
 
-    pub fn run(&self, options: CuratorRunOptions) -> Result<CuratorRunReport> {
+    pub async fn run(&self, options: CuratorRunOptions) -> Result<CuratorRunReport> {
+        let cron_refs = cron_referenced_skills(&self.db).await?;
+        self.run_with_cron_refs(options, cron_refs)
+    }
+
+    pub fn run_with_cron_refs(
+        &self,
+        options: CuratorRunOptions,
+        cron_refs: HashSet<String>,
+    ) -> Result<CuratorRunReport> {
         self.sync_discovered()?;
         let now = self.clock.now();
         let discovered = self.discovered_with_metadata()?;
-        let cron_refs = cron_referenced_skills(&self.db)?;
         let mut report = CuratorRunReport {
             dry_run: options.dry_run,
             scanned: discovered.len(),
@@ -444,9 +452,13 @@ fn transition_for(
     }
 }
 
-fn cron_referenced_skills(db: &Db) -> Result<HashSet<String>> {
+pub(crate) async fn cron_referenced_skills(db: &Db) -> Result<HashSet<String>> {
+    cron_referenced_skills_from_jobs(db.list_scheduled_jobs(None).await?)
+}
+
+pub fn cron_referenced_skills_from_jobs(jobs: Vec<ScheduledJobRow>) -> Result<HashSet<String>> {
     let mut out = HashSet::new();
-    for job in db.list_scheduled_jobs(None)? {
+    for job in jobs {
         let schedule: serde_json::Value = serde_json::from_str(&job.schedule_json)
             .with_context(|| format!("decoding schedule for `{}`", job.id))?;
         if schedule.get("type").and_then(|v| v.as_str()) != Some("cron") {
@@ -498,7 +510,7 @@ fn consolidation_prompt(db: &Db) -> Result<String> {
     ))
 }
 
-pub fn register_scheduler(
+pub async fn register_scheduler(
     handle: &crate::daemon::scheduler::DaemonSchedulerHandle,
     db: Db,
 ) -> Result<()> {
@@ -508,43 +520,49 @@ pub fn register_scheduler(
         async move {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let cfg = crate::config::extended::load_for_cwd(&cwd).skills;
-            let report = SkillCurator::new(db, cwd, cfg).run(CuratorRunOptions::default())?;
+            let report = SkillCurator::new(db, cwd, cfg)
+                .run(CuratorRunOptions::default())
+                .await?;
             Ok(report.summary())
         }
     })?;
-    ensure_default_job(handle, &db)
+    ensure_default_job(handle, &db).await
 }
 
-pub fn ensure_default_job(
+pub async fn ensure_default_job(
     handle: &crate::daemon::scheduler::DaemonSchedulerHandle,
     db: &Db,
 ) -> Result<()> {
     if handle
-        .list_jobs(Some(CURATOR_OWNER))?
+        .list_jobs(Some(CURATOR_OWNER))
+        .await?
         .into_iter()
         .any(|job| job.id == CURATOR_JOB_ID)
     {
         return Ok(());
     }
-    handle.create_job(ScheduledJobCreate {
-        id: CURATOR_JOB_ID.to_string(),
-        owner: CURATOR_OWNER.to_string(),
-        schedule: ScheduledJobSchedule::Idle {
-            min_idle_seconds: CURATOR_MIN_IDLE_SECONDS,
-            max_age_seconds: CURATOR_INTERVAL_SECONDS,
-        },
-        payload: ScheduledJobPayload::Callback {
-            subsystem: CURATOR_SUBSYSTEM.to_string(),
-        },
-        enabled: true,
-        missed_run_policy: MissedRunPolicy::Skip,
-    })?;
+    handle
+        .create_job(ScheduledJobCreate {
+            id: CURATOR_JOB_ID.to_string(),
+            owner: CURATOR_OWNER.to_string(),
+            schedule: ScheduledJobSchedule::Idle {
+                min_idle_seconds: CURATOR_MIN_IDLE_SECONDS,
+                max_age_seconds: CURATOR_INTERVAL_SECONDS,
+            },
+            payload: ScheduledJobPayload::Callback {
+                subsystem: CURATOR_SUBSYSTEM.to_string(),
+            },
+            enabled: true,
+            missed_run_policy: MissedRunPolicy::Skip,
+        })
+        .await?;
     let now = chrono::Utc::now().timestamp();
     db.update_scheduled_job_next_run(
         CURATOR_JOB_ID,
         Some(now.saturating_add(CURATOR_INTERVAL_SECONDS as i64)),
         now,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -703,8 +721,8 @@ mod tests {
         SkillCurator::with_clock(db, cwd.to_path_buf(), cfg, clock)
     }
 
-    #[test]
-    fn curator_transitions_matrix() {
+    #[tokio::test]
+    async fn curator_transitions_matrix() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let now = 10_000_000;
@@ -755,6 +773,7 @@ mod tests {
             updated_at: now,
             next_run_at: Some(now + 60),
         })
+        .await
         .unwrap();
         let clock = FixedClock::new(now);
         let c = curator(db.clone(), tmp.path(), cfg(&root), clock.clone());
@@ -765,6 +784,7 @@ mod tests {
                 dry_run: false,
                 consolidate: false,
             })
+            .await
             .unwrap();
 
         assert!(report.stale.contains(&"old-stale".to_string()));
@@ -801,7 +821,7 @@ mod tests {
         db.record_skill_use(seed, true, now + 1).unwrap();
         db.set_skill_usage_state("old-stale", SkillUsageState::Stale, None, None, now + 1)
             .unwrap();
-        let report = c.run(CuratorRunOptions::default()).unwrap();
+        let report = c.run(CuratorRunOptions::default()).await.unwrap();
         assert!(report.reactivated.contains(&"old-stale".to_string()));
         assert_eq!(
             db.get_skill_usage("old-stale").unwrap().unwrap().state,
@@ -838,10 +858,11 @@ mod tests {
             Some(executor.callback_registry()),
         );
 
-        ensure_default_job(&handle, &db).unwrap();
+        ensure_default_job(&handle, &db).await.unwrap();
 
         let job = handle
             .list_jobs(Some(CURATOR_OWNER))
+            .await
             .unwrap()
             .into_iter()
             .find(|job| job.id == CURATOR_JOB_ID)
@@ -849,8 +870,8 @@ mod tests {
         assert!(job.next_run_at.unwrap() - chrono::Utc::now().timestamp() > 6 * 24 * 60 * 60);
     }
 
-    #[test]
-    fn curator_never_deletes() {
+    #[tokio::test]
+    async fn curator_never_deletes() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");
         let now = 10_000_000;
@@ -863,7 +884,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let c = curator(db, tmp.path(), cfg(&root), FixedClock::new(now));
 
-        c.run(CuratorRunOptions::default()).unwrap();
+        c.run(CuratorRunOptions::default()).await.unwrap();
 
         assert!(!root.join("archive-me").exists());
         assert!(

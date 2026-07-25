@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn steer_delegation_side_channel(
+pub(super) async fn steer_delegation_side_channel(
     session: &Session,
     _redact: &RedactionTable,
     task_call_id: String,
@@ -15,7 +15,7 @@ pub(super) fn steer_delegation_side_channel(
             "message is required for steer".to_string(),
         );
     }
-    let rows = match session.db.list_task_delegation_children(session.id) {
+    let rows = match session.db.list_task_delegation_children(session.id).await {
         Ok(rows) => rows,
         Err(error) => {
             return proto::DelegationSteerResult::internal(format!(
@@ -54,12 +54,11 @@ pub(super) fn steer_delegation_side_channel(
             "message is required for steer".to_string(),
         );
     }
-    match session.db.enqueue_task_delegation_steer(
-        &row.task_call_id,
-        &row.label,
-        &message,
-        &origin_principal,
-    ) {
+    match session
+        .db
+        .enqueue_task_delegation_steer(&row.task_call_id, &row.label, &message, &origin_principal)
+        .await
+    {
         Ok(()) => proto::DelegationSteerResult::queued(
             row.task_call_id.clone(),
             row.label.clone(),

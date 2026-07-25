@@ -326,48 +326,51 @@ pub(super) async fn run_worker(
             NoticeSource::DaemonDirect,
         );
     }
-    let assistant_identity_prefix =
-        match session.assistant_name.as_deref().and_then(|name| match session.db.get_assistant(name)
-        {
+    let assistant_row = if let Some(name) = session.assistant_name.as_deref() {
+        match session.db.get_assistant(name).await {
             Ok(row) => row,
             Err(error) => {
                 tracing::warn!(%error, assistant = name, "loading assistant row for identity failed");
                 None
             }
-        }) {
-            Some(row) => match crate::assistants::identity::load_for_session(&session.db, &row) {
-                Ok(load) => {
-                    for text in &load.notices {
-                        send_current_session_event(
-                            &session,
-                            &event_tx,
-                            &redaction,
-                            proto::Event::Notice {
-                                session_id,
-                                text: text.clone(),
-                            },
-                            NoticeSource::DaemonDirect,
-                        );
-                    }
-                    Some(load.system_prefix)
-                }
-                Err(error) => {
-                    tracing::warn!(%error, assistant = %row.name, "loading assistant identity failed");
+        }
+    } else {
+        None
+    };
+    let assistant_identity_prefix = match assistant_row {
+        Some(row) => match crate::assistants::identity::load_for_session(&session.db, &row).await {
+            Ok(load) => {
+                for text in &load.notices {
                     send_current_session_event(
                         &session,
                         &event_tx,
                         &redaction,
                         proto::Event::Notice {
                             session_id,
-                            text: format!("Assistant identity could not be loaded: {error}"),
+                            text: text.clone(),
                         },
                         NoticeSource::DaemonDirect,
                     );
-                    None
                 }
-            },
-            None => None,
-        };
+                Some(load.system_prefix)
+            }
+            Err(error) => {
+                tracing::warn!(%error, assistant = %row.name, "loading assistant identity failed");
+                send_current_session_event(
+                    &session,
+                    &event_tx,
+                    &redaction,
+                    proto::Event::Notice {
+                        session_id,
+                        text: format!("Assistant identity could not be loaded: {error}"),
+                    },
+                    NoticeSource::DaemonDirect,
+                );
+                None
+            }
+        },
+        None => None,
+    };
     // The daemon's shared shutdown gate, captured before `model` is moved into
     // `spawn_args`. Reused when building model-comparison tandem (shadow)
     // models so a tandem request — itself a new provider round-trip — refuses
@@ -421,11 +424,14 @@ pub(super) async fn run_worker(
     };
     let tool_surface_override = stored_tool_surface_override(&session);
     let root = Arc::new(
-        match builtin::load_with_tool_surface_override(
+        match builtin::load_with_assistant_db_and_tool_surface_override(
             &root_agent_name,
             &spawn_args,
+            &session.db,
             tool_surface_override.as_ref(),
-        ) {
+        )
+        .await
+        {
             Ok(agent) => agent,
             Err(error) if tool_surface_override.is_some() => {
                 tracing::warn!(
@@ -434,10 +440,23 @@ pub(super) async fn run_worker(
                     agent = %root_agent_name,
                     "applying stored tool surface override failed; falling back to agent definition"
                 );
-                builtin::load(&root_agent_name, &spawn_args)
-                    .unwrap_or_else(|_| builtin::default_build(&spawn_args))
+                builtin::load_with_assistant_db_and_tool_surface_override(
+                    &root_agent_name,
+                    &spawn_args,
+                    &session.db,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|_| builtin::default_build(&spawn_args))
             }
-            Err(_) => builtin::default_build(&spawn_args),
+            Err(_) => builtin::load_with_assistant_db_and_tool_surface_override(
+                &root_agent_name,
+                &spawn_args,
+                &session.db,
+                None,
+            )
+            .await
+            .unwrap_or_else(|_| builtin::default_build(&spawn_args)),
         },
     );
 
@@ -1173,7 +1192,8 @@ pub(super) async fn run_worker(
                         label,
                         message,
                         origin_principal,
-                    );
+                    )
+                    .await;
                     let _ = respond_to.send(result);
                 }
                 SessionWork::RemoveQueuedUserMessage {

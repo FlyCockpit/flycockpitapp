@@ -997,6 +997,7 @@ impl Driver {
             .session
             .db
             .current_session_goal(self.session.id, false)
+            .await
             .ok()
             .flatten()
             .map(|g| {
@@ -1011,10 +1012,15 @@ impl Driver {
                 )
             });
         let mut appendix = compact::build_appendix(&calls, &self.cwd, &pins, &[], active_goal);
-        if let Ok(overview) = self.session.db.task_todo_overview(self.session.id, 24) {
+        if let Ok(overview) = self
+            .session
+            .db
+            .task_todo_overview(self.session.id, 24)
+            .await
+        {
             appendix.task_overview = compact::render_task_todo_overview(&overview);
         }
-        let history_agent_available = self.history_agent_available_for_compaction_nudge();
+        let history_agent_available = self.history_agent_available_for_compaction_nudge().await;
 
         // 3. Seed-tools (read-only/idempotent; re-executed, not replayed).
         let seeds = compact::derive_seed_tools(&calls);
@@ -1107,8 +1113,9 @@ impl Driver {
         })
     }
 
-    fn history_agent_available_for_compaction_nudge(&self) -> bool {
+    async fn history_agent_available_for_compaction_nudge(&self) -> bool {
         crate::agents::resolve_with_assistant_db(&self.cwd, "history", &self.session.db)
+            .await
             .ok()
             .flatten()
             .is_some_and(|def| crate::agents::is_builtin_agent("history") && def.mode.is_subagent())

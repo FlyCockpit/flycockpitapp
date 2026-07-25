@@ -244,6 +244,7 @@ async fn goal_rpc_reads_sets_and_clears() {
             Some("context secret"),
             Some(100),
         )
+        .await
         .unwrap();
     let mut state = owner_state();
 
@@ -331,6 +332,7 @@ async fn goal_change_is_visible_to_live_worker() {
             None,
             Some(100),
         )
+        .await
         .unwrap();
     let live_before = state
         .attached
@@ -372,6 +374,7 @@ async fn goal_change_is_visible_to_live_worker() {
     let goal = live_after
         .db
         .current_session_goal(live_after.id, false)
+        .await
         .unwrap()
         .expect("goal visible through live worker session handle");
     assert_eq!(goal.status, proto::GoalStatus::Paused);
@@ -392,6 +395,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
             None,
             Some(100),
         )
+        .await
         .unwrap();
 
     let first_ctx = ctx.clone();
@@ -426,6 +430,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     assert_eq!(
         ctx.db
             .current_session_goal(session_id, false)
+            .await
             .unwrap()
             .expect("goal exists")
             .status,
@@ -446,6 +451,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     assert_eq!(
         ctx.db
             .current_session_goal(session_id, false)
+            .await
             .unwrap()
             .expect("goal persists immediately")
             .status,
@@ -497,6 +503,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     assert_eq!(
         ctx.db
             .current_session_goal(session_id, false)
+            .await
             .unwrap()
             .expect("next turn reads paused goal")
             .status,
@@ -759,7 +766,7 @@ async fn assistant_rpc_creates_session_via_registry() {
         )
         .await
         .unwrap();
-    create_test_assistant(&ctx, &assistant_home, "helper-bot");
+    create_test_assistant(&ctx, &assistant_home, "helper-bot").await;
     let mut state = owner_state();
 
     let response = handle_request(Request::ListAssistants, &mut state, &ctx)
@@ -809,7 +816,7 @@ async fn assistant_session_creation_is_atomic() {
     let ctx = test_ctx();
     let assistant_home = tempfile::tempdir().unwrap();
     let untrusted_project = tempfile::tempdir().unwrap();
-    create_test_assistant(&ctx, &assistant_home, "helper-bot");
+    create_test_assistant(&ctx, &assistant_home, "helper-bot").await;
     let mut state = owner_state();
 
     let err = handle_request(
@@ -2106,8 +2113,8 @@ async fn promote_resource_request_stale_id_is_nonfatal() {
 #[tokio::test]
 async fn boot_housekeeping_succeeds_with_empty_task_delegation_tables() {
     let db = Db::open_in_memory().expect("in-memory db");
-    run_boot_housekeeping(&db);
-    assert_eq!(db.reconcile_orphaned_task_delegations().unwrap(), 0);
+    run_boot_housekeeping(&db).await;
+    assert_eq!(db.reconcile_orphaned_task_delegations().await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -4412,6 +4419,7 @@ impl ReadonlyDispatchCaseKind {
                         Some("context"),
                         Some(100),
                     )
+                    .await
                     .unwrap();
                 let response = dispatch_matrix_request(
                     &ctx,
@@ -6013,6 +6021,7 @@ async fn assert_goal_mutating_happy(kind: &str) {
             None,
             Some(100),
         )
+        .await
         .unwrap();
     let response = dispatch_matrix_request(
         &ctx,
@@ -6039,6 +6048,7 @@ async fn assert_goal_mutating_happy(kind: &str) {
             assert!(
                 ctx.db
                     .current_session_goal(session.session_id, false)
+                    .await
                     .unwrap()
                     .is_none()
             );
@@ -6079,7 +6089,7 @@ async fn assert_goal_mutating_malformed(kind: &str) {
     }
 }
 
-fn create_test_assistant(
+async fn create_test_assistant(
     ctx: &Arc<DaemonContext>,
     tmp: &tempfile::TempDir,
     name: &str,
@@ -6097,6 +6107,7 @@ fn create_test_assistant(
             home_dir: tmp.path().join(name),
         },
     )
+    .await
     .expect("create assistant")
 }
 
@@ -6112,7 +6123,7 @@ async fn assert_create_assistant_session_happy() {
         )
         .await
         .unwrap();
-    create_test_assistant(&ctx, &tmp, "helper-bot");
+    create_test_assistant(&ctx, &tmp, "helper-bot").await;
     let response = dispatch_matrix_request(
         &ctx,
         Request::CreateAssistantSession {
@@ -6641,6 +6652,7 @@ async fn assert_scheduler_dispatch_happy(kind: &str) {
             assert!(
                 scheduler
                     .list_jobs(None)
+                    .await
                     .unwrap()
                     .iter()
                     .any(|job| job.id == "job-authz")
@@ -6654,6 +6666,7 @@ async fn assert_scheduler_dispatch_happy(kind: &str) {
             assert!(
                 scheduler
                     .list_jobs(None)
+                    .await
                     .unwrap()
                     .iter()
                     .all(|job| job.id != "job-authz")

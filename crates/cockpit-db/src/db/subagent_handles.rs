@@ -27,11 +27,7 @@ impl Db {
     /// to `session_id`. `transcript_json` is the JSON-serialized message
     /// history. Idempotent on the handle (upsert) so re-reporting under the
     /// same handle refreshes the stored transcript.
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn save_subagent_handle(
+    pub async fn save_subagent_handle(
         &self,
         handle: &str,
         session_id: Uuid,
@@ -44,7 +40,7 @@ impl Db {
         let agent = agent.to_owned();
         let cwd = cwd.map(str::to_owned);
         let transcript_json = transcript_json.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO subagent_handles
                      (handle, session_id, agent, cwd, transcript_json, created_at, updated_at)
@@ -65,22 +61,20 @@ impl Db {
             .context("inserting subagent_handle")?;
             Ok(())
         })
+        .await
     }
 
     /// Load a subagent handle scoped to `session_id`. Returns `None` when
     /// the handle is unknown / evicted / belongs to a different session —
     /// the caller turns that into a clear "spawn a fresh subagent" error
     /// (never a silent cold start).
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn load_subagent_handle(
+    pub async fn load_subagent_handle(
         &self,
         handle: &str,
         session_id: Uuid,
     ) -> Result<Option<SubagentHandle>> {
-        self.read_blocking(|conn| {
+        let handle = handle.to_owned();
+        self.read(move |conn| {
             let row = conn
                 .query_row(
                     "SELECT agent, cwd, transcript_json FROM subagent_handles
@@ -102,6 +96,7 @@ impl Db {
                 transcript_json,
             }))
         })
+        .await
     }
 }
 
@@ -115,10 +110,12 @@ mod tests {
         let s = db.create_session("p", "/x", "explore").await.unwrap();
         let other = db.create_session("p", "/x", "explore").await.unwrap();
         db.save_subagent_handle("h1", s.session_id, "explore", Some("/repo/a"), "[1,2,3]")
+            .await
             .unwrap();
 
         let got = db
             .load_subagent_handle("h1", s.session_id)
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(got.agent, "explore");
@@ -128,12 +125,14 @@ mod tests {
         // Unknown handle → None (the stale-handle path).
         assert!(
             db.load_subagent_handle("nope", s.session_id)
+                .await
                 .unwrap()
                 .is_none()
         );
         // Right handle, wrong session → None (scoped).
         assert!(
             db.load_subagent_handle("h1", other.session_id)
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -144,11 +143,14 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "explore").await.unwrap();
         db.save_subagent_handle("h1", s.session_id, "explore", Some("/repo/a"), "[1]")
+            .await
             .unwrap();
         db.save_subagent_handle("h1", s.session_id, "explore", Some("/repo/b"), "[1,2]")
+            .await
             .unwrap();
         let got = db
             .load_subagent_handle("h1", s.session_id)
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(got.cwd.as_deref(), Some("/repo/b"));

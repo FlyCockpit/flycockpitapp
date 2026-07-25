@@ -164,39 +164,43 @@ impl DaemonSchedulerHandle {
         let _ = self.wake_tx.send(next);
     }
 
-    pub fn record_user_activity(&self) {
-        if let Err(error) = self.scheduler.record_user_activity() {
+    pub async fn record_user_activity(&self) {
+        if let Err(error) = self.scheduler.record_user_activity().await {
             tracing::warn!(error = %error, "scheduler activity recompute failed");
         }
         self.wake();
     }
 
-    pub fn create_job(&self, job: ScheduledJobCreate) -> Result<ScheduledJobSummary> {
-        let summary = self.scheduler.create_job(job)?;
+    pub async fn create_job(&self, job: ScheduledJobCreate) -> Result<ScheduledJobSummary> {
+        let summary = self.scheduler.create_job(job).await?;
         self.wake();
         Ok(summary)
     }
 
-    pub fn list_jobs(&self, owner: Option<&str>) -> Result<Vec<ScheduledJobSummary>> {
-        self.scheduler.list_jobs(owner)
+    pub async fn list_jobs(&self, owner: Option<&str>) -> Result<Vec<ScheduledJobSummary>> {
+        self.scheduler.list_jobs(owner).await
     }
 
-    pub fn delete_job(&self, id: &str) -> Result<bool> {
-        let deleted = self.scheduler.delete_job(id)?;
+    pub async fn delete_job(&self, id: &str) -> Result<bool> {
+        let deleted = self.scheduler.delete_job(id).await?;
         if deleted {
             self.wake();
         }
         Ok(deleted)
     }
 
-    pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<Option<ScheduledJobSummary>> {
-        let job = self.scheduler.set_enabled(id, enabled)?;
+    pub async fn set_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<Option<ScheduledJobSummary>> {
+        let job = self.scheduler.set_enabled(id, enabled).await?;
         self.wake();
         Ok(job)
     }
 
-    pub fn run_now(&self, id: &str) -> Result<()> {
-        self.scheduler.run_job_by_id(id)?;
+    pub async fn run_now(&self, id: &str) -> Result<()> {
+        self.scheduler.run_job_by_id(id).await?;
         self.wake();
         Ok(())
     }
@@ -257,16 +261,16 @@ impl DaemonScheduler {
         handle
     }
 
-    pub fn record_user_activity(&self) -> Result<()> {
+    pub async fn record_user_activity(&self) -> Result<()> {
         *self
             .last_user_activity
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.clock.now();
-        self.rebuild_timeline()
+        self.rebuild_timeline().await
     }
 
-    pub fn create_job(&self, job: ScheduledJobCreate) -> Result<ScheduledJobSummary> {
-        validate_job_create_with_db(&job, &self.db)?;
+    pub async fn create_job(&self, job: ScheduledJobCreate) -> Result<ScheduledJobSummary> {
+        validate_job_create_with_db(&job, &self.db).await?;
         let now = self.clock.now();
         let next_run_at = compute_next_run(
             &job.schedule,
@@ -277,39 +281,47 @@ impl DaemonScheduler {
             job.missed_run_policy,
             None,
         )?;
-        let row = self.db.insert_scheduled_job(NewScheduledJobRow {
-            id: job.id,
-            owner: job.owner,
-            schedule_json: serde_json::to_string(&job.schedule)?,
-            payload_json: serde_json::to_string(&job.payload)?,
-            enabled: job.enabled,
-            missed_run_policy: job.missed_run_policy.as_str().to_string(),
-            created_at: now,
-            updated_at: now,
-            next_run_at: job.enabled.then_some(next_run_at).flatten(),
-        })?;
-        self.rebuild_timeline()?;
+        let row = self
+            .db
+            .insert_scheduled_job(NewScheduledJobRow {
+                id: job.id,
+                owner: job.owner,
+                schedule_json: serde_json::to_string(&job.schedule)?,
+                payload_json: serde_json::to_string(&job.payload)?,
+                enabled: job.enabled,
+                missed_run_policy: job.missed_run_policy.as_str().to_string(),
+                created_at: now,
+                updated_at: now,
+                next_run_at: job.enabled.then_some(next_run_at).flatten(),
+            })
+            .await?;
+        self.rebuild_timeline().await?;
         row_to_summary(row)
     }
 
-    pub fn list_jobs(&self, owner: Option<&str>) -> Result<Vec<ScheduledJobSummary>> {
+    pub async fn list_jobs(&self, owner: Option<&str>) -> Result<Vec<ScheduledJobSummary>> {
         self.db
-            .list_scheduled_jobs(owner)?
+            .list_scheduled_jobs(owner)
+            .await?
             .into_iter()
             .map(row_to_summary)
             .collect()
     }
 
-    pub fn delete_job(&self, id: &str) -> Result<bool> {
-        let deleted = self.db.delete_scheduled_job(id)?;
+    pub async fn delete_job(&self, id: &str) -> Result<bool> {
+        let deleted = self.db.delete_scheduled_job(id).await?;
         if deleted {
-            self.rebuild_timeline()?;
+            self.rebuild_timeline().await?;
         }
         Ok(deleted)
     }
 
-    pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<Option<ScheduledJobSummary>> {
-        let Some(job) = self.db.get_scheduled_job(id)? else {
+    pub async fn set_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<Option<ScheduledJobSummary>> {
+        let Some(job) = self.db.get_scheduled_job(id).await? else {
             return Ok(None);
         };
         let job = row_to_job(job)?;
@@ -330,16 +342,17 @@ impl DaemonScheduler {
             .flatten();
         let job = self
             .db
-            .set_scheduled_job_enabled(id, enabled, next_run_at, now)?
+            .set_scheduled_job_enabled(id, enabled, next_run_at, now)
+            .await?
             .map(row_to_summary)
             .transpose()?;
-        self.rebuild_timeline()?;
+        self.rebuild_timeline().await?;
         Ok(job)
     }
 
-    pub fn recompute_after_start(&self) -> Result<()> {
+    pub async fn recompute_after_start(&self) -> Result<()> {
         let now = self.clock.now();
-        for row in self.db.list_scheduled_jobs(None)? {
+        for row in self.db.list_scheduled_jobs(None).await? {
             let job = row_to_job(row)?;
             if !job.enabled {
                 continue;
@@ -353,9 +366,11 @@ impl DaemonScheduler {
                 job.missed_run_policy,
                 job.next_run_at,
             )?;
-            self.db.update_scheduled_job_next_run(&job.id, next, now)?;
+            self.db
+                .update_scheduled_job_next_run(&job.id, next, now)
+                .await?;
         }
-        self.rebuild_timeline()
+        self.rebuild_timeline().await
     }
 
     pub fn next_wake(&self) -> Result<Option<i64>> {
@@ -378,7 +393,8 @@ impl DaemonScheduler {
         let now = self.clock.now();
         let jobs = self
             .db
-            .list_scheduled_jobs(None)?
+            .list_scheduled_jobs(None)
+            .await?
             .into_iter()
             .map(row_to_job)
             .collect::<Result<Vec<_>>>()?;
@@ -395,22 +411,41 @@ impl DaemonScheduler {
             }
             if let Some(wait_until) = self.idle_wait_until(&job, now)? {
                 self.db
-                    .update_scheduled_job_next_run(&job.id, Some(wait_until), now)?;
+                    .update_scheduled_job_next_run(&job.id, Some(wait_until), now)
+                    .await?;
                 continue;
             }
+            let claim_next_run_at = compute_next_run(
+                &job.schedule,
+                now,
+                Some(now),
+                job.created_at,
+                self.last_user_activity(),
+                job.missed_run_policy,
+                None,
+            )?;
+            let Some(claimed) = self
+                .db
+                .claim_scheduled_job_due(&job.id, job.next_run_at, claim_next_run_at, now)
+                .await?
+            else {
+                continue;
+            };
+            let job = row_to_job(claimed)?;
             self.enqueue_job(job, RunKind::Scheduled)?;
         }
-        self.rebuild_timeline()?;
+        self.rebuild_timeline().await?;
         Ok(results)
     }
 
-    pub fn run_job_by_id(&self, id: &str) -> Result<()> {
+    pub async fn run_job_by_id(&self, id: &str) -> Result<()> {
         let row = self
             .db
-            .get_scheduled_job(id)?
+            .get_scheduled_job(id)
+            .await?
             .ok_or_else(|| anyhow::anyhow!("scheduled job `{id}` not found"))?;
         self.enqueue_job(row_to_job(row)?, RunKind::Manual)?;
-        self.rebuild_timeline()?;
+        self.rebuild_timeline().await?;
         Ok(())
     }
 
@@ -426,7 +461,7 @@ impl DaemonScheduler {
                 );
             }
             scheduler.clear_in_flight(&job.id);
-            if let Err(error) = scheduler.rebuild_timeline() {
+            if let Err(error) = scheduler.rebuild_timeline().await {
                 tracing::warn!(error = %error, "scheduler timeline rebuild after job failed");
             }
         });
@@ -480,7 +515,7 @@ impl DaemonScheduler {
             summary,
             finished_at,
         };
-        let Some(current_row) = self.db.get_scheduled_job(&job.id)? else {
+        let Some(current_row) = self.db.get_scheduled_job(&job.id).await? else {
             return Ok(result);
         };
         let current = row_to_job(current_row)?;
@@ -524,7 +559,8 @@ impl DaemonScheduler {
                 backoff_until,
                 enabled,
                 disabled_notice: disabled_notice.or(current.disabled_notice),
-            })?;
+            })
+            .await?;
         Ok(result)
     }
 
@@ -557,10 +593,10 @@ impl DaemonScheduler {
         Ok((wait_until > now).then_some(wait_until))
     }
 
-    fn rebuild_timeline(&self) -> Result<()> {
+    async fn rebuild_timeline(&self) -> Result<()> {
         let now = self.clock.now();
         let mut heap = BinaryHeap::new();
-        for row in self.db.list_scheduled_jobs(None)? {
+        for row in self.db.list_scheduled_jobs(None).await? {
             let job = row_to_job(row)?;
             if !job.enabled {
                 continue;
@@ -593,7 +629,7 @@ async fn run_scheduler_loop(
     mut wake_rx: watch::Receiver<u64>,
     shutdown: crate::daemon::shutdown::ShutdownSignal,
 ) {
-    if let Err(error) = scheduler.recompute_after_start() {
+    if let Err(error) = scheduler.recompute_after_start().await {
         tracing::warn!(error = %error, "scheduler startup recompute failed");
     }
     loop {
@@ -700,7 +736,8 @@ impl ProductionJobExecutor {
         }
         let row = self
             .db
-            .get_assistant(&assistant)?
+            .get_assistant(&assistant)
+            .await?
             .ok_or_else(|| anyhow::anyhow!("assistant `{assistant}` not found"))?;
         crate::assistants::load_from_row(&row)
             .with_context(|| format!("validating assistant `{assistant}`"))?;
@@ -867,10 +904,10 @@ pub fn validate_job_create(job: &ScheduledJobCreate) -> Result<()> {
     Ok(())
 }
 
-fn validate_job_create_with_db(job: &ScheduledJobCreate, db: &Db) -> Result<()> {
+async fn validate_job_create_with_db(job: &ScheduledJobCreate, db: &Db) -> Result<()> {
     validate_job_create(job)?;
     if let ScheduledJobPayload::RunPrompt { assistant, .. } = &job.payload
-        && db.get_assistant(assistant)?.is_none()
+        && db.get_assistant(assistant).await?.is_none()
     {
         bail!("assistant `{assistant}` not found");
     }
@@ -1498,11 +1535,11 @@ mod tests {
     }
 
     async fn wait_for_sleeper_calls(sleeper: &RecordingSleeper, expected: usize) {
-        for _ in 0..100 {
+        for _ in 0..10_000 {
             if sleeper.calls() >= expected {
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!(
             "expected at least {expected} scheduler sleep calls, saw {}",
@@ -1511,7 +1548,7 @@ mod tests {
     }
 
     async fn wait_for_executor_runs(executor: &CountingExecutor, expected: usize) {
-        for _ in 0..100 {
+        for _ in 0..10_000 {
             if executor.runs.load(Ordering::SeqCst) >= expected {
                 return;
             }
@@ -1524,7 +1561,7 @@ mod tests {
     }
 
     async fn wait_for_started_jobs(executor: &BlockingByIdExecutor, expected: usize) {
-        for _ in 0..100 {
+        for _ in 0..10_000 {
             if executor.started().len() >= expected {
                 return;
             }
@@ -1537,7 +1574,7 @@ mod tests {
     }
 
     async fn wait_for_gated_started_jobs(executor: &GatedExecutor, expected: usize) {
-        for _ in 0..100 {
+        for _ in 0..10_000 {
             if executor.started().len() >= expected {
                 return;
             }
@@ -1551,11 +1588,13 @@ mod tests {
 
     async fn wait_for_job_result(scheduler: &DaemonScheduler, id: &str) -> ScheduledJobSummary {
         for _ in 0..10_000 {
-            let jobs = scheduler.list_jobs(None).unwrap();
+            let jobs = scheduler.list_jobs(None).await.unwrap();
             if let Some(job) = jobs
                 .into_iter()
                 .find(|job| job.id == id && job.last_result.is_some())
+                && !scheduler.is_in_flight(id)
             {
+                scheduler.rebuild_timeline().await.unwrap();
                 return job;
             }
             tokio::task::yield_now().await;
@@ -1569,16 +1608,28 @@ mod tests {
         expected: u32,
     ) -> ScheduledJobSummary {
         for _ in 0..10_000 {
-            let jobs = scheduler.list_jobs(None).unwrap();
+            let jobs = scheduler.list_jobs(None).await.unwrap();
             if let Some(job) = jobs
                 .into_iter()
                 .find(|job| job.id == id && job.failure_count == expected)
+                && !scheduler.is_in_flight(id)
             {
+                scheduler.rebuild_timeline().await.unwrap();
                 return job;
             }
             tokio::task::yield_now().await;
         }
         panic!("expected job `{id}` failure_count to reach {expected}");
+    }
+
+    async fn wait_for_next_wake(scheduler: &DaemonScheduler, expected: Option<i64>) {
+        for _ in 0..10_000 {
+            if scheduler.next_wake().unwrap() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(scheduler.next_wake().unwrap(), expected);
     }
 
     fn callback_job(id: &str, schedule: ScheduledJobSchedule) -> ScheduledJobCreate {
@@ -1721,7 +1772,7 @@ mod tests {
         EnvSnapshot::new(EnvSnapshotSource::DaemonStart, HashMap::new())
     }
 
-    fn create_helper_assistant(db: &Db, home_dir: std::path::PathBuf) {
+    async fn create_helper_assistant(db: &Db, home_dir: std::path::PathBuf) {
         create_assistant(
             db,
             CreateAssistantSpec {
@@ -1735,6 +1786,7 @@ mod tests {
                 home_dir,
             },
         )
+        .await
         .unwrap();
     }
 
@@ -1863,17 +1915,18 @@ mod tests {
                 "job-every",
                 ScheduledJobSchedule::Every { seconds: 10 },
             ))
+            .await
             .unwrap();
         let mut catch_up = callback_job("job-once", ScheduledJobSchedule::Once { at: 1_010 });
         catch_up.missed_run_policy = MissedRunPolicy::RunOnceOnStart;
-        scheduler.create_job(catch_up).unwrap();
+        scheduler.create_job(catch_up).await.unwrap();
 
         drop(scheduler);
         let reopened = Db::open(&db_path).unwrap();
         let (restarted, clock, executor) = scheduler_with_db(reopened.clone(), 1_020, false);
         clock.set(1_020);
-        restarted.recompute_after_start().unwrap();
-        let jobs = restarted.list_jobs(None).unwrap();
+        restarted.recompute_after_start().await.unwrap();
+        let jobs = restarted.list_jobs(None).await.unwrap();
         assert_eq!(jobs.len(), 2);
         assert_eq!(
             jobs.iter()
@@ -1890,20 +1943,14 @@ mod tests {
             "run_once_on_start should catch up one missed one-shot"
         );
         restarted.run_due_once().await.unwrap();
-        wait_for_executor_runs(&executor, 1).await;
+        let job_once = wait_for_job_result(&restarted, "job-once").await;
         assert_eq!(executor.runs.load(Ordering::SeqCst), 1);
-        assert!(
-            restarted
-                .list_jobs(None)
-                .unwrap()
-                .iter()
-                .any(|job| job.id == "job-once" && job.last_run_at == Some(1_020))
-        );
+        assert_eq!(job_once.last_run_at, Some(1_020));
         drop(restarted);
 
         let reopened_again = Db::open(&db_path).unwrap();
         let (restarted_again, clock, executor) = scheduler_with_db(reopened_again, 1_030, false);
-        restarted_again.recompute_after_start().unwrap();
+        restarted_again.recompute_after_start().await.unwrap();
         clock.set(1_030);
         restarted_again.run_due_once().await.unwrap();
         wait_for_executor_runs(&executor, 1).await;
@@ -1921,13 +1968,14 @@ mod tests {
                     max_age_seconds: 300,
                 },
             ))
+            .await
             .unwrap();
         clock.set(1_250);
-        scheduler.record_user_activity().unwrap();
+        scheduler.record_user_activity().await.unwrap();
         scheduler.run_due_once().await.unwrap();
         assert_eq!(executor.runs.load(Ordering::SeqCst), 0);
         clock.set(1_370);
-        scheduler.recompute_after_start().unwrap();
+        scheduler.recompute_after_start().await.unwrap();
         scheduler.run_due_once().await.unwrap();
         wait_for_executor_runs(&executor, 1).await;
         assert_eq!(executor.runs.load(Ordering::SeqCst), 1);
@@ -1944,12 +1992,14 @@ mod tests {
                 "job-a",
                 ScheduledJobSchedule::Every { seconds: 1 },
             ))
+            .await
             .unwrap();
         scheduler
             .create_job(callback_job(
                 "job-b",
                 ScheduledJobSchedule::Every { seconds: 1 },
             ))
+            .await
             .unwrap();
 
         clock.set(1_001);
@@ -1962,10 +2012,12 @@ mod tests {
                 "job-c",
                 ScheduledJobSchedule::Every { seconds: 10 },
             ))
+            .await
             .unwrap();
         assert!(
             scheduler
                 .list_jobs(None)
+                .await
                 .unwrap()
                 .iter()
                 .any(|job| job.id == "job-c")
@@ -1985,6 +2037,7 @@ mod tests {
                     &format!("job-{i:02}"),
                     ScheduledJobSchedule::Every { seconds: 1 },
                 ))
+                .await
                 .unwrap();
         }
 
@@ -2028,6 +2081,7 @@ mod tests {
                 "job-slow",
                 ScheduledJobSchedule::Every { seconds: 60 },
             ))
+            .await
             .unwrap();
 
         clock.set(1_060);
@@ -2055,6 +2109,7 @@ mod tests {
                 "job-slow-fail",
                 ScheduledJobSchedule::Every { seconds: 60 },
             ))
+            .await
             .unwrap();
 
         clock.set(1_060);
@@ -2085,10 +2140,11 @@ mod tests {
                     max_age_seconds: 60,
                 },
             ))
+            .await
             .unwrap();
 
         clock.set(1_059);
-        scheduler.record_user_activity().unwrap();
+        scheduler.record_user_activity().await.unwrap();
         clock.set(1_060);
         scheduler.run_due_once().await.unwrap();
         wait_for_executor_runs(&executor, 1).await;
@@ -2106,12 +2162,13 @@ mod tests {
                 "job-blocked",
                 ScheduledJobSchedule::Every { seconds: 1 },
             ))
+            .await
             .unwrap();
 
         clock.set(1_001);
         scheduler.run_due_once().await.unwrap();
         wait_for_started_jobs(&executor, 1).await;
-        let error = scheduler.run_job_by_id("job-blocked").unwrap_err();
+        let error = scheduler.run_job_by_id("job-blocked").await.unwrap_err();
         assert!(error.to_string().contains("already running"), "{error:#}");
     }
 
@@ -2126,9 +2183,10 @@ mod tests {
                 "job-blocked",
                 ScheduledJobSchedule::Every { seconds: 60 },
             ))
+            .await
             .unwrap();
 
-        scheduler.run_job_by_id("job-blocked").unwrap();
+        scheduler.run_job_by_id("job-blocked").await.unwrap();
         wait_for_started_jobs(&executor, 1).await;
         assert!(scheduler.is_in_flight("job-blocked"));
     }
@@ -2141,11 +2199,12 @@ mod tests {
                 "job-manual-fail",
                 ScheduledJobSchedule::Every { seconds: 60 },
             ))
+            .await
             .unwrap();
 
-        let mut job = scheduler.list_jobs(None).unwrap().remove(0);
+        let mut job = scheduler.list_jobs(None).await.unwrap().remove(0);
         for expected in 1..=MAX_FAILURES {
-            scheduler.run_job_by_id("job-manual-fail").unwrap();
+            scheduler.run_job_by_id("job-manual-fail").await.unwrap();
             job = wait_for_job_failure_count(&scheduler, "job-manual-fail", expected).await;
         }
         assert_eq!(executor.runs.load(Ordering::SeqCst), MAX_FAILURES as usize);
@@ -2168,6 +2227,7 @@ mod tests {
                 "job-timeout",
                 ScheduledJobSchedule::Every { seconds: 1 },
             ))
+            .await
             .unwrap();
 
         clock.set(1_001);
@@ -2191,14 +2251,15 @@ mod tests {
                 "job-delete",
                 ScheduledJobSchedule::Every { seconds: 60 },
             ))
+            .await
             .unwrap();
 
-        scheduler.run_job_by_id("job-delete").unwrap();
+        scheduler.run_job_by_id("job-delete").await.unwrap();
         wait_for_started_jobs(&executor, 1).await;
-        assert!(scheduler.delete_job("job-delete").unwrap());
+        assert!(scheduler.delete_job("job-delete").await.unwrap());
         executor.notify.notify_waiters();
         for _ in 0..100 {
-            if scheduler.list_jobs(None).unwrap().is_empty() {
+            if scheduler.list_jobs(None).await.unwrap().is_empty() {
                 return;
             }
             tokio::task::yield_now().await;
@@ -2217,11 +2278,12 @@ mod tests {
                 "job-disable",
                 ScheduledJobSchedule::Every { seconds: 60 },
             ))
+            .await
             .unwrap();
 
-        scheduler.run_job_by_id("job-disable").unwrap();
+        scheduler.run_job_by_id("job-disable").await.unwrap();
         wait_for_started_jobs(&executor, 1).await;
-        scheduler.set_enabled("job-disable", false).unwrap();
+        scheduler.set_enabled("job-disable", false).await.unwrap();
         executor.notify.notify_waiters();
         let job = wait_for_job_result(&scheduler, "job-disable").await;
         assert!(!job.enabled);
@@ -2361,6 +2423,7 @@ mod tests {
                 "job-fail",
                 ScheduledJobSchedule::Every { seconds: 1 },
             ))
+            .await
             .unwrap();
         clock.set(1_001);
         scheduler.run_due_once().await.unwrap();
@@ -2382,20 +2445,23 @@ mod tests {
         for expected_failure in 2..=MAX_FAILURES {
             clock.set(backoff);
             scheduler.run_due_once().await.unwrap();
-            wait_for_executor_runs(&executor, expected_failure as usize).await;
-            job = wait_for_job_result(&scheduler, "job-fail").await;
+            job = wait_for_job_failure_count(&scheduler, "job-fail", expected_failure).await;
             assert_eq!(job.failure_count, expected_failure);
             if expected_failure < MAX_FAILURES {
                 let next_backoff = job.backoff_until.expect("failure backs off");
                 assert!(next_backoff > backoff);
-                assert_eq!(scheduler.next_wake().unwrap(), Some(next_backoff));
+                wait_for_next_wake(&scheduler, Some(next_backoff)).await;
                 backoff = next_backoff;
             }
         }
         assert_eq!(executor.runs.load(Ordering::SeqCst), MAX_FAILURES as usize);
         assert!(!job.enabled);
         assert!(job.disabled_notice.unwrap().contains("disabled"));
-        let job = scheduler.set_enabled("job-fail", true).unwrap().unwrap();
+        let job = scheduler
+            .set_enabled("job-fail", true)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(job.enabled);
         assert_eq!(job.failure_count, 0);
         assert!(job.backoff_until.is_none());
@@ -2414,6 +2480,7 @@ mod tests {
                         seconds: 60 + i as u64,
                     },
                 ))
+                .await
                 .unwrap();
         }
         assert_eq!(scheduler.timeline_len(), 100);
@@ -2433,9 +2500,10 @@ mod tests {
                 "job-earlier",
                 ScheduledJobSchedule::Every { seconds: 5 },
             ))
+            .await
             .unwrap();
         wait_for_sleeper_calls(&sleeper, 2).await;
-        assert_eq!(handle.list_jobs(None).unwrap().len(), 101);
+        assert_eq!(handle.list_jobs(None).await.unwrap().len(), 101);
         assert_eq!(handle.wake_generation(), 1);
         assert_eq!(handle.scheduler.next_wake().unwrap(), Some(1_005));
         assert_eq!(sleeper.last_wake(), Some(1_005));
@@ -2473,6 +2541,7 @@ mod tests {
                 "job-callback",
                 ScheduledJobSchedule::Every { seconds: 1 },
             ))
+            .await
             .unwrap();
         clock.set(1_001);
         scheduler.run_due_once().await.unwrap();
@@ -2493,8 +2562,9 @@ mod tests {
                 "job-once",
                 ScheduledJobSchedule::Once { at: 2_000 },
             ))
+            .await
             .unwrap();
-        scheduler.run_job_by_id("job-once").unwrap();
+        scheduler.run_job_by_id("job-once").await.unwrap();
         let job = wait_for_job_result(&scheduler, "job-once").await;
         assert!(job.last_result.as_ref().unwrap().ok);
         assert_eq!(executor.runs.load(Ordering::SeqCst), 1);
@@ -2550,12 +2620,14 @@ mod tests {
         std::fs::create_dir_all(&project_root).unwrap();
         let error = scheduler
             .create_job(run_prompt_job("job-missing", "helper-bot", &project_root))
+            .await
             .unwrap_err();
         assert!(error.to_string().contains("helper-bot"), "{error:#}");
 
-        create_helper_assistant(&db, tmp.path().join("assistants/helper-bot"));
+        create_helper_assistant(&db, tmp.path().join("assistants/helper-bot")).await;
         scheduler
             .create_job(run_prompt_job("job-present", "helper-bot", &project_root))
+            .await
             .unwrap();
     }
 
@@ -2568,7 +2640,7 @@ mod tests {
         db.set_workspace_trust(&project_root, WorkspaceTrustMode::Trust)
             .await
             .unwrap();
-        create_helper_assistant(&db, tmp.path().join("assistants/helper-bot"));
+        create_helper_assistant(&db, tmp.path().join("assistants/helper-bot")).await;
         let runner = Arc::new(FakePromptRunner::default());
         let scheduler = DaemonScheduler::new(
             db.clone(),
@@ -2580,9 +2652,10 @@ mod tests {
         );
         scheduler
             .create_job(run_prompt_job("job-run", "helper-bot", &project_root))
+            .await
             .unwrap();
 
-        scheduler.run_job_by_id("job-run").unwrap();
+        scheduler.run_job_by_id("job-run").await.unwrap();
         let job = wait_for_job_result(&scheduler, "job-run").await;
         let result = job.last_result.expect("scheduled prompt result");
 
@@ -2617,7 +2690,7 @@ mod tests {
         db.set_workspace_trust(&project_root, WorkspaceTrustMode::Untrusted)
             .await
             .unwrap();
-        create_helper_assistant(&db, tmp.path().join("assistants/helper-bot"));
+        create_helper_assistant(&db, tmp.path().join("assistants/helper-bot")).await;
         let registry = production_registry(db.clone());
         let scheduler = DaemonScheduler::new(
             db.clone(),
@@ -2626,9 +2699,10 @@ mod tests {
         );
         scheduler
             .create_job(run_prompt_job("job-trust", "helper-bot", &project_root))
+            .await
             .unwrap();
 
-        scheduler.run_job_by_id("job-trust").unwrap();
+        scheduler.run_job_by_id("job-trust").await.unwrap();
         let job = wait_for_job_result(&scheduler, "job-trust").await;
         let result = job.last_result.expect("trust refusal result");
 

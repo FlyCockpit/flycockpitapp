@@ -619,16 +619,13 @@ mod tests {
         response: ResolveResponse,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let initial: Vec<uuid::Uuid> = db
-                .list_open_interrupts(session_id)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|row| row.interrupt_id)
-                .collect();
             loop {
                 let open = db.list_open_interrupts(session_id).await.unwrap();
-                if let Some(row) = open.iter().find(|row| !initial.contains(&row.interrupt_id)) {
+                if let Some(row) = open.first() {
+                    if !hub.has_waiter(row.interrupt_id) {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
                     db.resolve_interrupt(row.interrupt_id, &response)
                         .await
                         .unwrap();

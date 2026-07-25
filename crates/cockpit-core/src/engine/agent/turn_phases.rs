@@ -73,7 +73,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
     // the same assistant turn are dropped — the model will re-
     // emit them on the next turn once it has the task result.
     if resolved_name == "task" {
-        let known_task_call_ids = match session.db.list_task_delegation_children(session.id) {
+        let known_task_call_ids = match session.db.list_task_delegation_children(session.id).await {
             Ok(rows) => rows
                 .into_iter()
                 .map(|row| row.task_call_id)
@@ -242,6 +242,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             child,
                             &session.db,
                         )
+                        .await
                     {
                         record_task_unknown_agent_rejection(session, agent, tc).await;
                         return_structural!(task_refusal(
@@ -360,6 +361,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         &child,
                         &session.db,
                     )
+                    .await
                 {
                     record_task_unknown_agent_rejection(session, agent, tc).await;
                     return_structural!(task_refusal(&tc.id, tc.call_id.clone(), message));
@@ -650,10 +652,11 @@ pub(crate) async fn run_turn(
     phase_08_text_embedded_tool_call_recovery();
     phase_09_terminal_text_emit();
 
-    let active_tools = turn_toolbox(agent, &session, &cwd, &config);
+    let active_tools = turn_toolbox(agent, &session, &cwd, &config).await;
     let tools = active_tools.definitions(agent.llm_mode);
 
-    inject_turn_start_system_messages(&session, &active_tools, is_root, context_usage, history);
+    inject_turn_start_system_messages(&session, &active_tools, is_root, context_usage, history)
+        .await;
     let active_tool_names = active_tools.names();
     super::inject_available_skills_catalog(history, &cwd, &config, &active_tool_names);
 
@@ -1474,7 +1477,7 @@ pub(crate) async fn run_turn(
     Ok(TurnOutcome::Continue)
 }
 
-fn inject_turn_start_system_messages(
+async fn inject_turn_start_system_messages(
     session: &Session,
     active_tools: &ToolBox,
     is_root: bool,
@@ -1508,7 +1511,7 @@ fn inject_turn_start_system_messages(
     }
     if active_tool_names.contains(&"mcp")
         && let Some(nudge) =
-            crate::tools::mcp_tool::turn_start_advert_message(active_tools, session)
+            crate::tools::mcp_tool::turn_start_advert_message(active_tools, session).await
         && !history
             .iter()
             .any(|message| matches!(message, Message::System { content } if content == &nudge))
@@ -1578,8 +1581,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn nudge_is_injected_as_system_message() {
+    #[tokio::test]
+    async fn nudge_is_injected_as_system_message() {
         let tmp = tempfile::tempdir().unwrap();
         let session = test_session(tmp.path());
         for turn in 1..=8 {
@@ -1594,7 +1597,8 @@ mod tests {
             true,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
-        );
+        )
+        .await;
 
         let nudges: Vec<_> = history
             .iter()
@@ -1612,7 +1616,8 @@ mod tests {
             true,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
-        );
+        )
+        .await;
         let nudge_count = history
             .iter()
             .filter(|message| {
@@ -1622,8 +1627,8 @@ mod tests {
         assert_eq!(nudge_count, 1, "same-slot nudge is one-shot");
     }
 
-    #[test]
-    fn nudge_does_not_fire_for_subagent_frames() {
+    #[tokio::test]
+    async fn nudge_does_not_fire_for_subagent_frames() {
         let tmp = tempfile::tempdir().unwrap();
         let session = test_session(tmp.path());
         for turn in 1..=8 {
@@ -1638,7 +1643,8 @@ mod tests {
             false,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
-        );
+        )
+        .await;
 
         assert!(
             history.iter().all(
@@ -1648,8 +1654,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compact_nudge_injected_as_system_message() {
+    #[tokio::test]
+    async fn compact_nudge_injected_as_system_message() {
         let tmp = tempfile::tempdir().unwrap();
         let session = test_session(tmp.path());
         for turn in 1..=8 {
@@ -1665,7 +1671,8 @@ mod tests {
         };
         let mut history = Vec::new();
 
-        inject_turn_start_system_messages(&session, &toolbox, true, context_usage, &mut history);
+        inject_turn_start_system_messages(&session, &toolbox, true, context_usage, &mut history)
+            .await;
 
         let compact_nudges: Vec<_> = history
             .iter()
@@ -1684,7 +1691,8 @@ mod tests {
             "title nudge should coexist when simultaneously eligible"
         );
 
-        inject_turn_start_system_messages(&session, &toolbox, true, context_usage, &mut history);
+        inject_turn_start_system_messages(&session, &toolbox, true, context_usage, &mut history)
+            .await;
         let compact_nudge_count = history
             .iter()
             .filter(|message| {
@@ -1705,7 +1713,8 @@ mod tests {
                 ..context_usage
             },
             &mut inactive_history,
-        );
+        )
+        .await;
         assert!(
             inactive_history.iter().all(
                 |message| !matches!(message, Message::System { content } if content.contains("request_compact"))
@@ -1714,8 +1723,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nudge_is_suppressed_without_mcp() {
+    #[tokio::test]
+    async fn nudge_is_suppressed_without_mcp() {
         let tmp = tempfile::tempdir().unwrap();
         let session = test_session(tmp.path());
         for turn in 1..=8 {
@@ -1730,7 +1739,8 @@ mod tests {
             true,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
-        );
+        )
+        .await;
 
         assert!(
             history.iter().all(
@@ -1745,7 +1755,8 @@ mod tests {
             true,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
-        );
+        )
+        .await;
         assert!(
             history.iter().all(
                 |message| !matches!(message, Message::System { content } if content.contains("rename_session"))
@@ -1754,8 +1765,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn discoverable_family_advert_is_not_injected_at_turn_start() {
+    #[tokio::test]
+    async fn discoverable_family_advert_is_not_injected_at_turn_start() {
         let tmp = tempfile::tempdir().unwrap();
         let session = test_session(tmp.path());
         let toolbox = ToolBox::new()
@@ -1769,7 +1780,8 @@ mod tests {
             true,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
-        );
+        )
+        .await;
 
         let adverts: Vec<_> = history
             .iter()
@@ -1785,8 +1797,8 @@ mod tests {
         assert!(adverts.is_empty(), "{history:?}");
     }
 
-    #[test]
-    fn no_advert_nudge_when_catalog_empty() {
+    #[tokio::test]
+    async fn no_advert_nudge_when_catalog_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let session = test_session(tmp.path());
         let toolbox = ToolBox::new().with(Arc::new(crate::tools::mcp_tool::McpTool));
@@ -1798,7 +1810,8 @@ mod tests {
             true,
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             &mut history,
-        );
+        )
+        .await;
 
         assert!(
             history.iter().all(

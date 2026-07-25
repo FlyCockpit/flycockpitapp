@@ -134,7 +134,7 @@ pub fn invalidate_catalog_cache(cwd: &Path, cfg: &SkillsConfig) -> u64 {
 }
 
 #[cfg(test)]
-fn catalog_cache_contains(cwd: &Path, cfg: &SkillsConfig) -> bool {
+pub(crate) fn catalog_cache_contains(cwd: &Path, cfg: &SkillsConfig) -> bool {
     let dirs = resolve_scan_dirs(cwd, cfg);
     CATALOG_CACHE
         .get()

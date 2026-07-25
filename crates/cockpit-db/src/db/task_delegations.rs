@@ -6,6 +6,7 @@ use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::db::Db;
+use crate::db::task_delegation_payloads::{NewTaskDelegationPayload, TaskDelegationPayloadRow};
 
 const LOST_RESTART_REPORT: &str = "lost: daemon restarted before this delegation finished";
 
@@ -58,6 +59,16 @@ pub struct DelegationChildInit<'a> {
     pub todo_ids_json: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TaskDelegationJobUpsert<'a> {
+    pub session_id: Uuid,
+    pub task_call_id: &'a str,
+    pub function_call_id: Option<&'a str>,
+    pub parent_agent: &'a str,
+    pub original_args_json: Option<&'a str>,
+    pub children: &'a [DelegationChildInit<'a>],
+}
+
 #[derive(Debug, Clone)]
 struct DelegationChildInitOwned {
     label: String,
@@ -67,6 +78,33 @@ struct DelegationChildInitOwned {
     requested_cwd: Option<String>,
     resolved_cwd: Option<String>,
     todo_ids_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TaskDelegationJobWrite {
+    session_id: Uuid,
+    task_call_id: String,
+    function_call_id: Option<String>,
+    parent_agent: String,
+    original_args_json: Option<String>,
+    children: Vec<DelegationChildInitOwned>,
+}
+
+impl From<TaskDelegationJobUpsert<'_>> for TaskDelegationJobWrite {
+    fn from(value: TaskDelegationJobUpsert<'_>) -> Self {
+        Self {
+            session_id: value.session_id,
+            task_call_id: value.task_call_id.to_owned(),
+            function_call_id: value.function_call_id.map(str::to_owned),
+            parent_agent: value.parent_agent.to_owned(),
+            original_args_json: value.original_args_json.map(str::to_owned),
+            children: value
+                .children
+                .iter()
+                .map(DelegationChildInitOwned::from)
+                .collect(),
+        }
+    }
 }
 
 impl From<&DelegationChildInit<'_>> for DelegationChildInitOwned {
@@ -122,11 +160,7 @@ pub struct DelegationChildDetail {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn upsert_task_delegation_job(
+    pub async fn upsert_task_delegation_job(
         &self,
         session_id: Uuid,
         task_call_id: &str,
@@ -136,17 +170,68 @@ impl Db {
         children: &[DelegationChildInit<'_>],
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        let task_call_id = task_call_id.to_owned();
-        let function_call_id = function_call_id.map(str::to_owned);
-        let parent_agent = parent_agent.to_owned();
-        let original_args_json = original_args_json.map(str::to_owned);
-        let children: Vec<DelegationChildInitOwned> = children
-            .iter()
-            .map(DelegationChildInitOwned::from)
-            .collect();
-        self.write_blocking(move |conn| {
-            conn.execute(
-                "INSERT INTO task_delegation_jobs (
+        let job = TaskDelegationJobWrite::from(TaskDelegationJobUpsert {
+            session_id,
+            task_call_id,
+            function_call_id,
+            parent_agent,
+            original_args_json,
+            children,
+        });
+        self.write(move |conn| Self::upsert_task_delegation_job_conn(conn, job, now))
+            .await
+    }
+
+    pub async fn upsert_task_delegation_job_and_payload(
+        &self,
+        job: TaskDelegationJobUpsert<'_>,
+        payload: NewTaskDelegationPayload<'_>,
+    ) -> Result<TaskDelegationPayloadRow> {
+        let mut rows = self
+            .upsert_task_delegation_job_and_payloads(job, vec![payload])
+            .await?;
+        rows.pop()
+            .context("combined delegation payload insert returned no rows")
+    }
+
+    pub async fn upsert_task_delegation_job_and_payloads(
+        &self,
+        job: TaskDelegationJobUpsert<'_>,
+        payloads: Vec<NewTaskDelegationPayload<'_>>,
+    ) -> Result<Vec<TaskDelegationPayloadRow>> {
+        let now = Utc::now().timestamp();
+        let job = TaskDelegationJobWrite::from(job);
+        let prepared_payloads = payloads
+            .into_iter()
+            .map(|payload| self.prepare_task_delegation_payload(payload))
+            .collect::<Result<Vec<_>>>()?;
+        self.write(move |conn| {
+            Self::upsert_task_delegation_job_conn(conn, job, now)?;
+            let mut rows = Vec::with_capacity(prepared_payloads.len());
+            for prepared_payload in prepared_payloads {
+                rows.push(Self::insert_prepared_task_delegation_payload_conn(
+                    conn,
+                    prepared_payload,
+                )?);
+            }
+            Ok(rows)
+        })
+        .await
+    }
+
+    fn upsert_task_delegation_job_conn(
+        conn: &Connection,
+        job: TaskDelegationJobWrite,
+        now: i64,
+    ) -> Result<()> {
+        let task_call_id = job.task_call_id;
+        let function_call_id = job.function_call_id;
+        let session_id = job.session_id;
+        let parent_agent = job.parent_agent;
+        let original_args_json = job.original_args_json;
+        let children = job.children;
+        conn.execute(
+            "INSERT INTO task_delegation_jobs (
                     task_call_id, function_call_id, parent_session_id, parent_agent,
                     original_args_json, status, created_at, updated_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?6)
@@ -156,20 +241,20 @@ impl Db {
                     parent_agent = excluded.parent_agent,
                     original_args_json = COALESCE(excluded.original_args_json, task_delegation_jobs.original_args_json),
                     updated_at = excluded.updated_at",
-                params![
-                    task_call_id,
-                    function_call_id,
-                    session_id.to_string(),
-                    parent_agent,
-                    original_args_json,
-                    now,
-                ],
-            )
-            .context("upserting task delegation job")?;
+            params![
+                &task_call_id,
+                function_call_id.as_deref(),
+                session_id.to_string(),
+                &parent_agent,
+                original_args_json.as_deref(),
+                now,
+            ],
+        )
+        .context("upserting task delegation job")?;
 
-            for child in children {
-                conn.execute(
-                    "INSERT INTO task_delegation_children (
+        for child in children {
+            conn.execute(
+                "INSERT INTO task_delegation_children (
                         task_call_id, label, child_agent, model, status, output_dir,
                         requested_cwd, resolved_cwd, todo_ids_json, started_at,
                         created_at, updated_at
@@ -182,29 +267,24 @@ impl Db {
                         resolved_cwd = excluded.resolved_cwd,
                         todo_ids_json = excluded.todo_ids_json,
                         updated_at = excluded.updated_at",
-                    params![
-                        task_call_id,
-                        child.label,
-                        child.child_agent,
-                        child.model,
-                        child.output_dir,
-                        child.requested_cwd,
-                        child.resolved_cwd,
-                        child.todo_ids_json,
-                        now,
-                    ],
-                )
-                .context("upserting task delegation child")?;
-            }
-            Ok(())
-        })
+                params![
+                    &task_call_id,
+                    &child.label,
+                    &child.child_agent,
+                    child.model.as_deref(),
+                    child.output_dir.as_deref(),
+                    child.requested_cwd.as_deref(),
+                    child.resolved_cwd.as_deref(),
+                    child.todo_ids_json.as_deref(),
+                    now,
+                ],
+            )
+            .context("upserting task delegation child")?;
+        }
+        Ok(())
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn background_task_delegation_child(
+    pub async fn background_task_delegation_child(
         &self,
         task_call_id: &str,
         label: &str,
@@ -212,7 +292,7 @@ impl Db {
         let now = Utc::now().timestamp();
         let task_call_id = task_call_id.to_owned();
         let label = label.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             immediate_transaction(
                 conn,
                 "beginning background delegation transaction",
@@ -242,13 +322,10 @@ impl Db {
                 },
             )
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn complete_task_delegation_child(
+    pub async fn complete_task_delegation_child(
         &self,
         task_call_id: &str,
         label: &str,
@@ -266,7 +343,7 @@ impl Db {
         let label = label.to_owned();
         let report = report.to_owned();
         let snapshot_json = snapshot_json.map(str::to_owned);
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             immediate_transaction(
                 conn,
                 "beginning complete delegation transaction",
@@ -322,17 +399,15 @@ impl Db {
                 },
             )
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn undelivered_task_delegation_children(
+    pub async fn undelivered_task_delegation_children(
         &self,
         task_call_id: &str,
     ) -> Result<Vec<DelegationChildRow>> {
-        self.read_blocking(|conn| {
+        let task_call_id = task_call_id.to_owned();
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT task_call_id, label, child_agent, status, report, result_delivered
@@ -349,13 +424,10 @@ impl Db {
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .context("decoding undelivered delegation children")
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn mark_task_delegation_child_delivered(
+    pub async fn mark_task_delegation_child_delivered(
         &self,
         task_call_id: &str,
         label: &str,
@@ -363,7 +435,7 @@ impl Db {
         let now = Utc::now().timestamp();
         let task_call_id = task_call_id.to_owned();
         let label = label.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             immediate_transaction(
                 conn,
                 "beginning delivered delegation transaction",
@@ -401,17 +473,14 @@ impl Db {
                 },
             )
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_task_delegation_children(
+    pub async fn list_task_delegation_children(
         &self,
         session_id: Uuid,
     ) -> Result<Vec<DelegationChildDetail>> {
-        self.read_blocking(|conn| {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT c.task_call_id, c.label, c.child_agent, c.model, c.status,
@@ -433,17 +502,18 @@ impl Db {
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .context("decoding task delegation children")
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn cancel_task_delegation_child(&self, task_call_id: &str, label: &str) -> Result<bool> {
+    pub async fn cancel_task_delegation_child(
+        &self,
+        task_call_id: &str,
+        label: &str,
+    ) -> Result<bool> {
         let now = Utc::now().timestamp();
         let task_call_id = task_call_id.to_owned();
         let label = label.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             immediate_transaction(
                 conn,
                 "beginning cancel delegation transaction",
@@ -487,17 +557,18 @@ impl Db {
                 },
             )
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn mark_task_delegation_child_lost(&self, task_call_id: &str, label: &str) -> Result<bool> {
+    pub async fn mark_task_delegation_child_lost(
+        &self,
+        task_call_id: &str,
+        label: &str,
+    ) -> Result<bool> {
         let now = Utc::now().timestamp();
         let task_call_id = task_call_id.to_owned();
         let label = label.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             immediate_transaction(
                 conn,
                 "beginning lost delegation transaction",
@@ -511,15 +582,12 @@ impl Db {
                 },
             )
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn reconcile_orphaned_task_delegations(&self) -> Result<usize> {
+    pub async fn reconcile_orphaned_task_delegations(&self) -> Result<usize> {
         let now = Utc::now().timestamp();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             immediate_transaction(
                 conn,
                 "beginning orphaned delegation reconcile",
@@ -568,13 +636,10 @@ impl Db {
                 },
             )
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn enqueue_task_delegation_steer(
+    pub async fn enqueue_task_delegation_steer(
         &self,
         task_call_id: &str,
         label: &str,
@@ -594,7 +659,7 @@ impl Db {
         let label = label.to_owned();
         let body = body.to_owned();
         let origin_principal = origin_principal.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "INSERT INTO task_delegation_steers (task_call_id, label, body, origin_principal, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -603,13 +668,10 @@ impl Db {
             .context("enqueueing task delegation steer")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn drain_task_delegation_steers(
+    pub async fn drain_task_delegation_steers(
         &self,
         task_call_id: &str,
         label: &str,
@@ -617,7 +679,7 @@ impl Db {
         let now = Utc::now().timestamp();
         let task_call_id = task_call_id.to_owned();
         let label = label.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let pending = {
                 let mut stmt = conn
                     .prepare(
@@ -646,17 +708,15 @@ impl Db {
             }
             Ok(pending)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_task_delegation_steers(
+    pub async fn list_task_delegation_steers(
         &self,
         session_id: Uuid,
     ) -> Result<Vec<TaskDelegationSteerRow>> {
-        self.read_blocking(|conn| Self::list_task_delegation_steers_conn(conn, session_id))
+        self.read(move |conn| Self::list_task_delegation_steers_conn(conn, session_id))
+            .await
     }
 
     pub fn list_task_delegation_steers_conn(
@@ -824,8 +884,135 @@ mod tests {
             None,
             &inits,
         )
+        .await
         .unwrap();
         session.session_id
+    }
+
+    #[tokio::test]
+    async fn db_async_delegation_upsert_roundtrip_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = seed_job(&db, "task-async-roundtrip", &["default"]).await;
+
+        let rows = db.list_task_delegation_children(session_id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_call_id, "task-async-roundtrip");
+        assert_eq!(rows[0].label, "default");
+        assert_eq!(rows[0].status, DelegationStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn db_async_delegation_row_and_payload_are_written_atomically() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
+        let reader_db = db.clone();
+        let session_id = session.session_id;
+        let reader = tokio::spawn(async move {
+            for _ in 0..128 {
+                let rows = reader_db
+                    .list_task_delegation_children(session_id)
+                    .await
+                    .unwrap();
+                if rows.iter().any(|row| row.task_call_id == "task-atomic") {
+                    assert!(
+                        reader_db
+                            .task_delegation_payload("task-atomic", "default")
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        "reader observed delegation row without payload"
+                    );
+                }
+            }
+        });
+        let children = [DelegationChildInit {
+            label: "default",
+            child_agent: "explore",
+            model: None,
+            output_dir: None,
+            requested_cwd: None,
+            resolved_cwd: None,
+            todo_ids_json: None,
+        }];
+        let row = db
+            .upsert_task_delegation_job_and_payload(
+                TaskDelegationJobUpsert {
+                    session_id: session.session_id,
+                    task_call_id: "task-atomic",
+                    function_call_id: Some("fc-atomic"),
+                    parent_agent: "Build",
+                    original_args_json: None,
+                    children: &children,
+                },
+                NewTaskDelegationPayload {
+                    task_call_id: "task-atomic",
+                    function_call_id: Some("fc-atomic"),
+                    parent_session_id: session.session_id,
+                    parent_agent: "Build",
+                    label: "default",
+                    child_agent: "explore",
+                    prompt: "atomic prompt",
+                },
+            )
+            .await
+            .unwrap();
+        reader.await.unwrap();
+        assert_eq!(row.label, "default");
+        assert_eq!(
+            db.load_task_delegation_payload("task-atomic", "default")
+                .await
+                .unwrap()
+                .body,
+            "atomic prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_async_delegation_cancelled_upsert_leaves_no_orphan_row() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
+        let children = [DelegationChildInit {
+            label: "default",
+            child_agent: "explore",
+            model: None,
+            output_dir: None,
+            requested_cwd: None,
+            resolved_cwd: None,
+            todo_ids_json: None,
+        }];
+        let future = db.upsert_task_delegation_job_and_payload(
+            TaskDelegationJobUpsert {
+                session_id: session.session_id,
+                task_call_id: "task-dropped",
+                function_call_id: Some("fc-dropped"),
+                parent_agent: "Build",
+                original_args_json: None,
+                children: &children,
+            },
+            NewTaskDelegationPayload {
+                task_call_id: "task-dropped",
+                function_call_id: Some("fc-dropped"),
+                parent_session_id: session.session_id,
+                parent_agent: "Build",
+                label: "default",
+                child_agent: "explore",
+                prompt: "dropped prompt",
+            },
+        );
+        drop(future);
+
+        assert!(
+            db.list_task_delegation_children(session.session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.task_delegation_payload("task-dropped", "default")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -840,11 +1027,12 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap();
 
-        let rows = db.list_task_delegation_children(session_id).unwrap();
+        let rows = db.list_task_delegation_children(session_id).await.unwrap();
         assert_eq!(rows[0].status, DelegationStatus::Completed);
-        assert_eq!(job_status(&db, "task-1"), DelegationStatus::Completed);
+        assert_eq!(job_status(&db, "task-1").await, DelegationStatus::Completed);
     }
 
     #[tokio::test]
@@ -853,11 +1041,12 @@ mod tests {
         let session_id = seed_job(&db, "task-1", &["default"]).await;
 
         db.complete_task_delegation_child("task-1", "default", "ordinary report", true, None)
+            .await
             .unwrap();
 
-        let rows = db.list_task_delegation_children(session_id).unwrap();
+        let rows = db.list_task_delegation_children(session_id).await.unwrap();
         assert_eq!(rows[0].status, DelegationStatus::Failed);
-        assert_eq!(job_status(&db, "task-1"), DelegationStatus::Failed);
+        assert_eq!(job_status(&db, "task-1").await, DelegationStatus::Failed);
     }
 
     #[tokio::test]
@@ -866,16 +1055,18 @@ mod tests {
         let session_id = seed_job(&db, "task-1", &["a", "b"]).await;
 
         db.complete_task_delegation_child("task-1", "a", "Error: quoted and fixed", false, None)
+            .await
             .unwrap();
         db.complete_task_delegation_child("task-1", "b", "plain report", false, None)
+            .await
             .unwrap();
 
-        let rows = db.list_task_delegation_children(session_id).unwrap();
+        let rows = db.list_task_delegation_children(session_id).await.unwrap();
         assert!(
             rows.iter()
                 .all(|row| row.status == DelegationStatus::Completed)
         );
-        assert_eq!(job_status(&db, "task-1"), DelegationStatus::Completed);
+        assert_eq!(job_status(&db, "task-1").await, DelegationStatus::Completed);
     }
 
     #[tokio::test]
@@ -884,11 +1075,13 @@ mod tests {
         seed_job(&db, "task-1", &["a", "b"]).await;
 
         db.complete_task_delegation_child("task-1", "a", "plain report", false, None)
+            .await
             .unwrap();
         db.complete_task_delegation_child("task-1", "b", "plain report", true, None)
+            .await
             .unwrap();
 
-        assert_eq!(job_status(&db, "task-1"), DelegationStatus::Failed);
+        assert_eq!(job_status(&db, "task-1").await, DelegationStatus::Failed);
     }
 
     #[tokio::test]
@@ -911,30 +1104,39 @@ mod tests {
                 todo_ids_json: None,
             }],
         )
+        .await
         .unwrap();
 
         assert!(
             db.background_task_delegation_child("task-1", "default")
+                .await
                 .unwrap()
         );
         db.complete_task_delegation_child("task-1", "default", "report", false, None)
+            .await
             .unwrap();
 
-        let rows = db.undelivered_task_delegation_children("task-1").unwrap();
+        let rows = db
+            .undelivered_task_delegation_children("task-1")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].label, "default");
         assert_eq!(rows[0].status, DelegationStatus::Completed);
 
         assert!(
             db.mark_task_delegation_child_delivered("task-1", "default")
+                .await
                 .unwrap()
         );
         assert!(
             !db.mark_task_delegation_child_delivered("task-1", "default")
+                .await
                 .unwrap()
         );
         assert!(
             db.undelivered_task_delegation_children("task-1")
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -960,26 +1162,33 @@ mod tests {
                 todo_ids_json: None,
             }],
         )
+        .await
         .unwrap();
 
         db.enqueue_task_delegation_steer("task-1", "default", "first", "agent:task-1")
+            .await
             .unwrap();
         db.enqueue_task_delegation_steer("task-1", "default", "second", "local:test")
+            .await
             .unwrap();
         assert!(
             db.cancel_task_delegation_child("task-1", "default")
+                .await
                 .unwrap()
         );
         assert!(
             !db.cancel_task_delegation_child("task-1", "default")
+                .await
                 .unwrap(),
             "second cancel is idempotent"
         );
         db.complete_task_delegation_child("task-1", "default", "late report", false, None)
+            .await
             .unwrap();
 
         let rows = db
             .list_task_delegation_children(session.session_id)
+            .await
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, DelegationStatus::Cancelled);
@@ -987,6 +1196,7 @@ mod tests {
         assert_eq!(rows[0].pending_steers, 2);
         let drained = db
             .drain_task_delegation_steers("task-1", "default")
+            .await
             .unwrap();
         assert_eq!(
             drained
@@ -999,10 +1209,12 @@ mod tests {
         assert_eq!(drained[1].origin_principal, "local:test");
         let rows = db
             .list_task_delegation_children(session.session_id)
+            .await
             .unwrap();
         assert_eq!(rows[0].pending_steers, 0);
         assert!(
             db.drain_task_delegation_steers("task-1", "default")
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -1028,25 +1240,23 @@ mod tests {
                 todo_ids_json: None,
             }],
         )
+        .await
         .unwrap();
 
-        assert_eq!(db.reconcile_orphaned_task_delegations().unwrap(), 1);
-        assert_eq!(db.reconcile_orphaned_task_delegations().unwrap(), 0);
+        assert_eq!(db.reconcile_orphaned_task_delegations().await.unwrap(), 1);
+        assert_eq!(db.reconcile_orphaned_task_delegations().await.unwrap(), 0);
 
         let rows = db
             .list_task_delegation_children(session.session_id)
+            .await
             .unwrap();
         assert_eq!(rows[0].status, DelegationStatus::Lost);
         assert_eq!(rows[0].report.as_deref(), Some(LOST_RESTART_REPORT));
         assert!(rows[0].finished_at.is_some());
-        assert_eq!(job_status(&db, "task-1"), DelegationStatus::Lost);
+        assert_eq!(job_status(&db, "task-1").await, DelegationStatus::Lost);
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn mark_task_delegation_child_lost_preserves_completed_jobs() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
@@ -1077,23 +1287,27 @@ mod tests {
                 },
             ],
         )
+        .await
         .unwrap();
         db.complete_task_delegation_child("task-1", "done", "done report", false, None)
+            .await
             .unwrap();
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute(
                 "UPDATE task_delegation_jobs SET status = 'completed' WHERE task_call_id = 'task-1'",
                 [],
             )?;
             Ok(())
         })
+        .await
         .unwrap();
 
         assert!(
             db.mark_task_delegation_child_lost("task-1", "orphan")
+                .await
                 .unwrap()
         );
-        assert_eq!(job_status(&db, "task-1"), DelegationStatus::Completed);
+        assert_eq!(job_status(&db, "task-1").await, DelegationStatus::Completed);
     }
 
     #[tokio::test]
@@ -1116,34 +1330,36 @@ mod tests {
                 todo_ids_json: None,
             }],
         )
+        .await
         .unwrap();
 
-        assert_eq!(db.reconcile_orphaned_task_delegations().unwrap(), 1);
-        let rows = db.undelivered_task_delegation_children("task-1").unwrap();
+        assert_eq!(db.reconcile_orphaned_task_delegations().await.unwrap(), 1);
+        let rows = db
+            .undelivered_task_delegation_children("task-1")
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, DelegationStatus::Lost);
         assert_eq!(rows[0].report.as_deref(), Some(LOST_RESTART_REPORT));
 
         assert!(
             db.mark_task_delegation_child_delivered("task-1", "default")
+                .await
                 .unwrap()
         );
         assert!(
             db.undelivered_task_delegation_children("task-1")
+                .await
                 .unwrap()
                 .is_empty()
         );
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
     async fn complete_child_rolls_back_when_job_update_fails() {
         let db = Db::open_in_memory().unwrap();
         let session_id = seed_job(&db, "task-rollback", &["default"]).await;
-        db.write_blocking(move |conn| {
+        db.write(move |conn| {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_task_job_update
                  BEFORE UPDATE ON task_delegation_jobs
@@ -1153,28 +1369,30 @@ mod tests {
             )?;
             Ok(())
         })
+        .await
         .unwrap();
 
         let err = db
             .complete_task_delegation_child("task-rollback", "default", "report", false, None)
+            .await
             .unwrap_err();
         assert!(
             format!("{err:#}").contains("injected job update failure"),
             "unexpected error: {err:#}"
         );
 
-        let rows = db.list_task_delegation_children(session_id).unwrap();
+        let rows = db.list_task_delegation_children(session_id).await.unwrap();
         assert_eq!(rows[0].status, DelegationStatus::Running);
         assert_eq!(rows[0].report, None);
-        assert_eq!(job_status(&db, "task-rollback"), DelegationStatus::Running);
+        assert_eq!(
+            job_status(&db, "task-rollback").await,
+            DelegationStatus::Running
+        );
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    fn job_status(db: &Db, task_call_id: &str) -> DelegationStatus {
-        db.read_blocking(|conn| {
+    async fn job_status(db: &Db, task_call_id: &str) -> DelegationStatus {
+        let task_call_id = task_call_id.to_owned();
+        db.read(move |conn| {
             let status: String = conn.query_row(
                 "SELECT status FROM task_delegation_jobs WHERE task_call_id = ?1",
                 params![task_call_id],
@@ -1182,6 +1400,7 @@ mod tests {
             )?;
             Ok(DelegationStatus::from_str(&status))
         })
+        .await
         .unwrap()
     }
 }

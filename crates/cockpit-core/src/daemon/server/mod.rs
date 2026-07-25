@@ -1720,11 +1720,6 @@ impl DaemonContext {
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
-        if let Some(handle) = &scheduler
-            && let Err(error) = crate::skills::curator::register_scheduler(handle, db.clone())
-        {
-            tracing::warn!(error = %error, "skill curator scheduler registration failed");
-        }
         Self {
             db,
             registry,
@@ -1912,7 +1907,7 @@ pub(crate) async fn boot_with_db(
             .context("loading lock state")?,
     );
     timer.phase("lock_manager");
-    run_boot_housekeeping(&db);
+    run_boot_housekeeping(&db).await;
     timer.phase("prune_and_sweep");
     let ctx = DaemonContext::new(
         db,
@@ -1921,6 +1916,11 @@ pub(crate) async fn boot_with_db(
         terminal_factory,
         crate::daemon::config_source::ConfigSource::production(),
     );
+    if let Some(handle) = &ctx.scheduler
+        && let Err(error) = crate::skills::curator::register_scheduler(handle, ctx.db.clone()).await
+    {
+        tracing::warn!(error = %error, "skill curator scheduler registration failed");
+    }
     Ok(ctx)
 }
 
@@ -1958,7 +1958,7 @@ fn terminal_temp_root(paths: &DaemonPaths) -> PathBuf {
         .join("terminal-pastes")
 }
 
-fn run_boot_housekeeping(db: &Db) {
+async fn run_boot_housekeeping(db: &Db) {
     // Drop autocomplete-tally rows that have aged out of the 30-day
     // window. Best-effort — a prune failure shouldn't block boot.
     let before = chrono::Utc::now().timestamp() - crate::db::usage_events::USAGE_WINDOW_SECS;
@@ -1980,7 +1980,7 @@ fn run_boot_housekeeping(db: &Db) {
         retention_config(),
         chrono::Utc::now().timestamp(),
     );
-    match db.reconcile_orphaned_task_delegations() {
+    match db.reconcile_orphaned_task_delegations().await {
         Ok(n) if n > 0 => {
             tracing::info!(count = n, "marked orphaned task delegations lost on boot")
         }

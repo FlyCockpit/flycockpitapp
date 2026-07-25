@@ -1001,7 +1001,7 @@ pub(crate) async fn inject_knowledge_for_turn(
     redact: Arc<RedactionTable>,
 ) {
     let extended = config.extended();
-    let bundles = attached_bundles(session, cwd, &extended);
+    let bundles = attached_bundles(session, cwd, &extended).await;
     if bundles.is_empty() {
         return;
     }
@@ -1076,23 +1076,23 @@ async fn search_bundles(
     Ok(all)
 }
 
-pub(crate) fn attached_bundles_available(
+pub(crate) async fn attached_bundles_available(
     session: &Session,
     cwd: &Path,
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> bool {
     let extended = config.extended();
-    !attached_bundles(session, cwd, &extended).is_empty()
+    !attached_bundles(session, cwd, &extended).await.is_empty()
 }
 
-pub(crate) fn attached_bundles(
+pub(crate) async fn attached_bundles(
     session: &Session,
     cwd: &Path,
     extended: &ExtendedConfig,
 ) -> Vec<AttachedBundle> {
     let mut bundles = Vec::new();
     if let Some(name) = &session.assistant_name
-        && let Ok(Some(row)) = session.db.get_assistant(name)
+        && let Ok(Some(row)) = session.db.get_assistant(name).await
     {
         let root = Path::new(&row.home_dir).join("knowledge");
         if root.exists() {
@@ -1118,13 +1118,13 @@ fn project_bundle_trusted() -> bool {
         .is_some_and(|policy| policy.mode == WorkspaceTrustMode::Trust)
 }
 
-pub(crate) fn with_memory_search_if_attached(
+pub(crate) async fn with_memory_search_if_attached(
     toolbox: crate::engine::tool::ToolBox,
     session: &Session,
     cwd: &Path,
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> crate::engine::tool::ToolBox {
-    if attached_bundles_available(session, cwd, config) {
+    if attached_bundles_available(session, cwd, config).await {
         toolbox.with(Arc::new(MemorySearchTool))
     } else {
         toolbox.without(MEMORY_SEARCH_TOOL_NAME)
@@ -1175,7 +1175,7 @@ impl Tool for MemorySearchTool {
             return Err(invalid_input("memory_search query must not be empty"));
         }
         let extended = ctx.config.extended();
-        let bundles = attached_bundles(&ctx.session, &ctx.cwd, &extended);
+        let bundles = attached_bundles(&ctx.session, &ctx.cwd, &extended).await;
         if bundles.is_empty() {
             return Ok(ToolOutput::text(
                 "No attached knowledge bundles are available.",
@@ -1542,9 +1542,9 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         assert!(crate::tokens::count(&rendered) <= 80);
     }
 
-    #[test]
-    fn project_bundle_trust_gated() {
-        let _env = crate::test_env::lock();
+    #[tokio::test]
+    async fn project_bundle_trust_gated() {
+        let _env = crate::test_env::lock_async().await;
         crate::config::trust::clear_runtime_policy_for_tests();
         let tmp = TempDir::new().unwrap();
         let project_bundle = tmp.path().join(".cockpit/knowledge");
@@ -1555,20 +1555,33 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             ..Default::default()
         };
 
-        assert!(attached_bundles(&session, tmp.path(), &extended).is_empty());
+        assert!(
+            attached_bundles(&session, tmp.path(), &extended)
+                .await
+                .is_empty()
+        );
         crate::config::trust::set_runtime_policy(
             trust_root(tmp.path()),
             WorkspaceTrustMode::Untrusted,
         );
-        assert!(attached_bundles(&session, tmp.path(), &extended).is_empty());
+        assert!(
+            attached_bundles(&session, tmp.path(), &extended)
+                .await
+                .is_empty()
+        );
         crate::config::trust::set_runtime_policy(trust_root(tmp.path()), WorkspaceTrustMode::Trust);
-        assert_eq!(attached_bundles(&session, tmp.path(), &extended).len(), 1);
+        assert_eq!(
+            attached_bundles(&session, tmp.path(), &extended)
+                .await
+                .len(),
+            1
+        );
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
-    #[test]
-    fn memory_search_tool_gated() {
-        let _env = crate::test_env::lock();
+    #[tokio::test]
+    async fn memory_search_tool_gated() {
+        let _env = crate::test_env::lock_async().await;
         crate::config::trust::clear_runtime_policy_for_tests();
         let tmp = TempDir::new().unwrap();
         let session = test_session(tmp.path());
@@ -1582,6 +1595,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
                     tmp.path()
                 )
             )
+            .await
             .names()
             .contains(&"memory_search")
         );
@@ -1603,6 +1617,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
                     tmp.path()
                 )
             )
+            .await
             .names()
             .contains(&"memory_search")
         );

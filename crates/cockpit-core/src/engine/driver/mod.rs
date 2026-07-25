@@ -1246,7 +1246,7 @@ impl Driver {
         }
     }
 
-    fn assign_todos_to_task(
+    async fn assign_todos_to_task(
         &self,
         brief: String,
         todo_ids: &[uuid::Uuid],
@@ -1257,13 +1257,12 @@ impl Driver {
         if todo_ids.is_empty() {
             return brief;
         }
-        let assigned = match self.session.db.assign_task_todos(
-            self.session.id,
-            todo_ids,
-            task_call_id,
-            label,
-            child_agent,
-        ) {
+        let assigned = match self
+            .session
+            .db
+            .assign_task_todos(self.session.id, todo_ids, task_call_id, label, child_agent)
+            .await
+        {
             Ok(todos) => todos,
             Err(e) => {
                 return format!(
@@ -1291,7 +1290,7 @@ impl Driver {
         format!("{brief}{block}")
     }
 
-    fn reconcile_todo_delta(
+    async fn reconcile_todo_delta(
         &self,
         task_call_id: &str,
         label: &str,
@@ -1300,13 +1299,12 @@ impl Driver {
         failed: bool,
     ) -> String {
         let state = if failed { "error" } else { "completed" };
-        if let Err(e) = self.session.db.finish_task_assignment(
-            self.session.id,
-            task_call_id,
-            label,
-            state,
-            None,
-        ) {
+        if let Err(e) = self
+            .session
+            .db
+            .finish_task_assignment(self.session.id, task_call_id, label, state, None)
+            .await
+        {
             tracing::warn!(error = %e, task_call_id, "finish task todo assignment failed");
         }
         let Some(delta) = extract_todo_delta(report) else {
@@ -1331,14 +1329,12 @@ impl Driver {
                     .flatten();
                 let summary = item.get("summary").and_then(serde_json::Value::as_str);
                 if status.is_some() || summary.is_some() {
-                    if let Err(e) = self.session.db.update_task_todo(
-                        self.session.id,
-                        id,
-                        status,
-                        None,
-                        None,
-                        summary,
-                    ) {
+                    if let Err(e) = self
+                        .session
+                        .db
+                        .update_task_todo(self.session.id, id, status, None, None, summary)
+                        .await
+                    {
                         tracing::warn!(error = %e, todo_id = %id, "todo delta status update failed");
                     } else {
                         applied += 1;
@@ -1369,6 +1365,7 @@ impl Driver {
                                 child_agent,
                                 None,
                             )
+                            .await
                             .is_ok()
                         {
                             applied += 1;
@@ -1392,6 +1389,7 @@ impl Driver {
                                 child_agent,
                                 None,
                             )
+                            .await
                             .is_ok()
                         {
                             applied += 1;
@@ -1443,12 +1441,7 @@ impl Driver {
             ctx,
             max_concurrent_schedules,
         );
-        let initial_tools = crate::engine::agent::turn_toolbox(
-            &root,
-            &session,
-            &cwd,
-            &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
-        );
+        let initial_tools = root.tools.clone();
         session.set_active_tool_names(
             initial_tools.names(),
             crate::engine::tool::Capability::SandboxEscalate.enabled(root.llm_mode),
@@ -2337,14 +2330,15 @@ impl Driver {
             .unwrap_or("")
     }
 
-    fn publish_active_tool_names(&self) {
+    async fn publish_active_tool_names(&self) {
         if let Some(frame) = self.stack.last() {
             let tools = crate::engine::agent::turn_toolbox(
                 &frame.agent,
                 &self.session,
                 &self.cwd,
                 &self.config,
-            );
+            )
+            .await;
             self.session.set_active_tool_names(
                 tools.names(),
                 crate::engine::tool::Capability::SandboxEscalate.enabled(frame.agent.llm_mode),
@@ -2361,7 +2355,8 @@ impl Driver {
             &self.session,
             &self.cwd,
             &self.config,
-        );
+        )
+        .await;
         let Some(text) = tools.capability_notice_text() else {
             return;
         };
@@ -2428,7 +2423,8 @@ impl Driver {
             );
         }
         let active_tools =
-            crate::engine::agent::turn_toolbox(&agent, &self.session, &self.cwd, &self.config);
+            crate::engine::agent::turn_toolbox(&agent, &self.session, &self.cwd, &self.config)
+                .await;
         if active_tools.get(&payload.tool).is_none() {
             bail!("parked interrupt tool `{}` is not registered", payload.tool);
         }
@@ -2566,13 +2562,13 @@ impl Driver {
                 let top = self.stack.last().expect("stack never empty");
                 top.agent.clone()
             };
-            self.publish_active_tool_names();
+            self.publish_active_tool_names().await;
             self.emit_command_capability_notice_if_new(tx).await;
             let is_root = self.stack.len() == 1;
             let backup_model = self.resolve_backup_model(&agent.model);
             let fallback_models = self.resolve_failover_models(&agent.model);
             let call_id = uuid::Uuid::new_v4();
-            self.publish_active_tool_names();
+            self.publish_active_tool_names().await;
             let context_usage = self.context_usage_snapshot();
             let tandem = self
                 .tandem_set
@@ -2673,7 +2669,12 @@ impl Driver {
 
             if is_root {
                 self.persist_prune_ledger();
-                if let Err(e) = self.session.db.refresh_session_goal_usage(self.session.id) {
+                if let Err(e) = self
+                    .session
+                    .db
+                    .refresh_session_goal_usage(self.session.id)
+                    .await
+                {
                     tracing::warn!(error = %e, "refreshing goal usage failed");
                 }
             }
@@ -2713,7 +2714,7 @@ impl Driver {
                         continue;
                     }
                     self.acknowledge_interrupted_turns_after_progress().await;
-                    self.maybe_spawn_self_improvement_review(tx);
+                    self.maybe_spawn_self_improvement_review(tx).await;
                     return Ok(());
                 }
                 TurnOutcome::Return { fields } => {
@@ -2722,7 +2723,7 @@ impl Driver {
                         continue;
                     }
                     self.acknowledge_interrupted_turns_after_progress().await;
-                    self.maybe_spawn_self_improvement_review(tx);
+                    self.maybe_spawn_self_improvement_review(tx).await;
                     return Ok(());
                 }
                 _ => bail!("parked interrupt replay continuation produced unsupported outcome"),
@@ -2752,7 +2753,7 @@ impl Driver {
         }
     }
 
-    fn maybe_spawn_self_improvement_review(&mut self, tx: &mpsc::Sender<TurnEvent>) -> bool {
+    async fn maybe_spawn_self_improvement_review(&mut self, tx: &mpsc::Sender<TurnEvent>) -> bool {
         if let Some(review) = &self.self_improvement_review {
             if review.is_finished() {
                 self.self_improvement_review = None;
@@ -2767,6 +2768,7 @@ impl Driver {
             .session
             .db
             .get_assistant(&assistant_name)
+            .await
             .ok()
             .flatten()
             .and_then(|row| {
@@ -2855,7 +2857,7 @@ impl Driver {
                 self.reset_goal_progress_tracking().await;
                 self.clear_goal_idle_intervention();
                 self.maybe_continue_active_goal(&input_queue, tx).await?;
-                self.refresh_goal_watchdog(&mut goal_watchdog);
+                self.refresh_goal_watchdog(&mut goal_watchdog).await;
                 continue;
             }
             // Wait for the next thing to do: a user message, a control
@@ -2886,7 +2888,7 @@ impl Driver {
                     }
                     self.run_folded_submission_commands(items, &input_queue, tx).await?;
                     self.maybe_continue_active_goal(&input_queue, tx).await?;
-                    self.refresh_goal_watchdog(&mut goal_watchdog);
+                    self.refresh_goal_watchdog(&mut goal_watchdog).await;
                 }
                 ctl = control_rx.recv() => {
                     goal_watchdog = None;
@@ -2913,7 +2915,7 @@ impl Driver {
                             self.clear_goal_idle_intervention();
                             self.run_job_event(event, &input_queue, tx).await?;
                             self.maybe_continue_active_goal(&input_queue, tx).await?;
-                            self.refresh_goal_watchdog(&mut goal_watchdog);
+                            self.refresh_goal_watchdog(&mut goal_watchdog).await;
                         }
                         None => break,
                     }
@@ -2927,7 +2929,7 @@ impl Driver {
                         self.reset_goal_progress_tracking().await;
                         self.clear_goal_idle_intervention();
                         self.maybe_continue_active_goal(&input_queue, tx).await?;
-                        self.refresh_goal_watchdog(&mut goal_watchdog);
+                        self.refresh_goal_watchdog(&mut goal_watchdog).await;
                     }
                 }
                 cmd = self.job_cmd_rx.recv() => {
@@ -2946,7 +2948,7 @@ impl Driver {
                     }
                 } => {
                     goal_watchdog = None;
-                    match self.goal_usage_limit_watchdog_action()? {
+                    match self.goal_usage_limit_watchdog_action().await? {
                         GoalUsageLimitWatchdogAction::AutoResume => {
                             let _ = tx
                                 .send(TurnEvent::Notice {
@@ -2978,7 +2980,7 @@ impl Driver {
                             self.maybe_continue_active_goal(&input_queue, tx).await?;
                         }
                     }
-                    self.refresh_goal_watchdog(&mut goal_watchdog);
+                    self.refresh_goal_watchdog(&mut goal_watchdog).await;
                 }
             }
             // Stack has unwound to the root and the queue is drained — the
@@ -2995,13 +2997,13 @@ impl Driver {
             // now-settled foreground history.
             self.emit_context_projection(tx).await;
             let turn_id = self.current_lifecycle_turn_id.take();
-            let reason = self.take_idle_reason();
+            let reason = self.take_idle_reason().await;
             let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
         }
         Ok(())
     }
 
-    fn take_idle_reason(&mut self) -> crate::engine::IdleReason {
+    async fn take_idle_reason(&mut self) -> crate::engine::IdleReason {
         if let Some(reason) = self.pending_idle_reason.take() {
             self.goal_was_active_recently = false;
             return reason;
@@ -3018,6 +3020,7 @@ impl Driver {
             .session
             .db
             .current_session_goal(self.session.id, false)
+            .await
             .ok()
             .flatten()
             .map(|goal| goal.status)
@@ -3279,7 +3282,8 @@ impl Driver {
             let Some(goal) = self
                 .session
                 .db
-                .current_session_goal(self.session.id, false)?
+                .current_session_goal(self.session.id, false)
+                .await?
             else {
                 if self.goal_was_active_recently {
                     self.pending_idle_reason = Some(crate::engine::IdleReason::GoalComplete);
@@ -3303,13 +3307,17 @@ impl Driver {
                     self.emit_goal_no_progress_budget_exhausted(&goal, tx).await;
                     return Ok(());
                 }
-                let _ = self.session.db.update_session_goal(
-                    self.session.id,
-                    crate::db::session_goals::GoalStatus::BudgetLimited,
-                    None,
-                    None,
-                    Some("token budget exhausted"),
-                );
+                let _ = self
+                    .session
+                    .db
+                    .update_session_goal(
+                        self.session.id,
+                        crate::db::session_goals::GoalStatus::BudgetLimited,
+                        None,
+                        None,
+                        Some("token budget exhausted"),
+                    )
+                    .await;
                 self.reset_goal_progress_tracking().await;
                 self.clear_goal_idle_intervention();
                 return Ok(());
@@ -3443,19 +3451,29 @@ impl Driver {
         if !crate::engine::retry::is_usage_limit_failure(&failure.class, provider_status) {
             return false;
         }
-        let Ok(Some(goal)) = self.session.db.current_session_goal(self.session.id, false) else {
+        let Ok(Some(goal)) = self
+            .session
+            .db
+            .current_session_goal(self.session.id, false)
+            .await
+        else {
             return false;
         };
         if goal.status != crate::db::session_goals::GoalStatus::Active {
             return false;
         }
-        if let Err(e) = self.session.db.update_session_goal(
-            self.session.id,
-            crate::db::session_goals::GoalStatus::UsageLimited,
-            None,
-            None,
-            Some("provider usage or rate limit reached"),
-        ) {
+        if let Err(e) = self
+            .session
+            .db
+            .update_session_goal(
+                self.session.id,
+                crate::db::session_goals::GoalStatus::UsageLimited,
+                None,
+                None,
+                Some("provider usage or rate limit reached"),
+            )
+            .await
+        {
             tracing::warn!(error = %e, "marking goal usage_limited failed");
             return false;
         }
@@ -3493,11 +3511,12 @@ impl Driver {
         Duration::from_secs(secs)
     }
 
-    fn goal_usage_limit_watchdog_action(&mut self) -> Result<GoalUsageLimitWatchdogAction> {
+    async fn goal_usage_limit_watchdog_action(&mut self) -> Result<GoalUsageLimitWatchdogAction> {
         let Some(goal) = self
             .session
             .db
-            .current_session_goal(self.session.id, false)?
+            .current_session_goal(self.session.id, false)
+            .await?
         else {
             return Ok(GoalUsageLimitWatchdogAction::NotUsageLimited);
         };
@@ -3512,13 +3531,16 @@ impl Driver {
         }
         self.goal_usage_limit_auto_resume_attempts =
             self.goal_usage_limit_auto_resume_attempts.saturating_add(1);
-        self.session.db.update_session_goal(
-            self.session.id,
-            crate::db::session_goals::GoalStatus::Active,
-            None,
-            None,
-            Some("auto-resuming after provider usage-limit backoff"),
-        )?;
+        self.session
+            .db
+            .update_session_goal(
+                self.session.id,
+                crate::db::session_goals::GoalStatus::Active,
+                None,
+                None,
+                Some("auto-resuming after provider usage-limit backoff"),
+            )
+            .await?;
         self.goal_idle_intervention_pending = false;
         self.goal_idle_intervention_code = None;
         Ok(GoalUsageLimitWatchdogAction::AutoResume)
@@ -3660,7 +3682,7 @@ impl Driver {
         Some(extract_user_text(content))
     }
 
-    fn is_goal_intervention_continue(&self, text: &str) -> bool {
+    async fn is_goal_intervention_continue(&self, text: &str) -> bool {
         if !self.goal_idle_intervention_pending {
             return false;
         }
@@ -3670,6 +3692,7 @@ impl Driver {
         self.session
             .db
             .current_session_goal(self.session.id, false)
+            .await
             .ok()
             .flatten()
             .is_some_and(|goal| goal.status == crate::db::session_goals::GoalStatus::Active)
@@ -3772,6 +3795,7 @@ impl Driver {
             .session
             .db
             .current_session_goal(self.session.id, false)
+            .await
             .ok()
             .flatten()
             .map(|goal| {
@@ -3877,6 +3901,7 @@ impl Driver {
                 .session
                 .db
                 .current_session_goal(self.session.id, false)
+                .await
                 .ok()
                 .flatten()
                 .is_none_or(|goal| goal.status != crate::db::session_goals::GoalStatus::Active)
@@ -3987,7 +4012,7 @@ impl Driver {
             let _ = tx.send(TurnEvent::UserMessageRetracted).await;
             self.emit_context_projection(tx).await;
             let turn_id = self.current_lifecycle_turn_id.take();
-            let reason = self.take_idle_reason();
+            let reason = self.take_idle_reason().await;
             let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
             return None;
         }
@@ -4118,11 +4143,12 @@ impl Driver {
             .await
     }
 
-    fn refresh_goal_watchdog(&self, watchdog: &mut Option<Pin<Box<Sleep>>>) {
+    async fn refresh_goal_watchdog(&self, watchdog: &mut Option<Pin<Box<Sleep>>>) {
         let status = self
             .session
             .db
             .current_session_goal(self.session.id, false)
+            .await
             .ok()
             .flatten()
             .map(|g| g.status);
@@ -4747,7 +4773,7 @@ impl Driver {
     /// - the stored agent doesn't match the requested one (a `docs` handle
     ///   never exists, so a `docs` follow-up always lands here) / the
     ///   transcript is unreadable.
-    fn rehydrate_handle(
+    async fn rehydrate_handle(
         &self,
         handle: &str,
         child_agent: &str,
@@ -4761,6 +4787,7 @@ impl Driver {
             .session
             .db
             .load_subagent_handle(handle, self.session.id)
+            .await
             .ok()
             .flatten();
         let Some(row) = loaded else {
@@ -4789,7 +4816,7 @@ impl Driver {
     /// same handle keeps re-querying); otherwise mints a fresh opaque id.
     /// Best-effort: a DB failure returns `None` (no handle offered) rather than
     /// failing the run.
-    fn persist_subagent_handle(
+    async fn persist_subagent_handle(
         &self,
         child_agent: &str,
         history: &[Message],
@@ -4801,13 +4828,18 @@ impl Driver {
         let handle = existing
             .map(str::to_string)
             .unwrap_or_else(|| format!("sub-{}", uuid::Uuid::new_v4()));
-        match self.session.db.save_subagent_handle(
-            &handle,
-            self.session.id,
-            child_agent,
-            cwd.as_deref(),
-            &transcript_json,
-        ) {
+        match self
+            .session
+            .db
+            .save_subagent_handle(
+                &handle,
+                self.session.id,
+                child_agent,
+                cwd.as_deref(),
+                &transcript_json,
+            )
+            .await
+        {
             Ok(()) => Some(handle),
             Err(e) => {
                 tracing::warn!(error = %e, "persisting subagent handle failed");
@@ -5060,7 +5092,7 @@ impl Driver {
     ) -> Option<Message> {
         let popped_depth = self.stack.len();
         let child = self.stack.pop().expect("pop_child requires a child frame");
-        self.publish_active_tool_names();
+        self.publish_active_tool_names().await;
         self.emit_command_capability_notice_if_new(tx).await;
         self.prune_watermark.remove(&popped_depth);
         // Drop any locks the child still held — the §3c invariant doesn't
@@ -5121,14 +5153,15 @@ impl Driver {
         // event and the parent's tool_result carry it.
         let llm_mode = self.stack[0].agent.llm_mode;
         let followup_enabled = crate::engine::tool::Capability::FollowupSeed.enabled(llm_mode);
-        let report = if followup_enabled
+        let followup_handle = if followup_enabled
             && crate::engine::builtin::is_followup_eligible(&child.agent.name)
-            && let Some(handle) = self.persist_subagent_handle(
-                &child.agent.name,
-                &child.history,
-                Some(&self.cwd),
-                None,
-            ) {
+        {
+            self.persist_subagent_handle(&child.agent.name, &child.history, Some(&self.cwd), None)
+                .await
+        } else {
+            None
+        };
+        let report = if let Some(handle) = followup_handle {
             format!("{report}{}", handle_footer(&handle))
         } else {
             report
@@ -5427,7 +5460,7 @@ impl Driver {
         // `UserMessageRecorded` so the transcript shows the cleaned text + chip
         // and reveals the original on click. `None` when preflight didn't run.
         let preflight_cleaned = submission.preflight_cleaned;
-        let goal_continue_anchor_seq = if self.is_goal_intervention_continue(&user_text) {
+        let goal_continue_anchor_seq = if self.is_goal_intervention_continue(&user_text).await {
             Some(self.latest_session_event_seq().await)
         } else {
             None
@@ -5838,7 +5871,12 @@ impl Driver {
             // subagent frame is transient and never resumed); best-effort.
             if is_root {
                 self.persist_prune_ledger();
-                if let Err(e) = self.session.db.refresh_session_goal_usage(self.session.id) {
+                if let Err(e) = self
+                    .session
+                    .db
+                    .refresh_session_goal_usage(self.session.id)
+                    .await
+                {
                     tracing::warn!(error = %e, "refreshing goal usage failed");
                 }
             }
@@ -5994,7 +6032,7 @@ impl Driver {
                             self.emit_goal_continue_no_progress(anchor_seq, tx).await;
                         }
                     }
-                    self.maybe_spawn_self_improvement_review(tx);
+                    self.maybe_spawn_self_improvement_review(tx).await;
                     return Ok(());
                 }
                 TurnOutcome::SpawnSubagent {
@@ -6042,7 +6080,9 @@ impl Driver {
                         &child_agent,
                         &granted_tools,
                         &self.session.db,
-                    ) {
+                    )
+                    .await
+                    {
                         next_prompt = Message::tool_result_with_call_id(
                             task_call_id,
                             task_function_call_id,
@@ -6059,44 +6099,43 @@ impl Driver {
                         "interactive": true,
                     }))
                     .ok();
-                    if let Err(e) = self.session.db.upsert_task_delegation_job(
-                        self.session.id,
-                        &task_call_id,
-                        task_function_call_id.as_deref(),
-                        &parent_agent,
-                        task_args_json.as_deref(),
-                        &[crate::db::task_delegations::DelegationChildInit {
-                            label: "default",
-                            child_agent: &child_agent,
-                            model: model_selector_display(&model).as_deref(),
-                            output_dir: None,
-                            requested_cwd: None,
-                            resolved_cwd: None,
-                            todo_ids_json: None,
-                        }],
-                    ) {
-                        tracing::warn!(error = %e, task_call_id, "persist interactive task delegation job failed");
-                        next_prompt = Message::tool_result_with_call_id(
-                            task_call_id,
-                            task_function_call_id,
-                            prepend_task_repair_notes(
-                                DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                                &repair_notes,
-                            ),
-                        );
-                        continue;
-                    }
-                    match self.persist_delegation_payload(
-                        &task_call_id,
-                        task_function_call_id.as_deref(),
-                        &parent_agent,
-                        "default",
-                        &child_agent,
-                        &brief,
-                    ) {
-                        Ok(loaded) => brief = loaded,
+                    let model_display = model_selector_display(&model);
+                    let child_inits = [crate::db::task_delegations::DelegationChildInit {
+                        label: "default",
+                        child_agent: &child_agent,
+                        model: model_display.as_deref(),
+                        output_dir: None,
+                        requested_cwd: None,
+                        resolved_cwd: None,
+                        todo_ids_json: None,
+                    }];
+                    match self
+                        .session
+                        .db
+                        .upsert_task_delegation_job_and_payload(
+                            crate::db::task_delegations::TaskDelegationJobUpsert {
+                                session_id: self.session.id,
+                                task_call_id: &task_call_id,
+                                function_call_id: task_function_call_id.as_deref(),
+                                parent_agent: &parent_agent,
+                                original_args_json: task_args_json.as_deref(),
+                                children: &child_inits,
+                            },
+                            crate::db::task_delegation_payloads::NewTaskDelegationPayload {
+                                task_call_id: &task_call_id,
+                                function_call_id: task_function_call_id.as_deref(),
+                                parent_session_id: self.session.id,
+                                parent_agent: &parent_agent,
+                                label: "default",
+                                child_agent: &child_agent,
+                                prompt: &brief,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(row) => brief = delegation_payload_reference_prompt(&row),
                         Err(e) => {
-                            tracing::warn!(error = %e, task_call_id, "persist interactive task delegation payload failed");
+                            tracing::warn!(error = %e, task_call_id, "persist interactive task delegation job and payload failed");
                             next_prompt = Message::tool_result_with_call_id(
                                 task_call_id,
                                 task_function_call_id,
@@ -6110,6 +6149,7 @@ impl Driver {
                     }
                     let (mut delegation_payload_history, brief) = match self
                         .delegation_payload_delivery(&task_call_id, "default", &brief, true)
+                        .await
                     {
                         Ok(delivery) => delivery,
                         Err(e) => {
@@ -6215,7 +6255,7 @@ impl Driver {
                         deferred_log: crate::engine::deferred::DeferredLog::new(),
                         fallback_decision: None,
                     });
-                    self.publish_active_tool_names();
+                    self.publish_active_tool_names().await;
                     self.emit_command_capability_notice_if_new(tx).await;
                     let _ = tx
                         .send(TurnEvent::ForegroundInputTarget {
@@ -6230,13 +6270,15 @@ impl Driver {
                     } else {
                         brief
                     };
-                    let brief = self.assign_todos_to_task(
-                        brief,
-                        &todo_ids,
-                        &task_call_id,
-                        "default",
-                        &child_agent,
-                    );
+                    let brief = self
+                        .assign_todos_to_task(
+                            brief,
+                            &todo_ids,
+                            &task_call_id,
+                            "default",
+                            &child_agent,
+                        )
+                        .await;
                     // Parent→child skill seeding (`task.skill_seed`,
                     // implementation note): validate the
                     // requested skill names against this primary's active-skill
@@ -6308,7 +6350,9 @@ impl Driver {
                         &child_agent,
                         &granted_tools,
                         &self.session.db,
-                    ) {
+                    )
+                    .await
+                    {
                         next_prompt = Message::tool_result_with_call_id(
                             task_call_id,
                             task_function_call_id,
@@ -6389,7 +6433,9 @@ impl Driver {
                             &entry.child_agent,
                             &entry.granted_tools,
                             &self.session.db,
-                        ) {
+                        )
+                        .await
+                        {
                             unknown_agent_error = Some(format!(
                                 "Error: batch entry `{}`: {}",
                                 entry.label,

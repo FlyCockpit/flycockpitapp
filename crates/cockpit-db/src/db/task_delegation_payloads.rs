@@ -54,6 +54,20 @@ pub struct LoadedTaskDelegationPayload {
     pub body: String,
 }
 
+pub(crate) struct PreparedTaskDelegationPayload {
+    task_call_id: String,
+    label: String,
+    hash: String,
+    parent_session_id: Uuid,
+    parent_agent: String,
+    function_call_id: Option<String>,
+    child_agent: String,
+    byte_len: usize,
+    body_inline: Option<String>,
+    sidecar_path: Option<String>,
+    created_at: i64,
+}
+
 pub fn delegation_payload_hash(content: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(content.as_bytes());
@@ -71,31 +85,45 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn insert_task_delegation_payload(
+    pub async fn insert_task_delegation_payload(
         &self,
         payload: NewTaskDelegationPayload<'_>,
     ) -> Result<TaskDelegationPayloadRow> {
+        let prepared = self.prepare_task_delegation_payload(payload)?;
+        self.write(move |conn| Self::insert_prepared_task_delegation_payload_conn(conn, prepared))
+            .await
+    }
+
+    pub(crate) fn prepare_task_delegation_payload(
+        &self,
+        payload: NewTaskDelegationPayload<'_>,
+    ) -> Result<PreparedTaskDelegationPayload> {
         let hash = delegation_payload_hash(payload.prompt);
         let byte_len = payload.prompt.len();
         let created_at = Utc::now().timestamp();
         let (body_inline, sidecar_path) =
             self.persist_delegation_payload_body(payload.parent_session_id, &hash, payload.prompt)?;
-        let task_call_id = payload.task_call_id.to_owned();
-        let label = payload.label.to_owned();
-        let parent_session_id = payload.parent_session_id;
-        let parent_agent = payload.parent_agent.to_owned();
-        let function_call_id = payload.function_call_id.map(str::to_owned);
-        let child_agent = payload.child_agent.to_owned();
-        let lookup_task_call_id = task_call_id.clone();
-        let lookup_label = label.clone();
+        Ok(PreparedTaskDelegationPayload {
+            task_call_id: payload.task_call_id.to_owned(),
+            label: payload.label.to_owned(),
+            hash,
+            parent_session_id: payload.parent_session_id,
+            parent_agent: payload.parent_agent.to_owned(),
+            function_call_id: payload.function_call_id.map(str::to_owned),
+            child_agent: payload.child_agent.to_owned(),
+            byte_len,
+            body_inline,
+            sidecar_path,
+            created_at,
+        })
+    }
 
-        self.write_blocking(move |conn| {
-            conn.execute(
-                "INSERT INTO task_delegation_payloads (
+    pub(crate) fn insert_prepared_task_delegation_payload_conn(
+        conn: &Connection,
+        payload: PreparedTaskDelegationPayload,
+    ) -> Result<TaskDelegationPayloadRow> {
+        conn.execute(
+            "INSERT INTO task_delegation_payloads (
                     task_call_id, label, payload_hash, parent_session_id, parent_agent,
                     function_call_id, child_agent, prompt_byte_len, body_inline,
                     sidecar_path, created_at
@@ -111,38 +139,34 @@ impl Db {
                     sidecar_path = excluded.sidecar_path,
                     created_at = excluded.created_at,
                     delivered_at = NULL",
-                params![
-                    task_call_id,
-                    label,
-                    hash,
-                    parent_session_id.to_string(),
-                    parent_agent,
-                    function_call_id,
-                    child_agent,
-                    byte_len as i64,
-                    body_inline.as_deref(),
-                    sidecar_path.as_deref(),
-                    created_at,
-                ],
-            )
-            .context("inserting task delegation payload")?;
-            Ok(())
-        })?;
-
-        self.task_delegation_payload(&lookup_task_call_id, &lookup_label)?
+            params![
+                payload.task_call_id,
+                payload.label,
+                payload.hash,
+                payload.parent_session_id.to_string(),
+                payload.parent_agent,
+                payload.function_call_id,
+                payload.child_agent,
+                payload.byte_len as i64,
+                payload.body_inline.as_deref(),
+                payload.sidecar_path.as_deref(),
+                payload.created_at,
+            ],
+        )
+        .context("inserting task delegation payload")?;
+        Self::task_delegation_payload_conn(conn, &payload.task_call_id, &payload.label)?
             .context("inserted task delegation payload missing")
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn task_delegation_payload(
+    pub async fn task_delegation_payload(
         &self,
         task_call_id: &str,
         label: &str,
     ) -> Result<Option<TaskDelegationPayloadRow>> {
-        self.read_blocking(|conn| Self::task_delegation_payload_conn(conn, task_call_id, label))
+        let task_call_id = task_call_id.to_owned();
+        let label = label.to_owned();
+        self.read(move |conn| Self::task_delegation_payload_conn(conn, &task_call_id, &label))
+            .await
     }
 
     pub fn task_delegation_payload_conn(
@@ -163,16 +187,13 @@ impl Db {
         .context("querying task delegation payload")
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn task_delegation_payload_by_hash(
+    pub async fn task_delegation_payload_by_hash(
         &self,
         session_id: Uuid,
         hash: &str,
     ) -> Result<Option<TaskDelegationPayloadRow>> {
-        self.read_blocking(|conn| {
+        let hash = hash.to_owned();
+        self.read(move |conn| {
             conn.query_row(
                 "SELECT task_call_id, label, payload_hash, parent_session_id,
                         parent_agent, function_call_id, child_agent, prompt_byte_len,
@@ -187,37 +208,38 @@ impl Db {
             .optional()
             .context("querying task delegation payload by hash")
         })
+        .await
     }
 
-    pub fn load_task_delegation_payload(
+    pub async fn load_task_delegation_payload(
         &self,
         task_call_id: &str,
         label: &str,
     ) -> Result<LoadedTaskDelegationPayload> {
         let row = self
-            .task_delegation_payload(task_call_id, label)?
+            .task_delegation_payload(task_call_id, label)
+            .await?
             .with_context(|| format!("task delegation payload `{task_call_id}:{label}` missing"))?;
         let body = self.load_task_delegation_payload_body(&row)?;
         Ok(LoadedTaskDelegationPayload { body })
     }
 
-    pub fn load_task_delegation_payload_by_hash(
+    pub async fn load_task_delegation_payload_by_hash(
         &self,
         session_id: Uuid,
         hash: &str,
     ) -> Result<Option<LoadedTaskDelegationPayload>> {
-        let Some(row) = self.task_delegation_payload_by_hash(session_id, hash)? else {
+        let Some(row) = self
+            .task_delegation_payload_by_hash(session_id, hash)
+            .await?
+        else {
             return Ok(None);
         };
         let body = self.load_task_delegation_payload_body(&row)?;
         Ok(Some(LoadedTaskDelegationPayload { body }))
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn mark_task_delegation_payload_delivered(
+    pub async fn mark_task_delegation_payload_delivered(
         &self,
         task_call_id: &str,
         label: &str,
@@ -225,7 +247,7 @@ impl Db {
         let now = Utc::now().timestamp();
         let task_call_id = task_call_id.to_owned();
         let label = label.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE task_delegation_payloads
                     SET delivered_at = COALESCE(delivered_at, ?3)
@@ -235,14 +257,11 @@ impl Db {
             .context("marking task delegation payload delivered")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn session_has_task_delegation_payloads(&self, session_id: Uuid) -> Result<bool> {
-        self.read_blocking(|conn| {
+    pub async fn session_has_task_delegation_payloads(&self, session_id: Uuid) -> Result<bool> {
+        self.read(move |conn| {
             let exists: i64 = conn
                 .query_row(
                     "SELECT EXISTS(
@@ -254,17 +273,15 @@ impl Db {
                 .context("checking task delegation payload presence")?;
             Ok(exists != 0)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_task_delegation_payloads(
+    pub async fn list_task_delegation_payloads(
         &self,
         session_id: Uuid,
     ) -> Result<Vec<TaskDelegationPayloadRow>> {
-        self.read_blocking(|conn| Self::list_task_delegation_payloads_conn(conn, session_id))
+        self.read(move |conn| Self::list_task_delegation_payloads_conn(conn, session_id))
+            .await
     }
 
     pub fn list_task_delegation_payloads_conn(
@@ -417,6 +434,7 @@ mod tests {
                 todo_ids_json: None,
             }],
         )
+        .await
         .unwrap();
 
         let row = db
@@ -429,6 +447,7 @@ mod tests {
                 child_agent: "explore",
                 prompt: "redacted prompt",
             })
+            .await
             .unwrap();
         assert_eq!(row.payload_hash, delegation_payload_hash("redacted prompt"));
         assert_eq!(row.prompt_byte_len, "redacted prompt".len());
@@ -437,12 +456,15 @@ mod tests {
 
         let loaded = db
             .load_task_delegation_payload("task-1", "default")
+            .await
             .unwrap();
         assert_eq!(loaded.body, "redacted prompt");
         db.mark_task_delegation_payload_delivered("task-1", "default")
+            .await
             .unwrap();
         assert!(
             db.task_delegation_payload("task-1", "default")
+                .await
                 .unwrap()
                 .unwrap()
                 .delivered()
@@ -470,6 +492,7 @@ mod tests {
                 todo_ids_json: None,
             }],
         )
+        .await
         .unwrap();
         let row = db
             .insert_task_delegation_payload(NewTaskDelegationPayload {
@@ -481,6 +504,7 @@ mod tests {
                 child_agent: "explore",
                 prompt: "sidecar prompt",
             })
+            .await
             .unwrap();
         assert!(row.body_inline.is_none());
         let sidecar = db
@@ -492,6 +516,7 @@ mod tests {
         std::fs::remove_file(sidecar).unwrap();
         let err = db
             .load_task_delegation_payload("task-2", "alpha")
+            .await
             .unwrap_err();
         assert!(
             err.to_string().contains("reading delegation payload"),

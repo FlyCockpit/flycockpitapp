@@ -490,7 +490,8 @@ impl SessionRegistry {
         let row = self
             .inner
             .db
-            .get_assistant(assistant_name)?
+            .get_assistant(assistant_name)
+            .await?
             .ok_or_else(|| anyhow::anyhow!("assistant `{assistant_name}` not found"))?;
         crate::assistants::load_from_row(&row)?;
 

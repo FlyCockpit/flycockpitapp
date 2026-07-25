@@ -84,7 +84,7 @@ pub fn hash_optional_file(path: &Path) -> Result<Option<String>> {
     }
 }
 
-pub fn load_for_session(db: &Db, row: &AssistantRow) -> Result<IdentityLoad> {
+pub async fn load_for_session(db: &Db, row: &AssistantRow) -> Result<IdentityLoad> {
     let home_dir = Path::new(&row.home_dir);
     let mut config: crate::assistants::AssistantConfig =
         serde_json::from_str(&row.config_json).unwrap_or_default();
@@ -134,6 +134,7 @@ pub fn load_for_session(db: &Db, row: &AssistantRow) -> Result<IdentityLoad> {
     {
         let config_json = serde_json::to_string(&config)?;
         db.update_assistant_config(&row.name, &config_json)
+            .await
             .with_context(|| format!("updating identity hashes for assistant `{}`", row.name))?;
     }
 
@@ -264,7 +265,7 @@ fn contains_base64_blob(body: &str) -> bool {
 }
 
 pub async fn check_identity_write(ctx: &ToolCtx, path: &Path) -> Result<IdentityWriteGate> {
-    let Some((row, identity_file)) = identity_target(ctx, path)? else {
+    let Some((row, identity_file)) = identity_target(ctx, path).await? else {
         return Ok(IdentityWriteGate::Allow { note: None });
     };
     let config: crate::assistants::AssistantConfig =
@@ -315,8 +316,8 @@ pub fn tool_refusal(message: String) -> ToolOutput {
     ToolOutput::text(message)
 }
 
-pub fn record_identity_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
-    let Some((row, identity_file)) = identity_target(ctx, path)? else {
+pub async fn record_identity_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
+    let Some((row, identity_file)) = identity_target(ctx, path).await? else {
         return Ok(());
     };
     let mut config: crate::assistants::AssistantConfig =
@@ -329,15 +330,19 @@ pub fn record_identity_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
     let config_json = serde_json::to_string(&config)?;
     ctx.session
         .db
-        .update_assistant_config(&row.name, &config_json)?;
+        .update_assistant_config(&row.name, &config_json)
+        .await?;
     Ok(())
 }
 
-fn identity_target(ctx: &ToolCtx, path: &Path) -> Result<Option<(AssistantRow, &'static str)>> {
+async fn identity_target(
+    ctx: &ToolCtx,
+    path: &Path,
+) -> Result<Option<(AssistantRow, &'static str)>> {
     let Some(name) = ctx.session.assistant_name.as_deref() else {
         return Ok(None);
     };
-    let Some(row) = ctx.session.db.get_assistant(name)? else {
+    let Some(row) = ctx.session.db.get_assistant(name).await? else {
         return Ok(None);
     };
     let home = Path::new(&row.home_dir);
@@ -382,7 +387,7 @@ mod tests {
 
     use crate::engine::tool::Tool;
 
-    fn assistant_tool_ctx(
+    async fn assistant_tool_ctx(
         project: &Path,
         home: &Path,
         mode: SoulEditMode,
@@ -403,6 +408,7 @@ mod tests {
                 &serde_json::to_string(&cfg).unwrap(),
                 "hash",
             )
+            .await
             .unwrap();
         let project_id = crate::session::project_id_for(&project.to_path_buf());
         let project_root = project.display().to_string();
@@ -508,8 +514,8 @@ mod tests {
         assert_eq!(strip_comment_only_template(USER_TEMPLATE), "");
     }
 
-    #[test]
-    fn soul_external_edit_notice() {
+    #[tokio::test]
+    async fn soul_external_edit_notice() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         seed_identity_files(tmp.path()).unwrap();
@@ -526,9 +532,10 @@ mod tests {
                 &serde_json::to_string(&cfg).unwrap(),
                 "hash",
             )
+            .await
             .unwrap();
         std::fs::write(soul_path(tmp.path()), "new soul\n").unwrap();
-        let loaded = load_for_session(&db, &row).unwrap();
+        let loaded = load_for_session(&db, &row).await.unwrap();
         assert!(
             loaded
                 .notices
@@ -537,8 +544,8 @@ mod tests {
             "{:?}",
             loaded.notices
         );
-        let row = db.get_assistant("helper").unwrap().unwrap();
-        let loaded = load_for_session(&db, &row).unwrap();
+        let row = db.get_assistant("helper").await.unwrap().unwrap();
+        let loaded = load_for_session(&db, &row).await.unwrap();
         assert!(
             !loaded
                 .notices
@@ -553,7 +560,8 @@ mod tests {
     async fn soul_edit_modes_human_only_refuses() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let (ctx, _) = assistant_tool_ctx(project.path(), home.path(), SoulEditMode::HumanOnly);
+        let (ctx, _) =
+            assistant_tool_ctx(project.path(), home.path(), SoulEditMode::HumanOnly).await;
         let original = std::fs::read_to_string(soul_path(home.path())).unwrap();
 
         let out = crate::tools::write::WriteTool
@@ -583,7 +591,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let (ctx, _) =
-            assistant_tool_ctx(project.path(), home.path(), SoulEditMode::ApproveProposals);
+            assistant_tool_ctx(project.path(), home.path(), SoulEditMode::ApproveProposals).await;
 
         let out = crate::tools::write::WriteTool
             .call(
@@ -609,7 +617,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let (mut ctx, _) =
-            assistant_tool_ctx(project.path(), home.path(), SoulEditMode::ApproveProposals);
+            assistant_tool_ctx(project.path(), home.path(), SoulEditMode::ApproveProposals).await;
         let store = crate::approval::store::GrantStore::new(
             ctx.session.db.clone(),
             ctx.session.id,
@@ -677,7 +685,13 @@ mod tests {
             std::fs::read_to_string(user_path(home.path())).unwrap(),
             "approved user context\n"
         );
-        let row = ctx.session.db.get_assistant("helper").unwrap().unwrap();
+        let row = ctx
+            .session
+            .db
+            .get_assistant("helper")
+            .await
+            .unwrap()
+            .unwrap();
         let cfg: crate::assistants::AssistantConfig =
             serde_json::from_str(&row.config_json).unwrap();
         assert_eq!(
@@ -690,7 +704,8 @@ mod tests {
     async fn soul_edit_modes_autonomous_applies_and_records_hash() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let (ctx, _) = assistant_tool_ctx(project.path(), home.path(), SoulEditMode::Autonomous);
+        let (ctx, _) =
+            assistant_tool_ctx(project.path(), home.path(), SoulEditMode::Autonomous).await;
         crate::tools::read::ReadTool
             .call(
                 serde_json::json!({"path": soul_path(home.path()).display().to_string()}),
@@ -719,7 +734,13 @@ mod tests {
             std::fs::read_to_string(soul_path(home.path())).unwrap(),
             "model rewrite\n"
         );
-        let row = ctx.session.db.get_assistant("helper").unwrap().unwrap();
+        let row = ctx
+            .session
+            .db
+            .get_assistant("helper")
+            .await
+            .unwrap()
+            .unwrap();
         let cfg: crate::assistants::AssistantConfig =
             serde_json::from_str(&row.config_json).unwrap();
         assert_eq!(

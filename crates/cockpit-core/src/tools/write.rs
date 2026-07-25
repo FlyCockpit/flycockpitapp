@@ -139,7 +139,7 @@ impl Tool for WriteTool {
             create_new_and_release(&path, normalized.as_bytes(), write_guard, create_new_file)
                 .await?
         };
-        crate::assistants::identity::record_identity_write(ctx, &path)?;
+        crate::assistants::identity::record_identity_write(ctx, &path).await?;
         if skill_validation.is_some() {
             crate::skills::invalidate_catalog_cache(&ctx.cwd, &config.skills);
         }
@@ -270,6 +270,7 @@ mod tests {
             &serde_json::to_string(&cfg).unwrap(),
             "hash",
         )
+        .await
         .unwrap();
         let project_id = crate::session::project_id_for(&home.to_path_buf());
         let project_root = home.display().to_string();
@@ -663,15 +664,29 @@ mod tests {
     #[tokio::test]
     async fn non_skill_write_is_unaffected() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(tmp.path());
-        let before = crate::skills::catalog_generation();
+        write_skill_package(
+            tmp.path(),
+            "cached",
+            &skill_manifest("cached", "old", "Body"),
+        );
+        let ctx = skill_test_ctx(tmp.path());
+        let cfg = ctx.config.extended();
+        let discovered = crate::skills::discover(tmp.path(), &cfg.skills).unwrap();
+        assert_eq!(discovered[0].frontmatter.description, "old");
+        assert!(crate::skills::catalog_cache_contains(
+            tmp.path(),
+            &cfg.skills
+        ));
 
         let out = write(&tmp.path().join("plain.md"), "hello", &ctx)
             .await
             .unwrap();
 
         assert!(!out.contains("[skill]"), "{out}");
-        assert_eq!(crate::skills::catalog_generation(), before);
+        assert!(crate::skills::catalog_cache_contains(
+            tmp.path(),
+            &cfg.skills
+        ));
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("plain.md")).unwrap(),
             "hello"

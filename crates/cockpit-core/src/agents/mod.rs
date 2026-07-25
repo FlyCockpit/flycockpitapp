@@ -898,22 +898,21 @@ pub fn find_override(cwd: &Path, name: &str) -> Option<PathBuf> {
 /// (naming its `source`) rather than silently falling back to the
 /// embedded default — that would hide the user's mistake.
 pub fn resolve(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
-    resolve_inner(cwd, name, resolve_assistant_agent)
+    resolve_inner(cwd, name)
 }
 
-pub(crate) fn resolve_with_assistant_db(
+pub(crate) async fn resolve_with_assistant_db(
     cwd: &Path,
     name: &str,
     db: &crate::db::Db,
 ) -> Result<Option<AgentDef>> {
-    resolve_inner(cwd, name, |name| resolve_assistant_agent_from_db(db, name))
+    if let Some(def) = resolve_inner(cwd, name)? {
+        return Ok(Some(def));
+    }
+    resolve_assistant_agent_from_db(db, name).await
 }
 
-fn resolve_inner(
-    cwd: &Path,
-    name: &str,
-    resolve_assistant: impl FnOnce(&str) -> Result<Option<AgentDef>>,
-) -> Result<Option<AgentDef>> {
+fn resolve_inner(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
     if is_removed_primary(name) {
         if find_override(cwd, name).is_some() {
             tracing::warn!(
@@ -937,18 +936,14 @@ fn resolve_inner(
     if let Some(def) = embedded_default(name) {
         return Ok(Some(def));
     }
-    resolve_assistant(name)
+    Ok(None)
 }
 
-fn resolve_assistant_agent(name: &str) -> Result<Option<AgentDef>> {
-    let Ok(db) = crate::db::Db::open_default() else {
-        return Ok(None);
-    };
-    resolve_assistant_agent_from_db(&db, name)
-}
-
-fn resolve_assistant_agent_from_db(db: &crate::db::Db, name: &str) -> Result<Option<AgentDef>> {
-    let Some(row) = db.get_assistant(name)? else {
+async fn resolve_assistant_agent_from_db(
+    db: &crate::db::Db,
+    name: &str,
+) -> Result<Option<AgentDef>> {
+    let Some(row) = db.get_assistant(name).await? else {
         return Ok(None);
     };
     Ok(Some(crate::assistants::load_from_row(&row)?.agent))

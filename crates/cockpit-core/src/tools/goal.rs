@@ -80,9 +80,9 @@ impl Tool for GoalTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let args: GoalArgs = typed_args(args)?;
         match args.action.as_str() {
-            "create" => handle_create(args, ctx),
-            "get" => handle_get(args, ctx),
-            "update" => handle_update(args, ctx),
+            "create" => handle_create(args, ctx).await,
+            "get" => handle_get(args, ctx).await,
+            "update" => handle_update(args, ctx).await,
             other => Err(invalid_input(format!(
                 "`action` must be create, get, or update (got `{other}`)"
             ))),
@@ -90,15 +90,19 @@ impl Tool for GoalTool {
     }
 }
 
-fn handle_create(args: GoalArgs, ctx: &ToolCtx) -> Result<ToolOutput> {
+async fn handle_create(args: GoalArgs, ctx: &ToolCtx) -> Result<ToolOutput> {
     let objective = required_opt_str(args.objective.as_deref(), "objective")?;
-    let goal = ctx.session.db.create_session_goal(
-        ctx.session.id,
-        &ctx.session.project_id,
-        objective,
-        args.context.as_deref(),
-        args.token_budget,
-    )?;
+    let goal = ctx
+        .session
+        .db
+        .create_session_goal(
+            ctx.session.id,
+            &ctx.session.project_id,
+            objective,
+            args.context.as_deref(),
+            args.token_budget,
+        )
+        .await?;
     Ok(ToolOutput::text(format!(
         "Created goal `{}` [{}]: {}",
         goal.id,
@@ -107,10 +111,18 @@ fn handle_create(args: GoalArgs, ctx: &ToolCtx) -> Result<ToolOutput> {
     )))
 }
 
-fn handle_get(args: GoalArgs, ctx: &ToolCtx) -> Result<ToolOutput> {
-    ctx.session.db.refresh_session_goal_usage(ctx.session.id)?;
+async fn handle_get(args: GoalArgs, ctx: &ToolCtx) -> Result<ToolOutput> {
+    ctx.session
+        .db
+        .refresh_session_goal_usage(ctx.session.id)
+        .await?;
     let include_context = args.include_context.unwrap_or(false);
-    let Some(goal) = ctx.session.db.current_session_goal(ctx.session.id, true)? else {
+    let Some(goal) = ctx
+        .session
+        .db
+        .current_session_goal(ctx.session.id, true)
+        .await?
+    else {
         return Ok(ToolOutput::text("No goal for this session."));
     };
     let elapsed = chrono::Utc::now()
@@ -134,7 +146,7 @@ fn handle_get(args: GoalArgs, ctx: &ToolCtx) -> Result<ToolOutput> {
     Ok(ToolOutput::text(out))
 }
 
-fn handle_update(args: GoalArgs, ctx: &ToolCtx) -> Result<ToolOutput> {
+async fn handle_update(args: GoalArgs, ctx: &ToolCtx) -> Result<ToolOutput> {
     let status = match required_opt_str(args.status.as_deref(), "status")? {
         "active" => GoalStatus::Active,
         "paused" => GoalStatus::Paused,
@@ -146,13 +158,18 @@ fn handle_update(args: GoalArgs, ctx: &ToolCtx) -> Result<ToolOutput> {
             )));
         }
     };
-    match ctx.session.db.update_session_goal(
-        ctx.session.id,
-        status,
-        args.evidence.as_deref(),
-        args.blocker.as_deref(),
-        args.context_delta.as_deref(),
-    )? {
+    match ctx
+        .session
+        .db
+        .update_session_goal(
+            ctx.session.id,
+            status,
+            args.evidence.as_deref(),
+            args.blocker.as_deref(),
+            args.context_delta.as_deref(),
+        )
+        .await?
+    {
         GoalUpdateOutcome::Updated(goal) => Ok(ToolOutput::text(format!(
             "Goal `{}` status is now `{}`.",
             goal.id,
@@ -252,10 +269,12 @@ mod tests {
                 None,
                 None,
             )
+            .await
             .unwrap();
         ctx.session
             .db
             .current_session_goal(ctx.session.id, true)
+            .await
             .unwrap();
         ctx.session
             .db
@@ -266,6 +285,7 @@ mod tests {
                 None,
                 None,
             )
+            .await
             .unwrap();
 
         let out = GoalTool

@@ -780,7 +780,7 @@ async fn call_bash_inner(
     }
 
     for target in &identity_write_targets {
-        crate::assistants::identity::record_identity_write(ctx, target)?;
+        crate::assistants::identity::record_identity_write(ctx, target).await?;
     }
 
     // Native shell-output compression (implementation note):

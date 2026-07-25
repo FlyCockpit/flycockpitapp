@@ -145,7 +145,7 @@ pub(super) async fn handle_serialized_request(
             forced_skill,
         } => {
             if let Some(scheduler) = &ctx.scheduler {
-                scheduler.record_user_activity();
+                scheduler.record_user_activity().await;
             }
             // New-user-work gate (`daemon-graceful-drain-shutdown.md`): once
             // a drain begins, reject new turns with a short notice rather
@@ -357,10 +357,12 @@ pub(super) async fn handle_serialized_request(
         Request::GoalStatus { session_id } => {
             ctx.db
                 .refresh_session_goal_usage(session_id)
+                .await
                 .map_err(internal)?;
             let goal = ctx
                 .db
                 .current_session_goal(session_id, false)
+                .await
                 .map_err(internal)?
                 .map(goal_to_proto);
             Ok(Response::GoalStatus { goal })
@@ -370,6 +372,7 @@ pub(super) async fn handle_serialized_request(
             let goal = ctx
                 .db
                 .set_session_goal_status(session_id, status)
+                .await
                 .map_err(|e| ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message: e.to_string(),
@@ -380,7 +383,11 @@ pub(super) async fn handle_serialized_request(
         }
 
         Request::ClearGoal { session_id } => {
-            let cleared = ctx.db.clear_session_goal(session_id).map_err(internal)?;
+            let cleared = ctx
+                .db
+                .clear_session_goal(session_id)
+                .await
+                .map_err(internal)?;
             Ok(Response::GoalCleared { cleared })
         }
 
@@ -388,6 +395,7 @@ pub(super) async fn handle_serialized_request(
             let assistants = ctx
                 .db
                 .list_assistants()
+                .await
                 .map_err(internal)?
                 .into_iter()
                 .map(assistant_to_proto)
@@ -774,23 +782,27 @@ pub(super) async fn handle_serialized_request(
 
         Request::CreateScheduledJob { job } => {
             let scheduler = require_scheduler(ctx)?;
-            let job = scheduler.create_job(job).map_err(internal)?;
+            let job = scheduler.create_job(job).await.map_err(internal)?;
             Ok(Response::ScheduledJob { job })
         }
         Request::ListScheduledJobs { owner } => {
             let scheduler = require_scheduler(ctx)?;
-            let jobs = scheduler.list_jobs(owner.as_deref()).map_err(internal)?;
+            let jobs = scheduler
+                .list_jobs(owner.as_deref())
+                .await
+                .map_err(internal)?;
             Ok(Response::ScheduledJobs { jobs })
         }
         Request::DeleteScheduledJob { id } => {
             let scheduler = require_scheduler(ctx)?;
-            let deleted = scheduler.delete_job(&id).map_err(internal)?;
+            let deleted = scheduler.delete_job(&id).await.map_err(internal)?;
             Ok(Response::ScheduledJobDeleted { id, deleted })
         }
         Request::SetScheduledJobEnabled { id, enabled } => {
             let scheduler = require_scheduler(ctx)?;
             let job = scheduler
                 .set_enabled(&id, enabled)
+                .await
                 .map_err(internal)?
                 .ok_or_else(|| ErrorPayload {
                     code: ErrorCode::BadRequest,
@@ -800,7 +812,7 @@ pub(super) async fn handle_serialized_request(
         }
         Request::RunScheduledJob { id } => {
             let scheduler = require_scheduler(ctx)?;
-            scheduler.run_now(&id).map_err(internal)?;
+            scheduler.run_now(&id).await.map_err(internal)?;
             Ok(Response::ScheduledJobRunQueued { id })
         }
 
@@ -1307,6 +1319,7 @@ pub(super) async fn handle_concurrent_request(
             let assistants = ctx
                 .db
                 .list_assistants()
+                .await
                 .map_err(internal)?
                 .into_iter()
                 .map(assistant_to_proto)
@@ -1453,7 +1466,10 @@ pub(super) async fn handle_concurrent_request(
         }),
         Request::ListScheduledJobs { owner } => {
             let scheduler = require_scheduler(&ctx)?;
-            let jobs = scheduler.list_jobs(owner.as_deref()).map_err(internal)?;
+            let jobs = scheduler
+                .list_jobs(owner.as_deref())
+                .await
+                .map_err(internal)?;
             Ok(Response::ScheduledJobs { jobs })
         }
         Request::ListAgents => list_agents_shared(&ctx, &shared).await,
@@ -2569,6 +2585,18 @@ pub(super) async fn curator_request(
         .load_with_trust(&project_root, &trust_policy)
         .map_err(workspace_trust_error)?;
     let db = ctx.db.clone();
+    let run_cron_refs = if matches!(action, proto::CuratorAction::Run { .. }) {
+        Some(
+            crate::skills::curator::cron_referenced_skills(&db)
+                .await
+                .map_err(|error| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: error.to_string(),
+                })?,
+        )
+    } else {
+        None
+    };
     let result = tokio::task::spawn_blocking(move || -> Result<proto::CuratorResult> {
         crate::config::trust::with_workspace_trust_policy(trust_policy, || {
             let curator =
@@ -2581,11 +2609,12 @@ pub(super) async fn curator_request(
                     dry_run,
                     consolidate,
                 } => Ok(proto::CuratorResult::Run {
-                    report: curator_run_report_to_proto(curator.run(
+                    report: curator_run_report_to_proto(curator.run_with_cron_refs(
                         crate::skills::curator::CuratorRunOptions {
                             dry_run,
                             consolidate,
                         },
+                        run_cron_refs.context("scheduler skill references not loaded")?,
                     )?),
                 }),
                 proto::CuratorAction::Pin { name } => {

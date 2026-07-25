@@ -69,7 +69,8 @@ impl Tool for DelegationPayloadRetrieveTool {
         let Some(payload) = ctx
             .session
             .db
-            .load_task_delegation_payload_by_hash(ctx.session.id, hash)?
+            .load_task_delegation_payload_by_hash(ctx.session.id, hash)
+            .await?
         else {
             return Ok(ToolOutput::text(format!(
                 "No delegation payload with hash `{hash}` is available in this session."
@@ -138,6 +139,7 @@ mod tests {
                     todo_ids_json: None,
                 }],
             )
+            .await
             .unwrap();
         let row = ctx
             .session
@@ -151,6 +153,7 @@ mod tests {
                 child_agent: "Explore",
                 prompt: content,
             })
+            .await
             .unwrap();
         assert_eq!(row.payload_hash, delegation_payload_hash(content));
         row.payload_hash

@@ -2507,6 +2507,7 @@ async fn export_task_delegation_payloads_writes_bounded_index_and_payload() {
             todo_ids_json: None,
         }],
     )
+    .await
     .unwrap();
     let body = "x".repeat(800);
     db.insert_task_delegation_payload(
@@ -2520,8 +2521,10 @@ async fn export_task_delegation_payloads_writes_bounded_index_and_payload() {
             prompt: &body,
         },
     )
+    .await
     .unwrap();
     db.mark_task_delegation_payload_delivered("task-long", "alpha")
+        .await
         .unwrap();
 
     let target = get_test_session(&db, sid).await;
@@ -2570,6 +2573,7 @@ async fn export_task_delegation_steers_includes_origin_and_redacted_body() {
             todo_ids_json: None,
         }],
     )
+    .await
     .unwrap();
     db.enqueue_task_delegation_steer(
         "task-steer",
@@ -2577,6 +2581,7 @@ async fn export_task_delegation_steers_includes_origin_and_redacted_body() {
         "use SECRET_STEER_TOKEN",
         "local:tester",
     )
+    .await
     .unwrap();
 
     let target = get_test_session(&db, sid).await;

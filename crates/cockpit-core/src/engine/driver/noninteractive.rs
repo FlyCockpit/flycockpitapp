@@ -633,7 +633,8 @@ impl Drop for BackgroundNoninteractiveJob {
 }
 
 impl Driver {
-    pub(in crate::engine::driver) fn persist_delegation_payload(
+    #[cfg(test)]
+    pub(in crate::engine::driver) async fn persist_delegation_payload(
         &self,
         task_call_id: &str,
         task_function_call_id: Option<&str>,
@@ -656,6 +657,7 @@ impl Driver {
                     prompt: &prompt,
                 },
             )
+            .await
             .with_context(|| {
                 format!("persisting task delegation payload `{task_call_id}:{label}`")
             })?;
@@ -663,11 +665,12 @@ impl Driver {
             .session
             .db
             .load_task_delegation_payload(task_call_id, label)
+            .await
             .with_context(|| format!("loading task delegation payload `{task_call_id}:{label}`"))?;
         Ok(loaded.body)
     }
 
-    pub(in crate::engine::driver) fn delegation_payload_delivery(
+    pub(in crate::engine::driver) async fn delegation_payload_delivery(
         &self,
         task_call_id: &str,
         label: &str,
@@ -677,12 +680,14 @@ impl Driver {
         let row = self
             .session
             .db
-            .task_delegation_payload(task_call_id, label)?
+            .task_delegation_payload(task_call_id, label)
+            .await?
             .with_context(|| format!("task delegation payload `{task_call_id}:{label}` missing"))?;
         if row.prompt_byte_len <= DELEGATION_PAYLOAD_DIRECT_LIMIT_BYTES {
             self.session
                 .db
-                .mark_task_delegation_payload_delivered(task_call_id, label)?;
+                .mark_task_delegation_payload_delivered(task_call_id, label)
+                .await?;
             return Ok((Vec::new(), prompt.to_string()));
         }
         if !retrieval_allowed {
@@ -691,7 +696,8 @@ impl Driver {
         let history = delegation_payload_retrieval_history(&row, prompt);
         self.session
             .db
-            .mark_task_delegation_payload_delivered(task_call_id, label)?;
+            .mark_task_delegation_payload_delivered(task_call_id, label)
+            .await?;
         Ok((history, delegation_payload_reference_prompt(&row)))
     }
 
@@ -717,43 +723,43 @@ impl Driver {
         }))
         .ok();
         let parent_agent = self.stack.last().unwrap().agent.name.clone();
-        if let Err(e) = self.session.db.upsert_task_delegation_job(
-            self.session.id,
-            &task_call_id,
-            task_function_call_id.as_deref(),
-            &parent_agent,
-            task_args_json.as_deref(),
-            &[crate::db::task_delegations::DelegationChildInit {
-                label: "default",
-                child_agent: &task.child_agent,
-                model: model_selector_display(&task.model).as_deref(),
-                output_dir: None,
-                requested_cwd: task.child_cwd.requested_json(),
-                resolved_cwd: Some(&resolved_cwd_display),
-                todo_ids_json: None,
-            }],
-        ) {
-            tracing::warn!(error = %e, task_call_id, "persist single task delegation job failed");
-            return Ok(Message::tool_result_with_call_id(
-                task_call_id,
-                task_function_call_id,
-                prepend_task_repair_notes(
-                    DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                    &task.repair_notes,
-                ),
-            ));
-        }
-        match self.persist_delegation_payload(
-            &task_call_id,
-            task_function_call_id.as_deref(),
-            &parent_agent,
-            "default",
-            &task.child_agent,
-            &task.brief,
-        ) {
-            Ok(loaded) => task.brief = loaded,
+        let model_display = model_selector_display(&task.model);
+        let child_inits = [crate::db::task_delegations::DelegationChildInit {
+            label: "default",
+            child_agent: &task.child_agent,
+            model: model_display.as_deref(),
+            output_dir: None,
+            requested_cwd: task.child_cwd.requested_json(),
+            resolved_cwd: Some(&resolved_cwd_display),
+            todo_ids_json: None,
+        }];
+        match self
+            .session
+            .db
+            .upsert_task_delegation_job_and_payload(
+                crate::db::task_delegations::TaskDelegationJobUpsert {
+                    session_id: self.session.id,
+                    task_call_id: &task_call_id,
+                    function_call_id: task_function_call_id.as_deref(),
+                    parent_agent: &parent_agent,
+                    original_args_json: task_args_json.as_deref(),
+                    children: &child_inits,
+                },
+                crate::db::task_delegation_payloads::NewTaskDelegationPayload {
+                    task_call_id: &task_call_id,
+                    function_call_id: task_function_call_id.as_deref(),
+                    parent_session_id: self.session.id,
+                    parent_agent: &parent_agent,
+                    label: "default",
+                    child_agent: &task.child_agent,
+                    prompt: &task.brief,
+                },
+            )
+            .await
+        {
+            Ok(row) => task.brief = delegation_payload_reference_prompt(&row),
             Err(e) => {
-                tracing::warn!(error = %e, task_call_id, "persist single task delegation payload failed");
+                tracing::warn!(error = %e, task_call_id, "persist single task delegation job and payload failed");
                 return Ok(Message::tool_result_with_call_id(
                     task_call_id,
                     task_function_call_id,
@@ -817,11 +823,13 @@ impl Driver {
                     .session
                     .db
                     .background_task_delegation_child(&task_call_id, "default")
+                    .await
                 {
                     tracing::warn!(error = %e, task_call_id, "background single task delegation failed");
                 }
                 let ack =
-                    self.background_delegation_ack(&task_call_id, task_function_call_id.clone());
+                    self.background_delegation_ack(&task_call_id, task_function_call_id.clone())
+                        .await;
                 if let Some(parent) = self.stack.last_mut() {
                     parent.history.push(ack);
                 }
@@ -892,7 +900,9 @@ impl Driver {
             &child_agent,
             &granted_tools,
             &self.session.db,
-        ) {
+        )
+        .await
+        {
             return Ok(SingleNoninteractiveCompletion {
                 child_agent,
                 task_call_id,
@@ -910,12 +920,10 @@ impl Driver {
             });
         }
 
-        let (delegation_payload_history, delivered_brief) = match self.delegation_payload_delivery(
-            &task_call_id,
-            "default",
-            &brief,
-            child_agent != "docs",
-        ) {
+        let (delegation_payload_history, delivered_brief) = match self
+            .delegation_payload_delivery(&task_call_id, "default", &brief, child_agent != "docs")
+            .await
+        {
             Ok(delivery) => delivery,
             Err(e) => {
                 tracing::warn!(error = %e, task_call_id, "task delegation payload delivery failed");
@@ -1023,13 +1031,15 @@ impl Driver {
         let mut seeds: Vec<crate::db::seed_tools::SeedTool> = Vec::new();
         let mut new_handle: Option<String> = None;
         let mut snapshot = NoninteractiveDelegationSnapshot::empty();
-        let composed_brief = self.assign_todos_to_task(
-            composed_brief,
-            &todo_ids,
-            &task_call_id,
-            "default",
-            &child_agent,
-        );
+        let composed_brief = self
+            .assign_todos_to_task(
+                composed_brief,
+                &todo_ids,
+                &task_call_id,
+                "default",
+                &child_agent,
+            )
+            .await;
 
         let outcome = if child_agent == "docs" {
             // The docs pipeline is not a built-in child agent load, so there is
@@ -1069,12 +1079,15 @@ impl Driver {
         } else {
             let rehydrated = match &resume_handle {
                 None => Ok(Vec::new()),
-                Some(handle) => self.rehydrate_handle(
-                    handle,
-                    &child_agent,
-                    Some(&child_cwd.resolved),
-                    followup_enabled,
-                ),
+                Some(handle) => {
+                    self.rehydrate_handle(
+                        handle,
+                        &child_agent,
+                        Some(&child_cwd.resolved),
+                        followup_enabled,
+                    )
+                    .await
+                }
             };
             match rehydrated {
                 Err(msg) => DelegationChildOutcome::failed(msg),
@@ -1247,12 +1260,14 @@ impl Driver {
                             if followup_enabled
                                 && crate::engine::builtin::is_followup_eligible(&child_agent)
                             {
-                                new_handle = self.persist_subagent_handle(
-                                    &child_agent,
-                                    &outcome.history,
-                                    Some(&child_cwd.resolved),
-                                    resume_handle.as_deref(),
-                                );
+                                new_handle = self
+                                    .persist_subagent_handle(
+                                        &child_agent,
+                                        &outcome.history,
+                                        Some(&child_cwd.resolved),
+                                        resume_handle.as_deref(),
+                                    )
+                                    .await;
                                 if read_only {
                                     seeds = collector.drain();
                                 }
@@ -1335,13 +1350,12 @@ impl Driver {
                 failed,
                 Some(result.clone()),
             );
-            if let Err(e) = self.session.db.complete_task_delegation_child(
-                &task_call_id,
-                "default",
-                &report,
-                failed,
-                None,
-            ) {
+            if let Err(e) = self
+                .session
+                .db
+                .complete_task_delegation_child(&task_call_id, "default", &report, failed, None)
+                .await
+            {
                 tracing::warn!(error = %e, task_call_id, "complete single delegation child failed");
             }
             let _ = self
@@ -1369,8 +1383,9 @@ impl Driver {
                 "\n\n[note: some seeded results were omitted to stay within the report budget]",
             );
         }
-        let report =
-            self.reconcile_todo_delta(&task_call_id, "default", &child_agent, &report, failed);
+        let report = self
+            .reconcile_todo_delta(&task_call_id, "default", &child_agent, &report, failed)
+            .await;
         let report = match &new_handle {
             Some(handle) => format!("{report}{}", handle_footer(handle)),
             None => report,
@@ -1443,13 +1458,12 @@ impl Driver {
             failed,
             Some(result.clone()),
         );
-        if let Err(e) = self.session.db.complete_task_delegation_child(
-            &task_call_id,
-            "default",
-            &report,
-            failed,
-            None,
-        ) {
+        if let Err(e) = self
+            .session
+            .db
+            .complete_task_delegation_child(&task_call_id, "default", &report, failed, None)
+            .await
+        {
             tracing::warn!(error = %e, task_call_id, "complete single delegation child failed");
         }
         let _ = self
@@ -1598,6 +1612,7 @@ impl Driver {
                     if was_backgrounded {
                         Ok(self
                             .async_delegation_result(&task_call_id)
+                            .await
                             .map(NoninteractiveCompletionDelivery::AsyncUser)
                             .unwrap_or(NoninteractiveCompletionDelivery::None))
                     } else {
@@ -1605,6 +1620,7 @@ impl Driver {
                             .session
                             .db
                             .mark_task_delegation_child_delivered(&task_call_id, "default")
+                            .await
                         {
                             tracing::warn!(error = %e, task_call_id, "mark inline single delegation delivered failed");
                         }
@@ -1623,9 +1639,11 @@ impl Driver {
                         job.delivered = true;
                     }
                     if was_backgrounded {
-                        self.record_background_noninteractive_error(&task_call_id, &body);
+                        self.record_background_noninteractive_error(&task_call_id, &body)
+                            .await;
                         Ok(self
                             .async_delegation_result(&task_call_id)
+                            .await
                             .map(NoninteractiveCompletionDelivery::AsyncUser)
                             .unwrap_or(NoninteractiveCompletionDelivery::None))
                     } else {
@@ -1660,6 +1678,7 @@ impl Driver {
                     if was_backgrounded {
                         Ok(self
                             .async_delegation_result(&task_call_id)
+                            .await
                             .map(NoninteractiveCompletionDelivery::AsyncUser)
                             .unwrap_or(NoninteractiveCompletionDelivery::None))
                     } else {
@@ -1667,14 +1686,18 @@ impl Driver {
                             .session
                             .db
                             .undelivered_task_delegation_children(&task_call_id)
+                            .await
                         {
                             Ok(rows) => {
                                 for row in rows {
-                                    if let Err(e) =
-                                        self.session.db.mark_task_delegation_child_delivered(
+                                    if let Err(e) = self
+                                        .session
+                                        .db
+                                        .mark_task_delegation_child_delivered(
                                             &task_call_id,
                                             &row.label,
                                         )
+                                        .await
                                     {
                                         tracing::warn!(error = %e, task_call_id, label = %row.label, "mark inline batch delegation delivered failed");
                                     }
@@ -1699,9 +1722,11 @@ impl Driver {
                         job.delivered = true;
                     }
                     if was_backgrounded {
-                        self.record_background_noninteractive_error(&task_call_id, &body);
+                        self.record_background_noninteractive_error(&task_call_id, &body)
+                            .await;
                         Ok(self
                             .async_delegation_result(&task_call_id)
+                            .await
                             .map(NoninteractiveCompletionDelivery::AsyncUser)
                             .unwrap_or(NoninteractiveCompletionDelivery::None))
                     } else {
@@ -1752,7 +1777,7 @@ impl Driver {
         }
     }
 
-    pub(in crate::engine::driver) fn record_background_noninteractive_error(
+    pub(in crate::engine::driver) async fn record_background_noninteractive_error(
         &mut self,
         task_call_id: &str,
         body: &str,
@@ -1761,6 +1786,7 @@ impl Driver {
             .session
             .db
             .list_task_delegation_children(self.session.id)
+            .await
         {
             Ok(rows) => rows,
             Err(e) => {
@@ -1772,13 +1798,12 @@ impl Driver {
             .into_iter()
             .filter(|row| row.task_call_id == task_call_id && delegation_status_live(row.status))
         {
-            if let Err(e) = self.session.db.complete_task_delegation_child(
-                task_call_id,
-                &row.label,
-                body,
-                true,
-                None,
-            ) {
+            if let Err(e) = self
+                .session
+                .db
+                .complete_task_delegation_child(task_call_id, &row.label, body, true, None)
+                .await
+            {
                 tracing::warn!(error = %e, task_call_id, label = %row.label, "complete errored background delegation child failed");
             }
             self.noninteractive_delegations.complete(
@@ -1791,7 +1816,7 @@ impl Driver {
         }
     }
 
-    pub(in crate::engine::driver) fn background_delegation_ack(
+    pub(in crate::engine::driver) async fn background_delegation_ack(
         &mut self,
         task_call_id: &str,
         task_function_call_id: Option<String>,
@@ -1808,6 +1833,7 @@ impl Driver {
                 .session
                 .db
                 .mark_task_delegation_child_delivered(task_call_id, label)
+                .await
             {
                 tracing::warn!(error = %e, task_call_id, label, "mark delegation ack child delivered failed");
             }
@@ -1816,7 +1842,7 @@ impl Driver {
         Message::tool_result_with_call_id(task_call_id.to_string(), task_function_call_id, body)
     }
 
-    pub(in crate::engine::driver) fn async_delegation_result(
+    pub(in crate::engine::driver) async fn async_delegation_result(
         &mut self,
         task_call_id: &str,
     ) -> Option<String> {
@@ -1824,6 +1850,7 @@ impl Driver {
             .session
             .db
             .undelivered_task_delegation_children(task_call_id)
+            .await
         {
             Ok(rows) => rows
                 .into_iter()
@@ -1857,6 +1884,7 @@ impl Driver {
                 .session
                 .db
                 .mark_task_delegation_child_delivered(task_call_id, &child.label)
+                .await
             {
                 let label = child.label.as_str();
                 tracing::warn!(error = %e, task_call_id, label, "mark async delegation child delivered failed");
@@ -1870,7 +1898,7 @@ impl Driver {
         ))
     }
 
-    pub(in crate::engine::driver) fn enqueue_delegation_steer(
+    pub(in crate::engine::driver) async fn enqueue_delegation_steer(
         &mut self,
         target_task_call_id: Option<String>,
         label: Option<String>,
@@ -1882,6 +1910,7 @@ impl Driver {
             .session
             .db
             .list_task_delegation_children(self.session.id)
+            .await
             .map_err(|e| format!("could not load task delegations: {e:#}"))?;
         let orphaned = orphaned_task_control_keys(&rows, &self.noninteractive_delegations);
         let selected =
@@ -1925,6 +1954,7 @@ impl Driver {
         self.session
             .db
             .enqueue_task_delegation_steer(&row.task_call_id, &row.label, &body, &origin_principal)
+            .await
             .map_err(|e| format!("could not persist steer: {e:#}"))?;
         self.noninteractive_delegations
             .push_steer(&row.task_call_id, &row.label, body);
@@ -1957,6 +1987,7 @@ impl Driver {
             .session
             .db
             .list_task_delegation_children(self.session.id)
+            .await
         {
             Ok(rows) => rows,
             Err(e) => return format!("Error: could not load task delegations: {e:#}"),
@@ -2005,15 +2036,20 @@ impl Driver {
                             .session
                             .db
                             .mark_task_delegation_child_lost(&row.task_call_id, &row.label)
+                            .await
                         {
                             Ok(true) => {
-                                let _ = self.session.db.finish_task_assignment(
-                                    self.session.id,
-                                    &row.task_call_id,
-                                    &row.label,
-                                    "lost",
-                                    None,
-                                );
+                                let _ = self
+                                    .session
+                                    .db
+                                    .finish_task_assignment(
+                                        self.session.id,
+                                        &row.task_call_id,
+                                        &row.label,
+                                        "lost",
+                                        None,
+                                    )
+                                    .await;
                                 orphaned_lost.push(format!("{}:{}", row.task_call_id, row.label))
                             }
                             Ok(false) => unchanged.push(format!(
@@ -2038,6 +2074,7 @@ impl Driver {
                         .session
                         .db
                         .cancel_task_delegation_child(&row.task_call_id, &row.label)
+                        .await
                     {
                         Ok(changed) => changed,
                         Err(e) => {
@@ -2047,13 +2084,17 @@ impl Driver {
                             );
                         }
                     };
-                    let _ = self.session.db.finish_task_assignment(
-                        self.session.id,
-                        &row.task_call_id,
-                        &row.label,
-                        "cancelled",
-                        None,
-                    );
+                    let _ = self
+                        .session
+                        .db
+                        .finish_task_assignment(
+                            self.session.id,
+                            &row.task_call_id,
+                            &row.label,
+                            "cancelled",
+                            None,
+                        )
+                        .await;
                     if live_changed || db_changed {
                         changed.push(format!("{}:{}", row.task_call_id, row.label));
                     } else {
@@ -2224,13 +2265,16 @@ impl Driver {
                         "children": [task_child_detail_json(row, &orphaned)],
                     }));
                 };
-                match self.enqueue_delegation_steer(
-                    Some(row.task_call_id.clone()),
-                    Some(row.label.clone()),
-                    body,
-                    format!("agent:{}", row.task_call_id),
-                    false,
-                ) {
+                match self
+                    .enqueue_delegation_steer(
+                        Some(row.task_call_id.clone()),
+                        Some(row.label.clone()),
+                        body,
+                        format!("agent:{}", row.task_call_id),
+                        false,
+                    )
+                    .await
+                {
                     Ok(result) => task_envelope(result.to_task_envelope_value()),
                     Err(message) => format!("Error: {message}"),
                 }
@@ -2303,46 +2347,52 @@ impl Driver {
         }))
         .ok();
         let parent_agent = self.stack.last().unwrap().agent.name.clone();
-        if let Err(e) = self.session.db.upsert_task_delegation_job(
-            self.session.id,
-            &task_call_id,
-            task_function_call_id.as_deref(),
-            &parent_agent,
-            task_args_json.as_deref(),
-            &child_inits,
-        ) {
-            tracing::warn!(error = %e, task_call_id, "persist batch task delegation job failed");
-            return Ok(Message::tool_result_with_call_id(
-                task_call_id,
-                task_function_call_id,
-                prepend_task_repair_notes(
-                    DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                    &task.repair_notes,
-                ),
-            ));
-        }
-        for entry in &mut task.entries {
-            match self.persist_delegation_payload(
-                &task_call_id,
-                task_function_call_id.as_deref(),
-                &parent_agent,
-                &entry.label,
-                &entry.child_agent,
-                &entry.prompt,
-            ) {
-                Ok(loaded) => entry.prompt = loaded,
-                Err(e) => {
-                    let label = entry.label.clone();
-                    tracing::warn!(error = %e, task_call_id, label, "persist batch task delegation payload failed");
-                    return Ok(Message::tool_result_with_call_id(
-                        task_call_id,
-                        task_function_call_id,
-                        prepend_task_repair_notes(
-                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                            &task.repair_notes,
-                        ),
-                    ));
+        let payloads = task
+            .entries
+            .iter()
+            .map(
+                |entry| crate::db::task_delegation_payloads::NewTaskDelegationPayload {
+                    task_call_id: task_call_id.as_str(),
+                    function_call_id: task_function_call_id.as_deref(),
+                    parent_session_id: self.session.id,
+                    parent_agent: parent_agent.as_str(),
+                    label: entry.label.as_str(),
+                    child_agent: entry.child_agent.as_str(),
+                    prompt: entry.prompt.as_str(),
+                },
+            )
+            .collect::<Vec<_>>();
+        match self
+            .session
+            .db
+            .upsert_task_delegation_job_and_payloads(
+                crate::db::task_delegations::TaskDelegationJobUpsert {
+                    session_id: self.session.id,
+                    task_call_id: &task_call_id,
+                    function_call_id: task_function_call_id.as_deref(),
+                    parent_agent: &parent_agent,
+                    original_args_json: task_args_json.as_deref(),
+                    children: &child_inits,
+                },
+                payloads,
+            )
+            .await
+        {
+            Ok(rows) => {
+                for (entry, row) in task.entries.iter_mut().zip(rows.iter()) {
+                    entry.prompt = delegation_payload_reference_prompt(row);
                 }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, task_call_id, "persist batch task delegation job and payloads failed");
+                return Ok(Message::tool_result_with_call_id(
+                    task_call_id,
+                    task_function_call_id,
+                    prepend_task_repair_notes(
+                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                        &task.repair_notes,
+                    ),
+                ));
             }
         }
         for entry in &task.entries {
@@ -2408,12 +2458,14 @@ impl Driver {
                         .session
                         .db
                         .background_task_delegation_child(&task_call_id, &label)
+                        .await
                     {
                         tracing::warn!(error = %e, task_call_id, label, "background batch task delegation failed");
                     }
                 }
                 let ack =
-                    self.background_delegation_ack(&task_call_id, task_function_call_id.clone());
+                    self.background_delegation_ack(&task_call_id, task_function_call_id.clone())
+                        .await;
                 if let Some(parent) = self.stack.last_mut() {
                     parent.history.push(ack);
                 }
@@ -2545,7 +2597,9 @@ impl Driver {
                     &entry.label,
                     &entry.prompt,
                     entry.child_agent != "docs",
-                ) {
+                )
+                .await
+            {
                 Ok(delivery) => delivery,
                 Err(e) => {
                     tracing::warn!(
@@ -2642,6 +2696,7 @@ impl Driver {
                         &entry.granted_tools,
                         &driver.session.db,
                     )
+                    .await
                     {
                         DelegationChildOutcome::failed(err)
                     } else if entry.child_agent == "docs" {
@@ -2728,7 +2783,8 @@ impl Driver {
                             &entry_task_call_id,
                             &entry.label,
                             &entry.child_agent,
-                        );
+                        )
+                        .await;
                         let (seed_prefix, seeds_truncated) =
                             driver
                                 .prefill_child_seeds(&entry.seeds, &child, &child_cwd.resolved, None)
@@ -2830,13 +2886,15 @@ impl Driver {
         }
 
         while let Some((idx, entry, outcome, snapshot)) = runs.next().await {
-            let report = self.reconcile_todo_delta(
-                &task_call_id,
-                &entry.label,
-                &entry.child_agent,
-                &outcome.report,
-                outcome.failed,
-            );
+            let report = self
+                .reconcile_todo_delta(
+                    &task_call_id,
+                    &entry.label,
+                    &entry.child_agent,
+                    &outcome.report,
+                    outcome.failed,
+                )
+                .await;
             let mut report_data = subagent_report_event_data(
                 &entry.child_agent,
                 Some(&task_call_id),
@@ -2974,13 +3032,12 @@ impl Driver {
                 failed,
                 Some(result.clone()),
             );
-            if let Err(e) = self.session.db.complete_task_delegation_child(
-                &task_call_id,
-                &label,
-                &report,
-                failed,
-                None,
-            ) {
+            if let Err(e) = self
+                .session
+                .db
+                .complete_task_delegation_child(&task_call_id, &label, &report, failed, None)
+                .await
+            {
                 tracing::warn!(error = %e, task_call_id, label, "complete batch delegation child failed");
             }
             let _ = self
@@ -3711,6 +3768,7 @@ pub(crate) async fn run_noninteractive_resumable(
             match session
                 .db
                 .drain_task_delegation_steers(&target.task_call_id, &target.label)
+                .await
             {
                 Ok(steers) if !steers.is_empty() => {
                     history.push(next_prompt);

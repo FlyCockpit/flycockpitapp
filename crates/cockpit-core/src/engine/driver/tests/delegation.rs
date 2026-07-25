@@ -87,6 +87,7 @@ async fn task_delegate_unknown_agent_writes_no_delegation_payload_row() {
         .session
         .db
         .list_task_delegation_children(driver.session.id)
+        .await
         .unwrap();
     assert!(children.is_empty(), "{children:?}");
 }
@@ -194,8 +195,8 @@ async fn task_unknown_agent_records_tool_rejected_event() {
     assert_eq!(event.data["reason"], "task_unknown_agent");
 }
 
-#[test]
-fn grant_rejection_unknown_agent_lists_reachable_agents() {
+#[tokio::test]
+async fn grant_rejection_unknown_agent_lists_reachable_agents() {
     let (driver, _tmp) = test_driver(8);
 
     let message = grant_rejection(
@@ -206,6 +207,7 @@ fn grant_rejection_unknown_agent_lists_reachable_agents() {
         &[],
         &driver.session.db,
     )
+    .await
     .unwrap();
 
     assert!(

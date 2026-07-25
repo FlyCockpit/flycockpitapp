@@ -99,18 +99,18 @@ pub struct Agent {
     pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
 }
 
-pub(crate) fn turn_toolbox(
+pub(crate) async fn turn_toolbox(
     agent: &Agent,
     session: &Session,
     cwd: &std::path::Path,
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> ToolBox {
     let mut toolbox =
-        toolbox_with_retrieval_if_needed(agent.tools.clone(), session, agent.llm_mode);
+        toolbox_with_retrieval_if_needed(agent.tools.clone(), session, agent.llm_mode).await;
     if !agent.model.can_delegate() {
         toolbox = toolbox.without("task").without("spawn");
     }
-    toolbox = crate::knowledge::with_memory_search_if_attached(toolbox, session, cwd, config);
+    toolbox = crate::knowledge::with_memory_search_if_attached(toolbox, session, cwd, config).await;
     let env = agent
         .env_overlay
         .read()
@@ -369,7 +369,7 @@ async fn inject_live_project_guidance_change(
     ));
 }
 
-fn toolbox_with_retrieval_if_needed(
+async fn toolbox_with_retrieval_if_needed(
     mut tools: ToolBox,
     session: &Session,
     llm_mode: crate::config::extended::LlmMode,
@@ -389,6 +389,7 @@ fn toolbox_with_retrieval_if_needed(
     if session
         .db
         .session_has_task_delegation_payloads(session.id)
+        .await
         .unwrap_or(false)
     {
         tools = tools.with(Arc::new(
@@ -1687,6 +1688,7 @@ mod compressed_tool_result_tests {
                 &session,
                 crate::config::extended::LlmMode::Normal
             )
+            .await
             .names()
             .contains(&"tool_result_retrieve")
         );
@@ -1706,6 +1708,7 @@ mod compressed_tool_result_tests {
                 &session,
                 crate::config::extended::LlmMode::Normal
             )
+            .await
             .names()
             .contains(&"tool_result_retrieve")
         );
@@ -1770,6 +1773,7 @@ mod compressed_tool_result_tests {
                 &session,
                 crate::config::extended::LlmMode::Normal
             )
+            .await
             .names()
             .contains(&"tool_result_retrieve")
         );
@@ -1838,6 +1842,7 @@ mod compressed_tool_result_tests {
                 &session,
                 crate::config::extended::LlmMode::Normal
             )
+            .await
             .names()
             .contains(&"escalate")
         );
@@ -1854,6 +1859,7 @@ mod compressed_tool_result_tests {
                 &session,
                 crate::config::extended::LlmMode::Normal
             )
+            .await
             .names()
             .contains(&"escalate")
         );
@@ -1863,6 +1869,7 @@ mod compressed_tool_result_tests {
                 &session,
                 crate::config::extended::LlmMode::Frontier
             )
+            .await
             .names()
             .contains(&"escalate")
         );
@@ -1872,6 +1879,7 @@ mod compressed_tool_result_tests {
                 &session,
                 crate::config::extended::LlmMode::Defensive
             )
+            .await
             .names()
             .contains(&"escalate")
         );
@@ -1901,6 +1909,7 @@ mod compressed_tool_result_tests {
                 &session,
                 crate::config::extended::LlmMode::Defensive
             )
+            .await
             .names()
             .contains(&"escalate")
         );

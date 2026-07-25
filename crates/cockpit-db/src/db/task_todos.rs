@@ -122,11 +122,7 @@ pub struct TaskTodoOverview {
 }
 
 impl Db {
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn create_task_todo(
+    pub async fn create_task_todo(
         &self,
         session_id: Uuid,
         content: &str,
@@ -139,7 +135,7 @@ impl Db {
         let id = Uuid::new_v4();
         let now = Utc::now().timestamp();
         let content = content.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let pos: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(position), -1) + 1 FROM task_todos WHERE session_id = ?1",
@@ -172,14 +168,11 @@ impl Db {
                 version: 0,
             })
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn list_task_todos(&self, session_id: Uuid) -> Result<Vec<TaskTodo>> {
-        self.read_blocking(|conn| {
+    pub async fn list_task_todos(&self, session_id: Uuid) -> Result<Vec<TaskTodo>> {
+        self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, session_id, content, status, priority, position, outcome_summary, version
@@ -194,13 +187,10 @@ impl Db {
             rows.map(|r| r.context("decoding task_todo"))
                 .collect::<Result<Vec<_>>>()
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn update_task_todo(
+    pub async fn update_task_todo(
         &self,
         session_id: Uuid,
         todo_id: Uuid,
@@ -212,7 +202,7 @@ impl Db {
         let now = Utc::now().timestamp();
         let content = content.map(str::to_owned);
         let outcome_summary = outcome_summary.map(str::to_owned);
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let existing = load_todo(conn, session_id, todo_id)?;
             let new_content = content
                 .as_deref()
@@ -244,13 +234,10 @@ impl Db {
             .context("updating task_todo")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn append_task_todo_note(
+    pub async fn append_task_todo_note(
         &self,
         session_id: Uuid,
         todo_id: Uuid,
@@ -267,7 +254,7 @@ impl Db {
         let now = Utc::now().timestamp();
         let body = body.to_owned();
         let author_agent = author_agent.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             load_todo(conn, session_id, todo_id)?;
             conn.execute(
                 "INSERT INTO task_todo_notes
@@ -287,13 +274,10 @@ impl Db {
             .context("inserting task_todo_note")?;
             Ok(id)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn assign_task_todos(
+    pub async fn assign_task_todos(
         &self,
         session_id: Uuid,
         todo_ids: &[Uuid],
@@ -306,7 +290,7 @@ impl Db {
         let task_call_id = task_call_id.to_owned();
         let label = label.to_owned();
         let child_agent = child_agent.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin assign_task_todos tx")?;
@@ -342,13 +326,10 @@ impl Db {
             tx.commit().context("commit assign_task_todos tx")?;
             Ok(assigned)
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn finish_task_assignment(
+    pub async fn finish_task_assignment(
         &self,
         session_id: Uuid,
         task_call_id: &str,
@@ -360,7 +341,7 @@ impl Db {
         let task_call_id = task_call_id.to_owned();
         let label = label.to_owned();
         let state = state.to_owned();
-        self.write_blocking(move |conn| {
+        self.write(move |conn| {
             conn.execute(
                 "UPDATE task_todo_assignments
                     SET state = ?1, child_session_id = COALESCE(?2, child_session_id), updated_at = ?3
@@ -377,13 +358,10 @@ impl Db {
             .context("updating task_todo_assignment")?;
             Ok(())
         })
+        .await
     }
 
-    #[expect(
-        deprecated,
-        reason = "db-async-foundation bridge; migrated later in db async accessor prompts"
-    )]
-    pub fn task_todo_detail_by_id_or_name(
+    pub async fn task_todo_detail_by_id_or_name(
         &self,
         session_id: Uuid,
         id_or_name: &str,
@@ -392,8 +370,9 @@ impl Db {
         if key.is_empty() {
             anyhow::bail!("todo id or name must not be empty");
         }
-        self.read_blocking(|conn| {
-            let todo = if let Ok(id) = Uuid::parse_str(key) {
+        let key = key.to_owned();
+        self.read(move |conn| {
+            let todo = if let Ok(id) = Uuid::parse_str(&key) {
                 load_todo_opt(conn, session_id, id)?
             } else {
                 let like = format!("%{key}%");
@@ -429,10 +408,15 @@ impl Db {
                 assignments,
             }))
         })
+        .await
     }
 
-    pub fn task_todo_overview(&self, session_id: Uuid, limit: usize) -> Result<TaskTodoOverview> {
-        let all = self.list_task_todos(session_id)?;
+    pub async fn task_todo_overview(
+        &self,
+        session_id: Uuid,
+        limit: usize,
+    ) -> Result<TaskTodoOverview> {
+        let all = self.list_task_todos(session_id).await?;
         let total = all.len();
         let mut active: Vec<_> = all
             .iter()
@@ -595,10 +579,13 @@ mod tests {
         let s = db.create_session("p", "/x", "Build").await.unwrap();
         let todo = db
             .create_task_todo(s.session_id, "implement thing", 5)
+            .await
             .unwrap();
         db.assign_task_todos(s.session_id, &[todo.id], "call-a", "default", "explore")
+            .await
             .unwrap();
         db.assign_task_todos(s.session_id, &[todo.id], "call-b", "default", "builder")
+            .await
             .unwrap();
         db.append_task_todo_note(
             s.session_id,
@@ -608,6 +595,7 @@ mod tests {
             "explore",
             None,
         )
+        .await
         .unwrap();
         db.append_task_todo_note(
             s.session_id,
@@ -617,10 +605,12 @@ mod tests {
             "builder",
             None,
         )
+        .await
         .unwrap();
 
         let detail = db
             .task_todo_detail_by_id_or_name(s.session_id, &todo.id.to_string())
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(detail.assignments.len(), 2);
@@ -629,10 +619,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn db_async_delegation_todos_roundtrip_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "Build").await.unwrap();
+        let todo = db
+            .create_task_todo(s.session_id, "wire async todo", 3)
+            .await
+            .unwrap();
+        db.assign_task_todos(s.session_id, &[todo.id], "call-async", "default", "explore")
+            .await
+            .unwrap();
+        db.finish_task_assignment(s.session_id, "call-async", "default", "completed", None)
+            .await
+            .unwrap();
+
+        let detail = db
+            .task_todo_detail_by_id_or_name(s.session_id, "wire async todo")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.todo.id, todo.id);
+        assert_eq!(detail.assignments[0].state, "completed");
+    }
+
+    #[tokio::test]
     async fn assign_task_todos_failure_rolls_back_prior_assignments() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").await.unwrap();
-        let todo = db.create_task_todo(s.session_id, "auth", 5).unwrap();
+        let todo = db.create_task_todo(s.session_id, "auth", 5).await.unwrap();
         let missing = Uuid::new_v4();
 
         let err = db
@@ -643,6 +657,7 @@ mod tests {
                 "default",
                 "explore",
             )
+            .await
             .unwrap_err();
 
         assert!(
@@ -651,6 +666,7 @@ mod tests {
         );
         let detail = db
             .task_todo_detail_by_id_or_name(s.session_id, &todo.id.to_string())
+            .await
             .unwrap()
             .unwrap();
         assert!(detail.assignments.is_empty());
@@ -662,21 +678,26 @@ mod tests {
     async fn assignments_scope_finish_by_task_call_and_label() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").await.unwrap();
-        let a = db.create_task_todo(s.session_id, "auth", 5).unwrap();
-        let b = db.create_task_todo(s.session_id, "db", 5).unwrap();
+        let a = db.create_task_todo(s.session_id, "auth", 5).await.unwrap();
+        let b = db.create_task_todo(s.session_id, "db", 5).await.unwrap();
         db.assign_task_todos(s.session_id, &[a.id], "call-1", "auth", "explore")
+            .await
             .unwrap();
         db.assign_task_todos(s.session_id, &[b.id], "call-1", "db", "explore")
+            .await
             .unwrap();
         db.finish_task_assignment(s.session_id, "call-1", "auth", "completed", None)
+            .await
             .unwrap();
 
         let auth = db
             .task_todo_detail_by_id_or_name(s.session_id, &a.id.to_string())
+            .await
             .unwrap()
             .unwrap();
         let db_todo = db
             .task_todo_detail_by_id_or_name(s.session_id, &b.id.to_string())
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(auth.assignments[0].label, "auth");
@@ -691,8 +712,10 @@ mod tests {
         let s = db.create_session("p", "/x", "Build").await.unwrap();
         let todo = db
             .create_task_todo(s.session_id, "ship compact overview", 9)
+            .await
             .unwrap();
         db.assign_task_todos(s.session_id, &[todo.id], "call-1", "default", "builder")
+            .await
             .unwrap();
         db.update_task_todo(
             s.session_id,
@@ -702,6 +725,7 @@ mod tests {
             None,
             Some("overview renders ids"),
         )
+        .await
         .unwrap();
         db.append_task_todo_note(
             s.session_id,
@@ -711,6 +735,7 @@ mod tests {
             "builder",
             None,
         )
+        .await
         .unwrap();
         db.append_task_todo_note(
             s.session_id,
@@ -720,12 +745,15 @@ mod tests {
             "builder",
             None,
         )
+        .await
         .unwrap();
         db.finish_task_assignment(s.session_id, "call-1", "default", "completed", None)
+            .await
             .unwrap();
 
         let detail = db
             .task_todo_detail_by_id_or_name(s.session_id, "compact overview")
+            .await
             .unwrap()
             .unwrap();
         assert!(matches!(detail.todo.status, TodoStatus::Completed));

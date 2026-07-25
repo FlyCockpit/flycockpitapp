@@ -7,8 +7,9 @@
 //! a `seq`-addressable `offset`, mirroring the `read` tool's truncation
 //! marker (prompt `search-old-sessions.md`).
 //!
-//! Output is plain tool text and passes back through the redaction
-//! chokepoint normally — no bypass.
+//! Output is plain tool text and passes back through the redaction chokepoint
+//! normally — no bypass. Stored history is raw, so reads are trust-filtered in
+//! the DB and must only reach models as ordinary tool output.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,6 +18,7 @@ use uuid::Uuid;
 
 use crate::db::session_search::ThreadTurn;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
+use crate::tools::session_search::caller_history_trust;
 
 /// Turns per page. A thread rarely needs the whole transcript at once;
 /// the agent pages with `offset` (a `seq`) to see more.
@@ -96,7 +98,7 @@ impl Tool for SessionReadTool {
         let turns = ctx
             .session
             .db
-            .thread_turns(session_id)
+            .thread_turns_for_trust(session_id, caller_history_trust(ctx))
             .await
             .map_err(|e| anyhow::anyhow!("session_read: {e:#}"))?;
         if turns.is_empty() {
@@ -197,7 +199,7 @@ async fn match_window_start(
     let seqs = ctx
         .session
         .db
-        .thread_match_seqs(session_id, query)
+        .thread_match_seqs_for_trust(session_id, query, caller_history_trust(ctx))
         .await
         .map_err(|e| anyhow::anyhow!("session_read: {e:#}"))?;
     let Some(&first_match) = seqs.first() else {

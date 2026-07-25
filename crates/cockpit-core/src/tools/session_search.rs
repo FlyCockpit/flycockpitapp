@@ -9,19 +9,24 @@
 //!
 //! Output is plain tool text; it passes back through the redaction
 //! chokepoint on the next outbound prompt like any other tool result —
-//! no bypass, no second pre-redaction (prompt decision).
+//! no bypass, no second pre-redaction (prompt decision). Stored history is raw,
+//! and trusted-model rows may contain secrets because trusted outbound redaction
+//! is a no-op; history text must only reach models as ordinary tool output.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+use crate::db::session_search::HistoryCallerTrust;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 
 /// Default number of threads shown; the agent can widen via `limit`.
 const DEFAULT_LIMIT: u32 = 10;
 /// Hard ceiling on `limit` so a runaway value can't dump the whole DB.
 const MAX_LIMIT: u32 = 50;
+const TOOL_SCAN_MAX_SESSIONS: u32 = 16;
+const TOOL_SCAN_MAX_ROWS_PER_SESSION: u32 = 20;
 
 pub struct SessionSearchTool;
 
@@ -120,7 +125,14 @@ impl Tool for SessionSearchTool {
         let hits = ctx
             .session
             .db
-            .search_candidates(query, project_id, Some(ctx.session.id), since, pool)
+            .search_candidates_for_trust(
+                query,
+                project_id,
+                Some(ctx.session.id),
+                since,
+                pool,
+                caller_history_trust(ctx),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("session_search: {e:#}"))?;
 
@@ -152,6 +164,150 @@ impl Tool for SessionSearchTool {
         }
         out.push_str("\nUse session_read with a short id (and the topic as `query`) to read a thread back.\n");
         Ok(ToolOutput::text(out))
+    }
+}
+
+pub struct SessionLineageSearchTool;
+
+#[async_trait]
+impl Tool for SessionLineageSearchTool {
+    fn name(&self) -> &str {
+        "session_lineage_search"
+    }
+
+    fn description(&self) -> &str {
+        "Search the current session's compaction lineage, including compacted predecessors and the current session"
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Keyword search text" },
+                "limit": { "type": "integer", "description": "Max FTS hits (default 10, max 50)" },
+                "include_tool_events": { "type": "boolean", "description": "Also scan bounded tool-call event JSON inside the lineage" }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        ctx.session
+            .db
+            .fts5_available()
+            .await
+            .map_err(|e| invalid_input(format!("{e:#}")))?;
+
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .ok_or_else(|| invalid_input("`query` is required"))?;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|l| (l as u32).clamp(1, MAX_LIMIT))
+            .unwrap_or(DEFAULT_LIMIT);
+        let include_tool_events = args
+            .get("include_tool_events")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let trust = caller_history_trust(ctx);
+
+        let lineage = ctx
+            .session
+            .db
+            .compaction_lineage_sessions(ctx.session.id)
+            .await
+            .map_err(|e| anyhow::anyhow!("session_lineage_search: {e:#}"))?;
+        let hits = ctx
+            .session
+            .db
+            .search_lineage_candidates(query, ctx.session.id, limit, trust)
+            .await
+            .map_err(|e| anyhow::anyhow!("session_lineage_search: {e:#}"))?;
+        let scan = if include_tool_events {
+            Some(
+                ctx.session
+                    .db
+                    .scan_tool_events_in_sessions(
+                        query,
+                        &lineage,
+                        trust,
+                        TOOL_SCAN_MAX_SESSIONS,
+                        TOOL_SCAN_MAX_ROWS_PER_SESSION,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("session_lineage_search: {e:#}"))?,
+            )
+        } else {
+            None
+        };
+
+        if hits.is_empty() && scan.as_ref().is_none_or(|scan| scan.hits.is_empty()) {
+            return Ok(ToolOutput::text(format!(
+                "No accessible lineage history matches `{query}`."
+            )));
+        }
+
+        let mut out = format!("Lineage history matches for `{query}`:\n");
+        for hit in &hits {
+            let id = hit
+                .short_id
+                .clone()
+                .unwrap_or_else(|| hit.session_id.to_string());
+            let title = hit.title.as_deref().unwrap_or("(untitled)");
+            out.push_str(&format!(
+                "{}  {}  {}\n    {}\n",
+                id,
+                human_date(hit.last_active_at),
+                title,
+                hit.snippet.trim()
+            ));
+        }
+        if let Some(scan) = scan {
+            if !scan.hits.is_empty() {
+                out.push_str("\nBounded tool-event matches:\n");
+                for hit in scan.hits {
+                    out.push_str(&format!(
+                        "{} [{}] {}: {}\n",
+                        hit.session_id,
+                        hit.seq,
+                        hit.event_type,
+                        hit.snippet.trim()
+                    ));
+                }
+            }
+            if scan.truncated {
+                out.push_str(
+                    "\nTool-event scan hit its bounded cap; narrow the query for more detail.\n",
+                );
+                return Ok(ToolOutput::truncated_text(out));
+            }
+        }
+        Ok(ToolOutput::text(out))
+    }
+}
+
+pub(crate) fn caller_history_trust(ctx: &ToolCtx) -> HistoryCallerTrust {
+    let (Some(provider), Some(model)) = (ctx.session.active_provider(), ctx.session.active_model())
+    else {
+        return HistoryCallerTrust::Untrusted;
+    };
+    if ctx
+        .config
+        .providers()
+        .resolve_trust(&provider, &model)
+        .is_trusted()
+    {
+        HistoryCallerTrust::Trusted
+    } else {
+        HistoryCallerTrust::Untrusted
     }
 }
 
@@ -188,6 +344,29 @@ mod tests {
     use crate::db::session_log::SessionEventKind;
     use crate::tools::common::test_ctx;
     use serde_json::json;
+
+    fn write_untrusted_provider(root: &std::path::Path) {
+        let providers = root.join(".cockpit/providers");
+        std::fs::create_dir_all(&providers).unwrap();
+        std::fs::write(
+            root.join(".cockpit/config.json"),
+            r#"{"llm_mode":"normal"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            providers.join("local.json"),
+            serde_json::json!({
+                "url": "https://example.test/v1",
+                "models": [{
+                    "id": "local-model",
+                    "trust": "untrusted",
+                    "mode": "normal"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn search_returns_ranked_threads_with_snippets() {
@@ -255,6 +434,47 @@ mod tests {
             out.content.contains("No past sessions"),
             "current session must be excluded: {}",
             out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn history_trust_lineage_search_includes_current_session_without_relaxing_session_search()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        write_untrusted_provider(tmp.path());
+        let ctx = test_ctx(tmp.path());
+        ctx.session
+            .set_active_model("local", "local-model")
+            .unwrap();
+        ctx.session
+            .db
+            .insert_session_event(
+                ctx.session.id,
+                SessionEventKind::UserMessage,
+                None,
+                None,
+                &json!({ "text": "current lineage has moonstone detail" }),
+            )
+            .await
+            .unwrap();
+
+        let lineage = SessionLineageSearchTool
+            .call(
+                json!({ "query": "moonstone", "include_tool_events": false }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(lineage.content.contains("moonstone"), "{}", lineage.content);
+
+        let cross_thread = SessionSearchTool
+            .call(json!({ "query": "moonstone" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            cross_thread.content.contains("No past sessions"),
+            "{}",
+            cross_thread.content
         );
     }
 

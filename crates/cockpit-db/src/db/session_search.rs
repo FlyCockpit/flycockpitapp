@@ -9,9 +9,22 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::db::Db;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryCallerTrust {
+    Trusted,
+    Untrusted,
+}
+
+impl HistoryCallerTrust {
+    fn can_read_trusted(self) -> bool {
+        matches!(self, Self::Trusted)
+    }
+}
 
 /// One FTS5 hit, resolved back to its thread + in-thread location. The
 /// snippet is generated from canonical session text with matched literal
@@ -38,6 +51,20 @@ pub struct ThreadTurn {
     /// `user` or `assistant`.
     pub role: String,
     pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolEventScanHit {
+    pub session_id: Uuid,
+    pub seq: i64,
+    pub event_type: String,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolEventScan {
+    pub hits: Vec<ToolEventScanHit>,
+    pub truncated: bool,
 }
 
 impl Db {
@@ -84,6 +111,26 @@ impl Db {
         since: Option<i64>,
         pool: u32,
     ) -> Result<Vec<SearchHit>> {
+        self.search_candidates_for_trust(
+            query,
+            project_id,
+            exclude_session,
+            since,
+            pool,
+            HistoryCallerTrust::Trusted,
+        )
+        .await
+    }
+
+    pub async fn search_candidates_for_trust(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        exclude_session: Option<Uuid>,
+        since: Option<i64>,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
         let query = query.to_string();
         let project_id = project_id.map(str::to_string);
         self.read(move |conn| {
@@ -94,6 +141,7 @@ impl Db {
                 exclude_session,
                 since,
                 pool,
+                caller_trust,
             )
         })
         .await
@@ -104,35 +152,56 @@ impl Db {
     /// windowing — the tool slices this in Rust per the `read`-tool
     /// pagination conventions. Non-message events are skipped.
     pub async fn thread_turns(&self, session_id: Uuid) -> Result<Vec<ThreadTurn>> {
-        self.read(move |conn| Self::thread_turns_conn(conn, session_id))
+        self.thread_turns_for_trust(session_id, HistoryCallerTrust::Trusted)
+            .await
+    }
+
+    pub async fn thread_turns_for_trust(
+        &self,
+        session_id: Uuid,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<ThreadTurn>> {
+        self.read(move |conn| Self::thread_turns_conn_for_trust(conn, session_id, caller_trust))
             .await
     }
 
     pub fn thread_turns_conn(conn: &Connection, session_id: Uuid) -> Result<Vec<ThreadTurn>> {
+        Self::thread_turns_conn_for_trust(conn, session_id, HistoryCallerTrust::Trusted)
+    }
+
+    pub fn thread_turns_conn_for_trust(
+        conn: &Connection,
+        session_id: Uuid,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<ThreadTurn>> {
         let mut stmt = conn
             .prepare(
                 "SELECT seq, type, json_extract(data_json, '$.text') AS text
                    FROM session_events
                   WHERE session_id = ?1
                     AND type IN ('user_message', 'assistant_message')
+                    AND (?2 OR model_trust IS NULL OR model_trust <> 'trusted')
                   ORDER BY seq ASC",
             )
             .context("preparing thread_turns")?;
         let rows = stmt
-            .query_map([session_id.to_string()], |row| {
-                let kind: String = row.get("type")?;
-                let role = match kind.as_str() {
-                    "assistant_message" => "assistant",
-                    _ => "user",
-                }
-                .to_string();
-                let text: Option<String> = row.get("text")?;
-                Ok(ThreadTurn {
-                    seq: row.get("seq")?,
-                    role,
-                    text: text.unwrap_or_default(),
-                })
-            })
+            .query_map(
+                params![session_id.to_string(), caller_trust.can_read_trusted()],
+                |row| {
+                    let kind: String = row.get("type")?;
+                    let role = match kind.as_str() {
+                        "assistant_message" => "assistant",
+                        _ => "user",
+                    }
+                    .to_string();
+                    let text: Option<String> = row.get("text")?;
+                    Ok(ThreadTurn {
+                        seq: row.get("seq")?,
+                        role,
+                        text: text.unwrap_or_default(),
+                    })
+                },
+            )
             .context("querying thread_turns")?;
         let mut out = Vec::new();
         for r in rows {
@@ -145,6 +214,16 @@ impl Db {
     /// oldest first. `session_read` centers its window on these. Empty
     /// when the thread has no textual match.
     pub async fn thread_match_seqs(&self, session_id: Uuid, query: &str) -> Result<Vec<i64>> {
+        self.thread_match_seqs_for_trust(session_id, query, HistoryCallerTrust::Trusted)
+            .await
+    }
+
+    pub async fn thread_match_seqs_for_trust(
+        &self,
+        session_id: Uuid,
+        query: &str,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<i64>> {
         let query = query.to_string();
         self.read(move |conn| {
             let Some(match_query) = literal_fts_match_query(&query) else {
@@ -155,22 +234,72 @@ impl Db {
                     "SELECT f.seq
                        FROM session_fts
                        JOIN session_fts_docs AS f ON f.rowid = session_fts.rowid
+                       JOIN session_events AS e ON e.seq = f.seq
                       WHERE session_fts MATCH ?1
                         AND f.row_kind = 'message'
                         AND f.session_id = ?2
+                        AND (?3 OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
                       ORDER BY f.seq ASC",
                 )
                 .context("preparing thread_match_seqs")?;
             let rows = stmt
-                .query_map(params![match_query, session_id.to_string()], |row| {
-                    row.get::<_, i64>("seq")
-                })
+                .query_map(
+                    params![
+                        match_query,
+                        session_id.to_string(),
+                        caller_trust.can_read_trusted()
+                    ],
+                    |row| row.get::<_, i64>("seq"),
+                )
                 .context("querying thread_match_seqs")?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r.context("decoding match seq")?);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    pub async fn compaction_lineage_sessions(&self, session_id: Uuid) -> Result<Vec<Uuid>> {
+        self.read(move |conn| compaction_lineage_sessions_conn(conn, session_id))
+            .await
+    }
+
+    pub async fn search_lineage_candidates(
+        &self,
+        query: &str,
+        session_id: Uuid,
+        pool: u32,
+        caller_trust: HistoryCallerTrust,
+    ) -> Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        self.read(move |conn| {
+            let lineage = compaction_lineage_sessions_conn(conn, session_id)?;
+            search_candidates_in_sessions_inner(conn, &query, &lineage, pool, caller_trust)
+        })
+        .await
+    }
+
+    pub async fn scan_tool_events_in_sessions(
+        &self,
+        query: &str,
+        session_ids: &[Uuid],
+        caller_trust: HistoryCallerTrust,
+        max_sessions: u32,
+        max_rows_per_session: u32,
+    ) -> Result<ToolEventScan> {
+        let query = query.to_string();
+        let session_ids = session_ids.to_vec();
+        self.read(move |conn| {
+            scan_tool_events_in_sessions_conn(
+                conn,
+                &query,
+                &session_ids,
+                caller_trust,
+                max_sessions,
+                max_rows_per_session,
+            )
         })
         .await
     }
@@ -183,6 +312,7 @@ fn search_candidates_inner(
     exclude_session: Option<Uuid>,
     since: Option<i64>,
     pool: u32,
+    caller_trust: HistoryCallerTrust,
 ) -> Result<Vec<SearchHit>> {
     let Some(match_query) = literal_fts_match_query(query) else {
         return Ok(Vec::new());
@@ -204,6 +334,12 @@ fn search_candidates_inner(
                     s.last_active_at AS last_active_at,
                     CASE f.row_kind
                       WHEN 'title' THEN s.title
+                      WHEN 'compaction' THEN COALESCE(
+                        json_extract(e.data_json, '$.brief_text'),
+                        json_extract(e.data_json, '$.handoff_text'),
+                        json_extract(h.payload_json, '$.brief_text'),
+                        json_extract(h.payload_json, '$.handoff_text')
+                      )
                       ELSE json_extract(e.data_json, '$.text')
                     END AS body,
                     bm25(session_fts) AS rank
@@ -211,28 +347,41 @@ fn search_candidates_inner(
                JOIN session_fts_docs AS f ON f.rowid = session_fts.rowid
                JOIN sessions AS s ON s.session_id = f.session_id
           LEFT JOIN session_events AS e ON e.seq = f.seq
+          LEFT JOIN compaction_handoffs AS h
+                 ON h.handoff_id = json_extract(e.data_json, '$.handoff_ref')
+                AND h.session_id = e.session_id
               WHERE session_fts MATCH ?1
                 AND s.archived_at IS NULL
                 AND (?2 IS NULL OR s.project_id = ?2)
                 AND (?3 IS NULL OR s.session_id <> ?3)
                 AND (?4 IS NULL OR s.last_active_at >= ?4)
+                AND (?5 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
               ORDER BY rank ASC, s.last_active_at DESC",
         )
         .context("preparing search_candidates")?;
 
     let exclude = exclude_session.map(|u| u.to_string());
     let rows = stmt
-        .query_map(params![match_query, project_id, exclude, since], |row| {
-            let sid: String = row.get("session_id")?;
-            Ok((
-                sid,
-                row.get::<_, Option<String>>("short_id")?,
-                row.get::<_, Option<String>>("title")?,
-                row.get::<_, i64>("last_active_at")?,
-                row.get::<_, Option<String>>("body")?,
-                row.get::<_, f64>("rank")?,
-            ))
-        })
+        .query_map(
+            params![
+                match_query,
+                project_id,
+                exclude,
+                since,
+                caller_trust.can_read_trusted()
+            ],
+            |row| {
+                let sid: String = row.get("session_id")?;
+                Ok((
+                    sid,
+                    row.get::<_, Option<String>>("short_id")?,
+                    row.get::<_, Option<String>>("title")?,
+                    row.get::<_, i64>("last_active_at")?,
+                    row.get::<_, Option<String>>("body")?,
+                    row.get::<_, f64>("rank")?,
+                ))
+            },
+        )
         .context("querying search_candidates")?;
 
     // Collapse to one hit per thread, keeping the first (best-ranking)
@@ -274,6 +423,261 @@ fn search_candidates_inner(
             .map(|id| by_session.remove(&id).unwrap())
             .collect(),
     ))
+}
+
+fn search_candidates_in_sessions_inner(
+    conn: &Connection,
+    query: &str,
+    session_ids: &[Uuid],
+    pool: u32,
+    caller_trust: HistoryCallerTrust,
+) -> Result<Vec<SearchHit>> {
+    let Some(match_query) = literal_fts_match_query(query) else {
+        return Ok(Vec::new());
+    };
+    let terms = literal_fts_terms(query);
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for session_id in session_ids {
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.session_id AS session_id,
+                        s.short_id AS short_id,
+                        s.title AS title,
+                        s.last_active_at AS last_active_at,
+                        CASE f.row_kind
+                          WHEN 'title' THEN s.title
+                          WHEN 'compaction' THEN COALESCE(
+                            json_extract(e.data_json, '$.brief_text'),
+                            json_extract(e.data_json, '$.handoff_text'),
+                            json_extract(h.payload_json, '$.brief_text'),
+                            json_extract(h.payload_json, '$.handoff_text')
+                          )
+                          ELSE json_extract(e.data_json, '$.text')
+                        END AS body,
+                        bm25(session_fts) AS rank
+                   FROM session_fts
+                   JOIN session_fts_docs AS f ON f.rowid = session_fts.rowid
+                   JOIN sessions AS s ON s.session_id = f.session_id
+              LEFT JOIN session_events AS e ON e.seq = f.seq
+              LEFT JOIN compaction_handoffs AS h
+                     ON h.handoff_id = json_extract(e.data_json, '$.handoff_ref')
+                    AND h.session_id = e.session_id
+                  WHERE session_fts MATCH ?1
+                    AND f.session_id = ?2
+                    AND (?3 OR f.row_kind = 'title' OR e.model_trust IS NULL OR e.model_trust <> 'trusted')
+                  ORDER BY rank ASC, f.seq ASC",
+            )
+            .context("preparing lineage search")?;
+        let rows = stmt
+            .query_map(
+                params![
+                    match_query,
+                    session_id.to_string(),
+                    caller_trust.can_read_trusted()
+                ],
+                |row| {
+                    let sid: String = row.get("session_id")?;
+                    Ok((
+                        sid,
+                        row.get::<_, Option<String>>("short_id")?,
+                        row.get::<_, Option<String>>("title")?,
+                        row.get::<_, i64>("last_active_at")?,
+                        row.get::<_, Option<String>>("body")?,
+                        row.get::<_, f64>("rank")?,
+                    ))
+                },
+            )
+            .context("querying lineage search")?;
+        for row in rows {
+            let (sid, short_id, title, last_active_at, body, bm25) =
+                row.context("decoding lineage search hit")?;
+            let hit_session_id =
+                Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?;
+            if !seen.insert(hit_session_id) {
+                continue;
+            }
+            let Some(body) = body else {
+                continue;
+            };
+            out.push(SearchHit {
+                session_id: hit_session_id,
+                short_id,
+                title,
+                last_active_at,
+                snippet: canonical_snippet(&body, &terms),
+                bm25,
+            });
+            if out.len() as u32 >= pool {
+                return Ok(rank_candidates(out));
+            }
+        }
+    }
+    Ok(rank_candidates(out))
+}
+
+fn compaction_lineage_sessions_conn(conn: &Connection, session_id: Uuid) -> Result<Vec<Uuid>> {
+    let existing = existing_session_ids(conn)?;
+    if !existing.contains(&session_id) {
+        return Ok(Vec::new());
+    }
+    let links = compaction_links(conn)?;
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(session_id);
+
+    let mut backwards = Vec::new();
+    let mut cursor = session_id;
+    while let Some((predecessor, _)) = links.iter().find(|(_, successor)| *successor == cursor) {
+        if !existing.contains(predecessor) || !visited.insert(*predecessor) {
+            break;
+        }
+        backwards.push(*predecessor);
+        cursor = *predecessor;
+    }
+    backwards.reverse();
+
+    let mut forwards = Vec::new();
+    cursor = session_id;
+    while let Some((_, successor)) = links.iter().find(|(predecessor, _)| *predecessor == cursor) {
+        if !existing.contains(successor) || !visited.insert(*successor) {
+            break;
+        }
+        forwards.push(*successor);
+        cursor = *successor;
+    }
+
+    let mut lineage = backwards;
+    lineage.push(session_id);
+    lineage.extend(forwards);
+    Ok(lineage)
+}
+
+fn existing_session_ids(conn: &Connection) -> Result<std::collections::HashSet<Uuid>> {
+    let mut stmt = conn
+        .prepare("SELECT session_id FROM sessions")
+        .context("preparing session id scan")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>("session_id"))
+        .context("querying session ids")?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        let sid = row.context("decoding session id")?;
+        out.insert(Uuid::parse_str(&sid).with_context(|| format!("session_id `{sid}`"))?);
+    }
+    Ok(out)
+}
+
+fn compaction_links(conn: &Connection) -> Result<Vec<(Uuid, Uuid)>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.session_id, e.data_json, h.payload_json
+               FROM session_events e
+          LEFT JOIN compaction_handoffs h
+                 ON h.handoff_id = json_extract(e.data_json, '$.handoff_ref')
+                AND h.session_id = e.session_id
+              WHERE e.type = 'session_compacted'
+              ORDER BY e.seq ASC",
+        )
+        .context("preparing compaction link scan")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>("session_id")?,
+                row.get::<_, String>("data_json")?,
+                row.get::<_, Option<String>>("payload_json")?,
+            ))
+        })
+        .context("querying compaction links")?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (_, data_json, payload_json) = row.context("decoding compaction link")?;
+        let link_source = payload_json.as_deref().unwrap_or(data_json.as_str());
+        let Ok(value) = serde_json::from_str::<Value>(link_source) else {
+            continue;
+        };
+        let Some(predecessor) = value
+            .get("predecessor_session_id")
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            continue;
+        };
+        let Some(successor) = value
+            .get("successor_session_id")
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            continue;
+        };
+        out.push((predecessor, successor));
+    }
+    Ok(out)
+}
+
+fn scan_tool_events_in_sessions_conn(
+    conn: &Connection,
+    query: &str,
+    session_ids: &[Uuid],
+    caller_trust: HistoryCallerTrust,
+    max_sessions: u32,
+    max_rows_per_session: u32,
+) -> Result<ToolEventScan> {
+    let terms = literal_fts_terms(query);
+    if terms.is_empty() {
+        return Ok(ToolEventScan {
+            hits: Vec::new(),
+            truncated: false,
+        });
+    }
+    let needle = terms.join(" ");
+    let mut hits = Vec::new();
+    let mut truncated = session_ids.len() > max_sessions as usize;
+    for session_id in session_ids.iter().take(max_sessions as usize) {
+        let fetch_limit = i64::from(max_rows_per_session.clamp(1, 100)) + 1;
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, type, data_json
+                   FROM session_events
+                  WHERE session_id = ?1
+                    AND type IN ('tool_call', 'tool_call_started', 'tool_call_completed', 'tool_rejected')
+                    AND instr(lower(data_json), lower(?2)) > 0
+                    AND (?3 OR model_trust IS NULL OR model_trust <> 'trusted')
+                  ORDER BY seq ASC
+                  LIMIT ?4",
+            )
+            .context("preparing bounded tool event scan")?;
+        let rows = stmt
+            .query_map(
+                params![
+                    session_id.to_string(),
+                    needle,
+                    caller_trust.can_read_trusted(),
+                    fetch_limit
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>("seq")?,
+                        row.get::<_, String>("type")?,
+                        row.get::<_, String>("data_json")?,
+                    ))
+                },
+            )
+            .context("querying bounded tool event scan")?;
+        for (idx, row) in rows.enumerate() {
+            if idx >= max_rows_per_session as usize {
+                truncated = true;
+                break;
+            }
+            let (seq, event_type, data_json) = row.context("decoding tool event scan hit")?;
+            hits.push(ToolEventScanHit {
+                session_id: *session_id,
+                seq,
+                event_type,
+                snippet: canonical_snippet(&data_json, &terms),
+            });
+        }
+    }
+    Ok(ToolEventScan { hits, truncated })
 }
 
 const SNIPPET_CONTEXT_CHARS: usize = 48;
@@ -400,7 +804,8 @@ fn rank_candidates(mut candidates: Vec<SearchHit>) -> Vec<SearchHit> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::session_log::SessionEventKind;
+    use crate::db::session_log::{SessionEventContext, SessionEventKind};
+    use rusqlite::params;
     use serde_json::json;
 
     /// Insert a message event and return its seq.
@@ -408,6 +813,290 @@ mod tests {
         db.insert_session_event(session_id, kind, None, None, &json!({ "text": text }))
             .await
             .unwrap()
+    }
+
+    async fn event_with_trust(
+        db: &Db,
+        session_id: Uuid,
+        kind: SessionEventKind,
+        text: &str,
+        trust: Option<&str>,
+    ) -> i64 {
+        db.insert_session_event_with_context(
+            session_id,
+            kind,
+            None,
+            None,
+            SessionEventContext {
+                model_trust: trust,
+                provider_id: trust.map(|_| "provider-a"),
+                model_id: trust.map(|_| "model-a"),
+                llm_mode: trust.map(|_| "normal"),
+                ..Default::default()
+            },
+            &json!({ "text": text }),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn compact_link(
+        db: &Db,
+        predecessor: Uuid,
+        successor: Uuid,
+        body: &str,
+        spilled: bool,
+    ) -> i64 {
+        let payload = json!({
+            "kind": "compaction",
+            "predecessor_session_id": predecessor.to_string(),
+            "successor_session_id": successor.to_string(),
+            "brief_text": body,
+            "handoff_text": format!("handoff {body}"),
+        });
+        let data = if spilled {
+            let handoff_id = Uuid::new_v4();
+            db.store_compaction_payload(handoff_id, predecessor, &payload.to_string())
+                .await
+                .unwrap();
+            json!({
+                "kind": "compaction",
+                "predecessor_session_id": predecessor.to_string(),
+                "successor_session_id": successor.to_string(),
+                "handoff_ref": handoff_id.to_string(),
+            })
+        } else {
+            payload
+        };
+        db.insert_session_event_with_context(
+            predecessor,
+            SessionEventKind::SessionCompacted,
+            Some("Build"),
+            None,
+            SessionEventContext {
+                provider_id: Some("provider-a"),
+                model_id: Some("model-a"),
+                llm_mode: Some("normal"),
+                model_trust: Some("untrusted"),
+                ..Default::default()
+            },
+            &data,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn history_trust_filters_search_and_thread_reads_in_sql() {
+        let db = Db::open_in_memory().unwrap();
+        let all_trusted = db.create_session("p", "/a", "Build").await.unwrap();
+        let mixed = db.create_session("p", "/b", "Build").await.unwrap();
+
+        event_with_trust(
+            &db,
+            all_trusted.session_id,
+            SessionEventKind::AssistantMessage,
+            "needle only trusted",
+            Some("trusted"),
+        )
+        .await;
+        event_with_trust(
+            &db,
+            mixed.session_id,
+            SessionEventKind::AssistantMessage,
+            "needle trusted hidden",
+            Some("trusted"),
+        )
+        .await;
+        event_with_trust(
+            &db,
+            mixed.session_id,
+            SessionEventKind::AssistantMessage,
+            "needle untrusted visible",
+            Some("untrusted"),
+        )
+        .await;
+        event_with_trust(
+            &db,
+            mixed.session_id,
+            SessionEventKind::UserMessage,
+            "needle null visible",
+            None,
+        )
+        .await;
+
+        let untrusted = db
+            .search_candidates_for_trust(
+                "needle",
+                Some("p"),
+                None,
+                None,
+                10,
+                HistoryCallerTrust::Untrusted,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            untrusted
+                .iter()
+                .map(|hit| hit.session_id)
+                .collect::<Vec<_>>(),
+            vec![mixed.session_id]
+        );
+
+        let trusted = db
+            .search_candidates_for_trust(
+                "needle",
+                Some("p"),
+                None,
+                None,
+                10,
+                HistoryCallerTrust::Trusted,
+            )
+            .await
+            .unwrap();
+        assert_eq!(trusted.len(), 2);
+
+        let turns = db
+            .thread_turns_for_trust(mixed.session_id, HistoryCallerTrust::Untrusted)
+            .await
+            .unwrap();
+        assert_eq!(turns.len(), 2);
+        assert!(
+            turns
+                .iter()
+                .all(|turn| !turn.text.contains("trusted hidden"))
+        );
+    }
+
+    #[tokio::test]
+    async fn history_trust_lineage_walks_spilled_links_and_stops_on_cycles() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.create_session("p", "/a", "Build").await.unwrap();
+        let b = db.create_session("p", "/b", "Build").await.unwrap();
+        let c = db.create_session("p", "/c", "Build").await.unwrap();
+        compact_link(&db, a.session_id, b.session_id, "alpha-brief", false).await;
+        compact_link(&db, b.session_id, c.session_id, "bravo-brief", true).await;
+
+        let lineage = db.compaction_lineage_sessions(b.session_id).await.unwrap();
+        assert_eq!(lineage, vec![a.session_id, b.session_id, c.session_id]);
+
+        compact_link(&db, c.session_id, a.session_id, "cycle-brief", false).await;
+        let cyclic = db.compaction_lineage_sessions(a.session_id).await.unwrap();
+        assert!(cyclic.len() <= 3, "cycle must not loop: {cyclic:?}");
+        assert!(cyclic.contains(&a.session_id));
+
+        let dangling = db.create_session("p", "/dangling", "Build").await.unwrap();
+        compact_link(
+            &db,
+            dangling.session_id,
+            Uuid::new_v4(),
+            "dangling-brief",
+            false,
+        )
+        .await;
+        assert_eq!(
+            db.compaction_lineage_sessions(dangling.session_id)
+                .await
+                .unwrap(),
+            vec![dangling.session_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn history_trust_fts_indexes_compaction_briefs_inline_and_spilled() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.create_session("p", "/a", "Build").await.unwrap();
+        let b = db.create_session("p", "/b", "Build").await.unwrap();
+        let c = db.create_session("p", "/c", "Build").await.unwrap();
+        let inline_seq = compact_link(&db, a.session_id, b.session_id, "inlinequartz", false).await;
+        compact_link(&db, b.session_id, c.session_id, "spilledtopaz", true).await;
+
+        let inline = db
+            .search_candidates("inlinequartz", Some("p"), None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(inline[0].session_id, a.session_id);
+        let spilled = db
+            .search_candidates("spilledtopaz", Some("p"), None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(spilled[0].session_id, b.session_id);
+
+        db.write(move |conn| {
+            conn.execute(
+                "DELETE FROM session_events WHERE seq = ?1",
+                params![inline_seq],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            db.search_candidates("inlinequartz", Some("p"), None, None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn history_trust_tool_events_are_bounded_scanned_not_indexed_and_trust_filtered() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/a", "Build").await.unwrap();
+        db.insert_session_event_with_context(
+            session.session_id,
+            SessionEventKind::ToolCall,
+            Some("Build"),
+            Some("call-1"),
+            SessionEventContext {
+                model_trust: Some("trusted"),
+                provider_id: Some("provider-a"),
+                model_id: Some("trusted-model"),
+                llm_mode: Some("normal"),
+                ..Default::default()
+            },
+            &json!({"tool": "bash", "output": "secretamber trusted"}),
+        )
+        .await
+        .unwrap();
+        db.insert_session_event_with_context(
+            session.session_id,
+            SessionEventKind::ToolCall,
+            Some("Build"),
+            Some("call-2"),
+            SessionEventContext {
+                model_trust: Some("untrusted"),
+                provider_id: Some("provider-a"),
+                model_id: Some("untrusted-model"),
+                llm_mode: Some("normal"),
+                ..Default::default()
+            },
+            &json!({"tool": "bash", "output": "secretamber visible"}),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.search_candidates("secretamber", Some("p"), None, None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let scan = db
+            .scan_tool_events_in_sessions(
+                "secretamber",
+                &[session.session_id],
+                HistoryCallerTrust::Untrusted,
+                1,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(scan.hits.len(), 1);
+        assert!(scan.hits[0].snippet.contains("visible"));
+        assert!(!scan.hits[0].snippet.contains("secretamber trusted"));
+        assert!(!scan.truncated);
     }
 
     #[tokio::test]

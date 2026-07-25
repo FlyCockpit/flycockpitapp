@@ -695,9 +695,9 @@ CREATE INDEX idx_loop_guard_rules_session ON loop_guard_rules (session_id);
 -- ---- session full-text search (`session_search` / `session_read`) -----------------
 -- A single FTS5 virtual table indexes the *searchable* surface of every
 -- session: the session TITLE plus the text of `user_message` /
--- `assistant_message` events. Tool outputs, tool-call args, and raw
--- inference payloads are deliberately NOT indexed — they're noise for
--- recall and a token/privacy hazard.
+-- `assistant_message` events and model-written compaction briefs/handoffs.
+-- Tool outputs, tool-call args, and raw inference payloads are deliberately
+-- NOT indexed — they're noise for recall and a token/privacy hazard.
 --
 -- Layout choice: a contentless FTS5 table (`content=''`) with one indexed
 -- text column, because the searchable text is spread across two base
@@ -707,7 +707,8 @@ CREATE INDEX idx_loop_guard_rules_session ON loop_guard_rules (session_id);
 -- thread (`session_id`) and, for message rows, an in-thread location
 -- (`seq`); it stores identifiers only, never a second copy of text.
 --
---   row_kind   — 'title' | 'message', so `session_read` windows correctly.
+--   row_kind   — 'title' | 'message' | 'compaction', so readers can window
+--                messages separately from compaction summary matches.
 --   seq        — session_events.seq for a message row; NULL for a title.
 
 CREATE VIRTUAL TABLE session_fts USING fts5(
@@ -717,7 +718,7 @@ CREATE VIRTUAL TABLE session_fts USING fts5(
 
 CREATE TABLE session_fts_docs (
     rowid      INTEGER PRIMARY KEY,
-    row_kind   TEXT NOT NULL CHECK (row_kind IN ('title', 'message')),
+    row_kind   TEXT NOT NULL CHECK (row_kind IN ('title', 'message', 'compaction')),
     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     seq        INTEGER REFERENCES session_events(seq) ON DELETE CASCADE,
     UNIQUE(row_kind, session_id, seq)
@@ -730,52 +731,160 @@ CREATE UNIQUE INDEX session_fts_docs_one_title
 CREATE INDEX session_fts_docs_session_idx
     ON session_fts_docs(session_id);
 
--- Message-event sync: only `user_message` / `assistant_message` rows carry
--- conversational text; every other event type is skipped at the trigger so
--- the index stays clean. The text lives at data_json.'$.text'. Because the
--- FTS table is contentless, UPDATE/DELETE use FTS5's special delete
--- command with the old canonical text, then reconcile the identifier-only
--- rowid mapping.
+-- Event sync: `user_message` / `assistant_message` rows carry conversational
+-- text at data_json.'$.text'. `session_compacted` rows carry model-written
+-- summaries at data_json.'$.brief_text' / '$.handoff_text', or in the spilled
+-- compaction_handoffs payload referenced by '$.handoff_ref'. Tool events stay
+-- out of FTS. Because the table is contentless, UPDATE/DELETE use FTS5's
+-- special delete command with the old canonical text, then reconcile the
+-- identifier-only rowid mapping.
 
 CREATE TRIGGER session_fts_events_ai AFTER INSERT ON session_events
-WHEN new.type IN ('user_message', 'assistant_message')
-     AND json_extract(new.data_json, '$.text') IS NOT NULL
+WHEN (new.type IN ('user_message', 'assistant_message')
+      AND json_extract(new.data_json, '$.text') IS NOT NULL)
+   OR (new.type = 'session_compacted'
+      AND COALESCE(
+        json_extract(new.data_json, '$.brief_text'),
+        json_extract(new.data_json, '$.handoff_text'),
+        (SELECT json_extract(payload_json, '$.brief_text')
+           FROM compaction_handoffs
+          WHERE handoff_id = json_extract(new.data_json, '$.handoff_ref')
+            AND session_id = new.session_id),
+        (SELECT json_extract(payload_json, '$.handoff_text')
+           FROM compaction_handoffs
+          WHERE handoff_id = json_extract(new.data_json, '$.handoff_ref')
+            AND session_id = new.session_id)
+      ) IS NOT NULL)
 BEGIN
     INSERT INTO session_fts_docs (row_kind, session_id, seq)
-    VALUES ('message', new.session_id, new.seq);
+    VALUES (
+      CASE WHEN new.type = 'session_compacted' THEN 'compaction' ELSE 'message' END,
+      new.session_id,
+      new.seq
+    );
     INSERT INTO session_fts (rowid, body)
-    VALUES (last_insert_rowid(), json_extract(new.data_json, '$.text'));
+    VALUES (
+      last_insert_rowid(),
+      CASE WHEN new.type = 'session_compacted' THEN
+        COALESCE(
+          json_extract(new.data_json, '$.brief_text'),
+          json_extract(new.data_json, '$.handoff_text'),
+          (SELECT json_extract(payload_json, '$.brief_text')
+             FROM compaction_handoffs
+            WHERE handoff_id = json_extract(new.data_json, '$.handoff_ref')
+              AND session_id = new.session_id),
+          (SELECT json_extract(payload_json, '$.handoff_text')
+             FROM compaction_handoffs
+            WHERE handoff_id = json_extract(new.data_json, '$.handoff_ref')
+              AND session_id = new.session_id)
+        )
+      ELSE json_extract(new.data_json, '$.text') END
+    );
 END;
 
 CREATE TRIGGER session_fts_events_ad AFTER DELETE ON session_events
-WHEN old.type IN ('user_message', 'assistant_message')
+WHEN old.type IN ('user_message', 'assistant_message', 'session_compacted')
 BEGIN
     INSERT INTO session_fts (session_fts, rowid, body)
-    SELECT 'delete', rowid, json_extract(old.data_json, '$.text')
+    SELECT 'delete',
+           rowid,
+           CASE WHEN old.type = 'session_compacted' THEN
+             COALESCE(
+               json_extract(old.data_json, '$.brief_text'),
+               json_extract(old.data_json, '$.handoff_text'),
+               (SELECT json_extract(payload_json, '$.brief_text')
+                  FROM compaction_handoffs
+                 WHERE handoff_id = json_extract(old.data_json, '$.handoff_ref')
+                   AND session_id = old.session_id),
+               (SELECT json_extract(payload_json, '$.handoff_text')
+                  FROM compaction_handoffs
+                 WHERE handoff_id = json_extract(old.data_json, '$.handoff_ref')
+                   AND session_id = old.session_id)
+             )
+           ELSE json_extract(old.data_json, '$.text') END
     FROM session_fts_docs
-    WHERE row_kind = 'message' AND seq = old.seq;
+    WHERE row_kind IN ('message', 'compaction') AND seq = old.seq;
     DELETE FROM session_fts_docs
-    WHERE row_kind = 'message' AND seq = old.seq;
+    WHERE row_kind IN ('message', 'compaction') AND seq = old.seq;
 END;
 
 CREATE TRIGGER session_fts_events_au AFTER UPDATE ON session_events
 WHEN old.type IN ('user_message', 'assistant_message')
+     OR old.type = 'session_compacted'
      OR new.type IN ('user_message', 'assistant_message')
+     OR new.type = 'session_compacted'
 BEGIN
     INSERT INTO session_fts (session_fts, rowid, body)
-    SELECT 'delete', rowid, json_extract(old.data_json, '$.text')
+    SELECT 'delete',
+           rowid,
+           CASE WHEN old.type = 'session_compacted' THEN
+             COALESCE(
+               json_extract(old.data_json, '$.brief_text'),
+               json_extract(old.data_json, '$.handoff_text'),
+               (SELECT json_extract(payload_json, '$.brief_text')
+                  FROM compaction_handoffs
+                 WHERE handoff_id = json_extract(old.data_json, '$.handoff_ref')
+                   AND session_id = old.session_id),
+               (SELECT json_extract(payload_json, '$.handoff_text')
+                  FROM compaction_handoffs
+                 WHERE handoff_id = json_extract(old.data_json, '$.handoff_ref')
+                   AND session_id = old.session_id)
+             )
+           ELSE json_extract(old.data_json, '$.text') END
     FROM session_fts_docs
-    WHERE row_kind = 'message' AND seq = old.seq;
+    WHERE row_kind IN ('message', 'compaction') AND seq = old.seq;
     DELETE FROM session_fts_docs
-    WHERE row_kind = 'message' AND seq = old.seq;
+    WHERE row_kind IN ('message', 'compaction') AND seq = old.seq;
     INSERT INTO session_fts_docs (row_kind, session_id, seq)
-    SELECT 'message', new.session_id, new.seq
-    WHERE new.type IN ('user_message', 'assistant_message')
-      AND json_extract(new.data_json, '$.text') IS NOT NULL;
+    SELECT CASE WHEN new.type = 'session_compacted' THEN 'compaction' ELSE 'message' END,
+           new.session_id,
+           new.seq
+    WHERE (new.type IN ('user_message', 'assistant_message')
+           AND json_extract(new.data_json, '$.text') IS NOT NULL)
+       OR (new.type = 'session_compacted'
+           AND COALESCE(
+             json_extract(new.data_json, '$.brief_text'),
+             json_extract(new.data_json, '$.handoff_text'),
+             (SELECT json_extract(payload_json, '$.brief_text')
+                FROM compaction_handoffs
+               WHERE handoff_id = json_extract(new.data_json, '$.handoff_ref')
+                 AND session_id = new.session_id),
+             (SELECT json_extract(payload_json, '$.handoff_text')
+                FROM compaction_handoffs
+               WHERE handoff_id = json_extract(new.data_json, '$.handoff_ref')
+                 AND session_id = new.session_id)
+           ) IS NOT NULL);
     INSERT INTO session_fts (rowid, body)
-    SELECT last_insert_rowid(), json_extract(new.data_json, '$.text')
-    WHERE new.type IN ('user_message', 'assistant_message')
-      AND json_extract(new.data_json, '$.text') IS NOT NULL;
+    SELECT last_insert_rowid(),
+           CASE WHEN new.type = 'session_compacted' THEN
+             COALESCE(
+               json_extract(new.data_json, '$.brief_text'),
+               json_extract(new.data_json, '$.handoff_text'),
+               (SELECT json_extract(payload_json, '$.brief_text')
+                  FROM compaction_handoffs
+                 WHERE handoff_id = json_extract(new.data_json, '$.handoff_ref')
+                   AND session_id = new.session_id),
+               (SELECT json_extract(payload_json, '$.handoff_text')
+                  FROM compaction_handoffs
+                 WHERE handoff_id = json_extract(new.data_json, '$.handoff_ref')
+                   AND session_id = new.session_id)
+             )
+           ELSE json_extract(new.data_json, '$.text') END
+    WHERE (new.type IN ('user_message', 'assistant_message')
+           AND json_extract(new.data_json, '$.text') IS NOT NULL)
+       OR (new.type = 'session_compacted'
+           AND COALESCE(
+             json_extract(new.data_json, '$.brief_text'),
+             json_extract(new.data_json, '$.handoff_text'),
+             (SELECT json_extract(payload_json, '$.brief_text')
+                FROM compaction_handoffs
+               WHERE handoff_id = json_extract(new.data_json, '$.handoff_ref')
+                 AND session_id = new.session_id),
+             (SELECT json_extract(payload_json, '$.handoff_text')
+                FROM compaction_handoffs
+               WHERE handoff_id = json_extract(new.data_json, '$.handoff_ref')
+                 AND session_id = new.session_id)
+           ) IS NOT NULL);
 END;
 
 -- Title sync: a session's title is searchable too. Titles change via

@@ -979,6 +979,7 @@ pub(super) enum Overlay {
     Sessions(crate::tui::sessions_pane::SessionsPane),
     Skills(crate::tui::skills_pane::SkillsPane),
     Tools(crate::tui::tools_pane::ToolsPane),
+    GoalSettings(crate::tui::goal_settings_pane::GoalSettingsPane),
     Permissions(crate::tui::permissions_pane::PermissionsPane),
     Resources(crate::tui::resources_pane::ResourcesPane),
     Quick(crate::tui::quick_dialog::QuickDialog),
@@ -1020,6 +1021,7 @@ impl Overlay {
             | Self::Usage(_)
             | Self::Skills(_)
             | Self::Tools(_)
+            | Self::GoalSettings(_)
             | Self::Context(_)
             | Self::Help(_) => None,
         }

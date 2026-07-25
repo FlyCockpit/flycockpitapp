@@ -891,6 +891,26 @@ pub(super) async fn handle_serialized_request(
             Ok(Response::Ack)
         }
 
+        Request::SetGoalSettingsOverride {
+            override_json,
+            persist_session,
+        } => {
+            let att = require_attached(state)?;
+            if let Some(raw) = override_json.as_deref() {
+                crate::agents::parse_goal_settings_override_json(raw).map_err(|error| {
+                    bad_request(format!("invalid goal settings override: {error}"))
+                })?;
+            }
+            att.handle
+                .send_work(SessionWork::SetGoalSettingsOverride {
+                    override_json,
+                    persist_session,
+                })
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
         Request::SetApprovalMode { mode } => {
             let att = require_attached(state)?;
             let mode = att.handle.set_approval_mode(mode);

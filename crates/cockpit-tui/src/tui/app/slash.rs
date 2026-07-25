@@ -394,6 +394,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "goal-settings",
+        description: "Edit goal-verification overrides for this session or agent",
+        takes_args: false,
+        run: run_goal_settings,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "help",
         description: "Open getting-started help and the slash command reference",
         takes_args: false,
@@ -1145,6 +1153,27 @@ fn run_tools(app: &mut App, _: &str) -> bool {
         }
         Err(error) => {
             app.push_plain(format!("/tools: {error:#}"));
+        }
+    }
+    false
+}
+
+fn run_goal_settings(app: &mut App, _: &str) -> bool {
+    let agent = app
+        .agent_path
+        .last()
+        .cloned()
+        .unwrap_or_else(|| app.launch.agent_name.clone());
+    match crate::tui::goal_settings_pane::GoalSettingsPane::open(
+        &app.launch.cwd,
+        &agent,
+        app.agent_path.len() == 1,
+    ) {
+        Ok(pane) => {
+            app.overlay = Overlay::GoalSettings(pane);
+        }
+        Err(error) => {
+            app.push_plain(format!("/goal-settings: {error:#}"));
         }
     }
     false

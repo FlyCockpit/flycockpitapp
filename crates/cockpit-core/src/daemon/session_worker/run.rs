@@ -69,6 +69,23 @@ pub(super) fn stored_tool_surface_override(
     }
 }
 
+pub(super) fn stored_goal_settings_override(
+    session: &Session,
+) -> Option<crate::agents::GoalSettingsOverride> {
+    let raw = session.goal_settings_override_json()?;
+    match crate::agents::parse_goal_settings_override_json(&raw) {
+        Ok(override_) => Some(override_),
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session.id,
+                %error,
+                "stored goal settings override is invalid; falling back to lower-priority defaults"
+            );
+            None
+        }
+    }
+}
+
 pub(super) struct ParkedReplayCompletion {
     interrupt_id: uuid::Uuid,
     decision: Option<proto::InterruptDecision>,
@@ -435,6 +452,7 @@ pub(super) async fn run_worker(
         granted_tools: Vec::new(),
     };
     let tool_surface_override = stored_tool_surface_override(&session);
+    let _goal_settings_override = stored_goal_settings_override(&session);
     let root = Arc::new(
         match builtin::load_with_assistant_db_and_tool_surface_override(
             &root_agent_name,
@@ -1692,6 +1710,43 @@ pub(super) async fn run_worker(
                     {
                         break WorkerStop::DriverFailed;
                     }
+                }
+                SessionWork::SetGoalSettingsOverride {
+                    override_json,
+                    persist_session,
+                } => {
+                    if let Some(raw) = override_json.as_deref()
+                        && let Err(error) = crate::agents::parse_goal_settings_override_json(raw)
+                    {
+                        tracing::warn!(%error, session_id = %session_id, "invalid goal settings override JSON");
+                        let _ = engine_event_notice_tx
+                            .send(TurnEvent::Notice {
+                                text: format!(
+                                    "Goal settings update failed — invalid override JSON: {error}"
+                                ),
+                            })
+                            .await;
+                        continue;
+                    }
+                    if persist_session
+                        && let Err(error) =
+                            session.set_goal_settings_override_json(override_json.clone())
+                    {
+                        tracing::warn!(%error, session_id = %session_id, "persisting goal settings override failed");
+                        let _ = engine_event_notice_tx
+                            .send(TurnEvent::Notice {
+                                text: format!(
+                                    "Goal settings update failed — could not persist session override: {error:#}"
+                                ),
+                            })
+                            .await;
+                        continue;
+                    }
+                    let _ = engine_event_notice_tx
+                        .send(TurnEvent::Notice {
+                            text: "Goal settings updated.".to_string(),
+                        })
+                        .await;
                 }
                 SessionWork::SetDelegationRecursion {
                     enabled,

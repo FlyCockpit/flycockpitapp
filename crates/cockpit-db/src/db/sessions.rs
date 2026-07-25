@@ -33,6 +33,7 @@ pub struct SessionRow {
     pub model: Option<String>,
     pub session_llm_mode: Option<String>,
     pub tool_surface_override_json: Option<String>,
+    pub goal_settings_override_json: Option<String>,
     pub active_agent: String,
     /// Owning assistant for assistant-backed sessions. NULL for ordinary
     /// sessions and for historical rows.
@@ -131,6 +132,7 @@ impl SessionRow {
             model: row.get("model")?,
             session_llm_mode: row.get("session_llm_mode").unwrap_or(None),
             tool_surface_override_json: row.get("tool_surface_override_json").unwrap_or(None),
+            goal_settings_override_json: row.get("goal_settings_override_json").unwrap_or(None),
             active_agent: row.get("active_agent")?,
             assistant_name: row.get("assistant_name").unwrap_or(None),
             short_id: row.get("short_id")?,
@@ -298,6 +300,8 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
     let has_model_prompt_snapshot =
         table_has_column(conn, "sessions", "model_system_prompt_snapshot_json")?;
     let has_assistant_name = table_has_column(conn, "sessions", "assistant_name")?;
+    let has_goal_settings_override =
+        table_has_column(conn, "sessions", "goal_settings_override_json")?;
     match (has_created_by_principal, has_redaction_table) {
         (true, true) => {
             conn.execute(
@@ -407,6 +411,14 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
                 ],
             )?;
         }
+    }
+    if has_goal_settings_override {
+        conn.execute(
+            "UPDATE sessions
+                SET goal_settings_override_json = ?1
+              WHERE session_id = ?2",
+            params![row.goal_settings_override_json, row.session_id.to_string()],
+        )?;
     }
     match (has_model_prompt_snapshot, has_assistant_name) {
         (true, true) => {
@@ -518,10 +530,10 @@ fn execute_fork_insert(
           last_active_at, active_agent, short_id,
           parent_session_id, fork_point_turn_id,
           provider, model, session_llm_mode, tool_surface_override_json,
-          ephemeral, user_content_tokens, title_stage,
+          goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -536,6 +548,7 @@ fn execute_fork_insert(
             row.model,
             row.session_llm_mode,
             row.tool_surface_override_json,
+            row.goal_settings_override_json,
             row.ephemeral as i64,
             row.user_content_tokens,
             row.title_stage,
@@ -622,6 +635,7 @@ fn build_session_row(
         model: None,
         session_llm_mode: None,
         tool_surface_override_json: None,
+        goal_settings_override_json: None,
         active_agent: active_agent.to_string(),
         assistant_name,
         short_id,
@@ -1116,6 +1130,7 @@ impl Db {
                 model: parent.model,
                 session_llm_mode: parent.session_llm_mode,
                 tool_surface_override_json: parent.tool_surface_override_json,
+                goal_settings_override_json: parent.goal_settings_override_json,
                 active_agent: parent.active_agent,
                 assistant_name: parent.assistant_name,
                 short_id: Some(short_id),
@@ -1220,6 +1235,7 @@ impl Db {
             model: parent.model,
             session_llm_mode: parent.session_llm_mode,
             tool_surface_override_json: parent.tool_surface_override_json,
+            goal_settings_override_json: parent.goal_settings_override_json,
             active_agent: parent.active_agent,
             assistant_name: parent.assistant_name,
             short_id: Some(short_id),
@@ -1811,6 +1827,23 @@ impl Db {
                 params![override_json, session_id.to_string()],
             )
             .context("setting session tool surface override")?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_goal_settings_override(
+        &self,
+        session_id: Uuid,
+        override_json: Option<&str>,
+    ) -> Result<()> {
+        let override_json = override_json.map(str::to_owned);
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET goal_settings_override_json = ?1 WHERE session_id = ?2",
+                params![override_json, session_id.to_string()],
+            )
+            .context("setting session goal settings override")?;
             Ok(())
         })
         .await
@@ -2543,6 +2576,28 @@ mod tests {
             .unwrap();
         let stored = db.get_session(session.session_id).await.unwrap().unwrap();
         assert_eq!(stored.tool_surface_override_json, None);
+    }
+
+    #[tokio::test]
+    async fn db_async_goal_settings_override_roundtrips_through_async_api() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let override_json = r#"{"enabled":false,"skepticCount":2}"#;
+
+        db.set_goal_settings_override(session.session_id, Some(override_json))
+            .await
+            .unwrap();
+        let stored = db.get_session(session.session_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.goal_settings_override_json.as_deref(),
+            Some(override_json)
+        );
+
+        db.set_goal_settings_override(session.session_id, None)
+            .await
+            .unwrap();
+        let stored = db.get_session(session.session_id).await.unwrap().unwrap();
+        assert_eq!(stored.goal_settings_override_json, None);
     }
 
     #[tokio::test]

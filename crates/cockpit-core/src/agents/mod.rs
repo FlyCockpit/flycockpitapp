@@ -89,6 +89,14 @@ pub struct AgentDef {
     /// the role/name default.
     #[serde(rename = "scanToolResults", default)]
     pub scan_tool_results: Option<bool>,
+    /// Per-agent goal verification overrides. Empty fields inherit from the
+    /// session override (when present) and then global `ExtendedConfig`.
+    #[serde(
+        rename = "goalVerification",
+        default,
+        skip_serializing_if = "GoalSettingsOverride::is_empty"
+    )]
+    pub goal_verification: GoalSettingsOverride,
     #[serde(default)]
     pub permission: Option<serde_json::Value>,
     /// Body of the markdown file (the agent's system prompt). Resolved
@@ -203,6 +211,107 @@ pub fn apply_tool_surface_override(
     def.tools = candidate.tools;
     def.tool_tiers = candidate.tool_tiers;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GoalSettingsOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(
+        rename = "skepticCount",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub skeptic_count: Option<usize>,
+    #[serde(
+        rename = "skepticModel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub skeptic_model: Option<String>,
+    #[serde(rename = "maxRounds", default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
+}
+
+impl GoalSettingsOverride {
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.skeptic_count.is_none()
+            && self.skeptic_model.is_none()
+            && self.max_rounds.is_none()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.skeptic_count == Some(0) {
+            bail!("goalVerification.skepticCount must be at least 1");
+        }
+        if self.max_rounds == Some(0) {
+            bail!("goalVerification.maxRounds must be at least 1");
+        }
+        if let Some(model) = self.skeptic_model.as_deref() {
+            let trimmed = model.trim();
+            if trimmed.is_empty()
+                || crate::config::provider::split_provider_model(trimmed).is_none()
+            {
+                bail!(
+                    "goalVerification.skepticModel must use provider/model form with non-empty provider and model"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn resolve_goal_verification_config(
+    session: Option<&GoalSettingsOverride>,
+    agent: Option<&GoalSettingsOverride>,
+    global: crate::config::extended::GoalVerificationConfig,
+) -> crate::config::extended::GoalVerificationConfig {
+    let mut resolved = global;
+    if let Some(agent) = agent {
+        apply_goal_settings_override(&mut resolved, agent);
+    }
+    if let Some(session) = session {
+        apply_goal_settings_override(&mut resolved, session);
+    }
+    resolved
+}
+
+pub fn effective_goal_verification_for_agent(
+    cwd: &Path,
+    agent_name: &str,
+    session: Option<&GoalSettingsOverride>,
+    global: crate::config::extended::GoalVerificationConfig,
+) -> crate::config::extended::GoalVerificationConfig {
+    let agent_override = resolve(cwd, agent_name)
+        .ok()
+        .flatten()
+        .map(|def| def.goal_verification);
+    resolve_goal_verification_config(session, agent_override.as_ref(), global)
+}
+
+pub fn parse_goal_settings_override_json(raw: &str) -> Result<GoalSettingsOverride> {
+    let override_: GoalSettingsOverride = serde_json::from_str(raw)?;
+    override_.validate()?;
+    Ok(override_)
+}
+
+fn apply_goal_settings_override(
+    resolved: &mut crate::config::extended::GoalVerificationConfig,
+    override_: &GoalSettingsOverride,
+) {
+    if let Some(enabled) = override_.enabled {
+        resolved.enabled = enabled;
+    }
+    if let Some(skeptic_count) = override_.skeptic_count {
+        resolved.skeptic_count = skeptic_count;
+    }
+    if let Some(skeptic_model) = &override_.skeptic_model {
+        resolved.skeptic_model = Some(skeptic_model.trim().to_string());
+    }
+    if let Some(max_rounds) = override_.max_rounds {
+        resolved.max_rounds = max_rounds;
+    }
 }
 
 fn tool_family(name: &str) -> &'static str {
@@ -546,6 +655,12 @@ impl AgentDef {
         if let Some(scan) = self.scan_tool_results {
             fm.insert("scanToolResults".into(), scan.into());
         }
+        if !self.goal_verification.is_empty() {
+            fm.insert(
+                "goalVerification".into(),
+                serde_yaml::to_value(&self.goal_verification)?,
+            );
+        }
         if let Some(perm) = &self.permission {
             fm.insert("permission".into(), serde_yaml::to_value(perm)?);
         }
@@ -608,6 +723,8 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         tool_descriptions: BTreeMap<String, ToolDescriptionSpec>,
         #[serde(rename = "scanToolResults", default)]
         scan_tool_results: Option<bool>,
+        #[serde(rename = "goalVerification", default)]
+        goal_verification: GoalSettingsOverride,
         #[serde(default)]
         permission: Option<serde_json::Value>,
     }
@@ -641,6 +758,7 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         tool_tiers: fm.tool_tiers,
         tool_descriptions: fm.tool_descriptions,
         scan_tool_results: fm.scan_tool_results,
+        goal_verification: fm.goal_verification,
         permission: fm.permission,
         // Trim the blank line(s) the frontmatter fence leaves before the
         // body and any trailing newline, so the stored prompt matches the

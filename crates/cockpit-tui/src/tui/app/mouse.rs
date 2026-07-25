@@ -214,6 +214,7 @@ impl App {
             }
             Overlay::Sessions(_) => return,
             Overlay::Tools(_) => return,
+            Overlay::GoalSettings(_) => return,
             Overlay::Skills(pane) => {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => pane.scroll_up(),
@@ -664,6 +665,7 @@ impl App {
                     | Overlay::Sessions(_)
                     | Overlay::Skills(_)
                     | Overlay::Tools(_)
+                    | Overlay::GoalSettings(_)
                     | Overlay::Permissions(_)
                     | Overlay::Context(_)
                     | Overlay::Notes(_)

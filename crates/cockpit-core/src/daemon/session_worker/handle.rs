@@ -1253,6 +1253,10 @@ pub enum SessionWork {
         prune_after_switch: bool,
         monty_nudge: Option<String>,
     },
+    SetGoalSettingsOverride {
+        override_json: Option<String>,
+        persist_session: bool,
+    },
     /// Set the session's live delegation recursion override (`/quick`). Does
     /// not persist delegation config.
     SetDelegationRecursion {

@@ -2216,6 +2216,39 @@ async fn invalid_stored_tool_surface_override_falls_back() {
 }
 
 #[tokio::test]
+async fn resume_reapplies_goal_settings_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let created = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    created
+        .set_goal_settings_override_json(Some(
+            r#"{"enabled":false,"skepticCount":2,"maxRounds":1}"#.to_string(),
+        ))
+        .unwrap();
+
+    let resumed = Session::resume(db, created.id).unwrap().unwrap();
+    let override_ = stored_goal_settings_override(&resumed).unwrap();
+
+    assert_eq!(override_.enabled, Some(false));
+    assert_eq!(override_.skeptic_count, Some(2));
+    assert_eq!(override_.max_rounds, Some(1));
+}
+
+#[tokio::test]
+async fn resume_ignores_invalid_goal_settings_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let created = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    created
+        .set_goal_settings_override_json(Some(r#"{"skepticCount":0}"#.to_string()))
+        .unwrap();
+
+    let resumed = Session::resume(db, created.id).unwrap().unwrap();
+
+    assert_eq!(stored_goal_settings_override(&resumed), None);
+}
+
+#[tokio::test]
 async fn worker_uses_registry_resolved_config_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let snapshot = snapshot_for_tests();

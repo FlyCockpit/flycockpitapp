@@ -164,7 +164,13 @@ async fn handle_update(args: GoalArgs, ctx: &ToolCtx) -> Result<ToolOutput> {
             .db
             .current_session_goal(ctx.session.id, false)
             .await?;
-        let verification = ctx.config.extended().goal_verification;
+        let session_override = ctx.session.goal_settings_override();
+        let verification = crate::agents::effective_goal_verification_for_agent(
+            &ctx.cwd,
+            &ctx.agent_id,
+            session_override.as_ref(),
+            ctx.config.extended().goal_verification,
+        );
         if current
             .as_ref()
             .is_some_and(|goal| verification.enabled_for_token_budget(goal.token_budget))

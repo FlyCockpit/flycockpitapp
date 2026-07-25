@@ -345,6 +345,7 @@ mod tests {
                 .collect(),
             tool_descriptions: BTreeMap::new(),
             scan_tool_results: None,
+            goal_verification: cockpit_core::agents::GoalSettingsOverride::default(),
             permission: None,
             prompt: "body".to_string(),
             prompt_variants: std::collections::HashMap::new(),

@@ -30,6 +30,7 @@ pub mod diff;
 pub mod diff_pane;
 pub mod dir_suggest;
 pub mod geometry;
+pub mod goal_settings_pane;
 pub mod history;
 pub mod input_source;
 pub mod keys_overlay;

@@ -2771,6 +2771,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "SessionWork::SetToolSurfaceOverride delivered to attached worker",
         },
         MutatingDispatchCase {
+            kind: "set_goal_settings_override",
+            effect_class: InMemory,
+            observation: "SessionWork::SetGoalSettingsOverride delivered to attached worker",
+        },
+        MutatingDispatchCase {
             kind: "set_approval_mode",
             effect_class: InMemory,
             observation: "approval mode response and broadcast event reflect new mode",
@@ -3095,6 +3100,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_active_model"
         | "set_agent"
         | "set_tool_surface_override"
+        | "set_goal_settings_override"
         | "set_llm_mode"
         | "set_session_llm_mode"
         | "set_delegation_recursion"
@@ -3178,6 +3184,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("set_active_model"),
         authz_session_writer("set_agent"),
         authz_session_writer("set_tool_surface_override"),
+        authz_session_writer("set_goal_settings_override"),
         authz_session_writer("set_llm_mode"),
         authz_session_writer("set_session_llm_mode"),
         authz_session_writer("set_approval_mode"),
@@ -3892,6 +3899,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "set_active_model"
             | "set_agent"
             | "set_tool_surface_override"
+            | "set_goal_settings_override"
             | "set_llm_mode"
             | "set_session_llm_mode"
             | "set_approval_mode"
@@ -4159,6 +4167,10 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             persist_session: true,
             prune_after_switch: true,
             monty_nudge: Some("monty tools enabled: read".to_string()),
+        },
+        "set_goal_settings_override" => Request::SetGoalSettingsOverride {
+            override_json: Some(r#"{"enabled":false,"skepticCount":2}"#.to_string()),
+            persist_session: true,
         },
         "set_approval_mode" => Request::SetApprovalMode {
             mode: crate::config::extended::ApprovalMode::Manual,
@@ -4911,6 +4923,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "set_active_model"
         | "set_agent"
         | "set_tool_surface_override"
+        | "set_goal_settings_override"
         | "set_llm_mode"
         | "set_session_llm_mode"
         | "set_delegation_recursion"
@@ -5061,6 +5074,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "set_active_model"
         | "set_agent"
         | "set_tool_surface_override"
+        | "set_goal_settings_override"
         | "set_llm_mode"
         | "set_session_llm_mode"
         | "set_delegation_recursion"
@@ -5334,6 +5348,10 @@ async fn assert_worker_delivery_happy(kind: &str) {
             prune_after_switch: true,
             monty_nudge: Some("monty tools enabled: read".to_string()),
         },
+        "set_goal_settings_override" => Request::SetGoalSettingsOverride {
+            override_json: Some(r#"{"enabled":false,"skepticCount":2}"#.to_string()),
+            persist_session: true,
+        },
         "set_delegation_recursion" => Request::SetDelegationRecursion {
             enabled: true,
             default_depth: 3,
@@ -5513,6 +5531,20 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert_eq!(monty_nudge.as_deref(), Some("monty tools enabled: read"));
                 }
                 (
+                    "set_goal_settings_override",
+                    SessionWork::SetGoalSettingsOverride {
+                        override_json,
+                        persist_session,
+                    },
+                ) => {
+                    assert!(
+                        override_json
+                            .as_deref()
+                            .is_some_and(|raw| raw.contains("\"skepticCount\":2"))
+                    );
+                    assert!(persist_session);
+                }
+                (
                     "set_delegation_recursion",
                     SessionWork::SetDelegationRecursion {
                         enabled,
@@ -5641,6 +5673,10 @@ async fn assert_attached_required_malformed(kind: &str) {
             persist_session: true,
             prune_after_switch: true,
             monty_nudge: None,
+        },
+        "set_goal_settings_override" => Request::SetGoalSettingsOverride {
+            override_json: Some(r#"{"enabled":false,"skepticCount":2}"#.to_string()),
+            persist_session: true,
         },
         "set_approval_mode" => Request::SetApprovalMode {
             mode: crate::config::extended::ApprovalMode::Manual,
@@ -7912,6 +7948,16 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::SetGoalSettingsOverride {
+                override_json: Some(r#"{"enabled":false,"skepticCount":2}"#.to_string()),
+                persist_session: true,
+            },
+            kind: "set_goal_settings_override",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::SetApprovalMode {
                 mode: crate::config::extended::ApprovalMode::Manual,
             },
@@ -8225,6 +8271,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SetLlmMode,
         SetSessionLlmMode,
         SetToolSurfaceOverride,
+        SetGoalSettingsOverride,
         SetApprovalMode,
         SetDelegationRecursion,
         SetSandbox,

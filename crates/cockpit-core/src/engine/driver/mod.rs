@@ -3488,7 +3488,7 @@ impl Driver {
             return Ok(());
         }
 
-        let cfg = self.config.extended().goal_verification;
+        let cfg = self.effective_goal_verification_config();
         let max_rounds = i64::from(cfg.effective_max_rounds());
         if goal.verification_rounds >= max_rounds {
             self.goal_idle_intervention_pending = true;
@@ -3548,6 +3548,23 @@ impl Driver {
         self.goal_verification_round = Some(round);
         self.emit_goal_verification_progress(tx).await;
         Ok(())
+    }
+
+    fn effective_goal_verification_config(
+        &self,
+    ) -> crate::config::extended::GoalVerificationConfig {
+        let agent_name = self
+            .stack
+            .first()
+            .map(|frame| frame.agent.name.as_str())
+            .unwrap_or("Build");
+        let session_override = self.session.goal_settings_override();
+        crate::agents::effective_goal_verification_for_agent(
+            &self.cwd,
+            agent_name,
+            session_override.as_ref(),
+            self.config.extended().goal_verification,
+        )
     }
 
     async fn goal_verification_prompt(
@@ -3716,9 +3733,7 @@ impl Driver {
             return Ok(());
         };
         let max_rounds = i64::from(
-            self.config
-                .extended()
-                .goal_verification
+            self.effective_goal_verification_config()
                 .effective_max_rounds(),
         );
         if goal.verification_rounds >= max_rounds {

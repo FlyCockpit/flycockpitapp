@@ -524,6 +524,14 @@ impl App {
                 }
                 return false;
             }
+            Overlay::GoalSettings(mut pane) => {
+                if let Some(outcome) = pane.handle_key(key) {
+                    self.handle_goal_settings_outcome(outcome);
+                } else {
+                    self.overlay = Overlay::GoalSettings(pane);
+                }
+                return false;
+            }
             Overlay::Permissions(mut pane) => {
                 if !pane.handle_key(key) {
                     self.overlay = Overlay::Permissions(pane);

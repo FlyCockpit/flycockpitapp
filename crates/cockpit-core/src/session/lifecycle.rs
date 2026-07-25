@@ -122,6 +122,7 @@ impl Session {
                     row.model = self.active_model();
                     row.session_llm_mode = self.session_llm_mode_raw();
                     row.tool_surface_override_json = self.tool_surface_override_json();
+                    row.goal_settings_override_json = self.goal_settings_override_json();
                     row.redaction_table_json = self.redaction_table_json.lock().unwrap().clone();
                     row
                 }
@@ -253,6 +254,7 @@ impl Session {
             provider: Mutex::new(row.provider),
             session_llm_mode: Mutex::new(row.session_llm_mode),
             tool_surface_override_json: Mutex::new(row.tool_surface_override_json),
+            goal_settings_override_json: Mutex::new(row.goal_settings_override_json),
             redaction_table_json: Mutex::new(row.redaction_table_json),
             model_system_prompt_snapshot,
             last_time_prelude: Mutex::new(None),

@@ -540,6 +540,29 @@ fn slash_tools_opens_overlay_for_foreground_agent() {
     }
 }
 
+#[test]
+fn slash_goal_settings_opens_dialog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app(&tmp);
+    app.agent_path = vec!["Build".to_string()];
+
+    let command = SLASH_COMMANDS
+        .iter()
+        .find(|c| c.name == "goal-settings")
+        .unwrap();
+    assert!(!command.takes_args);
+    let goal = SLASH_COMMANDS.iter().find(|c| c.name == "goal").unwrap();
+    assert_eq!(command.is_available(&app), goal.is_available(&app));
+
+    app.composer.set("/goal-settings");
+    app.execute_slash(*command);
+
+    match app.overlay {
+        Overlay::GoalSettings(ref pane) => assert_eq!(pane.agent_name(), "Build"),
+        _ => panic!("/goal-settings did not open goal settings dialog"),
+    }
+}
+
 /// `/keys` is registered (visible); `/keybindings` is a hidden alias and is
 /// NOT a separate menu entry.
 #[test]

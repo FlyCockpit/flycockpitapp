@@ -583,6 +583,13 @@
     },
     "request": "set_session_llm_mode"
   },
+  "set_goal_settings_override": {
+    "params": {
+      "override_json": "{\"enabled\":false,\"skepticCount\":2}",
+      "persist_session": true
+    },
+    "request": "set_goal_settings_override"
+  },
   "set_tool_surface_override": {
     "params": {
       "monty_nudge": "monty tools enabled: code",

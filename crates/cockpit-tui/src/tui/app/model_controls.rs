@@ -153,6 +153,28 @@ impl App {
         }
     }
 
+    pub(super) fn handle_goal_settings_outcome(
+        &mut self,
+        outcome: crate::tui::goal_settings_pane::GoalSettingsOutcome,
+    ) {
+        match outcome {
+            crate::tui::goal_settings_pane::GoalSettingsOutcome::Close => {}
+            crate::tui::goal_settings_pane::GoalSettingsOutcome::Apply {
+                override_json,
+                persist_session,
+            } => {
+                self.send_daemon_request(
+                    "/goal-settings",
+                    cockpit_core::daemon::proto::Request::SetGoalSettingsOverride {
+                        override_json,
+                        persist_session,
+                    },
+                    ControlApplied::None,
+                );
+            }
+        }
+    }
+
     pub(super) fn open_config_drift_dialog(&mut self) {
         let can_switch = self
             .config_drift

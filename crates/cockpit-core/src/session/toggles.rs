@@ -281,6 +281,36 @@ impl Session {
         Ok(())
     }
 
+    pub fn goal_settings_override_json(&self) -> Option<String> {
+        self.goal_settings_override_json.lock().unwrap().clone()
+    }
+
+    pub fn goal_settings_override(&self) -> Option<crate::agents::GoalSettingsOverride> {
+        self.goal_settings_override_json()
+            .and_then(|raw| crate::agents::parse_goal_settings_override_json(&raw).ok())
+    }
+
+    pub fn set_goal_settings_override_json(&self, override_json: Option<String>) -> Result<()> {
+        *self.goal_settings_override_json.lock().unwrap() = override_json.clone();
+        if self.stage_pending_row(|row| {
+            row.goal_settings_override_json = override_json.clone();
+        }) {
+            return Ok(());
+        }
+        let session_id = self.id;
+        self.db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET goal_settings_override_json = ?1 WHERE session_id = ?2",
+                    params![override_json, session_id.to_string()],
+                )
+                .context("setting session goal settings override")?;
+                Ok(())
+            })
+            .context("persisting session goal settings override")?;
+        Ok(())
+    }
+
     pub fn set_active_model(&self, provider: &str, model: &str) -> Result<()> {
         *self.provider.lock().unwrap() = Some(provider.to_string());
         *self.model.lock().unwrap() = Some(model.to_string());

@@ -260,6 +260,7 @@ impl dyn SettingsPage {
 }
 
 #[cfg(test)]
+#[allow(clippy::large_enum_variant)]
 enum Page {
     Root { cursor: usize },
     Agents(AgentsPage),

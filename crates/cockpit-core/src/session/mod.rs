@@ -201,6 +201,7 @@ pub struct Session {
     provider: Mutex<Option<String>>,
     session_llm_mode: Mutex<Option<String>>,
     tool_surface_override_json: Mutex<Option<String>>,
+    goal_settings_override_json: Mutex<Option<String>>,
     redaction_table_json: Mutex<Option<String>>,
     model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
     /// Last time a `[time: ...]` prelude was injected onto a user
@@ -1723,6 +1724,9 @@ mod tests {
             .unwrap();
         s.set_tool_surface_override_json(Some(override_json.to_string()))
             .unwrap();
+        let goal_override_json = r#"{"enabled":false,"skepticCount":2}"#;
+        s.set_goal_settings_override_json(Some(goal_override_json.to_string()))
+            .unwrap();
         assert!(db.get_session(s.id).await.unwrap().is_none());
 
         s.persist_if_needed().unwrap();
@@ -1731,6 +1735,10 @@ mod tests {
         assert_eq!(
             row.tool_surface_override_json.as_deref(),
             Some(override_json)
+        );
+        assert_eq!(
+            row.goal_settings_override_json.as_deref(),
+            Some(goal_override_json)
         );
     }
 

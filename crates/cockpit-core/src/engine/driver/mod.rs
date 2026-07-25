@@ -131,6 +131,14 @@ pub enum DriverControl {
         mode: Option<crate::config::extended::LlmMode>,
         prune_after_switch: bool,
     },
+    /// Replace the root agent's session-scoped tool surface. Applied only at
+    /// idle while the root frame is foreground; refused while an interactive
+    /// subagent owns the foreground.
+    SetToolSurfaceOverride {
+        selection: crate::agents::ToolSurfaceSelection,
+        prune_after_switch: bool,
+        monty_nudge: Option<String>,
+    },
     /// Swap the session's redaction table live (`/toggle-redaction`). The
     /// session worker rebuilds the table from the in-memory effective
     /// `RedactConfig` and hands it here; the driver replaces `self.redact`
@@ -685,6 +693,10 @@ pub struct Driver {
     /// separate from model refresh so one recurring failure cannot suppress
     /// the other's first transcript notice.
     active_tool_surface_refresh_failure_notice: Option<String>,
+    /// One-shot note about session-only Monty tool-surface changes. Appended
+    /// to the next ordinary tool result so the model sees cache-neutral
+    /// discoverable/disabled changes exactly once.
+    pending_monty_tool_nudge: Option<String>,
     active_model_state_generation: u64,
     current_lifecycle_turn_id: Option<String>,
     /// Cancellation handle for the in-flight user-message run (ctrl+c →
@@ -1296,6 +1308,7 @@ impl Driver {
             active_tool_surface_refresh_failure_notice: self
                 .active_tool_surface_refresh_failure_notice
                 .clone(),
+            pending_monty_tool_nudge: self.pending_monty_tool_nudge.clone(),
             active_model_state_generation: self.active_model_state_generation,
             current_lifecycle_turn_id: self.current_lifecycle_turn_id.clone(),
             cancel_current: self.cancel_current.clone(),
@@ -1593,6 +1606,7 @@ impl Driver {
             preflight_guard_logged: false,
             active_model_refresh_failure_notice: None,
             active_tool_surface_refresh_failure_notice: None,
+            pending_monty_tool_nudge: None,
             active_model_state_generation: 0,
             current_lifecycle_turn_id: None,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
@@ -3249,6 +3263,14 @@ impl Driver {
             } => {
                 self.set_llm_mode(mode, prune_after_switch, tx).await;
             }
+            DriverControl::SetToolSurfaceOverride {
+                selection,
+                prune_after_switch,
+                monty_nudge,
+            } => {
+                self.set_tool_surface_override(selection, prune_after_switch, monty_nudge, tx)
+                    .await;
+            }
             DriverControl::SetRedaction {
                 table,
                 scan_environment,
@@ -4885,6 +4907,80 @@ impl Driver {
                         text: format!(
                             "LLM mode switch to `{}` failed — {e:#}. Keeping the current mode active.",
                             mode.as_str()
+                        ),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    async fn set_tool_surface_override(
+        &mut self,
+        selection: crate::agents::ToolSurfaceSelection,
+        prune_after_switch: bool,
+        monty_nudge: Option<String>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        if self.stack.len() != 1 {
+            tracing::warn!(
+                "tool surface override ignored: an interactive subagent holds the foreground"
+            );
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: "Tool surface changes were refused because an interactive subagent holds the foreground.".to_string(),
+                })
+                .await;
+            return;
+        }
+        let name = self.stack[0].agent.name.clone();
+        let args = self.spawn_args(true);
+        match crate::agents::resolve(&self.cwd, &name) {
+            Ok(Some(mut def)) => {
+                match crate::agents::apply_tool_surface_override(&mut def, &selection)
+                    .and_then(|_| crate::engine::builtin::agent_from_def(&def, &args))
+                {
+                    Ok(agent) => {
+                        self.stack[0].agent = Arc::new(agent);
+                        self.schedule.set_agent(self.stack[0].agent.clone());
+                        if let Some(note) = monty_nudge {
+                            self.pending_monty_tool_nudge = Some(note);
+                        }
+                        let _ = tx
+                            .send(TurnEvent::Notice {
+                                text: "Tool surface updated for this session.".to_string(),
+                            })
+                            .await;
+                        self.emit_context_projection(tx).await;
+                        if prune_after_switch {
+                            self.do_prune(false, tx).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "tool surface override failed to rebuild agent");
+                        let _ = tx
+                            .send(TurnEvent::Notice {
+                                text: format!(
+                                    "Tool surface update failed — {e:#}. Keeping the current tool surface active."
+                                ),
+                            })
+                            .await;
+                    }
+                }
+            }
+            Ok(None) => {
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!(
+                            "Tool surface update failed — agent `{name}` could not be resolved."
+                        ),
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!(
+                            "Tool surface update failed — {e:#}. Keeping the current tool surface active."
                         ),
                     })
                     .await;
@@ -6828,8 +6924,12 @@ impl Driver {
                 TurnOutcome::ToolResult {
                     task_call_id,
                     task_function_call_id,
-                    body,
+                    mut body,
                 } => {
+                    if let Some(note) = self.pending_monty_tool_nudge.take() {
+                        body.push_str("\n\n[tool surface update]\n");
+                        body.push_str(&note);
+                    }
                     next_prompt = Message::tool_result_with_call_id(
                         task_call_id,
                         task_function_call_id,

@@ -385,7 +385,7 @@ fn history_def() -> AgentDef {
         Some(crate::engine::builtin::HISTORY_PROMPT_NORMAL),
     );
     for tool in ["session_search", "session_read", "session_lineage_search"] {
-        def.tool_tiers.insert(tool.to_string(), ToolTier::Builtin);
+        def.tool_tiers.insert(tool.to_string(), ToolTier::Enabled);
     }
     def
 }
@@ -585,7 +585,7 @@ mod tests {
             if crate::engine::builtin::default_discoverable_tools_for(&def.name).contains(&tool) {
                 ToolTier::Discoverable
             } else {
-                ToolTier::Builtin
+                ToolTier::Enabled
             }
         })
     }
@@ -595,7 +595,7 @@ mod tests {
             .as_ref()
             .expect("embedded def has explicit tools")
             .iter()
-            .filter(|tool| effective_tier(def, tool) == ToolTier::Builtin)
+            .filter(|tool| effective_tier(def, tool) == ToolTier::Enabled)
             .cloned()
             .collect()
     }
@@ -809,7 +809,7 @@ mod tests {
             );
         }
         for tool in ["session_search", "session_read", "session_lineage_search"] {
-            assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Builtin));
+            assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Enabled));
         }
     }
 }

@@ -1247,6 +1247,12 @@ pub enum SessionWork {
     SetSessionLlmMode {
         mode: crate::config::extended::LlmMode,
     },
+    SetToolSurfaceOverride {
+        override_json: String,
+        persist_session: bool,
+        prune_after_switch: bool,
+        monty_nudge: Option<String>,
+    },
     /// Set the session's live delegation recursion override (`/quick`). Does
     /// not persist delegation config.
     SetDelegationRecursion {

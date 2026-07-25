@@ -538,6 +538,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "tools",
+        description: "Edit the current agent's tool surface",
+        takes_args: false,
+        run: run_tools,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "pin",
         description: "Pick a message to pin (↑/↓ move, enter pin, esc cancel)",
         takes_args: false,
@@ -1118,6 +1126,27 @@ fn run_permissions(app: &mut App, _: &str) -> bool {
     app.overlay = Overlay::Permissions(crate::tui::permissions_pane::PermissionsPane::open(
         &app.launch.cwd,
     ));
+    false
+}
+
+fn run_tools(app: &mut App, _: &str) -> bool {
+    let agent = app
+        .agent_path
+        .last()
+        .cloned()
+        .unwrap_or_else(|| app.launch.agent_name.clone());
+    match crate::tui::tools_pane::ToolsPane::open(
+        &app.launch.cwd,
+        &agent,
+        app.agent_path.len() == 1,
+    ) {
+        Ok(pane) => {
+            app.overlay = Overlay::Tools(pane);
+        }
+        Err(error) => {
+            app.push_plain(format!("/tools: {error:#}"));
+        }
+    }
     false
 }
 

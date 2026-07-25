@@ -1361,6 +1361,10 @@ impl App {
                     pane.render(frame, rects.body);
                     self.overlay = Overlay::Skills(pane);
                 }
+                Overlay::Tools(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::Tools(pane);
+                }
                 Overlay::Permissions(mut pane) => {
                     pane.render(frame, rects.body);
                     self.overlay = Overlay::Permissions(pane);

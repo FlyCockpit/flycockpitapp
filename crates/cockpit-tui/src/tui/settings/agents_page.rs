@@ -39,9 +39,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::tui::theme::MUTED_COLOR_INDEX;
-use cockpit_core::agents::{
-    AgentDef, AgentKind, AgentListing, ToolTier, is_builtin_agent, list_all,
+use crate::tui::tool_surface_picker::{
+    ToolSurfaceDraft, ToolSurfaceEditOutcome, ToolSurfacePicker, ToolSurfaceRender,
+    tool_surface_lines,
 };
+#[cfg(test)]
+use cockpit_core::agents::ToolTier;
+use cockpit_core::agents::{AgentDef, AgentKind, AgentListing, is_builtin_agent, list_all};
 
 use super::agent_editor::{AgentEditor, EditorOutcome};
 use super::reset::{ResetButton, ResetOutcome};
@@ -103,15 +107,11 @@ pub(super) struct AgentDetail {
     path: PathBuf,
     original_text: String,
     def: AgentDef,
+    draft: Box<ToolSurfaceDraft>,
     picker: ToolSurfacePicker,
     status: Option<String>,
     row_errors: BTreeMap<String, String>,
     source: AgentRowSource,
-}
-
-#[derive(Default)]
-struct ToolSurfacePicker {
-    cursor: usize,
 }
 
 impl AgentsPage {
@@ -246,69 +246,23 @@ fn normalize_model(model: Option<String>) -> Option<String> {
 }
 
 impl AgentDetail {
-    fn selected_tool(&self) -> Option<&'static str> {
-        cockpit_core::agents::tool_surface_catalog()
-            .get(self.picker.cursor)
-            .map(|item| item.name)
-    }
-
-    fn granted(&self, tool: &str) -> bool {
-        self.def
-            .tools
-            .as_ref()
-            .is_some_and(|tools| tools.iter().any(|item| item == tool))
-    }
-
-    fn tier(&self, tool: &str) -> ToolTier {
-        self.def
-            .tool_tiers
-            .get(tool)
-            .copied()
-            .unwrap_or(ToolTier::Builtin)
-    }
-
-    fn set_granted(&mut self, tool: &str, granted: bool) {
-        let mut tools = self.def.tools.take().unwrap_or_default();
-        if granted {
-            if !tools.iter().any(|existing| existing == tool) {
-                tools.push(tool.to_string());
-                tools.sort();
-            }
-        } else {
-            tools.retain(|existing| existing != tool);
-            self.def.tool_tiers.remove(tool);
-            if self.def.tool_descriptions.remove(tool).is_some() {
-                self.status = Some(format!("removed custom description for `{tool}`"));
-            }
-        }
-        self.def.tools = (!tools.is_empty()).then_some(tools);
-        self.row_errors.remove(tool);
-    }
-
     fn toggle_selected_tool(&mut self) {
-        let Some(tool) = self.selected_tool() else {
-            return;
-        };
-        self.set_granted(tool, !self.granted(tool));
+        if let ToolSurfaceEditOutcome::Ungranted(tool) =
+            self.draft.toggle_selected_tool(&self.picker, false)
+            && self.def.tool_descriptions.remove(&tool).is_some()
+        {
+            self.status = Some(format!("removed custom description for `{tool}`"));
+        }
+        if let Some(tool) = self.picker.selected_tool() {
+            self.row_errors.remove(tool);
+        }
     }
 
     fn cycle_selected_tier(&mut self) {
-        let Some(tool) = self.selected_tool() else {
-            return;
-        };
-        if !self.granted(tool) {
-            self.set_granted(tool, true);
+        self.draft.cycle_selected_tier(&self.picker);
+        if let Some(tool) = self.picker.selected_tool() {
+            self.row_errors.remove(tool);
         }
-        let tiers = cockpit_core::agents::legal_tool_tiers(tool);
-        let current = self.tier(tool);
-        let index = tiers.iter().position(|tier| *tier == current).unwrap_or(0);
-        let next = tiers[(index + 1) % tiers.len()];
-        if next == ToolTier::Builtin {
-            self.def.tool_tiers.remove(tool);
-        } else {
-            self.def.tool_tiers.insert(tool.to_string(), next);
-        }
-        self.row_errors.remove(tool);
     }
 }
 
@@ -488,10 +442,10 @@ impl SettingsCx {
                 p.detail = None;
             }
             KeyCode::Up | KeyCode::Char('k') if len > 0 => {
-                detail.picker.cursor = crate::tui::nav::wrap_prev(detail.picker.cursor, len);
+                detail.picker.move_prev();
             }
             KeyCode::Down | KeyCode::Char('j') if len > 0 => {
-                detail.picker.cursor = crate::tui::nav::wrap_next(detail.picker.cursor, len);
+                detail.picker.move_next();
             }
             KeyCode::Char(' ') => {
                 detail.toggle_selected_tool();
@@ -563,11 +517,13 @@ impl SettingsCx {
         if let Some(idx) = p.rows.iter().position(|r| r.name == name) {
             p.cursor = idx;
         }
+        let draft = ToolSurfaceDraft::from_def(&def);
         p.detail = Some(AgentDetail {
             name,
             path,
             original_text,
             def,
+            draft: Box::new(draft),
             picker: ToolSurfacePicker::default(),
             status: None,
             row_errors: BTreeMap::new(),
@@ -596,6 +552,7 @@ impl SettingsCx {
                 Some("conflict: file changed on disk; raw editor can reconcile it".into());
             return;
         }
+        detail.draft.write_to_def(&mut detail.def);
         if let Err(error) = cockpit_core::agents::validate_invariants(&detail.def) {
             let message = error.to_string();
             if let Some(tool) = backticked_tool(&message) {
@@ -871,71 +828,17 @@ impl SettingsCx {
     }
 
     fn render_agent_detail(&self, frame: &mut Frame, area: Rect, detail: &AgentDetail) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
-        let red = Style::default().fg(Color::Red);
-        let green = Style::default().fg(Color::Green);
-        let cyan = Style::default().fg(Color::Cyan);
-        let mut lines: Vec<Line<'static>> = vec![
-            Line::from(vec![
-                Span::styled(
-                    detail.name.clone(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  tool surface".to_string(), muted),
-            ]),
-            Line::default(),
-        ];
-        let mut last_family = "";
-        for (index, item) in cockpit_core::agents::tool_surface_catalog()
-            .into_iter()
-            .enumerate()
-        {
-            if item.family != last_family {
-                if !last_family.is_empty() {
-                    lines.push(Line::default());
-                }
-                lines.push(Line::from(Span::styled(item.family.to_string(), muted)));
-                last_family = item.family;
-            }
-            let on_cursor = index == detail.picker.cursor;
-            let marker = if on_cursor { "▸ " } else { "  " };
-            let granted = detail.granted(item.name);
-            let check = if granted { "[x]" } else { "[ ]" };
-            let tier = if granted {
-                detail.tier(item.name).label()
-            } else {
-                "-"
-            };
-            let name_style = if on_cursor {
-                yellow.add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let state_style = if granted { green } else { muted };
-            let mut spans = vec![
-                Span::raw(marker),
-                Span::styled(check.to_string(), state_style),
-                Span::raw(" "),
-                Span::styled(item.name.to_string(), name_style),
-                Span::raw("  "),
-                Span::styled(format!("tier: {tier}"), cyan),
-            ];
-            if item.tiers.len() == 2 {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled("no discoverable", muted));
-            }
-            if let Some(error) = detail.row_errors.get(item.name) {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(error.clone(), red));
-            }
-            lines.push(Line::from(spans));
-        }
-        if let Some(status) = &detail.status {
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(status.clone(), yellow)));
-        }
-        let selected_line = selected_line_from_marker(&lines);
+        let (lines, selected_line) = tool_surface_lines(
+            &detail.picker,
+            &detail.draft,
+            ToolSurfaceRender {
+                title: &detail.name,
+                subtitle: "tool surface",
+                status: detail.status.as_deref(),
+                row_errors: &detail.row_errors,
+                block_safety_ungrant: false,
+            },
+        );
         self.scroll_states
             .render_lines(frame, area, "agent-detail", lines, selected_line);
     }
@@ -1084,7 +987,7 @@ mod tests {
             .iter()
             .position(|tool| tool.name == name)
             .unwrap();
-        page_mut(d).detail.as_mut().unwrap().picker.cursor = idx;
+        page_mut(d).detail.as_mut().unwrap().picker.set_cursor(idx);
     }
 
     fn load_agent(path: &std::path::Path, name: &str) -> AgentDef {
@@ -1146,9 +1049,9 @@ mod tests {
         focus(&mut d, "mine");
         d.handle_key(press(KeyCode::Enter));
         let detail = page(&d).detail.as_ref().expect("detail opens");
-        assert!(detail.granted("read"));
-        assert!(detail.granted("search"));
-        assert_eq!(detail.tier("search"), ToolTier::Discoverable);
+        assert!(detail.draft.granted("read"));
+        assert!(detail.draft.granted("search"));
+        assert_eq!(detail.draft.tier("search"), ToolTier::Discoverable);
     }
 
     #[test]
@@ -1194,11 +1097,11 @@ mod tests {
             let mut observed = Vec::new();
             for _ in 0..4 {
                 d.handle_key(press(KeyCode::Char('t')));
-                observed.push(page(&d).detail.as_ref().unwrap().tier(tool));
+                observed.push(page(&d).detail.as_ref().unwrap().draft.tier(tool));
             }
             assert!(!observed.contains(&ToolTier::Discoverable), "{tool}");
-            assert!(observed.contains(&ToolTier::Builtin), "{tool}");
-            assert!(observed.contains(&ToolTier::Disabled), "{tool}");
+            assert!(observed.contains(&ToolTier::Enabled), "{tool}");
+            assert!(!observed.contains(&ToolTier::Disabled), "{tool}");
         }
     }
 

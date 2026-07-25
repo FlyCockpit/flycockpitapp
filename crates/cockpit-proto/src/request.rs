@@ -553,6 +553,20 @@ pub enum Request {
         mode: LlmMode,
     },
 
+    /// Replace the attached session's tool-surface override and rebuild the
+    /// root agent at the next idle/control boundary. The payload is serialized
+    /// `agents::ToolSurfaceSelection`; kept JSON here so the wire crate does
+    /// not depend on the core agent-definition crate.
+    SetToolSurfaceOverride {
+        override_json: String,
+        #[serde(default = "default_true")]
+        persist_session: bool,
+        #[serde(default)]
+        prune_after_switch: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        monty_nudge: Option<String>,
+    },
+
     /// Set the attached session's live command-approval mode. Session-only;
     /// does not write `defaultApprovalMode`.
     SetApprovalMode {
@@ -835,6 +849,7 @@ macro_rules! request_variants {
             (Request::SetAgent { .. }, "set_agent");
             (Request::SetLlmMode { .. }, "set_llm_mode");
             (Request::SetSessionLlmMode { .. }, "set_session_llm_mode");
+            (Request::SetToolSurfaceOverride { .. }, "set_tool_surface_override");
             (Request::SetApprovalMode { .. }, "set_approval_mode");
             (Request::SetDelegationRecursion { .. }, "set_delegation_recursion");
             (Request::SetSandbox { .. }, "set_sandbox");
@@ -952,6 +967,7 @@ macro_rules! command {
             (Request::SetAgent { .. }, "set_agent", session_writer, attached, true, serialized, none);
             (Request::SetLlmMode { .. }, "set_llm_mode", session_writer, attached, true, serialized, none);
             (Request::SetSessionLlmMode { .. }, "set_session_llm_mode", session_writer, attached, true, serialized, none);
+            (Request::SetToolSurfaceOverride { .. }, "set_tool_surface_override", session_writer, attached, true, serialized, none);
             (Request::SetApprovalMode { .. }, "set_approval_mode", session_writer, attached, true, serialized, none);
             (Request::SetDelegationRecursion { .. }, "set_delegation_recursion", session_writer, attached, true, serialized, none);
             (Request::SetSandbox { .. }, "set_sandbox", session_writer, attached, true, serialized, none);

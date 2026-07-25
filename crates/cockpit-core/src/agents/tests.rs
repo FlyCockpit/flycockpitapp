@@ -165,6 +165,7 @@ description: Tiered agent
 mode: subagent
 tools: [read, search, skill_manage]
 toolTiers:
+  read: enabled
   search: discoverable
   skill_manage: disabled
 ---
@@ -172,6 +173,10 @@ toolTiers:
 Body
 "#;
     let def = parse_agent(text, "tiered", "tiered.md".into()).unwrap();
+    assert_eq!(
+        def.tool_tiers.get("read"),
+        Some(&crate::agents::ToolTier::Enabled)
+    );
     assert_eq!(
         def.tool_tiers.get("search"),
         Some(&crate::agents::ToolTier::Discoverable)
@@ -184,6 +189,28 @@ Body
     let md = def.to_markdown().unwrap();
     let reparsed = parse_agent(&md, "tiered", "tiered.md".into()).unwrap();
     assert_eq!(reparsed.tool_tiers, def.tool_tiers);
+}
+
+#[test]
+fn tool_tier_enabled_label_round_trips() {
+    assert_eq!(ToolTier::Enabled.label(), "enabled");
+    assert_eq!(ToolTier::from_label("enabled"), Some(ToolTier::Enabled));
+    assert_eq!(ToolTier::from_label("builtin"), None);
+
+    let yaml = serde_yaml::to_string(&ToolTier::Enabled).unwrap();
+    assert_eq!(yaml.trim(), "enabled");
+    let reparsed: ToolTier = serde_yaml::from_str("enabled").unwrap();
+    assert_eq!(reparsed, ToolTier::Enabled);
+}
+
+#[test]
+fn legal_tool_tiers_excludes_disabled_for_safety_set() {
+    for tool in ["question", "write"] {
+        let tiers = crate::agents::legal_tool_tiers(tool);
+        assert_eq!(tiers, &[ToolTier::Enabled], "{tool}");
+        assert!(!tiers.contains(&ToolTier::Discoverable), "{tool}");
+        assert!(!tiers.contains(&ToolTier::Disabled), "{tool}");
+    }
 }
 
 // ── Invariant validation ─────────────────────────────────────────────────
@@ -293,6 +320,27 @@ fn tool_tier_validation_rejects_non_granted_structural_and_lock_write() {
     let msg = format!("{err}");
     assert!(msg.contains("`write`"), "{msg}");
     assert!(msg.contains("write/lock"), "{msg}");
+}
+
+#[test]
+fn validate_invariants_rejects_disabled_safety_tool() {
+    let mut structural = def_with_tools("my-agent", &["read", "question"]);
+    structural
+        .tool_tiers
+        .insert("question".to_string(), ToolTier::Disabled);
+    let err = validate_invariants(&structural).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("`question`"), "{msg}");
+    assert!(msg.contains("disabled"), "{msg}");
+
+    let mut lock_write = def_with_tools("writer", &["read", "write"]);
+    lock_write
+        .tool_tiers
+        .insert("write".to_string(), ToolTier::Disabled);
+    let err = validate_invariants(&lock_write).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("`write`"), "{msg}");
+    assert!(msg.contains("disabled"), "{msg}");
 }
 
 #[test]

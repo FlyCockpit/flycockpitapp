@@ -125,6 +125,34 @@ impl App {
         }
     }
 
+    pub(super) fn handle_tools_outcome(&mut self, outcome: crate::tui::tools_pane::ToolsOutcome) {
+        match outcome {
+            crate::tui::tools_pane::ToolsOutcome::Close => {}
+            crate::tui::tools_pane::ToolsOutcome::Apply {
+                override_json,
+                persist_session,
+                cache_break,
+                monty_nudge,
+            } => {
+                let applied = if cache_break {
+                    ControlApplied::CacheBreakWarning
+                } else {
+                    ControlApplied::None
+                };
+                self.send_daemon_request(
+                    "/tools",
+                    cockpit_core::daemon::proto::Request::SetToolSurfaceOverride {
+                        override_json,
+                        persist_session,
+                        prune_after_switch: cache_break,
+                        monty_nudge,
+                    },
+                    applied,
+                );
+            }
+        }
+    }
+
     pub(super) fn open_config_drift_dialog(&mut self) {
         let can_switch = self
             .config_drift

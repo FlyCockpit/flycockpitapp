@@ -412,7 +412,7 @@ fn with_tiered_recall_tools(
             continue;
         }
         tb = match effective_tool_tier(def, name, is_assistant) {
-            crate::agents::ToolTier::Builtin => add_tool_by_name(tb, name, def, args)?,
+            crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, args)?,
             crate::agents::ToolTier::Discoverable => {
                 add_discoverable_tool_by_name(tb, name, def, args)?
             }
@@ -1215,7 +1215,7 @@ fn non_direct_tier_names(def: &crate::agents::AgentDef) -> std::collections::BTr
     let mut names: std::collections::BTreeSet<String> = def
         .tool_tiers
         .iter()
-        .filter(|(_name, tier)| **tier != crate::agents::ToolTier::Builtin)
+        .filter(|(_name, tier)| **tier != crate::agents::ToolTier::Enabled)
         .map(|(name, _tier)| name.clone())
         .collect();
     names.extend(
@@ -1304,7 +1304,7 @@ fn effective_tool_tier(
     if default_discoverable_tools_for(&def.name).contains(&tool) {
         return crate::agents::ToolTier::Discoverable;
     }
-    crate::agents::ToolTier::Builtin
+    crate::agents::ToolTier::Enabled
 }
 
 fn add_discoverable_tool_by_name(
@@ -1327,7 +1327,7 @@ fn validate_discoverable_mcp_reachable(def: &crate::agents::AgentDef, tb: &ToolB
     }
 
     bail!(
-        "agent `{}` has discoverable MCP tools [{}] but does not grant `mcp`, so they are unreachable; grant `mcp` or tier them `builtin`",
+        "agent `{}` has discoverable MCP tools [{}] but does not grant `mcp`, so they are unreachable; grant `mcp` or tier them `enabled`",
         def.name,
         discoverable.join(", ")
     );
@@ -1587,7 +1587,7 @@ fn is_primary(name: &str) -> bool {
 /// default grant (so an override that only tweaks the prompt keeps the
 /// right tools); a custom agent with no grant gets the read-only
 /// investigator surface.
-fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Agent> {
+pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Agent> {
     let is_assistant = args.assistant_identity_prefix.is_some()
         && crate::agents::embedded_default(&def.name).is_none();
     if def.name == "deepthink" {
@@ -1629,7 +1629,7 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
     let mut tb = ToolBox::new();
     for name in &grant {
         tb = match effective_tool_tier(def, name, is_assistant) {
-            crate::agents::ToolTier::Builtin => add_tool_by_name(tb, name, def, args)?,
+            crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, args)?,
             crate::agents::ToolTier::Discoverable => {
                 add_discoverable_tool_by_name(tb, name, def, args)?
             }
@@ -2524,7 +2524,7 @@ mod tests {
             );
         }
         for tool in ["session_search", "session_read", "session_lineage_search"] {
-            assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Builtin));
+            assert_eq!(def.tool_tiers.get(tool), Some(&ToolTier::Enabled));
         }
         crate::agents::validate_invariants(&def).expect("history def is invariant-valid");
     }
@@ -2675,7 +2675,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_tier_builtin_discoverable_disabled_place_tools_and_catalog_entries() {
+    fn tool_tier_enabled_discoverable_disabled_place_tools_and_catalog_entries() {
         use crate::agents::{AgentDef, AgentMode, ToolTier};
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
@@ -2716,6 +2716,11 @@ mod tests {
                 .contains("direct builtin tool")
         );
         assert!(
+            crate::mcp::builtin::search(&host, "read")
+                .iter()
+                .any(|hit| hit.tool == "read")
+        );
+        assert!(
             !crate::mcp::builtin::describe(&host, "code")
                 .unwrap()
                 .description
@@ -2735,12 +2740,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_tier_builtin_tool_is_invocable_from_mcp_script() {
+    async fn enabled_tier_tools_reachable_via_monty() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("sample.txt"), "hello from mcp\n").unwrap();
         let agent = default_build(&test_spawn_args(tmp.path()));
         let host = host_for_agent(&agent, tmp.path());
 
+        assert!(agent.tools.names().contains(&"read"));
+        assert!(
+            crate::mcp::builtin::search(&host, "read")
+                .iter()
+                .any(|hit| hit.tool == "read")
+        );
         let out = crate::mcp::sandbox::run_with_host(
             "mcp.invoke('cockpit', 'read', {'path': 'sample.txt'})",
             &crate::mcp::config::McpConfig::default(),
@@ -2911,7 +2922,7 @@ mod tests {
             );
         }
         for tool in ["search", "code", "context_pack"] {
-            assert_eq!(effective_tool_tier(&def, tool, false), ToolTier::Builtin);
+            assert_eq!(effective_tool_tier(&def, tool, false), ToolTier::Enabled);
         }
         for removed in ["deps", "circular", "impact", "hot"] {
             assert!(
@@ -3129,7 +3140,7 @@ mod tests {
             source: tmp.path().join("custom-tiered.md"),
         };
         let agent = agent_from_def(&def, &args).unwrap();
-        def.tool_tiers.insert("code".to_string(), ToolTier::Builtin);
+        def.tool_tiers.insert("code".to_string(), ToolTier::Enabled);
 
         assert!(!agent.tools.names().contains(&"code"));
         assert!(crate::mcp::builtin::describe(&host_for_agent(&agent, tmp.path()), "code").is_ok());

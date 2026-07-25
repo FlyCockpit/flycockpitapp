@@ -256,9 +256,21 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
                 def.name
             );
         }
+        if *tier == ToolTier::Disabled && STRUCTURAL_TOOLS.contains(&tool.as_str()) {
+            bail!(
+                "agent `{}` may not tier structural tool `{tool}` as `disabled`",
+                def.name
+            );
+        }
         if *tier == ToolTier::Discoverable && LOCK_WRITE_TOOLS.contains(&tool.as_str()) {
             bail!(
                 "agent `{}` may not tier write/lock tool `{tool}` as `discoverable`",
+                def.name
+            );
+        }
+        if *tier == ToolTier::Disabled && LOCK_WRITE_TOOLS.contains(&tool.as_str()) {
+            bail!(
+                "agent `{}` may not tier write/lock tool `{tool}` as `disabled`",
                 def.name
             );
         }
@@ -353,7 +365,7 @@ fn validate_discoverable_tools_have_mcp(def: &AgentDef, tools: &[String]) -> Res
             .unwrap_or_else(|| discoverable_default_tier(&def.name, tool));
         if tier == ToolTier::Discoverable {
             bail!(
-                "agent `{}` tiers tool `{tool}` as `discoverable` but does not grant `mcp`, so the tool is unreachable — grant `mcp` or tier it `builtin`",
+                "agent `{}` tiers tool `{tool}` as `discoverable` but does not grant `mcp`, so the tool is unreachable — grant `mcp` or tier it `enabled`",
                 def.name
             );
         }
@@ -365,7 +377,7 @@ fn discoverable_default_tier(agent_name: &str, tool: &str) -> ToolTier {
     if crate::engine::builtin::default_discoverable_tools_for(agent_name).contains(&tool) {
         ToolTier::Discoverable
     } else {
-        ToolTier::Builtin
+        ToolTier::Enabled
     }
 }
 
@@ -481,7 +493,7 @@ mod grant_tests {
             ("writeunlock", "write"),
             ("editunlock", "edit"),
         ] {
-            let def = tiered_def("legacy-writer", &[retired], retired, ToolTier::Builtin);
+            let def = tiered_def("legacy-writer", &[retired], retired, ToolTier::Enabled);
             let err = validate_invariants(&def)
                 .expect_err("retired lock tool name must be rejected")
                 .to_string();
@@ -519,10 +531,10 @@ mod grant_tests {
             ToolTier::Discoverable,
         );
         let builtin = tiered_def(
-            "custom-builtin",
+            "custom-enabled",
             &["read", "code"],
             "code",
-            ToolTier::Builtin,
+            ToolTier::Enabled,
         );
         let disabled = tiered_def(
             "custom-disabled",
@@ -532,7 +544,7 @@ mod grant_tests {
         );
 
         validate_invariants(&with_mcp).expect("mcp makes discoverable tool reachable");
-        validate_invariants(&builtin).expect("builtin tier is directly reachable");
+        validate_invariants(&builtin).expect("enabled tier is directly reachable");
         validate_invariants(&disabled).expect("disabled tier is not discoverable");
     }
 }

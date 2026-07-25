@@ -188,7 +188,7 @@ fn learn_driver(
     std::fs::create_dir_all(&agents_dir).unwrap();
     std::fs::write(
         agents_dir.join("Build.md"),
-        "---\ndescription: Learn test primary\nmode: primary\ntools: [skill_manage, mcp]\ntoolTiers:\n  skill_manage: builtin\n---\n\nAuthor reusable skills from verified evidence.\n",
+        "---\ndescription: Learn test primary\nmode: primary\ntools: [skill_manage, mcp]\ntoolTiers:\n  skill_manage: enabled\n---\n\nAuthor reusable skills from verified evidence.\n",
     )
     .unwrap();
 

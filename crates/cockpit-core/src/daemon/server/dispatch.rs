@@ -870,6 +870,27 @@ pub(super) async fn handle_serialized_request(
             Ok(Response::Ack)
         }
 
+        Request::SetToolSurfaceOverride {
+            override_json,
+            persist_session,
+            prune_after_switch,
+            monty_nudge,
+        } => {
+            let att = require_attached(state)?;
+            serde_json::from_str::<crate::agents::ToolSurfaceSelection>(&override_json)
+                .map_err(|error| bad_request(format!("invalid tool surface override: {error}")))?;
+            att.handle
+                .send_work(SessionWork::SetToolSurfaceOverride {
+                    override_json,
+                    persist_session,
+                    prune_after_switch,
+                    monty_nudge,
+                })
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
         Request::SetApprovalMode { mode } => {
             let att = require_attached(state)?;
             let mode = att.handle.set_approval_mode(mode);

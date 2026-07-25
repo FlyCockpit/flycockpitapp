@@ -7,9 +7,9 @@ tools:
   - session_read
   - session_lineage_search
 toolTiers:
-  session_search: builtin
-  session_read: builtin
-  session_lineage_search: builtin
+  session_search: enabled
+  session_read: enabled
+  session_lineage_search: enabled
 ---
 
 You are `history`, a read-only recall subagent. Search session history and compaction lineage for the exact detail requested, then return only the useful excerpt or conclusion.

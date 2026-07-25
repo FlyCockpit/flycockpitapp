@@ -516,6 +516,14 @@ impl App {
                 }
                 return false;
             }
+            Overlay::Tools(mut pane) => {
+                if let Some(outcome) = pane.handle_key(key) {
+                    self.handle_tools_outcome(outcome);
+                } else {
+                    self.overlay = Overlay::Tools(pane);
+                }
+                return false;
+            }
             Overlay::Permissions(mut pane) => {
                 if !pane.handle_key(key) {
                     self.overlay = Overlay::Permissions(pane);

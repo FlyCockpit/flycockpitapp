@@ -69,7 +69,7 @@ pub struct AgentDef {
     pub tools: Option<Vec<String>>,
     /// Per-agent tool placement. Omitted tools use the role default; for
     /// user-authored definitions without a role default, omission means
-    /// [`ToolTier::Builtin`].
+    /// [`ToolTier::Enabled`].
     #[serde(rename = "toolTiers", default)]
     pub tool_tiers: BTreeMap<String, ToolTier>,
     /// Per-agent tool-description overrides (prompt
@@ -119,7 +119,7 @@ pub struct AgentDef {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolTier {
-    Builtin,
+    Enabled,
     Discoverable,
     Disabled,
 }
@@ -127,7 +127,7 @@ pub enum ToolTier {
 impl ToolTier {
     pub fn label(self) -> &'static str {
         match self {
-            ToolTier::Builtin => "builtin",
+            ToolTier::Enabled => "enabled",
             ToolTier::Discoverable => "discoverable",
             ToolTier::Disabled => "disabled",
         }
@@ -135,7 +135,7 @@ impl ToolTier {
 
     pub fn from_label(value: &str) -> Option<Self> {
         match value {
-            "builtin" => Some(ToolTier::Builtin),
+            "enabled" => Some(ToolTier::Enabled),
             "discoverable" => Some(ToolTier::Discoverable),
             "disabled" => Some(ToolTier::Disabled),
             _ => None,
@@ -159,23 +159,26 @@ pub struct ToolSurfaceItem {
 }
 
 const ALL_TOOL_TIERS: &[ToolTier] = &[
-    ToolTier::Builtin,
+    ToolTier::Enabled,
     ToolTier::Discoverable,
     ToolTier::Disabled,
 ];
-const NON_DISCOVERABLE_TOOL_TIERS: &[ToolTier] = &[ToolTier::Builtin, ToolTier::Disabled];
+const SAFETY_TOOL_TIERS: &[ToolTier] = &[ToolTier::Enabled];
 
 pub fn known_tool_names() -> &'static [&'static str] {
     invariants::known_tool_names()
 }
 
 pub fn legal_tool_tiers(tool: &str) -> &'static [ToolTier] {
-    if invariants::STRUCTURAL_TOOLS.contains(&tool) || invariants::LOCK_WRITE_TOOLS.contains(&tool)
-    {
-        NON_DISCOVERABLE_TOOL_TIERS
+    if is_safety_tool(tool) {
+        SAFETY_TOOL_TIERS
     } else {
         ALL_TOOL_TIERS
     }
+}
+
+pub fn is_safety_tool(tool: &str) -> bool {
+    invariants::STRUCTURAL_TOOLS.contains(&tool) || invariants::LOCK_WRITE_TOOLS.contains(&tool)
 }
 
 pub fn tool_surface_catalog() -> Vec<ToolSurfaceItem> {

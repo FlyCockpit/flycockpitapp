@@ -583,6 +583,15 @@
     },
     "request": "set_session_llm_mode"
   },
+  "set_tool_surface_override": {
+    "params": {
+      "monty_nudge": "monty tools enabled: code",
+      "override_json": "{\"tools\":[\"read\",\"code\",\"mcp\"],\"toolTiers\":{\"code\":\"discoverable\"}}",
+      "persist_session": true,
+      "prune_after_switch": true
+    },
+    "request": "set_tool_surface_override"
+  },
   "set_tandem_models": {
     "params": {
       "models": [["fixture", "model"]]

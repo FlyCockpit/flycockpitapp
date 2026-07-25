@@ -333,6 +333,45 @@ fn cache_break_warning_suppressed_on_no_cache_provider() {
 }
 
 #[test]
+fn tools_warning_suppressed_on_no_cache_provider() {
+    use cockpit_config::providers::{CacheConfig, CacheMode, ProviderEntry, ProvidersConfig};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.launch.active_model = Some(("local".to_string(), "model".to_string()));
+    app.config_snapshot.providers = ProvidersConfig {
+        providers: std::collections::BTreeMap::from([(
+            "local".to_string(),
+            ProviderEntry {
+                url: "http://127.0.0.1:1234".to_string(),
+                cache: CacheConfig {
+                    mode: CacheMode::None,
+                    ttl_secs: 300,
+                },
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+
+    let request_id = cockpit_core::engine::ControlRequestId(1);
+    app.pending_control_requests.insert(
+        request_id,
+        super::PendingControlRequest {
+            label: "/tools".to_string(),
+            applied: super::ControlApplied::CacheBreakWarning,
+        },
+    );
+
+    let before = app.history.len();
+    app.apply_control_request_outcome(
+        request_id,
+        cockpit_core::engine::ControlRequestOutcome::Applied,
+    );
+    assert_eq!(app.history.len(), before);
+}
+
+#[test]
 fn xml_escape_attr() {
     assert_eq!(xml_escape("a\"b<c>&d"), "a&quot;b&lt;c&gt;&amp;d");
 }

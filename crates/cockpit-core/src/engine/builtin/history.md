@@ -7,9 +7,9 @@ tools:
   - session_read
   - session_lineage_search
 toolTiers:
-  session_search: builtin
-  session_read: builtin
-  session_lineage_search: builtin
+  session_search: enabled
+  session_read: enabled
+  session_lineage_search: enabled
 ---
 
 You are the `history` subagent. Your job is to recover relevant details from prior Cockpit session history without bloating the caller's context.

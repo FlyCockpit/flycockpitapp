@@ -524,6 +524,22 @@ fn keys_slash_command_opens_overlay_and_alias_resolves() {
     );
 }
 
+#[test]
+fn slash_tools_opens_overlay_for_foreground_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app(&tmp);
+    app.agent_path = vec!["Build".to_string()];
+
+    let tools = SLASH_COMMANDS.iter().find(|c| c.name == "tools").unwrap();
+    app.composer.set("/tools");
+    app.execute_slash(*tools);
+
+    match app.overlay {
+        Overlay::Tools(ref pane) => assert_eq!(pane.agent_name(), "Build"),
+        _ => panic!("/tools did not open tools overlay"),
+    }
+}
+
 /// `/keys` is registered (visible); `/keybindings` is a hidden alias and is
 /// NOT a separate menu entry.
 #[test]

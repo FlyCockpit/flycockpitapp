@@ -2281,11 +2281,11 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                         .tool_tiers
                         .get(tool.name)
                         .copied()
-                        .unwrap_or(cockpit_core::agents::ToolTier::Builtin);
+                        .unwrap_or(cockpit_core::agents::ToolTier::Enabled);
                     let tiers = cockpit_core::agents::legal_tool_tiers(tool.name);
                     let index = tiers.iter().position(|tier| *tier == current).unwrap_or(0);
                     let next = tiers[(index + 1) % tiers.len()];
-                    if next == cockpit_core::agents::ToolTier::Builtin {
+                    if next == cockpit_core::agents::ToolTier::Enabled {
                         tool_surface.tool_tiers.remove(tool.name);
                     } else {
                         tool_surface.tool_tiers.insert(tool.name.to_string(), next);
@@ -2758,7 +2758,7 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                             .tool_tiers
                             .get(item.name)
                             .copied()
-                            .unwrap_or(cockpit_core::agents::ToolTier::Builtin)
+                            .unwrap_or(cockpit_core::agents::ToolTier::Enabled)
                             .label()
                     } else {
                         "-"

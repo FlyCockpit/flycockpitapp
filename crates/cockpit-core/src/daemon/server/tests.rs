@@ -2766,6 +2766,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "SessionWork::SetSessionLlmMode delivered to attached worker",
         },
         MutatingDispatchCase {
+            kind: "set_tool_surface_override",
+            effect_class: DriverForwarded,
+            observation: "SessionWork::SetToolSurfaceOverride delivered to attached worker",
+        },
+        MutatingDispatchCase {
             kind: "set_approval_mode",
             effect_class: InMemory,
             observation: "approval mode response and broadcast event reflect new mode",
@@ -3089,6 +3094,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "delete_session"
         | "set_active_model"
         | "set_agent"
+        | "set_tool_surface_override"
         | "set_llm_mode"
         | "set_session_llm_mode"
         | "set_delegation_recursion"
@@ -3171,6 +3177,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("list_models"),
         authz_session_writer("set_active_model"),
         authz_session_writer("set_agent"),
+        authz_session_writer("set_tool_surface_override"),
         authz_session_writer("set_llm_mode"),
         authz_session_writer("set_session_llm_mode"),
         authz_session_writer("set_approval_mode"),
@@ -3884,6 +3891,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "resolve_interrupt"
             | "set_active_model"
             | "set_agent"
+            | "set_tool_surface_override"
             | "set_llm_mode"
             | "set_session_llm_mode"
             | "set_approval_mode"
@@ -4145,6 +4153,12 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "set_llm_mode" => Request::SetLlmMode { mode: None },
         "set_session_llm_mode" => Request::SetSessionLlmMode {
             mode: crate::config::extended::LlmMode::Normal,
+        },
+        "set_tool_surface_override" => Request::SetToolSurfaceOverride {
+            override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
+            persist_session: true,
+            prune_after_switch: true,
+            monty_nudge: Some("monty tools enabled: read".to_string()),
         },
         "set_approval_mode" => Request::SetApprovalMode {
             mode: crate::config::extended::ApprovalMode::Manual,
@@ -4896,6 +4910,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "resolve_interrupt"
         | "set_active_model"
         | "set_agent"
+        | "set_tool_surface_override"
         | "set_llm_mode"
         | "set_session_llm_mode"
         | "set_delegation_recursion"
@@ -5045,6 +5060,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "resolve_interrupt"
         | "set_active_model"
         | "set_agent"
+        | "set_tool_surface_override"
         | "set_llm_mode"
         | "set_session_llm_mode"
         | "set_delegation_recursion"
@@ -5312,6 +5328,12 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "set_session_llm_mode" => Request::SetSessionLlmMode {
             mode: crate::config::extended::LlmMode::Normal,
         },
+        "set_tool_surface_override" => Request::SetToolSurfaceOverride {
+            override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
+            persist_session: true,
+            prune_after_switch: true,
+            monty_nudge: Some("monty tools enabled: read".to_string()),
+        },
         "set_delegation_recursion" => Request::SetDelegationRecursion {
             enabled: true,
             default_depth: 3,
@@ -5477,6 +5499,20 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert_eq!(mode, crate::config::extended::LlmMode::Normal);
                 }
                 (
+                    "set_tool_surface_override",
+                    SessionWork::SetToolSurfaceOverride {
+                        override_json,
+                        persist_session,
+                        prune_after_switch,
+                        monty_nudge,
+                    },
+                ) => {
+                    assert!(override_json.contains("\"read\""));
+                    assert!(persist_session);
+                    assert!(prune_after_switch);
+                    assert_eq!(monty_nudge.as_deref(), Some("monty tools enabled: read"));
+                }
+                (
                     "set_delegation_recursion",
                     SessionWork::SetDelegationRecursion {
                         enabled,
@@ -5599,6 +5635,12 @@ async fn assert_attached_required_malformed(kind: &str) {
         "set_llm_mode" => Request::SetLlmMode { mode: None },
         "set_session_llm_mode" => Request::SetSessionLlmMode {
             mode: crate::config::extended::LlmMode::Normal,
+        },
+        "set_tool_surface_override" => Request::SetToolSurfaceOverride {
+            override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
+            persist_session: true,
+            prune_after_switch: true,
+            monty_nudge: None,
         },
         "set_approval_mode" => Request::SetApprovalMode {
             mode: crate::config::extended::ApprovalMode::Manual,
@@ -7858,6 +7900,18 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::SetToolSurfaceOverride {
+                override_json: r#"{"tools":["read"],"toolTiers":{}}"#.to_string(),
+                persist_session: true,
+                prune_after_switch: true,
+                monty_nudge: None,
+            },
+            kind: "set_tool_surface_override",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::SetApprovalMode {
                 mode: crate::config::extended::ApprovalMode::Manual,
             },
@@ -8170,6 +8224,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SetAgent,
         SetLlmMode,
         SetSessionLlmMode,
+        SetToolSurfaceOverride,
         SetApprovalMode,
         SetDelegationRecursion,
         SetSandbox,

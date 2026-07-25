@@ -23,6 +23,18 @@ pub(super) fn session_llm_mode_control(
     }
 }
 
+pub(super) fn tool_surface_override_control(
+    selection: crate::agents::ToolSurfaceSelection,
+    prune_after_switch: bool,
+    monty_nudge: Option<String>,
+) -> crate::engine::driver::DriverControl {
+    crate::engine::driver::DriverControl::SetToolSurfaceOverride {
+        selection,
+        prune_after_switch,
+        monty_nudge,
+    }
+}
+
 pub(super) fn stored_session_llm_mode(
     session: &Session,
 ) -> Option<crate::config::extended::LlmMode> {
@@ -478,6 +490,7 @@ pub(super) async fn run_worker(
     let (driver_control_tx, driver_control_rx) =
         mpsc::channel::<crate::engine::driver::DriverControl>(WORK_QUEUE_CAPACITY);
     let (engine_event_tx, mut engine_event_rx) = mpsc::channel::<TurnEvent>(WORK_QUEUE_CAPACITY);
+    let engine_event_notice_tx = engine_event_tx.clone();
 
     // Forward engine events → broadcast channel as proto::Event, and
     // maintain the live job/turn status (GOALS §17f) off the same
@@ -1630,6 +1643,56 @@ pub(super) async fn run_worker(
                         break WorkerStop::DriverFailed;
                     }
                 }
+                SessionWork::SetToolSurfaceOverride {
+                    override_json,
+                    persist_session,
+                    prune_after_switch,
+                    monty_nudge,
+                } => {
+                    let selection = match serde_json::from_str::<crate::agents::ToolSurfaceSelection>(
+                        &override_json,
+                    ) {
+                        Ok(selection) => selection,
+                        Err(error) => {
+                            tracing::warn!(%error, session_id = %session_id, "invalid tool surface override JSON");
+                            let _ = engine_event_notice_tx
+                                    .send(TurnEvent::Notice {
+                                        text: format!(
+                                            "Tool surface update failed — invalid override JSON: {error}"
+                                        ),
+                                    })
+                                    .await;
+                            continue;
+                        }
+                    };
+                    if persist_session
+                        && let Err(error) =
+                            session.set_tool_surface_override_json(Some(override_json.clone()))
+                    {
+                        tracing::warn!(%error, session_id = %session_id, "persisting tool surface override failed");
+                        let _ = engine_event_notice_tx
+                            .send(TurnEvent::Notice {
+                                text: format!(
+                                    "Tool surface update failed — could not persist session override: {error:#}"
+                                ),
+                            })
+                            .await;
+                        continue;
+                    }
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        tool_surface_override_control(selection, prune_after_switch, monty_nudge),
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
                 SessionWork::SetDelegationRecursion {
                     enabled,
                     default_depth,
@@ -1989,6 +2052,7 @@ pub(super) async fn run_worker(
         }
     }
     drop(driver_input_queue);
+    drop(engine_event_notice_tx);
     let _ = forward.await;
     let _ = queue_forward.await;
 

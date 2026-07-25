@@ -58,5 +58,7 @@ pub mod slash;
 pub mod stats_pane;
 pub mod textfield;
 pub mod theme;
+pub(crate) mod tool_surface_picker;
+pub mod tools_pane;
 pub mod usage_pane;
 pub mod vim_editor;

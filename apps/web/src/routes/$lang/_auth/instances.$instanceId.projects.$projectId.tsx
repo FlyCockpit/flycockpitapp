@@ -40,6 +40,12 @@ import { useRemoteProjectSessions } from "@/hooks/use-remote-project-sessions";
 import { useTranscriptHistoryPaging } from "@/hooks/use-transcript-history-paging";
 import { llmModeView } from "@/lib/inference-failure-view";
 import {
+  type InterruptSelection,
+  type InterruptView,
+  interruptView,
+  type RiskVariant,
+} from "@/lib/interrupt-view";
+import {
   canMutateSessions,
   resolveSessionViewerMode,
   type SessionViewerMode,
@@ -52,7 +58,6 @@ import {
   type SessionPagingState,
   useRemoteSessionsStore,
   type WebHistoryEntry,
-  type WebInterruptResolution,
   type WebSessionSummary,
 } from "@/stores/remote-sessions";
 import { friendly } from "@/utils/friendly-error";
@@ -348,13 +353,12 @@ function ProjectSessionPage() {
                   onLoadOlder={transcriptPaging.loadOlderWithAnchor}
                   interruptFocus={search.interrupt}
                   readOnly={!canWriteSessions}
-                  onResolve={(interruptId, resolution, answer) =>
+                  onResolve={(interruptId, selection) =>
                     canWriteSessions
                       ? resolveInterrupt(instanceId, {
                           sessionId: detail.summary.sessionId,
                           interruptId,
-                          resolution,
-                          answer,
+                          selection,
                         })
                       : Promise.resolve()
                   }
@@ -673,11 +677,7 @@ function Transcript({
   onLoadOlder: () => Promise<void>;
   interruptFocus?: string;
   readOnly: boolean;
-  onResolve: (
-    interruptId: string,
-    resolution: WebInterruptResolution,
-    answer?: string,
-  ) => Promise<void>;
+  onResolve: (interruptId: string, selection: InterruptSelection) => Promise<void>;
 }) {
   const { t } = useTranslation("instances");
   return (
@@ -722,11 +722,7 @@ function TranscriptEntry({
   entry: WebHistoryEntry;
   focused: boolean;
   readOnly: boolean;
-  onResolve: (
-    interruptId: string,
-    resolution: WebInterruptResolution,
-    answer?: string,
-  ) => Promise<void>;
+  onResolve: (interruptId: string, selection: InterruptSelection) => Promise<void>;
 }) {
   const { t } = useTranslation("instances");
   if (entry.kind === "user_message")
@@ -805,40 +801,420 @@ function TranscriptEntry({
     );
   if (entry.kind === "interrupt") {
     return (
-      <Card className={focused ? "border-primary" : ""}>
-        <CardHeader>
-          <CardTitle className="text-base">{entry.interrupt.title}</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {entry.interrupt.body ? (
-            <p className="text-sm text-muted-foreground">{entry.interrupt.body}</p>
-          ) : null}
-          {entry.interrupt.resolved ? (
-            <p className="text-sm text-muted-foreground">{t("remote.interruptResolved")}</p>
-          ) : readOnly ? (
-            <p className="text-sm text-muted-foreground">{t("remote.readOnlyInterruptNotice")}</p>
-          ) : (
-            <div className="flex flex-wrap gap-2">
-              <Button
-                size="sm"
-                onClick={() => void onResolve(entry.interrupt.interruptId, "approve")}
-              >
-                {t("remote.approve")}
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => void onResolve(entry.interrupt.interruptId, "deny")}
-              >
-                {t("remote.deny")}
-              </Button>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      <InterruptTranscriptCard
+        entry={entry}
+        focused={focused}
+        readOnly={readOnly}
+        onResolve={onResolve}
+      />
     );
   }
   return <div className="rounded-md border p-3 text-sm text-muted-foreground">{entry.kind}</div>;
+}
+
+type InterruptHistoryEntry = Extract<WebHistoryEntry, { kind: "interrupt" }>;
+
+function InterruptTranscriptCard({
+  entry,
+  focused,
+  readOnly,
+  onResolve,
+}: {
+  entry: InterruptHistoryEntry;
+  focused: boolean;
+  readOnly: boolean;
+  onResolve: (interruptId: string, selection: InterruptSelection) => Promise<void>;
+}) {
+  const { t } = useTranslation("instances");
+  const [text, setText] = useState("");
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const view = interruptView(entry.interrupt.question, { readOnly });
+  const interruptId = entry.interrupt.interruptId;
+
+  const resolve = (selection: InterruptSelection) => {
+    void onResolve(interruptId, selection);
+  };
+
+  const toggleSelected = (optionId: string) => {
+    setSelectedIds((current) =>
+      current.includes(optionId)
+        ? current.filter((selectedId) => selectedId !== optionId)
+        : [...current, optionId],
+    );
+  };
+
+  return (
+    <Card className={focused ? "border-primary" : ""}>
+      <CardHeader>
+        <div className="flex flex-wrap items-center gap-2">
+          <CardTitle className="text-base">{view.prompt}</CardTitle>
+          <span className="rounded-full border px-2 py-0.5 text-xs text-muted-foreground">
+            {view.frame === "approval"
+              ? t("remote.interruptFrameApproval")
+              : t("remote.interruptFrameQuestion")}
+          </span>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {entry.interrupt.body && !(view.kind === "single" && view.commandDetail) ? (
+          <p className="text-sm text-muted-foreground">{entry.interrupt.body}</p>
+        ) : null}
+        {view.kind === "single" ? <InterruptCommandDetail view={view} /> : null}
+        {entry.interrupt.resolved ? (
+          <p className="text-sm text-muted-foreground">{t("remote.interruptResolved")}</p>
+        ) : readOnly ? (
+          <p className="text-sm text-muted-foreground">{t("remote.readOnlyInterruptNotice")}</p>
+        ) : (
+          <>
+            {view.kind === "single" ? (
+              <SingleInterruptActions view={view} text={text} setText={setText} resolve={resolve} />
+            ) : null}
+            {view.kind === "multi" ? (
+              <MultiInterruptActions
+                view={view}
+                text={text}
+                setText={setText}
+                selectedIds={selectedIds}
+                toggleSelected={toggleSelected}
+                resolve={resolve}
+              />
+            ) : null}
+            {view.kind === "freetext" ? (
+              <div className="space-y-2">
+                <Input
+                  type={view.inputType}
+                  value={text}
+                  onChange={(event) => setText(event.target.value)}
+                  placeholder={t("remote.interruptAnswerPlaceholder")}
+                />
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" onClick={() => resolve({ kind: "freetext", text })}>
+                    {t("remote.interruptAnswer")}
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => resolve({ kind: "cancel" })}>
+                    {t("remote.interruptDecline")}
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function SingleInterruptActions({
+  view,
+  text,
+  setText,
+  resolve,
+}: {
+  view: Extract<InterruptView, { kind: "single" }>;
+  text: string;
+  setText: (text: string) => void;
+  resolve: (selection: InterruptSelection) => void;
+}) {
+  const { t } = useTranslation("instances");
+  const hasAnyOption =
+    view.primaryOptions.length > 0 ||
+    view.secondaryOptions.length > 0 ||
+    (view.commandDetail?.scopeChoices.length ?? 0) > 0;
+
+  return (
+    <div className="space-y-3">
+      <OptionButtonGroup
+        options={view.primaryOptions}
+        onSelect={(optionId) => resolve({ kind: "single", selectedId: optionId })}
+      />
+
+      {view.commandDetail?.scopeChoices.length ? (
+        <div className="space-y-2">
+          <p className="text-xs font-medium text-muted-foreground">
+            {t("remote.interruptGrantScope")}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {view.commandDetail.scopeChoices.map((scope) => (
+              <Button
+                key={scope.optionId}
+                size="sm"
+                variant="outline"
+                onClick={() => resolve({ kind: "single", selectedId: scope.optionId })}
+              >
+                {t(scope.labelKey, { scope: scope.scope })}
+              </Button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {view.sandboxEscalation ? <SandboxEscalationDetail view={view} /> : null}
+
+      {view.secondaryOptions.length ? (
+        <div className="space-y-2">
+          <p className="text-xs font-medium text-muted-foreground">
+            {t("remote.interruptAdditionalAccess")}
+          </p>
+          <OptionButtonGroup
+            options={view.secondaryOptions}
+            variant="outline"
+            onSelect={(optionId) => resolve({ kind: "single", selectedId: optionId })}
+          />
+        </div>
+      ) : null}
+
+      {view.freeText ? (
+        <div className="space-y-2">
+          <Input
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            placeholder={t("remote.interruptCustomAnswerPlaceholder")}
+          />
+          <Button size="sm" onClick={() => resolve({ kind: "freetext", text })}>
+            {t("remote.interruptAnswer")}
+          </Button>
+        </div>
+      ) : null}
+
+      {!hasAnyOption && !view.freeText && !view.permission ? (
+        <Button size="sm" variant="outline" onClick={() => resolve({ kind: "cancel" })}>
+          {t("remote.interruptAcknowledge")}
+        </Button>
+      ) : null}
+
+      <Button size="sm" variant="outline" onClick={() => resolve({ kind: "cancel" })}>
+        {t("remote.interruptDecline")}
+      </Button>
+    </div>
+  );
+}
+
+function MultiInterruptActions({
+  view,
+  text,
+  setText,
+  selectedIds,
+  toggleSelected,
+  resolve,
+}: {
+  view: Extract<InterruptView, { kind: "multi" }>;
+  text: string;
+  setText: (text: string) => void;
+  selectedIds: string[];
+  toggleSelected: (optionId: string) => void;
+  resolve: (selection: InterruptSelection) => void;
+}) {
+  const { t } = useTranslation("instances");
+  return (
+    <div className="space-y-3">
+      <MultiOptionButtons
+        options={view.primaryOptions}
+        selectedIds={selectedIds}
+        toggleSelected={toggleSelected}
+      />
+      {view.secondaryOptions.length ? (
+        <div className="space-y-2">
+          <p className="text-xs font-medium text-muted-foreground">
+            {t("remote.interruptAdditionalChoices")}
+          </p>
+          <MultiOptionButtons
+            options={view.secondaryOptions}
+            selectedIds={selectedIds}
+            toggleSelected={toggleSelected}
+          />
+        </div>
+      ) : null}
+      {view.freeText ? (
+        <Input
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+          placeholder={t("remote.interruptCustomAnswerPlaceholder")}
+        />
+      ) : null}
+      <div className="flex flex-wrap gap-2">
+        <Button
+          size="sm"
+          disabled={selectedIds.length === 0}
+          onClick={() => resolve({ kind: "multi", selectedIds })}
+        >
+          {t("remote.interruptSubmitChoices")}
+        </Button>
+        {view.freeText ? (
+          <Button size="sm" variant="outline" onClick={() => resolve({ kind: "freetext", text })}>
+            {t("remote.interruptAnswer")}
+          </Button>
+        ) : null}
+        <Button size="sm" variant="outline" onClick={() => resolve({ kind: "cancel" })}>
+          {t("remote.interruptDecline")}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function OptionButtonGroup({
+  options,
+  variant,
+  onSelect,
+}: {
+  options: { id: string; label: string; description?: string }[];
+  variant?: "default" | "outline";
+  onSelect: (optionId: string) => void;
+}) {
+  if (!options.length) return null;
+  return (
+    <div className="flex flex-wrap gap-2">
+      {options.map((option) => (
+        <div key={option.id} className="space-y-1">
+          <Button size="sm" variant={variant} onClick={() => onSelect(option.id)}>
+            {option.label}
+          </Button>
+          {option.description ? (
+            <p className="max-w-sm text-xs text-muted-foreground">{option.description}</p>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function MultiOptionButtons({
+  options,
+  selectedIds,
+  toggleSelected,
+}: {
+  options: { id: string; label: string; description?: string }[];
+  selectedIds: string[];
+  toggleSelected: (optionId: string) => void;
+}) {
+  if (!options.length) return null;
+  return (
+    <div className="flex flex-wrap gap-2">
+      {options.map((option) => {
+        const selected = selectedIds.includes(option.id);
+        return (
+          <div key={option.id} className="space-y-1">
+            <Button
+              size="sm"
+              variant={selected ? "default" : "outline"}
+              onClick={() => toggleSelected(option.id)}
+            >
+              {option.label}
+            </Button>
+            {option.description ? (
+              <p className="max-w-sm text-xs text-muted-foreground">{option.description}</p>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function InterruptCommandDetail({ view }: { view: Extract<InterruptView, { kind: "single" }> }) {
+  const { t } = useTranslation("instances");
+  const command = view.commandDetail;
+  if (!command) return null;
+  return (
+    <div className="space-y-2 rounded-md border bg-muted/20 p-3 text-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          className={`rounded-full border px-2 py-0.5 text-xs ${riskBadgeClass(command.risk.variant)}`}
+        >
+          {command.risk.label}
+        </span>
+        {view.approvalClassLabelKey ? (
+          <span className="rounded-full border px-2 py-0.5 text-xs text-muted-foreground">
+            {t(view.approvalClassLabelKey)}
+          </span>
+        ) : null}
+        <span className="text-xs text-muted-foreground">{command.stepLabel}</span>
+      </div>
+      <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-background p-2 text-xs">
+        {command.fullCommand}
+      </pre>
+      {command.cwd ? (
+        <p className="text-xs text-muted-foreground">
+          {t("remote.interruptCwd", { cwd: command.cwd })}
+        </p>
+      ) : null}
+      {command.reasons.length ? (
+        <p className="text-xs text-muted-foreground">
+          {t("remote.interruptReasons", { reasons: command.reasons.join(", ") })}
+        </p>
+      ) : null}
+      {command.affectedTargets.length ? (
+        <p className="text-xs text-muted-foreground">
+          {t("remote.interruptAffected", { targets: command.affectedTargets.join(", ") })}
+        </p>
+      ) : null}
+      {command.policyCap ? (
+        <p className="text-xs text-muted-foreground">
+          {t("remote.interruptPolicyCap", { cap: command.policyCap })}
+        </p>
+      ) : null}
+      {command.nativeToolHints.length ? (
+        <p className="text-xs text-muted-foreground">
+          {t("remote.interruptHints", { hints: command.nativeToolHints.join(", ") })}
+        </p>
+      ) : null}
+      {command.writeContent ? (
+        <div className="rounded border bg-background p-2">
+          <p className="mb-1 text-xs text-muted-foreground">
+            {command.writeContent.dynamic
+              ? t("remote.interruptWriteContentDynamic")
+              : t("remote.interruptWriteContent")}
+          </p>
+          <pre className="max-h-28 overflow-auto whitespace-pre-wrap break-words text-xs">
+            {command.writeContent.preview}
+            {command.writeContent.truncated ? "..." : ""}
+          </pre>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function SandboxEscalationDetail({ view }: { view: Extract<InterruptView, { kind: "single" }> }) {
+  const { t } = useTranslation("instances");
+  const escalation = view.sandboxEscalation;
+  if (!escalation) return null;
+  return (
+    <div className="space-y-1 rounded-md border border-warning/50 bg-warning/5 p-3 text-xs">
+      <p className="font-medium text-warning">{t("remote.interruptSandboxEscalation")}</p>
+      <p>{t("remote.interruptSandboxExit", { code: escalation.confinedExit })}</p>
+      <p className="whitespace-pre-wrap break-words">
+        {t("remote.interruptSandboxStderr", {
+          stderr: `${escalation.confinedStderrPreview}${escalation.confinedStderrTruncated ? "..." : ""}`,
+        })}
+      </p>
+      {escalation.suggestedPaths.length ? (
+        <p>
+          {t("remote.interruptSandboxPaths", {
+            paths: escalation.suggestedPaths.join(", "),
+          })}
+        </p>
+      ) : null}
+      {escalation.suggestedAccess ? (
+        <p>{t("remote.interruptSandboxAccess", { access: escalation.suggestedAccess })}</p>
+      ) : null}
+      {escalation.denial ? (
+        <p>
+          {t("remote.interruptSandboxDenial", {
+            confidence: escalation.denial.confidence,
+            count: escalation.denial.evidenceCount,
+          })}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function riskBadgeClass(variant: RiskVariant) {
+  if (variant === "low") return "border-emerald-500/50 text-emerald-700";
+  if (variant === "medium") return "border-amber-500/50 text-amber-700";
+  if (variant === "high" || variant === "critical") return "border-destructive/60 text-destructive";
+  return "text-muted-foreground";
 }
 
 function Bubble({

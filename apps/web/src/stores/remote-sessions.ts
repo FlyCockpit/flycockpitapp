@@ -8,7 +8,6 @@ import type {
   GitStatusResult,
   HistoryPageResult,
   InterruptQuestion,
-  ResolveResponse,
   HistoryEntry as WireHistoryEntry,
   SessionSummary as WireSessionSummary,
 } from "@flycockpit/cockpit-protocol";
@@ -22,6 +21,7 @@ import {
   type LlmMode,
   llmModeView,
 } from "@/lib/inference-failure-view";
+import { type InterruptSelection, resolveFromSelection } from "@/lib/interrupt-view";
 
 type ConnectionStatus = "idle" | "connecting" | "connected" | "offline" | "error";
 
@@ -149,9 +149,6 @@ export type SessionPagingState = {
   error: string | null;
 };
 
-const webInterruptResolutionValues = ["approve", "deny", "answer"] as const;
-export type WebInterruptResolution = (typeof webInterruptResolutionValues)[number];
-
 export type SessionDetail = {
   summary: WebSessionSummary;
   history: WebHistoryEntry[];
@@ -199,8 +196,7 @@ type RemoteSessionState = {
     input: {
       sessionId: string;
       interruptId: string;
-      resolution: WebInterruptResolution;
-      answer?: string;
+      selection: InterruptSelection;
     },
   ) => Promise<void>;
   renameSession: (instanceId: string, sessionId: string, title: string) => Promise<void>;
@@ -715,21 +711,6 @@ function interruptQuestionTitle(question: InterruptQuestion) {
 function interruptQuestionBody(question: InterruptQuestion, fallback: string) {
   if (question.kind === "single") return question.data.command_detail?.full_command ?? fallback;
   return fallback;
-}
-
-function resolveResponseForInterrupt(
-  question: InterruptQuestion,
-  resolution: WebInterruptResolution,
-  answer?: string,
-): ResolveResponse {
-  if (resolution === "deny") return { kind: "cancel" };
-  if (question.kind === "freetext") return { kind: "freetext", data: { text: answer ?? "" } };
-  if (question.kind === "multi") {
-    const selected = question.data.options[0]?.id;
-    return selected ? { kind: "multi", data: { selected_ids: [selected] } } : { kind: "cancel" };
-  }
-  const selected = question.data.options[0]?.id;
-  return selected ? { kind: "single", data: { selected_id: selected } } : { kind: "cancel" };
 }
 
 function usageFromData(data: Record<string, unknown>): WebUsage {
@@ -1341,7 +1322,7 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
     if (entry?.kind !== "interrupt") return;
     await get().clients[instanceId]?.resolveInterrupt(
       input.interruptId,
-      resolveResponseForInterrupt(entry.interrupt.question, input.resolution, input.answer),
+      resolveFromSelection(entry.interrupt.question, input.selection),
     );
   },
   renameSession: async (instanceId, sessionId, title) => {

@@ -38,8 +38,8 @@ use crate::tui::theme::{
 };
 
 use super::{
-    AUTOCOMPLETE_ROWS, AffordanceTarget, App, HistoryEntryId, HistoryRenderCacheEntry, PaneSide,
-    PrewrappedEntry, ScrollAnchor, Selection, SuggestionBoxKind, SuggestionBoxRowHit,
+    AUTOCOMPLETE_ROWS, AffordanceTarget, App, DirtyScan, HistoryEntryId, HistoryRenderCacheEntry,
+    PaneSide, PrewrappedEntry, ScrollAnchor, Selection, SuggestionBoxKind, SuggestionBoxRowHit,
     SuggestionBoxTarget, Toast, ToastKind, TranscriptFind, WORKING_MESSAGES,
 };
 
@@ -65,6 +65,7 @@ thread_local! {
     static MATERIALIZED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GEOMETRY_RECOMPUTED_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FIND_LINES_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FINGERPRINT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -86,6 +87,11 @@ pub(crate) fn reset_geometry_recompute_count() {
 #[cfg(test)]
 pub(crate) fn reset_find_lines_rebuild_count() {
     FIND_LINES_REBUILDS.with(|rebuilds| rebuilds.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_fingerprint_call_count() {
+    FINGERPRINT_CALLS.with(|calls| calls.set(0));
 }
 
 #[cfg(test)]
@@ -111,6 +117,11 @@ pub(crate) fn geometry_recompute_count() -> usize {
 #[cfg(test)]
 pub(crate) fn find_lines_rebuild_count() -> usize {
     FIND_LINES_REBUILDS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn fingerprint_call_count() -> usize {
+    FINGERPRINT_CALLS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -372,6 +383,9 @@ fn hash_len(hasher: &mut DefaultHasher, value: &str) {
 }
 
 fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
+    #[cfg(test)]
+    FINGERPRINT_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let mut hasher = DefaultHasher::new();
     std::mem::discriminant(entry).hash(&mut hasher);
     match entry {
@@ -1710,16 +1724,39 @@ impl App {
     }
 
     pub(super) fn sync_history_render_versions(&mut self) {
-        let live_ids: std::collections::HashSet<_> = self.history.ids().iter().copied().collect();
+        let live_positions: std::collections::HashMap<_, _> = self
+            .history
+            .ids()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(idx, id)| (id, idx))
+            .collect();
+        let live_ids: std::collections::HashSet<_> = live_positions.keys().copied().collect();
         let previous_geometry_entries = self.chat_geometry.entry_count();
         let mut dirty_from: Option<usize> = None;
 
-        for (idx, entry) in self.history.iter().enumerate() {
-            let id = self
-                .history
-                .id_at(idx)
-                .expect("history entry ids stay in lockstep");
-            let fingerprint = history_entry_render_fingerprint(entry);
+        self.history_render_versions
+            .retain(|id, _| live_ids.contains(id));
+        self.history_render_fingerprints
+            .retain(|id, _| live_ids.contains(id));
+        self.history_render_cache_retain_live_ids(&live_ids);
+
+        let mut scan_ids = match self.history.take_dirty() {
+            DirtyScan::All => live_ids.clone(),
+            DirtyScan::Ids(ids) => ids,
+        };
+        for id in &live_ids {
+            if !self.history_render_fingerprints.contains_key(id) {
+                scan_ids.insert(*id);
+            }
+        }
+
+        for id in scan_ids {
+            let Some(&idx) = live_positions.get(&id) else {
+                continue;
+            };
+            let fingerprint = history_entry_render_fingerprint(&self.history[idx]);
             let changed = self
                 .history_render_fingerprints
                 .get(&id)
@@ -1744,11 +1781,6 @@ impl App {
             }
         }
 
-        self.history_render_versions
-            .retain(|id, _| live_ids.contains(id));
-        self.history_render_fingerprints
-            .retain(|id, _| live_ids.contains(id));
-        self.history_render_cache_retain_live_ids(&live_ids);
         if previous_geometry_entries != self.history.len() {
             dirty_from = Some(dirty_from.unwrap_or(0).min(self.history.len()));
         }
@@ -5261,10 +5293,12 @@ mod render_history_spacing_tests {
         App, ChatCopyTarget, ChatRowKind, ChatRowMeta, ControlChip, HISTORY_RENDER_CACHE_MAX_ROWS,
         HistoryRenderCacheEntry, PinHit, ScrollAnchor, Selection, TranscriptFind,
         affordance_target_for_row, chat_visible_top, extract_selection_plaintext,
-        find_lines_rebuild_count, geometry_recompute_count, materialized_row_count,
-        pin_hit_for_visual_row, prewrap_call_count, prewrap_entry_rows, prewrap_row_count,
-        rendered_line_text, reset_find_lines_rebuild_count, reset_geometry_recompute_count,
-        reset_materialized_row_count, reset_prewrap_counters, wrap_line_to_visual_rows,
+        find_lines_rebuild_count, fingerprint_call_count, geometry_recompute_count,
+        history_entry_render_fingerprint, materialized_row_count, pin_hit_for_visual_row,
+        prewrap_call_count, prewrap_entry_rows, prewrap_row_count, rendered_line_text,
+        reset_find_lines_rebuild_count, reset_fingerprint_call_count,
+        reset_geometry_recompute_count, reset_materialized_row_count, reset_prewrap_counters,
+        wrap_line_to_visual_rows,
     };
     use crate::tui::app::{
         AffordanceTarget, HISTORY_PAGE_ENTRIES, HISTORY_WINDOW_TARGET_ENTRIES, HistoryEntryId,
@@ -7356,6 +7390,143 @@ mod render_history_spacing_tests {
             app.history.last(),
             Some(HistoryEntry::Subagent { .. })
         ));
+    }
+
+    #[test]
+    fn fingerprint_walk_computes_zero_when_no_history_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = long_history_app(tmp.path(), 300);
+
+        render_history_no_selection(&mut app, 80, 6);
+        reset_fingerprint_call_count();
+        render_history_no_selection(&mut app, 80, 6);
+
+        assert_eq!(fingerprint_call_count(), 0);
+    }
+
+    #[test]
+    fn fingerprint_walk_marks_only_streamed_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = long_history_app(tmp.path(), 300);
+
+        render_history_no_selection(&mut app, 80, 6);
+        reset_fingerprint_call_count();
+        match app.history.last_mut().expect("tail entry") {
+            HistoryEntry::Agent { text, .. } => text.push_str(" streamed tail"),
+            other => panic!("expected agent tail, got {other:?}"),
+        }
+        render_history_no_selection(&mut app, 80, 6);
+
+        assert_eq!(fingerprint_call_count(), 1);
+    }
+
+    #[test]
+    fn fingerprint_walk_marks_only_mid_list_insert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = long_history_app(tmp.path(), 300);
+
+        render_history_no_selection(&mut app, 80, 6);
+        let before_versions = app.history_render_versions.clone();
+        let existing_ids = app.history.ids().to_vec();
+
+        reset_fingerprint_call_count();
+        app.history.insert(3, agent("inserted entry"));
+        render_history_no_selection(&mut app, 80, 6);
+
+        assert_eq!(fingerprint_call_count(), 1);
+        for id in existing_ids {
+            assert_eq!(
+                app.history_render_versions.get(&id),
+                before_versions.get(&id),
+                "existing id {id:?} should keep its render version"
+            );
+        }
+    }
+
+    #[test]
+    fn fingerprint_walk_full_rebuild_on_bulk_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = (0..17)
+            .map(|idx| agent(&format!("bulk swapped entry {idx}")))
+            .collect::<Vec<_>>()
+            .into();
+
+        reset_fingerprint_call_count();
+        render_history_no_selection(&mut app, 80, 6);
+
+        assert_eq!(fingerprint_call_count(), 17);
+    }
+
+    #[test]
+    fn sync_history_render_versions_leaves_no_stale_fingerprints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = long_history_app(tmp.path(), 8);
+
+        render_history_no_selection(&mut app, 80, 6);
+        app.history.push(agent("pushed"));
+        render_history_no_selection(&mut app, 80, 6);
+        app.history.insert(2, user("inserted user"));
+        render_history_no_selection(&mut app, 80, 6);
+        app.history.remove(4);
+        render_history_no_selection(&mut app, 80, 6);
+        match app.history.last_mut().expect("tail entry") {
+            HistoryEntry::Agent { text, .. } => text.push_str(" tail mutation"),
+            other => panic!("expected agent tail, got {other:?}"),
+        }
+        render_history_no_selection(&mut app, 80, 6);
+        for entry in app.history.iter_mut().take(2) {
+            if let HistoryEntry::Agent { text, .. } | HistoryEntry::User { text, .. } = entry {
+                text.push_str(" bulk mutation");
+            }
+        }
+        render_history_no_selection(&mut app, 80, 6);
+        app.history
+            .extend(vec![agent("extended 1"), agent("extended 2")]);
+        render_history_no_selection(&mut app, 80, 6);
+        app.history.truncate(app.history.len() - 1);
+        render_history_no_selection(&mut app, 80, 6);
+
+        for (idx, entry) in app.history.iter().enumerate() {
+            let id = app
+                .history
+                .id_at(idx)
+                .expect("history ids stay in lockstep");
+            assert_eq!(
+                app.history_render_fingerprints.get(&id).copied(),
+                Some(history_entry_render_fingerprint(entry)),
+                "stale fingerprint at resident index {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepend_marks_only_prepended_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = window_history_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+
+        render_history_no_selection(&mut app, 80, 6);
+        let before_versions = app.history_render_versions.clone();
+        let existing_ids = app.history.ids().to_vec();
+
+        reset_fingerprint_call_count();
+        let page = (191..=200).map(sequenced_user).collect::<Vec<_>>();
+        assert!(app.prepend_history_page(page, Some(191), true));
+        render_history_no_selection(&mut app, 80, 6);
+
+        assert_eq!(fingerprint_call_count(), 10);
+        for id in existing_ids {
+            assert_eq!(
+                app.history_render_versions.get(&id),
+                before_versions.get(&id),
+                "surviving resident id {id:?} should not be re-fingerprinted"
+            );
+        }
     }
 
     #[test]

@@ -116,7 +116,7 @@ use cockpit_core::engine::{
 };
 use cockpit_core::git::{self, RepoStatus};
 use cockpit_core::welcome::{self, LaunchBundle, LaunchInfo};
-pub(super) use history_log::{HistoryEntryId, HistoryLog};
+pub(super) use history_log::{DirtyScan, HistoryEntryId, HistoryLog};
 pub(super) use history_window::HistoryWindow;
 #[cfg(test)]
 pub(super) use history_window::{HISTORY_PAGE_ENTRIES, HISTORY_WINDOW_TARGET_ENTRIES};

@@ -1,6 +1,6 @@
 use std::ops::{Deref, Index, IndexMut};
 
-use super::{App, HistoryEntry, HistoryLog, TranscriptViewMeta};
+use super::{App, DirtyScan, HistoryEntry, HistoryLog, TranscriptViewMeta};
 
 pub(in crate::tui) const HISTORY_WINDOW_TARGET_ENTRIES: usize = 600;
 pub(in crate::tui) const HISTORY_PAGE_ENTRIES: usize = 200;
@@ -110,6 +110,10 @@ impl HistoryWindow {
 
     pub(super) fn iter_mut(&mut self) -> std::slice::IterMut<'_, HistoryEntry> {
         self.log.iter_mut()
+    }
+
+    pub(super) fn take_dirty(&mut self) -> DirtyScan {
+        self.log.take_dirty()
     }
 
     pub(super) fn trim_front_to_target(&mut self) -> bool {

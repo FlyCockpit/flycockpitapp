@@ -95,6 +95,26 @@ impl HistoryLog {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn prepend<I: IntoIterator<Item = HistoryEntry>>(&mut self, entries: I) {
+        let entries: Vec<_> = entries.into_iter().collect();
+        if entries.is_empty() {
+            return;
+        }
+        let ids: Vec<_> = (0..entries.len()).map(|_| self.issue_id()).collect();
+        self.entries.splice(0..0, entries);
+        self.ids.splice(0..0, ids);
+        self.debug_assert_invariants();
+    }
+
+    pub(super) fn drain_front(&mut self, count: usize) -> Vec<HistoryEntry> {
+        let count = count.min(self.entries.len());
+        self.ids.drain(0..count);
+        let entries = self.entries.drain(0..count).collect();
+        self.debug_assert_invariants();
+        entries
+    }
+
     #[allow(dead_code)]
     pub(super) fn truncate(&mut self, len: usize) {
         self.entries.truncate(len);

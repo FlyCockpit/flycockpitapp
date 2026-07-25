@@ -129,4 +129,64 @@ mod tests {
         assert!(line.contains(&missing.to_string()), "{line}");
         assert!(!exports_dir.join("conversation.json").exists());
     }
+
+    #[test]
+    fn history_window_export_is_complete_regardless_of_residency() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let exports_dir = tmp.path().join("exports");
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let session = db
+            .blocking_for_sync_cli({
+                let project_root = tmp.path().display().to_string();
+                move |conn| {
+                    let row = cockpit_db::Db::build_new_session_row_conn(
+                        conn,
+                        "project",
+                        &project_root,
+                        "Build",
+                    )?;
+                    let row = cockpit_db::Db::insert_session_row_conn(conn, &row)?;
+                    for idx in 0..25 {
+                        cockpit_db::Db::insert_session_event_json_conn(
+                            conn,
+                            row.session_id,
+                            cockpit_db::session_log::SessionEventKind::UserMessage,
+                            Some("Build"),
+                            None,
+                            cockpit_db::session_log::SessionEventContext::default(),
+                            1_000 + idx,
+                            &serde_json::json!({ "text": format!("persisted turn {idx}") })
+                                .to_string(),
+                        )?;
+                    }
+                    Ok(row)
+                }
+            })
+            .unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.session_id = Some(session.session_id);
+        app.history = (20..25)
+            .map(|idx| HistoryEntry::User {
+                text: format!("resident turn {idx}"),
+                cleaned: None,
+                expanded: false,
+                timestamp: chrono::Local::now(),
+                seq: Some(idx),
+                preflight_pending: false,
+                persist_failed: false,
+            })
+            .collect::<Vec<_>>()
+            .into();
+
+        let export_db = db.clone();
+        app.export_transcript_json_with_db("conversation", &exports_dir, move || Ok(export_db));
+
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(exports_dir.join("conversation.json")).unwrap())
+                .unwrap();
+        let turns = exported.as_array().unwrap();
+        assert_eq!(turns.len(), 25);
+        assert_eq!(turns[0]["text"], "persisted turn 0");
+        assert_eq!(turns[24]["text"], "persisted turn 24");
+    }
 }

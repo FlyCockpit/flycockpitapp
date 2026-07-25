@@ -22,6 +22,7 @@ mod exit_tail;
 mod export_actions;
 pub(in crate::tui) mod help_overlay;
 mod history_log;
+mod history_window;
 mod input;
 mod local_commands;
 mod model_controls;
@@ -116,6 +117,9 @@ use cockpit_core::engine::{
 use cockpit_core::git::{self, RepoStatus};
 use cockpit_core::welcome::{self, LaunchBundle, LaunchInfo};
 pub(super) use history_log::{HistoryEntryId, HistoryLog};
+pub(super) use history_window::HistoryWindow;
+#[cfg(test)]
+pub(super) use history_window::{HISTORY_PAGE_ENTRIES, HISTORY_WINDOW_TARGET_ENTRIES};
 
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const ANIMATION_TICK: Duration = Duration::from_millis(100);
@@ -1074,7 +1078,7 @@ pub(super) struct SideConversation {
     pub(super) socket: std::path::PathBuf,
     /// Saved main-session view, restored on exit.
     saved_runner: Option<Result<AgentRunner, String>>,
-    saved_history: HistoryLog,
+    saved_history: HistoryWindow,
     saved_history_render_versions: HashMap<HistoryEntryId, u64>,
     saved_history_render_fingerprints: HashMap<HistoryEntryId, u64>,
     saved_history_render_cache: HashMap<HistoryEntryId, HistoryRenderCacheEntry>,
@@ -1482,7 +1486,7 @@ pub struct App {
     /// the newest entry (cursor going `1 → 0`). `None` when not in
     /// history mode or when entry happened from an empty composer.
     pub(super) staged_draft: Option<String>,
-    pub(super) history: HistoryLog,
+    pub(super) history: HistoryWindow,
     /// In-flight assistant turn (between `ThinkingStarted` and the
     /// matching `AssistantText`/tool boundary). When `Some`, the
     /// renderer appends a live entry to the bottom of the history
@@ -2600,7 +2604,7 @@ pub(super) struct SubagentViewMeta {
 #[derive(Clone)]
 pub(super) struct StoredTranscriptView {
     pub(super) meta: TranscriptViewMeta,
-    pub(super) history: HistoryLog,
+    pub(super) history: HistoryWindow,
     pub(super) pending: Option<PendingMsg>,
     pub(super) history_render_versions: HashMap<HistoryEntryId, u64>,
     pub(super) history_render_fingerprints: HashMap<HistoryEntryId, u64>,
@@ -2887,7 +2891,7 @@ impl App {
             prompt_history: Vec::new(),
             prompt_history_cursor: 0,
             staged_draft: None,
-            history: HistoryLog::default(),
+            history: HistoryWindow::default(),
             pending: None,
             transcript_view: TranscriptViewMeta::Main,
             transcript_view_stack: Vec::new(),

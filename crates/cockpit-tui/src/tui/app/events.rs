@@ -2817,6 +2817,16 @@ impl SubagentHistoryEntries for HistoryLog {
     }
 }
 
+impl SubagentHistoryEntries for HistoryWindow {
+    fn iter_mut_entries(&mut self) -> std::slice::IterMut<'_, HistoryEntry> {
+        self.iter_mut()
+    }
+
+    fn push_entry(&mut self, entry: HistoryEntry) {
+        self.push(entry);
+    }
+}
+
 #[cfg(test)]
 impl SubagentHistoryEntries for Vec<HistoryEntry> {
     fn iter_mut_entries(&mut self) -> std::slice::IterMut<'_, HistoryEntry> {

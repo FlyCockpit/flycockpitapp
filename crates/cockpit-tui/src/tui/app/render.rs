@@ -2359,6 +2359,7 @@ impl App {
     pub(super) fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.chat_area = Some(area);
         let area_h = area.height as usize;
+        self.enforce_history_window();
         self.sync_history_render_versions();
 
         let mut recached_from: Option<usize> = None;
@@ -5266,7 +5267,8 @@ mod render_history_spacing_tests {
         reset_materialized_row_count, reset_prewrap_counters, wrap_line_to_visual_rows,
     };
     use crate::tui::app::{
-        AffordanceTarget, HistoryEntryId, HistoryLog, SandboxDownNotice, SideConversation,
+        AffordanceTarget, HISTORY_PAGE_ENTRIES, HISTORY_WINDOW_TARGET_ENTRIES, HistoryEntryId,
+        HistoryLog, SandboxDownNotice, SideConversation,
     };
     use crate::tui::composer::VimMode;
     use crate::tui::history::{
@@ -5332,6 +5334,10 @@ mod render_history_spacing_tests {
             preflight_pending: false,
             persist_failed: false,
         }
+    }
+
+    fn sequenced_user(seq: i64) -> HistoryEntry {
+        pinned_user(&format!("window row {seq}"), seq)
     }
 
     fn preflight_user(text: &str) -> HistoryEntry {
@@ -6152,6 +6158,29 @@ mod render_history_spacing_tests {
             .collect::<Vec<_>>()
             .into();
         app
+    }
+
+    fn window_history_app(root: &std::path::Path, count: usize) -> App {
+        let mut app = App::new(Some(root), false);
+        app.launch.banner_enabled = false;
+        app.use_emojis = false;
+        app.history = (0..count as i64)
+            .map(sequenced_user)
+            .collect::<Vec<_>>()
+            .into();
+        app
+    }
+
+    fn history_text(entry: &HistoryEntry) -> &str {
+        match entry {
+            HistoryEntry::User { text, .. } | HistoryEntry::Agent { text, .. } => text,
+            HistoryEntry::Plain { line }
+            | HistoryEntry::CommandError { line }
+            | HistoryEntry::Maintenance { line }
+            | HistoryEntry::BackupWarning { line }
+            | HistoryEntry::InferenceWarning { line } => line,
+            other => panic!("entry has no direct text: {other:?}"),
+        }
     }
 
     fn cached_positions(app: &App) -> Vec<usize> {
@@ -7197,6 +7226,136 @@ mod render_history_spacing_tests {
         let after = visible_buffer_rows(&mut app, 80, 4);
 
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn history_window_trims_front_when_pinned_to_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = window_history_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+
+        render_history_no_selection(&mut app, 80, 6);
+
+        assert_eq!(app.history.len(), HISTORY_WINDOW_TARGET_ENTRIES);
+        assert!(app.history.has_older());
+        assert_eq!(app.history.older_cursor(), Some(201));
+        assert_eq!(history_text(&app.history[0]), "window row 201");
+        assert_history_render_maps_only_live_ids(&app);
+    }
+
+    #[test]
+    fn history_window_does_not_trim_while_scrolled_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = window_history_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+        app.chat_pinned_to_tail = false;
+        app.chat_scroll_offset = 5;
+
+        render_history_no_selection(&mut app, 80, 6);
+
+        assert_eq!(
+            app.history.len(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1
+        );
+        assert!(!app.history.has_older());
+        assert_eq!(app.history.older_cursor(), None);
+    }
+
+    #[test]
+    fn history_window_prepend_leaves_viewport_lines_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = window_history_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+
+        render_history_no_selection(&mut app, 80, 4);
+        app.set_chat_scroll_offset_from_interaction(9);
+        let before = visible_buffer_rows(&mut app, 80, 4);
+
+        let page = (1..=200).map(sequenced_user).collect();
+        assert!(app.prepend_history_page(page, Some(1), false));
+        let after = visible_buffer_rows(&mut app, 80, 4);
+
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn history_window_trim_then_prepend_preserves_entry_content_association() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = window_history_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+
+        render_history_no_selection(&mut app, 80, 6);
+        let resident_id = app.history.id_at(0).unwrap();
+        let resident_text = history_text(&app.history[0]).to_string();
+
+        let page = (1..=200).map(sequenced_user).collect();
+        assert!(app.prepend_history_page(page, Some(1), false));
+        let position = app
+            .history
+            .ids()
+            .iter()
+            .position(|id| *id == resident_id)
+            .expect("resident entry id remains present");
+
+        assert_eq!(position, HISTORY_PAGE_ENTRIES);
+        assert_eq!(history_text(&app.history[position]), resident_text);
+    }
+
+    #[test]
+    fn history_window_rejects_non_older_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = window_history_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+
+        render_history_no_selection(&mut app, 80, 6);
+        let before_len = app.history.len();
+        let before_first = app.history.id_at(0);
+
+        assert!(!app.prepend_history_page(vec![sequenced_user(201)], Some(200), true));
+
+        assert_eq!(app.history.len(), before_len);
+        assert_eq!(app.history.id_at(0), before_first);
+        assert_eq!(history_text(&app.history[0]), "window row 201");
+    }
+
+    #[test]
+    fn history_window_survives_subagent_view_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = window_history_app(
+            tmp.path(),
+            HISTORY_WINDOW_TARGET_ENTRIES + HISTORY_PAGE_ENTRIES + 1,
+        );
+        app.daemon_prompt = None;
+        app.history.push(running_subagent());
+
+        render_history_no_selection(&mut app, 80, 6);
+        let before_len = app.history.len();
+        let before_cursor = app.history.older_cursor();
+        let before_has_older = app.history.has_older();
+        let subagent_idx = app.history.len() - 1;
+
+        assert!(app.open_subagent_view_for_history_index(subagent_idx));
+        assert!(app.history.is_empty());
+        assert!(!app.history.has_older());
+        assert!(app.return_from_subagent_view());
+
+        assert_eq!(app.history.len(), before_len);
+        assert_eq!(app.history.older_cursor(), before_cursor);
+        assert_eq!(app.history.has_older(), before_has_older);
+        assert!(matches!(
+            app.history.last(),
+            Some(HistoryEntry::Subagent { .. })
+        ));
     }
 
     #[test]

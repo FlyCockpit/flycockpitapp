@@ -85,6 +85,7 @@ pub fn configured_recursion_context(
 pub(crate) const BUILD_PROMPT: &str = include_str!("build.md");
 pub(crate) const BUILD_PROMPT_NORMAL: &str = include_str!("build.normal.md");
 pub(crate) const BUILD_PROMPT_FRONTIER: &str = include_str!("build.frontier.md");
+pub(crate) const CAREFUL_PROMPT: &str = include_str!("careful.md");
 pub(crate) const BUILDER_PROMPT: &str = include_str!("builder.md");
 pub(crate) const BUILDER_PROMPT_NORMAL: &str = include_str!("builder.normal.md");
 #[allow(dead_code)]
@@ -1140,18 +1141,23 @@ fn find_agent_guidance(cwd: &Path, names: &[String]) -> Option<(std::path::PathB
 /// Load user-defined custom-bash tools from the effective layered config and
 /// append them to `tb`. Web provider config is the only source for the
 /// built-in web tools; the `tools` map is only user-defined tools.
-/// Disabled rows and empty commands are skipped.
+/// Disabled/discoverable rows and empty commands are skipped because
+/// non-direct named grants are materialized by the tiered grant loop.
 fn with_custom_tools(
     mut tb: ToolBox,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     cwd: &Path,
-    disabled_tools: &std::collections::BTreeSet<String>,
+    non_direct_tools: &std::collections::BTreeSet<String>,
 ) -> ToolBox {
     let cfg = config.extended();
 
     if cfg.web.provider != crate::config::extended::WebProvider::Custom {
-        tb = tb.with(Arc::new(crate::tools::web::WebFetchTool));
-        tb = tb.with(Arc::new(crate::tools::web::WebSearchTool));
+        if !non_direct_tools.contains(crate::tools::custom::WEBFETCH) {
+            tb = tb.with(Arc::new(crate::tools::web::WebFetchTool));
+        }
+        if !non_direct_tools.contains(crate::tools::custom::WEBSEARCH) {
+            tb = tb.with(Arc::new(crate::tools::web::WebSearchTool));
+        }
     } else {
         for (name, command) in [
             (
@@ -1163,7 +1169,7 @@ fn with_custom_tools(
                 cfg.web.custom.search_command.as_deref(),
             ),
         ] {
-            if disabled_tools.contains(name) {
+            if non_direct_tools.contains(name) {
                 continue;
             }
             let Some(command) = command.map(str::trim).filter(|command| !command.is_empty()) else {
@@ -1188,7 +1194,7 @@ fn with_custom_tools(
     }
 
     for (name, tpl) in cfg.tools.iter() {
-        if disabled_tools.contains(name) {
+        if non_direct_tools.contains(name) {
             continue;
         }
         if !tpl.enabled || tpl.command.trim().is_empty() {
@@ -1205,12 +1211,19 @@ fn with_custom_tools(
     tb
 }
 
-fn disabled_tier_names(def: &crate::agents::AgentDef) -> std::collections::BTreeSet<String> {
-    def.tool_tiers
+fn non_direct_tier_names(def: &crate::agents::AgentDef) -> std::collections::BTreeSet<String> {
+    let mut names: std::collections::BTreeSet<String> = def
+        .tool_tiers
         .iter()
-        .filter(|(_name, tier)| **tier == crate::agents::ToolTier::Disabled)
+        .filter(|(_name, tier)| **tier != crate::agents::ToolTier::Builtin)
         .map(|(name, _tier)| name.clone())
-        .collect()
+        .collect();
+    names.extend(
+        default_discoverable_tools_for(&def.name)
+            .iter()
+            .map(|name| (*name).to_string()),
+    );
+    names
 }
 
 pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static str] {
@@ -1226,6 +1239,23 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "goal",
             "lsp",
         ],
+        "Careful" => &[
+            "context_pack",
+            "code",
+            "graph",
+            "change_impact",
+            "lsp",
+            "skill",
+            "harness_list",
+            "harness_invoke",
+            "session_search",
+            "session_read",
+            "session_lineage_search",
+            "todo",
+            "goal",
+            "webfetch",
+            "websearch",
+        ],
         "Multireview" => &[
             "harness_list",
             "harness_invoke",
@@ -1239,9 +1269,9 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
     }
 }
 
-fn default_disabled_tools_for(name: &str) -> &'static [&'static str] {
+pub(crate) fn default_disabled_tools_for(name: &str) -> &'static [&'static str] {
     match name {
-        "Build" | "builder" | "Plan" | "bee" | "scout" | "explore" | "Multireview" => {
+        "Build" | "builder" | "Plan" | "Careful" | "bee" | "scout" | "explore" | "Multireview" => {
             &["skill_manage"]
         }
         _ => &[],
@@ -1541,7 +1571,7 @@ fn with_return_tool(tb: ToolBox, name: &str) -> ToolBox {
 /// to exclude primaries from the delegated-subagent `return` tool: a primary is
 /// never delegated to and finishes via `Done`/`handoff`.
 fn is_primary(name: &str) -> bool {
-    matches!(name, "Build" | "Plan" | "Multireview")
+    crate::agents::is_builtin_primary(name)
 }
 
 /// Build an [`Agent`] from a resolved [`crate::agents::AgentDef`] — the
@@ -1609,7 +1639,7 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Result<Age
     if !is_internal_agent_def_name(&def.name) || internal_agent_def_uses_custom_tools(&def.name) {
         // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
         // of the named grant — attach them like the built-in factories do.
-        tb = with_custom_tools(tb, &args.config, &args.cwd, &disabled_tier_names(def));
+        tb = with_custom_tools(tb, &args.config, &args.cwd, &non_direct_tier_names(def));
     }
     if !is_internal_agent_def_name(&def.name) {
         // Cross-session recall tools, gated on interactive spawn.
@@ -2530,7 +2560,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
 
-        for name in ["history", "bee", "scout", "deepthink", "Build", "Plan"] {
+        for name in [
+            "history",
+            "bee",
+            "scout",
+            "deepthink",
+            "Build",
+            "Careful",
+            "Plan",
+        ] {
             let agent = load(name, &args).unwrap();
             assert!(
                 !agent.tools.names().contains(&"defer_to_orchestrator"),
@@ -3193,6 +3231,45 @@ mod tests {
                     "`{name}` has discoverable tools {discoverable:?} but no direct `mcp` tool"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn defensive_role_uses_tiered_recall_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let agent = load("Careful", &args).unwrap();
+        let names = agent.tools.names();
+        let discoverable = agent.tools.discoverable_mcp_tool_names();
+
+        assert_eq!(
+            names,
+            vec![
+                "bash", "edit", "mcp", "question", "read", "schedule", "search", "task", "unlock",
+                "write",
+            ]
+        );
+        assert!(
+            names.len() <= 10,
+            "Careful direct tools should stay within the small-surface budget: {names:?}"
+        );
+        for non_direct in [
+            "session_search",
+            "session_read",
+            "session_lineage_search",
+            "todo",
+            "goal",
+            "webfetch",
+            "websearch",
+        ] {
+            assert!(
+                !names.contains(&non_direct),
+                "{non_direct} must not be injected into Careful's direct tool surface"
+            );
+            assert!(
+                discoverable.iter().any(|tool| tool == non_direct),
+                "{non_direct} should stay reachable through mcp: {discoverable:?}"
+            );
         }
     }
 
@@ -4999,7 +5076,7 @@ mod tests {
         let names: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
         assert!(names.contains(&"builder"), "{names:?}");
         assert!(names.contains(&"explore"), "{names:?}");
-        for forbidden in ["Plan", "Build", "Swarm", "Auto"] {
+        for forbidden in ["Plan", "Build", "Careful", "Swarm", "Auto"] {
             assert!(
                 !names.contains(&forbidden),
                 "`task` must not target the primary `{forbidden}`: {names:?}"

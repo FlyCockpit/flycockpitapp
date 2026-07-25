@@ -813,6 +813,24 @@ async fn plan_default_stale_session_keeps_plan() {
 }
 
 #[tokio::test]
+async fn resolve_root_agent_preserves_stored_defensive_primary() {
+    use crate::config::extended::DefaultPrimaryAgent as D;
+
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let row = db.create_session("proj", "/proj", "Careful").await.unwrap();
+
+    assert_eq!(
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
+        "Careful"
+    );
+    assert_eq!(
+        resolve_root_agent(row.session_id, &db, &cfg_with(D::Plan)).await,
+        "Careful",
+        "stored Careful primary must survive resume instead of falling back to the configured default"
+    );
+}
+
+#[tokio::test]
 async fn roster_trim_removed_primary_notice_is_one_time() {
     use crate::config::extended::DefaultPrimaryAgent as D;
 

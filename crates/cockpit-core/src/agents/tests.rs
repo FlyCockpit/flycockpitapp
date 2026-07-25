@@ -841,12 +841,12 @@ fn scout_and_multireview_builtin_surfaces_are_read_only() {
 }
 
 #[test]
-fn roster_trim_chat_ownable_is_plan_build_only() {
+fn roster_trim_chat_ownable_lists_public_primaries() {
     let tmp = tempfile::tempdir().unwrap();
     project_agents_dir(tmp.path());
 
     let order = chat_ownable_primaries_with(tmp.path());
-    assert_eq!(order, vec!["Plan", "Build"]);
+    assert_eq!(order, vec!["Plan", "Build", "Careful"]);
 }
 
 #[test]
@@ -887,32 +887,40 @@ fn roster_trim_removed_builtin_override_file_ignored() {
 
 #[test]
 fn next_primary_in_cycle_wraps_builtins_only() {
-    let order: Vec<String> = vec!["Plan".into(), "Build".into()];
+    let order: Vec<String> = vec!["Plan".into(), "Build".into(), "Careful".into()];
     assert_eq!(next_primary_in_cycle("Plan", &order), "Build");
-    assert_eq!(next_primary_in_cycle("Build", &order), "Plan");
+    assert_eq!(next_primary_in_cycle("Build", &order), "Careful");
+    assert_eq!(next_primary_in_cycle("Careful", &order), "Plan");
 }
 
 #[test]
 fn next_primary_in_cycle_wraps_through_user_primaries() {
-    let order: Vec<String> = vec!["Plan".into(), "Build".into(), "alpha".into(), "zeta".into()];
-    assert_eq!(next_primary_in_cycle("Build", &order), "alpha");
+    let order: Vec<String> = vec![
+        "Plan".into(),
+        "Build".into(),
+        "Careful".into(),
+        "alpha".into(),
+        "zeta".into(),
+    ];
+    assert_eq!(next_primary_in_cycle("Build", &order), "Careful");
+    assert_eq!(next_primary_in_cycle("Careful", &order), "alpha");
     assert_eq!(next_primary_in_cycle("alpha", &order), "zeta");
     // The last user primary wraps back to the front of the cycle.
     assert_eq!(next_primary_in_cycle("zeta", &order), "Plan");
 }
 
 #[test]
-fn shift_tab_cycle_wraps_plan_build_only() {
-    let order: Vec<String> = vec!["Plan".into(), "Build".into()];
+fn shift_tab_cycle_wraps_public_builtins() {
+    let order: Vec<String> = vec!["Plan".into(), "Build".into(), "Careful".into()];
     let mut cur = "Plan".to_string();
     let mut visited = Vec::new();
     for _ in 0..order.len() {
         cur = next_primary_in_cycle(&cur, &order);
         visited.push(cur.clone());
     }
-    assert_eq!(visited, vec!["Build", "Plan"]);
+    assert_eq!(visited, vec!["Build", "Careful", "Plan"]);
     let mut cur = "Plan".to_string();
-    for expected in ["Build", "Plan", "Build"] {
+    for expected in ["Build", "Careful", "Plan", "Build"] {
         cur = next_primary_in_cycle(&cur, &order);
         assert_eq!(cur, expected, "cycle stalled after {cur}");
     }
@@ -920,7 +928,7 @@ fn shift_tab_cycle_wraps_plan_build_only() {
 
 #[test]
 fn next_primary_in_cycle_off_cycle_starts_at_front() {
-    let order: Vec<String> = vec!["Plan".into(), "Build".into()];
+    let order: Vec<String> = vec!["Plan".into(), "Build".into(), "Careful".into()];
     // A subagent / stale name isn't in the cycle — start at the front.
     assert_eq!(next_primary_in_cycle("builder", &order), "Plan");
     // An empty cycle is a no-op (returns the current name unchanged).

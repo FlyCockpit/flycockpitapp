@@ -25,6 +25,7 @@ use super::{AgentDef, AgentMode, ToolDescriptionSpec, ToolTier};
 /// paths. Driven off the code (the factory functions).
 pub const BUILTIN_AGENT_NAMES: &[&str] = &[
     "Build",
+    "Careful",
     "builder",
     "explore",
     "history",
@@ -58,6 +59,17 @@ pub fn is_hidden_primary(name: &str) -> bool {
     HIDDEN_PRIMARY_NAMES.contains(&name)
 }
 
+/// Public built-in primaries in the `/agent` listing and Shift+Tab cycle.
+pub const PUBLIC_PRIMARY_NAMES: &[&str] = &["Plan", "Build", "Careful"];
+
+/// Every built-in primary that may own a root session, including hidden
+/// feature-flow primaries.
+pub const BUILTIN_PRIMARY_NAMES: &[&str] = &["Plan", "Build", "Careful", "Multireview"];
+
+pub fn is_builtin_primary(name: &str) -> bool {
+    BUILTIN_PRIMARY_NAMES.contains(&name)
+}
+
 /// The builtin primary used when a stored or configured primary is no longer
 /// available.
 pub const FALLBACK_PRIMARY: &str = "Build";
@@ -68,6 +80,7 @@ pub const FALLBACK_PRIMARY: &str = "Build";
 pub fn embedded_default(name: &str) -> Option<AgentDef> {
     match name {
         "Build" => Some(build_def()),
+        "Careful" => Some(careful_def()),
         "builder" => Some(builder_def()),
         "explore" => Some(explore_def()),
         "history" => Some(history_def()),
@@ -136,6 +149,45 @@ fn def_with_normal(
         // Embedded defaults have no on-disk source.
         source: PathBuf::new(),
     }
+}
+
+/// `Careful` — a Defensive-mode-targeted write-capable primary. It keeps only
+/// the minimum direct Build tools needed for ordinary edits; broader code intel,
+/// skill, harness, and recall capabilities stay reachable through `mcp`.
+fn careful_def() -> AgentDef {
+    def(
+        "Careful",
+        "Defensive-mode coding primary; small direct tool surface, uses `mcp` for broader Build capabilities.",
+        AgentMode::Primary,
+        &[
+            "read",
+            "bash",
+            "search",
+            "write",
+            "edit",
+            "unlock",
+            "schedule",
+            "question",
+            "task",
+            "mcp",
+            "context_pack",
+            "code",
+            "graph",
+            "change_impact",
+            "lsp",
+            "skill",
+            "harness_list",
+            "harness_invoke",
+            "session_search",
+            "session_read",
+            "session_lineage_search",
+            "todo",
+            "goal",
+            "webfetch",
+            "websearch",
+        ],
+        crate::engine::builtin::CAREFUL_PROMPT,
+    )
 }
 
 /// `Build` — the user-facing, write-capable primary agent (GOALS §3a).
@@ -504,6 +556,140 @@ fn docs_answerer_def() -> AgentDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn effective_tier(def: &AgentDef, tool: &str) -> ToolTier {
+        if crate::engine::builtin::default_disabled_tools_for(&def.name).contains(&tool) {
+            return ToolTier::Disabled;
+        }
+        def.tool_tiers.get(tool).copied().unwrap_or_else(|| {
+            if crate::engine::builtin::default_discoverable_tools_for(&def.name).contains(&tool) {
+                ToolTier::Discoverable
+            } else {
+                ToolTier::Builtin
+            }
+        })
+    }
+
+    fn builtin_tool_names(def: &AgentDef) -> std::collections::BTreeSet<String> {
+        def.tools
+            .as_ref()
+            .expect("embedded def has explicit tools")
+            .iter()
+            .filter(|tool| effective_tier(def, tool) == ToolTier::Builtin)
+            .cloned()
+            .collect()
+    }
+
+    fn effective_surface_names(def: &AgentDef) -> std::collections::BTreeSet<String> {
+        def.tools
+            .as_ref()
+            .expect("embedded def has explicit tools")
+            .iter()
+            .filter(|tool| effective_tier(def, tool) != ToolTier::Disabled)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn defensive_role_def_grants_at_most_ten_tools() {
+        let def = embedded_default("Careful").expect("Careful embedded default");
+        let grants = builtin_tool_names(&def);
+
+        assert!(
+            grants.len() <= 10,
+            "Careful direct grants should stay small: {grants:?}"
+        );
+        assert_eq!(
+            grants,
+            [
+                "bash", "edit", "mcp", "question", "read", "schedule", "search", "task", "unlock",
+                "write",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect()
+        );
+    }
+
+    #[test]
+    fn defensive_role_def_covers_every_build_tool_by_grant_or_discovery() {
+        let build = build_def();
+        let careful = embedded_default("Careful").expect("Careful embedded default");
+        let build_surface = effective_surface_names(&build);
+        let careful_surface = effective_surface_names(&careful);
+
+        let missing: Vec<_> = build_surface
+            .difference(&careful_surface)
+            .cloned()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "Careful must grant or tier every Build surface tool; missing {missing:?}"
+        );
+        assert!(
+            crate::engine::builtin::default_discoverable_tools_for("Careful")
+                .iter()
+                .all(|tool| careful_surface.contains(*tool)),
+            "Careful discoverable defaults must be present in its declared tools"
+        );
+    }
+
+    #[test]
+    fn defensive_role_is_not_experimental_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listed = crate::agents::chat_ownable_primaries(tmp.path());
+
+        assert!(BUILTIN_AGENT_NAMES.contains(&"Careful"));
+        assert!(is_builtin_primary("Careful"));
+        assert!(!is_hidden_primary("Careful"));
+        assert!(!is_removed_primary("Careful"));
+        assert_eq!(
+            embedded_default("Careful")
+                .expect("Careful embedded default")
+                .mode,
+            AgentMode::Primary
+        );
+        assert!(
+            listed.iter().any(|name| name == "Careful"),
+            "Careful should be public in the primary list: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn build_def_tool_set_unchanged_by_defensive_role() {
+        let build = build_def();
+
+        assert_eq!(
+            build.tools,
+            Some(
+                [
+                    "read",
+                    "bash",
+                    "context_pack",
+                    "code",
+                    "graph",
+                    "search",
+                    "change_impact",
+                    "lsp",
+                    "write",
+                    "edit",
+                    "unlock",
+                    "schedule",
+                    "question",
+                    "skill",
+                    "skill_manage",
+                    "harness_list",
+                    "harness_invoke",
+                    "task",
+                    "mcp",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect()
+            )
+        );
+        assert!(build.tool_tiers.is_empty());
+    }
 
     #[test]
     fn history_agent_def_is_subagent_read_only_and_builtin_tiered() {

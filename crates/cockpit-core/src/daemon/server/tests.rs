@@ -9116,7 +9116,7 @@ async fn list_agents_returns_chat_ownable_primaries() {
             .iter()
             .map(|agent| agent.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["Plan", "Build"]
+        vec!["Plan", "Build", "Careful"]
     );
     for agent in &agents {
         assert!(agent.builtin);

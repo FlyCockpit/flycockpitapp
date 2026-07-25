@@ -40,8 +40,8 @@ pub(crate) mod invariants;
 
 pub(crate) use builtin_defs::embedded_internal_default;
 pub use builtin_defs::{
-    BUILTIN_AGENT_NAMES, FALLBACK_PRIMARY, embedded_default, is_builtin_agent, is_hidden_primary,
-    is_removed_primary,
+    BUILTIN_AGENT_NAMES, FALLBACK_PRIMARY, embedded_default, is_builtin_agent, is_builtin_primary,
+    is_hidden_primary, is_removed_primary,
 };
 pub use invariants::validate_invariants;
 
@@ -445,10 +445,10 @@ fn chat_ownable_primaries_with(cwd: &Path) -> Vec<String> {
     // Builtins first, in the prompt-specified cycle order — note this is
     // intentionally *not* `BUILTIN_AGENT_NAMES` order (which interleaves the
     // subagents) nor the settings toggle's order.
-    let mut out: Vec<String> = ["Plan", "Build"]
-        .into_iter()
+    let mut out: Vec<String> = builtin_defs::PUBLIC_PRIMARY_NAMES
+        .iter()
         .filter(|name| !is_hidden_primary(name))
-        .map(str::to_string)
+        .map(|name| (*name).to_string())
         .collect();
 
     // User-defined chat-ownable agents, alphabetical by name. `list_all`

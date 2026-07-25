@@ -164,7 +164,7 @@ pub(crate) fn resolve_root_agent_conn(
         return crate::agents::FALLBACK_PRIMARY.to_string();
     }
     Some(active)
-        .filter(|name| matches!(name.as_str(), "Plan" | "Build" | "Multireview"))
+        .filter(|name| crate::agents::is_builtin_primary(name))
         .unwrap_or_else(default_primary)
 }
 

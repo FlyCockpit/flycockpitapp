@@ -24,16 +24,16 @@
     "db:down": "bash ../../scripts/compose.sh down"
   },
   "dependencies": {
-    "@prisma/adapter-pg": "^7.8.0",
+    "@prisma/adapter-pg": "^7.9.0",
     "@prisma/client": "catalog:",
     "@flycockpit/env": "workspace:*",
     "dotenv": "catalog:",
-    "pg": "^8.21.0",
+    "pg": "^8.22.0",
     "zod": "catalog:"
   },
   "devDependencies": {
     "@flycockpit/config": "workspace:*",
-    "prisma": "^7.8.0",
+    "prisma": "^7.9.0",
     "tsx": "catalog:",
     "typescript": "catalog:"
   },

@@ -203,7 +203,8 @@ async fn run_deepfetch(
 ) -> Result<()> {
     use crate::providers::deepfetch::{
         DeepfetchMode, DeepfetchScope, HttpDeepfetchProbeClient, collect_deepfetch_targets,
-        deepfetch_confirmation_message, plan_deepfetch, probe_target, should_run_deepfetch,
+        deepfetch_confirmation_message, format_deepfetch_report, plan_deepfetch, probe_target,
+        should_run_deepfetch,
     };
 
     let scope = DeepfetchScope {
@@ -274,7 +275,7 @@ async fn run_deepfetch(
                 break;
             }
         };
-        println!("  {report:?}");
+        println!("  {}", format_deepfetch_report(&report));
         let entry = cfg
             .providers
             .get(&target.provider_id)

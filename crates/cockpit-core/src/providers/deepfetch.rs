@@ -152,6 +152,74 @@ pub enum EndpointSelectionNote {
     AutoDetectedAfterBothWorked,
 }
 
+fn wire_api_label(wire: WireApi) -> &'static str {
+    match wire {
+        WireApi::Auto => "auto",
+        WireApi::Completions => "completions",
+        WireApi::Responses => "responses",
+    }
+}
+
+fn endpoint_note_label(note: EndpointSelectionNote) -> &'static str {
+    match note {
+        EndpointSelectionNote::Explicit => "explicit selection",
+        EndpointSelectionNote::Pinned => "probed endpoint pinned",
+        EndpointSelectionNote::AutoDetectedAfterBothWorked => "both endpoints worked",
+    }
+}
+
+fn context_suffix(context_tokens: Option<u32>) -> String {
+    context_tokens
+        .map(|tokens| format!(", context≈{tokens}"))
+        .unwrap_or_default()
+}
+
+/// Render a deep-fetch result as a short, user-facing report line.
+pub fn format_deepfetch_report(report: &DeepfetchApplyReport) -> String {
+    match report {
+        DeepfetchApplyReport::Applied {
+            endpoint,
+            pinned_wire_api,
+            context_tokens,
+            endpoint_note,
+        } => {
+            let pin = pinned_wire_api
+                .map(|wire| format!(", pinned {}", wire_api_label(wire)))
+                .unwrap_or_default();
+            format!(
+                "using {}{}{} ({})",
+                wire_api_label(*endpoint),
+                pin,
+                context_suffix(*context_tokens),
+                endpoint_note_label(*endpoint_note)
+            )
+        }
+        DeepfetchApplyReport::BothEndpointsWork {
+            endpoint,
+            context_tokens,
+        } => format!(
+            "both endpoints work; using {}{}",
+            wire_api_label(*endpoint),
+            context_suffix(*context_tokens)
+        ),
+        DeepfetchApplyReport::ExplicitPinPreserved { existing, probed } => format!(
+            "kept explicit {} pin despite {} probe",
+            wire_api_label(*existing),
+            wire_api_label(*probed)
+        ),
+        DeepfetchApplyReport::Entitlement { endpoint } => endpoint
+            .map(|wire| format!("not entitled to probe {}", wire_api_label(wire)))
+            .unwrap_or_else(|| "not entitled to probe endpoints".into()),
+        DeepfetchApplyReport::RateLimited { endpoint } => endpoint
+            .map(|wire| format!("rate limited while probing {}", wire_api_label(wire)))
+            .unwrap_or_else(|| "rate limited while probing endpoints".into()),
+        DeepfetchApplyReport::Inconclusive { endpoint, reason } => endpoint
+            .map(|wire| format!("inconclusive {} probe: {reason}", wire_api_label(wire)))
+            .unwrap_or_else(|| format!("inconclusive endpoint probes: {reason}")),
+        DeepfetchApplyReport::SkippedNoEndpointChoice => "skipped: no endpoint choice".into(),
+    }
+}
+
 pub trait DeepfetchProbeClient {
     fn probe_endpoint<'a>(
         &'a mut self,
@@ -486,13 +554,17 @@ pub fn plan_deepfetch(targets: &[DeepfetchTarget]) -> DeepfetchPlan {
     }
 }
 
-pub fn deepfetch_confirmation_message(plan: &DeepfetchPlan) -> String {
+pub fn deepfetch_confirmation_body(plan: &DeepfetchPlan) -> String {
     format!(
-        "Deep fetch will send up to {} live probe request(s) across {} provider(s) and {} model(s). These calls use your provider credentials and may cost money. Continue? [y/N] ",
+        "Deep fetch will send up to {} live probe request(s) across {} provider(s) and {} model(s). These calls use your provider credentials and may cost money.",
         plan.total_requests(),
         plan.providers,
         plan.models
     )
+}
+
+pub fn deepfetch_confirmation_message(plan: &DeepfetchPlan) -> String {
+    format!("{} Continue? [y/N] ", deepfetch_confirmation_body(plan))
 }
 
 pub fn should_run_deepfetch(
@@ -929,11 +1001,20 @@ mod tests {
         assert_eq!(plan.models, 3);
         assert_eq!(plan.endpoint_requests, 4);
         assert_eq!(plan.context_requests, 3);
+        let body = deepfetch_confirmation_body(&plan);
+        assert!(body.contains("7 live probe request"));
+        assert!(body.contains("2 provider"));
+        assert!(body.contains("3 model"));
+        assert!(body.contains("may cost money"));
+        assert!(!body.contains("[y/N]"));
+        assert!(!body.contains("Continue?"));
         let message = deepfetch_confirmation_message(&plan);
+        assert!(message.starts_with(&body));
         assert!(message.contains("7 live probe request"));
         assert!(message.contains("2 provider"));
         assert!(message.contains("3 model"));
         assert!(message.contains("may cost money"));
+        assert!(message.contains("[y/N]"));
 
         let one_provider = collect_deepfetch_targets(
             &cfg,
@@ -962,6 +1043,75 @@ mod tests {
             (plan.providers, plan.models, plan.total_requests()),
             (1, 1, 1)
         );
+    }
+
+    #[test]
+    fn deepfetch_reports_are_human_readable_for_every_variant() {
+        let reports = [
+            DeepfetchApplyReport::Applied {
+                endpoint: WireApi::Responses,
+                pinned_wire_api: Some(WireApi::Responses),
+                context_tokens: Some(128_000),
+                endpoint_note: EndpointSelectionNote::Pinned,
+            },
+            DeepfetchApplyReport::BothEndpointsWork {
+                endpoint: WireApi::Completions,
+                context_tokens: None,
+            },
+            DeepfetchApplyReport::ExplicitPinPreserved {
+                existing: WireApi::Completions,
+                probed: WireApi::Responses,
+            },
+            DeepfetchApplyReport::Entitlement {
+                endpoint: Some(WireApi::Completions),
+            },
+            DeepfetchApplyReport::RateLimited {
+                endpoint: Some(WireApi::Responses),
+            },
+            DeepfetchApplyReport::Inconclusive {
+                endpoint: None,
+                reason: "network timeout".into(),
+            },
+            DeepfetchApplyReport::SkippedNoEndpointChoice,
+        ];
+
+        let rendered: Vec<_> = reports.iter().map(format_deepfetch_report).collect();
+        assert!(rendered.iter().all(|line| !line.is_empty()));
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.contains('{') && !line.contains('}'))
+        );
+        assert!(rendered[0].contains("context≈128000"));
+        assert!(!rendered[1].contains("context≈"));
+        assert!(rendered[4].contains("rate limited"));
+        assert!(rendered[4].contains("responses"));
+        assert!(!rendered[5].contains("auto"));
+        assert!(!rendered[5].contains("completions"));
+        assert!(!rendered[5].contains("responses"));
+        for rust_identifier in ["Explicit", "Pinned", "AutoDetectedAfterBothWorked"] {
+            assert!(rendered.iter().all(|line| !line.contains(rust_identifier)));
+        }
+    }
+
+    #[test]
+    fn endpoint_note_labels_are_lowercase_prose() {
+        let labels = [
+            endpoint_note_label(EndpointSelectionNote::Explicit),
+            endpoint_note_label(EndpointSelectionNote::Pinned),
+            endpoint_note_label(EndpointSelectionNote::AutoDetectedAfterBothWorked),
+        ];
+
+        for label in labels {
+            assert!(!label.is_empty());
+            assert!(
+                label
+                    .chars()
+                    .all(|ch| !ch.is_alphabetic() || ch.is_lowercase())
+            );
+            assert!(label.contains(' ') || label.chars().all(|ch| ch.is_lowercase()));
+            assert!(!label.contains("AutoDetectedAfterBothWorked"));
+        }
     }
 
     #[test]

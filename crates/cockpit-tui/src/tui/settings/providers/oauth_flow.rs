@@ -161,6 +161,19 @@ pub(crate) struct OAuthBrowserBegin {
     ssh: bool,
 }
 
+#[cfg(test)]
+impl OAuthBrowserBegin {
+    pub(crate) fn for_test(listening: bool, ssh: bool) -> Self {
+        Self {
+            login: xai_oauth::ManualLogin::for_test("https://example.test/oauth"),
+            listening,
+            browser_error: None,
+            listener_error: None,
+            ssh,
+        }
+    }
+}
+
 pub(crate) struct GrokBrowserStart {
     pub(crate) begin: OAuthBrowserBegin,
     pub(crate) listener: Option<tokio::net::TcpListener>,
@@ -313,6 +326,7 @@ pub(crate) struct OAuthFlowState {
     pub(crate) manual_input: TextField,
     session: OAuthSession,
     pub(crate) pending: bool,
+    focus_paste_after_begin: bool,
     pub(crate) polling: bool,
     pub(crate) ssh: bool,
     pub(crate) spinner_tick: usize,
@@ -362,6 +376,7 @@ impl OAuthFlowState {
             manual_input: TextField::default(),
             session: OAuthSession::None,
             pending: false,
+            focus_paste_after_begin: false,
             polling: false,
             ssh: (effects.is_ssh)(),
             spinner_tick: 0,
@@ -443,6 +458,7 @@ impl OAuthFlowState {
                 None
             }
             (OAuthProvider::Grok, OAuthBeginResult::Browser(Ok(begin))) => {
+                let focus_paste_after_begin = std::mem::take(&mut self.focus_paste_after_begin);
                 let OAuthBrowserBegin {
                     login,
                     listening,
@@ -455,7 +471,7 @@ impl OAuthFlowState {
                     login,
                 };
                 self.ssh = ssh;
-                self.paste_focused = false;
+                self.paste_focused = focus_paste_after_begin || !listening;
                 self.pending = listening;
                 self.status = Some(Ok(match (listener_error, browser_error, ssh) {
                     (Some(listener), Some(browser), _) => format!(
@@ -477,6 +493,7 @@ impl OAuthFlowState {
             }
             (OAuthProvider::Grok, OAuthBeginResult::Browser(Err(e))) => {
                 self.pending = false;
+                self.focus_paste_after_begin = false;
                 self.status = Some(Err(e));
                 None
             }
@@ -579,7 +596,9 @@ pub(super) fn handle_oauth_flow_key_with(
             }
             KeyCode::Enter => {
                 let OAuthSession::Browser { login, .. } = &s.session else {
-                    s.status = Some(Err("manual OAuth session was not initialized".into()));
+                    s.status = Some(Err(
+                        "start login or manual paste first so a PKCE session can be created".into(),
+                    ));
                     s.paste_focused = false;
                     return OAuthKeyOutcome::stay(None);
                 };
@@ -685,14 +704,23 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
     match (s.provider, option) {
         (_, OAuthOption::Continue | OAuthOption::SkipContinue) => OAuthKeyOutcome::confirm(),
         (OAuthProvider::Grok, OAuthOption::ManualPaste) => {
-            s.paste_focused = true;
-            s.manual_input.set("");
-            OAuthKeyOutcome::stay(None)
+            if s.has_browser_session() {
+                s.paste_focused = true;
+                OAuthKeyOutcome::stay(None)
+            } else {
+                s.pending = true;
+                s.focus_paste_after_begin = true;
+                s.status = Some(Ok("Preparing xAI OAuth login...".to_string()));
+                OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
+                    provider: OAuthProvider::Grok,
+                    op: OAuthFlowOp::Begin,
+                }))
+            }
         }
         (OAuthProvider::Grok, OAuthOption::Login) => {
             s.pending = true;
             s.paste_focused = false;
-            s.manual_input.set("");
+            s.focus_paste_after_begin = false;
             s.status = Some(Ok(if s.cursor == 0 && !s.ssh {
                 "Preparing xAI OAuth login...".to_string()
             } else if s.ssh {
@@ -965,7 +993,15 @@ fn render_browser_callback_session(
                     .add_modifier(Modifier::UNDERLINED),
             ),
         ]));
-        lines.push(Line::from(Span::styled("c copy URL".to_string(), muted)));
+        lines.push(Line::from(Span::styled(
+            if s.paste_focused {
+                "esc: options (c copies URL)"
+            } else {
+                "c copy URL"
+            }
+            .to_string(),
+            muted,
+        )));
         lines.push(Line::default());
     }
 }

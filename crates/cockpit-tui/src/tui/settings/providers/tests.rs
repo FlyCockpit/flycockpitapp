@@ -1,3 +1,4 @@
+use super::oauth_flow::OAuthBrowserBegin;
 use super::*;
 use cockpit_config::providers::{AuthKind, ProvidersConfig};
 use cockpit_config::providers::{ConfigDoc, ProviderEntry};
@@ -1687,17 +1688,9 @@ fn oauth_grok_bind_failure_offers_manual_paste() {
     assert!(!state.pending);
     assert!(!state.ssh);
     assert!(state.has_browser_session());
+    assert!(state.paste_focused);
     let status = state.status.as_ref().unwrap().as_ref().unwrap();
     assert!(status.contains("callback port busy"), "{status}");
-    state.cursor = 1;
-    let outcome = handle_oauth_flow_key_with(
-        press(KeyCode::Enter),
-        &mut state,
-        OAuthHost::AddWizard,
-        effects,
-    );
-    assert!(outcome.action.is_none());
-    assert!(state.paste_focused);
 }
 
 #[test]
@@ -1717,14 +1710,6 @@ fn oauth_grok_ssh_begin_binds_no_listener() {
     assert!(!state.pending);
     assert!(state.ssh);
     assert!(state.has_browser_session());
-    state.cursor = 1;
-    let outcome = handle_oauth_flow_key_with(
-        press(KeyCode::Enter),
-        &mut state,
-        OAuthHost::AddWizard,
-        effects,
-    );
-    assert!(outcome.action.is_none());
     assert!(state.paste_focused);
     assert!(oauth_effects_log().is_empty());
 }
@@ -1752,6 +1737,96 @@ fn oauth_grok_manual_paste_option_focuses_without_rebeginning_state() {
     assert!(outcome.action.is_none());
     assert!(state.paste_focused);
     assert_eq!(state.browser_state_for_test(), Some(before.as_str()));
+}
+
+#[test]
+fn oauth_grok_manual_paste_starts_session_then_focuses_input() {
+    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
+    state.logged_in = false;
+    state.cursor = 1;
+
+    let outcome = handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::AddWizard);
+
+    assert!(matches!(
+        outcome.action,
+        Some(OAuthFlowRequest {
+            provider: OAuthProvider::Grok,
+            op: OAuthFlowOp::Begin,
+        })
+    ));
+    assert!(state.pending);
+    assert!(!state.paste_focused);
+
+    state.apply_begin(
+        OAuthBeginResult::Browser(Ok(OAuthBrowserBegin::for_test(true, false))),
+        fake_oauth_effects(),
+    );
+
+    assert!(state.has_browser_session());
+    assert!(state.paste_focused);
+}
+
+#[test]
+fn oauth_grok_manual_paste_preserves_existing_session_and_input() {
+    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
+    state.set_browser_session_for_test("https://example.test/oauth");
+    state.manual_input.set("already pasted");
+    state.cursor = 1;
+    let before = state.browser_state_for_test().unwrap().to_string();
+
+    let outcome = handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::AddWizard);
+
+    assert!(outcome.action.is_none());
+    assert!(state.paste_focused);
+    assert_eq!(state.browser_state_for_test(), Some(before.as_str()));
+    assert_eq!(state.manual_input.text(), "already pasted");
+}
+
+#[test]
+fn oauth_grok_login_after_failed_manual_begin_does_not_focus_paste() {
+    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
+    state.logged_in = false;
+    state.cursor = 1;
+    handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::AddWizard);
+    state.apply_begin(
+        OAuthBeginResult::Browser(Err("begin failed".into())),
+        fake_oauth_effects(),
+    );
+
+    state.cursor = 0;
+    handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::AddWizard);
+    state.apply_begin(
+        OAuthBeginResult::Browser(Ok(OAuthBrowserBegin::for_test(true, false))),
+        fake_oauth_effects(),
+    );
+
+    assert!(state.has_browser_session());
+    assert!(!state.paste_focused);
+}
+
+#[test]
+fn oauth_grok_manual_paste_rendering_and_no_session_error_explain_recovery() {
+    let mut focused = OAuthFlowState::new(OAuthProvider::Grok);
+    focused.set_browser_session_for_test("https://example.test/oauth");
+    focused.paste_focused = true;
+    let focused_body = oauth_body_text(&focused, OAuthHost::AddWizard);
+    assert!(focused_body.contains("esc: options (c copies URL)"));
+    assert!(!focused_body.contains("c copy URL"));
+
+    focused.paste_focused = false;
+    let menu_body = oauth_body_text(&focused, OAuthHost::AddWizard);
+    assert!(menu_body.contains("c copy URL"));
+
+    let mut without_session = OAuthFlowState::new(OAuthProvider::Grok);
+    without_session.paste_focused = true;
+    handle_oauth_flow_key(
+        press(KeyCode::Enter),
+        &mut without_session,
+        OAuthHost::AddWizard,
+    );
+    let message = without_session.status.unwrap().unwrap_err();
+    assert!(message.contains("start login or manual paste first"));
+    assert_ne!(message, "manual OAuth session was not initialized");
 }
 
 #[test]
@@ -2222,7 +2297,7 @@ fn every_visible_oauth_row_acts_on_enter() {
             },
             host,
             1,
-            ExpectedEnter::PasteFocus,
+            ExpectedEnter::Action,
         );
         if host == OAuthHost::AddWizard {
             assert_enter_effect(

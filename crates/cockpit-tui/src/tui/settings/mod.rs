@@ -1467,11 +1467,13 @@ impl SettingsDialog {
         }
 
         self.drain_fetch_all();
+        self.drain_deep_fetch();
         if let Some(page) = self.page.downcast_mut::<ProvidersPage>() {
             match page {
                 ProvidersPage::OAuthSetup { state, .. } if state.pending || state.polling => {
                     state.spinner_tick = state.spinner_tick.wrapping_add(1);
                 }
+                ProvidersPage::DeepFetch { state, .. } => state.advance_spinner(),
                 ProvidersPage::Add(state)
                     if state
                         .oauth_auth

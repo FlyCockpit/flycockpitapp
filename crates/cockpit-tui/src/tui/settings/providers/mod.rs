@@ -14,12 +14,14 @@
 //!     `render_field_row`, `valid_url`, `valid_id`,
 //!     `apply_copilot_setup`, `render_copilot_body`).
 
+mod deepfetch;
 mod fetch;
 mod oauth_flow;
 mod row_editor;
 
 use std::path::PathBuf;
 
+pub(super) use deepfetch::DeepFetchState;
 #[cfg(test)]
 pub(super) use fetch::FetchedSummary;
 pub(super) use fetch::{
@@ -466,6 +468,12 @@ pub(super) enum ProvidersPage {
     FetchOnePrompt(FetchOnePromptState),
     /// Per-provider live fetch failed but a fallback catalog is available.
     FetchFallbackPrompt(FetchFallbackPromptState),
+    /// Explicitly confirmed, one-provider deep fetch. The state owns the Edit
+    /// page so an unsaved edit can never be persisted by a probe run.
+    DeepFetch {
+        state: DeepFetchState,
+        parent: Box<EditState>,
+    },
     /// One-button "Set up GitHub Copilot auth" confirm screen for the
     /// Copilot provider whose Edit state is in `parent`. Reached by Enter
     /// on the "Copilot auth" row of the Edit page (Copilot providers
@@ -613,6 +621,7 @@ impl ProvidersPage {
             | ProvidersPage::FetchAll(_)
             | ProvidersPage::FetchOnePrompt(_)
             | ProvidersPage::FetchFallbackPrompt(_)
+            | ProvidersPage::DeepFetch { .. }
             | ProvidersPage::CopilotSetup { .. } => None,
             ProvidersPage::OAuthSetup { state, .. } => {
                 state.paste_focused.then_some(&mut state.manual_input)
@@ -1130,6 +1139,9 @@ impl SettingsCx {
             ProvidersPage::FetchOnePrompt(state) => self.handle_fetch_one_prompt_key(key, state),
             ProvidersPage::FetchFallbackPrompt(state) => {
                 self.handle_fetch_fallback_prompt_key(key, state)
+            }
+            ProvidersPage::DeepFetch { state, parent } => {
+                self.handle_deep_fetch_key(key, state, parent)
             }
             ProvidersPage::CopilotSetup { state, parent } => {
                 self.handle_copilot_setup_key(key, state, parent)
@@ -1830,10 +1842,21 @@ impl SettingsCx {
                 };
             }
             Some(EditAction::DeepFetch) => {
-                let provider = &s.provider_id;
-                s.status = Some(format!(
-                    "deep fetch sends billable probes; run `cockpit fetch-models --deep {provider}` and confirm the prompt"
-                ));
+                let owned =
+                    std::mem::replace(s, EditState::new(String::new(), ProviderEntry::default()));
+                match DeepFetchState::prepare(&self.config_path, &owned.provider_id) {
+                    Ok(state) => {
+                        return Nav::Replace(super::providers_page(ProvidersPage::DeepFetch {
+                            state,
+                            parent: Box::new(owned),
+                        }));
+                    }
+                    Err(error) => {
+                        let mut owned = owned;
+                        owned.status = Some(error);
+                        return Nav::Replace(super::providers_page(ProvidersPage::Edit(owned)));
+                    }
+                }
             }
             Some(EditAction::Delete) => {
                 if s.delete_pending {
@@ -2360,6 +2383,7 @@ impl SettingsCx {
             ProvidersPage::FetchFallbackPrompt(s) => {
                 self.render_fetch_fallback_prompt(frame, area, s)
             }
+            ProvidersPage::DeepFetch { state, .. } => self.render_deep_fetch(frame, area, state),
             ProvidersPage::CopilotSetup { state, .. } => {
                 self.render_copilot_setup(frame, area, state)
             }
@@ -3874,6 +3898,11 @@ impl SettingsPage for ProvidersPage {
                     s.provider_id
                 )
             }
+            ProvidersPage::DeepFetch { state, .. } => format!(
+                " › {} › {} › Deep fetch",
+                super::PROVIDERS_TITLE,
+                state.provider_id
+            ),
             ProvidersPage::CopilotSetup { .. } => {
                 format!(" › {} › Copilot setup", super::PROVIDERS_TITLE)
             }
@@ -3977,6 +4006,7 @@ impl SettingsPage for ProvidersPage {
             ProvidersPage::FetchFallbackPrompt(_) => {
                 "↑/↓/Tab/Shift+Tab  enter: choose  esc: cancel"
             }
+            ProvidersPage::DeepFetch { state, .. } => state.help_text(),
             ProvidersPage::CopilotSetup { .. } => "enter: apply  esc: cancel",
             ProvidersPage::OAuthSetup { state, .. } => {
                 oauth_help_legend(OAuthHost::Standalone, state)

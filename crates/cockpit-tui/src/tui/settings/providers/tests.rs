@@ -2,10 +2,17 @@ use super::oauth_flow::OAuthBrowserBegin;
 use super::*;
 use cockpit_config::providers::{AuthKind, ProvidersConfig};
 use cockpit_config::providers::{ConfigDoc, ProviderEntry};
+use cockpit_core::providers::deepfetch::{
+    ContextProbeRequest, DeepfetchProbeClient, EndpointProbeRequest, ProbeRawOutcome,
+};
 use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn provider_with_models(models: Vec<ModelEntry>) -> ProviderEntry {
     ProviderEntry {
@@ -38,7 +45,10 @@ fn dialog_with_config(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDi
     std::fs::write(&path, "{}").unwrap();
     let mut doc = ConfigDoc::load(&path).unwrap();
     doc.write(&config).unwrap();
-    let dialog = SettingsDialog::open(path);
+    let mut dialog = SettingsDialog::open(path);
+    // Provider-save tests must never touch the developer's real credential
+    // store when literal-header protection runs as part of a save.
+    dialog.credential_store_path = Some(tmp.path().join("credentials.json"));
     (tmp, dialog)
 }
 
@@ -179,6 +189,52 @@ fn assert_rendered_contains_text(rendered: &str, expected: &str) {
         compact_text(rendered).contains(&compact_text(expected)),
         "expected `{expected}` in:\n{rendered}"
     );
+}
+
+struct RecordingDeepFetchClient {
+    endpoint_calls: Vec<EndpointProbeRequest>,
+    context_calls: Vec<ContextProbeRequest>,
+    cancel_after_first_context: Option<Arc<AtomicBool>>,
+    fail_context: bool,
+}
+
+impl RecordingDeepFetchClient {
+    fn succeeds() -> Self {
+        Self {
+            endpoint_calls: Vec::new(),
+            context_calls: Vec::new(),
+            cancel_after_first_context: None,
+            fail_context: false,
+        }
+    }
+}
+
+impl DeepfetchProbeClient for RecordingDeepFetchClient {
+    fn probe_endpoint<'a>(
+        &'a mut self,
+        request: EndpointProbeRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ProbeRawOutcome>> + Send + 'a>> {
+        self.endpoint_calls.push(request);
+        Box::pin(async { Ok(ProbeRawOutcome::Works) })
+    }
+
+    fn probe_context<'a>(
+        &'a mut self,
+        request: ContextProbeRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ProbeRawOutcome>> + Send + 'a>> {
+        self.context_calls.push(request);
+        let cancel = self.cancel_after_first_context.take();
+        let fail = self.fail_context;
+        Box::pin(async move {
+            if let Some(cancel) = cancel {
+                cancel.store(true, Ordering::Release);
+            }
+            if fail {
+                anyhow::bail!("test probe failure");
+            }
+            Ok(ProbeRawOutcome::Works)
+        })
+    }
 }
 
 #[test]
@@ -424,8 +480,8 @@ fn edit_menu_copilot_auth_row_only_for_copilot_providers() {
 }
 
 #[test]
-fn edit_menu_deepfetch_action_points_to_confirmed_command() {
-    let (_, mut dialog) = dialog_with_config(one_provider_config(None));
+fn deep_fetch_constructs_confirm_page_without_starting_probes() {
+    let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
     let entry = dialog.config.providers["p"].clone();
     let mut state = EditState::new("p".into(), entry.clone());
     state.cursor = edit_menu_actions("p", &entry)
@@ -436,12 +492,250 @@ fn edit_menu_deepfetch_action_points_to_confirmed_command() {
 
     dialog.handle_key(press(KeyCode::Enter));
 
-    let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
-        panic!("expected edit page");
+    let TestPageRef::Providers(ProvidersPage::DeepFetch { state, .. }) = dialog.test_page() else {
+        panic!("expected deep-fetch confirmation page");
     };
-    let status = state.status.as_deref().unwrap_or_default();
-    assert!(status.contains("cockpit fetch-models --deep p"));
-    assert!(status.contains("confirm"));
+    assert!(state.is_confirming());
+    assert_eq!(state.target_count(), 2);
+    assert_eq!(state.completed_and_lines_for_test(), (0, Vec::new()));
+}
+
+#[test]
+fn deep_fetch_cancel_from_confirm_returns_to_edit_without_probing() {
+    let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
+    let entry = dialog.config.providers["p"].clone();
+    let state = DeepFetchState::prepare(&dialog.config_path, "p").unwrap();
+    dialog.set_test_page(Page::Providers(ProvidersPage::DeepFetch {
+        state,
+        parent: Box::new(EditState::new("p".into(), entry)),
+    }));
+
+    dialog.handle_key(press(KeyCode::Down));
+    dialog.handle_key(press(KeyCode::Enter));
+
+    let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
+        panic!("expected Edit page after cancellation");
+    };
+    assert_eq!(state.status.as_deref(), Some("deep fetch cancelled"));
+    assert_eq!(
+        load_provider(&tmp.path().join("config.json"), "p")
+            .models
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn deep_fetch_plan_and_run_use_disk_entry_not_unsaved_edit() {
+    let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
+    let mut unsaved = dialog.config.providers["p"].clone();
+    unsaved.models.push(model("unsaved", false));
+    let mut edit = EditState::new("p".into(), unsaved);
+    edit.cursor = edit_menu_actions("p", &edit.entry)
+        .iter()
+        .position(|action| matches!(action, EditAction::DeepFetch))
+        .unwrap();
+    dialog.set_test_page(Page::Providers(ProvidersPage::Edit(edit)));
+    dialog.handle_key(press(KeyCode::Enter));
+
+    let TestPageRef::Providers(ProvidersPage::DeepFetch { state, .. }) = dialog.test_page() else {
+        panic!("expected deep-fetch confirmation page");
+    };
+    assert_eq!(state.target_count(), 2, "confirmation plan must use disk");
+    assert_eq!(
+        state.plan_total_requests(),
+        6,
+        "confirmation request count must use disk"
+    );
+
+    let state = DeepFetchState::prepare(&dialog.config_path, "p").unwrap();
+    let mut disk = ConfigDoc::load(&dialog.config_path).unwrap().providers();
+    let mut client = RecordingDeepFetchClient::succeeds();
+    state
+        .run_with_client_for_test(&dialog.config_path, &mut disk, &mut client)
+        .await
+        .unwrap();
+
+    let saved = load_provider(&tmp.path().join("config.json"), "p");
+    assert_eq!(saved.models.len(), 2);
+    assert!(!saved.models.iter().any(|model| model.id == "unsaved"));
+    assert!(!client.endpoint_calls.is_empty());
+}
+
+#[test]
+fn deep_fetch_running_blocks_q_and_requests_cancel_on_escape() {
+    let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
+    let entry = dialog.config.providers["p"].clone();
+    let mut state = DeepFetchState::prepare(&dialog.config_path, "p").unwrap();
+    state.set_running_for_test();
+    dialog.set_test_page(Page::Providers(ProvidersPage::DeepFetch {
+        state,
+        parent: Box::new(EditState::new("p".into(), entry)),
+    }));
+
+    assert!(!dialog.handle_key(press(KeyCode::Char('q'))));
+    let TestPageRef::Providers(ProvidersPage::DeepFetch { state, .. }) = dialog.test_page() else {
+        panic!("q must not close the running deep-fetch page");
+    };
+    assert!(state.is_running());
+    assert!(
+        state
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("probes are in flight")
+    );
+
+    dialog.handle_key(press(KeyCode::Esc));
+    let TestPageRef::Providers(ProvidersPage::DeepFetch { state, .. }) = dialog.test_page() else {
+        panic!("Esc must keep the page open until the in-flight probe completes");
+    };
+    assert!(state.cancellation_requested());
+}
+
+#[tokio::test]
+async fn deep_fetch_cancellation_stops_between_models_and_keeps_lines() {
+    let (_tmp, dialog) = dialog_with_config(one_provider_config(None));
+    let state = DeepFetchState::prepare(&dialog.config_path, "p").unwrap();
+    let mut disk = ConfigDoc::load(&dialog.config_path).unwrap().providers();
+    let mut client = RecordingDeepFetchClient {
+        cancel_after_first_context: Some(state.cancellation_handle_for_test()),
+        ..RecordingDeepFetchClient::succeeds()
+    };
+
+    state
+        .run_with_client_for_test(&dialog.config_path, &mut disk, &mut client)
+        .await
+        .unwrap();
+
+    assert!(state.cancellation_requested());
+    assert!(
+        client
+            .endpoint_calls
+            .iter()
+            .all(|call| call.model_id == "stale")
+    );
+    let (completed, lines) = state.completed_and_lines_for_test();
+    assert_eq!(completed, 1);
+    assert!(lines.iter().any(|line| line.contains("p:stale")));
+}
+
+#[test]
+fn deep_fetch_done_renders_summary_and_returns_it_to_edit() {
+    let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
+    let entry = dialog.config.providers["p"].clone();
+    let mut state = DeepFetchState::prepare(&dialog.config_path, "p").unwrap();
+    state.set_running_for_test();
+    state.finish_for_test(
+        Ok("deep fetch complete: test summary".into()),
+        vec!["saved line".into()],
+    );
+    dialog.set_test_page(Page::Providers(ProvidersPage::DeepFetch {
+        state,
+        parent: Box::new(EditState::new("p".into(), entry)),
+    }));
+    dialog.tick();
+
+    let rendered = render_provider_rows(&dialog, 100, 20).join("\n");
+    assert_rendered_contains_text(&rendered, "deep fetch complete: test summary");
+    assert_rendered_contains_text(&rendered, "saved line");
+    dialog.handle_key(press(KeyCode::Enter));
+    let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
+        panic!("expected edit page after Done");
+    };
+    assert_eq!(
+        state.status.as_deref(),
+        Some("deep fetch complete: test summary")
+    );
+}
+
+#[test]
+fn deep_fetch_failure_reaches_done_and_retains_prior_lines() {
+    let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
+    let entry = dialog.config.providers["p"].clone();
+    let mut state = DeepFetchState::prepare(&dialog.config_path, "p").unwrap();
+    state.set_running_for_test();
+    state.finish_for_test(
+        Err("deep fetch failed: test probe failure".into()),
+        vec!["→ p:stale".into(), "  using responses".into()],
+    );
+    dialog.set_test_page(Page::Providers(ProvidersPage::DeepFetch {
+        state,
+        parent: Box::new(EditState::new("p".into(), entry)),
+    }));
+    dialog.tick();
+
+    let TestPageRef::Providers(ProvidersPage::DeepFetch { state, .. }) = dialog.test_page() else {
+        panic!("failed run must remain on Done page");
+    };
+    assert!(state.is_done());
+    assert!(
+        state
+            .status
+            .as_deref()
+            .unwrap()
+            .starts_with("deep fetch failed:")
+    );
+    assert_eq!(state.completed_and_lines_for_test().1.len(), 2);
+}
+
+#[test]
+fn deep_fetch_running_help_has_no_q_and_page_has_no_text_field_or_missing_breadcrumb() {
+    let (_tmp, dialog) = dialog_with_config(one_provider_config(None));
+    let entry = dialog.config.providers["p"].clone();
+    let mut state = DeepFetchState::prepare(&dialog.config_path, "p").unwrap();
+    state.set_running_for_test();
+    let mut page = ProvidersPage::DeepFetch {
+        state,
+        parent: Box::new(EditState::new("p".into(), entry)),
+    };
+
+    assert!(!page.help_text(&dialog.cx).contains("q:"));
+    assert!(page.active_text_field().is_none());
+    assert!(page.title(&dialog.cx).contains("p"));
+}
+
+#[test]
+fn deep_fetch_success_refreshes_cached_and_parent_provider_entry() {
+    let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
+    let mut persisted = dialog.config.providers["p"].clone();
+    persisted.models.push(model("persisted", false));
+    let mut doc = ConfigDoc::load(&dialog.config_path).unwrap();
+    doc.write_provider_models("p", &persisted.models, None, persisted.model_catalog, None)
+        .unwrap();
+
+    let mut state = DeepFetchState::prepare(&dialog.config_path, "p").unwrap();
+    state.set_running_for_test();
+    state.finish_for_test(Ok("deep fetch complete: refreshed".into()), Vec::new());
+    let stale_parent = EditState::new("p".into(), dialog.config.providers["p"].clone());
+    dialog.set_test_page(Page::Providers(ProvidersPage::DeepFetch {
+        state,
+        parent: Box::new(stale_parent),
+    }));
+    dialog.tick();
+
+    assert!(
+        dialog.config.providers["p"]
+            .models
+            .iter()
+            .any(|model| model.id == "persisted")
+    );
+    let TestPageRef::Providers(ProvidersPage::DeepFetch { parent, .. }) = dialog.test_page() else {
+        panic!("expected Done page");
+    };
+    assert!(
+        parent
+            .entry
+            .models
+            .iter()
+            .any(|model| model.id == "persisted")
+    );
+    assert!(
+        load_provider(&tmp.path().join("config.json"), "p")
+            .models
+            .iter()
+            .any(|model| model.id == "persisted")
+    );
 }
 
 #[test]

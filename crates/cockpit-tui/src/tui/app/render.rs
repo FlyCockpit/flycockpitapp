@@ -818,20 +818,6 @@ fn history_entry_gap_rows(
 }
 
 impl App {
-    pub(super) fn model_summary_history_line(&self) -> String {
-        match &self.launch.active_model {
-            Some((p, m)) => format!(
-                "/model: active model is now {p}/{m}{}",
-                if self.launch.active_model_is_favorite {
-                    " (★)"
-                } else {
-                    ""
-                }
-            ),
-            None => "/model: no active model".to_string(),
-        }
-    }
-
     pub(super) fn slash_query(&self) -> Option<&str> {
         let rest = self.composer.text().strip_prefix('/')?;
         let end = rest.find(char::is_whitespace).unwrap_or(rest.len());

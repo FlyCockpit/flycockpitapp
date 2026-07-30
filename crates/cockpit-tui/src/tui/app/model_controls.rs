@@ -111,6 +111,7 @@ impl App {
         self.footer_mode_picker = None;
         match crate::tui::model_picker::ModelPickerDialog::open_with_failures(
             self.config_snapshot.providers.clone(),
+            self.launch.active_model.clone(),
             &self.usage_models,
             &self.auth_failure_annotations,
             chrono::Utc::now().timestamp(),
@@ -363,13 +364,13 @@ impl App {
         };
         self.overlay = Overlay::None;
         if let Some(active) = selected {
+            let line = format!("Selected model: {}/{}", active.provider, active.model);
             self.notify_active_model_selected(
                 active,
                 cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
             );
+            self.push_plain(line);
         }
-        let line = self.model_summary_history_line();
-        self.push_plain(line);
     }
 
     pub(super) fn notify_active_model_selected(

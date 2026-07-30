@@ -76,6 +76,7 @@ struct Entry {
     reasoning_effort: Option<ReasoningEffortCapability>,
     thinking_modes: Vec<ThinkingMode>,
     failure_annotation: Option<String>,
+    trust: cockpit_config::providers::ModelTrust,
 }
 
 impl Entry {
@@ -124,6 +125,7 @@ fn picker_entry(provider_id: &str, provider: &ProviderEntry, model: &ModelEntry)
             model.thinking_modes.clone()
         },
         failure_annotation: None,
+        trust: cockpit_config::providers::ModelTrust::Untrusted,
     }
 }
 
@@ -220,6 +222,7 @@ impl ModelPickerDialog {
         let providers = cockpit_core::secret_ref::load_effective(cwd);
         Self::open_with_failures(
             providers,
+            None,
             counts,
             &HashMap::new(),
             chrono::Utc::now().timestamp(),
@@ -231,6 +234,7 @@ impl ModelPickerDialog {
     /// metadata (ids, favorites, trust, capabilities) the picker renders.
     pub fn open_with_failures(
         cfg: cockpit_config::providers::ProvidersConfig,
+        session_active_model: Option<(String, String)>,
         counts: &HashMap<String, u64>,
         failures: &crate::tui::auth_failure::AuthFailureAnnotations,
         now_epoch_secs: i64,
@@ -245,6 +249,7 @@ impl ModelPickerDialog {
                         .map(|failure| {
                             crate::tui::auth_failure::annotation_suffix(failure, now_epoch_secs)
                         });
+                picker.trust = cfg.resolve_trust(pid, &model.id);
                 entries.push(picker);
             }
         }
@@ -252,10 +257,11 @@ impl ModelPickerDialog {
         // then label asc (the original alphabetical fallback). Favorites
         // stay pinned above a more-frequent non-favorite.
         sort_entries(&mut entries, counts);
-        let active_model = cfg
-            .active_model
-            .as_ref()
-            .map(|active| (active.provider.clone(), active.model.clone()));
+        let active_model = session_active_model.or_else(|| {
+            cfg.active_model
+                .as_ref()
+                .map(|active| (active.provider.clone(), active.model.clone()))
+        });
         let (cursor, scroll) =
             initial_pick_position(&entries, active_model.as_ref(), "", MODEL_WINDOW);
 
@@ -360,7 +366,23 @@ impl ModelPickerDialog {
                 self.pick.move_by(-1, total);
                 self.pick.clamp_windowed(total, MODEL_WINDOW);
             }
+            KeyCode::Char('p')
+                if key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+            {
+                self.pick.move_by(-1, total);
+                self.pick.clamp_windowed(total, MODEL_WINDOW);
+            }
             KeyCode::Down => {
+                self.pick.move_by(1, total);
+                self.pick.clamp_windowed(total, MODEL_WINDOW);
+            }
+            KeyCode::Char('n')
+                if key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+            {
                 self.pick.move_by(1, total);
                 self.pick.clamp_windowed(total, MODEL_WINDOW);
             }
@@ -547,7 +569,7 @@ impl ModelPickerDialog {
             Step::ChooseReasoning { .. } => self.render_reasoning(frame, layout[0]),
         }
         let help = match &self.step {
-            Step::Pick => "type to filter  ↑/↓  enter: pick  esc: cancel",
+            Step::Pick => "type to filter  ↑/↓ or Ctrl+n/Ctrl+p  enter: pick  esc: cancel",
             Step::ChooseThinking { .. } => "↑/↓  enter: confirm  ←: back  esc: cancel",
             Step::ChooseReasoning { .. } => "↑/↓  enter: confirm  ←: back  esc: cancel",
         };
@@ -670,6 +692,16 @@ impl ModelPickerDialog {
                     Span::raw(marker.to_string()),
                     Span::styled(e.label(), label_style),
                 ];
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    match e.trust {
+                        cockpit_config::providers::ModelTrust::Trusted => "[trusted]".to_string(),
+                        cockpit_config::providers::ModelTrust::Untrusted => {
+                            "[untrusted]".to_string()
+                        }
+                    },
+                    muted,
+                ));
                 if let Some(name) = &e.display_name {
                     spans.push(Span::raw("  "));
                     spans.push(Span::styled(name.clone(), muted));
@@ -1012,6 +1044,7 @@ pub fn cycle_active_favorite(
                     reasoning_effort: model.capabilities.reasoning_effort.clone(),
                     thinking_modes: model.thinking_modes.clone(),
                     failure_annotation: None,
+                    trust: cfg.resolve_trust(pid, &model.id),
                 });
             }
         }
@@ -1128,6 +1161,7 @@ mod tests {
             reasoning_effort: None,
             thinking_modes: Vec::new(),
             failure_annotation: None,
+            trust: cockpit_config::providers::ModelTrust::Untrusted,
         }
     }
 
@@ -1343,6 +1377,7 @@ mod tests {
         .collect();
         let mut dialog = ModelPickerDialog::open_with_failures(
             providers_at(tmp.path()),
+            None,
             &HashMap::new(),
             &failures,
             17_200,
@@ -1352,7 +1387,7 @@ mod tests {
         let rendered = rendered_text(&mut dialog, 80, 12);
 
         assert!(
-            rendered.contains("p/claude  failed 403 · 2h ago"),
+            rendered.contains("p/claude  [untrusted]  failed 403 · 2h ago"),
             "{rendered}"
         );
     }
@@ -1753,7 +1788,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("▸ p/first"));
-        assert!(rendered.contains("p/active  [active]"));
+        assert!(rendered.contains("p/active  [untrusted]  [active]"));
     }
 
     #[test]

@@ -30,6 +30,61 @@ fn test_session_handle() -> SessionWorkerHandle {
     SessionWorkerHandle::test_handle(session, locks)
 }
 
+#[tokio::test]
+async fn deleting_sealed_value_evicts_live_injection_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+    db.upsert_sealed_value(
+        session.id,
+        "prod_token",
+        "very-high-entropy-token",
+        "deploy",
+        "user",
+    )
+    .await
+    .unwrap();
+    let handle = SessionWorkerHandle::test_handle(session, Arc::new(LockManager::in_memory(db)));
+    assert!(
+        handle
+            .resolve_sealed_value_for_injection("prod_token")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(handle.delete_sealed_value("prod_token").await.unwrap());
+    assert!(
+        handle
+            .resolve_sealed_value_for_injection("prod_token")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn creating_sealed_value_updates_live_redaction_before_returning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+    let handle = SessionWorkerHandle::test_handle(session, Arc::new(LockManager::in_memory(db)));
+
+    handle
+        .set_sealed_value("prod_token", "very-high-entropy-token", "deploy", "user")
+        .await
+        .unwrap();
+
+    let scrubbed = handle.redaction_table().scrub("very-high-entropy-token");
+    assert!(!scrubbed.contains("very-high-entropy-token"));
+    assert!(
+        handle
+            .resolve_sealed_value_for_injection("prod_token")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
 fn queued_user_message_for_test(text: &str) -> crate::engine::message::QueuedUserMessage {
     crate::engine::message::QueuedUserMessage {
         id: Uuid::new_v4(),

@@ -1266,6 +1266,15 @@ impl Db {
             fork_point_turn_id.as_deref(),
         )
         .context("copying fork transcript")?;
+        // Sealed values are fork-point state, not a live parent lookup: a
+        // value created in the parent after this fork must stay parent-only.
+        tx.execute(
+            "INSERT INTO sealed_values (session_id, value_id, value, reason, origin, created_at)
+             SELECT ?1, value_id, value, reason, origin, created_at
+             FROM sealed_values WHERE session_id = ?2",
+            params![session_id.to_string(), parent_session_id.to_string()],
+        )
+        .context("copying sealed values into fork")?;
         tx.commit().context("commit create_fork tx")?;
         Ok(row)
     }

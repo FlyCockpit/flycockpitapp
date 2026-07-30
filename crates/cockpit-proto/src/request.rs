@@ -214,6 +214,13 @@ pub enum Request {
     PinnedMessageState {
         session_id: Uuid,
     },
+    ListSealedValues {
+        session_id: Uuid,
+    },
+    DeleteSealedValue {
+        session_id: Uuid,
+        value_id: String,
+    },
 
     ListProjectNotes {
         project_root: String,
@@ -883,6 +890,8 @@ macro_rules! request_variants {
             (Request::ListPinnedMessageSeqs { .. }, "list_pinned_message_seqs");
             (Request::ListPinnedMessagesWithText { .. }, "list_pinned_messages_with_text");
             (Request::PinnedMessageState { .. }, "pinned_message_state");
+            (Request::ListSealedValues { .. }, "list_sealed_values");
+            (Request::DeleteSealedValue { .. }, "delete_sealed_value");
             (Request::ListProjectNotes { .. }, "list_project_notes");
             (Request::CreateProjectNote { .. }, "create_project_note");
             (Request::SetProjectNoteContent { .. }, "set_project_note_content");
@@ -1016,6 +1025,8 @@ macro_rules! command {
             (Request::ListPinnedMessageSeqs { session_id }, "list_pinned_message_seqs", session_row_reader(session_id), field(session_id), false, concurrent, none);
             (Request::ListPinnedMessagesWithText { session_id }, "list_pinned_messages_with_text", session_row_reader(session_id), field(session_id), false, concurrent, none);
             (Request::PinnedMessageState { session_id }, "pinned_message_state", session_row_reader(session_id), field(session_id), false, concurrent, none);
+            (Request::ListSealedValues { session_id }, "list_sealed_values", owner_only, field(session_id), false, concurrent, none);
+            (Request::DeleteSealedValue { session_id, .. }, "delete_sealed_value", owner_only, field(session_id), true, serialized, none);
             (Request::ListProjectNotes { project_root }, "list_project_notes", owner_only, none, true, serialized, path(project_root));
             (Request::CreateProjectNote { project_root, .. }, "create_project_note", owner_only, none, true, serialized, path(project_root));
             (Request::SetProjectNoteContent { project_root, .. }, "set_project_note_content", owner_only, none, true, serialized, path(project_root));
@@ -1235,6 +1246,24 @@ mod tests {
         };
         assert_eq!(request.wire_tag(), "upsert_assistant");
         assert!(crate::command!(command_tags).contains(&request.wire_tag()));
+    }
+
+    #[test]
+    fn sealed_value_rpcs_are_registered_in_both_macro_tables() {
+        let session_id = Uuid::nil();
+        let requests = [
+            Request::ListSealedValues { session_id },
+            Request::DeleteSealedValue {
+                session_id,
+                value_id: "prod_token".into(),
+            },
+        ];
+        let tags: Vec<_> = requests.iter().map(Request::wire_tag).collect();
+        assert_eq!(tags, ["list_sealed_values", "delete_sealed_value"]);
+        let command_tags = crate::command!(command_tags);
+        for tag in tags {
+            assert!(command_tags.contains(&tag), "missing command row for {tag}");
+        }
     }
 }
 

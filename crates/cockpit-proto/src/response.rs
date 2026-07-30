@@ -180,6 +180,9 @@ pub enum Response {
     PinState {
         state: PinState,
     },
+    SealedValues {
+        values: Vec<SealedValueMetadata>,
+    },
 
     ProjectNotes {
         notes: Vec<ProjectNote>,
@@ -470,6 +473,7 @@ macro_rules! response_variants {
             (Response::PinSeqs { .. }, "pin_seqs");
             (Response::PinsWithText { .. }, "pins_with_text");
             (Response::PinState { .. }, "pin_state");
+            (Response::SealedValues { .. }, "sealed_values");
             (Response::ProjectNotes { .. }, "project_notes");
             (Response::ProjectNoteCreated { .. }, "project_note_created");
             (Response::ProjectNoteRenamed { .. }, "project_note_renamed");
@@ -528,6 +532,19 @@ impl Response {
             };
         }
         response_variants!(wire_tag)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sealed_values_response_is_registered() {
+        assert_eq!(
+            Response::SealedValues { values: Vec::new() }.wire_tag(),
+            "sealed_values"
+        );
     }
 }
 

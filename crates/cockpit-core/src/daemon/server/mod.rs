@@ -432,6 +432,13 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 scrub_string(&mut pin.text, redact);
             }
         }
+        proto::Response::SealedValues { values } => {
+            for value in values {
+                scrub_string(&mut value.value_id, redact);
+                scrub_string(&mut value.reason, redact);
+                scrub_string(&mut value.origin, redact);
+            }
+        }
         proto::Response::ProjectNotes { notes } => {
             for note in notes {
                 scrub_string(&mut note.project_root, redact);

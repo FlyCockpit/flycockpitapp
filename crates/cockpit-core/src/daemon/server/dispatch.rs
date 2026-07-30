@@ -436,6 +436,34 @@ pub(super) async fn handle_serialized_request(
                 state: proto::PinState { count, seqs },
             })
         }
+        Request::ListSealedValues { session_id } => ctx
+            .db
+            .list_sealed_value_metadata(session_id)
+            .await
+            .map(|values| Response::SealedValues {
+                values: values
+                    .into_iter()
+                    .map(sealed_value_metadata_to_proto)
+                    .collect(),
+            })
+            .map_err(internal),
+        Request::DeleteSealedValue {
+            session_id,
+            value_id,
+        } => {
+            if let Some(handle) = ctx.registry.live_handle(session_id) {
+                handle
+                    .delete_sealed_value(&value_id)
+                    .await
+                    .map_err(internal)?;
+            } else {
+                ctx.db
+                    .delete_sealed_value(session_id, &value_id)
+                    .await
+                    .map_err(internal)?;
+            }
+            Ok(Response::Ack)
+        }
 
         Request::ListProjectNotes { project_root } => ctx
             .db
@@ -1535,6 +1563,17 @@ pub(super) async fn handle_concurrent_request(
                 state: proto::PinState { count, seqs },
             })
         }
+        Request::ListSealedValues { session_id } => ctx
+            .db
+            .list_sealed_value_metadata(session_id)
+            .await
+            .map(|values| Response::SealedValues {
+                values: values
+                    .into_iter()
+                    .map(sealed_value_metadata_to_proto)
+                    .collect(),
+            })
+            .map_err(internal),
         Request::ExportSessionData {
             session_id,
             kind,
@@ -2677,6 +2716,18 @@ fn project_note_to_proto(row: crate::db::project_notes::ProjectNote) -> proto::P
         project_root: row.project_root,
         name: row.name,
         content: row.content,
+    }
+}
+
+fn sealed_value_metadata_to_proto(
+    row: crate::db::sealed_values::SealedValueMetadata,
+) -> proto::SealedValueMetadata {
+    proto::SealedValueMetadata {
+        value_id: row.value_id,
+        reason: row.reason,
+        origin: row.origin,
+        created_at: row.created_at,
+        origin_session_id: row.origin_session_id,
     }
 }
 

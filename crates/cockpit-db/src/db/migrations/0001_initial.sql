@@ -15,7 +15,7 @@
 -- Exact identity for the amended pre-release squash. Unlike the
 -- `schema_version` migration ledger, this changes whenever 0001 is amended so
 -- an older development database cannot silently masquerade as current.
-PRAGMA user_version = 8;
+PRAGMA user_version = 9;
 
 -- ---- assistants ------------------------------------------------------------
 
@@ -149,6 +149,23 @@ CREATE INDEX idx_sessions_shared_project ON sessions (project_root, shared_with_
   WHERE shared_with_collaborators = 1;
 CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at DESC)
   WHERE assistant_name IS NOT NULL;
+
+-- ---- sealed_values ---------------------------------------------------------
+-- Session-owned write-only values.  The literal is deliberately kept in the
+-- private session database, like persisted transcript and redaction data.
+CREATE TABLE sealed_values (
+    session_id TEXT NOT NULL,
+    value_id   TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    reason     TEXT NOT NULL,
+    origin     TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, value_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_sealed_values_session_created
+    ON sealed_values(session_id, created_at ASC, value_id ASC);
 
 -- ---- app_flags -------------------------------------------------------------
 -- Machine-local one-time UI flags. These are deliberately outside project

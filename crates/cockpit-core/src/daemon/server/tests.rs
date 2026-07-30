@@ -168,6 +168,75 @@ async fn pin_rpc_parity_with_direct_db_calls() {
 }
 
 #[tokio::test]
+async fn sealed_value_metadata_round_trips_through_daemon_without_literal() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    ctx.db
+        .upsert_sealed_value(
+            session.session_id,
+            "prod_token",
+            "very-secret-literal",
+            "deployment credential",
+            "user",
+        )
+        .await
+        .unwrap();
+    let mut state = owner_state();
+    let response = handle_request(
+        Request::ListSealedValues {
+            session_id: session.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::SealedValues { values } = response else {
+        panic!("expected sealed metadata")
+    };
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0].value_id, "prod_token");
+    assert_eq!(values[0].reason, "deployment credential");
+    assert!(!format!("{:?}", values[0]).contains("very-secret-literal"));
+    handle_request(
+        Request::DeleteSealedValue {
+            session_id: session.session_id,
+            value_id: "prod_token".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(
+        ctx.db
+            .list_sealed_value_metadata(session.session_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn sealed_value_rpcs_reject_non_owner_principal() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    let mut state = remote_state_with_grants(Vec::new());
+    for request in [
+        Request::ListSealedValues {
+            session_id: session.session_id,
+        },
+        Request::DeleteSealedValue {
+            session_id: session.session_id,
+            value_id: "prod_token".into(),
+        },
+    ] {
+        let error = handle_request(request, &mut state, &ctx).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Authorization);
+    }
+}
+
+#[tokio::test]
 async fn pin_toggle_returns_resulting_state() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -3009,6 +3078,7 @@ fn dispatch_matrix_class_for_command(
         | ("list_agents", "owner_only", false)
         | ("list_models", "owner_only", false)
         | ("list_assistants", "owner_only", false)
+        | ("list_sealed_values", "owner_only", false)
         | ("export_session_data", "owner_only", false)
         | ("get_usage_counts", "owner_only", false)
         | ("stats_rollup", "owner_only", false) => DispatchMatrixClass::AccessControlled,
@@ -3230,6 +3300,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "toggle_pinned_message",
             effect_class: Durable,
             observation: "pin state is toggled",
+        },
+        MutatingDispatchCase {
+            kind: "delete_sealed_value",
+            effect_class: Durable,
+            observation: "sealed value row is deleted",
         },
         MutatingDispatchCase {
             kind: "create_project_note",
@@ -3720,6 +3795,8 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "pin_message"
         | "unpin_message"
         | "toggle_pinned_message"
+        | "list_sealed_values"
+        | "delete_sealed_value"
         | "list_project_notes"
         | "create_project_note"
         | "upsert_assistant" => AuthzAllowedOutcome::Response,
@@ -3809,6 +3886,8 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_reader("list_pinned_message_seqs"),
         authz_session_reader("list_pinned_messages_with_text"),
         authz_session_reader("pinned_message_state"),
+        authz_owner_only("list_sealed_values"),
+        authz_owner_only("delete_sealed_value"),
         authz_owner_only("list_project_notes"),
         authz_owner_only("create_project_note"),
         authz_owner_only("set_project_note_content"),
@@ -4665,6 +4744,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "list_pinned_message_seqs" => Request::ListPinnedMessageSeqs { session_id },
         "list_pinned_messages_with_text" => Request::ListPinnedMessagesWithText { session_id },
         "pinned_message_state" => Request::PinnedMessageState { session_id },
+        "list_sealed_values" => Request::ListSealedValues { session_id },
+        "delete_sealed_value" => Request::DeleteSealedValue {
+            session_id,
+            value_id: "value".into(),
+        },
         "list_project_notes" => Request::ListProjectNotes {
             project_root: root.clone(),
         },
@@ -5686,6 +5770,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "delete_project_note"
         | "list_project_notes"
         | "upsert_assistant" => assert_new_daemon_rpc_mutating_happy(case.kind).await,
+        "delete_sealed_value" => assert_new_daemon_rpc_mutating_happy(case.kind).await,
         "create_assistant_session" => assert_create_assistant_session_happy().await,
         "auto_title" => assert_auto_title_mutating_happy().await,
         "curator" => assert_curator_mutating_happy().await,
@@ -5808,7 +5893,8 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "rename_project_note"
         | "delete_project_note"
         | "list_project_notes"
-        | "upsert_assistant" => assert_new_daemon_rpc_mutating_malformed(case.kind).await,
+        | "upsert_assistant"
+        | "delete_sealed_value" => assert_new_daemon_rpc_mutating_malformed(case.kind).await,
         "create_assistant_session" => {
             let ctx = test_ctx();
             let err = dispatch_matrix_request(
@@ -7078,6 +7164,10 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
             session_id: session.session_id,
             seq,
         },
+        "delete_sealed_value" => Request::DeleteSealedValue {
+            session_id: session.session_id,
+            value_id: "value".into(),
+        },
         "create_project_note" => Request::CreateProjectNote {
             project_root: "/repo".into(),
             name: "new".into(),
@@ -7112,7 +7202,10 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
         .expect("new RPC happy");
     assert!(
         !matches!(response, Response::Ack)
-            || matches!(kind, "set_project_note_content" | "delete_project_note")
+            || matches!(
+                kind,
+                "set_project_note_content" | "delete_project_note" | "delete_sealed_value"
+            )
     );
 }
 
@@ -7122,6 +7215,10 @@ async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
         "pin_message" | "unpin_message" | "toggle_pinned_message" => Request::PinMessage {
             session_id: Uuid::new_v4(),
             seq: 1,
+        },
+        "delete_sealed_value" => Request::DeleteSealedValue {
+            session_id: Uuid::new_v4(),
+            value_id: "value".into(),
         },
         "create_project_note" => Request::CreateProjectNote {
             project_root: "/repo".into(),
@@ -8119,6 +8216,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_re
         "list_pinned_message_seqs",
         "list_pinned_messages_with_text",
         "list_scheduled_jobs",
+        "list_sealed_values",
         "list_sessions",
         "list_skills",
         "count_pinned_messages",
@@ -9174,6 +9272,23 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: false,
         },
         CommandMetadataCase {
+            request: Request::ListSealedValues { session_id },
+            kind: "list_sealed_values",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::DeleteSealedValue {
+                session_id,
+                value_id: "value".into(),
+            },
+            kind: "delete_sealed_value",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::ListProjectNotes {
                 project_root: project_root.clone(),
             },
@@ -9280,6 +9395,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ListPinnedMessageSeqs,
         ListPinnedMessagesWithText,
         PinnedMessageState,
+        ListSealedValues,
+        DeleteSealedValue,
         ListProjectNotes,
         CreateProjectNote,
         SetProjectNoteContent,

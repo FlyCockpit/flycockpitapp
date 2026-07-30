@@ -698,6 +698,21 @@ impl RedactionTable {
         )
     }
 
+    /// Add one caller-supplied literal to this table.  Sealed-value storage
+    /// uses this before making the literal durable, so all subsequent egress
+    /// observes the redaction without a stored-but-unscrubbed window.
+    pub fn with_forced_literal(&self, value: String, origin: String) -> Result<Self> {
+        let mut entries = self.entries.clone();
+        entries.push((value, origin));
+        Self::from_entries(
+            entries,
+            self.placeholder.clone(),
+            self.disabled,
+            self.unsupported_files.clone(),
+            self.protected.clone(),
+        )
+    }
+
     /// Serialize this accumulated table for session-local persistence. The
     /// payload intentionally contains literal values: it is stored in the
     /// same private session DB that now stores raw transcript content.

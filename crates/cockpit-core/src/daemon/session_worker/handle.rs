@@ -15,6 +15,8 @@ pub struct SessionWorkerHandle {
     event_tx: EventSender,
     turn_completions: Arc<Mutex<TurnCompletions>>,
     redaction: SharedRedactionTable,
+    /// Injection-only session values. Never exposed over proto or Debug.
+    sealed_values: Arc<Mutex<HashMap<String, String>>>,
     /// Live job/turn status for the `/sessions` browser (GOALS §17f).
     live: Arc<LiveState>,
     /// Count of attached *interactive* clients — ones that can answer an
@@ -669,6 +671,7 @@ impl SessionWorkerHandle {
             event_tx,
             turn_completions: Arc::new(Mutex::new(TurnCompletions::default())),
             redaction,
+            sealed_values: Arc::new(Mutex::new(HashMap::new())),
             live: Arc::new(LiveState::default()),
             interactive_clients: Arc::new(AtomicUsize::new(0)),
             session,
@@ -952,6 +955,69 @@ impl SessionWorkerHandle {
 
     pub fn redaction_table(&self) -> Arc<RedactionTable> {
         current_redaction(&self.redaction)
+    }
+
+    pub async fn resolve_sealed_value_for_injection(
+        &self,
+        value_id: &str,
+    ) -> anyhow::Result<Option<crate::session::sealed_values::SealedValueForInjection>> {
+        if let Some(value) = self.sealed_values.lock().unwrap().get(value_id).cloned() {
+            return Ok(Some(
+                crate::session::sealed_values::SealedValueForInjection::new(value),
+            ));
+        }
+        let value = self
+            .session
+            .resolve_sealed_value_for_injection(value_id)
+            .await?;
+        if let Some(value) = &value {
+            self.sealed_values
+                .lock()
+                .unwrap()
+                .insert(value_id.to_owned(), value.as_str().to_owned());
+        }
+        Ok(value)
+    }
+
+    /// Create or overwrite a sealed value. Install its literal into the live
+    /// redaction table before the database operation can yield, so no
+    /// concurrent worker egress can expose it.
+    pub async fn set_sealed_value(
+        &self,
+        value_id: &str,
+        value: &str,
+        reason: &str,
+        origin: &str,
+    ) -> anyhow::Result<crate::db::sealed_values::SealedValueMetadata> {
+        crate::session::sealed_values::validate_sealed_value(value_id, value)?;
+        self.seal_redaction_literal(value.to_owned(), value_id)?;
+        let metadata = self
+            .session
+            .set_sealed_value(&self.redaction_table(), value_id, value, reason, origin)
+            .await?;
+        self.sealed_values
+            .lock()
+            .unwrap()
+            .insert(value_id.to_owned(), value.to_owned());
+        Ok(metadata)
+    }
+
+    pub async fn delete_sealed_value(&self, value_id: &str) -> anyhow::Result<bool> {
+        let deleted = self.session.delete_sealed_value(value_id).await?;
+        self.sealed_values.lock().unwrap().remove(value_id);
+        Ok(deleted)
+    }
+
+    /// Union a sealed literal into the live egress table and make the union
+    /// durable before the caller proceeds to persist/inject the value.
+    pub fn seal_redaction_literal(&self, value: String, value_id: &str) -> anyhow::Result<()> {
+        let table = self
+            .redaction_table()
+            .with_forced_literal(value, format!("sealed:{value_id}"))?;
+        let table = Arc::new(table);
+        self.session.persist_redaction_table(&table)?;
+        set_current_redaction(&self.redaction, table);
+        Ok(())
     }
 
     pub fn session(&self) -> Arc<Session> {
@@ -1431,6 +1497,7 @@ pub fn spawn(
         event_tx: event_tx.clone(),
         turn_completions: turn_completions.clone(),
         redaction: redaction.clone(),
+        sealed_values: Arc::new(Mutex::new(HashMap::new())),
         live: live.clone(),
         interactive_clients: interactive_clients.clone(),
         session: session.clone(),

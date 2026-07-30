@@ -42,6 +42,7 @@ pub mod export;
 mod gitignore;
 mod lifecycle;
 mod recording;
+pub mod sealed_values;
 pub(crate) use recording::notice_severity;
 pub use recording::{
     ModelSwitchAudit, ModelSwitchOutcome, ModelSwitchTrigger, SessionEventModelFrame,

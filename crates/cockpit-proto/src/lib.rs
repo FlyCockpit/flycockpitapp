@@ -461,7 +461,7 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// such as removals, renames, and type changes bump
 /// [`MIN_SUPPORTED_PROTOCOL_VERSION`] and are the only class that narrows the
 /// compatibility window.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Oldest wire schema version this binary accepts.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
@@ -1230,6 +1230,36 @@ pub struct ProjectNote {
     pub content: String,
 }
 
+/// Metadata for a session sealed value.  The literal is deliberately absent
+/// from this wire type.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SealedValueMetadata {
+    pub value_id: String,
+    pub reason: String,
+    pub origin: String,
+    pub created_at: i64,
+    pub origin_session_id: Uuid,
+}
+
+#[cfg(test)]
+mod sealed_value_tests {
+    use super::*;
+
+    #[test]
+    fn sealed_value_metadata_wire_shape_has_no_literal_field() {
+        let metadata = SealedValueMetadata {
+            value_id: "prod_token".into(),
+            reason: "deploy".into(),
+            origin: "user".into(),
+            created_at: 1,
+            origin_session_id: Uuid::nil(),
+        };
+        let encoded = serde_json::to_string(&metadata).unwrap();
+        assert!(!encoded.contains("value\""));
+        assert!(!encoded.contains("secret"));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssistantSessionCreated {
     pub session_id: Uuid,
@@ -1738,7 +1768,7 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const RELEASED_PROTOCOL_VERSIONS: &[u32] = &[1, 2, 3, 4];
+    const RELEASED_PROTOCOL_VERSIONS: &[u32] = &[1, 2, 3, 4, 5];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]

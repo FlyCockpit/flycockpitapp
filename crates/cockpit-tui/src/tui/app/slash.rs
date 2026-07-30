@@ -1137,7 +1137,7 @@ fn format_sealed_values(values: &mut [cockpit_core::daemon::proto::SealedValueMe
         .map(|value| {
             let mut reason = value.reason.chars().take(120).collect::<String>();
             if value.reason.chars().count() > 120 {
-                reason.push_str("…");
+                reason.push('…');
             }
             format!(
                 "{} | {} | {} | {} | {}",

@@ -2103,12 +2103,11 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
             "computer-use subagent requires a configured vision-capable, subagent-invokable model with native computer_use enabled"
         );
     };
-    let model = Arc::new(crate::engine::model::Model::for_provider_trusted_only(
+    let model = Arc::new(crate::engine::model::Model::for_provider(
         &providers,
         &provider_id,
         &model_id,
         args.effective_model().session_redact_table(),
-        args.effective_model().trusted_only_flag(),
     )?);
     let caps = providers.resolve_capabilities(model.provider_id(), model.model_id_ref());
     if caps.images != Some(true) {

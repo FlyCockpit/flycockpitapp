@@ -37,7 +37,6 @@ pub struct QuickCurrent {
     pub llm_mode: LlmMode,
     pub recursion_enabled: bool,
     pub recursion_depth: u32,
-    pub trusted_only: bool,
     pub sandbox_mode: SandboxMode,
     pub container_network_enabled: bool,
     pub container_availability: cockpit_core::container::ContainerAvailability,
@@ -51,7 +50,6 @@ pub struct QuickCurrent {
 pub struct QuickCommit {
     pub llm_mode: Option<LlmMode>,
     pub recursion: Option<(bool, u32)>,
-    pub trusted_only: Option<bool>,
     pub sandbox_mode: Option<SandboxMode>,
     pub container_network_enabled: Option<bool>,
     pub approval_mode: Option<ApprovalMode>,
@@ -69,17 +67,15 @@ pub enum QuickOutcome {
 enum Tab {
     Mode,
     Recursion,
-    Trust,
     Sandbox,
     Permissions,
     Cache,
     Model,
 }
 
-const TABS: [Tab; 7] = [
+const TABS: [Tab; 6] = [
     Tab::Mode,
     Tab::Recursion,
-    Tab::Trust,
     Tab::Sandbox,
     Tab::Permissions,
     Tab::Cache,
@@ -96,10 +92,9 @@ pub struct QuickDialog {
     current: QuickCurrent,
     models: Vec<QuickModelChoice>,
     tab: usize,
-    cursors: [usize; 7],
+    cursors: [usize; 6],
     staged_llm_mode: Option<LlmMode>,
     staged_recursion: Option<RecursionChoice>,
-    staged_trusted_only: Option<bool>,
     staged_sandbox_mode: Option<SandboxMode>,
     staged_container_network_enabled: Option<bool>,
     staged_approval_mode: Option<ApprovalMode>,
@@ -152,10 +147,9 @@ impl QuickDialog {
             current,
             models,
             tab: 0,
-            cursors: [0; 7],
+            cursors: [0; 6],
             staged_llm_mode: None,
             staged_recursion: None,
-            staged_trusted_only: None,
             staged_sandbox_mode: None,
             staged_container_network_enabled: None,
             staged_approval_mode: None,
@@ -270,20 +264,19 @@ impl QuickDialog {
             .iter()
             .position(|choice| *choice == self.current_recursion())
             .unwrap_or(0);
-        self.cursors[2] = usize::from(self.current.trusted_only);
-        self.cursors[3] = sandbox_mode_options()
+        self.cursors[2] = sandbox_mode_options()
             .iter()
             .position(|mode| *mode == self.current.sandbox_mode)
             .unwrap_or(1);
-        self.cursors[4] = approval_options()
+        self.cursors[3] = approval_options()
             .iter()
             .position(|mode| *mode == self.current.approval_mode)
             .unwrap_or(0);
-        self.cursors[5] = retention_options()
+        self.cursors[4] = retention_options()
             .iter()
             .position(|retention| *retention == self.current.prompt_cache_retention)
             .unwrap_or(0);
-        self.cursors[6] = self
+        self.cursors[5] = self
             .current
             .active_model
             .as_ref()
@@ -312,7 +305,6 @@ impl QuickDialog {
         match tab {
             Tab::Mode => mode_options().len(),
             Tab::Recursion => recursion_options().len(),
-            Tab::Trust => 2,
             Tab::Sandbox => sandbox_mode_options().len() + 1,
             Tab::Permissions => approval_options().len(),
             Tab::Cache => retention_options().len(),
@@ -327,9 +319,6 @@ impl QuickDialog {
             }
             Tab::Recursion => {
                 self.staged_recursion = Some(recursion_options()[self.cursors[self.tab]]);
-            }
-            Tab::Trust => {
-                self.staged_trusted_only = Some(self.cursors[self.tab] == 1);
             }
             Tab::Sandbox => {
                 let cursor = self.cursors[self.tab];
@@ -388,11 +377,6 @@ impl QuickDialog {
                 RecursionChoice::Off => (false, 0),
                 RecursionChoice::Depth(depth) => (true, depth),
             });
-        }
-        if let Some(enabled) = self.staged_trusted_only
-            && enabled != self.current.trusted_only
-        {
-            commit.trusted_only = Some(enabled);
         }
         if let Some(mode) = self.staged_sandbox_mode
             && mode != self.current.sandbox_mode
@@ -470,28 +454,6 @@ impl QuickDialog {
                         self.current_recursion() == *choice,
                         self.active_staged_recursion() == *choice
                             && self.staged_recursion.is_some(),
-                        false,
-                    )
-                })
-                .collect(),
-            Tab::Trust => [false, true]
-                .iter()
-                .enumerate()
-                .map(|(i, enabled)| {
-                    self.option_line(
-                        i,
-                        if *enabled {
-                            "trusted only"
-                        } else {
-                            "allow untrusted"
-                        },
-                        if *enabled {
-                            "require trusted models for every inference"
-                        } else {
-                            "allow configured untrusted models"
-                        },
-                        self.current.trusted_only == *enabled,
-                        self.staged_trusted_only == Some(*enabled),
                         false,
                     )
                 })
@@ -666,7 +628,6 @@ impl Tab {
         match self {
             Tab::Mode => "Mode",
             Tab::Recursion => "Recursion",
-            Tab::Trust => "Trust",
             Tab::Sandbox => "Sandbox",
             Tab::Permissions => "Permissions",
             Tab::Cache => "Cache",
@@ -814,7 +775,6 @@ mod tests {
             llm_mode: LlmMode::Defensive,
             recursion_enabled: true,
             recursion_depth: 2,
-            trusted_only: false,
             sandbox_mode: SandboxMode::Sandbox,
             container_network_enabled: false,
             container_availability: cockpit_core::container::ContainerAvailability {
@@ -865,11 +825,16 @@ mod tests {
 
     #[test]
     fn tab_forward_and_back() {
+        assert_eq!(TABS.len(), 6);
         let mut dialog = QuickDialog::open(current(), vec![model("p/a")]);
         assert_eq!(dialog.active_tab(), Tab::Mode);
         dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.active_tab(), Tab::Recursion);
         dialog.handle_key(shift_tab());
+        assert_eq!(dialog.active_tab(), Tab::Mode);
+        for _ in 0..6 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
         assert_eq!(dialog.active_tab(), Tab::Mode);
     }
 
@@ -885,14 +850,12 @@ mod tests {
         dialog.handle_key(key(KeyCode::Down));
         let recursion_cursor = dialog.active_cursor();
         dialog.handle_key(key(KeyCode::Right));
-        assert_eq!(dialog.active_tab(), Tab::Trust);
-        let trust_cursor = dialog.active_cursor();
+        assert_eq!(dialog.active_tab(), Tab::Sandbox);
+        dialog.handle_key(key(KeyCode::Left));
+        assert_eq!(dialog.active_tab(), Tab::Recursion);
+        dialog.handle_key(key(KeyCode::Left));
+        assert_eq!(dialog.active_tab(), Tab::Mode);
         dialog.handle_key(key(KeyCode::Right));
-        assert_ne!(dialog.active_cursor(), trust_cursor);
-        dialog.handle_key(key(KeyCode::Left));
-        assert_eq!(dialog.active_tab(), Tab::Trust);
-        assert_eq!(dialog.active_cursor(), trust_cursor);
-        dialog.handle_key(key(KeyCode::Left));
         assert_eq!(dialog.active_tab(), Tab::Recursion);
         assert_eq!(dialog.active_cursor(), recursion_cursor);
     }
@@ -979,7 +942,7 @@ mod tests {
     #[test]
     fn sandbox_tab_stages_container_mode() {
         let mut dialog = QuickDialog::open(current(), vec![model("p/a")]);
-        for _ in 0..3 {
+        for _ in 0..2 {
             dialog.handle_key(key(KeyCode::Tab));
         }
         assert_eq!(dialog.active_tab(), Tab::Sandbox);
@@ -1000,7 +963,7 @@ mod tests {
     #[test]
     fn sandbox_tab_network_toggle_requires_staged_container_mode() {
         let mut dialog = QuickDialog::open(current(), vec![model("p/a")]);
-        for _ in 0..3 {
+        for _ in 0..2 {
             dialog.handle_key(key(KeyCode::Tab));
         }
 
@@ -1037,7 +1000,7 @@ mod tests {
             reason: Some(cockpit_core::container::ContainerUnavailableReason::NoRuntime),
         };
         let mut dialog = QuickDialog::open(current, vec![model("p/a")]);
-        for _ in 0..3 {
+        for _ in 0..2 {
             dialog.handle_key(key(KeyCode::Tab));
         }
         dialog.handle_key(key(KeyCode::Down));
@@ -1054,7 +1017,7 @@ mod tests {
     #[test]
     fn disabled_empty_favorite_model_tab() {
         let mut dialog = QuickDialog::open(current(), Vec::new());
-        for _ in 0..6 {
+        for _ in 0..5 {
             dialog.handle_key(key(KeyCode::Tab));
         }
         assert_eq!(dialog.active_tab(), Tab::Model);

@@ -2916,7 +2916,6 @@ mod tests {
             llm_mode: LlmMode::Defensive,
             recursion_enabled: true,
             recursion_depth: 2,
-            trusted_only: false,
             sandbox_mode: SandboxMode::Sandbox,
             container_network_enabled: false,
             container_availability: ContainerAvailability {
@@ -2941,7 +2940,7 @@ mod tests {
                 mode: LlmMode::Normal,
             }],
         );
-        for _ in 0..5 {
+        for _ in 0..4 {
             quick.handle_key(press(KeyCode::Tab));
         }
         quick.handle_key(press(KeyCode::Down));
@@ -2983,7 +2982,7 @@ mod tests {
         let mut unsupported_current = current_quick_retention();
         unsupported_current.prompt_cache_retention_status = CapabilityStatus::Unsupported;
         let mut unsupported_quick = QuickDialog::open(unsupported_current, Vec::new());
-        for _ in 0..5 {
+        for _ in 0..4 {
             unsupported_quick.handle_key(press(KeyCode::Tab));
         }
         unsupported_quick.handle_key(press(KeyCode::Down));

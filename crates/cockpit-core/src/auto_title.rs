@@ -282,12 +282,7 @@ async fn generate_slug_inner(
     let Some(model_ref) = extended.auto_title_model_ref() else {
         anyhow::bail!("utility_model is not configured");
     };
-    let model = crate::engine::model::Model::from_ref_trusted_only(
-        &providers,
-        model_ref,
-        redact,
-        session.trusted_only_flag(),
-    )?;
+    let model = crate::engine::model::Model::from_ref(&providers, model_ref, redact)?;
     let model = match shutdown_gate {
         Some(gate) => model.with_shutdown_gate(gate),
         None => model,

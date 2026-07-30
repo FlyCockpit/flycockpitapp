@@ -513,7 +513,6 @@ pub async fn run(
     model_ref: Option<&str>,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
-    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     template: &str,
     raw_text: &str,
@@ -534,7 +533,6 @@ pub async fn run(
         model_ref,
         providers,
         redact,
-        trusted_only,
         shutdown_gate,
         template,
         &prose,
@@ -617,19 +615,13 @@ async fn rewrite(
     model_ref: Option<&str>,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
-    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     template: &str,
     prose: &str,
     context: &PreflightContext,
 ) -> Option<String> {
     let model_ref = model_ref?;
-    let model = match crate::engine::model::Model::from_ref_trusted_only(
-        providers,
-        model_ref,
-        redact,
-        trusted_only,
-    ) {
+    let model = match crate::engine::model::Model::from_ref(providers, model_ref, redact) {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(error = %e, "preflight: model build failed; failing open");
@@ -660,10 +652,6 @@ async fn rewrite(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn trust_flag_off() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
-    }
 
     #[test]
     fn skip_leading_slash_command() {
@@ -763,7 +751,6 @@ mod tests {
             None,
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
-            trust_flag_off(),
             None,
             "rewrite this",
             "a sufficiently long verbose prompt to rewrite",
@@ -782,7 +769,6 @@ mod tests {
             None,
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
-            trust_flag_off(),
             None,
             "rewrite this",
             "a sufficiently long verbose prompt to rewrite",
@@ -805,7 +791,6 @@ mod tests {
             Some("p:m"),
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
-            trust_flag_off(),
             None,
             "rewrite this",
             "/plan do a big refactor of the parser",
@@ -1149,7 +1134,6 @@ mod tests {
             Some("p:m"),
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
-            trust_flag_off(),
             None,
             "rewrite this",
             "do that again for the other file",
@@ -1219,7 +1203,6 @@ mod tests {
             Some("p:m"),
             &providers,
             redact,
-            trust_flag_off(),
             None,
             "rewrite this",
             "summarize that file again for me please",

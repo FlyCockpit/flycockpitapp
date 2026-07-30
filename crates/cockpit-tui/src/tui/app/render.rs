@@ -535,7 +535,6 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
             child,
             task_call_id,
             label,
-            trusted_only,
             model_trusted,
             routing,
             outcome,
@@ -546,7 +545,6 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
             hash_len(&mut hasher, child);
             hash_len(&mut hasher, task_call_id);
             hash_len(&mut hasher, label);
-            trusted_only.hash(&mut hasher);
             model_trusted.hash(&mut hasher);
             routing
                 .model
@@ -5632,7 +5630,6 @@ mod render_history_spacing_tests {
             child: "explore".to_string(),
             task_call_id: "call-1".to_string(),
             label: "default".to_string(),
-            trusted_only: false,
             model_trusted: true,
             routing: SubagentRoutingChips::default(),
             spawned_at: std::time::Instant::now(),
@@ -5647,7 +5644,6 @@ mod render_history_spacing_tests {
             child: "docs".to_string(),
             task_call_id: "call-1".to_string(),
             label: "default".to_string(),
-            trusted_only: false,
             model_trusted: true,
             routing: SubagentRoutingChips::default(),
             spawned_at: std::time::Instant::now(),
@@ -5843,7 +5839,6 @@ mod render_history_spacing_tests {
             label: "default".to_string(),
             report: "done".to_string(),
             failed: false,
-            trusted_only: false,
             model_trusted: true,
             routing: serde_json::Value::Null,
         });

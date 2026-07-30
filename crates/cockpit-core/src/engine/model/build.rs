@@ -14,37 +14,9 @@ impl Model {
         Self::from_config_with_env(cfg, redact, |name| std::env::var(name).ok())
     }
 
-    #[allow(dead_code)]
-    pub fn from_config_trusted_only(
-        cfg: &ProvidersConfig,
-        redact: Arc<RedactionTable>,
-        trusted_only: Arc<AtomicBool>,
-    ) -> Result<Self> {
-        Self::from_config_with_env_trusted_only(cfg, redact, trusted_only, |name| {
-            std::env::var(name).ok()
-        })
-    }
-
     pub fn from_config_with_env<F>(
         cfg: &ProvidersConfig,
         redact: Arc<RedactionTable>,
-        lookup: F,
-    ) -> Result<Self>
-    where
-        F: Fn(&str) -> Option<String>,
-    {
-        Self::from_config_with_env_trusted_only(
-            cfg,
-            redact,
-            Arc::new(AtomicBool::new(false)),
-            lookup,
-        )
-    }
-
-    pub fn from_config_with_env_trusted_only<F>(
-        cfg: &ProvidersConfig,
-        redact: Arc<RedactionTable>,
-        trusted_only: Arc<AtomicBool>,
         lookup: F,
     ) -> Result<Self>
     where
@@ -57,12 +29,9 @@ impl Model {
             .providers
             .get(&active.provider)
             .with_context(|| format!("provider `{}` is not configured", active.provider))?;
-        let trusted = Self::ensure_trusted_only_build_allowed(
-            cfg,
-            &active.provider,
-            &active.model,
-            &trusted_only,
-        )?;
+        let trusted = cfg
+            .resolve_trust(&active.provider, &active.model)
+            .is_trusted();
         let cache = cfg.resolve_cache(&active.provider, &active.model);
         let timeout = cfg.resolve_timeout(&active.provider, &active.model);
         let hard_timeout_on_stall = true;
@@ -97,7 +66,6 @@ impl Model {
             subagent_invokable,
             can_delegate,
             computer_use,
-            trusted_only,
             redact,
             effective_redact,
             lookup,
@@ -120,18 +88,6 @@ impl Model {
         Self::for_provider(cfg, provider_id, model_id, redact)
     }
 
-    pub fn from_ref_trusted_only(
-        cfg: &ProvidersConfig,
-        model_ref: &str,
-        redact: Arc<RedactionTable>,
-        trusted_only: Arc<AtomicBool>,
-    ) -> Result<Self> {
-        let (provider_id, model_id) = model_ref
-            .split_once(':')
-            .with_context(|| format!("model ref `{model_ref}` must be provider:model-id"))?;
-        Self::for_provider_trusted_only(cfg, provider_id, model_id, redact, trusted_only)
-    }
-
     /// Build a `Model` for an arbitrary `(provider, model_id)` pair,
     /// re-using the same auth-header / env-resolve pipeline as
     /// [`Self::from_config`] but bypassing the active-model selection.
@@ -150,23 +106,6 @@ impl Model {
         })
     }
 
-    pub fn for_provider_trusted_only(
-        cfg: &ProvidersConfig,
-        provider_id: &str,
-        model_id: &str,
-        redact: Arc<RedactionTable>,
-        trusted_only: Arc<AtomicBool>,
-    ) -> Result<Self> {
-        Self::for_provider_with_env_trusted_only(
-            cfg,
-            provider_id,
-            model_id,
-            redact,
-            trusted_only,
-            |name| std::env::var(name).ok(),
-        )
-    }
-
     pub fn for_provider_with_env<F>(
         cfg: &ProvidersConfig,
         provider_id: &str,
@@ -177,33 +116,11 @@ impl Model {
     where
         F: Fn(&str) -> Option<String>,
     {
-        Self::for_provider_with_env_trusted_only(
-            cfg,
-            provider_id,
-            model_id,
-            redact,
-            Arc::new(AtomicBool::new(false)),
-            lookup,
-        )
-    }
-
-    pub fn for_provider_with_env_trusted_only<F>(
-        cfg: &ProvidersConfig,
-        provider_id: &str,
-        model_id: &str,
-        redact: Arc<RedactionTable>,
-        trusted_only: Arc<AtomicBool>,
-        lookup: F,
-    ) -> Result<Self>
-    where
-        F: Fn(&str) -> Option<String>,
-    {
         let entry = cfg
             .providers
             .get(provider_id)
             .with_context(|| format!("provider `{provider_id}` is not configured"))?;
-        let trusted =
-            Self::ensure_trusted_only_build_allowed(cfg, provider_id, model_id, &trusted_only)?;
+        let trusted = cfg.resolve_trust(provider_id, model_id).is_trusted();
         let cache = cfg.resolve_cache(provider_id, model_id);
         let timeout = cfg.resolve_timeout(provider_id, model_id);
         let hard_timeout_on_stall = true;
@@ -235,7 +152,6 @@ impl Model {
             subagent_invokable,
             can_delegate,
             computer_use,
-            trusted_only,
             redact,
             effective_redact,
             lookup,
@@ -269,7 +185,6 @@ pub(super) fn build_model(
     quality_rank: i64,
     cost_rank: i64,
     subagent_invokable: bool,
-    trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
     lookup: impl Fn(&str) -> Option<String>,
@@ -291,7 +206,6 @@ pub(super) fn build_model(
         subagent_invokable,
         true,
         None,
-        trusted_only,
         session_redact,
         redact,
         lookup,
@@ -316,7 +230,6 @@ pub(super) fn build_model_with_can_delegate(
     subagent_invokable: bool,
     can_delegate: bool,
     computer_use: Option<crate::config::providers::ComputerUseCapability>,
-    trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
     lookup: impl Fn(&str) -> Option<String>,
@@ -347,7 +260,6 @@ pub(super) fn build_model_with_can_delegate(
             cost_rank,
             subagent_invokable,
             can_delegate,
-            trusted_only,
             session_redact,
             redact,
         )
@@ -369,7 +281,6 @@ pub(super) fn build_model_with_can_delegate(
             subagent_invokable,
             can_delegate,
             computer_use.as_ref(),
-            trusted_only,
             session_redact,
             redact,
         )
@@ -390,7 +301,6 @@ pub(super) fn build_model_with_can_delegate(
             cost_rank,
             subagent_invokable,
             can_delegate,
-            trusted_only,
             session_redact,
             redact,
         )
@@ -444,7 +354,6 @@ pub(super) fn build_anthropic_model(
     quality_rank: i64,
     cost_rank: i64,
     subagent_invokable: bool,
-    trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
@@ -463,7 +372,6 @@ pub(super) fn build_anthropic_model(
         subagent_invokable,
         true,
         None,
-        trusted_only,
         session_redact,
         redact,
     )
@@ -485,7 +393,6 @@ pub(super) fn build_anthropic_model_with_can_delegate(
     subagent_invokable: bool,
     can_delegate: bool,
     computer_use: Option<&crate::config::providers::ComputerUseCapability>,
-    trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
@@ -557,7 +464,6 @@ pub(super) fn build_anthropic_model_with_can_delegate(
         cost_rank,
         subagent_invokable,
         can_delegate,
-        trusted_only,
         // Default never-draining gate; the registry swaps in the daemon's
         // shared gate via `Model::with_shutdown_gate` for worker models.
         gate: crate::daemon::shutdown::ShutdownSignal::new(),
@@ -583,7 +489,6 @@ pub(super) fn build_chatgpt_model(
     quality_rank: i64,
     cost_rank: i64,
     subagent_invokable: bool,
-    trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
@@ -600,7 +505,6 @@ pub(super) fn build_chatgpt_model(
         cost_rank,
         subagent_invokable,
         true,
-        trusted_only,
         session_redact,
         redact,
     )
@@ -620,7 +524,6 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
     cost_rank: i64,
     subagent_invokable: bool,
     can_delegate: bool,
-    trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
@@ -690,7 +593,6 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
         cost_rank,
         subagent_invokable,
         can_delegate,
-        trusted_only,
         gate: crate::daemon::shutdown::ShutdownSignal::new(),
         session_redact,
         redact,
@@ -725,7 +627,6 @@ pub(super) fn build_openai_model(
         0,
         0,
         false,
-        Arc::new(AtomicBool::new(false)),
         redact.clone(),
         redact,
     )
@@ -749,7 +650,6 @@ pub(super) fn build_openai_model_from_resolved(
     quality_rank: i64,
     cost_rank: i64,
     subagent_invokable: bool,
-    trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
@@ -769,7 +669,6 @@ pub(super) fn build_openai_model_from_resolved(
         cost_rank,
         subagent_invokable,
         true,
-        trusted_only,
         session_redact,
         redact,
     )
@@ -792,7 +691,6 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit(
     quality_rank: i64,
     cost_rank: i64,
     subagent_invokable: bool,
-    trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
@@ -812,7 +710,6 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit(
         cost_rank,
         subagent_invokable,
         true,
-        trusted_only,
         session_redact,
         redact,
     )
@@ -835,7 +732,6 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
     cost_rank: i64,
     subagent_invokable: bool,
     can_delegate: bool,
-    trusted_only: Arc<AtomicBool>,
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
@@ -912,7 +808,6 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
         cost_rank,
         subagent_invokable,
         can_delegate,
-        trusted_only,
         // Default never-draining gate; the registry swaps in the daemon's
         // shared gate via `Model::with_shutdown_gate` for worker models.
         gate: crate::daemon::shutdown::ShutdownSignal::new(),

@@ -435,7 +435,6 @@ impl App {
             llm_mode: self.llm_mode,
             recursion_enabled: self.delegation_recursion_enabled,
             recursion_depth: self.delegation_recursion_depth,
-            trusted_only: self.trusted_only_enabled,
             sandbox_mode: self.sandbox_mode,
             container_network_enabled: self.container_network_enabled,
             container_availability: self.container_availability.clone(),
@@ -480,15 +479,6 @@ impl App {
                 cockpit_core::daemon::proto::Request::SetDelegationRecursion {
                     enabled,
                     default_depth,
-                },
-                ControlApplied::None,
-            );
-        }
-        if let Some(enabled) = commit.trusted_only {
-            self.send_daemon_request(
-                "/quick",
-                cockpit_core::daemon::proto::Request::SetTrustedOnly {
-                    enabled: Some(enabled),
                 },
                 ControlApplied::None,
             );

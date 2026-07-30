@@ -135,7 +135,6 @@ async fn select(
         extended,
         providers,
         redact,
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &[],
         turns,
@@ -151,7 +150,6 @@ pub async fn select_with_diagnostics(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
-    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     active_tools: &[String],
     turns: &[PredictionTurn],
@@ -162,7 +160,6 @@ pub async fn select_with_diagnostics(
         extended,
         providers,
         redact,
-        trusted_only,
         shutdown_gate,
         active_tools,
         turns,
@@ -184,7 +181,6 @@ async fn select_inner(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
-    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     active_tools: &[String],
     turns: &[PredictionTurn],
@@ -224,12 +220,7 @@ async fn select_inner(
         return Ok((Selection::None, diagnostics));
     }
 
-    let model = crate::engine::model::Model::from_ref_trusted_only(
-        providers,
-        model_ref,
-        redact.clone(),
-        trusted_only,
-    )?;
+    let model = crate::engine::model::Model::from_ref(providers, model_ref, redact.clone())?;
     let model = match shutdown_gate {
         Some(gate) => model.with_shutdown_gate(gate),
         None => model,

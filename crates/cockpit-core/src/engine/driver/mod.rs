@@ -1043,7 +1043,6 @@ fn with_model_routing_metadata(
     mut data: serde_json::Value,
     model: &crate::engine::model::Model,
 ) -> serde_json::Value {
-    data["trusted_only"] = serde_json::json!(model.trusted_only_enabled());
     data["model_trusted"] = serde_json::json!(model.is_trusted());
     data["routing"] = model.routing_metadata_json(None);
     data
@@ -1053,7 +1052,6 @@ fn with_model_routing_metadata(
 pub(in crate::engine::driver) struct ChildRoutingMetadata {
     pub(in crate::engine::driver) provider: String,
     pub(in crate::engine::driver) model: String,
-    pub(in crate::engine::driver) trusted_only: bool,
     pub(in crate::engine::driver) model_trusted: bool,
     pub(in crate::engine::driver) routing: serde_json::Value,
 }
@@ -1079,7 +1077,6 @@ impl ChildRoutingMetadata {
         Self {
             provider: model.provider_id().to_string(),
             model: model.model_id_ref().to_string(),
-            trusted_only: model.trusted_only_enabled(),
             model_trusted: model.is_trusted(),
             routing,
         }
@@ -1114,7 +1111,6 @@ impl ChildRoutingMetadata {
             child: child.into(),
             provider: self.provider.clone(),
             model: self.model.clone(),
-            trusted_only: self.trusted_only,
             model_trusted: self.model_trusted,
             routing: self.routing.clone(),
         }
@@ -1127,7 +1123,6 @@ fn with_child_routing_metadata(
 ) -> serde_json::Value {
     data["provider"] = serde_json::json!(routing.provider);
     data["model"] = serde_json::json!(routing.model);
-    data["trusted_only"] = serde_json::json!(routing.trusted_only);
     data["model_trusted"] = serde_json::json!(routing.model_trusted);
     data["routing"] = routing.routing.clone();
     data
@@ -2179,7 +2174,6 @@ impl Driver {
             model_ref,
             &providers,
             self.redact.clone(),
-            self.session.trusted_only_flag(),
             Some(root.agent.model.shutdown_gate()),
             &resolved.preflight_prompt,
             raw_text,
@@ -5714,7 +5708,6 @@ impl Driver {
                 label: "default".to_string(),
                 report: report.clone(),
                 failed: false,
-                trusted_only: routing.trusted_only,
                 model_trusted: routing.model_trusted,
                 routing: routing.routing,
             })
@@ -5832,7 +5825,6 @@ impl Driver {
                     label: "default".to_string(),
                     report: report.clone(),
                     failed: true,
-                    trusted_only: routing.trusted_only,
                     model_trusted: routing.model_trusted,
                     routing: routing.routing,
                 })

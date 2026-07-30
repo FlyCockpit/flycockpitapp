@@ -863,8 +863,6 @@ pub enum Event {
         requested_cwd: Option<String>,
         resolved_cwd: Option<String>,
         #[serde(default)]
-        trusted_only: bool,
-        #[serde(default)]
         model_trusted: bool,
         #[serde(default)]
         routing: serde_json::Value,
@@ -878,8 +876,6 @@ pub enum Event {
         child: String,
         provider: String,
         model: String,
-        #[serde(default)]
-        trusted_only: bool,
         #[serde(default)]
         model_trusted: bool,
         #[serde(default)]
@@ -895,8 +891,6 @@ pub enum Event {
         report: String,
         #[serde(default)]
         failed: bool,
-        #[serde(default)]
-        trusted_only: bool,
         #[serde(default)]
         model_trusted: bool,
         #[serde(default)]
@@ -1194,14 +1188,6 @@ pub enum Event {
         supported: bool,
     },
 
-    /// Trusted-only inference mode was set/toggled for the session
-    /// (`/trusted-only`). Broadcast to every attached client so they surface
-    /// the resulting state and update the live slash-command description.
-    TrustedOnlyState {
-        session_id: Uuid,
-        enabled: bool,
-    },
-
     /// Command-approval mode changed for the session (`/quick`).
     ApprovalModeState {
         session_id: Uuid,
@@ -1395,7 +1381,6 @@ macro_rules! event_variants {
             (Event::RedactionState { .. }, "redaction_state");
             (Event::PreflightState { .. }, "preflight_state");
             (Event::LongcacheState { .. }, "longcache_state");
-            (Event::TrustedOnlyState { .. }, "trusted_only_state");
             (Event::ApprovalModeState { .. }, "approval_mode_state");
             (Event::DelegationRecursionState { .. }, "delegation_recursion_state");
             (Event::TandemState { .. }, "tandem_state");

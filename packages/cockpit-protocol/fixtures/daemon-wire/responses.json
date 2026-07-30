@@ -3,7 +3,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "ack",
-    "v": 4
+    "v": 5
   },
   "attached": {
     "data": {
@@ -104,7 +104,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "attached",
-    "v": 4
+    "v": 5
   },
   "forked": {
     "data": {
@@ -116,7 +116,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "forked",
-    "v": 4
+    "v": 5
   },
   "fs_list": {
     "data": {
@@ -137,7 +137,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_list",
-    "v": 4
+    "v": 5
   },
   "fs_read": {
     "data": {
@@ -149,7 +149,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_read",
-    "v": 4
+    "v": 5
   },
   "fs_stat": {
     "data": {
@@ -167,7 +167,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_stat",
-    "v": 4
+    "v": 5
   },
   "fs_write": {
     "data": {
@@ -176,7 +176,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_write",
-    "v": 4
+    "v": 5
   },
   "git_diff_file": {
     "data": {
@@ -186,7 +186,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_diff_file",
-    "v": 4
+    "v": 5
   },
   "git_status": {
     "data": {
@@ -199,7 +199,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_status",
-    "v": 4
+    "v": 5
   },
   "history_page": {
     "data": {
@@ -218,7 +218,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "history_page",
-    "v": 4
+    "v": 5
   },
   "models": {
     "data": {
@@ -234,7 +234,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "models",
-    "v": 4
+    "v": 5
   },
   "restart_decision": {
     "data": {
@@ -244,7 +244,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "restart_decision",
-    "v": 4
+    "v": 5
   },
   "session_messages": {
     "data": {
@@ -262,7 +262,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "session_messages",
-    "v": 4
+    "v": 5
   },
   "sessions": {
     "data": {
@@ -294,7 +294,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "sessions",
-    "v": 4
+    "v": 5
   },
   "stats_rollup": {
     "data": {
@@ -400,7 +400,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "stats_rollup",
-    "v": 4
+    "v": 5
   },
   "subagent_history_page": {
     "data": {
@@ -421,6 +421,6 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "subagent_history_page",
-    "v": 4
+    "v": 5
   }
 }

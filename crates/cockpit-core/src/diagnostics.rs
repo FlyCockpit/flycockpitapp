@@ -194,7 +194,6 @@ fn provider_lines(
     extended: &crate::config::extended::ExtendedConfig,
     delegation_enabled: bool,
 ) -> (Vec<String>, bool) {
-    let trusted_only = extended.trusted_only;
     let mut out = Vec::new();
     let mut failed = false;
     match cfg.resolve_embedding_model(extended) {
@@ -234,10 +233,7 @@ fn provider_lines(
         let eligible_subagent_count = provider
             .models
             .iter()
-            .filter(|model| {
-                cfg.resolve_subagent_invokable(id, &model.id)
-                    && (!trusted_only || cfg.resolve_trust(id, &model.id).is_trusted())
-            })
+            .filter(|model| cfg.resolve_subagent_invokable(id, &model.id))
             .count();
         total_invokable += eligible_subagent_count;
         let can_delegate_count = provider
@@ -301,9 +297,6 @@ fn provider_lines(
         ];
         if hidden_count > 0 {
             notes.push(format!("{hidden_count} hidden from subagent routing"));
-        }
-        if trusted_only && model_count > 0 && trusted_count == 0 {
-            notes.push("trusted-only: no eligible trusted models".to_string());
         }
         out.push(format!(
             "{id}: {model_count} model(s), fetch {fetch}, {}",
@@ -694,10 +687,6 @@ fn delegation_lines(
             )
         ),
         format!(
-            "trusted-only mode: {}",
-            if extended.trusted_only { "on" } else { "off" }
-        ),
-        format!(
             "deepthink: {} (tool-free reasoning-only)",
             if extended.deepthink.enabled {
                 "enabled"
@@ -817,7 +806,6 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"{
-                "trustedOnly": true,
                 "deepthink": { "enabled": true },
                 "delegation": {
                     "maxParallel": 3,
@@ -857,7 +845,6 @@ mod tests {
             rendered.contains("1 hidden from subagent routing"),
             "{rendered}"
         );
-        assert!(rendered.contains("trusted-only mode: on"), "{rendered}");
         assert!(
             rendered.contains("deepthink: enabled (tool-free reasoning-only)"),
             "{rendered}"

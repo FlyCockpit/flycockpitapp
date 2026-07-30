@@ -21,7 +21,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -191,9 +190,6 @@ pub struct RunContext<'a> {
     /// Scrubs the outbound prompt here, and is threaded into the utility model
     /// the over-cap summarizer builds so that send is scrubbed too.
     pub redact: Arc<RedactionTable>,
-    /// Live trusted-only gate for the utility model used by over-cap
-    /// summarization.
-    pub trusted_only: Arc<AtomicBool>,
     /// Utility model ref + providers for over-cap summarization. `None`
     /// disables summarization (over-cap output falls back to a tail).
     pub utility_model: Option<&'a str>,
@@ -309,7 +305,6 @@ pub async fn run_harness(ctx: RunContext<'_>) -> Result<HarnessRunResult, String
         ctx.utility_model,
         ctx.providers,
         ctx.redact.clone(),
-        ctx.trusted_only.clone(),
         ctx.shutdown_gate.clone(),
     )
     .await;
@@ -336,22 +331,14 @@ async fn cap_or_summarize(
     utility_model: Option<&str>,
     providers: &ProvidersConfig,
     redact: Arc<RedactionTable>,
-    trusted_only: Arc<AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> (String, bool) {
     if crate::tokens::count(text) <= HARNESS_REPORT_TOKEN_CAP {
         return (text.to_string(), false);
     }
     if let Some(model_ref) = utility_model
-        && let Some(summary) = summarize_with_utility(
-            text,
-            model_ref,
-            providers,
-            redact,
-            trusted_only,
-            shutdown_gate,
-        )
-        .await
+        && let Some(summary) =
+            summarize_with_utility(text, model_ref, providers, redact, shutdown_gate).await
     {
         return (summary, true);
     }
@@ -368,16 +355,9 @@ async fn summarize_with_utility(
     model_ref: &str,
     providers: &ProvidersConfig,
     redact: Arc<RedactionTable>,
-    trusted_only: Arc<AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> Option<String> {
-    let model = crate::engine::model::Model::from_ref_trusted_only(
-        providers,
-        model_ref,
-        redact,
-        trusted_only,
-    )
-    .ok()?;
+    let model = crate::engine::model::Model::from_ref(providers, model_ref, redact).ok()?;
     let model = match shutdown_gate {
         Some(gate) => model.with_shutdown_gate(gate),
         None => model,
@@ -489,10 +469,6 @@ impl Worktree {
 mod tests {
     use super::*;
 
-    fn trust_flag_off() -> Arc<AtomicBool> {
-        Arc::new(AtomicBool::new(false))
-    }
-
     #[test]
     fn write_policy_defaults_by_primary() {
         assert_eq!(WritePolicy::for_primary("Build"), WritePolicy::Direct);
@@ -541,7 +517,6 @@ mod tests {
             None,
             &providers,
             std::sync::Arc::new(RedactionTable::empty()),
-            trust_flag_off(),
             None,
         )
         .await;
@@ -560,7 +535,6 @@ mod tests {
             None,
             &providers,
             std::sync::Arc::new(RedactionTable::empty()),
-            trust_flag_off(),
             None,
         )
         .await;
@@ -632,7 +606,6 @@ mod tests {
             agent_id: "Build",
             policy: WritePolicy::Direct,
             redact: redact.clone(),
-            trusted_only: trust_flag_off(),
             utility_model: None,
             providers: &providers,
             shutdown_gate: None,
@@ -678,7 +651,6 @@ mod tests {
             agent_id: "Plan",
             policy: WritePolicy::Isolated,
             redact: redact.clone(),
-            trusted_only: trust_flag_off(),
             utility_model: None,
             providers: &providers,
             shutdown_gate: None,
@@ -713,7 +685,6 @@ mod tests {
             agent_id: "Build",
             policy: WritePolicy::Direct,
             redact: redact.clone(),
-            trusted_only: trust_flag_off(),
             utility_model: None,
             providers: &providers,
             shutdown_gate: None,
@@ -741,7 +712,6 @@ mod tests {
             agent_id: "Plan",
             policy: WritePolicy::Isolated,
             redact,
-            trusted_only: trust_flag_off(),
             utility_model: None,
             providers: &providers,
             shutdown_gate: None,

@@ -930,7 +930,6 @@ fn native_chatgpt_model(redact: TestArc<RedactionTable>) -> Model {
         0,
         0,
         false,
-        trust_flag_off(),
         redact.clone(),
         redact,
     )
@@ -965,7 +964,6 @@ fn native_anthropic_model_at(
         0,
         0,
         false,
-        trust_flag_off(),
         redact.clone(),
         redact,
     )
@@ -998,7 +996,6 @@ fn native_anthropic_requires_x_api_key() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     ) {
@@ -1677,7 +1674,6 @@ fn build_model_routes_anthropic_host_to_native_arm() {
         0,
         0,
         false,
-        trust_flag_off(),
         std::sync::Arc::new(RedactionTable::empty()),
         std::sync::Arc::new(RedactionTable::empty()),
         |name| std::env::var(name).ok(),
@@ -1714,7 +1710,6 @@ fn build_model_routes_anthropic_host_to_native_arm() {
         0,
         0,
         false,
-        trust_flag_off(),
         std::sync::Arc::new(RedactionTable::empty()),
         std::sync::Arc::new(RedactionTable::empty()),
         |name| std::env::var(name).ok(),
@@ -2151,7 +2146,6 @@ fn build_resolves_wire_api_provider_aware_when_auto() {
         0,
         0,
         false,
-        trust_flag_off(),
         std::sync::Arc::new(RedactionTable::empty()),
         std::sync::Arc::new(RedactionTable::empty()),
     )
@@ -2195,7 +2189,6 @@ fn responses_wire_gets_transformed_tools_chat_wire_does_not() {
             0,
             0,
             false,
-            trust_flag_off(),
             TestArc::new(RedactionTable::empty()),
             TestArc::new(RedactionTable::empty()),
         )
@@ -2287,7 +2280,6 @@ fn learned_success_is_used_below_explicit_config() {
         0,
         0,
         false,
-        trust_flag_off(),
         std::sync::Arc::new(RedactionTable::empty()),
         std::sync::Arc::new(RedactionTable::empty()),
     )
@@ -2676,161 +2668,6 @@ fn disabled_table() -> TestArc<RedactionTable> {
     TestArc::new(RedactionTable::build(&cfg, std::path::Path::new(".")).unwrap())
 }
 
-fn trust_flag_off() -> TestArc<std::sync::atomic::AtomicBool> {
-    TestArc::new(std::sync::atomic::AtomicBool::new(false))
-}
-
-fn trust_test_config(trusted: bool) -> ProvidersConfig {
-    let mut entry = ProviderEntry {
-        url: "http://localhost:1234/v1".into(),
-        headers: vec![],
-        trust: Some(if trusted {
-            crate::config::providers::ModelTrust::Trusted
-        } else {
-            crate::config::providers::ModelTrust::Untrusted
-        }),
-        ..ProviderEntry::default()
-    };
-    entry.models.push(ModelEntry {
-        id: "m".into(),
-        location: Some(crate::config::providers::ModelLocation::PrivateRemote),
-        quality_rank: Some(7),
-        cost_rank: Some(3),
-        subagent_invokable: Some(true),
-        ..ModelEntry::default()
-    });
-    let mut providers = ProvidersConfig::default();
-    providers.providers.insert("p".into(), entry);
-    providers.active_model = Some(ActiveModelRef {
-        provider: "p".into(),
-        model: "m".into(),
-        reasoning_effort: None,
-        thinking_mode: None,
-        prompt_cache_retention: None,
-    });
-    providers
-}
-
-#[test]
-fn trusted_only_build_allows_trusted_model() {
-    let cfg = trust_test_config(true);
-    let flag = TestArc::new(std::sync::atomic::AtomicBool::new(true));
-    let model = Model::from_config_with_env_trusted_only(
-        &cfg,
-        TestArc::new(RedactionTable::empty()),
-        flag,
-        |_| None,
-    )
-    .expect("trusted model should build under trusted-only");
-    assert!(model.is_trusted());
-    assert!(model.trusted_only_enabled());
-    let routing = model.routing_metadata_json(Some("p:m"));
-    assert_eq!(routing["requested_selector"], "p:m");
-    assert_eq!(routing["resolved_provider"], "p");
-    assert_eq!(routing["resolved_model"], "m");
-    assert_eq!(routing["trust"], "trusted");
-    assert_eq!(routing["location"], "private_remote");
-    assert_eq!(routing["quality_rank"], 7);
-    assert_eq!(routing["cost_rank"], 3);
-    assert_eq!(routing["subagent_invokable"], true);
-    assert_eq!(routing["trusted_only"], true);
-}
-
-#[test]
-fn routing_metadata_reports_real_fallback_decision() {
-    let cfg = trust_test_config(true);
-    let flag = TestArc::new(std::sync::atomic::AtomicBool::new(true));
-    let model = Model::from_config_with_env_trusted_only(
-        &cfg,
-        TestArc::new(RedactionTable::empty()),
-        flag,
-        |_| None,
-    )
-    .expect("trusted model should build under trusted-only");
-
-    let routing =
-        model.routing_metadata_json_with_fallback_decision(Some("p:m"), "backup_model_used");
-
-    assert_eq!(routing["fallback_decision"], "backup_model_used");
-}
-
-#[test]
-fn trusted_only_build_refuses_untrusted_model() {
-    let cfg = trust_test_config(false);
-    let flag = TestArc::new(std::sync::atomic::AtomicBool::new(true));
-    let err = match Model::from_config_with_env_trusted_only(
-        &cfg,
-        TestArc::new(RedactionTable::empty()),
-        flag,
-        |_| None,
-    ) {
-        Ok(_) => panic!("untrusted model should fail closed under trusted-only"),
-        Err(err) => err,
-    };
-    assert!(format!("{err:#}").contains("trusted-only is enabled"));
-}
-
-#[tokio::test]
-async fn trusted_only_live_toggle_blocks_existing_untrusted_model_before_dispatch() {
-    let cfg = trust_test_config(false);
-    let flag = TestArc::new(std::sync::atomic::AtomicBool::new(false));
-    let model = Model::from_config_with_env_trusted_only(
-        &cfg,
-        TestArc::new(RedactionTable::empty()),
-        flag.clone(),
-        |_| None,
-    )
-    .expect("untrusted model can exist while trusted-only is off");
-    flag.store(true, std::sync::atomic::Ordering::Relaxed);
-    let err = model
-        .text_completion("this must not reach a provider")
-        .await
-        .expect_err("live trusted-only toggle should block dispatch");
-    assert!(format!("{err:#}").contains("p:m"));
-}
-
-#[tokio::test]
-async fn trusted_only_live_toggle_blocks_all_utility_dispatches() {
-    let cfg = trust_test_config(false);
-    let flag = TestArc::new(std::sync::atomic::AtomicBool::new(false));
-    let model = Model::from_config_with_env_trusted_only(
-        &cfg,
-        TestArc::new(RedactionTable::empty()),
-        flag.clone(),
-        |_| None,
-    )
-    .expect("untrusted model can exist while trusted-only is off");
-    flag.store(true, std::sync::atomic::Ordering::Relaxed);
-
-    for (name, err) in [
-        (
-            "text_completion",
-            model
-                .text_completion("this must not reach a provider")
-                .await
-                .expect_err("trusted-only must block text_completion"),
-        ),
-        (
-            "text_completion_with_system",
-            model
-                .text_completion_with_system("system", "this must not reach a provider")
-                .await
-                .expect_err("trusted-only must block text_completion_with_system"),
-        ),
-        (
-            "tool_completion",
-            model
-                .tool_completion("system", "this must not reach a provider", &simple_tool())
-                .await
-                .expect_err("trusted-only must block tool_completion"),
-        ),
-    ] {
-        let err = format!("{err:#}");
-        assert!(err.contains("trusted-only is enabled"), "{name}: {err}");
-        assert!(err.contains("p:m"), "{name}: {err}");
-    }
-}
-
 #[test]
 fn trusted_model_uses_empty_effective_table_but_keeps_session_table() {
     let (_tmp, redact) = secret_table();
@@ -2865,11 +2702,13 @@ fn trusted_model_uses_empty_effective_table_but_keeps_session_table() {
 
     let trusted = Model::for_provider(&cfg, "local", "trusted", redact.clone()).unwrap();
     assert!(trusted.redact_table().is_empty());
+    assert_eq!(trusted.redact().scrub(SECRET), SECRET);
     assert!(!trusted.session_redact_table().is_empty());
 
     let remote =
         Model::for_provider(&cfg, "remote", "default", trusted.session_redact_table()).unwrap();
     assert!(!remote.redact_table().is_empty());
+    assert!(!remote.redact().scrub(SECRET).contains(SECRET));
 }
 
 #[test]
@@ -3254,7 +3093,6 @@ async fn capture_openai_body(
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -3481,7 +3319,6 @@ async fn terminal_failure_preserves_configured_provider_identity() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -3532,7 +3369,6 @@ async fn grok_multi_agent_tools_without_entitlement_blocks_before_network() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -3589,7 +3425,6 @@ async fn grok_multi_agent_tools_with_entitlement_allows_dispatch() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -3633,7 +3468,6 @@ async fn grok_non_multi_agent_tools_are_not_rejected_by_multi_agent_gate() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -3695,7 +3529,6 @@ fn openai_model_at_with_wire_and_redact(
         0,
         0,
         false,
-        trust_flag_off(),
         redact.clone(),
         redact,
     )
@@ -3723,7 +3556,6 @@ fn openai_model_at_with_wire_and_utility_limit(
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -3787,7 +3619,6 @@ async fn approved_responses_404_retries_chat_and_persists_completions() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -3866,7 +3697,6 @@ async fn approved_chat_404_retries_responses_and_captures_final_wire() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -3938,7 +3768,6 @@ fn resolve_live_endpoint_precedence_order() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -4040,7 +3869,6 @@ fn with_live_wire_api_preserves_session_confirmed_and_reseeds_config() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -4080,7 +3908,6 @@ async fn confirmed_swap_suppresses_prompt_on_later_turns() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -4166,7 +3993,6 @@ async fn confirmed_endpoint_survives_probe_cache_expiry() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -4248,7 +4074,6 @@ async fn works_recorded_per_documented_contract() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -4290,7 +4115,6 @@ async fn works_recorded_per_documented_contract() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -4346,7 +4170,6 @@ async fn explicit_wire_api_pin_wins_over_learned() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -4411,7 +4234,6 @@ fn wire_api_config_change_applies_without_rebuild() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -4472,7 +4294,6 @@ async fn declined_swap_does_not_confirm_or_pin() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -4538,7 +4359,6 @@ async fn utility_model_resolves_without_recovery_context() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -5189,7 +5009,6 @@ async fn headless_responses_404_does_not_retry_or_hang() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -5291,7 +5110,6 @@ async fn native_anthropic_dispatch_sends_canonical_user_agent() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -5351,7 +5169,6 @@ async fn native_chatgpt_dispatch_sends_codex_responses_shape() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )
@@ -5461,7 +5278,6 @@ fn stale_codex_openai_compatible_config_gets_corrective_error() {
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
         |_| None,
@@ -5514,7 +5330,6 @@ async fn openai_compatible_dispatch_sends_canonical_user_agent_and_resolved_extr
         0,
         0,
         false,
-        trust_flag_off(),
         TestArc::new(RedactionTable::empty()),
         TestArc::new(RedactionTable::empty()),
     )

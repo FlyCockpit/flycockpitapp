@@ -1352,12 +1352,7 @@ pub enum SessionWork {
     SetLongcache {
         enabled: Option<bool>,
     },
-    /// Set (or toggle) trusted-only inference mode for the running session.
-    /// Session-only unless the caller also writes `trustedOnly` to config.
-    SetTrustedOnly {
-        enabled: Option<bool>,
-    },
-    /// Set the session's model-comparison tandem (shadow) set
+    /// Set the session's model-comparison tandem (shadow) set.
     /// (`/model-comparison`, implementation note).
     /// Builds a completion model for each selected `(provider, model)` (the
     /// active model excluded) and routes them to the driver. **Empty = feature

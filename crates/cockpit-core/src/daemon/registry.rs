@@ -184,7 +184,7 @@ impl Drop for StartTicket {
 }
 
 enum AttachClaim {
-    Live(SessionWorkerHandle),
+    Live(Box<SessionWorkerHandle>),
     Starting(Arc<StartSlot>),
     Start(StartTicket),
 }
@@ -234,12 +234,7 @@ fn resolve_session_worker_model(
 ) -> Result<Arc<Model>> {
     let inherited_model = {
         let env_lookup = |name: &str| env_snapshot.vars().get(name).cloned();
-        let model = Model::from_config_with_env_trusted_only(
-            providers_cfg,
-            redact.clone(),
-            session.trusted_only_flag(),
-            env_lookup,
-        )?;
+        let model = Model::from_config_with_env(providers_cfg, redact.clone(), env_lookup)?;
         with_worker_model_runtime(model, shutdown, config_path.clone())
     };
 
@@ -254,14 +249,7 @@ fn resolve_session_worker_model(
     let model = split_btw_model_ref(model_ref)
         .context("model ref must be provider:model-id or provider/model")
         .and_then(|(provider, model_id)| {
-            Model::for_provider_with_env_trusted_only(
-                providers_cfg,
-                &provider,
-                &model_id,
-                redact,
-                session.trusted_only_flag(),
-                env_lookup,
-            )
+            Model::for_provider_with_env(providers_cfg, &provider, &model_id, redact, env_lookup)
         });
 
     match model {
@@ -414,7 +402,7 @@ impl SessionRegistry {
                     // release snapshot exists — so a second concurrent attach to an
                     // already-attached session triggers nothing.
                     self.resume_session_locks(id);
-                    return Ok(handle);
+                    return Ok(*handle);
                 }
                 AttachClaim::Starting(slot) => {
                     let handle = wait_for_start(slot)
@@ -587,11 +575,11 @@ impl SessionRegistry {
                     joins.remove(&session_id);
                 }
             } else {
-                return AttachClaim::Live(entry.handle.clone());
+                return AttachClaim::Live(Box::new(entry.handle.clone()));
             }
         }
         if let Some(entry) = state.live.get(&session_id) {
-            return AttachClaim::Live(entry.handle.clone());
+            return AttachClaim::Live(Box::new(entry.handle.clone()));
         }
         if let Some(slot) = state.starting.get(&session_id) {
             return AttachClaim::Starting(slot.clone());
@@ -659,7 +647,6 @@ impl SessionRegistry {
         let session_id = session.id;
         let project_root = session.project_root.clone();
 
-        session.set_trusted_only(extended_cfg.trusted_only);
         session.set_sandbox_escalation_enabled(extended_cfg.sandbox_escalation_enabled);
 
         // Build per-session redaction table from the immutable session env.
@@ -715,12 +702,11 @@ impl SessionRegistry {
             .and_then(crate::config::provider::split_provider_model)
             .and_then(|(provider, model_id)| {
                 let env_lookup = |name: &str| env_snapshot.vars().get(name).cloned();
-                Model::for_provider_with_env_trusted_only(
+                Model::for_provider_with_env(
                     providers_cfg,
                     &provider,
                     &model_id,
                     redact.clone(),
-                    session.trusted_only_flag(),
                     env_lookup,
                 )
                 .ok()

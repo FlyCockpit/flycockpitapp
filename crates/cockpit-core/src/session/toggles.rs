@@ -192,30 +192,6 @@ impl Session {
         enabled
     }
 
-    /// Whether trusted-only inference mode is active for this session.
-    pub fn trusted_only(&self) -> bool {
-        self.trusted_only.load(Ordering::Relaxed)
-    }
-
-    /// Set trusted-only inference mode for this session and return the new
-    /// state. Models built with [`Self::trusted_only_flag`] observe this
-    /// immediately before future provider dispatches.
-    pub fn set_trusted_only(&self, enabled: bool) -> bool {
-        self.trusted_only.store(enabled, Ordering::Relaxed);
-        enabled
-    }
-
-    /// Toggle trusted-only inference mode for this session.
-    pub fn toggle_trusted_only(&self) -> bool {
-        let new = !self.trusted_only();
-        self.set_trusted_only(new)
-    }
-
-    /// Clone the live trusted-only flag for model handles.
-    pub fn trusted_only_flag(&self) -> Arc<AtomicBool> {
-        self.trusted_only.clone()
-    }
-
     pub fn active_model(&self) -> Option<String> {
         self.model.lock().unwrap().clone()
     }

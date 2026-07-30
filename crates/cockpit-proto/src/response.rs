@@ -406,11 +406,6 @@ pub enum Response {
         enabled: bool,
     },
 
-    /// The resulting trusted-only state after [`Request::SetTrustedOnly`].
-    TrustedOnlyState {
-        enabled: bool,
-    },
-
     /// The resulting command-approval mode after
     /// [`Request::SetApprovalMode`]. Session-only — not persisted.
     ApprovalModeState {
@@ -512,7 +507,6 @@ macro_rules! response_variants {
             (Response::RedactionState { .. }, "redaction_state");
             (Response::PreflightState { .. }, "preflight_state");
             (Response::LongcacheState { .. }, "longcache_state");
-            (Response::TrustedOnlyState { .. }, "trusted_only_state");
             (Response::ApprovalModeState { .. }, "approval_mode_state");
             (Response::DelegationRecursionState { .. }, "delegation_recursion_state");
             (Response::CaffeinateState { .. }, "caffeinate_state");

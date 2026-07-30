@@ -310,7 +310,6 @@ pub enum TurnEvent {
         prompt: String,
         requested_cwd: Option<String>,
         resolved_cwd: Option<String>,
-        trusted_only: bool,
         model_trusted: bool,
         routing: serde_json::Value,
     },
@@ -323,7 +322,6 @@ pub enum TurnEvent {
         child: String,
         provider: String,
         model: String,
-        trusted_only: bool,
         model_trusted: bool,
         routing: serde_json::Value,
     },
@@ -335,7 +333,6 @@ pub enum TurnEvent {
         label: String,
         report: String,
         failed: bool,
-        trusted_only: bool,
         model_trusted: bool,
         routing: serde_json::Value,
     },
@@ -577,11 +574,6 @@ pub enum TurnEvent {
     /// UI-only: the TUI mirrors this for `/longcache` status. Request params
     /// still re-resolve against active-model capability and may omit the key.
     LongcacheState { enabled: bool, supported: bool },
-
-    /// Trusted-only inference mode was set/toggled for the session.
-    /// UI-only: the TUI surfaces the resulting state as a toast and updates
-    /// the live `/trusted-only` description mirror.
-    TrustedOnlyState { enabled: bool },
 
     /// Command-approval mode was set for the session. UI-only and
     /// session-only; never enters model context.

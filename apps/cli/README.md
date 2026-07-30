@@ -282,13 +282,11 @@ cockpit provider-catalog-status
 
 Provider and model entries can carry policy metadata used by routing, diagnostics, and export safety:
 
-- `trust`: `trusted` models may receive exact prompts and tool results; `untrusted` models keep outbound redaction. This is separate from workspace trust.
+- `trust`: model trust is the sole model trust posture and separate from workspace trust. `trusted` disables outbound redaction; `untrusted` keeps it enabled. Trusted models are intended for self-hosted providers, though trusting an external provider is permitted and is the user's decision.
 - `location`: `local`, `remote`, or `private_remote`. Locality is descriptive and never implies trust.
 - `quality_rank` and `cost_rank`: tie-breakers for policy selection. Higher quality is preferred for quality-optimized work; lower cost is preferred for cost-optimized work.
 - `subagent_invokable`: only models with this set, or inherited from their provider, are eligible for subagent routing.
 - `system_prompt`: optional per-model instructions edited from `/settings -> Providers -> Models -> Settings` as `Model instructions`. When set, Cockpit prepends the text before the agent role prompt, then the stable harness/session/cwd block, while project instruction files remain user-role guidance later in history. Empty or whitespace-only values behave as unset and preserve the no-prompt request shape.
-- `trustedOnly`: when enabled in `config.json`, every inference must resolve to a trusted model; untrusted utility or subagent models are refused.
-
 Model instructions are exact to the configured `(provider, model)` and participate in normal global/project config layering; a project value overrides a global value, and deleting it reveals the lower layer. Fresh root sessions snapshot the effective model instructions for the whole conversation lineage, so resumes, model switches, forks, and subagents keep the captured text even if settings change later. New root sessions see the new settings.
 
 Provider/model context settings include a default-on `Compaction shadow brief` switch and `Shadow margin %` (10 percentage points by default). Near the automatic compaction threshold, Cockpit pre-drafts a utility brief only at an idle boundary; foreground user turns pre-empt unfinished drafts, and compaction delta-revises a fresh completed draft. Turn the switch off to restore synchronous full-brief drafting.

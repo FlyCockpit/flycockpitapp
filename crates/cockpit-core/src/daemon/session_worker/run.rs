@@ -1917,20 +1917,6 @@ pub(super) async fn run_worker(
                         break WorkerStop::DriverFailed;
                     }
                 }
-                SessionWork::SetTrustedOnly { enabled } => {
-                    let target = enabled.unwrap_or_else(|| session.toggle_trusted_only());
-                    if enabled.is_some() {
-                        session.set_trusted_only(target);
-                    }
-                    send_current_event(
-                        &event_tx,
-                        &redaction,
-                        proto::Event::TrustedOnlyState {
-                            session_id,
-                            enabled: target,
-                        },
-                    );
-                }
                 SessionWork::SetTandemModels { models } => {
                     // `/model-comparison`: build a completion model for each
                     // selected `(provider, model)` from the already-configured
@@ -1961,12 +1947,11 @@ pub(super) async fn run_worker(
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .clone();
-                        match crate::engine::model::Model::for_provider_with_env_trusted_only(
+                        match crate::engine::model::Model::for_provider_with_env(
                             &providers_cfg,
                             provider,
                             model_id,
                             tandem_redact.clone(),
-                            session.trusted_only_flag(),
                             |name| session_env.get(name).cloned(),
                         ) {
                             Ok(m) => {

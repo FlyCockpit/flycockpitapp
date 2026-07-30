@@ -26,7 +26,6 @@ impl Model {
     ) -> Result<String> {
         use rig::completion::Prompt;
         let guard = self.outbound_guard();
-        guard.ensure_dispatch_allowed()?;
         // Inference-dispatch chokepoint: refuse a *new* provider request once
         // the daemon has begun draining. Background utility calls are abandoned
         // immediately; turn-blocking utility calls remain owned by the parent
@@ -108,7 +107,6 @@ impl Model {
     ) -> Result<String> {
         use rig::completion::Prompt;
         let guard = self.outbound_guard();
-        guard.ensure_dispatch_allowed()?;
         // Inference-dispatch chokepoint: refuse a *new* provider request once
         // the daemon has begun draining. Background utility calls are abandoned
         // immediately; turn-blocking utility calls remain owned by the parent
@@ -202,7 +200,6 @@ impl Model {
     ) -> Result<Vec<crate::engine::message::ToolCall>> {
         use rig::completion::Completion;
         let guard = self.outbound_guard();
-        guard.ensure_dispatch_allowed()?;
         // Inference-dispatch chokepoint: refuse a *new* provider request once
         // the daemon has begun draining. Background utility calls are abandoned
         // immediately; turn-blocking utility calls remain owned by the parent
@@ -418,7 +415,6 @@ impl Model {
         InferenceTiming,
     )> {
         let params = self.with_resolved_model_params(params);
-        self.outbound_guard().ensure_dispatch_allowed()?;
         let PreparedCompletionRequest {
             system,
             history,

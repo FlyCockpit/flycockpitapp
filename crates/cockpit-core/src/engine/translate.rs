@@ -30,7 +30,6 @@ pub async fn inbound(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
-    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> String {
     translate_direction(
@@ -40,7 +39,6 @@ pub async fn inbound(
         extended,
         providers,
         redact,
-        trusted_only,
         shutdown_gate,
     )
     .await
@@ -54,7 +52,6 @@ pub async fn outbound(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
-    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> String {
     translate_direction(
@@ -64,7 +61,6 @@ pub async fn outbound(
         extended,
         providers,
         redact,
-        trusted_only,
         shutdown_gate,
     )
     .await
@@ -81,7 +77,6 @@ async fn translate_direction(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
-    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> String {
     // Inactive feature (unset/equal languages) → no translation.
@@ -99,7 +94,6 @@ async fn translate_direction(
         extended,
         providers,
         redact,
-        trusted_only,
         shutdown_gate,
     )
     .await
@@ -120,16 +114,10 @@ async fn try_translate(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
-    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
 ) -> Option<String> {
     let model_ref = extended.translation_model_ref()?;
-    let model = match crate::engine::model::Model::from_ref_trusted_only(
-        providers,
-        model_ref,
-        redact,
-        trusted_only,
-    ) {
+    let model = match crate::engine::model::Model::from_ref(providers, model_ref, redact) {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(error = %e, "translate: model build failed; passing through");
@@ -263,7 +251,6 @@ mod tests {
             &extended,
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
         )
         .await;
@@ -273,7 +260,6 @@ mod tests {
             &extended,
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
         )
         .await;
@@ -291,7 +277,6 @@ mod tests {
             &extended,
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
         )
         .await;
@@ -301,7 +286,6 @@ mod tests {
             &extended,
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
         )
         .await;
@@ -346,7 +330,6 @@ mod tests {
                 &extended,
                 &providers,
                 std::sync::Arc::new(crate::redact::RedactionTable::empty()),
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
             )
             .await,

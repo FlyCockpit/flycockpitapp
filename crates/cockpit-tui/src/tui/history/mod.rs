@@ -254,8 +254,6 @@ pub enum HistoryEntry {
         task_call_id: String,
         label: String,
         /// True when the delegating/subagent inference ran under a
-        /// trusted-only routing policy.
-        trusted_only: bool,
         /// True when the selected subagent model is trusted.
         model_trusted: bool,
         /// Compact display subset from the durable routing metadata.
@@ -987,7 +985,6 @@ pub fn render_entry(
             parent,
             child,
             label,
-            trusted_only,
             model_trusted,
             routing,
             spawned_at,
@@ -998,7 +995,6 @@ pub fn render_entry(
             parent,
             child,
             label,
-            trusted_only: *trusted_only,
             model_trusted: *model_trusted,
             routing,
             spawned_at: *spawned_at,
@@ -2161,7 +2157,6 @@ struct SubagentRenderInput<'a> {
     parent: &'a str,
     child: &'a str,
     label: &'a str,
-    trusted_only: bool,
     model_trusted: bool,
     routing: &'a SubagentRoutingChips,
     spawned_at: std::time::Instant,
@@ -2175,7 +2170,6 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         parent,
         child,
         label,
-        trusted_only,
         model_trusted,
         routing,
         spawned_at,
@@ -2223,7 +2217,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
                 Style::default().add_modifier(Modifier::ITALIC),
             ),
         ]);
-        append_subagent_routing_chips(&mut spans, trusted_only, model_trusted, routing);
+        append_subagent_routing_chips(&mut spans, model_trusted, routing);
         return Rendered {
             lines: vec![Line::from(spans)],
             chip_row: None,
@@ -2255,7 +2249,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         Span::styled(child.to_string(), name_style),
         Span::raw(format!(" {verb} {duration}")),
     ]);
-    append_subagent_routing_chips(&mut header_spans, trusted_only, model_trusted, routing);
+    append_subagent_routing_chips(&mut header_spans, model_trusted, routing);
     let header = Line::from(header_spans);
 
     let mut out: Vec<Line<'static>> = vec![header];
@@ -2362,7 +2356,6 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
 
 fn append_subagent_routing_chips(
     spans: &mut Vec<Span<'static>>,
-    trusted_only: bool,
     model_trusted: bool,
     routing: &SubagentRoutingChips,
 ) {
@@ -2404,15 +2397,6 @@ fn append_subagent_routing_chips(
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!("[fallback:{fallback}]"),
-            Style::default()
-                .fg(Color::Indexed(MUTED_COLOR_INDEX))
-                .add_modifier(Modifier::DIM),
-        ));
-    }
-    if trusted_only {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            "[trusted-only]".to_string(),
             Style::default()
                 .fg(Color::Indexed(MUTED_COLOR_INDEX))
                 .add_modifier(Modifier::DIM),

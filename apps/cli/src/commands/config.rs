@@ -127,8 +127,6 @@ struct PolicyBundle {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct PortableExtendedPolicy {
-    #[serde(default, rename = "trustedOnly")]
-    trusted_only: bool,
     #[serde(default)]
     deepthink: DeepthinkConfig,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -158,7 +156,6 @@ struct PortableExtendedPolicy {
 impl PortableExtendedPolicy {
     fn from_config(cfg: &ExtendedConfig) -> Self {
         Self {
-            trusted_only: cfg.trusted_only,
             deepthink: cfg.deepthink.clone(),
             agent_chooses_subagent_model: cfg.agent_chooses_subagent_model,
             utility_model: cfg.utility_model.clone(),
@@ -175,7 +172,6 @@ impl PortableExtendedPolicy {
     }
 
     fn apply_to(&self, cfg: &mut ExtendedConfig) {
-        cfg.trusted_only = self.trusted_only;
         cfg.deepthink = self.deepthink.clone();
         cfg.agent_chooses_subagent_model = self.agent_chooses_subagent_model;
         cfg.utility_model = self.utility_model.clone();
@@ -411,22 +407,5 @@ mod tests {
         assert!(replaced.active_model.is_none());
         assert!(!replaced.providers.contains_key("local"));
         assert!(replaced.providers.contains_key("imported"));
-    }
-
-    #[test]
-    fn extended_policy_applies_trusted_only_and_deepthink() {
-        let policy = PortableExtendedPolicy {
-            trusted_only: true,
-            deepthink: DeepthinkConfig { enabled: true },
-            agent_chooses_subagent_model: true,
-            utility_model: Some("p:u".into()),
-            ..PortableExtendedPolicy::default()
-        };
-        let mut cfg = ExtendedConfig::default();
-        policy.apply_to(&mut cfg);
-        assert!(cfg.trusted_only);
-        assert!(cfg.deepthink.enabled);
-        assert!(cfg.agent_chooses_subagent_model);
-        assert_eq!(cfg.utility_model.as_deref(), Some("p:u"));
     }
 }

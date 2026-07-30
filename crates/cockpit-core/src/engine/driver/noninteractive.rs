@@ -1069,13 +1069,6 @@ impl Driver {
                 prompt: delivered_brief.clone(),
                 requested_cwd: child_cwd.requested.clone(),
                 resolved_cwd: Some(child_cwd.resolved_display()),
-                trusted_only: self
-                    .stack
-                    .last()
-                    .unwrap()
-                    .agent
-                    .model
-                    .trusted_only_enabled(),
                 model_trusted: self.stack.last().unwrap().agent.model.is_trusted(),
                 routing: routing.clone(),
             })
@@ -1101,7 +1094,6 @@ impl Driver {
                     "prompt": delivered_brief.clone(),
                     "why": why.clone(),
                     "model": model_selector_json(&model),
-                    "trusted_only": self.stack.last().unwrap().agent.model.trusted_only_enabled(),
                     "model_trusted": self.stack.last().unwrap().agent.model.is_trusted(),
                     "routing": routing,
                     "context": context.as_str(),
@@ -1588,7 +1580,6 @@ impl Driver {
                 label: "default".to_string(),
                 report: report.clone(),
                 failed,
-                trusted_only: routing.trusted_only,
                 model_trusted: routing.model_trusted,
                 routing: routing.routing,
             })
@@ -2841,13 +2832,6 @@ impl Driver {
                     prompt: entry.prompt.clone(),
                     requested_cwd: child_cwd.requested.clone(),
                     resolved_cwd: Some(child_cwd.resolved_display()),
-                    trusted_only: self
-                        .stack
-                        .last()
-                        .unwrap()
-                        .agent
-                        .model
-                        .trusted_only_enabled(),
                     model_trusted: self.stack.last().unwrap().agent.model.is_trusted(),
                     routing: routing.clone(),
                 })
@@ -2856,34 +2840,37 @@ impl Driver {
                 &task_call_id,
                 task_function_call_id.as_deref(),
             );
-            if let Err(e) = self.session.record_event(
-                crate::db::session_log::SessionEventKind::SubagentSpawned,
-                Some(&self.stack.last().unwrap().agent.name),
-                Some(&task_call_id),
-                &serde_json::json!({
-                    "child_agent": entry.child_agent.clone(),
-                    "task_call_id": task_call_id,
-                    "provider_call_id": task_identity.provider_call_id,
-                    "provider_call_id_source": task_identity.provider_call_id_source,
-                    "provider_identity": task_identity.event_identity_json(&task_call_id),
-                    "label": entry.label.clone(),
-                    "noninteractive": true,
-                    "prompt": entry.prompt.clone(),
-                    "why": why.clone(),
-                    "model": model_selector_json(&entry.model),
-                    "trusted_only": self.stack.last().unwrap().agent.model.trusted_only_enabled(),
-                    "model_trusted": self.stack.last().unwrap().agent.model.is_trusted(),
-                    "routing": routing,
-                    "context": entry.context.as_str(),
-                    "remaining_depth": entry.remaining_depth,
-                    "resume_handle": entry.resume_handle.clone(),
-                    "requested_cwd": child_cwd.requested_json(),
-                    "resolved_cwd": child_cwd.resolved_display(),
-                    "grant_tools": entry.granted_tools.clone(),
-                    "todo_ids": entry.todo_ids.clone(),
-                    "write_scope": entry.write_scope.clone(),
-                }),
-            ).await {
+            if let Err(e) = self
+                .session
+                .record_event(
+                    crate::db::session_log::SessionEventKind::SubagentSpawned,
+                    Some(&self.stack.last().unwrap().agent.name),
+                    Some(&task_call_id),
+                    &serde_json::json!({
+                        "child_agent": entry.child_agent.clone(),
+                        "task_call_id": task_call_id,
+                        "provider_call_id": task_identity.provider_call_id,
+                        "provider_call_id_source": task_identity.provider_call_id_source,
+                        "provider_identity": task_identity.event_identity_json(&task_call_id),
+                        "label": entry.label.clone(),
+                        "noninteractive": true,
+                        "prompt": entry.prompt.clone(),
+                        "why": why.clone(),
+                        "model": model_selector_json(&entry.model),
+                        "model_trusted": self.stack.last().unwrap().agent.model.is_trusted(),
+                        "routing": routing,
+                        "context": entry.context.as_str(),
+                        "remaining_depth": entry.remaining_depth,
+                        "resume_handle": entry.resume_handle.clone(),
+                        "requested_cwd": child_cwd.requested_json(),
+                        "resolved_cwd": child_cwd.resolved_display(),
+                        "grant_tools": entry.granted_tools.clone(),
+                        "todo_ids": entry.todo_ids.clone(),
+                        "write_scope": entry.write_scope.clone(),
+                    }),
+                )
+                .await
+            {
                 tracing::warn!(error = %e, "record batch subagent_spawned event failed");
             }
 
@@ -3153,7 +3140,6 @@ impl Driver {
                     label: entry.label.clone(),
                     report: report.clone(),
                     failed: outcome.failed,
-                    trusted_only: routing.trusted_only,
                     model_trusted: routing.model_trusted,
                     routing: routing.routing,
                 })

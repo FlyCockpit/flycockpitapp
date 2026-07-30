@@ -137,11 +137,6 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_use: Option<ComputerUseMode>,
 
-    /// Require every inference request to use a provider/model marked
-    /// `trust: "trusted"`. Off by default.
-    #[serde(default, rename = "trustedOnly", alias = "trusted_only")]
-    pub trusted_only: bool,
-
     /// Opt-in to fetching remote `.well-known/cockpit` configs.
     #[serde(default)]
     pub allow_remote_config: bool,
@@ -1546,7 +1541,6 @@ impl Default for ExtendedConfig {
             tools: HashMap::new(),
             web: WebConfig::default(),
             computer_use: None,
-            trusted_only: false,
             allow_remote_config: false,
             utility_model: None,
             translation_model: None,
@@ -1896,8 +1890,6 @@ impl ExtendedConfigDoc {
         parse_field!("tools", tools);
         parse_field!("web", web);
         parse_field!("computer_use", computer_use);
-        parse_field!("trustedOnly", trusted_only);
-        parse_field!("trusted_only", trusted_only);
         parse_field!("allow_remote_config", allow_remote_config);
         parse_field!("utility_model", utility_model);
         parse_field!("translation_model", translation_model);
@@ -2003,8 +1995,6 @@ impl ExtendedConfigDoc {
         remove_malformed!("redact", RedactConfig);
         remove_malformed!("tui", TuiConfig);
         remove_malformed!("computer_use", Option<ComputerUseMode>);
-        remove_malformed!("trustedOnly", bool);
-        remove_malformed!("trusted_only", bool);
         remove_malformed!("project_knowledge", bool);
         remove_malformed!("knowledge_inject_max_tokens", usize);
         remove_malformed!("sandboxEscalationEnabled", bool);
@@ -2079,8 +2069,9 @@ impl ExtendedConfigDoc {
                 }
             }
         }
-        obj.remove("trusted_only");
         obj.remove("sandboxEscalationEnabled");
+        obj.remove(&["trusted", "Only"].concat());
+        obj.remove(&["trusted", "_only"].concat());
         // Optional fields are skipped on serialize, so clearing them must
         // explicitly remove stale raw keys from the target layer.
         for key in [

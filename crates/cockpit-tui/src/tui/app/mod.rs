@@ -356,22 +356,6 @@ fn resolve_tui_llm_mode(
     providers.resolve_mode(provider, model, global)
 }
 
-fn persist_trusted_only_default(cwd: &Path, enabled: bool) -> anyhow::Result<()> {
-    use cockpit_config::dirs::{CONFIG_FILE, discover_config_dirs};
-    use cockpit_config::extended::ExtendedConfigDoc;
-
-    let target = discover_config_dirs(cwd)
-        .into_iter()
-        .map(|d| d.path.join(CONFIG_FILE))
-        .find(|p| p.exists())
-        .unwrap_or_else(|| cwd.join(".cockpit").join(CONFIG_FILE));
-    let mut doc = ExtendedConfigDoc::load(&target)?;
-    let mut cfg = doc.config();
-    cfg.trusted_only = enabled;
-    doc.write(&cfg)?;
-    Ok(())
-}
-
 const DAEMON_AUTOSTART_NOTICE_FLAG: &str = "daemon-autostart-notice-v1";
 
 fn startup_daemon_state(
@@ -2076,9 +2060,6 @@ pub struct App {
     /// Daemon-resolved prompt-cache retention support for the actual foreground
     /// model. The footer uses this rather than re-inferring from launch config.
     pub(super) longcache_supported: bool,
-    /// Live trusted-only inference state (`/trusted-only`). Seeded from
-    /// `trustedOnly` config at launch and kept in sync by daemon broadcasts.
-    pub(super) trusted_only_enabled: bool,
     /// Live sandbox-escalation availability for this session. Seeded from
     /// config and kept in sync by daemon broadcasts.
     pub(super) sandbox_escalation_enabled: bool,
@@ -2835,7 +2816,6 @@ impl App {
         // config (project wins); the daemon keeps it in sync via
         // `PreflightState` broadcasts (`/preflight`).
         let preflight_enabled = extended.preflight.enabled;
-        let trusted_only_enabled = extended.trusted_only;
         let sandbox_escalation_enabled = extended.sandbox_escalation_enabled;
         let has_no_providers_at_startup = providers.providers.is_empty();
         let vim_setting = tui_cfg.vim_mode;
@@ -3070,7 +3050,6 @@ impl App {
             preflight_enabled,
             longcache_enabled: false,
             longcache_supported,
-            trusted_only_enabled,
             sandbox_escalation_enabled,
             approval_mode,
             delegation_recursion_enabled,

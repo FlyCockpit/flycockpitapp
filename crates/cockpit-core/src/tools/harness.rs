@@ -440,7 +440,6 @@ impl Tool for HarnessInvokeTool {
             agent_id: &ctx.agent_id,
             policy,
             redact: ctx.redact.clone(),
-            trusted_only: ctx.session.trusted_only_flag(),
             utility_model: extended.utility_model.as_deref(),
             providers: &providers,
             shutdown_gate: Some(ctx.shutdown_gate.clone()),

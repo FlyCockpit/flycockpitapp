@@ -1282,7 +1282,6 @@ async fn live_foreground_snapshot_tracks_nested_active_subagent() {
             prompt: "build it".into(),
             requested_cwd: None,
             resolved_cwd: None,
-            trusted_only: false,
             model_trusted: false,
             routing: serde_json::json!({}),
         },
@@ -1305,7 +1304,6 @@ async fn live_foreground_snapshot_tracks_nested_active_subagent() {
             prompt: "continue".into(),
             requested_cwd: None,
             resolved_cwd: None,
-            trusted_only: false,
             model_trusted: false,
             routing: serde_json::json!({}),
         },
@@ -1329,7 +1327,6 @@ async fn live_foreground_snapshot_tracks_nested_active_subagent() {
             label: "default".into(),
             report: "done".into(),
             failed: false,
-            trusted_only: false,
             model_trusted: false,
             routing: serde_json::json!({}),
         },
@@ -1358,7 +1355,6 @@ async fn routing_amend_does_not_alter_foreground_state() {
         prompt: "look around".into(),
         requested_cwd: None,
         resolved_cwd: None,
-        trusted_only: false,
         model_trusted: false,
         routing: serde_json::json!({ "resolved_model": "parent-model" }),
     };
@@ -1368,7 +1364,6 @@ async fn routing_amend_does_not_alter_foreground_state() {
         child: "explore".into(),
         provider: "lmstudio".into(),
         model: "child-model".into(),
-        trusted_only: true,
         model_trusted: true,
         routing: serde_json::json!({ "resolved_model": "child-model" }),
     };
@@ -1378,7 +1373,6 @@ async fn routing_amend_does_not_alter_foreground_state() {
         label: "default".into(),
         report: "done".into(),
         failed: false,
-        trusted_only: true,
         model_trusted: true,
         routing: serde_json::json!({ "resolved_model": "child-model" }),
     };

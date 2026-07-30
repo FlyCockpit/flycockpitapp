@@ -165,11 +165,6 @@ pub struct Session {
     /// spawn path applies the config default. In-memory only — a resumed
     /// session re-resolves from config at re-attach.
     shell_compression_enabled: AtomicBool,
-    /// Trusted-only inference mode for this session right now. Seeded from
-    /// `trustedOnly` at spawn and flipped live by `/trusted-only`. Models hold
-    /// clones of this flag so already-built handles refuse future untrusted
-    /// dispatches after a toggle.
-    trusted_only: Arc<AtomicBool>,
     /// Exact tool names on the current foreground agent's live toolbox. The
     /// daemon's skill inventory reads this snapshot so conditional Hermes
     /// activation matches execution, including config tools and grants.

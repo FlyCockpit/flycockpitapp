@@ -2,7 +2,6 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use crate::config::providers::{ProviderEntry, ProvidersConfig, ResolvedEmbeddingModel};
 use crate::engine::model::OutboundGuard;
@@ -35,7 +34,6 @@ impl OpenAiCompatEmbedder {
         providers: &ProvidersConfig,
         resolved: &ResolvedEmbeddingModel,
         session_redact: Arc<RedactionTable>,
-        trusted_only: Arc<AtomicBool>,
     ) -> Result<Self> {
         let entry = providers
             .providers
@@ -48,7 +46,6 @@ impl OpenAiCompatEmbedder {
             &resolved.model,
             resolved.embedding_dimensions,
             session_redact,
-            trusted_only,
         )
         .await
     }
@@ -61,7 +58,6 @@ impl OpenAiCompatEmbedder {
         model: &str,
         expected_dimensions: Option<u32>,
         session_redact: Arc<RedactionTable>,
-        trusted_only: Arc<AtomicBool>,
     ) -> Result<Self> {
         let request = models_fetch::resolve_provider_request_async(provider_id, entry).await?;
         let trusted = providers.resolve_trust(provider_id, model).is_trusted();
@@ -70,13 +66,7 @@ impl OpenAiCompatEmbedder {
         } else {
             session_redact
         };
-        let guard = OutboundGuard::new(
-            provider_id.to_string(),
-            model.to_string(),
-            trusted_only,
-            trusted,
-            effective_redact,
-        );
+        let guard = OutboundGuard::new(effective_redact);
         Ok(Self::from_resolved_request(
             request,
             model.to_string(),
@@ -110,7 +100,6 @@ impl OpenAiCompatEmbedder {
 #[async_trait]
 impl Embedder for OpenAiCompatEmbedder {
     async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        self.guard.ensure_dispatch_allowed()?;
         let redacted = self.guard.scrub_many(texts);
         let redacted_refs: Vec<&str> = redacted.iter().map(String::as_str).collect();
         let body = EmbeddingsRequest {
@@ -200,7 +189,6 @@ fn snippet(body: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -288,19 +276,13 @@ mod tests {
         )
     }
 
-    fn guard(trusted: bool, trusted_only: bool) -> OutboundGuard {
+    fn guard(trusted: bool) -> OutboundGuard {
         let redact = if trusted {
             Arc::new(RedactionTable::empty())
         } else {
             secret_table()
         };
-        OutboundGuard::new(
-            "p",
-            "m",
-            Arc::new(AtomicBool::new(trusted_only)),
-            trusted,
-            redact,
-        )
+        OutboundGuard::new(redact)
     }
 
     fn embedder(base_url: String, guard: OutboundGuard) -> OpenAiCompatEmbedder {
@@ -321,7 +303,7 @@ mod tests {
     #[tokio::test]
     async fn embedder_openai_compat_wire() {
         let (base_url, body_rx) = capture_embedding_server().await;
-        let embedder = embedder(base_url, guard(false, false));
+        let embedder = embedder(base_url, guard(false));
 
         let vectors = embedder.embed(&["alpha", "beta"]).await.unwrap();
 
@@ -333,7 +315,7 @@ mod tests {
 
     #[test]
     fn embedder_requires_redaction_table() {
-        let guard = guard(false, false);
+        let guard = guard(false);
         let embedder = OpenAiCompatEmbedder::from_resolved_request(
             models_fetch::ResolvedRequest {
                 base_url: "http://127.0.0.1:1/v1".into(),
@@ -353,7 +335,7 @@ mod tests {
             r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
         )
         .await;
-        let embedder = embedder(base_url, guard(false, false));
+        let embedder = embedder(base_url, guard(false));
         let input = format!("alpha {SECRET} omega");
 
         let _ = embedder.embed(&[input.as_str()]).await.unwrap();
@@ -366,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn embed_redacts_every_batch_element() {
         let (base_url, body_rx) = capture_embedding_server().await;
-        let embedder = embedder(base_url, guard(false, false));
+        let embedder = embedder(base_url, guard(false));
         let later = format!("beta {SECRET}");
 
         let _ = embedder.embed(&["alpha", later.as_str()]).await.unwrap();
@@ -382,7 +364,7 @@ mod tests {
             r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
         )
         .await;
-        let embedder = embedder(base_url, guard(true, false));
+        let embedder = embedder(base_url, guard(true));
         let input = format!("trusted {SECRET}");
 
         let _ = embedder.embed(&[input.as_str()]).await.unwrap();
@@ -399,21 +381,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embed_enforces_trusted_only_gate() {
-        let embedder = embedder("http://127.0.0.1:1/v1".into(), guard(false, true));
-
-        let err = embedder
-            .embed(&["this must not reach a provider"])
-            .await
-            .expect_err("trusted-only should block untrusted embeddings");
-
-        assert!(format!("{err:#}").contains("trusted-only is enabled"));
-    }
-
-    #[tokio::test]
     async fn embed_empty_batch_is_safe() {
         let (base_url, body_rx) = capture_embedding_server_with_response(r#"{"data":[]}"#).await;
-        let embedder = embedder(base_url, guard(false, false));
+        let embedder = embedder(base_url, guard(false));
 
         let vectors = embedder.embed(&[]).await.unwrap();
 
@@ -431,7 +401,7 @@ mod tests {
             },
             "text-embedding-3-small".into(),
             Some(3),
-            guard(false, false),
+            guard(false),
         );
 
         let _: &OutboundGuard = &embedder.guard;

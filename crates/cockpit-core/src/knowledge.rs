@@ -10,7 +10,6 @@ use std::ffi::c_char;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -1039,13 +1038,7 @@ async fn production_embedder(
         }
         Err(error) => return Err(error).context("resolving embedding model for knowledge"),
     };
-    let embedder = OpenAiCompatEmbedder::for_resolved_model(
-        &providers,
-        &resolved,
-        redact,
-        Arc::new(AtomicBool::new(extended.trusted_only)),
-    )
-    .await?;
+    let embedder = OpenAiCompatEmbedder::for_resolved_model(&providers, &resolved, redact).await?;
     Ok(Some(Arc::new(embedder)))
 }
 

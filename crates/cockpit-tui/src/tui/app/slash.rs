@@ -136,13 +136,6 @@ fn describe_longcache(app: &App, _: &SlashCommand) -> String {
     )
 }
 
-fn describe_trusted_only(app: &App, _: &SlashCommand) -> String {
-    format!(
-        "{} Require trusted models for every inference (arg: on/off/default on/default off; bare = toggle)",
-        on_off(app.trusted_only_enabled)
-    )
-}
-
 fn describe_sandbox_escalate(app: &App, _: &SlashCommand) -> String {
     format!(
         "{} Allow explicit sandbox-escalation retries for this session (arg: allow/disallow; bare = status)",
@@ -602,14 +595,6 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
-        name: "trusted-only",
-        description: "Require trusted models for every inference (arg: on/off/default on/default off; bare = toggle)",
-        takes_args: true,
-        run: run_trusted_only,
-        available: available_always,
-        describe: describe_trusted_only,
-    },
-    SlashCommand {
         name: "plan",
         description: "Switch the primary agent to Plan (author a plan)",
         takes_args: false,
@@ -1029,11 +1014,6 @@ fn run_longcache(app: &mut App, args: &str) -> bool {
 
 fn run_quick(app: &mut App, _: &str) -> bool {
     app.open_quick_dialog();
-    false
-}
-
-fn run_trusted_only(app: &mut App, args: &str) -> bool {
-    app.handle_trusted_only_command(args);
     false
 }
 
@@ -1944,48 +1924,6 @@ impl App {
         self.send_daemon_request(
             "/longcache",
             cockpit_core::daemon::proto::Request::SetLongcache { enabled },
-            ControlApplied::None,
-        );
-    }
-
-    /// `/trusted-only [on|off|default on|default off]`: require trusted
-    /// provider/model targets for subsequent inference requests. A bare
-    /// invocation toggles the live session state. `default on/off` persists the
-    /// default and applies it to the current session.
-    pub(super) fn handle_trusted_only_command(&mut self, args: &str) {
-        let normalized = args.trim().to_ascii_lowercase();
-        let mut persist_default = false;
-        let enabled = match normalized.as_str() {
-            "" => None,
-            "on" | "enable" | "enabled" => Some(true),
-            "off" | "disable" | "disabled" => Some(false),
-            "default on" | "persist on" => {
-                persist_default = true;
-                Some(true)
-            }
-            "default off" | "persist off" => {
-                persist_default = true;
-                Some(false)
-            }
-            other => {
-                self.push_plain(format!(
-                        "/trusted-only: unknown arg `{other}` — use `on`, `off`, `default on`, `default off`, or no arg to toggle"
-                    ));
-                return;
-            }
-        };
-        if persist_default
-            && let Some(value) = enabled
-            && let Err(error) = persist_trusted_only_default(&self.launch.cwd, value)
-        {
-            self.push_plain(format!(
-                "/trusted-only: failed to persist default: {error:#}"
-            ));
-            return;
-        }
-        self.send_daemon_request(
-            "/trusted-only",
-            cockpit_core::daemon::proto::Request::SetTrustedOnly { enabled },
             ControlApplied::None,
         );
     }

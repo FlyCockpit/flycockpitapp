@@ -9,7 +9,6 @@ fn running(parent: &str, child: &str) -> HistoryEntry {
         child: child.into(),
         task_call_id: "task".into(),
         label: "default".into(),
-        trusted_only: false,
         model_trusted: false,
         routing: SubagentRoutingChips::default(),
         spawned_at: std::time::Instant::now(),
@@ -24,7 +23,6 @@ fn running_labeled(parent: &str, child: &str, task_call_id: &str, label: &str) -
         child: child.into(),
         task_call_id: task_call_id.into(),
         label: label.into(),
-        trusted_only: false,
         model_trusted: false,
         routing: SubagentRoutingChips::default(),
         spawned_at: std::time::Instant::now(),
@@ -37,7 +35,6 @@ fn report_update(report: impl Into<String>) -> SubagentReportUpdate {
     SubagentReportUpdate {
         report: report.into(),
         failed: false,
-        trusted_only: false,
         model_trusted: false,
         routing: SubagentRoutingChips::default(),
     }
@@ -47,7 +44,6 @@ fn failed_report_update(report: impl Into<String>) -> SubagentReportUpdate {
     SubagentReportUpdate {
         report: report.into(),
         failed: true,
-        trusted_only: false,
         model_trusted: false,
         routing: SubagentRoutingChips::default(),
     }
@@ -55,7 +51,6 @@ fn failed_report_update(report: impl Into<String>) -> SubagentReportUpdate {
 
 fn routing_update(model: &str) -> SubagentRoutingUpdate {
     SubagentRoutingUpdate {
-        trusted_only: true,
         model_trusted: true,
         routing: SubagentRoutingChips {
             model: Some(model.into()),
@@ -97,13 +92,9 @@ fn expanded(entry: &HistoryEntry) -> bool {
     }
 }
 
-fn trust_flags(entry: &HistoryEntry) -> Option<(bool, bool)> {
+fn trust_flags(entry: &HistoryEntry) -> Option<bool> {
     match entry {
-        HistoryEntry::Subagent {
-            trusted_only,
-            model_trusted,
-            ..
-        } => Some((*trusted_only, *model_trusted)),
+        HistoryEntry::Subagent { model_trusted, .. } => Some(*model_trusted),
         _ => None,
     }
 }
@@ -137,7 +128,6 @@ fn report_updates_subagent_trust_metadata() {
         SubagentReportUpdate {
             report: "all done".into(),
             failed: false,
-            trusted_only: true,
             model_trusted: true,
             routing: SubagentRoutingChips {
                 model: Some("claude-sonnet-4-6".into()),
@@ -146,7 +136,7 @@ fn report_updates_subagent_trust_metadata() {
             },
         },
     );
-    assert_eq!(trust_flags(&history[0]), Some((true, true)));
+    assert_eq!(trust_flags(&history[0]), Some(true));
     match &history[0] {
         HistoryEntry::Subagent { routing, .. } => {
             assert_eq!(routing.model.as_deref(), Some("claude-sonnet-4-6"));
@@ -170,7 +160,7 @@ fn routing_amend_updates_inflight_subagent_chips() {
 
     assert_eq!(history.len(), 1);
     assert_eq!(routing_model(&history[0]), Some("child-model"));
-    assert_eq!(trust_flags(&history[0]), Some((true, true)));
+    assert_eq!(trust_flags(&history[0]), Some(true));
 }
 
 #[test]

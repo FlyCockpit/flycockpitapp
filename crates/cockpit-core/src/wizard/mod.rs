@@ -947,7 +947,7 @@ pub fn security_descriptor_for_config(
     WizardDescriptor {
         id: SECURITY_WIZARD_ID,
         title: "Security posture",
-        description: "Review sandboxing, approvals, trusted-only, redaction, and workspace trust",
+        description: "Review sandboxing, approvals, redaction, and workspace trust",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
         steps: vec![
@@ -1017,18 +1017,6 @@ pub fn security_descriptor_for_config(
                 )),
                 prefill: None,
                 validate: Some(validate_approval_mode),
-                write: None,
-                branch: None,
-            },
-            StepDescriptor {
-                id: "trusted-only",
-                prompt: "Require trusted providers/models only?",
-                help: "Trusted-only blocks untrusted provider/model choices. Trusted providers can receive original text; untrusted providers receive redacted text.",
-                help_hook: None,
-                kind: StepKind::Confirm,
-                default_answer: Some(WizardAnswer::Confirm(current.trusted_only)),
-                prefill: None,
-                validate: None,
                 write: None,
                 branch: None,
             },
@@ -1104,13 +1092,6 @@ pub(crate) fn approval_mode_from_id(id: &str) -> Option<crate::config::extended:
         "yolo" => crate::config::extended::ApprovalMode::Yolo,
         _ => return None,
     })
-}
-
-pub fn trusted_only_answer(run: &WizardRun) -> Option<bool> {
-    let WizardAnswer::Confirm(value) = run.answer("trusted-only")? else {
-        return None;
-    };
-    Some(*value)
 }
 
 pub fn min_secret_length_answer(run: &WizardRun) -> Option<usize> {
@@ -2051,7 +2032,6 @@ mod tests {
                 ..Default::default()
             },
             default_approval_mode: crate::config::extended::ApprovalMode::Yolo,
-            trusted_only: true,
             redact: crate::config::extended::RedactConfig {
                 min_secret_length: 17,
                 ..Default::default()
@@ -2072,8 +2052,6 @@ mod tests {
         );
         run.submit(WizardAnswer::Select("yolo".to_string()))
             .unwrap();
-        assert_eq!(run.prefill(), Some(WizardAnswer::Confirm(true)));
-        run.submit(WizardAnswer::Confirm(true)).unwrap();
         assert_eq!(run.prefill(), Some(WizardAnswer::Text("17".to_string())));
     }
 

@@ -49,6 +49,6 @@ The setup wizard can test credentials before saving. A failed test reports the p
 
 ## Trust And Redaction
 
-Workspace trust controls whether project `.cockpit/` config and project approvals are honored. Model trust controls whether a model may receive exact prompts and tool results. Untrusted models keep outbound redaction enabled.
+Workspace trust controls whether project `.cockpit/` config and project approvals are honored. Model trust is the sole model trust posture: trusted models disable outbound redaction, while untrusted models keep it enabled. Trusted models are intended for self-hosted providers; trusting an external provider is permitted and is the user's decision.
 
 Secrets are scrubbed through Cockpit's redaction table before they leave the machine for model requests, exports, sync, or client display boundaries. Redaction is a safety boundary, but it is not a substitute for choosing providers and trust settings deliberately.

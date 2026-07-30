@@ -2342,7 +2342,6 @@ fn render_sub(
             child: child.into(),
             task_call_id: "task".into(),
             label: "default".into(),
-            trusted_only: true,
             model_trusted: true,
             routing: SubagentRoutingChips {
                 model: Some("claude-sonnet-4-6".into()),
@@ -2368,18 +2367,16 @@ fn render_sub(
 #[rustfmt::skip]
 async fn subagent_routing_chips_condense_model_and_trust() {
     fn chip_text(
-        trusted_only: bool,
         model_trusted: bool,
         routing: SubagentRoutingChips,
     ) -> String {
         let mut spans = Vec::new();
-        append_subagent_routing_chips(&mut spans, trusted_only, model_trusted, &routing);
+        append_subagent_routing_chips(&mut spans, model_trusted, &routing);
         spans_text(&spans)
     }
 
     assert_eq!(
         chip_text(
-            true,
             true,
             SubagentRoutingChips {
                 model: Some("gpt-5".into()),
@@ -2387,11 +2384,10 @@ async fn subagent_routing_chips_condense_model_and_trust() {
                 fallback: Some("backup".into()),
             },
         ),
-        " [gpt-5 · t] [private_remote] [fallback:backup] [trusted-only]"
+        " [gpt-5 · t] [private_remote] [fallback:backup]"
     );
     assert_eq!(
         chip_text(
-            false,
             false,
             SubagentRoutingChips {
                 model: Some("gpt-5".into()),
@@ -2402,11 +2398,11 @@ async fn subagent_routing_chips_condense_model_and_trust() {
         " [gpt-5 · u]"
     );
     assert_eq!(
-        chip_text(false, true, SubagentRoutingChips::default()),
+        chip_text(true, SubagentRoutingChips::default()),
         " [t]"
     );
     assert_eq!(
-        chip_text(false, false, SubagentRoutingChips::default()),
+        chip_text(false, SubagentRoutingChips::default()),
         " [u]"
     );
 }
@@ -2416,7 +2412,6 @@ fn fallback_chip_renders_for_non_none_decision() {
     let mut spans = Vec::new();
     append_subagent_routing_chips(
         &mut spans,
-        false,
         true,
         &SubagentRoutingChips {
             model: Some("gpt-5".into()),
@@ -2429,7 +2424,6 @@ fn fallback_chip_renders_for_non_none_decision() {
     let mut none_spans = Vec::new();
     append_subagent_routing_chips(
         &mut none_spans,
-        false,
         true,
         &SubagentRoutingChips {
             model: Some("gpt-5".into()),
@@ -2451,7 +2445,6 @@ fn subagent_running_is_one_orange_live_line() {
     assert!(text.contains("[claude-sonnet-4-6 · t]"), "{text}");
     assert!(!text.contains("[trusted]"), "{text}");
     assert!(text.contains("[private_remote]"), "{text}");
-    assert!(text.contains("[trusted-only]"), "{text}");
     // Verbatim casing: parent capitalized, child lowercase.
     assert!(!text.contains("Explore"));
     // Elapsed clock rendered (the `(…s)` readout).
@@ -2487,7 +2480,6 @@ fn subagent_report_renders_header_and_quoted_body() {
     assert!(header.contains("[claude-sonnet-4-6 · t]"), "{header}");
     assert!(!header.contains("[trusted]"), "{header}");
     assert!(header.contains("[private_remote]"), "{header}");
-    assert!(header.contains("[trusted-only]"), "{header}");
     assert!(any_orange(&r.lines[0]));
     // Body rows carry the left `│` bar.
     assert!(r.lines[1..].iter().any(|l| line_text(l).contains("│")));
@@ -2599,7 +2591,6 @@ fn subagent_batch_label_shows_running_and_done_state() {
             child: "explore".into(),
             task_call_id: "task".into(),
             label: "auth".into(),
-            trusted_only: true,
             model_trusted: true,
             routing: SubagentRoutingChips {
                 model: Some("reasoning-model".into()),
@@ -2627,7 +2618,6 @@ fn subagent_batch_label_shows_running_and_done_state() {
             child: "explore".into(),
             task_call_id: "task".into(),
             label: "auth".into(),
-            trusted_only: true,
             model_trusted: true,
             routing: SubagentRoutingChips {
                 model: Some("reasoning-model".into()),

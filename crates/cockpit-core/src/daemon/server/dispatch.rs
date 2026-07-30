@@ -1161,15 +1161,6 @@ pub(super) async fn handle_serialized_request(
             Ok(Response::Ack)
         }
 
-        Request::SetTrustedOnly { enabled } => {
-            let att = require_attached(state)?;
-            att.handle
-                .send_work(SessionWork::SetTrustedOnly { enabled })
-                .await
-                .map_err(internal)?;
-            Ok(Response::Ack)
-        }
-
         Request::SetRedaction {
             scan_environment,
             scan_dotenv,

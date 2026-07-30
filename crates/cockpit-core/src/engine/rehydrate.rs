@@ -3074,7 +3074,6 @@ mod tests {
                 "label": "default",
                 "provider": "lmstudio",
                 "model": "child-model",
-                "trusted_only": false,
                 "model_trusted": true,
                 "routing": { "resolved_model": "child-model" }
             }),

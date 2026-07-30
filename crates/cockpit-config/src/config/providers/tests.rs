@@ -1402,7 +1402,6 @@ fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
             required_capabilities: vec![],
             min_context_tokens: None,
             require_subagent_invokable: true,
-            trusted_only: false,
             optimize: ModelOptimization::Cost,
             role: Some("cheap_code"),
             agent: Some("explore"),
@@ -1417,7 +1416,6 @@ fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
             required_capabilities: vec![RequiredModelCapability::ToolCalling],
             min_context_tokens: Some(16_000),
             require_subagent_invokable: true,
-            trusted_only: false,
             optimize: ModelOptimization::Quality,
             role: None,
             agent: None,
@@ -1435,7 +1433,6 @@ fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
             ],
             min_context_tokens: Some(64_000),
             require_subagent_invokable: true,
-            trusted_only: true,
             optimize: ModelOptimization::Balanced,
             role: Some("reasoning"),
             agent: Some("deepthink"),
@@ -1450,7 +1447,6 @@ fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
             required_capabilities: vec![RequiredModelCapability::StructuredOutputs],
             min_context_tokens: None,
             require_subagent_invokable: true,
-            trusted_only: false,
             optimize: ModelOptimization::Balanced,
             role: Some("strict"),
             agent: None,
@@ -1487,7 +1483,6 @@ fn mixed_harness_policy_loaded_from_files_covers_trust_and_hidden_models() {
             required_capabilities: vec![],
             min_context_tokens: None,
             require_subagent_invokable: false,
-            trusted_only: true,
             optimize: ModelOptimization::Balanced,
             role: Some("top_level"),
             agent: Some("Build"),
@@ -1502,7 +1497,6 @@ fn mixed_harness_policy_loaded_from_files_covers_trust_and_hidden_models() {
             required_capabilities: vec![],
             min_context_tokens: None,
             require_subagent_invokable: true,
-            trusted_only: true,
             optimize: ModelOptimization::Quality,
             role: Some("sensitive_child"),
             agent: Some("builder"),
@@ -1510,23 +1504,19 @@ fn mixed_harness_policy_loaded_from_files_covers_trust_and_hidden_models() {
         .unwrap();
     assert_eq!(child.selector(), "mixed:child-trusted");
 
-    let untrusted_refusal = cfg
+    let untrusted = cfg
         .resolve_model_policy(&ModelPolicyRequest {
             selector: ModelPolicySelector::Exact("mixed:parent-untrusted"),
             trust: None,
             required_capabilities: vec![],
             min_context_tokens: None,
             require_subagent_invokable: true,
-            trusted_only: true,
             optimize: ModelOptimization::Balanced,
             role: Some("utility"),
             agent: Some("explore"),
         })
-        .unwrap_err();
-    assert!(matches!(
-        untrusted_refusal,
-        ModelPolicyError::Untrusted { .. }
-    ));
+        .unwrap();
+    assert_eq!(untrusted.selector(), "mixed:parent-untrusted");
 
     let hidden_refusal = cfg
         .resolve_model_policy(&ModelPolicyRequest {
@@ -1535,7 +1525,6 @@ fn mixed_harness_policy_loaded_from_files_covers_trust_and_hidden_models() {
             required_capabilities: vec![],
             min_context_tokens: None,
             require_subagent_invokable: true,
-            trusted_only: true,
             optimize: ModelOptimization::Quality,
             role: Some("sensitive_child"),
             agent: Some("builder"),

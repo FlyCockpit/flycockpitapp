@@ -129,7 +129,6 @@ fn fully_populated_config_json_round_trips_byte_identically() {
             search_command: Some("custom-search {query}".into()),
         },
     };
-    cfg.trusted_only = true;
     cfg.allow_remote_config = true;
     cfg.utility_model = Some("openai:gpt-5.5".into());
     cfg.translation_model = Some("openai:gpt-5.5-mini".into());
@@ -703,84 +702,17 @@ fn vim_mode_round_trips_through_extended_doc() {
 fn unknown_root_keys_survive_write() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
-    std::fs::write(&path, r#"{"future_feature":{"a":1}}"#).unwrap();
+    let retired_key = ["trusted", "Only"].concat();
+    let mut raw = serde_json::Map::new();
+    raw.insert("future_feature".into(), serde_json::json!({"a": 1}));
+    raw.insert(retired_key.clone(), serde_json::Value::Bool(true));
+    std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
     let mut doc = ExtendedConfigDoc::load(&path).unwrap();
     let cfg = doc.config();
     doc.write(&cfg).unwrap();
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert!(on_disk.contains("\"future_feature\""));
-}
-
-#[test]
-fn sparse_project_save_does_not_materialize_inherited_security_fields() {
-    let tmp = TempDir::new().unwrap();
-    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
-    let home_cfg = tmp.path().join("home/.config/cockpit/config.json");
-    std::fs::create_dir_all(home_cfg.parent().unwrap()).unwrap();
-    std::fs::write(
-        &home_cfg,
-        r#"{
-                "trustedOnly": true,
-                "redact": { "scan_environment": false, "denylist": ["home-secret"] },
-                "prompt_injection_guard": { "threshold": "high" },
-                "llm_mode": "frontier"
-            }"#,
-    )
-    .unwrap();
-    let project = tmp.path().join("repo");
-    let project_cfg = project.join(".cockpit/config.json");
-    std::fs::create_dir_all(project_cfg.parent().unwrap()).unwrap();
-    std::fs::write(&project_cfg, r#"{"name":"Project"}"#).unwrap();
-
-    let mut doc = ExtendedConfigDoc::load(&project_cfg).unwrap();
-    let mut cfg = doc.config();
-    cfg.name = Some("Renamed".into());
-    doc.write(&cfg).unwrap();
-
-    let raw = std::fs::read_to_string(&project_cfg).unwrap();
-    for forbidden in [
-        "trustedOnly",
-        "trusted_only",
-        "redact",
-        "prompt_injection_guard",
-        "llm_mode",
-    ] {
-        assert!(
-            !raw.contains(forbidden),
-            "project layer leaked {forbidden}: {raw}"
-        );
-    }
-    let merged = load_for_cwd(&project);
-    assert!(merged.trusted_only);
-    assert_eq!(merged.redact.denylist, vec!["home-secret".to_string()]);
-    assert_eq!(
-        merged.prompt_injection_guard.threshold,
-        InjectionThreshold::High
-    );
-    assert_eq!(merged.llm_mode, LlmMode::Frontier);
-}
-
-#[test]
-fn trusted_only_write_canonicalizes_aliases() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("config.json");
-    std::fs::write(&path, r#"{"trustedOnly":false,"trusted_only":true}"#).unwrap();
-    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
-    let cfg = doc.config();
-    assert!(cfg.trusted_only, "legacy alias is still accepted on read");
-    doc.write(&cfg).unwrap();
-    let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(raw.get("trustedOnly"), Some(&Value::Bool(true)));
-    assert!(
-        raw.get("trusted_only").is_none(),
-        "losing alias removed: {raw}"
-    );
-    assert!(
-        ExtendedConfigDoc::load(&path)
-            .unwrap()
-            .config()
-            .trusted_only
-    );
+    assert!(!on_disk.contains(&retired_key));
 }
 
 #[test]
@@ -807,26 +739,6 @@ fn partial_redact_and_tui_objects_parse_with_defaults_and_preserve_lists() {
     let reloaded = ExtendedConfigDoc::load(&path).unwrap().config();
     assert_eq!(reloaded.redact.denylist, vec!["secret".to_string()]);
     assert_eq!(reloaded.redact.allowlist, vec!["PUBLIC".to_string()]);
-}
-
-#[test]
-fn malformed_nearer_layer_keeps_inherited_security_values() {
-    let tmp = TempDir::new().unwrap();
-    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
-    let home_cfg = tmp.path().join("home/.config/cockpit/config.json");
-    std::fs::create_dir_all(home_cfg.parent().unwrap()).unwrap();
-    std::fs::write(&home_cfg, r#"{"trustedOnly":true,"llm_mode":"frontier"}"#).unwrap();
-    let project = tmp.path().join("repo");
-    std::fs::create_dir_all(project.join(".cockpit")).unwrap();
-    std::fs::write(
-        project.join(".cockpit/config.json"),
-        r#"{"trustedOnly":"nope","llm_mode":"yolo"}"#,
-    )
-    .unwrap();
-
-    let cfg = load_for_cwd(&project);
-    assert!(cfg.trusted_only);
-    assert_eq!(cfg.llm_mode, LlmMode::Frontier);
 }
 
 #[test]

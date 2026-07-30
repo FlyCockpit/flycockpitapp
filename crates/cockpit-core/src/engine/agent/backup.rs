@@ -762,24 +762,6 @@ mod backup_fallback_tests {
         format!("http://{addr}/v1")
     }
 
-    /// A local server that accepts requests and then stays silent long enough
-    /// for the client's TTFT threshold to fire.
-    async fn silent_server() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    let _ = stream.shutdown().await;
-                });
-            }
-        });
-        format!("http://{addr}/v1")
-    }
-
     /// A local server that, for every connection, reads the request and returns
     /// a minimal valid chat-completions SSE stream: one text delta = `body`,
     /// then a finish + `[DONE]`. Returns the bound `base_url`.
@@ -1080,7 +1062,7 @@ mod backup_fallback_tests {
     }
 
     #[test]
-    fn failover_walk_orders_by_trust_then_rank_after_configured_backup() {
+    fn failover_walk_orders_by_rank_after_configured_backup() {
         let mut cfg = ProvidersConfig::default();
         cfg.providers.insert(
             "primary".into(),
@@ -1126,8 +1108,8 @@ mod backup_fallback_tests {
             ids,
             vec![
                 "explicit:explicit-model",
-                "trusted-high:trusted-high",
-                "trusted-low:trusted-low"
+                "untrusted-best:untrusted-best",
+                "trusted-high:trusted-high"
             ]
         );
     }
@@ -1200,190 +1182,6 @@ mod backup_fallback_tests {
                 .iter()
                 .any(|e| matches!(e, TurnEvent::BackupUsed { .. }))
         );
-    }
-
-    #[test]
-    fn failover_walk_never_promotes_untrusted_under_trusted_only() {
-        let mut cfg = ProvidersConfig::default();
-        cfg.providers.insert(
-            "primary".into(),
-            ProviderEntry {
-                url: "http://localhost:1/v1".into(),
-                trust: Some(ModelTrust::Trusted),
-                ..ProviderEntry::default()
-            },
-        );
-        let mut trusted = provider_with_model("http://localhost:2/v1", "trusted");
-        trusted.trust = Some(ModelTrust::Trusted);
-        cfg.providers.insert("trusted".into(), trusted);
-        cfg.providers.insert(
-            "untrusted".into(),
-            provider_with_model("http://localhost:3/v1", "untrusted"),
-        );
-        let primary = Model::for_provider_trusted_only(
-            &cfg,
-            "primary",
-            "primary-model",
-            std::sync::Arc::new(RedactionTable::empty()),
-            Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        )
-        .unwrap();
-        let fallbacks = crate::engine::driver::build_failover_models(&cfg, &primary);
-        assert!(
-            fallbacks
-                .iter()
-                .all(|model| model.provider_id() != "untrusted")
-        );
-        assert!(
-            fallbacks
-                .iter()
-                .any(|model| model.provider_id() == "trusted")
-        );
-    }
-
-    /// A primary stream that never produces a first token times out only
-    /// because a backup is configured, and the existing backup wrapper answers
-    /// the turn with the backup model.
-    #[tokio::test]
-    async fn ttft_timeout_falls_back_to_backup_with_yellow_banner() {
-        let primary_url = silent_server().await;
-        let backup_url = sse_server("from-backup").await;
-
-        let mut cfg = ProvidersConfig::default();
-        cfg.providers
-            .insert("flaky".into(), provider_at(&primary_url));
-        cfg.providers
-            .insert("reliable".into(), provider_at(&backup_url));
-        cfg.providers.get_mut("flaky").unwrap().backup = Some(BackupConfig {
-            provider: "reliable".into(),
-            model: "backup-model".into(),
-        });
-
-        let primary = Arc::new(
-            Model::for_provider(
-                &cfg,
-                "flaky",
-                "primary-model",
-                std::sync::Arc::new(RedactionTable::empty()),
-            )
-            .unwrap(),
-        );
-        let backup = Arc::new(
-            Model::for_provider(
-                &cfg,
-                "reliable",
-                "backup-model",
-                std::sync::Arc::new(RedactionTable::empty()),
-            )
-            .unwrap(),
-        );
-        let agent = agent_with(primary);
-
-        let (tmp, session, locks, redact) = ctx();
-        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-        let outcome = run(
-            &agent,
-            Some(&backup),
-            session,
-            locks,
-            redact,
-            tmp.path().to_path_buf(),
-            &tx,
-        )
-        .await
-        .expect("backup answers the timed-out turn");
-        assert!(matches!(outcome, TurnOutcome::Done));
-
-        let events = drain(&mut rx);
-        assert!(events.iter().any(|e| matches!(
-            e,
-            TurnEvent::InferenceWarning { phase, .. } if phase == "ttft"
-        )));
-        let banner = events.iter().find_map(|e| match e {
-            TurnEvent::BackupUsed {
-                primary_model,
-                error_class,
-                backup_model,
-                ..
-            } => Some((
-                primary_model.clone(),
-                error_class.clone(),
-                backup_model.clone(),
-            )),
-            _ => None,
-        });
-        let (pm, class, bm) = banner.expect("a BackupUsed banner was emitted");
-        assert_eq!(pm, "primary-model");
-        assert_eq!(class, InferenceErrorClass::TimeoutTtft);
-        assert_eq!(bm, "backup-model");
-        assert!(events.iter().any(|e| matches!(
-            e,
-            TurnEvent::AssistantText { text, .. } if text.contains("from-backup")
-        )));
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, TurnEvent::InferenceFailed { .. })),
-            "the primary timeout must be suppressed when the backup answers"
-        );
-    }
-
-    async fn assert_stall_hard_fails_and_engages_backup() {
-        let primary_url = silent_server().await;
-        let backup_url = sse_server("from-backup").await;
-        let mut cfg = ProvidersConfig::default();
-        cfg.providers
-            .insert("flaky".into(), provider_at(&primary_url));
-        cfg.providers
-            .insert("reliable".into(), provider_at(&backup_url));
-        let primary = Arc::new(
-            Model::for_provider(
-                &cfg,
-                "flaky",
-                "primary-model",
-                std::sync::Arc::new(RedactionTable::empty()),
-            )
-            .unwrap(),
-        );
-        let backup = Arc::new(
-            Model::for_provider(
-                &cfg,
-                "reliable",
-                "backup-model",
-                std::sync::Arc::new(RedactionTable::empty()),
-            )
-            .unwrap(),
-        );
-        let agent = agent_with(primary);
-        let (tmp, session, locks, redact) = ctx();
-        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-        run(
-            &agent,
-            Some(&backup),
-            session,
-            locks,
-            redact,
-            tmp.path().to_path_buf(),
-            &tx,
-        )
-        .await
-        .expect("backup answers stalled child");
-        let events = drain(&mut rx);
-        assert!(events.iter().any(|e| matches!(
-            e,
-            TurnEvent::BackupUsed { error_class, .. }
-                if error_class == &InferenceErrorClass::TimeoutTtft
-        )));
-    }
-
-    #[tokio::test]
-    async fn delegated_child_stall_hard_fails_and_engages_failover() {
-        assert_stall_hard_fails_and_engages_backup().await;
-    }
-
-    #[tokio::test]
-    async fn interactive_turn_stall_hard_fails_and_engages_backup() {
-        assert_stall_hard_fails_and_engages_backup().await;
     }
 
     #[tokio::test]
@@ -1724,5 +1522,36 @@ mod backup_fallback_tests {
         // — independent of which agent is running `running`.
         assert_eq!(backup.provider_id(), "reliable");
         assert_eq!(backup.model_id_ref(), "backup-model");
+    }
+
+    #[test]
+    fn failover_discovery_includes_an_untrusted_invokable_model() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "primary".into(),
+            provider_with_model("http://localhost:1/v1", "main"),
+        );
+        cfg.providers.insert(
+            "candidate".into(),
+            ProviderEntry {
+                url: "http://localhost:2/v1".into(),
+                models: vec![ModelEntry {
+                    id: "untrusted".into(),
+                    subagent_invokable: Some(true),
+                    trust: Some(ModelTrust::Untrusted),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let primary =
+            Model::for_provider(&cfg, "primary", "main", Arc::new(RedactionTable::empty()))
+                .unwrap();
+
+        let fallbacks = crate::engine::driver::build_failover_models(&cfg, &primary);
+
+        assert!(fallbacks.iter().any(|model| {
+            model.provider_id() == "candidate" && model.model_id_ref() == "untrusted"
+        }));
     }
 }

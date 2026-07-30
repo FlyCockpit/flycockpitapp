@@ -1379,7 +1379,6 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | RedactionState { session_id, .. }
         | PreflightState { session_id, .. }
         | LongcacheState { session_id, .. }
-        | TrustedOnlyState { session_id, .. }
         | ApprovalModeState { session_id, .. }
         | DelegationRecursionState { session_id, .. }
         | TandemState { session_id, .. }

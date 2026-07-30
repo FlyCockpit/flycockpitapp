@@ -301,25 +301,6 @@ fn shell_compression_round_trips_through_extended_doc() {
 }
 
 #[test]
-fn trusted_only_defaults_off_and_round_trips_through_extended_doc() {
-    let cfg: ExtendedConfig = serde_json::from_str("{}").unwrap();
-    assert!(!cfg.trusted_only);
-    assert!(!ExtendedConfig::default().trusted_only);
-
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("config.json");
-    std::fs::write(&path, "{}").unwrap();
-    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
-    let mut cfg = doc.config();
-    cfg.trusted_only = true;
-    doc.write(&cfg).unwrap();
-    let on_disk = std::fs::read_to_string(&path).unwrap();
-    assert!(on_disk.contains("\"trustedOnly\""), "{on_disk}");
-    let cfg2 = ExtendedConfigDoc::load(&path).unwrap().config();
-    assert!(cfg2.trusted_only);
-}
-
-#[test]
 fn shell_compression_toggled_flips() {
     assert_eq!(
         ShellCompression::Enabled.toggled(),

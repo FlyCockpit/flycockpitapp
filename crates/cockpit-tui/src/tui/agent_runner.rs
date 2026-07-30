@@ -1838,7 +1838,6 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | RedactionState { session_id, .. }
         | PreflightState { session_id, .. }
         | LongcacheState { session_id, .. }
-        | TrustedOnlyState { session_id, .. }
         | ApprovalModeState { session_id, .. }
         | DelegationRecursionState { session_id, .. }
         | TandemState { session_id, .. }
@@ -2324,7 +2323,6 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             prompt,
             requested_cwd,
             resolved_cwd,
-            trusted_only,
             model_trusted,
             routing,
             ..
@@ -2336,7 +2334,6 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             prompt,
             requested_cwd,
             resolved_cwd,
-            trusted_only,
             model_trusted,
             routing,
         },
@@ -2346,7 +2343,6 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             child,
             provider,
             model,
-            trusted_only,
             model_trusted,
             routing,
             ..
@@ -2356,7 +2352,6 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             child,
             provider,
             model,
-            trusted_only,
             model_trusted,
             routing,
         },
@@ -2366,7 +2361,6 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             label,
             report,
             failed,
-            trusted_only,
             model_trusted,
             routing,
             ..
@@ -2376,7 +2370,6 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             label,
             report,
             failed,
-            trusted_only,
             model_trusted,
             routing,
         },
@@ -2565,7 +2558,6 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         LongcacheState {
             enabled, supported, ..
         } => TurnEvent::LongcacheState { enabled, supported },
-        TrustedOnlyState { enabled, .. } => TurnEvent::TrustedOnlyState { enabled },
         ApprovalModeState { mode, .. } => TurnEvent::ApprovalModeState { mode },
         DelegationRecursionState {
             enabled,
@@ -3556,7 +3548,6 @@ mod tests {
             child: "explore".into(),
             provider: "test-provider".into(),
             model: "child-model".into(),
-            trusted_only: true,
             model_trusted: false,
             routing: routing.clone(),
         };
@@ -3569,7 +3560,6 @@ mod tests {
                 child,
                 provider,
                 model,
-                trusted_only,
                 model_trusted,
                 routing: actual_routing,
             }) => {
@@ -3578,7 +3568,6 @@ mod tests {
                 assert_eq!(child, "explore");
                 assert_eq!(provider, "test-provider");
                 assert_eq!(model, "child-model");
-                assert!(trusted_only);
                 assert!(!model_trusted);
                 assert_eq!(actual_routing, routing);
             }

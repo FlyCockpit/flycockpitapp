@@ -3532,11 +3532,6 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "SessionWork::SetLongcache delivered to attached worker",
         },
         MutatingDispatchCase {
-            kind: "set_trusted_only",
-            effect_class: DriverForwarded,
-            observation: "SessionWork::SetTrustedOnly delivered to attached worker",
-        },
-        MutatingDispatchCase {
             kind: "set_redaction",
             effect_class: DriverForwarded,
             observation: "SessionWork::SetRedaction delivered to attached worker",
@@ -3848,7 +3843,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_delegation_recursion"
         | "set_preflight"
         | "set_longcache"
-        | "set_trusted_only"
         | "set_redaction"
         | "set_tandem_models"
         | "refresh_config"
@@ -3951,7 +3945,6 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("set_sandbox_escalation"),
         authz_session_writer("set_preflight"),
         authz_session_writer("set_longcache"),
-        authz_session_writer("set_trusted_only"),
         authz_session_writer("set_redaction"),
         authz_session_writer("set_tandem_models"),
         authz_owner_only("set_caffeinate"),
@@ -4666,7 +4659,6 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "set_sandbox_escalation"
             | "set_preflight"
             | "set_longcache"
-            | "set_trusted_only"
             | "set_redaction"
             | "set_tandem_models"
             | "cancel_schedule"
@@ -4990,7 +4982,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "set_sandbox_escalation" => Request::SetSandboxEscalation { enabled: false },
         "set_preflight" => Request::SetPreflight { enabled: None },
         "set_longcache" => Request::SetLongcache { enabled: None },
-        "set_trusted_only" => Request::SetTrustedOnly { enabled: None },
         "set_redaction" => Request::SetRedaction {
             scan_environment: Some(false),
             scan_dotenv: None,
@@ -5817,7 +5808,6 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "set_delegation_recursion"
         | "set_preflight"
         | "set_longcache"
-        | "set_trusted_only"
         | "set_redaction"
         | "set_tandem_models"
         | "refresh_config"
@@ -5978,7 +5968,6 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "set_delegation_recursion"
         | "set_preflight"
         | "set_longcache"
-        | "set_trusted_only"
         | "set_redaction"
         | "set_tandem_models"
         | "cancel_schedule"
@@ -6260,9 +6249,6 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "set_longcache" => Request::SetLongcache {
             enabled: Some(true),
         },
-        "set_trusted_only" => Request::SetTrustedOnly {
-            enabled: Some(true),
-        },
         "set_redaction" => Request::SetRedaction {
             scan_environment: Some(false),
             scan_dotenv: Some(true),
@@ -6458,9 +6444,6 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 ("set_longcache", SessionWork::SetLongcache { enabled }) => {
                     assert_eq!(enabled, Some(true));
                 }
-                ("set_trusted_only", SessionWork::SetTrustedOnly { enabled }) => {
-                    assert_eq!(enabled, Some(true));
-                }
                 (
                     "set_redaction",
                     SessionWork::SetRedaction {
@@ -6590,7 +6573,6 @@ async fn assert_attached_required_malformed(kind: &str) {
         "set_sandbox_escalation" => Request::SetSandboxEscalation { enabled: false },
         "set_preflight" => Request::SetPreflight { enabled: None },
         "set_longcache" => Request::SetLongcache { enabled: None },
-        "set_trusted_only" => Request::SetTrustedOnly { enabled: None },
         "set_redaction" => Request::SetRedaction {
             scan_environment: Some(false),
             scan_dotenv: None,
@@ -8258,7 +8240,6 @@ async fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_re
         "set_sandbox_escalation",
         "set_preflight",
         "set_longcache",
-        "set_trusted_only",
         "set_redaction",
         "set_tandem_models",
     ] {
@@ -9048,15 +9029,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
-            request: Request::SetTrustedOnly {
-                enabled: Some(false),
-            },
-            kind: "set_trusted_only",
-            session_id: Some(attached_session_id),
-            audit_path: None,
-            mutating: true,
-        },
-        CommandMetadataCase {
             request: Request::SetRedaction {
                 scan_environment: Some(true),
                 scan_dotenv: None,
@@ -9462,7 +9434,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SetSandboxEscalation,
         SetPreflight,
         SetLongcache,
-        SetTrustedOnly,
         SetRedaction,
         SetTandemModels,
         SetCaffeinate,
@@ -12745,10 +12716,7 @@ async fn attach_compatible_reflects_client_protocol_version() {
 /// Regression (`daemon-trust-test-isolation.md`): daemon attach resolves
 /// the session's model from the [`ConfigSource`] injected through the
 /// `DaemonContext` constructor — never from the machine's live layered
-/// config. On a machine whose `~/.config/cockpit` enables trusted-only
-/// with an untrusted active model (the exact condition that redded the
-/// dispatch-matrix tests), this passes only if the attach path consults
-/// the seam.
+/// config. This passes only if the attach path consults the injected seam.
 #[tokio::test]
 async fn attach_resolves_model_from_injected_config_source() {
     use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry};

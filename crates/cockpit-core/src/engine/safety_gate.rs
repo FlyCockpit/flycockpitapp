@@ -117,7 +117,6 @@ pub async fn evaluate(
     provider_model: Option<&str>,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
-    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     tool: &str,
     payload: &str,
@@ -125,17 +124,7 @@ pub async fn evaluate(
     let Some(model_ref) = provider_model else {
         return SafetyOutcome::Unavailable(SafetyUnavailableReason::Unset);
     };
-    match evaluate_inner(
-        model_ref,
-        providers,
-        redact,
-        trusted_only,
-        shutdown_gate,
-        tool,
-        payload,
-    )
-    .await
-    {
+    match evaluate_inner(model_ref, providers, redact, shutdown_gate, tool, payload).await {
         Some(verdict) => SafetyOutcome::Rated(verdict),
         None => SafetyOutcome::Unavailable(SafetyUnavailableReason::Unusable),
     }
@@ -145,17 +134,11 @@ async fn evaluate_inner(
     model_ref: &str,
     providers: &ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
-    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     tool: &str,
     payload: &str,
 ) -> Option<SafetyVerdict> {
-    let model = match crate::engine::model::Model::from_ref_trusted_only(
-        providers,
-        model_ref,
-        redact,
-        trusted_only,
-    ) {
+    let model = match crate::engine::model::Model::from_ref(providers, model_ref, redact) {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(error = %e, "safety_gate: model build failed; failing closed");
@@ -285,7 +268,6 @@ mod tests {
             None,
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
             "bash",
             "rm -rf /",
@@ -305,7 +287,6 @@ mod tests {
             Some("no-colon-here"),
             &providers,
             std::sync::Arc::new(crate::redact::RedactionTable::empty()),
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
             "bash",
             "ls",

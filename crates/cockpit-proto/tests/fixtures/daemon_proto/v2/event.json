@@ -203,7 +203,6 @@
             "model_language": "",
             "user_language": ""
           },
-          "trustedOnly": false,
           "tui": {
             "attention": {
               "bell": false,
@@ -915,8 +914,7 @@
         "fixture": "routing"
       },
       "session_id": "11111111-1111-4111-8111-111111111111",
-      "task_call_id": "task_call_id-fixture",
-      "trusted_only": true
+      "task_call_id": "task_call_id-fixture"
     },
     "event": "subagent_report"
   },
@@ -931,8 +929,7 @@
         "fixture": "routing"
       },
       "session_id": "11111111-1111-4111-8111-111111111111",
-      "task_call_id": "task_call_id-fixture",
-      "trusted_only": true
+      "task_call_id": "task_call_id-fixture"
     },
     "event": "subagent_routing"
   },
@@ -949,8 +946,7 @@
         "fixture": "routing"
       },
       "session_id": "11111111-1111-4111-8111-111111111111",
-      "task_call_id": "task_call_id-fixture",
-      "trusted_only": true
+      "task_call_id": "task_call_id-fixture"
     },
     "event": "subagent_spawned"
   },
@@ -1035,13 +1031,6 @@
       "tool": "tool-fixture"
     },
     "event": "tool_start"
-  },
-  "trusted_only_state": {
-    "data": {
-      "enabled": true,
-      "session_id": "11111111-1111-4111-8111-111111111111"
-    },
-    "event": "trusted_only_state"
   },
   "usage": {
     "data": {

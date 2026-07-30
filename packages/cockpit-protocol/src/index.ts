@@ -707,7 +707,6 @@ export const knownEventKindSchema = z.enum([
   "tool_error",
   "tool_progress",
   "tool_start",
-  "trusted_only_state",
   "usage",
   "user_message_recorded",
   "user_message_retracted",

@@ -9,7 +9,7 @@
 //! They live in `cockpit-core` rather than in a front end because every
 //! surface that can run a wizard must write identical config. These are the
 //! approval/sandbox/redaction and model-trust/delegation chokepoints
-//! (`sandbox.default_mode`, `default_approval_mode`, `trusted_only`,
+//! (`sandbox.default_mode`, `default_approval_mode`,
 //! `redact.min_secret_length`, model `trust`/`can_delegate`/capability
 //! overrides), so a second copy is a security divergence, not just
 //! duplication. `cockpit setup` (terminal renderer) and the TUI settings
@@ -34,7 +34,7 @@ use crate::wizard::{
     model_capability_answers, model_class_answer, model_context_tokens_answer,
     model_default_thinking_answer, model_make_default_answer, model_max_output_tokens_answer,
     model_ref_answer, model_subagent_answers, model_system_prompt_answer, model_trust_answer,
-    sandbox_mode_answer, trusted_only_answer,
+    sandbox_mode_answer,
 };
 
 /// Build the descriptor for wizard `id`, seeded from the config effective
@@ -68,7 +68,7 @@ pub fn security_config_path(cwd: &Path) -> PathBuf {
 }
 
 /// Persist the security wizard's answers: sandbox default mode, default
-/// approval mode, workspace `trusted_only`, and the redaction minimum
+/// approval mode, and the redaction minimum
 /// secret length. Each field is written only when the answer differs from
 /// the effective value, so an all-defaults run writes nothing and returns
 /// `Ok(None)`; otherwise returns the config file that was written.
@@ -89,12 +89,6 @@ pub fn apply_security_answers(cwd: &Path, run: &WizardRun) -> Result<Option<Path
         && mode != effective.default_approval_mode
     {
         cfg.default_approval_mode = mode;
-        changed = true;
-    }
-    if let Some(enabled) = trusted_only_answer(run)
-        && enabled != effective.trusted_only
-    {
-        cfg.trusted_only = enabled;
         changed = true;
     }
     if let Some(min_secret_length) = min_secret_length_answer(run)
@@ -614,41 +608,7 @@ mod tests {
         let raw = read_json(&config_path);
         assert_eq!(raw["sandbox"]["defaultMode"], "container_readonly");
         assert!(raw.get("defaultApprovalMode").is_none());
-        assert!(raw.get("trustedOnly").is_none());
-        assert!(raw.get("trusted_only").is_none());
         assert!(raw.get("redact").is_none());
-    }
-
-    #[test]
-    fn security_wizard_writes_all_four_fields() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("global-config.json");
-        let _guard = CockpitConfigEnvGuard::set(&config_path);
-        let mut run = security_run_for_cwd(tmp.path());
-        submit_security_wizard_until_save(
-            &mut run,
-            &[
-                ("sandbox", WizardAnswer::Select("container".to_string())),
-                ("approval", WizardAnswer::Select("auto".to_string())),
-                ("trusted-only", WizardAnswer::Confirm(true)),
-                ("redaction", WizardAnswer::Text("24".to_string())),
-            ],
-        );
-
-        let saved = apply_security_answers(tmp.path(), &run).unwrap();
-
-        assert_eq!(saved.as_deref(), Some(config_path.as_path()));
-        let cfg = crate::config::extended::load_for_cwd(tmp.path());
-        assert_eq!(
-            cfg.sandbox.default_mode,
-            crate::tools::sandbox_mode::SandboxMode::Container
-        );
-        assert_eq!(
-            cfg.default_approval_mode,
-            crate::config::extended::ApprovalMode::Auto
-        );
-        assert!(cfg.trusted_only);
-        assert_eq!(cfg.redact.min_secret_length, 24);
     }
 
     #[test]
@@ -681,7 +641,7 @@ mod tests {
         let parent_config = parent.join(".cockpit/config.json");
         std::fs::create_dir_all(parent_config.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&child).unwrap();
-        std::fs::write(&parent_config, r#"{"trustedOnly":true}"#).unwrap();
+        std::fs::write(&parent_config, r#"{}"#).unwrap();
         let before = std::fs::read_to_string(&parent_config).unwrap();
         let policy = trust_policy_for(
             &parent,

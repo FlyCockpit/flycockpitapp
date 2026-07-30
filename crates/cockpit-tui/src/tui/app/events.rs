@@ -725,7 +725,6 @@ impl App {
                 child,
                 task_call_id,
                 label,
-                trusted_only,
                 model_trusted,
                 routing,
                 ..
@@ -742,7 +741,6 @@ impl App {
                     child,
                     task_call_id,
                     label,
-                    trusted_only,
                     model_trusted,
                     routing: subagent_routing_chips_from_value(&routing),
                     spawned_at: Instant::now(),
@@ -754,13 +752,11 @@ impl App {
                 child,
                 task_call_id,
                 label,
-                trusted_only,
                 model_trusted,
                 routing,
                 ..
             } => {
                 let update = SubagentRoutingUpdate {
-                    trusted_only,
                     model_trusted,
                     routing: subagent_routing_chips_from_value(&routing),
                 };
@@ -797,7 +793,6 @@ impl App {
                 label,
                 report,
                 failed,
-                trusted_only,
                 model_trusted,
                 routing,
             } => {
@@ -805,7 +800,6 @@ impl App {
                 let update = SubagentReportUpdate {
                     report,
                     failed,
-                    trusted_only,
                     model_trusted,
                     routing: subagent_routing_chips_from_value(&routing),
                 };
@@ -1316,13 +1310,6 @@ impl App {
                         ToastKind::Info,
                     );
                 }
-            }
-            TurnEvent::TrustedOnlyState { enabled } => {
-                self.trusted_only_enabled = enabled;
-                self.show_toast(
-                    format!("trusted-only {}", if enabled { "on" } else { "off" }),
-                    ToastKind::Info,
-                );
             }
             TurnEvent::SandboxEscalationState { enabled } => {
                 self.sandbox_escalation_enabled = enabled;
@@ -2098,7 +2085,6 @@ pub(super) fn wire_history_to_entries(
                 child,
                 task_call_id,
                 label,
-                trusted_only: false,
                 model_trusted: false,
                 routing: SubagentRoutingChips::default(),
                 spawned_at: Instant::now(),
@@ -2779,14 +2765,12 @@ pub(super) fn xml_escape(s: &str) -> String {
 pub(super) struct SubagentReportUpdate {
     pub(super) report: String,
     pub(super) failed: bool,
-    pub(super) trusted_only: bool,
     pub(super) model_trusted: bool,
     pub(super) routing: SubagentRoutingChips,
 }
 
 #[derive(Clone)]
 pub(super) struct SubagentRoutingUpdate {
-    pub(super) trusted_only: bool,
     pub(super) model_trusted: bool,
     pub(super) routing: SubagentRoutingChips,
 }
@@ -2854,7 +2838,6 @@ pub(super) fn settle_subagent_in(
     let SubagentReportUpdate {
         report,
         failed,
-        trusted_only,
         model_trusted,
         routing,
     } = update;
@@ -2871,7 +2854,6 @@ pub(super) fn settle_subagent_in(
                 spawned_at,
                 outcome: outcome @ None,
                 expanded,
-                trusted_only: entry_trusted_only,
                 model_trusted: entry_model_trusted,
                 routing: entry_routing,
                 ..
@@ -2879,22 +2861,13 @@ pub(super) fn settle_subagent_in(
                 spawned_at,
                 outcome,
                 expanded,
-                entry_trusted_only,
                 entry_model_trusted,
                 entry_routing,
             )),
             _ => None,
         });
     match found {
-        Some((
-            spawned_at,
-            outcome,
-            expanded,
-            entry_trusted_only,
-            entry_model_trusted,
-            entry_routing,
-        )) => {
-            *entry_trusted_only = trusted_only;
+        Some((spawned_at, outcome, expanded, entry_model_trusted, entry_routing)) => {
             *entry_model_trusted = model_trusted;
             *entry_routing = routing;
             *outcome = Some(SubagentOutcome {
@@ -2912,7 +2885,6 @@ pub(super) fn settle_subagent_in(
             child: child.to_string(),
             task_call_id: task_call_id.to_string(),
             label: label.to_string(),
-            trusted_only,
             model_trusted,
             routing,
             spawned_at: Instant::now(),
@@ -2934,27 +2906,26 @@ pub(super) fn amend_subagent_routing_in(
     label: &str,
     update: SubagentRoutingUpdate,
 ) -> bool {
-    let Some((entry_trusted_only, entry_model_trusted, entry_routing)) = history
-        .iter_mut_entries()
-        .rev()
-        .find_map(|entry| match entry {
-            HistoryEntry::Subagent {
-                child: c,
-                task_call_id: call,
-                label: entry_label,
-                trusted_only,
-                model_trusted,
-                routing,
-                ..
-            } if c == child && call == task_call_id && entry_label == label => {
-                Some((trusted_only, model_trusted, routing))
-            }
-            _ => None,
-        })
+    let Some((entry_model_trusted, entry_routing)) =
+        history
+            .iter_mut_entries()
+            .rev()
+            .find_map(|entry| match entry {
+                HistoryEntry::Subagent {
+                    child: c,
+                    task_call_id: call,
+                    label: entry_label,
+                    model_trusted,
+                    routing,
+                    ..
+                } if c == child && call == task_call_id && entry_label == label => {
+                    Some((model_trusted, routing))
+                }
+                _ => None,
+            })
     else {
         return false;
     };
-    *entry_trusted_only = update.trusted_only;
     *entry_model_trusted = update.model_trusted;
     *entry_routing = update.routing;
     true

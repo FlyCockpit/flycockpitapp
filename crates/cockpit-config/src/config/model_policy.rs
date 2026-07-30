@@ -39,7 +39,6 @@ pub struct ModelPolicyRequest<'a> {
     pub required_capabilities: Vec<RequiredModelCapability>,
     pub min_context_tokens: Option<u32>,
     pub require_subagent_invokable: bool,
-    pub trusted_only: bool,
     pub optimize: ModelOptimization,
     pub role: Option<&'a str>,
     pub agent: Option<&'a str>,
@@ -54,7 +53,6 @@ impl<'a> ModelPolicyRequest<'a> {
             required_capabilities: Vec::new(),
             min_context_tokens: None,
             require_subagent_invokable: true,
-            trusted_only: false,
             optimize: ModelOptimization::default(),
             role: Some(category),
             agent: None,
@@ -123,10 +121,6 @@ pub enum ModelPolicyError {
         provider: String,
         model: String,
     },
-    Untrusted {
-        provider: String,
-        model: String,
-    },
     MissingCapability {
         provider: String,
         model: String,
@@ -155,9 +149,6 @@ impl std::fmt::Display for ModelPolicyError {
             }
             Self::NotSubagentInvokable { provider, model } => {
                 write!(f, "model `{provider}:{model}` is not subagent-invokable")
-            }
-            Self::Untrusted { provider, model } => {
-                write!(f, "model `{provider}:{model}` is untrusted")
             }
             Self::MissingCapability {
                 provider,
@@ -466,12 +457,6 @@ impl ProvidersConfig {
                 model: model.id.clone(),
             });
         }
-        if request.trusted_only && !self.resolve_trust(provider, &model.id).is_trusted() {
-            return Err(ModelPolicyError::Untrusted {
-                provider: provider.to_string(),
-                model: model.id.clone(),
-            });
-        }
         if !self.providers.get(provider).is_some_and(|entry| {
             entry.availability.permits(
                 match request.selector {
@@ -550,7 +535,6 @@ impl ProvidersConfig {
                 required_capabilities: vec![RequiredModelCapability::Embeddings],
                 min_context_tokens: None,
                 require_subagent_invokable: false,
-                trusted_only: false,
                 optimize: ModelOptimization::Balanced,
                 role: Some("embedding_model"),
                 agent: None,

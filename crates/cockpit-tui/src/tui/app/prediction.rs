@@ -50,14 +50,8 @@ impl App {
                     return;
                 }
             };
-            let trusted_only = Arc::new(std::sync::atomic::AtomicBool::new(extended.trusted_only));
             let text = cockpit_core::engine::predict::predict(
-                &turns,
-                mode,
-                &extended,
-                &providers,
-                redactor,
-                trusted_only,
+                &turns, mode, &extended, &providers, redactor,
             )
             .await;
             if let Ok(mut guard) = slot.lock() {

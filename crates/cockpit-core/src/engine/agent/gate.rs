@@ -163,7 +163,6 @@ pub(super) async fn safety_gate_decision_with_configs(
         model_ref,
         providers,
         ctx.redact.clone(),
-        ctx.session.trusted_only_flag(),
         Some(ctx.shutdown_gate.clone()),
         tool,
         &payload,
@@ -231,7 +230,6 @@ async fn evaluate_for_gate(
     model_ref: Option<&str>,
     providers: &crate::config::providers::ProvidersConfig,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
-    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown_gate: Option<crate::daemon::shutdown::ShutdownSignal>,
     tool: &str,
     payload: &str,
@@ -245,16 +243,8 @@ async fn evaluate_for_gate(
             return outcome;
         }
     }
-    crate::engine::safety_gate::evaluate(
-        model_ref,
-        providers,
-        redact,
-        trusted_only,
-        shutdown_gate,
-        tool,
-        payload,
-    )
-    .await
+    crate::engine::safety_gate::evaluate(model_ref, providers, redact, shutdown_gate, tool, payload)
+        .await
 }
 
 async fn standing_reject_gate_block(tool: &str, args: &Value, ctx: &ToolCtx) -> Option<GateBlock> {

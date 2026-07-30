@@ -230,7 +230,6 @@ pub fn resolve_policy_selector(
                 required_capabilities,
                 min_context_tokens: *min_context_tokens,
                 require_subagent_invokable: true,
-                trusted_only: false,
                 optimize: ModelOptimization::Balanced,
                 role: default_category,
                 agent: Some(agent_name),
@@ -269,7 +268,6 @@ pub fn resolve_policy_selector(
                 required_capabilities,
                 min_context_tokens: *min_context_tokens,
                 require_subagent_invokable: true,
-                trusted_only: trust.is_some_and(ModelTrust::is_trusted),
                 optimize: *optimize,
                 role: Some(category),
                 agent: Some(agent_name),
@@ -313,7 +311,6 @@ pub fn resolve_delegated_model(
             required_capabilities: default_required_capabilities_for_agent(agent_name),
             min_context_tokens: None,
             require_subagent_invokable: true,
-            trusted_only: false,
             optimize: ModelOptimization::Balanced,
             role: Some(role.as_str()),
             agent: Some(agent_name),
@@ -338,24 +335,22 @@ fn build_model(
 ) -> anyhow::Result<Arc<Model>> {
     let selector = selector.trim();
     if let Some((provider, model)) = selector.split_once(':') {
-        return Model::for_provider_trusted_only(
+        return Model::for_provider(
             providers,
             provider,
             model,
             session_model.session_redact_table(),
-            session_model.trusted_only_flag(),
         )
         .map(Arc::new);
     }
     let Some((provider, model)) = crate::config::provider::split_provider_model(selector) else {
         anyhow::bail!("model selector `{selector}` must be provider:model or provider/model");
     };
-    Model::for_provider_trusted_only(
+    Model::for_provider(
         providers,
         &provider,
         &model,
         session_model.session_redact_table(),
-        session_model.trusted_only_flag(),
     )
     .map(Arc::new)
 }
@@ -369,12 +364,11 @@ fn build_policy_model(
         .resolve_model_policy(request)
         .map_err(policy_error_message)
         .map_err(SelectorResolution::InvalidLiteral)?;
-    Model::for_provider_trusted_only(
+    Model::for_provider(
         providers,
         &resolved.provider,
         &resolved.model,
         session_model.session_redact_table(),
-        session_model.trusted_only_flag(),
     )
     .map(Arc::new)
     .map_err(|e| SelectorResolution::InvalidLiteral(format!("{e:#}")))
@@ -403,7 +397,6 @@ pub fn render_model_discovery(caller_agent: &str, providers: &ProvidersConfig) -
             required_capabilities: Vec::new(),
             min_context_tokens: None,
             require_subagent_invokable: true,
-            trusted_only: false,
             optimize: ModelOptimization::Balanced,
             role: Some(&category),
             agent: Some(caller_agent),
@@ -440,7 +433,6 @@ pub fn render_model_discovery(caller_agent: &str, providers: &ProvidersConfig) -
                 required_capabilities: Vec::new(),
                 min_context_tokens: None,
                 require_subagent_invokable: true,
-                trusted_only: false,
                 optimize: ModelOptimization::Balanced,
                 role: None,
                 agent: Some(caller_agent),
@@ -698,9 +690,6 @@ fn policy_error_message(error: ModelPolicyError) -> String {
         }
         ModelPolicyError::NotSubagentInvokable { provider, model } => {
             format!("model `{provider}:{model}` is not available for subagent invocation")
-        }
-        ModelPolicyError::Untrusted { provider, model } => {
-            format!("model `{provider}:{model}` is untrusted")
         }
         ModelPolicyError::MissingCapability {
             provider,

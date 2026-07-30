@@ -41,7 +41,6 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
     session.set_sandbox_enabled(true);
     session.set_approval_mode(extended.default_approval_mode);
     session.set_shell_compression(extended.shell_compression);
-    session.set_trusted_only(extended.trusted_only);
     if let Some(active) = providers.active_model.as_ref() {
         session
             .set_active_model(&active.provider, &active.model)
@@ -53,12 +52,9 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
             .context("building redaction table")?,
     );
     let model = Arc::new(
-        Model::from_config_with_env_trusted_only(
-            &providers,
-            redact.clone(),
-            session.trusted_only_flag(),
-            |name| env.vars().get(name).cloned(),
-        )
+        Model::from_config_with_env(&providers, redact.clone(), |name| {
+            env.vars().get(name).cloned()
+        })
         .context("resolving active model")?,
     );
     let reasoning_params = model.resolve_reasoning_params(&providers);

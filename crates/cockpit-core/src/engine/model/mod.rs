@@ -30,7 +30,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -257,10 +256,6 @@ pub enum Model {
         subagent_invokable: bool,
         /// Whether this resolved provider/model may delegate to subagents.
         can_delegate: bool,
-        /// Live session trusted-only flag. Checked immediately before every
-        /// provider dispatch so `/trusted-only` applies to already-built
-        /// active, backup, tandem, and utility model handles.
-        trusted_only: Arc<AtomicBool>,
         /// Daemon-wide graceful-shutdown gate
         /// (`daemon-graceful-drain-shutdown.md`). Every outbound provider
         /// request consults it; once the daemon begins draining it refuses
@@ -308,8 +303,6 @@ pub enum Model {
         subagent_invokable: bool,
         /// Same routing-audit delegation permission metadata as [`Model::OpenAi`].
         can_delegate: bool,
-        /// Same live trusted-only flag as [`Model::OpenAi`].
-        trusted_only: Arc<AtomicBool>,
         /// Same daemon graceful-shutdown gate as [`Model::OpenAi`].
         gate: crate::daemon::shutdown::ShutdownSignal,
         /// Same session redaction table as [`Model::OpenAi`].
@@ -357,8 +350,6 @@ pub enum Model {
         subagent_invokable: bool,
         /// Same routing-audit delegation permission metadata as [`Model::OpenAi`].
         can_delegate: bool,
-        /// Same live trusted-only flag as [`Model::OpenAi`].
-        trusted_only: Arc<AtomicBool>,
         /// Same daemon graceful-shutdown gate as [`Model::OpenAi`].
         gate: crate::daemon::shutdown::ShutdownSignal,
         /// Same session redaction table as [`Model::OpenAi`].
@@ -422,7 +413,6 @@ impl Model {
             "matched_capabilities": [],
             "subagent_invokable": self.subagent_invokable(),
             "can_delegate": self.can_delegate(),
-            "trusted_only": self.trusted_only_enabled(),
         })
     }
 
@@ -472,45 +462,8 @@ impl Model {
         }
     }
 
-    /// Whether the live session trusted-only flag is currently active.
-    pub fn trusted_only_enabled(&self) -> bool {
-        self.trusted_only_flag().load(Ordering::Relaxed)
-    }
-
-    /// Clone the live trusted-only flag carried by this model.
-    pub fn trusted_only_flag(&self) -> Arc<AtomicBool> {
-        match self {
-            Model::OpenAi { trusted_only, .. }
-            | Model::ChatGpt { trusted_only, .. }
-            | Model::Anthropic { trusted_only, .. } => trusted_only.clone(),
-        }
-    }
-
-    fn trusted_only_violation(provider_id: &str, model_id: &str) -> anyhow::Error {
-        outbound_guard::trusted_only_violation(provider_id, model_id)
-    }
-
     fn outbound_guard(&self) -> OutboundGuard {
-        OutboundGuard::new(
-            self.provider_id(),
-            self.model_id_ref(),
-            self.trusted_only_flag(),
-            self.is_trusted(),
-            self.redact_table(),
-        )
-    }
-
-    fn ensure_trusted_only_build_allowed(
-        cfg: &ProvidersConfig,
-        provider_id: &str,
-        model_id: &str,
-        trusted_only: &Arc<AtomicBool>,
-    ) -> Result<bool> {
-        let trusted = cfg.resolve_trust(provider_id, model_id).is_trusted();
-        if trusted_only.load(Ordering::Relaxed) && !trusted {
-            return Err(Self::trusted_only_violation(provider_id, model_id));
-        }
-        Ok(trusted)
+        OutboundGuard::new(self.redact_table())
     }
 
     /// The effective outbound-provider redaction table. A disabled session

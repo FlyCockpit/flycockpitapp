@@ -311,7 +311,6 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             prompt,
             requested_cwd,
             resolved_cwd,
-            trusted_only,
             model_trusted,
             routing,
         } => vec![Event::SubagentSpawned {
@@ -323,7 +322,6 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             prompt,
             requested_cwd,
             resolved_cwd,
-            trusted_only,
             model_trusted,
             routing,
         }],
@@ -333,7 +331,6 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             child,
             provider,
             model,
-            trusted_only,
             model_trusted,
             routing,
         } => vec![Event::SubagentRouting {
@@ -343,7 +340,6 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             child,
             provider,
             model,
-            trusted_only,
             model_trusted,
             routing,
         }],
@@ -353,7 +349,6 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             label,
             report,
             failed,
-            trusted_only,
             model_trusted,
             routing,
         } => {
@@ -364,7 +359,6 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                 label,
                 report,
                 failed,
-                trusted_only,
                 model_trusted,
                 routing,
             }]
@@ -576,12 +570,6 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                 supported,
             }]
         }
-        TurnEvent::TrustedOnlyState { enabled } => {
-            vec![Event::TrustedOnlyState {
-                session_id,
-                enabled,
-            }]
-        }
         TurnEvent::ApprovalModeState { mode } => {
             vec![Event::ApprovalModeState { session_id, mode }]
         }
@@ -720,7 +708,6 @@ mod tests {
                 child: "explore".to_string(),
                 provider: "test-provider".to_string(),
                 model: "child-model".to_string(),
-                trusted_only: true,
                 model_trusted: false,
                 routing: routing.clone(),
             },
@@ -736,7 +723,6 @@ mod tests {
                     child,
                     provider,
                     model,
-                    trusted_only,
                     model_trusted,
                     routing: actual_routing,
                 },
@@ -747,7 +733,6 @@ mod tests {
                 assert_eq!(child, "explore");
                 assert_eq!(provider, "test-provider");
                 assert_eq!(model, "child-model");
-                assert!(*trusted_only);
                 assert!(!*model_trusted);
                 assert_eq!(actual_routing, &routing);
             }

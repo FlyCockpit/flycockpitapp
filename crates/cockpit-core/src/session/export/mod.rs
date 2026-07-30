@@ -293,7 +293,6 @@ fn transcript_json_from_history(history: &[proto::HistoryEntry]) -> Value {
                     "type": "subagent",
                     "parent": parent,
                     "child": child,
-                    "trusted_only": false,
                     "model_trusted": false,
                     "routing": {
                         "model": Option::<String>::None,

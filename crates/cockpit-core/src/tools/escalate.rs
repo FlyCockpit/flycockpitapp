@@ -252,7 +252,6 @@ async fn approval_for_escalation(
                 extended.guard_model_ref(),
                 &providers,
                 ctx.redact.clone(),
-                ctx.session.trusted_only_flag(),
                 None,
                 "bash",
                 command,

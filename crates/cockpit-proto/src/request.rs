@@ -703,16 +703,6 @@ pub enum Request {
         enabled: Option<bool>,
     },
 
-    /// Set (or toggle) trusted-only inference mode for the attached session
-    /// (`/trusted-only`). `enabled = None` toggles the live session state;
-    /// `Some(true)`/`Some(false)` set it explicitly. Effective immediately
-    /// for subsequent provider dispatches, including already-built model
-    /// handles. Acked with [`Event::TrustedOnlyState`].
-    SetTrustedOnly {
-        #[serde(default)]
-        enabled: Option<bool>,
-    },
-
     /// Toggle redaction sources for the attached session at runtime
     /// (`/toggle-redaction`). `scan_environment`/`scan_dotenv`/`scan_ssh_keys`
     /// each set the matching source explicitly (`Some`) or leave it unchanged
@@ -957,7 +947,6 @@ macro_rules! request_variants {
             (Request::SetSandboxEscalation { .. }, "set_sandbox_escalation");
             (Request::SetPreflight { .. }, "set_preflight");
             (Request::SetLongcache { .. }, "set_longcache");
-            (Request::SetTrustedOnly { .. }, "set_trusted_only");
             (Request::SetRedaction { .. }, "set_redaction");
             (Request::SetTandemModels { .. }, "set_tandem_models");
             (Request::SetCaffeinate { .. }, "set_caffeinate");
@@ -1092,7 +1081,6 @@ macro_rules! command {
             (Request::SetSandboxEscalation { .. }, "set_sandbox_escalation", session_writer, attached, true, serialized, none);
             (Request::SetPreflight { .. }, "set_preflight", session_writer, attached, true, serialized, none);
             (Request::SetLongcache { .. }, "set_longcache", session_writer, attached, true, serialized, none);
-            (Request::SetTrustedOnly { .. }, "set_trusted_only", session_writer, attached, true, serialized, none);
             (Request::SetRedaction { .. }, "set_redaction", session_writer, attached, true, serialized, none);
             (Request::SetTandemModels { .. }, "set_tandem_models", session_writer, attached, true, serialized, none);
             (Request::SetCaffeinate { .. }, "set_caffeinate", owner_only, none, true, serialized, none);

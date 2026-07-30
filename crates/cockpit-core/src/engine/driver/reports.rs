@@ -72,14 +72,13 @@ pub(crate) fn build_backup_model(
     model: &crate::engine::model::Model,
 ) -> Option<Arc<crate::engine::model::Model>> {
     let backup = providers.resolve_backup(model.provider_id(), model.model_id_ref())?;
-    let built = crate::engine::model::Model::for_provider_trusted_only(
+    let built = crate::engine::model::Model::for_provider(
         providers,
         &backup.provider,
         &backup.model,
         // Start from the primary's session redaction table, then let the
         // backup target resolve its own trust policy.
         model.session_redact_table(),
-        model.trusted_only_flag(),
     )
     .ok()?;
     let built = built.with_shutdown_gate(model.shutdown_gate());
@@ -111,11 +110,6 @@ pub(crate) fn build_failover_models(
             if !providers.resolve_subagent_invokable(provider_id, &entry.id) {
                 continue;
             }
-            if model.trusted_only_enabled()
-                && !providers.resolve_trust(provider_id, &entry.id).is_trusted()
-            {
-                continue;
-            }
             if configured_backup
                 .as_ref()
                 .is_some_and(|backup| backup.provider == *provider_id && backup.model == entry.id)
@@ -125,7 +119,6 @@ pub(crate) fn build_failover_models(
             discovered.push((
                 provider_id.clone(),
                 entry.id.clone(),
-                providers.resolve_trust(provider_id, &entry.id).is_trusted(),
                 providers.resolve_quality_rank(provider_id, &entry.id),
                 providers.resolve_cost_rank(provider_id, &entry.id),
             ));
@@ -133,24 +126,22 @@ pub(crate) fn build_failover_models(
     }
     discovered.sort_by(|a, b| {
         b.2.cmp(&a.2)
-            .then_with(|| b.3.cmp(&a.3))
-            .then_with(|| a.4.cmp(&b.4))
+            .then_with(|| a.3.cmp(&b.3))
             .then_with(|| a.0.cmp(&b.0))
             .then_with(|| a.1.cmp(&b.1))
     });
-    for (provider, model_id, _, _, _) in discovered {
+    for (provider, model_id, _, _) in discovered {
         refs.push((provider, model_id, false));
     }
 
     refs.into_iter()
         .take(crate::engine::agent::MAX_FAILOVER_CANDIDATES.saturating_sub(1))
         .filter_map(|(provider, model_id, _configured)| {
-            let built = crate::engine::model::Model::for_provider_trusted_only(
+            let built = crate::engine::model::Model::for_provider(
                 providers,
                 &provider,
                 &model_id,
                 model.session_redact_table(),
-                model.trusted_only_flag(),
             )
             .ok()?;
             let built = built.with_shutdown_gate(model.shutdown_gate());

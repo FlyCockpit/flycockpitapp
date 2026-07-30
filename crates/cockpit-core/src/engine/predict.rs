@@ -227,7 +227,6 @@ pub async fn predict(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     redactor: std::sync::Arc<crate::redact::RedactionTable>,
-    trusted_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<String> {
     if !mode.is_enabled() {
         return None;
@@ -239,12 +238,7 @@ pub async fn predict(
     }
 
     let model_ref = extended.predict_next_message_model_ref()?;
-    let model = match crate::engine::model::Model::from_ref_trusted_only(
-        providers,
-        model_ref,
-        redactor,
-        trusted_only,
-    ) {
+    let model = match crate::engine::model::Model::from_ref(providers, model_ref, redactor) {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(error = %e, "predict: model build failed; no ghost text");

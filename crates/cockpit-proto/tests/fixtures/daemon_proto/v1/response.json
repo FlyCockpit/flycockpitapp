@@ -1073,12 +1073,6 @@
     },
     "response": "terminal_paste_image"
   },
-  "trusted_only_state": {
-    "data": {
-      "enabled": true
-    },
-    "response": "trusted_only_state"
-  },
   "usage_counts": {
     "data": {
       "models": {

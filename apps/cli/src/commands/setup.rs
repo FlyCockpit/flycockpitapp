@@ -1144,25 +1144,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn trusted_only_step_toggles_policy() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let _env = CockpitConfigEnvGuard::set_async(&tmp.path().join("config.json")).await;
-
-        let (_, _, actions) = run_security_script(tmp.path(), &["", "", "y", ""]).await;
-
-        let path = actions.security_saved.expect("security config saved");
-        let raw: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).expect("read config"))
-                .expect("json");
-        assert_eq!(raw["trustedOnly"], true);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn redaction_step_validates_numeric() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _env = CockpitConfigEnvGuard::set_async(&tmp.path().join("config.json")).await;
 
-        let (_, io, actions) = run_security_script(tmp.path(), &["", "", "", "0", "12"]).await;
+        let (_, io, actions) = run_security_script(tmp.path(), &["", "", "0", "12"]).await;
 
         assert!(io.output.contains("enter a number from 1 to 4096"));
         let path = actions.security_saved.expect("security config saved");

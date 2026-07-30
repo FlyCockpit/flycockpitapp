@@ -200,7 +200,6 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         }
         | proto::Response::PreflightState { enabled: _ }
         | proto::Response::LongcacheState { enabled: _ }
-        | proto::Response::TrustedOnlyState { enabled: _ }
         | proto::Response::ApprovalModeState { mode: _ }
         | proto::Response::DelegationRecursionState {
             enabled: _,
@@ -542,10 +541,6 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             scan_dotenv: _,
             scan_ssh_keys: _,
         }
-        | proto::Event::TrustedOnlyState {
-            session_id: _,
-            enabled: _,
-        }
         | proto::Event::LongcacheState {
             session_id: _,
             enabled: _,
@@ -763,7 +758,6 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             prompt,
             requested_cwd,
             resolved_cwd,
-            trusted_only: _,
             model_trusted: _,
             routing,
         } => {
@@ -780,7 +774,6 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             child: _,
             provider,
             model,
-            trusted_only: _,
             model_trusted: _,
             routing,
         } => {
@@ -796,7 +789,6 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             label,
             report,
             failed: _,
-            trusted_only: _,
             model_trusted: _,
             routing,
         } => {

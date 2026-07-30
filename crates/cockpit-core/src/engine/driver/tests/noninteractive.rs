@@ -117,7 +117,6 @@ async fn child_routing_metadata_carries_fallback_chain() {
     let routing = ChildRoutingMetadata {
         provider: "healthy".to_string(),
         model: "healthy".to_string(),
-        trusted_only: false,
         model_trusted: true,
         routing: serde_json::json!({ "fallback_decision": "none" }),
     }
@@ -593,7 +592,6 @@ fn child_routing_for(model: &str) -> ChildRoutingMetadata {
     ChildRoutingMetadata {
         provider: "lmstudio".to_string(),
         model: model.to_string(),
-        trusted_only: false,
         model_trusted: true,
         routing: serde_json::json!({
             "provider": "lmstudio",

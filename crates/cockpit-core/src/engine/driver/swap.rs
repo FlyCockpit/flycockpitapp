@@ -290,12 +290,11 @@ impl Driver {
         let mut providers = self.live_providers_config()?;
         providers.active_model = Some(active.clone());
         let env_overlay = self.stack[0].agent.env_overlay.clone();
-        let mut built = crate::engine::model::Model::for_provider_with_env_trusted_only(
+        let mut built = crate::engine::model::Model::for_provider_with_env(
             &providers,
             &active.provider,
             &active.model,
             self.redact.clone(),
-            running.trusted_only_flag(),
             move |name| {
                 env_overlay
                     .read()

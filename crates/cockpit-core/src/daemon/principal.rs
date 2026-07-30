@@ -346,7 +346,6 @@ mod tests {
             "set_sandbox",
             "set_sandbox_escalation",
             "set_preflight",
-            "set_trusted_only",
             "set_redaction",
             "set_tandem_models",
         ] {

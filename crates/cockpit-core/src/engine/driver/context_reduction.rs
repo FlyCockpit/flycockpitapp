@@ -1240,11 +1240,10 @@ impl Driver {
         // agent's model and surfaces a terse one-line notice — losing the
         // handoff is worse than using the wrong model (priority #1).
         let compact_model = match extended.compact_model_ref() {
-            Some(model_ref) => match crate::engine::model::Model::from_ref_trusted_only(
+            Some(model_ref) => match crate::engine::model::Model::from_ref(
                 &providers,
                 model_ref,
                 self.redact.clone(),
-                top.agent.model.trusted_only_flag(),
             ) {
                 Ok(m) => Some(m.with_shutdown_gate(top.agent.model.shutdown_gate())),
                 Err(e) => {

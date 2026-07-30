@@ -527,7 +527,6 @@ pub(crate) async fn phase_10_dispatch_one_call(
                                 "prompt": prompt,
                                 "mode": mode,
                                 "model": model.as_ref().map(|selector| selector.to_json()),
-                                "trusted_only": agent.model.trusted_only_enabled(),
                                 "model_trusted": agent.model.is_trusted(),
                                 "routing": routing.clone(),
                                 "remaining_depth": remaining_depth,
@@ -550,7 +549,6 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             prompt: prompt.clone(),
                             requested_cwd: None,
                             resolved_cwd: None,
-                            trusted_only: agent.model.trusted_only_enabled(),
                             model_trusted: agent.model.is_trusted(),
                             routing,
                         })
@@ -1362,7 +1360,6 @@ pub(crate) async fn run_turn(
                 &text,
                 &config,
                 redact.clone(),
-                session.trusted_only_flag(),
                 Some(agent.model.shutdown_gate()),
             )
             .await

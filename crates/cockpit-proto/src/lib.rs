@@ -1210,6 +1210,27 @@ pub struct AssistantSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinnedMessage {
+    pub seq: i64,
+    pub is_assistant: bool,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinState {
+    pub count: i64,
+    pub seqs: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectNote {
+    pub id: Uuid,
+    pub project_root: String,
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssistantSessionCreated {
     pub session_id: Uuid,
     pub short_id: String,

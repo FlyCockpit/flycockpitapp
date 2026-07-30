@@ -391,6 +391,98 @@ pub(super) async fn handle_serialized_request(
             Ok(Response::GoalCleared { cleared })
         }
 
+        Request::PinMessage { session_id, seq } => ctx
+            .db
+            .pin_message(session_id, seq)
+            .await
+            .map(|changed| Response::PinChanged { changed })
+            .map_err(|error| bad_request(error.to_string())),
+        Request::UnpinMessage { session_id, seq } => ctx
+            .db
+            .unpin_message(session_id, seq)
+            .await
+            .map(|changed| Response::PinChanged { changed })
+            .map_err(|error| bad_request(error.to_string())),
+        Request::TogglePinnedMessage { session_id, seq } => ctx
+            .db
+            .toggle_pin(session_id, seq)
+            .await
+            .map(|pinned| Response::PinToggled { pinned })
+            .map_err(|error| bad_request(error.to_string())),
+        Request::CountPinnedMessages { session_id } => ctx
+            .db
+            .count_pins(session_id)
+            .await
+            .map(|count| Response::PinCount { count })
+            .map_err(internal),
+        Request::ListPinnedMessageSeqs { session_id } => ctx
+            .db
+            .list_pin_seqs(session_id)
+            .await
+            .map(|seqs| Response::PinSeqs { seqs })
+            .map_err(internal),
+        Request::ListPinnedMessagesWithText { session_id } => ctx
+            .db
+            .list_pins_with_text(session_id)
+            .await
+            .map(|pins| Response::PinsWithText {
+                pins: pins.into_iter().map(pinned_message_to_proto).collect(),
+            })
+            .map_err(internal),
+        Request::PinnedMessageState { session_id } => {
+            let count = ctx.db.count_pins(session_id).await.map_err(internal)?;
+            let seqs = ctx.db.list_pin_seqs(session_id).await.map_err(internal)?;
+            Ok(Response::PinState {
+                state: proto::PinState { count, seqs },
+            })
+        }
+
+        Request::ListProjectNotes { project_root } => ctx
+            .db
+            .list_project_notes(&project_root)
+            .await
+            .map(|notes| Response::ProjectNotes {
+                notes: notes.into_iter().map(project_note_to_proto).collect(),
+            })
+            .map_err(internal),
+        Request::CreateProjectNote { project_root, name } => ctx
+            .db
+            .create_project_note(&project_root, &name)
+            .await
+            .map(|note| Response::ProjectNoteCreated {
+                note: project_note_to_proto(note),
+            })
+            .map_err(|error| bad_request(error.to_string())),
+        Request::SetProjectNoteContent {
+            project_root,
+            id,
+            content,
+        } => {
+            ensure_project_note_member(&ctx.db, &project_root, id).await?;
+            ctx.db
+                .set_project_note_content(id, &content)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+        Request::RenameProjectNote {
+            project_root,
+            id,
+            name,
+        } => {
+            ensure_project_note_member(&ctx.db, &project_root, id).await?;
+            ctx.db
+                .rename_project_note(id, &name)
+                .await
+                .map(|name| Response::ProjectNoteRenamed { name })
+                .map_err(|error| bad_request(error.to_string()))
+        }
+        Request::DeleteProjectNote { project_root, id } => {
+            ensure_project_note_member(&ctx.db, &project_root, id).await?;
+            ctx.db.delete_project_note(id).await.map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
         Request::ListAssistants => {
             let assistants = ctx
                 .db
@@ -402,6 +494,19 @@ pub(super) async fn handle_serialized_request(
                 .collect();
             Ok(Response::Assistants { assistants })
         }
+        Request::UpsertAssistant {
+            name,
+            home_dir,
+            config_json,
+            content_hash,
+        } => ctx
+            .db
+            .upsert_assistant(&name, &home_dir, &config_json, &content_hash)
+            .await
+            .map(|row| Response::AssistantUpserted {
+                assistant: assistant_to_proto(row),
+            })
+            .map_err(|error| bad_request(error.to_string())),
 
         Request::CreateAssistantSession {
             name,
@@ -1402,6 +1507,33 @@ pub(super) async fn handle_concurrent_request(
                 .map(assistant_to_proto)
                 .collect();
             Ok(Response::Assistants { assistants })
+        }
+        Request::CountPinnedMessages { session_id } => ctx
+            .db
+            .count_pins(session_id)
+            .await
+            .map(|count| Response::PinCount { count })
+            .map_err(internal),
+        Request::ListPinnedMessageSeqs { session_id } => ctx
+            .db
+            .list_pin_seqs(session_id)
+            .await
+            .map(|seqs| Response::PinSeqs { seqs })
+            .map_err(internal),
+        Request::ListPinnedMessagesWithText { session_id } => ctx
+            .db
+            .list_pins_with_text(session_id)
+            .await
+            .map(|pins| Response::PinsWithText {
+                pins: pins.into_iter().map(pinned_message_to_proto).collect(),
+            })
+            .map_err(internal),
+        Request::PinnedMessageState { session_id } => {
+            let count = ctx.db.count_pins(session_id).await.map_err(internal)?;
+            let seqs = ctx.db.list_pin_seqs(session_id).await.map_err(internal)?;
+            Ok(Response::PinState {
+                state: proto::PinState { count, seqs },
+            })
         }
         Request::ExportSessionData {
             session_id,
@@ -2528,6 +2660,43 @@ pub(super) fn assistant_to_proto(
         home_dir: row.home_dir,
         config_json: row.config_json,
         content_hash: row.content_hash,
+    }
+}
+
+fn pinned_message_to_proto(row: crate::db::pins::PinnedMessage) -> proto::PinnedMessage {
+    proto::PinnedMessage {
+        seq: row.seq,
+        is_assistant: row.is_assistant,
+        text: row.text,
+    }
+}
+
+fn project_note_to_proto(row: crate::db::project_notes::ProjectNote) -> proto::ProjectNote {
+    proto::ProjectNote {
+        id: row.id,
+        project_root: row.project_root,
+        name: row.name,
+        content: row.content,
+    }
+}
+
+async fn ensure_project_note_member(
+    db: &crate::db::Db,
+    project_root: &str,
+    id: uuid::Uuid,
+) -> std::result::Result<(), ErrorPayload> {
+    let found = db
+        .list_project_notes(project_root)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .any(|note| note.id == id);
+    if found {
+        Ok(())
+    } else {
+        Err(bad_request(format!(
+            "project note `{id}` does not belong to project root `{project_root}`"
+        )))
     }
 }
 

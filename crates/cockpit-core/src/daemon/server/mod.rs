@@ -422,6 +422,32 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             message,
         } => scrub_string(message, redact),
         proto::Response::PausedWork { items } => scrub_paused_work(items, redact),
+        proto::Response::PinChanged { changed: _ }
+        | proto::Response::PinToggled { pinned: _ }
+        | proto::Response::PinCount { count: _ }
+        | proto::Response::PinSeqs { seqs: _ }
+        | proto::Response::PinState { state: _ } => {}
+        proto::Response::PinsWithText { pins } => {
+            for pin in pins {
+                scrub_string(&mut pin.text, redact);
+            }
+        }
+        proto::Response::ProjectNotes { notes } => {
+            for note in notes {
+                scrub_string(&mut note.project_root, redact);
+                scrub_string(&mut note.name, redact);
+                scrub_string(&mut note.content, redact);
+            }
+        }
+        proto::Response::ProjectNoteCreated { note } => {
+            scrub_string(&mut note.project_root, redact);
+            scrub_string(&mut note.name, redact);
+            scrub_string(&mut note.content, redact);
+        }
+        proto::Response::ProjectNoteRenamed { name } => scrub_string(name, redact),
+        proto::Response::AssistantUpserted { assistant } => {
+            scrub_assistant_summary(assistant, redact)
+        }
         proto::Response::Unknown => {}
     }
 }

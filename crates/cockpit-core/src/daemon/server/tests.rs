@@ -14,6 +14,12 @@ use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
+macro_rules! pin_registration_rows_from_command_table {
+    (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        vec![$(($kind, stringify!($authz), stringify!($ordering))),+]
+    }};
+}
+
 #[derive(Clone)]
 struct CaptureWriter(std::sync::Arc<StdMutex<Vec<u8>>>);
 
@@ -47,6 +53,594 @@ fn capture_warn_log(f: impl FnOnce()) -> String {
         .finish();
     tracing::subscriber::with_default(subscriber, f);
     String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+}
+
+#[tokio::test]
+async fn pin_rpc_parity_with_direct_db_calls() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    let seq = ctx
+        .db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "pin me"}),
+        )
+        .await
+        .unwrap();
+    let mut state = owner_state();
+
+    let response = handle_request(
+        Request::PinMessage {
+            session_id: session.session_id,
+            seq,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Response::PinChanged { changed: true }));
+    assert_eq!(
+        ctx.db.list_pin_seqs(session.session_id).await.unwrap(),
+        vec![seq]
+    );
+    let response = handle_request(
+        Request::TogglePinnedMessage {
+            session_id: session.session_id,
+            seq,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Response::PinToggled { pinned: false }));
+    let response = handle_request(
+        Request::PinMessage {
+            session_id: session.session_id,
+            seq,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Response::PinChanged { changed: true }));
+
+    let response = handle_request(
+        Request::CountPinnedMessages {
+            session_id: session.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Response::PinCount { count: 1 }));
+    let response = handle_request(
+        Request::ListPinnedMessageSeqs {
+            session_id: session.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Response::PinSeqs { seqs } if seqs == vec![seq]));
+    let response = handle_request(
+        Request::ListPinnedMessagesWithText {
+            session_id: session.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(response, Response::PinsWithText { pins } if pins.len() == 1 && pins[0].seq == seq && pins[0].text == "pin me")
+    );
+    let response = handle_request(
+        Request::PinnedMessageState {
+            session_id: session.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(response, Response::PinState { state } if state.count == 1 && state.seqs == vec![seq])
+    );
+    let response = handle_request(
+        Request::UnpinMessage {
+            session_id: session.session_id,
+            seq,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Response::PinChanged { changed: true }));
+}
+
+#[tokio::test]
+async fn pin_toggle_returns_resulting_state() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    let seq = ctx
+        .db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "toggle me"}),
+        )
+        .await
+        .unwrap();
+    let mut state = owner_state();
+
+    let first = handle_request(
+        Request::TogglePinnedMessage {
+            session_id: session.session_id,
+            seq,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let second = handle_request(
+        Request::TogglePinnedMessage {
+            session_id: session.session_id,
+            seq,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(first, Response::PinToggled { pinned: true }));
+    assert!(matches!(second, Response::PinToggled { pinned: false }));
+}
+
+#[tokio::test]
+async fn pin_and_unpin_report_whether_they_changed() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    let seq = ctx
+        .db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "change me"}),
+        )
+        .await
+        .unwrap();
+    let mut state = owner_state();
+
+    for (request, expected) in [
+        (
+            Request::PinMessage {
+                session_id: session.session_id,
+                seq,
+            },
+            true,
+        ),
+        (
+            Request::PinMessage {
+                session_id: session.session_id,
+                seq,
+            },
+            false,
+        ),
+        (
+            Request::UnpinMessage {
+                session_id: session.session_id,
+                seq,
+            },
+            true,
+        ),
+        (
+            Request::UnpinMessage {
+                session_id: session.session_id,
+                seq,
+            },
+            false,
+        ),
+    ] {
+        let response = handle_request(request, &mut state, &ctx).await.unwrap();
+        assert!(matches!(response, Response::PinChanged { changed } if changed == expected));
+    }
+}
+
+#[tokio::test]
+async fn pin_rpc_rejects_seq_not_in_session() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    let other = ctx.db.create_session("p", "/repo", "Other").await.unwrap();
+    let seq = ctx
+        .db
+        .insert_session_event(
+            other.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Other"),
+            None,
+            &serde_json::json!({"text": "not ours"}),
+        )
+        .await
+        .unwrap();
+    let mut state = owner_state();
+    for request in [
+        Request::PinMessage {
+            session_id: session.session_id,
+            seq,
+        },
+        Request::UnpinMessage {
+            session_id: session.session_id,
+            seq,
+        },
+        Request::TogglePinnedMessage {
+            session_id: session.session_id,
+            seq,
+        },
+    ] {
+        let error = handle_request(request, &mut state, &ctx).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::BadRequest);
+        assert!(error.message.contains("is not a member"));
+    }
+}
+
+#[tokio::test]
+async fn pin_rpcs_reject_non_owner_principal() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    let mut state = remote_state_with_grants(Vec::new());
+    for request in [
+        Request::PinMessage {
+            session_id: session.session_id,
+            seq: 1,
+        },
+        Request::UnpinMessage {
+            session_id: session.session_id,
+            seq: 1,
+        },
+        Request::TogglePinnedMessage {
+            session_id: session.session_id,
+            seq: 1,
+        },
+        Request::CountPinnedMessages {
+            session_id: session.session_id,
+        },
+        Request::ListPinnedMessageSeqs {
+            session_id: session.session_id,
+        },
+        Request::ListPinnedMessagesWithText {
+            session_id: session.session_id,
+        },
+        Request::PinnedMessageState {
+            session_id: session.session_id,
+        },
+    ] {
+        let error = handle_request(request, &mut state, &ctx).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Authorization);
+    }
+}
+
+#[tokio::test]
+async fn pin_reader_principal_can_read_but_not_write() {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    ctx.db
+        .set_session_shared_with_collaborators(session.session_id, true)
+        .await
+        .unwrap();
+    let grant = crate::daemon::principal::PrincipalGrant {
+        scope: crate::daemon::principal::PrincipalScope::AgentReadonly,
+        project_root: Some("/repo".into()),
+    };
+    let mut state = remote_state_with_grants(vec![grant]);
+    let response = handle_request(
+        Request::CountPinnedMessages {
+            session_id: session.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Response::PinCount { count: 0 }));
+    let error = handle_request(
+        Request::PinMessage {
+            session_id: session.session_id,
+            seq: 1,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ReadOnly);
+}
+
+#[test]
+fn pin_rpc_registration_tiers_match_spec() {
+    let rows = proto::command!(pin_registration_rows_from_command_table);
+    for kind in ["pin_message", "unpin_message", "toggle_pinned_message"] {
+        assert_eq!(
+            rows.iter().find(|row| row.0 == kind).copied(),
+            Some((kind, "session_row_writer", "serialized"))
+        );
+    }
+    for kind in [
+        "count_pinned_messages",
+        "list_pinned_message_seqs",
+        "list_pinned_messages_with_text",
+        "pinned_message_state",
+    ] {
+        assert_eq!(
+            rows.iter().find(|row| row.0 == kind).copied(),
+            Some((kind, "session_row_reader", "concurrent"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn project_note_rpc_parity_with_direct_db_calls() {
+    let ctx = test_ctx();
+    let mut state = owner_state();
+    let response = handle_request(
+        Request::CreateProjectNote {
+            project_root: "/repo".into(),
+            name: "todo".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::ProjectNoteCreated { note } = response else {
+        panic!("expected note")
+    };
+    assert_eq!(note.name, "todo");
+    handle_request(
+        Request::SetProjectNoteContent {
+            project_root: "/repo".into(),
+            id: note.id,
+            content: "body".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ctx.db.list_project_notes("/repo").await.unwrap()[0].content,
+        "body"
+    );
+    let response = handle_request(
+        Request::RenameProjectNote {
+            project_root: "/repo".into(),
+            id: note.id,
+            name: "renamed".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Response::ProjectNoteRenamed { name } if name == "renamed"));
+    let response = handle_request(
+        Request::ListProjectNotes {
+            project_root: "/repo".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::ProjectNotes { notes } = response else {
+        panic!("expected project notes")
+    };
+    let direct = ctx.db.list_project_notes("/repo").await.unwrap();
+    assert_eq!(notes.len(), direct.len());
+    assert_eq!(notes[0].id, direct[0].id);
+    assert_eq!(notes[0].name, direct[0].name);
+    let response = handle_request(
+        Request::DeleteProjectNote {
+            project_root: "/repo".into(),
+            id: note.id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Response::Ack));
+    assert!(ctx.db.list_project_notes("/repo").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn project_note_rejects_id_from_another_project_root() {
+    let ctx = test_ctx();
+    let note = ctx.db.create_project_note("/one", "todo").await.unwrap();
+    let mut state = owner_state();
+
+    let error = handle_request(
+        Request::SetProjectNoteContent {
+            project_root: "/two".into(),
+            id: note.id,
+            content: "cross project".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::BadRequest);
+}
+
+#[tokio::test]
+async fn project_note_rpcs_reject_unauthorized_project_root() {
+    let ctx = test_ctx();
+    let note = ctx.db.create_project_note("/repo", "todo").await.unwrap();
+    let mut state = remote_state_with_grants(vec![crate::daemon::principal::PrincipalGrant {
+        scope: crate::daemon::principal::PrincipalScope::Agent,
+        project_root: Some("/repo".into()),
+    }]);
+    for request in [
+        Request::ListProjectNotes {
+            project_root: "/repo".into(),
+        },
+        Request::CreateProjectNote {
+            project_root: "/repo".into(),
+            name: "new".into(),
+        },
+        Request::SetProjectNoteContent {
+            project_root: "/repo".into(),
+            id: note.id,
+            content: "body".into(),
+        },
+        Request::RenameProjectNote {
+            project_root: "/repo".into(),
+            id: note.id,
+            name: "new".into(),
+        },
+        Request::DeleteProjectNote {
+            project_root: "/repo".into(),
+            id: note.id,
+        },
+    ] {
+        let error = handle_request(request, &mut state, &ctx).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Authorization);
+    }
+}
+
+#[tokio::test]
+async fn project_note_create_returns_resolved_name() {
+    let ctx = test_ctx();
+    ctx.db.create_project_note("/repo", "todo").await.unwrap();
+    let mut state = owner_state();
+    let response = handle_request(
+        Request::CreateProjectNote {
+            project_root: "/repo".into(),
+            name: "todo".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::ProjectNoteCreated { note } = response else {
+        panic!("expected project note")
+    };
+    assert_eq!(note.name, "todo (2)");
+}
+
+#[tokio::test]
+async fn project_note_list_preserves_sidebar_order() {
+    let ctx = test_ctx();
+    for name in ["first", "second", "third"] {
+        ctx.db.create_project_note("/repo", name).await.unwrap();
+    }
+    let expected: Vec<_> = ctx
+        .db
+        .list_project_notes("/repo")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|note| note.id)
+        .collect();
+    let mut state = owner_state();
+    let response = handle_request(
+        Request::ListProjectNotes {
+            project_root: "/repo".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::ProjectNotes { notes } = response else {
+        panic!("expected project notes")
+    };
+    assert_eq!(
+        notes.into_iter().map(|note| note.id).collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn upsert_assistant_rpc_parity_with_direct_db_call() {
+    let ctx = test_ctx();
+    let mut state = owner_state();
+    let response = handle_request(
+        Request::UpsertAssistant {
+            name: "reviewer".into(),
+            home_dir: "/tmp/reviewer".into(),
+            config_json: "{}".into(),
+            content_hash: "hash".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::AssistantUpserted { assistant } = response else {
+        panic!("expected assistant")
+    };
+    assert_eq!(assistant.name, "reviewer");
+    assert_eq!(
+        ctx.db.list_assistants().await.unwrap()[0].content_hash,
+        "hash"
+    );
+}
+
+#[tokio::test]
+async fn upsert_assistant_rejects_non_owner_principal() {
+    let ctx = test_ctx();
+    let mut state = remote_state_with_grants(vec![crate::daemon::principal::PrincipalGrant {
+        scope: crate::daemon::principal::PrincipalScope::Agent,
+        project_root: Some("/repo".into()),
+    }]);
+    let error = handle_request(
+        Request::UpsertAssistant {
+            name: "reviewer".into(),
+            home_dir: "/tmp/reviewer".into(),
+            config_json: "{}".into(),
+            content_hash: "hash".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Authorization);
+}
+
+#[test]
+fn pins_with_text_response_is_scrubbed() {
+    let redact = table_for("literal-secret");
+    let mut response = Response::PinsWithText {
+        pins: vec![proto::PinnedMessage {
+            seq: 1,
+            is_assistant: false,
+            text: "contains literal-secret".into(),
+        }],
+    };
+
+    scrub_response_free_text(&mut response, &redact);
+    let Response::PinsWithText { pins } = response else {
+        panic!("expected pins")
+    };
+    assert!(!pins[0].text.contains("literal-secret"));
+    assert!(pins[0].text.contains("[redacted]"));
 }
 
 fn remote_principal() -> ClientPrincipal {
@@ -2418,6 +3012,12 @@ fn dispatch_matrix_class_for_command(
         | ("export_session_data", "owner_only", false)
         | ("get_usage_counts", "owner_only", false)
         | ("stats_rollup", "owner_only", false) => DispatchMatrixClass::AccessControlled,
+        ("count_pinned_messages", "session_row_reader", false)
+        | ("list_pinned_message_seqs", "session_row_reader", false)
+        | ("list_pinned_messages_with_text", "session_row_reader", false)
+        | ("pinned_message_state", "session_row_reader", false) => {
+            DispatchMatrixClass::AccessControlled
+        }
         (_, _, true) => DispatchMatrixClass::Mutating,
         other => panic!("dispatch matrix request kind is unclassified: {other:?}"),
     }
@@ -2615,6 +3215,51 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "clear_goal",
             effect_class: Durable,
             observation: "session goal is closed",
+        },
+        MutatingDispatchCase {
+            kind: "pin_message",
+            effect_class: Durable,
+            observation: "pin row is persisted",
+        },
+        MutatingDispatchCase {
+            kind: "unpin_message",
+            effect_class: Durable,
+            observation: "pin row is removed",
+        },
+        MutatingDispatchCase {
+            kind: "toggle_pinned_message",
+            effect_class: Durable,
+            observation: "pin state is toggled",
+        },
+        MutatingDispatchCase {
+            kind: "create_project_note",
+            effect_class: Durable,
+            observation: "project note row is created",
+        },
+        MutatingDispatchCase {
+            kind: "set_project_note_content",
+            effect_class: Durable,
+            observation: "project note content is persisted",
+        },
+        MutatingDispatchCase {
+            kind: "rename_project_note",
+            effect_class: Durable,
+            observation: "project note name is persisted",
+        },
+        MutatingDispatchCase {
+            kind: "delete_project_note",
+            effect_class: Durable,
+            observation: "project note row is deleted",
+        },
+        MutatingDispatchCase {
+            kind: "list_project_notes",
+            effect_class: Durable,
+            observation: "project note ordering is read through daemon",
+        },
+        MutatingDispatchCase {
+            kind: "upsert_assistant",
+            effect_class: Durable,
+            observation: "assistant registry row is persisted",
         },
         MutatingDispatchCase {
             kind: "create_assistant_session",
@@ -3068,6 +3713,16 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "guidance_estimate"
         | "restart_if_idle"
         | "stop_daemon" => AuthzAllowedOutcome::Response,
+        "count_pinned_messages"
+        | "list_pinned_message_seqs"
+        | "list_pinned_messages_with_text"
+        | "pinned_message_state"
+        | "pin_message"
+        | "unpin_message"
+        | "toggle_pinned_message"
+        | "list_project_notes"
+        | "create_project_note"
+        | "upsert_assistant" => AuthzAllowedOutcome::Response,
         "begin_attachment_upload"
         | "upload_attachment_chunk"
         | "finish_attachment_upload"
@@ -3091,6 +3746,9 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "store_flycockpit_credential"
         | "clear_flycockpit_credential"
         | "set_goal_status" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "set_project_note_content" | "rename_project_note" | "delete_project_note" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
         "open_terminal" => AuthzAllowedOutcome::Error(ErrorCode::RootMissing),
         "list_agents" | "list_models" => AuthzAllowedOutcome::Error(ErrorCode::NotAttached),
         "send_user_message"
@@ -3144,7 +3802,20 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_reader("goal_status"),
         authz_session_writer("set_goal_status"),
         authz_session_writer("clear_goal"),
+        authz_session_writer("pin_message"),
+        authz_session_writer("unpin_message"),
+        authz_session_writer("toggle_pinned_message"),
+        authz_session_reader("count_pinned_messages"),
+        authz_session_reader("list_pinned_message_seqs"),
+        authz_session_reader("list_pinned_messages_with_text"),
+        authz_session_reader("pinned_message_state"),
+        authz_owner_only("list_project_notes"),
+        authz_owner_only("create_project_note"),
+        authz_owner_only("set_project_note_content"),
+        authz_owner_only("rename_project_note"),
+        authz_owner_only("delete_project_note"),
         authz_owner_only("list_assistants"),
+        authz_owner_only("upsert_assistant"),
         authz_owner_only("create_assistant_session"),
         authz_session_writer("auto_title"),
         authz_owner_only("export_session_data"),
@@ -3987,7 +4658,41 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             status: proto::GoalStatus::Paused,
         },
         "clear_goal" => Request::ClearGoal { session_id },
+        "pin_message" => Request::PinMessage { session_id, seq: 1 },
+        "unpin_message" => Request::UnpinMessage { session_id, seq: 1 },
+        "toggle_pinned_message" => Request::TogglePinnedMessage { session_id, seq: 1 },
+        "count_pinned_messages" => Request::CountPinnedMessages { session_id },
+        "list_pinned_message_seqs" => Request::ListPinnedMessageSeqs { session_id },
+        "list_pinned_messages_with_text" => Request::ListPinnedMessagesWithText { session_id },
+        "pinned_message_state" => Request::PinnedMessageState { session_id },
+        "list_project_notes" => Request::ListProjectNotes {
+            project_root: root.clone(),
+        },
+        "create_project_note" => Request::CreateProjectNote {
+            project_root: root.clone(),
+            name: "note".into(),
+        },
+        "set_project_note_content" => Request::SetProjectNoteContent {
+            project_root: root.clone(),
+            id: Uuid::new_v4(),
+            content: "body".into(),
+        },
+        "rename_project_note" => Request::RenameProjectNote {
+            project_root: root.clone(),
+            id: Uuid::new_v4(),
+            name: "note".into(),
+        },
+        "delete_project_note" => Request::DeleteProjectNote {
+            project_root: root.clone(),
+            id: Uuid::new_v4(),
+        },
         "list_assistants" => Request::ListAssistants,
+        "upsert_assistant" => Request::UpsertAssistant {
+            name: "a".into(),
+            home_dir: root,
+            config_json: "{}".into(),
+            content_hash: "h".into(),
+        },
         "create_assistant_session" => Request::CreateAssistantSession {
             name: "missing-assistant".into(),
             project_root: root,
@@ -4972,6 +5677,15 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
             assert_paused_work_mutating_happy(case.kind).await;
         }
         "set_goal_status" | "clear_goal" => assert_goal_mutating_happy(case.kind).await,
+        "pin_message"
+        | "unpin_message"
+        | "toggle_pinned_message"
+        | "create_project_note"
+        | "set_project_note_content"
+        | "rename_project_note"
+        | "delete_project_note"
+        | "list_project_notes"
+        | "upsert_assistant" => assert_new_daemon_rpc_mutating_happy(case.kind).await,
         "create_assistant_session" => assert_create_assistant_session_happy().await,
         "auto_title" => assert_auto_title_mutating_happy().await,
         "curator" => assert_curator_mutating_happy().await,
@@ -5086,6 +5800,15 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             assert!(ctx.db.paused_session_work_all().await.unwrap().is_empty());
         }
         "set_goal_status" | "clear_goal" => assert_goal_mutating_malformed(case.kind).await,
+        "pin_message"
+        | "unpin_message"
+        | "toggle_pinned_message"
+        | "create_project_note"
+        | "set_project_note_content"
+        | "rename_project_note"
+        | "delete_project_note"
+        | "list_project_notes"
+        | "upsert_assistant" => assert_new_daemon_rpc_mutating_malformed(case.kind).await,
         "create_assistant_session" => {
             let ctx = test_ctx();
             let err = dispatch_matrix_request(
@@ -6324,6 +7047,114 @@ async fn assert_create_assistant_session_happy() {
     );
 }
 
+async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    let seq = ctx
+        .db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "message"}),
+        )
+        .await
+        .unwrap();
+    let note = ctx.db.create_project_note("/repo", "old").await.unwrap();
+    if matches!(kind, "unpin_message" | "toggle_pinned_message") {
+        ctx.db.pin_message(session.session_id, seq).await.unwrap();
+    }
+    let request = match kind {
+        "pin_message" => Request::PinMessage {
+            session_id: session.session_id,
+            seq,
+        },
+        "unpin_message" => Request::UnpinMessage {
+            session_id: session.session_id,
+            seq,
+        },
+        "toggle_pinned_message" => Request::TogglePinnedMessage {
+            session_id: session.session_id,
+            seq,
+        },
+        "create_project_note" => Request::CreateProjectNote {
+            project_root: "/repo".into(),
+            name: "new".into(),
+        },
+        "set_project_note_content" => Request::SetProjectNoteContent {
+            project_root: "/repo".into(),
+            id: note.id,
+            content: "body".into(),
+        },
+        "rename_project_note" => Request::RenameProjectNote {
+            project_root: "/repo".into(),
+            id: note.id,
+            name: "new".into(),
+        },
+        "delete_project_note" => Request::DeleteProjectNote {
+            project_root: "/repo".into(),
+            id: note.id,
+        },
+        "list_project_notes" => Request::ListProjectNotes {
+            project_root: "/repo".into(),
+        },
+        "upsert_assistant" => Request::UpsertAssistant {
+            name: "a".into(),
+            home_dir: "/repo".into(),
+            config_json: "{}".into(),
+            content_hash: "h".into(),
+        },
+        _ => unreachable!(),
+    };
+    let response = dispatch_matrix_request(&ctx, request)
+        .await
+        .expect("new RPC happy");
+    assert!(
+        !matches!(response, Response::Ack)
+            || matches!(kind, "set_project_note_content" | "delete_project_note")
+    );
+}
+
+async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
+    let ctx = test_ctx();
+    let request = match kind {
+        "pin_message" | "unpin_message" | "toggle_pinned_message" => Request::PinMessage {
+            session_id: Uuid::new_v4(),
+            seq: 1,
+        },
+        "create_project_note" => Request::CreateProjectNote {
+            project_root: "/repo".into(),
+            name: " ".into(),
+        },
+        "set_project_note_content" => Request::SetProjectNoteContent {
+            project_root: "/repo".into(),
+            id: Uuid::new_v4(),
+            content: "x".into(),
+        },
+        "rename_project_note" => Request::RenameProjectNote {
+            project_root: "/repo".into(),
+            id: Uuid::new_v4(),
+            name: "x".into(),
+        },
+        "delete_project_note" => Request::DeleteProjectNote {
+            project_root: "/repo".into(),
+            id: Uuid::new_v4(),
+        },
+        "list_project_notes" => Request::ListProjectNotes {
+            project_root: "/repo".into(),
+        },
+        "upsert_assistant" => Request::UpsertAssistant {
+            name: "a".into(),
+            home_dir: "/repo".into(),
+            config_json: "{}".into(),
+            content_hash: "h".into(),
+        },
+        _ => unreachable!(),
+    };
+    let _ = dispatch_matrix_request(&ctx, request).await;
+}
+
 #[cfg(unix)]
 async fn assert_auto_title_mutating_happy() {
     let project = tempfile::tempdir().unwrap();
@@ -7285,9 +8116,13 @@ async fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_re
         "list_agents",
         "list_assistants",
         "list_models",
+        "list_pinned_message_seqs",
+        "list_pinned_messages_with_text",
         "list_scheduled_jobs",
         "list_sessions",
         "list_skills",
+        "count_pinned_messages",
+        "pinned_message_state",
         "read_history_page",
         "read_subagent_history_page",
         "read_session_messages",
@@ -7367,7 +8202,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
     let interrupt_id = Uuid::from_u128(11);
     let project_root = "/repo".to_string();
 
-    let cases = vec![
+    let mut cases = vec![
         CommandMetadataCase {
             request: Request::Attach {
                 session_id: Some(attach_session_id),
@@ -8288,6 +9123,121 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
     ];
 
+    cases.extend([
+        CommandMetadataCase {
+            request: Request::PinMessage { session_id, seq: 1 },
+            kind: "pin_message",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::UnpinMessage { session_id, seq: 1 },
+            kind: "unpin_message",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::TogglePinnedMessage { session_id, seq: 1 },
+            kind: "toggle_pinned_message",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::CountPinnedMessages { session_id },
+            kind: "count_pinned_messages",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::ListPinnedMessageSeqs { session_id },
+            kind: "list_pinned_message_seqs",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::ListPinnedMessagesWithText { session_id },
+            kind: "list_pinned_messages_with_text",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::PinnedMessageState { session_id },
+            kind: "pinned_message_state",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::ListProjectNotes {
+                project_root: project_root.clone(),
+            },
+            kind: "list_project_notes",
+            session_id: None,
+            audit_path: Some("/repo"),
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::CreateProjectNote {
+                project_root: project_root.clone(),
+                name: "n".into(),
+            },
+            kind: "create_project_note",
+            session_id: None,
+            audit_path: Some("/repo"),
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::SetProjectNoteContent {
+                project_root: project_root.clone(),
+                id: Uuid::nil(),
+                content: "x".into(),
+            },
+            kind: "set_project_note_content",
+            session_id: None,
+            audit_path: Some("/repo"),
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::RenameProjectNote {
+                project_root: project_root.clone(),
+                id: Uuid::nil(),
+                name: "n".into(),
+            },
+            kind: "rename_project_note",
+            session_id: None,
+            audit_path: Some("/repo"),
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::DeleteProjectNote {
+                project_root: project_root.clone(),
+                id: Uuid::nil(),
+            },
+            kind: "delete_project_note",
+            session_id: None,
+            audit_path: Some("/repo"),
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::UpsertAssistant {
+                name: "a".into(),
+                home_dir: "/tmp".into(),
+                config_json: "{}".into(),
+                content_hash: "h".into(),
+            },
+            kind: "upsert_assistant",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+    ]);
+
     // Drift-proof exhaustiveness (`daemon-trust-test-isolation.md`): the
     // single variant list below feeds both an exhaustive `match` with no
     // wildcard arm — so adding a `Request` variant without listing it
@@ -8323,7 +9273,20 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         GoalStatus,
         SetGoalStatus,
         ClearGoal,
+        PinMessage,
+        UnpinMessage,
+        TogglePinnedMessage,
+        CountPinnedMessages,
+        ListPinnedMessageSeqs,
+        ListPinnedMessagesWithText,
+        PinnedMessageState,
+        ListProjectNotes,
+        CreateProjectNote,
+        SetProjectNoteContent,
+        RenameProjectNote,
+        DeleteProjectNote,
         ListAssistants,
+        UpsertAssistant,
         CreateAssistantSession,
         AutoTitle,
         ExportSessionData,

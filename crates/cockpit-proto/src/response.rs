@@ -162,8 +162,41 @@ pub enum Response {
         cleared: bool,
     },
 
+    PinChanged {
+        changed: bool,
+    },
+    PinToggled {
+        pinned: bool,
+    },
+    PinCount {
+        count: i64,
+    },
+    PinSeqs {
+        seqs: Vec<i64>,
+    },
+    PinsWithText {
+        pins: Vec<PinnedMessage>,
+    },
+    PinState {
+        state: PinState,
+    },
+
+    ProjectNotes {
+        notes: Vec<ProjectNote>,
+    },
+    ProjectNoteCreated {
+        note: ProjectNote,
+    },
+    ProjectNoteRenamed {
+        name: String,
+    },
+
     Assistants {
         assistants: Vec<AssistantSummary>,
+    },
+
+    AssistantUpserted {
+        assistant: AssistantSummary,
     },
 
     AssistantSessionCreated {
@@ -431,7 +464,17 @@ macro_rules! response_variants {
             (Response::GoalStatus { .. }, "goal_status");
             (Response::GoalUpdated { .. }, "goal_updated");
             (Response::GoalCleared { .. }, "goal_cleared");
+            (Response::PinChanged { .. }, "pin_changed");
+            (Response::PinToggled { .. }, "pin_toggled");
+            (Response::PinCount { .. }, "pin_count");
+            (Response::PinSeqs { .. }, "pin_seqs");
+            (Response::PinsWithText { .. }, "pins_with_text");
+            (Response::PinState { .. }, "pin_state");
+            (Response::ProjectNotes { .. }, "project_notes");
+            (Response::ProjectNoteCreated { .. }, "project_note_created");
+            (Response::ProjectNoteRenamed { .. }, "project_note_renamed");
             (Response::Assistants { .. }, "assistants");
+            (Response::AssistantUpserted { .. }, "assistant_upserted");
             (Response::AssistantSessionCreated { .. }, "assistant_session_created");
             (Response::AutoTitle { .. }, "auto_title");
             (Response::ExportSessionData { .. }, "export_session_data");

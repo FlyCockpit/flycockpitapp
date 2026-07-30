@@ -190,8 +190,62 @@ pub enum Request {
         session_id: Uuid,
     },
 
+    PinMessage {
+        session_id: Uuid,
+        seq: i64,
+    },
+    UnpinMessage {
+        session_id: Uuid,
+        seq: i64,
+    },
+    TogglePinnedMessage {
+        session_id: Uuid,
+        seq: i64,
+    },
+    CountPinnedMessages {
+        session_id: Uuid,
+    },
+    ListPinnedMessageSeqs {
+        session_id: Uuid,
+    },
+    ListPinnedMessagesWithText {
+        session_id: Uuid,
+    },
+    PinnedMessageState {
+        session_id: Uuid,
+    },
+
+    ListProjectNotes {
+        project_root: String,
+    },
+    CreateProjectNote {
+        project_root: String,
+        name: String,
+    },
+    SetProjectNoteContent {
+        project_root: String,
+        id: Uuid,
+        content: String,
+    },
+    RenameProjectNote {
+        project_root: String,
+        id: Uuid,
+        name: String,
+    },
+    DeleteProjectNote {
+        project_root: String,
+        id: Uuid,
+    },
+
     /// List persisted assistant definitions.
     ListAssistants,
+
+    UpsertAssistant {
+        name: String,
+        home_dir: String,
+        config_json: String,
+        content_hash: String,
+    },
 
     /// Create a new assistant session through the daemon registry. The
     /// session is deferred and is not persisted until its first user message.
@@ -822,7 +876,20 @@ macro_rules! request_variants {
             (Request::GoalStatus { .. }, "goal_status");
             (Request::SetGoalStatus { .. }, "set_goal_status");
             (Request::ClearGoal { .. }, "clear_goal");
+            (Request::PinMessage { .. }, "pin_message");
+            (Request::UnpinMessage { .. }, "unpin_message");
+            (Request::TogglePinnedMessage { .. }, "toggle_pinned_message");
+            (Request::CountPinnedMessages { .. }, "count_pinned_messages");
+            (Request::ListPinnedMessageSeqs { .. }, "list_pinned_message_seqs");
+            (Request::ListPinnedMessagesWithText { .. }, "list_pinned_messages_with_text");
+            (Request::PinnedMessageState { .. }, "pinned_message_state");
+            (Request::ListProjectNotes { .. }, "list_project_notes");
+            (Request::CreateProjectNote { .. }, "create_project_note");
+            (Request::SetProjectNoteContent { .. }, "set_project_note_content");
+            (Request::RenameProjectNote { .. }, "rename_project_note");
+            (Request::DeleteProjectNote { .. }, "delete_project_note");
             (Request::ListAssistants, "list_assistants");
+            (Request::UpsertAssistant { .. }, "upsert_assistant");
             (Request::CreateAssistantSession { .. }, "create_assistant_session");
             (Request::AutoTitle { .. }, "auto_title");
             (Request::ExportSessionData { .. }, "export_session_data");
@@ -942,7 +1009,20 @@ macro_rules! command {
             (Request::GoalStatus { session_id }, "goal_status", session_row_reader(session_id), field(session_id), false, serialized, none);
             (Request::SetGoalStatus { session_id, .. }, "set_goal_status", session_row_writer(session_id), field(session_id), true, serialized, none);
             (Request::ClearGoal { session_id }, "clear_goal", session_row_writer(session_id), field(session_id), true, serialized, none);
+            (Request::PinMessage { session_id, .. }, "pin_message", session_row_writer(session_id), field(session_id), true, serialized, none);
+            (Request::UnpinMessage { session_id, .. }, "unpin_message", session_row_writer(session_id), field(session_id), true, serialized, none);
+            (Request::TogglePinnedMessage { session_id, .. }, "toggle_pinned_message", session_row_writer(session_id), field(session_id), true, serialized, none);
+            (Request::CountPinnedMessages { session_id }, "count_pinned_messages", session_row_reader(session_id), field(session_id), false, concurrent, none);
+            (Request::ListPinnedMessageSeqs { session_id }, "list_pinned_message_seqs", session_row_reader(session_id), field(session_id), false, concurrent, none);
+            (Request::ListPinnedMessagesWithText { session_id }, "list_pinned_messages_with_text", session_row_reader(session_id), field(session_id), false, concurrent, none);
+            (Request::PinnedMessageState { session_id }, "pinned_message_state", session_row_reader(session_id), field(session_id), false, concurrent, none);
+            (Request::ListProjectNotes { project_root }, "list_project_notes", owner_only, none, true, serialized, path(project_root));
+            (Request::CreateProjectNote { project_root, .. }, "create_project_note", owner_only, none, true, serialized, path(project_root));
+            (Request::SetProjectNoteContent { project_root, .. }, "set_project_note_content", owner_only, none, true, serialized, path(project_root));
+            (Request::RenameProjectNote { project_root, .. }, "rename_project_note", owner_only, none, true, serialized, path(project_root));
+            (Request::DeleteProjectNote { project_root, .. }, "delete_project_note", owner_only, none, true, serialized, path(project_root));
             (Request::ListAssistants, "list_assistants", owner_only, none, false, concurrent, none);
+            (Request::UpsertAssistant { .. }, "upsert_assistant", owner_only, none, true, serialized, none);
             (Request::CreateAssistantSession { .. }, "create_assistant_session", owner_only, none, true, serialized, none);
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, serialized, none);
             (Request::ExportSessionData { session_id, .. }, "export_session_data", owner_only, field(session_id), false, concurrent, none);
@@ -1059,6 +1139,103 @@ pub enum LspControlAction {
 pub enum AttachmentPurpose {
     UserMessageImage,
     TerminalPasteImage { terminal_id: Uuid },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    macro_rules! command_tags {
+        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+            vec![$($tag),+]
+        }};
+    }
+
+    #[test]
+    fn pin_rpcs_are_registered_in_both_macro_tables() {
+        let session_id = Uuid::nil();
+        let requests = [
+            Request::PinMessage { session_id, seq: 1 },
+            Request::UnpinMessage { session_id, seq: 1 },
+            Request::TogglePinnedMessage { session_id, seq: 1 },
+            Request::CountPinnedMessages { session_id },
+            Request::ListPinnedMessageSeqs { session_id },
+            Request::ListPinnedMessagesWithText { session_id },
+            Request::PinnedMessageState { session_id },
+        ];
+        let tags: Vec<_> = requests.iter().map(Request::wire_tag).collect();
+        assert_eq!(
+            tags,
+            vec![
+                "pin_message",
+                "unpin_message",
+                "toggle_pinned_message",
+                "count_pinned_messages",
+                "list_pinned_message_seqs",
+                "list_pinned_messages_with_text",
+                "pinned_message_state",
+            ]
+        );
+        let command_tags = crate::command!(command_tags);
+        for tag in tags {
+            assert!(command_tags.contains(&tag), "missing command row for {tag}");
+        }
+    }
+
+    #[test]
+    fn project_note_rpcs_are_registered_in_both_macro_tables() {
+        let id = Uuid::nil();
+        let requests = [
+            Request::ListProjectNotes {
+                project_root: "/repo".into(),
+            },
+            Request::CreateProjectNote {
+                project_root: "/repo".into(),
+                name: "n".into(),
+            },
+            Request::SetProjectNoteContent {
+                project_root: "/repo".into(),
+                id,
+                content: "c".into(),
+            },
+            Request::RenameProjectNote {
+                project_root: "/repo".into(),
+                id,
+                name: "n".into(),
+            },
+            Request::DeleteProjectNote {
+                project_root: "/repo".into(),
+                id,
+            },
+        ];
+        let tags: Vec<_> = requests.iter().map(Request::wire_tag).collect();
+        assert_eq!(
+            tags,
+            vec![
+                "list_project_notes",
+                "create_project_note",
+                "set_project_note_content",
+                "rename_project_note",
+                "delete_project_note"
+            ]
+        );
+        let command_tags = crate::command!(command_tags);
+        for tag in tags {
+            assert!(command_tags.contains(&tag), "missing command row for {tag}");
+        }
+    }
+
+    #[test]
+    fn upsert_assistant_rpc_is_registered_in_both_macro_tables() {
+        let request = Request::UpsertAssistant {
+            name: "a".into(),
+            home_dir: "/a".into(),
+            config_json: "{}".into(),
+            content_hash: "h".into(),
+        };
+        assert_eq!(request.wire_tag(), "upsert_assistant");
+        assert!(crate::command!(command_tags).contains(&request.wire_tag()));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

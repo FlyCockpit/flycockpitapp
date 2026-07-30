@@ -38,6 +38,41 @@ pub struct PinnedMessage {
     pub text: String,
 }
 
+/// The requested transcript event does not belong to the supplied session.
+/// This remains distinct from an idempotent pin/unpin no-op.
+#[derive(Debug)]
+pub struct PinSeqNotInSession {
+    pub session_id: Uuid,
+    pub seq: i64,
+}
+
+impl std::fmt::Display for PinSeqNotInSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session event {} is not a member of session {}",
+            self.seq, self.session_id
+        )
+    }
+}
+
+impl std::error::Error for PinSeqNotInSession {}
+
+fn ensure_pin_seq_member(conn: &rusqlite::Connection, session_id: Uuid, seq: i64) -> Result<()> {
+    let member: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM session_events WHERE session_id = ?1 AND seq = ?2",
+            params![session_id.to_string(), seq],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("checking pin session-event membership")?;
+    if member.is_none() {
+        return Err(PinSeqNotInSession { session_id, seq }.into());
+    }
+    Ok(())
+}
+
 impl Db {
     /// Pin the message at `(session_id, seq)`. Idempotent: pinning an
     /// already-pinned message is a no-op (no error). Returns `true` when a
@@ -45,6 +80,7 @@ impl Db {
     pub async fn pin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         let pinned_ms = now_ms();
         self.write(move |conn| {
+            ensure_pin_seq_member(conn, session_id, seq)?;
             let n = conn
                 .execute(
                     "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms)
@@ -62,6 +98,7 @@ impl Db {
     /// `d` (delete) and checking a checklist item in `/pins`.
     pub async fn unpin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         self.write(move |conn| {
+            ensure_pin_seq_member(conn, session_id, seq)?;
             let n = conn
                 .execute(
                     "DELETE FROM pins WHERE session_id = ?1 AND seq = ?2",
@@ -95,6 +132,7 @@ impl Db {
     pub async fn toggle_pin(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         let pinned_ms = now_ms();
         self.transaction(move |conn| {
+            ensure_pin_seq_member(conn, session_id, seq)?;
             let found: Option<i64> = conn
                 .query_row(
                     "SELECT 1 FROM pins WHERE session_id = ?1 AND seq = ?2",
@@ -269,6 +307,48 @@ mod tests {
             1,
             "still exactly one pin"
         );
+    }
+
+    #[tokio::test]
+    async fn pin_rejects_seq_from_another_session() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.create_session("p", "/x", "Auto").await.unwrap();
+        let b = db.create_session("p", "/y", "Auto").await.unwrap();
+        let seq = record_msg(&db, b.session_id, SessionEventKind::UserMessage, "in b").await;
+
+        let error = db.pin_message(a.session_id, seq).await.unwrap_err();
+        assert!(error.downcast_ref::<PinSeqNotInSession>().is_some());
+        let error = db.unpin_message(a.session_id, seq).await.unwrap_err();
+        assert!(error.downcast_ref::<PinSeqNotInSession>().is_some());
+        let error = db.toggle_pin(a.session_id, seq).await.unwrap_err();
+        assert!(error.downcast_ref::<PinSeqNotInSession>().is_some());
+    }
+
+    #[tokio::test]
+    async fn pin_rejects_nonexistent_seq() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Auto").await.unwrap();
+
+        let error = db
+            .pin_message(session.session_id, 99_999)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<PinSeqNotInSession>().is_some());
+    }
+
+    #[tokio::test]
+    async fn unpin_unpinned_but_member_seq_returns_false() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Auto").await.unwrap();
+        let seq = record_msg(
+            &db,
+            session.session_id,
+            SessionEventKind::UserMessage,
+            "present",
+        )
+        .await;
+
+        assert!(!db.unpin_message(session.session_id, seq).await.unwrap());
     }
 
     #[tokio::test]

@@ -4480,6 +4480,13 @@ async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSo
         .await
         .unwrap();
 
+    if kind == "delete_sealed_value" {
+        ctx.db
+            .upsert_sealed_value(session_id, "value", "seeded-sealed-value", "test", "test")
+            .await
+            .unwrap();
+    }
+
     let needs_attached = authz_kind_needs_attached_state(kind, level);
     let revokes_session_access = needs_attached && level == AuthzLevel::NoAccess;
     let principal_level = if revokes_session_access {
@@ -7130,6 +7137,18 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
         .await
         .unwrap();
     let note = ctx.db.create_project_note("/repo", "old").await.unwrap();
+    if kind == "delete_sealed_value" {
+        ctx.db
+            .upsert_sealed_value(
+                session.session_id,
+                "value",
+                "seeded-sealed-value",
+                "test",
+                "test",
+            )
+            .await
+            .unwrap();
+    }
     if matches!(kind, "unpin_message" | "toggle_pinned_message") {
         ctx.db.pin_message(session.session_id, seq).await.unwrap();
     }

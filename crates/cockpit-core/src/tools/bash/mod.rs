@@ -179,17 +179,19 @@ impl Tool for BashTool {
 
     fn defensive_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
-            "type": "object",
-            "x-cockpit-primary-field": "command",
-            "properties": {
-                "command":    { "type": "string", "x-cockpit-aliases": ["cmd", "shell", "script", "commandLine"], "description": "The shell command line to run. May be a pipeline; chain dependent steps with `&&` since each call is a fresh shell with no carried-over state" },
-                "cwd":        { "type": "string", "description": "Directory to run the command in; defaults to the session working directory. Use this instead of a leading `cd`, which does not persist to later calls" },
-                "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Hard wall-clock timeout in milliseconds after the command starts before it is killed; defaults to 120000, minimum 1000, maximum 600000. Raise it for long builds/test runs" },
-                "queue_timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_QUEUE_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Optional milliseconds to wait for declared resource permits before giving up; this is separate from process runtime timeout" },
-                "resources": resources_schema("Declare resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1} for builds, tests, or other CPU/RAM-heavy work")
-            },
-            "required": ["command"]
-        }))
+                    "type": "object",
+                    "x-cockpit-primary-field": "command",
+                    "properties": {
+                        "command":    { "type": "string", "x-cockpit-aliases": ["cmd", "shell", "script", "commandLine"], "description": "The shell command line to run. May be a pipeline; chain dependent steps with `&&` since each call is a fresh shell with no carried-over state" },
+                        "cwd":        { "type": "string", "description": "Directory to run the command in; defaults to the session working directory. Use this instead of a leading `cd`, which does not persist to later calls" },
+                        "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Hard wall-clock timeout in milliseconds after the command starts before it is killed; defaults to 120000, minimum 1000, maximum 600000. Raise it for long builds/test runs" },
+                        "queue_timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_QUEUE_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Optional milliseconds to wait for declared resource permits before giving up; this is separate from process runtime timeout" },
+                        "resources": resources_schema("Declare resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1} for builds, tests, or other CPU/RAM-heavy work")
+        ,
+                        "sealed_values": { "type": "array", "items": { "type": "string" }, "description": "Optional sealed value ids to inject for this call only as SEALED_<ID> environment variables. You cannot read these values; do not transform or print them because transformations defeat redaction." }
+                    },
+                    "required": ["command"]
+                }))
     }
 
     fn presentation(&self, args: &Value) -> ToolPresentation {

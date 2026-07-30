@@ -183,7 +183,7 @@ async fn bash_scrub_overrides_matches_bare_and_camel_secret_names() {
         ("apiKey".to_string(), "camel-api-key-value".to_string()),
         ("REGION".to_string(), "us-east-1".to_string()),
     ]);
-    let scrubbed: std::collections::BTreeSet<_> = scrub_overrides(&env)
+    let scrubbed: std::collections::BTreeSet<_> = scrub_overrides(&env, &[])
         .into_iter()
         .map(|(key, _)| key)
         .collect();
@@ -191,6 +191,21 @@ async fn bash_scrub_overrides_matches_bare_and_camel_secret_names() {
     assert!(scrubbed.contains("PASSWORD"));
     assert!(scrubbed.contains("apiKey"));
     assert!(!scrubbed.contains("REGION"));
+}
+
+#[test]
+fn sealed_env_names_are_deterministic_and_forced_into_scrubbing() {
+    let name = sealed_env_name("dburl-prod");
+    assert_eq!(name, "SEALED_DBURL_PROD");
+    let env = std::collections::HashMap::from([(name.clone(), "secret".to_string())]);
+    let scrubbed: std::collections::BTreeSet<_> = scrub_overrides(&env, &[])
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    assert!(
+        !scrubbed.contains(&name),
+        "sealed variables must not be removed before child spawn"
+    );
 }
 
 #[tokio::test]
@@ -611,7 +626,7 @@ async fn grant_command(ctx: &ToolCtx, command: &str, scope: Scope) {
 async fn sandbox_off_ctx_with_grant(cwd: &std::path::Path, command: &str) -> ToolCtx {
     let ctx = ctx_with_store(cwd);
     ctx.session.set_sandbox_enabled(false);
-    grant_command(&ctx, command, Scope::Session).await;
+    grant_command(&ctx, &command, Scope::Session).await;
     ctx
 }
 
@@ -1119,6 +1134,72 @@ async fn bash_child_receives_session_env_overlay() {
         .expect("bash call returns");
     assert!(out.content.contains("sk-session"));
     assert!(out.content.contains("exit: 0"));
+}
+
+#[tokio::test]
+async fn bash_injects_sealed_value_for_one_call_without_mutating_overlay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_enabled(false);
+    let command = format!("printf %s \"{}SEALED_PROD_TOKEN\"", char::from(36));
+    grant_command(&ctx, &command, Scope::Session).await;
+    ctx.session
+        .set_sealed_value(
+            &ctx.redact,
+            "prod-token",
+            "very-secret-literal",
+            "deploy",
+            "user",
+        )
+        .await
+        .unwrap();
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": command, "sealed_values": ["prod-token"] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let model_output = ctx
+        .redact
+        .with_forced_literal(
+            "very-secret-literal".to_string(),
+            "sealed:prod-token".to_string(),
+        )
+        .unwrap()
+        .scrub(&out.content);
+    assert!(!model_output.contains("very-secret-literal"));
+    assert!(model_output.contains("REDACTED"), "{model_output}");
+    assert!(
+        !ctx.env_overlay
+            .read()
+            .unwrap()
+            .contains_key("SEALED_PROD_TOKEN")
+    );
+}
+
+#[tokio::test]
+async fn sealed_injection_rejects_unknown_ids_and_overlay_collisions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    let mut env = std::collections::HashMap::new();
+    let unknown = inject_sealed_values(
+        &serde_json::json!({ "sealed_values": ["missing"] }),
+        &ctx,
+        &mut env,
+    )
+    .await
+    .unwrap_err();
+    assert!(unknown.to_string().contains("missing"));
+    env.insert("SEALED_PROD_TOKEN".to_string(), "ordinary".to_string());
+    let collision = inject_sealed_values(
+        &serde_json::json!({ "sealed_values": ["prod-token"] }),
+        &ctx,
+        &mut env,
+    )
+    .await
+    .unwrap_err();
+    assert!(collision.to_string().contains("SEALED_PROD_TOKEN"));
 }
 
 #[tokio::test]

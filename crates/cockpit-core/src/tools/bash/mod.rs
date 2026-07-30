@@ -72,7 +72,7 @@ impl Default for BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        let description = "Run one shell command. Fresh shell each call: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers, editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources for expensive builds/tests; log verbose output to $TMPDIR."
+        let description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR. Sealed: `sealed_values` injects unreadable `SEALED_<ID>`; do not transform."
             .to_string();
 
         // The defensive, explicitly-steering form (`llm-modes-
@@ -170,7 +170,8 @@ impl Tool for BashTool {
                 "cwd":        { "type": "string", "description": "Working directory; defaults to session cwd" },
                 "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Hard timeout in ms; defaults to 120000, min 1000, max 600000" },
                 "queue_timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_QUEUE_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Optional timeout in ms while waiting for resource scheduler permits" },
-                "resources": resources_schema("Optional resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1}")
+                "resources": resources_schema("Optional resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1}"),
+                "sealed_values": { "type": "array", "items": { "type": "string" }, "description": "Optional sealed value ids to inject for this call only as SEALED_<ID> environment variables. You cannot read these values; do not transform or print them because transformations defeat redaction." }
             },
             "required": ["command"]
         })
@@ -304,6 +305,60 @@ fn normalize_bash_timeouts(args: &Value) -> BashTimeouts {
         queue_timeout_ms,
         notes,
     }
+}
+
+fn sealed_env_name(value_id: &str) -> String {
+    format!(
+        "SEALED_{}",
+        value_id.to_ascii_uppercase().replace(char::from(45), "_")
+    )
+}
+
+async fn inject_sealed_values(
+    args: &Value,
+    ctx: &ToolCtx,
+    session_env: &mut std::collections::HashMap<String, String>,
+) -> Result<Vec<String>> {
+    let Some(raw_ids) = args.get("sealed_values") else {
+        return Ok(Vec::new());
+    };
+    let ids = raw_ids.as_array().ok_or_else(|| {
+        crate::engine::tool::invalid_input("`sealed_values` must be an array of strings")
+    })?;
+    let mut names = Vec::with_capacity(ids.len());
+    for raw_id in ids {
+        let value_id = raw_id.as_str().ok_or_else(|| {
+            crate::engine::tool::invalid_input("`sealed_values` must contain only strings")
+        })?;
+        let name = sealed_env_name(value_id);
+        if session_env.contains_key(&name)
+            || [
+                "BASH_ENV",
+                "ENV",
+                "PROMPT_COMMAND",
+                "NODE_OPTIONS",
+                "SHELLOPTS",
+                "BASHOPTS",
+                "GREP_OPTIONS",
+                "GREP_COLORS",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+            ]
+            .contains(&name.as_str())
+        {
+            anyhow::bail!(
+                "sealed value `{value_id}` derives colliding environment variable `{name}`"
+            );
+        }
+        let value = ctx
+            .session
+            .resolve_sealed_value_for_injection(value_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("sealed value `{value_id}` is unknown"))?;
+        session_env.insert(name.clone(), value.as_str().to_string());
+        names.push(name);
+    }
+    Ok(names)
 }
 
 pub(crate) async fn rerun_escalated_bash(
@@ -445,6 +500,7 @@ async fn call_bash_inner(
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let sealed_env_names = inject_sealed_values(&args, ctx, &mut session_env).await?;
     let jq_shim_paths =
         if should_prepare_jq_shim(options.force_unconfined, ctx.session.sandbox_mode()) {
             crate::tools::jq_shim::prepare_host_jq_shim(&ctx.session, &mut session_env)
@@ -452,7 +508,7 @@ async fn call_bash_inner(
             Vec::new()
         };
     let tmp_dir = ctx.session.tmp_dir();
-    let scrub = scrub_overrides(&session_env);
+    let scrub = scrub_overrides(&session_env, &sealed_env_names);
     let command_classification = crate::approval::classify::classify(command);
     let extended_config = ctx.config.extended();
     let profile_introspector =
@@ -2712,6 +2768,7 @@ fn windows_shell_notice(_ctx: &ToolCtx) -> Option<&'static str> {
 /// unconfined path removes.
 fn scrub_overrides(
     session_env: &std::collections::HashMap<String, String>,
+    sealed_env_names: &[String],
 ) -> Vec<(String, String)> {
     session_env
         .keys()
@@ -2728,7 +2785,7 @@ fn scrub_overrides(
             "AWS_ACCESS_KEY_ID".to_string(),
             "AWS_SECRET_ACCESS_KEY".to_string(),
         ])
-        .filter(|k| crate::redact::env_scrub_patterns(k))
+        .filter(|k| !sealed_env_names.contains(k) && crate::redact::env_scrub_patterns(k))
         .map(|k| (k, String::new()))
         .collect()
 }

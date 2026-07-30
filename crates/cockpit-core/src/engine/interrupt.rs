@@ -45,7 +45,9 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::daemon::proto::{self, InterruptQuestionSet, ResolveResponse};
-use crate::daemon::{EventSender, SharedRedactionTable, send_current_event};
+use crate::daemon::{
+    EventSender, SharedRedactionTable, current_redaction, send_current_event, set_current_redaction,
+};
 use crate::db::needs_attention::InterruptParkPayload;
 
 tokio::task_local! {
@@ -339,6 +341,26 @@ impl InterruptHub {
     /// repeat. A detached hub (tests / standalone shim) is always headless.
     pub fn is_interactive_attached(&self) -> bool {
         self.interactive_clients.load(Ordering::SeqCst) > 0
+    }
+
+    /// Add a sealed literal to the worker's live egress redaction table and
+    /// persist that table before a caller writes the value itself. Detached
+    /// hubs have no worker-owned table, so callers retain their local table.
+    pub fn seal_redaction_literal(
+        &self,
+        session: &crate::session::Session,
+        value: String,
+        value_id: &str,
+    ) -> anyhow::Result<Option<Arc<crate::redact::RedactionTable>>> {
+        let Some(redaction) = &self.redaction else {
+            return Ok(None);
+        };
+        let table = current_redaction(redaction)
+            .with_forced_literal(value, format!("sealed:{value_id}"))?;
+        let table = Arc::new(table);
+        session.persist_redaction_table(&table)?;
+        set_current_redaction(redaction, table.clone());
+        Ok(Some(table))
     }
 
     /// Register a wakeup for `interrupt_id` and return the guard the

@@ -226,10 +226,20 @@ impl McpChildDispatch {
         builtin: Option<bool>,
         args: Value,
     ) -> Self {
+        let tool = tool.into();
+        let args = if builtin == Some(true) && tool == "set_sealed_value" {
+            let mut safe = args;
+            if let Some(object) = safe.as_object_mut() {
+                object.remove("value");
+            }
+            safe
+        } else {
+            args
+        };
         Self {
             kind,
             server,
-            tool: tool.into(),
+            tool,
             builtin,
             args,
         }
@@ -695,7 +705,16 @@ pub fn presentation(tool: &str, args: &Value) -> Option<ToolPresentation> {
     let registry = default_registry();
     let func = registry.get(tool)?;
     let display_args = args.get("args").unwrap_or(args);
-    let (summary, full_input) = readable_args(display_args);
+    let display_args = if tool == "set_sealed_value" {
+        let mut safe = display_args.clone();
+        if let Some(object) = safe.as_object_mut() {
+            object.remove("value");
+        }
+        safe
+    } else {
+        display_args.clone()
+    };
+    let (summary, full_input) = readable_args(&display_args);
     Some(ToolPresentation::with_parts(
         Some(func.presentation.glyph),
         func.presentation.label.clone(),
@@ -826,6 +845,30 @@ fn default_functions() -> Vec<BuiltinFunction> {
             Arc::new(|_ctx| Availability::available()),
             true,
             Arc::new(context_usage),
+        ),
+        BuiltinFunction::new(
+            "request_sealed_value",
+            "Ask the user for a sealed value without returning it to the agent",
+            BuiltinPresentation {
+                glyph: "🔒",
+                label: "request_sealed_value".to_string(),
+            },
+            Arc::new(request_sealed_value_schema),
+            Arc::new(|_ctx| Availability::available()),
+            true,
+            Arc::new(request_sealed_value),
+        ),
+        BuiltinFunction::new(
+            "set_sealed_value",
+            "Store a value sealed without returning it to the agent",
+            BuiltinPresentation {
+                glyph: "🔒",
+                label: "set_sealed_value".to_string(),
+            },
+            Arc::new(set_sealed_value_schema),
+            Arc::new(|_ctx| Availability::available()),
+            true,
+            Arc::new(set_sealed_value),
         ),
     ];
     for tool in [
@@ -1201,6 +1244,130 @@ fn context_usage<'a>(
             "auto_compact_pct": snapshot.auto_compact_pct,
             "snapshot": "turn_start"
         }))
+    })
+}
+
+fn request_sealed_value_schema() -> Value {
+    sealed_value_schema("message")
+}
+
+fn set_sealed_value_schema() -> Value {
+    sealed_value_schema("value")
+}
+
+fn sealed_value_schema(extra: &str) -> Value {
+    let mut properties = serde_json::Map::from_iter([
+        (
+            "value_id".to_string(),
+            serde_json::json!({"type": "string"}),
+        ),
+        ("reason".to_string(), serde_json::json!({"type": "string"})),
+    ]);
+    properties.insert(extra.to_string(), serde_json::json!({"type": "string"}));
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["value_id", "reason", extra],
+        "additionalProperties": false
+    })
+}
+
+fn required_sealed_arg<'a>(args: &'a Value, name: &str, tool: &str) -> Result<&'a str> {
+    args.get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .with_context(|| format!("`cockpit.{tool}` requires non-empty `{name}` as a string"))
+}
+
+async fn store_sealed_value(
+    ctx: &HostContext,
+    value_id: &str,
+    value: &str,
+    reason: &str,
+    origin: &str,
+) -> Result<Value> {
+    crate::session::sealed_values::validate_sealed_value(value_id, value)?;
+    let session = ctx
+        .session
+        .as_ref()
+        .context("sealed value tools require a live session")?;
+    let native = ctx
+        .native_tool_ctx
+        .as_ref()
+        .context("sealed value tools require a live tool context")?;
+    let overwritten = session
+        .list_sealed_value_metadata()
+        .await?
+        .iter()
+        .any(|metadata| metadata.value_id == value_id);
+    let table = native
+        .interrupts
+        .seal_redaction_literal(session, value.to_owned(), value_id)?
+        .unwrap_or_else(|| native.redact.clone());
+    session
+        .set_sealed_value(&table, value_id, value, reason, origin)
+        .await?;
+    Ok(serde_json::json!({
+        "value_id": value_id,
+        "status": if overwritten { "overwritten" } else { "created" },
+    }))
+}
+
+fn set_sealed_value<'a>(
+    ctx: &'a HostContext,
+    args: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+    Box::pin(async move {
+        let value_id = required_sealed_arg(&args, "value_id", "set_sealed_value")?;
+        let value = required_sealed_arg(&args, "value", "set_sealed_value")?;
+        let reason = required_sealed_arg(&args, "reason", "set_sealed_value")?;
+        store_sealed_value(ctx, value_id, value, reason, "agent-set").await
+    })
+}
+
+fn request_sealed_value<'a>(
+    ctx: &'a HostContext,
+    args: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+    Box::pin(async move {
+        let value_id = required_sealed_arg(&args, "value_id", "request_sealed_value")?;
+        let message = required_sealed_arg(&args, "message", "request_sealed_value")?;
+        let reason = required_sealed_arg(&args, "reason", "request_sealed_value")?;
+        let native = ctx
+            .native_tool_ctx
+            .as_ref()
+            .context("`cockpit.request_sealed_value` requires a live tool context")?;
+        if !native.interrupts.is_interactive_attached() {
+            bail!("`cockpit.request_sealed_value` requires an interactive session");
+        }
+        let prompt = format!(
+            "{message}\n\nReason: {reason}\n\nYour answer is stored sealed, can be used by the agent without being shown to it, and is redacted from transcripts. Decide whether you want to provide it."
+        );
+        let set = crate::daemon::proto::InterruptQuestionSet {
+            questions: vec![crate::daemon::proto::InterruptQuestion::Freetext {
+                prompt,
+                masked: true,
+            }],
+        };
+        let session = ctx
+            .session
+            .as_ref()
+            .context("sealed value tools require a live session")?;
+        let response = crate::engine::interrupt::raise_and_wait(
+            &session.db,
+            &native.interrupts,
+            session.id,
+            &native.agent_id,
+            "Sealed value requested",
+            set,
+            "sealed value request",
+        )
+        .await
+        .into_response()?;
+        let Some(value) = crate::engine::interrupt::freetext_of(&response) else {
+            return Ok(serde_json::json!({"value_id": value_id, "status": "declined"}));
+        };
+        store_sealed_value(ctx, value_id, &value, reason, "agent-request").await
     })
 }
 
@@ -2793,5 +2960,260 @@ mod tests {
             .unwrap();
         assert!(unavailable["compact_nudge_pct"].is_null());
         assert!(unavailable["auto_compact_pct"].is_null());
+    }
+
+    #[test]
+    fn sealed_value_builtins_are_advertised_with_required_schemas() {
+        let host = HostContext::empty_for_tests();
+        let descriptors = available_descriptors(&host);
+        for (name, required) in [
+            (
+                "request_sealed_value",
+                vec!["value_id", "message", "reason"],
+            ),
+            ("set_sealed_value", vec!["value_id", "value", "reason"]),
+        ] {
+            let descriptor = descriptors.iter().find(|entry| entry.name == name).unwrap();
+            let fields = descriptor.input_schema["required"].as_array().unwrap();
+            for field in required {
+                assert!(
+                    fields.iter().any(|entry| entry == field),
+                    "{name} missing {field}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sealed_set_value_strips_literal_from_child_records_and_presentation() {
+        let literal = "presentation-secret-123";
+        let dispatch = McpChildDispatch::new(
+            "invoke",
+            Some(BUILTIN_SERVER_ID.to_string()),
+            "set_sealed_value",
+            Some(true),
+            serde_json::json!({"value_id": "deploy-token", "value": literal, "reason": "deploy"}),
+        );
+        assert!(!dispatch.args.to_string().contains(literal));
+        let presentation = presentation(
+            "set_sealed_value",
+            &serde_json::json!({
+                "value_id": "deploy-token", "value": literal, "reason": "deploy"
+            }),
+        )
+        .unwrap();
+        assert!(!presentation.summary.contains(literal));
+        assert!(!presentation.full_input.contains(literal));
+    }
+
+    #[tokio::test]
+    async fn sealed_set_value_returns_only_metadata_redacts_and_reports_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        let (events, _receiver) = tokio::sync::broadcast::channel(16);
+        let shared = Arc::new(RwLock::new(
+            Arc::new(crate::redact::RedactionTable::empty()),
+        ));
+        ctx.interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            shared.clone(),
+            Arc::new(AtomicUsize::new(1)),
+            ctx.session.db.clone(),
+            ctx.session.id,
+        ));
+        let host = HostContext::from_tool_ctx(&ctx);
+        let secret = "sealed-value-secret-123";
+        let first = invoke(
+            &host,
+            "set_sealed_value",
+            serde_json::json!({
+                "value_id": "deploy-token", "value": secret, "reason": "deploy",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["value_id"], "deploy-token");
+        assert_eq!(first["status"], "created");
+        assert!(!first.to_string().contains(secret));
+        assert!(first.get("length").is_none());
+        assert!(!shared.read().unwrap().scrub(secret).contains(secret));
+        let second = invoke(
+            &host,
+            "set_sealed_value",
+            serde_json::json!({
+                "value_id": "deploy-token", "value": "other-sealed-secret-456", "reason": "rotate",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["status"], "overwritten");
+        let rejected = "password";
+        let error = invoke(
+            &host,
+            "set_sealed_value",
+            serde_json::json!({
+                "value_id": "bad", "value": rejected, "reason": "test",
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("unsafe"));
+        assert!(!error.to_string().contains(rejected));
+    }
+
+    #[tokio::test]
+    async fn sealed_request_value_stores_masked_answer_without_returning_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        let db = ctx.session.db.clone();
+        let session_id = ctx.session.id;
+        let (events, _receiver) = tokio::sync::broadcast::channel(16);
+        let shared = Arc::new(RwLock::new(
+            Arc::new(crate::redact::RedactionTable::empty()),
+        ));
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            shared,
+            Arc::new(AtomicUsize::new(1)),
+            db.clone(),
+            session_id,
+        ));
+        ctx.interrupts = hub.clone();
+        let host = HostContext::from_tool_ctx(&ctx);
+        let task = tokio::spawn(async move {
+            invoke(&host, "request_sealed_value", serde_json::json!({
+                "value_id": "deploy-token", "message": "Paste the deployment token", "reason": "deploy",
+            })).await
+        });
+        let row = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(row) = db
+                    .list_open_interrupts(session_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                {
+                    if hub.has_waiter(row.interrupt_id) {
+                        return row;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let question = row.questions.unwrap().questions.into_iter().next().unwrap();
+        let crate::daemon::proto::InterruptQuestion::Freetext { prompt, masked } = question else {
+            panic!("sealed request must be freetext");
+        };
+        assert!(masked);
+        assert!(prompt.contains("Paste the deployment token"));
+        assert!(prompt.contains("Reason: deploy"));
+        assert!(prompt.contains("stored sealed"));
+        let answer = "requested-sealed-secret-789";
+        let response = crate::daemon::proto::ResolveResponse::Freetext {
+            text: answer.to_string(),
+        };
+        db.resolve_interrupt(row.interrupt_id, &response)
+            .await
+            .unwrap();
+        assert!(hub.resolve(row.interrupt_id, response));
+        let out = task.await.unwrap().unwrap();
+        assert_eq!(out["status"], "created");
+        assert!(!out.to_string().contains(answer));
+        assert!(
+            !db.list_session_events(session_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| format!("{event:?}").contains(answer))
+        );
+        assert_eq!(
+            ctx.session
+                .resolve_sealed_value_for_injection("deploy-token")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            answer
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_request_value_declines_or_refuses_headless_without_storing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        let db = ctx.session.db.clone();
+        let session_id = ctx.session.id;
+        let (events, _receiver) = tokio::sync::broadcast::channel(16);
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            Arc::new(RwLock::new(
+                Arc::new(crate::redact::RedactionTable::empty()),
+            )),
+            Arc::new(AtomicUsize::new(1)),
+            db.clone(),
+            session_id,
+        ));
+        ctx.interrupts = hub.clone();
+        let host = HostContext::from_tool_ctx(&ctx);
+        let task = tokio::spawn(async move {
+            invoke(
+                &host,
+                "request_sealed_value",
+                serde_json::json!({
+                    "value_id": "declined", "message": "Paste it", "reason": "test",
+                }),
+            )
+            .await
+        });
+        let row = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(row) = db
+                    .list_open_interrupts(session_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                {
+                    if hub.has_waiter(row.interrupt_id) {
+                        return row;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        db.resolve_interrupt(
+            row.interrupt_id,
+            &crate::daemon::proto::ResolveResponse::Cancel,
+        )
+        .await
+        .unwrap();
+        assert!(hub.resolve(
+            row.interrupt_id,
+            crate::daemon::proto::ResolveResponse::Cancel
+        ));
+        assert_eq!(task.await.unwrap().unwrap()["status"], "declined");
+        assert!(
+            ctx.session
+                .resolve_sealed_value_for_injection("declined")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let headless = HostContext::from_tool_ctx(&crate::tools::common::test_ctx(tmp.path()));
+        let error = invoke(
+            &headless,
+            "request_sealed_value",
+            serde_json::json!({
+                "value_id": "headless", "message": "Paste it", "reason": "test",
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("interactive"));
     }
 }

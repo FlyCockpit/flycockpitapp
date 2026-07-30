@@ -460,6 +460,11 @@ impl App {
                     line: format!("/rename: {e}"),
                 }),
             },
+            AsyncActionKind::DaemonRpc("sealed") => match result.payload {
+                Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
+                Ok(_) => self.push_plain("/sealed: unexpected daemon response".to_string()),
+                Err(e) => self.push_plain(format!("/sealed: {e}")),
+            },
             AsyncActionKind::DaemonRpc("note") => match result.payload {
                 Ok(AsyncActionPayload::NoteRecorded { text }) => {
                     self.history.push(HistoryEntry::UserNote {

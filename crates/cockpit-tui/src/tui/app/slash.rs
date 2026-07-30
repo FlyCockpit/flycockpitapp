@@ -531,6 +531,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "sealed",
+        description: "List or revoke session sealed values (arg: delete <id>)",
+        takes_args: true,
+        run: run_sealed,
+        available: available_always,
+        describe: describe_sealed,
+    },
+    SlashCommand {
         name: "permissions",
         description: "View and delete persisted command/path approvals across project and global scopes",
         takes_args: false,
@@ -1088,6 +1096,57 @@ fn run_scratchpad(app: &mut App, _: &str) -> bool {
 fn run_note(app: &mut App, args: &str) -> bool {
     app.handle_note_command(args);
     false
+}
+
+fn run_sealed(app: &mut App, args: &str) -> bool {
+    app.handle_sealed_command(args);
+    false
+}
+
+fn describe_sealed(_: &App, _: &SlashCommand) -> String {
+    "List or revoke session sealed values (arg: delete <id>)".to_string()
+}
+
+fn sealed_request(
+    session_id: uuid::Uuid,
+    args: &str,
+) -> Option<cockpit_core::daemon::proto::Request> {
+    let args = args.trim();
+    if args.is_empty() {
+        Some(cockpit_core::daemon::proto::Request::ListSealedValues { session_id })
+    } else {
+        args.strip_prefix("delete ")
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(
+                |value_id| cockpit_core::daemon::proto::Request::DeleteSealedValue {
+                    session_id,
+                    value_id: value_id.to_string(),
+                },
+            )
+    }
+}
+
+fn format_sealed_values(values: &mut [cockpit_core::daemon::proto::SealedValueMetadata]) -> String {
+    values.sort_by(|a, b| (a.created_at, &a.value_id).cmp(&(b.created_at, &b.value_id)));
+    if values.is_empty() {
+        return "/sealed: no sealed values; agents can request or set them when needed".to_string();
+    }
+    let rows = values
+        .iter()
+        .map(|value| {
+            let mut reason = value.reason.chars().take(120).collect::<String>();
+            if value.reason.chars().count() > 120 {
+                reason.push_str("…");
+            }
+            format!(
+                "{} | {} | {} | {} | {}",
+                value.value_id, reason, value.origin, value.created_at, value.origin_session_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("/sealed: id | reason | origin | created_at | origin_session\n{rows}")
 }
 
 fn run_agent(app: &mut App, args: &str) -> bool {
@@ -2215,6 +2274,30 @@ impl App {
             },
         );
     }
+
+    pub(super) fn handle_sealed_command(&mut self, args: &str) {
+        if !self.daemon_connected {
+            self.push_plain("/sealed: a running session is required".to_string());
+            return;
+        }
+        let session_id = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => Some(runner.session_id()),
+            _ => self.launch.session_id,
+        };
+        let Some(session_id) = session_id else {
+            self.push_plain("/sealed: a running session is required".to_string());
+            return;
+        };
+        let Some(request) = sealed_request(session_id, args) else {
+            self.push_plain("/sealed: usage `/sealed` or `/sealed delete <id>`".to_string());
+            return;
+        };
+        self.async_actions.start_blocking(AsyncActionKind::DaemonRpc("sealed"), AsyncActionPolicy::AllowConcurrent, move || match agent_runner::daemon_request_blocking(request) {
+            Ok(cockpit_core::daemon::proto::Response::SealedValues { mut values }) => { let text = format_sealed_values(&mut values); Ok(AsyncActionPayload::Text(text)) }
+            Ok(cockpit_core::daemon::proto::Response::Ack) => Ok(AsyncActionPayload::Text("/sealed: revoked; future use stops now, while past transcripts remain redacted".to_string())),
+            Ok(_) => Err("unexpected daemon response".to_string()), Err(e) => Err(e),
+        });
+    }
 }
 
 /// Map a `/editor` argument to a pane side. Empty / unknown → fullscreen.
@@ -2797,5 +2880,53 @@ mod table_tests {
                 alias.alias
             );
         }
+    }
+
+    #[test]
+    fn sealed_command_is_registered_with_live_description() {
+        let command = slash_command_by_name("sealed").expect("/sealed registry row");
+        assert!(command.takes_args);
+        assert!(
+            command
+                .rendered_description(&App::new(None, false))
+                .contains("sealed values")
+        );
+    }
+
+    #[test]
+    fn sealed_request_emits_list_and_delete_variants() {
+        let session_id = uuid::Uuid::nil();
+        assert!(
+            matches!(sealed_request(session_id, ""), Some(cockpit_core::daemon::proto::Request::ListSealedValues { session_id: id }) if id == session_id)
+        );
+        assert!(
+            matches!(sealed_request(session_id, "delete prod_token"), Some(cockpit_core::daemon::proto::Request::DeleteSealedValue { session_id: id, value_id }) if id == session_id && value_id == "prod_token")
+        );
+        assert!(sealed_request(session_id, "delete").is_none());
+    }
+
+    #[test]
+    fn sealed_formatter_orders_metadata_and_never_renders_literal() {
+        let origin = uuid::Uuid::nil();
+        let mut values = vec![
+            cockpit_core::daemon::proto::SealedValueMetadata {
+                value_id: "z".into(),
+                reason: "deploy".into(),
+                origin: "user".into(),
+                created_at: 2,
+                origin_session_id: origin,
+            },
+            cockpit_core::daemon::proto::SealedValueMetadata {
+                value_id: "a".into(),
+                reason: "very-secret-literal".into(),
+                origin: "fork".into(),
+                created_at: 1,
+                origin_session_id: origin,
+            },
+        ];
+        let rendered = format_sealed_values(&mut values);
+        assert!(rendered.contains("a | very-secret-literal | fork | 1"));
+        assert!(rendered.find("a | ").unwrap() < rendered.find("z | ").unwrap());
+        assert!(!rendered.contains("actual-secret-value"));
     }
 }

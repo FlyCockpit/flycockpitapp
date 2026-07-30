@@ -451,16 +451,21 @@ pub(super) async fn handle_serialized_request(
             session_id,
             value_id,
         } => {
-            if let Some(handle) = ctx.registry.live_handle(session_id) {
+            let deleted = if let Some(handle) = ctx.registry.live_handle(session_id) {
                 handle
                     .delete_sealed_value(&value_id)
                     .await
-                    .map_err(internal)?;
+                    .map_err(internal)?
             } else {
                 ctx.db
                     .delete_sealed_value(session_id, &value_id)
                     .await
-                    .map_err(internal)?;
+                    .map_err(internal)?
+            };
+            if !deleted {
+                return Err(internal(anyhow::anyhow!(
+                    "sealed value `{value_id}` is unknown"
+                )));
             }
             Ok(Response::Ack)
         }

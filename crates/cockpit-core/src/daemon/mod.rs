@@ -917,6 +917,8 @@ fn spawn_detached_inner(
     no_sandbox: bool,
     resume_all_sessions: bool,
 ) -> Result<u32> {
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe().context("locating own binary")?;
     let mut command = Command::new(exe);
@@ -938,6 +940,8 @@ fn spawn_detached_inner(
             .env(EPHEMERAL_SOCKET_ENV, &paths.socket)
             .env(EPHEMERAL_PID_ENV, &paths.pid_file);
     }
+    #[cfg(unix)]
+    command.process_group(0);
     let child = command.spawn().context("spawning daemon child")?;
     Ok(child.id())
 }

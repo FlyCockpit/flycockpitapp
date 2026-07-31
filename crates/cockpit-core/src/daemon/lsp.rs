@@ -614,6 +614,8 @@ impl LspClient {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd.spawn().with_context(|| {
             format!(
                 "spawning LSP server `{}` with `{}`",
@@ -946,7 +948,7 @@ async fn remove_lsp_pending(
 impl Drop for LspClient {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.try_lock() {
-            let _ = child.start_kill();
+            crate::process::terminate_group_start(&mut child);
         }
     }
 }

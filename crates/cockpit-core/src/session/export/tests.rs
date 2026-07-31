@@ -2714,6 +2714,122 @@ async fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
     assert!(out.exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn archive_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = create_test_session(
+        &db,
+        "p",
+        tmp.path().to_str().expect("temporary path is UTF-8"),
+        "builder",
+    )
+    .await;
+    let target = get_test_session(&db, session.session_id).await;
+    let out = tmp.path().join("export.zip");
+
+    write_bundle_zip(&db, &target, &out, false, false, false)
+        .await
+        .expect("export succeeds");
+
+    assert_eq!(
+        std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "export archives must never be group- or world-readable"
+    );
+}
+
+#[tokio::test]
+async fn redaction_failure_aborts_export() {
+    let db = Db::open_in_memory().unwrap();
+    let session = create_test_session(&db, "p", "/proj", "builder").await;
+    let target = get_test_session(&db, session.session_id).await;
+    let bundle = collect_bundle(&db, session.session_id).await.unwrap();
+    let db_for_files = db.clone();
+
+    let error = db
+        .read(move |conn| {
+            build_zip_with_options_and_redactor_result_for_test(
+                &db_for_files,
+                conn,
+                &target,
+                &bundle,
+                ExportBundleOptions::default(),
+                &test_export_env(),
+                Err(anyhow::anyhow!("synthetic redaction-table failure")),
+            )
+        })
+        .await
+        .expect_err("a redaction-table failure must abort archive assembly");
+
+    assert!(
+        error
+            .to_string()
+            .contains("building export redaction table"),
+        "error must make the redaction failure clear: {error:#}"
+    );
+    assert!(
+        format!("{error:#}")
+            .to_string()
+            .contains("synthetic redaction-table failure"),
+        "error must preserve the redaction failure cause: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn include_sensitive_still_works() {
+    let db = Db::open_in_memory().unwrap();
+    let session = create_test_session(&db, "p", "/proj", "builder").await;
+    let secret = "include-sensitive-secret";
+    let call = Uuid::new_v4();
+    db.insert_inference_request(
+        &call.to_string(),
+        session.session_id,
+        &json!({
+            "model": "m",
+            "system": secret,
+            "tools": [],
+            "history": [],
+        }),
+        crate::db::session_log::InferenceRequestStatus::Completed,
+    )
+    .await
+    .unwrap();
+    db.insert_session_event(
+        session.session_id,
+        SessionEventKind::InferenceRequest,
+        Some("builder"),
+        Some(&call.to_string()),
+        &json!({"secret": secret}),
+    )
+    .await
+    .unwrap();
+    let target = get_test_session(&db, session.session_id).await;
+
+    let bundle = build_bundle_zip_bytes(&db, &target, false, true)
+        .await
+        .expect("--include-sensitive is the explicit export escape hatch");
+
+    assert!(
+        read_zip_entry(&bundle.bytes, "events.json")
+            .expect("events are exported")
+            .contains(secret),
+        "--include-sensitive must retain event payloads"
+    );
+    let request = entry_names(&bundle.bytes)
+        .into_iter()
+        .find(|name| name.starts_with("inference_requests/"))
+        .and_then(|name| read_zip_entry(&bundle.bytes, &name))
+        .expect("request payload is exported");
+    assert!(
+        request.contains(secret),
+        "--include-sensitive must retain inference payloads"
+    );
+}
+
 /// Insert one captured inference call: an `inference_calls` row (carrying
 /// the `is_utility` flag), the request payload, and the timeline event the
 /// export iterates. Returns the call_id.

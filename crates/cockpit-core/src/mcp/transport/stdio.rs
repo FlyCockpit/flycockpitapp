@@ -73,6 +73,8 @@ impl StdioClient {
             .kill_on_drop(true)
             .env_clear()
             .envs(stdio_child_env(std::env::vars(), env));
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning MCP stdio server `{command}`"))?;
@@ -292,14 +294,8 @@ impl StdioState {
         self.mark_poisoned(reason, reason_mode);
         match self.child.try_lock() {
             Ok(mut child) => {
-                if let Some(child) = child.as_mut()
-                    && let Err(error) = child.start_kill()
-                {
-                    tracing::warn!(
-                        error = %error,
-                        server = %self.server_name,
-                        "failed to start MCP stdio child teardown"
-                    );
+                if let Some(child) = child.as_mut() {
+                    crate::process::terminate_group_start(child);
                 }
             }
             Err(_) => {
@@ -321,13 +317,8 @@ impl StdioState {
         let Some(mut child) = child else {
             return;
         };
-        if let Err(error) = child.start_kill() {
-            tracing::warn!(
-                error = %error,
-                server = %self.server_name,
-                "failed to kill MCP stdio child"
-            );
-        }
+        let pid = child.id();
+        crate::process::terminate_group_async(&mut child, pid, STDIO_POISON_WAIT_TIMEOUT).await;
         match tokio::time::timeout(STDIO_POISON_WAIT_TIMEOUT, child.wait()).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => tracing::warn!(

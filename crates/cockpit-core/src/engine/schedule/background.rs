@@ -15,6 +15,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::FutureExt;
 
@@ -391,7 +392,13 @@ async fn run_background(
             changed = kill_rx.changed() => {
                 if changed.is_ok() && *kill_rx.borrow() {
                     killed = true;
-                    let _ = child.start_kill();
+                    let pid = child.id();
+                    crate::process::terminate_group_async(
+                        &mut child,
+                        pid,
+                        Duration::from_millis(200),
+                    )
+                    .await;
                     break;
                 }
             }
@@ -553,6 +560,8 @@ impl BackgroundCommandConfig {
         // If the authority aborts this task, kill the child too — a leaked
         // subprocess would outlive its job (anti-runaway).
         cmd.kill_on_drop(self.kill_on_drop);
+        #[cfg(unix)]
+        cmd.process_group(0);
     }
 }
 
@@ -853,6 +862,48 @@ mod tests {
     /// A background job that emits progress then sleeps: `tail` shows the
     /// emitted lines while it's still running, and `cancel` (via the kill
     /// handle) kills it and yields a cancelled completion.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_command_teardown_kills_grandchildren() {
+        let cfg = crate::config::extended::RedactConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
+        let (turn_tx, _turn_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let command = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let (handle, task) = spawn_test_job(
+            "tree",
+            &command,
+            tmp.path().to_path_buf(),
+            BackgroundLaunch::unconfined(HashMap::new()),
+            redact,
+            turn_tx,
+            event_tx,
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pid_file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        handle.kill();
+        let _ = event_rx.recv().await;
+        task.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "grandchild survived cancellation"
+        );
+    }
+
     #[tokio::test]
     async fn tail_shows_progress_then_cancel_kills() {
         let cfg = crate::config::extended::RedactConfig::default();

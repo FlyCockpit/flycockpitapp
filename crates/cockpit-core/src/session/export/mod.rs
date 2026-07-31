@@ -444,8 +444,8 @@ pub async fn write_bundle_zip(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating export directory `{}`", parent.display()))?;
     }
-    std::fs::write(out_path, &bundle.bytes)
-        .with_context(|| format!("writing export to `{}`", out_path.display()))?;
+    crate::private_fs::write_private_file(out_path, &bundle.bytes)
+        .with_context(|| format!("writing private export to `{}`", out_path.display()))?;
 
     Ok(bundle.summary)
 }
@@ -495,8 +495,8 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating export directory `{}`", parent.display()))?;
     }
-    std::fs::write(out_path, &bundle.bytes)
-        .with_context(|| format!("writing export to `{}`", out_path.display()))?;
+    crate::private_fs::write_private_file(out_path, &bundle.bytes)
+        .with_context(|| format!("writing private export to `{}`", out_path.display()))?;
 
     Ok(bundle.summary)
 }
@@ -631,6 +631,51 @@ fn build_zip_with_options_and_env_conn(
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
 ) -> Result<Vec<u8>> {
+    let export_redactor = export_redaction_table_with_env(target, env, options.include_sensitive)?;
+    build_zip_with_options_and_env_conn_with_redactor(
+        db,
+        conn,
+        target,
+        bundle,
+        options,
+        env,
+        &export_redactor,
+    )
+}
+
+/// Test-only seam for asserting that a redaction-table construction failure
+/// aborts bundle assembly before any archive bytes are returned.
+#[cfg(test)]
+fn build_zip_with_options_and_redactor_result_for_test(
+    db: &Db,
+    conn: &Connection,
+    target: &SessionRow,
+    bundle: &[SessionRow],
+    options: ExportBundleOptions,
+    env: &HashMap<String, String>,
+    redactor: Result<RedactionTable>,
+) -> Result<Vec<u8>> {
+    let export_redactor = redactor.context("building export redaction table")?;
+    build_zip_with_options_and_env_conn_with_redactor(
+        db,
+        conn,
+        target,
+        bundle,
+        options,
+        env,
+        &export_redactor,
+    )
+}
+
+fn build_zip_with_options_and_env_conn_with_redactor(
+    db: &Db,
+    conn: &Connection,
+    target: &SessionRow,
+    bundle: &[SessionRow],
+    options: ExportBundleOptions,
+    env: &HashMap<String, String>,
+    export_redactor: &RedactionTable,
+) -> Result<Vec<u8>> {
     // session_id → short_id lookup for tagging events.
     let short_ids: BTreeMap<Uuid, String> = bundle
         .iter()
@@ -661,8 +706,6 @@ fn build_zip_with_options_and_env_conn(
         .filter_map(|e| e.call_id.clone())
         .collect();
     let utility_call_ids = Db::utility_call_ids_conn(conn, &candidate_call_ids)?;
-    let export_redactor = export_redaction_table_with_env(target, env);
-
     // Call ids that have a successful `inference_request` event: those own the
     // captured-body file. A failed/hung turn records an `inference_failure`
     // event (not an `inference_request`) instead — its captured body (status
@@ -725,7 +768,7 @@ fn build_zip_with_options_and_env_conn(
         }
         for row in Db::list_task_delegation_steers_conn(conn, s.session_id)? {
             let body =
-                redact_string_for_export(row.body, &export_redactor, options.include_sensitive);
+                redact_string_for_export(row.body, export_redactor, options.include_sensitive);
             delegation_steer_index.push(json!({
                 "id": row.id,
                 "task_call_id": row.task_call_id,
@@ -752,7 +795,7 @@ fn build_zip_with_options_and_env_conn(
                 Ok(payload) => {
                     let body = redact_string_for_export(
                         payload.body,
-                        &export_redactor,
+                        export_redactor,
                         options.include_sensitive,
                     );
                     (Some(row.excerpt(&body)), None::<String>, Some(body))
@@ -872,7 +915,7 @@ fn build_zip_with_options_and_env_conn(
             value["file"] = json!(path);
             request_files.push((path, call_id.to_string()));
         }
-        redact_value_for_export(&mut value, &export_redactor, options.include_sensitive);
+        redact_value_for_export(&mut value, export_redactor, options.include_sensitive);
         event_values.push(value);
     }
 
@@ -958,7 +1001,7 @@ fn build_zip_with_options_and_env_conn(
                 },
                 "file": path,
             });
-            redact_value_for_export(&mut event, &export_redactor, options.include_sensitive);
+            redact_value_for_export(&mut event, export_redactor, options.include_sensitive);
             event_values.push(event);
         }
     }
@@ -977,8 +1020,11 @@ fn build_zip_with_options_and_env_conn(
     });
 
     let manifest = build_manifest_conn(conn, target, bundle, options, env);
-    let config_entries =
-        collect_config_entries_with_env(target, options.include_generated_artifacts, env);
+    let config_entries = collect_config_entries_with_env(
+        target,
+        options.include_generated_artifacts,
+        export_redactor,
+    );
     let approval_entries = collect_approval_entries_conn(conn, bundle)?;
 
     // Write the archive.
@@ -1015,7 +1061,7 @@ fn build_zip_with_options_and_env_conn(
                 // references always exists.
                 None => json!({ "error": "no captured request payload for this call_id" }),
             };
-            redact_value_for_export(&mut payload, &export_redactor, options.include_sensitive);
+            redact_value_for_export(&mut payload, export_redactor, options.include_sensitive);
             zw.start_file(path, opts)
                 .with_context(|| format!("zip: request entry `{path}`"))?;
             zw.write_all(serde_json::to_string_pretty(&payload)?.as_bytes())
@@ -1028,7 +1074,7 @@ fn build_zip_with_options_and_env_conn(
         // field) — the export does not block waiting for it.
         for (path, body) in &tandem_files {
             let mut body = body.clone();
-            redact_value_for_export(&mut body, &export_redactor, options.include_sensitive);
+            redact_value_for_export(&mut body, export_redactor, options.include_sensitive);
             zw.start_file(path, opts)
                 .with_context(|| format!("zip: tandem entry `{path}`"))?;
             zw.write_all(serde_json::to_string_pretty(&body)?.as_bytes())
@@ -1037,7 +1083,7 @@ fn build_zip_with_options_and_env_conn(
 
         for (path, body) in &tool_output_files {
             let mut body = body.clone();
-            redact_value_for_export(&mut body, &export_redactor, options.include_sensitive);
+            redact_value_for_export(&mut body, export_redactor, options.include_sensitive);
             zw.start_file(path, opts)
                 .with_context(|| format!("zip: tool output entry `{path}`"))?;
             zw.write_all(serde_json::to_string_pretty(&body)?.as_bytes())
@@ -1055,7 +1101,7 @@ fn build_zip_with_options_and_env_conn(
             zw.start_file(path, opts)
                 .with_context(|| format!("zip: compressed result entry `{path}`"))?;
             let body =
-                redact_string_for_export(body.clone(), &export_redactor, options.include_sensitive);
+                redact_string_for_export(body.clone(), export_redactor, options.include_sensitive);
             zw.write_all(body.as_bytes())
                 .with_context(|| format!("zip: writing compressed result `{path}`"))?;
         }
@@ -1365,13 +1411,16 @@ fn process_env_map() -> HashMap<String, String> {
 fn export_redaction_table_with_env(
     target: &SessionRow,
     env: &HashMap<String, String>,
-) -> RedactionTable {
+    include_sensitive: bool,
+) -> Result<RedactionTable> {
+    if include_sensitive {
+        tracing::warn!("exporting with --include-sensitive; redaction is explicitly disabled");
+        return Ok(RedactionTable::empty());
+    }
     let cwd = PathBuf::from(&target.project_root);
     let extended = crate::config::extended::load_for_cwd(&cwd);
-    RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "export: redaction table build failed; payload scrub is a no-op");
-        RedactionTable::empty()
-    })
+    RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env)
+        .context("building export redaction table")
 }
 
 fn redact_value_for_export(value: &mut Value, redactor: &RedactionTable, include_sensitive: bool) {
@@ -1439,23 +1488,11 @@ fn layer_label(kind: &ConfigDirKind, project_index: usize) -> String {
 fn collect_config_entries_with_env(
     target: &SessionRow,
     include_generated_artifacts: bool,
-    env: &HashMap<String, String>,
+    redactor: &RedactionTable,
 ) -> Vec<(String, String)> {
     let cwd = PathBuf::from(&target.project_root);
     let layers = discover_config_dirs(&cwd);
-
-    // Same redaction table the inference bodies were scrubbed with: built
-    // from the redact config + cwd. A build failure (or globally-disabled
-    // redaction) must not block the export — fall back to a no-op table that
-    // returns input unchanged, which a disabled config would do anyway.
-    let extended = crate::config::extended::load_for_cwd(&cwd);
-    let redactor = RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env)
-        .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "export: redaction table build failed; config scrub is a no-op");
-        RedactionTable::empty()
-    });
-
-    config_entries_from_layers(&layers, &redactor, include_generated_artifacts)
+    config_entries_from_layers(&layers, redactor, include_generated_artifacts)
 }
 
 /// Export the effective persisted approval grants relevant to this bundle.

@@ -13,6 +13,8 @@ use std::ffi::OsString;
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::io::Cursor;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Child;
 #[cfg(target_os = "linux")]
@@ -437,7 +439,8 @@ impl VirtualDisplayBackend {
             },
             scale_factor: ScaleFactor(1.0),
         };
-        let child = Command::new(xvfb)
+        let mut command = Command::new(xvfb);
+        command
             .arg(&display)
             .arg("-screen")
             .arg("0")
@@ -447,7 +450,10 @@ impl VirtualDisplayBackend {
             ))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command
             .spawn()
             .map_err(|error| ComputerError::CommandFailed {
                 program: "Xvfb".to_string(),
@@ -589,8 +595,7 @@ impl ComputerBackend for VirtualDisplayBackend {
 impl Drop for VirtualDisplayBackend {
     fn drop(&mut self) {
         if let Some(mut child) = self.xvfb.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::process::terminate_group_sync(&mut child, Duration::from_millis(200));
         }
     }
 }

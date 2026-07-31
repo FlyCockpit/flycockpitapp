@@ -35,8 +35,10 @@ pub use cockpit_db as db;
 mod terminal_host;
 
 use clap::Parser;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::cli::{Cli, Command};
@@ -734,7 +736,7 @@ fn init_tracing(level: Option<&str>, print_logs: bool) {
             fmt()
                 .with_env_filter(filter)
                 .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(file))
+                .with_writer(file)
                 .init();
         }
         None => {
@@ -746,14 +748,117 @@ fn init_tracing(level: Option<&str>, print_logs: bool) {
     }
 }
 
-fn open_log_file() -> Option<std::fs::File> {
-    let dir = dirs::cache_dir()?.join("cockpit");
-    std::fs::create_dir_all(&dir).ok()?;
+const LOG_FILE_MAX_BYTES: u64 = 1024 * 1024;
+const LOG_BACKUP_COUNT: usize = 2;
+
+#[derive(Clone)]
+struct RotatingLog {
+    state: Arc<Mutex<RotatingLogState>>,
+}
+struct RotatingLogState {
+    dir: PathBuf,
+    file: std::fs::File,
+    len: u64,
+}
+struct RotatingLogWriter {
+    state: Arc<Mutex<RotatingLogState>>,
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for RotatingLog {
+    type Writer = RotatingLogWriter;
+    fn make_writer(&self) -> Self::Writer {
+        RotatingLogWriter {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+impl Write for RotatingLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("log writer lock poisoned"))?;
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            if state.len >= LOG_FILE_MAX_BYTES {
+                rotate_log_state(&mut state)?;
+            }
+            let available = (LOG_FILE_MAX_BYTES - state.len) as usize;
+            let written = state
+                .file
+                .write(&remaining[..remaining.len().min(available)])?;
+            if written == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "log writer wrote zero bytes",
+                ));
+            }
+            state.len += written as u64;
+            remaining = &remaining[written..];
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.state
+            .lock()
+            .map_err(|_| std::io::Error::other("log writer lock poisoned"))?
+            .file
+            .flush()
+    }
+}
+
+fn open_log_file() -> Option<RotatingLog> {
+    open_log_file_at(dirs::cache_dir()?.join("cockpit"))
+}
+fn open_log_file_at(dir: PathBuf) -> Option<RotatingLog> {
+    cockpit_core::private_fs::ensure_private_dir(&dir).ok()?;
+    let path = dir.join("cockpit.log");
+    let file = open_private_append(&path).ok()?;
+    let len = file.metadata().ok()?.len();
+    Some(RotatingLog {
+        state: Arc::new(Mutex::new(RotatingLogState { dir, file, len })),
+    })
+}
+fn rotate_log_state(state: &mut RotatingLogState) -> std::io::Result<()> {
+    state.file.flush()?;
+    rotate_log_files(&state.dir)?;
+    let path = state.dir.join("cockpit.log");
+    state.file = open_private_append(&path)?;
+    state.len = 0;
+    Ok(())
+}
+fn rotate_log_files(dir: &Path) -> std::io::Result<()> {
+    let oldest = dir.join(format!("cockpit.log.{}", LOG_BACKUP_COUNT));
+    if oldest.exists() {
+        std::fs::remove_file(&oldest)?;
+    }
+    for index in (1..LOG_BACKUP_COUNT).rev() {
+        let from = dir.join(format!("cockpit.log.{index}"));
+        if from.exists() {
+            std::fs::rename(&from, dir.join(format!("cockpit.log.{}", index + 1)))?;
+        }
+    }
+    let current = dir.join("cockpit.log");
+    if current.exists() {
+        std::fs::rename(current, dir.join("cockpit.log.1"))?;
+    }
+    Ok(())
+}
+#[cfg(unix)]
+fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true).mode(0o600);
+    let file = options.open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+#[cfg(not(unix))]
+fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("cockpit.log"))
-        .ok()
+        .open(path)
 }
 
 #[cfg(test)]
@@ -790,5 +895,59 @@ mod tests {
         assert!(line.contains("`cockpit login` was split"), "{line}");
         assert!(line.contains("`cockpit account login`"), "{line}");
         assert!(line.contains("`cockpit provider add`"), "{line}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn log_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = open_log_file_at(dir.path().join("cockpit")).unwrap();
+        drop(file);
+        let mode = std::fs::metadata(dir.path().join("cockpit").join("cockpit.log"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn log_rotation_bounds_total_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("cockpit");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("cockpit.log"),
+            vec![b'x'; LOG_FILE_MAX_BYTES as usize],
+        )
+        .unwrap();
+        std::fs::write(
+            log_dir.join("cockpit.log.1"),
+            vec![b'y'; LOG_FILE_MAX_BYTES as usize],
+        )
+        .unwrap();
+        let log = open_log_file_at(log_dir.clone()).unwrap();
+        let mut writer = tracing_subscriber::fmt::MakeWriter::make_writer(&log);
+        writer.write_all(b"z").unwrap();
+        drop(writer);
+        assert_eq!(
+            std::fs::read(log_dir.join("cockpit.log.1")).unwrap().len() as u64,
+            LOG_FILE_MAX_BYTES
+        );
+        assert_eq!(
+            std::fs::read(log_dir.join("cockpit.log.2")).unwrap().len() as u64,
+            LOG_FILE_MAX_BYTES
+        );
+        let total: u64 = (0..=LOG_BACKUP_COUNT)
+            .map(|index| {
+                let path = if index == 0 {
+                    log_dir.join("cockpit.log")
+                } else {
+                    log_dir.join(format!("cockpit.log.{index}"))
+                };
+                path.metadata().map(|meta| meta.len()).unwrap_or(0)
+            })
+            .sum();
+        assert!(total <= LOG_FILE_MAX_BYTES * (LOG_BACKUP_COUNT as u64 + 1));
     }
 }

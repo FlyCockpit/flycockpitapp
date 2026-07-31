@@ -220,6 +220,24 @@ pub(crate) async fn terminate_group_async(
     }
 }
 
+/// Begin terminating a Tokio child and, on Unix, every process in the child
+/// process group. This is the non-async counterpart used from `Drop` paths;
+/// callers that can await should use [`terminate_group_async`] so a stubborn
+/// group also receives SIGKILL after its grace period.
+pub(crate) fn terminate_group_start(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+            match signal_group(pid, libc::SIGTERM) {
+                Ok(()) => return,
+                Err(error) if is_esrch(&error) => return,
+                Err(_) => {}
+            }
+        }
+    }
+    let _ = child.start_kill();
+}
+
 pub fn terminate_group_sync(child: &mut std::process::Child, grace: Duration) {
     #[cfg(unix)]
     {

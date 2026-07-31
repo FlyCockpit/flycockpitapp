@@ -450,6 +450,7 @@ impl SessionsPane {
         daemon_connected: bool,
         daemon_socket: Option<std::path::PathBuf>,
         use_emojis: bool,
+        shared_db: Option<Db>,
     ) -> Self {
         let project_id = resolve_project_id(cwd);
         let scope = if project_id.is_some() {
@@ -457,15 +458,9 @@ impl SessionsPane {
         } else {
             Scope::All
         };
-        // Daemonless: open the DB read-only up front (WAL → concurrent
-        // readers are safe; the startup probe already established no daemon
-        // is writing). Daemon-connected: the RPC path is used, so no direct
-        // handle is needed.
-        let db = if daemon_connected {
-            None
-        } else {
-            Db::open_default().ok()
-        };
+        // Daemonless browsing uses the App-owned handle; daemon-connected
+        // panes use RPCs and keep no direct DB handle.
+        let db = (!daemon_connected).then_some(shared_db).flatten();
         let mut pane = Self {
             project_id,
             scope,
@@ -3228,6 +3223,7 @@ mod tests {
             true,
             Some(tmp.path().join("missing-daemon.sock")),
             false,
+            None,
         );
 
         assert_eq!(pane.loading, Some("Loading sessions..."));

@@ -1218,6 +1218,9 @@ mod tests {
     async fn agents_page_assistant_rows_are_editable() {
         let tmp = TempDir::new().unwrap();
         let _xdg = XdgDataEnv::new_async(&tmp.path().join("xdg")).await;
+        // Test fixture only: this isolated XDG home deliberately constructs its
+        // own database before any App exists, so no TUI shared handle or daemon
+        // writer can exist to reuse.
         let db = cockpit_core::db::Db::open_default().unwrap();
         let home = tmp.path().join("assistants/helper-bot");
         cockpit_core::assistants::create_assistant(

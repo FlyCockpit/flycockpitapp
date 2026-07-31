@@ -5,8 +5,11 @@ impl App {
     /// slash command and the Ctrl+N keyboard shortcut. The editor mirrors the
     /// composer's vim setting so vim users get vim editing in their scratchpad.
     pub(super) fn open_scratchpad_pane(&mut self) {
-        let pane =
-            crate::tui::notes_pane::NotesPane::open(&self.launch.cwd, self.composer.vim_enabled());
+        let pane = crate::tui::notes_pane::NotesPane::open(
+            &self.launch.cwd,
+            self.composer.vim_enabled(),
+            self.shared_db(),
+        );
         let action = pane.initial_load_action();
         self.overlay = Overlay::Notes(pane);
         if let Some(action) = action {

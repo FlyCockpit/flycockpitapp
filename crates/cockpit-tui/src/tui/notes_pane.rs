@@ -220,14 +220,15 @@ impl NotesPane {
     /// root, falling back to `cwd`). Loading happens through
     /// [`Self::initial_load_action`] so the TUI does not block the async
     /// runtime while opening the pane.
-    pub fn open(cwd: &std::path::Path, vim_enabled: bool) -> Self {
+    pub fn open(cwd: &std::path::Path, vim_enabled: bool, db: Option<Db>) -> Self {
         let project_root = cockpit_core::git::find_worktree_root(cwd)
             .unwrap_or_else(|| cwd.to_path_buf())
             .to_string_lossy()
             .into_owned();
-        let (db, status) = match Db::open_default() {
-            Ok(db) => (Some(db), Some("loading notes".to_string())),
-            Err(e) => (None, Some(format!("db unavailable: {e}"))),
+        let status = if db.is_some() {
+            Some("loading notes".to_string())
+        } else {
+            Some("db unavailable".to_string())
         };
         Self {
             project_root,

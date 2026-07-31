@@ -681,7 +681,11 @@ impl App {
         }
     }
 
-    fn report_control_not_delivered(&mut self, label: &str, reason: ControlRequestNotDelivered) {
+    pub(super) fn report_control_not_delivered(
+        &mut self,
+        label: &str,
+        reason: ControlRequestNotDelivered,
+    ) {
         let message = match reason {
             ControlRequestNotDelivered::NoRunner => {
                 format!("{label}: send a message first to start a session")

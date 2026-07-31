@@ -53,10 +53,10 @@ impl App {
     /// note) when the DB can't be opened — pins degrade gracefully rather
     /// than crash the TUI.
     fn pins_db(&mut self) -> Option<Db> {
-        match Db::open_default() {
-            Ok(db) => Some(db),
-            Err(e) => {
-                self.push_plain(format!("pins: database unavailable ({e})"));
+        match self.shared_db() {
+            Some(db) => Some(db),
+            None => {
+                self.push_plain("pins: database unavailable".to_string());
                 None
             }
         }
@@ -89,9 +89,9 @@ impl App {
             self.pinned_seqs_session = None;
             return;
         };
-        match Db::open_default() {
-            Ok(db) => self.start_pin_state_refresh(sid, db, true),
-            Err(_) => {
+        match self.shared_db() {
+            Some(db) => self.start_pin_state_refresh(sid, db, true),
+            None => {
                 self.pin_count_session = Some(sid);
                 self.pinned_seqs_session = Some(sid);
                 self.pinned_seqs_cache.clear();

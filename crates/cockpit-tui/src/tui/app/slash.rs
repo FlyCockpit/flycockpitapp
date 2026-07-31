@@ -1066,6 +1066,7 @@ fn run_sessions(app: &mut App, _: &str) -> bool {
         app.daemon_connected,
         daemon_socket,
         app.config_snapshot.extended.tui.use_emojis,
+        app.shared_db(),
     ));
     if app.daemon_connected {
         app.start_sessions_list_action();
@@ -1397,6 +1398,10 @@ impl App {
     }
 
     pub(super) fn handle_curator_command(&mut self, args: &str) {
+        let Some(db) = self.shared_db() else {
+            self.push_plain("/curator: database unavailable".to_string());
+            return;
+        };
         let args = args.to_string();
         let cfg = self.config_snapshot.extended.skills.clone();
         let cwd = self.launch.cwd.clone();
@@ -1404,7 +1409,6 @@ impl App {
             AsyncActionKind::Internal("curator.command"),
             AsyncActionPolicy::AllowConcurrent,
             async move {
-                let db = cockpit_db::Db::open_default().map_err(|e| e.to_string())?;
                 let curator =
                     cockpit_core::skills::curator::SkillCurator::new(db.clone(), cwd, cfg);
                 let message = async {
@@ -1524,23 +1528,7 @@ impl App {
                     "/goal resume",
                 );
             }
-            "clear" => {
-                let Some(session_id) = self.launch.session_id else {
-                    self.push_plain("/goal clear: no active session.".to_string());
-                    return;
-                };
-                match cockpit_db::Db::open_default().and_then(|db| {
-                    db.blocking_for_sync_cli(move |conn| {
-                        cockpit_db::Db::clear_session_goal_conn(conn, session_id)
-                    })
-                }) {
-                    Ok(true) => self.push_plain("/goal clear: cleared current goal.".to_string()),
-                    Ok(false) => self.push_plain("/goal clear: no open goal.".to_string()),
-                    Err(e) => self.history.push(HistoryEntry::CommandError {
-                        line: format!("/goal clear: {e:#}"),
-                    }),
-                }
-            }
+            "clear" => self.clear_goal(),
             "edit" => {
                 self.composer.set("/goal ".to_string());
                 self.push_plain(
@@ -1766,7 +1754,11 @@ impl App {
             self.push_plain(format!("/assistant: {error}"));
             return;
         }
-        let session = match cockpit_db::Db::open_default().and_then(|db| {
+        let Some(db) = self.shared_db() else {
+            self.push_plain("/assistant: database unavailable".to_string());
+            return;
+        };
+        let session = match (|| {
             let name_for_row = name.to_string();
             let row = db
                 .blocking_write_for_sync_ui(move |conn| {
@@ -1793,7 +1785,7 @@ impl App {
                 )?;
                 cockpit_db::Db::insert_session_row_conn(conn, &row)
             })
-        }) {
+        })() {
             Ok(session) => session,
             Err(error) => {
                 self.push_plain(format!("/assistant: {error}"));
@@ -2144,12 +2136,15 @@ impl App {
             return;
         };
         if title.is_empty() {
+            let Some(db) = self.shared_db() else {
+                self.push_plain("/rename: database unavailable".to_string());
+                return;
+            };
             self.push_plain("/rename: generating".to_string());
             self.async_actions.start(
                 AsyncActionKind::Internal("rename.auto"),
                 AsyncActionPolicy::AllowConcurrent,
                 async move {
-                    let db = cockpit_db::Db::open_default().map_err(|e| e.to_string())?;
                     let session = cockpit_core::session::Session::resume(db, session_id)
                         .map_err(|e| e.to_string())?
                         .ok_or_else(|| format!("unknown session {session_id}"))?;
@@ -2928,5 +2923,219 @@ mod table_tests {
         assert!(rendered.contains("a | very-secret-literal | fork | 1"));
         assert!(rendered.find("a | ").unwrap() < rendered.find("z | ").unwrap());
         assert!(!rendered.contains("actual-secret-value"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::mpsc;
+
+    use crate::tui::agent_runner::{
+        AgentRunner, AttachedRequest, ClientTasks, ControlRequest, UsageCounts,
+    };
+    use crate::tui::history::HistoryEntry;
+    use cockpit_core::daemon::proto::{GoalStatus, GoalSummary, Request, Response};
+    use cockpit_core::engine::message::UserSubmission;
+
+    fn app_with_attached_request_rx() -> (App, mpsc::Receiver<AttachedRequest>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.daemon_prompt = None;
+        app.dialog = crate::tui::settings::Dialog::None;
+        let (input_tx, _input_rx) = mpsc::channel::<UserSubmission>(1);
+        let (record_tx, _record_rx) = mpsc::channel::<Request>(1);
+        let (control_tx, _control_rx) = mpsc::channel::<ControlRequest>(1);
+        let (attached_request_tx, attached_request_rx) = mpsc::channel::<AttachedRequest>(8);
+        let runner = AgentRunner {
+            input_tx,
+            record_tx,
+            control_tx,
+            attached_request_tx,
+            events: Arc::new(Mutex::new(Vec::new())),
+            event_notify: Arc::new(tokio::sync::Notify::new()),
+            active_agent: Arc::new(Mutex::new("Build".to_string())),
+            active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
+            skill_inventory_names: Arc::new(Mutex::new(None)),
+            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+            active_model_state: None,
+            session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
+            short_id: "goal01".to_string(),
+            project_id: "project".to_string(),
+            usage: UsageCounts::default(),
+            owns_daemon: false,
+            socket: PathBuf::from("/tmp/cockpit-goal-test.sock"),
+            history: Vec::new(),
+            paused_work: Vec::new(),
+            repair_required: None,
+            btw_fork: None,
+            daemon_version: "test".to_string(),
+            daemon_compatible: true,
+            current_client: None,
+            attach_context: None,
+            last_applied_seq: None,
+            client_tasks: ClientTasks::default(),
+        };
+        app.agent_runner = Some(Ok(runner));
+        (app, attached_request_rx)
+    }
+
+    fn goal_summary(status: GoalStatus) -> GoalSummary {
+        GoalSummary {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            project_id: "project".to_string(),
+            objective: "ship it".to_string(),
+            context: None,
+            status,
+            token_budget: Some(100),
+            tokens_used: 4,
+            blocked_attempts: 0,
+            last_read_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    async fn answer_goal_request(
+        app: &mut App,
+        rx: &mut mpsc::Receiver<AttachedRequest>,
+        response: Result<Response, String>,
+    ) -> Request {
+        let request = rx.recv().await.expect("goal daemon request");
+        let observed = request.request.clone();
+        request
+            .response_tx
+            .send(response)
+            .expect("deliver goal response");
+        for _ in 0..20 {
+            if app.drain_async_actions() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        observed
+    }
+
+    fn history_lines(app: &App) -> Vec<&str> {
+        app.history
+            .iter()
+            .filter_map(|entry| match entry {
+                HistoryEntry::Plain { line } | HistoryEntry::CommandError { line } => {
+                    Some(line.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn goal_commands_succeed_in_runtime_context() {
+        let (mut app, mut rx) = app_with_attached_request_rx();
+        let command = *slash_command_by_name("goal").expect("/goal command");
+        let cases = [
+            ("/goal", Response::GoalStatus { goal: None }),
+            (
+                "/goal status",
+                Response::GoalStatus {
+                    goal: Some(goal_summary(GoalStatus::Active)),
+                },
+            ),
+            (
+                "/goal pause",
+                Response::GoalUpdated {
+                    goal: goal_summary(GoalStatus::Paused),
+                },
+            ),
+            (
+                "/goal resume",
+                Response::GoalUpdated {
+                    goal: goal_summary(GoalStatus::Active),
+                },
+            ),
+            ("/goal clear", Response::GoalCleared { cleared: true }),
+        ];
+        for (input, response) in cases {
+            app.composer.set(input.to_string());
+            app.execute_slash(command);
+            answer_goal_request(&mut app, &mut rx, Ok(response)).await;
+        }
+        let lines = history_lines(&app);
+        assert!(lines.iter().any(|line| line.contains("no goal")));
+        assert!(lines.iter().any(|line| line.contains("tokens 4/100")));
+        assert!(lines.iter().any(|line| line.contains("goal is now paused")));
+        assert!(lines.iter().any(|line| line.contains("goal is now active")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("cleared current goal"))
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_db_error_renders_message() {
+        let (mut app, mut rx) = app_with_attached_request_rx();
+        let command = *slash_command_by_name("goal").expect("/goal command");
+        app.composer.set("/goal status".to_string());
+        app.execute_slash(command);
+        answer_goal_request(&mut app, &mut rx, Err("database unavailable".to_string())).await;
+        assert!(
+            history_lines(&app)
+                .iter()
+                .any(|line| line.contains("/goal: database unavailable"))
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_write_uses_daemon_when_available() {
+        let (mut app, mut rx) = app_with_attached_request_rx();
+        let command = *slash_command_by_name("goal").expect("/goal command");
+        app.composer.set("/goal pause".to_string());
+        app.execute_slash(command);
+        let request = answer_goal_request(
+            &mut app,
+            &mut rx,
+            Ok(Response::GoalUpdated {
+                goal: goal_summary(GoalStatus::Paused),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            request,
+            Request::SetGoalStatus {
+                status: GoalStatus::Paused,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_hostile_db_helpers_are_banned_from_tui_source() {
+        fn visit(dir: &std::path::Path, violations: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read TUI source") {
+                let path = entry.expect("source entry").path();
+                if path.is_dir() {
+                    visit(&path, violations);
+                } else if path.extension().is_some_and(|extension| extension == "rs")
+                    && std::fs::read_to_string(&path)
+                        .expect("read TUI Rust source")
+                        .contains(concat!("blocking_for_", "sync_cli"))
+                {
+                    violations.push(path);
+                }
+            }
+        }
+        let mut violations = Vec::new();
+        visit(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut violations,
+        );
+        assert!(
+            violations.is_empty(),
+            "TUI code must use async DB access or the daemon, not blocking_for_ sync_cli: {violations:?}"
+        );
     }
 }

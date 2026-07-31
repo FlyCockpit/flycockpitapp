@@ -340,37 +340,13 @@ impl App {
     }
 
     pub(super) fn show_goal_status(&mut self) {
-        let Some(session_id) = self.launch.session_id else {
-            self.push_plain("/goal: no active session. Usage: /goal <objective> | status | pause | resume | clear | edit".to_string());
+        let Some(session_id) = self.goal_session_id("/goal") else {
             return;
         };
-        match cockpit_db::Db::open_default().and_then(|db| {
-            db.blocking_for_sync_cli(move |conn| {
-                cockpit_db::Db::refresh_session_goal_usage_conn(conn, session_id)?;
-                cockpit_db::Db::current_session_goal_conn(conn, session_id, false)
-            })
-        }) {
-            Ok(Some(goal)) => {
-                let budget = goal
-                    .token_budget
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "none".to_string());
-                self.push_plain(format!(
-                        "/goal: {} · {} · tokens {}/{} · subcommands: status, pause, resume, clear, edit",
-                        goal.status.as_str(),
-                        goal.objective,
-                        goal.tokens_used,
-                        budget
-                    ));
-            }
-            Ok(None) => self.push_plain(
-                "/goal: no goal. Usage: /goal <objective> | status | pause | resume | clear | edit"
-                    .to_string(),
-            ),
-            Err(e) => self.history.push(HistoryEntry::CommandError {
-                line: format!("/goal: {e:#}"),
-            }),
-        }
+        self.start_goal_request(
+            "goal.status",
+            cockpit_core::daemon::proto::Request::GoalStatus { session_id },
+        );
     }
 
     pub(super) fn set_goal_status(
@@ -378,22 +354,98 @@ impl App {
         status: cockpit_db::session_goals::GoalStatus,
         label: &str,
     ) {
-        let Some(session_id) = self.launch.session_id else {
-            self.history.push(HistoryEntry::CommandError {
-                line: format!("{label}: no active session."),
-            });
+        let Some(session_id) = self.goal_session_id(label) else {
             return;
         };
-        match cockpit_db::Db::open_default().and_then(|db| {
-            db.blocking_for_sync_cli(move |conn| {
-                cockpit_db::Db::set_session_goal_status_conn(conn, session_id, status)
-            })
-        }) {
-            Ok(goal) => self.push_plain(format!("{label}: goal is now {}.", goal.status.as_str())),
-            Err(e) => self.history.push(HistoryEntry::CommandError {
-                line: format!("{label}: {e:#}"),
-            }),
+        self.start_goal_request(
+            "goal.set",
+            cockpit_core::daemon::proto::Request::SetGoalStatus { session_id, status },
+        );
+    }
+
+    pub(super) fn clear_goal(&mut self) {
+        let Some(session_id) = self.goal_session_id("/goal clear") else {
+            return;
+        };
+        self.start_goal_request(
+            "goal.clear",
+            cockpit_core::daemon::proto::Request::ClearGoal { session_id },
+        );
+    }
+
+    fn goal_session_id(&mut self, label: &str) -> Option<uuid::Uuid> {
+        match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => Some(runner.session_id()),
+            _ => {
+                self.report_control_not_delivered(
+                    label,
+                    cockpit_core::engine::ControlRequestNotDelivered::NoRunner,
+                );
+                None
+            }
         }
+    }
+
+    fn start_goal_request(
+        &mut self,
+        kind: &'static str,
+        request: cockpit_core::daemon::proto::Request,
+    ) {
+        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            unreachable!("goal_session_id checks the attached runner first");
+        };
+        let attached_request_tx = runner.attached_request_tx.clone();
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc(kind),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                attached_request_tx
+                    .send(crate::tui::agent_runner::AttachedRequest {
+                        request,
+                        response_tx,
+                    })
+                    .await
+                    .map_err(|_| "daemon client task has stopped".to_string())?;
+                let response = response_rx
+                    .await
+                    .map_err(|_| "daemon client dropped reply channel".to_string())??;
+                match response {
+                    cockpit_core::daemon::proto::Response::GoalStatus { goal: Some(goal) } => {
+                        let budget = goal
+                            .token_budget
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "none".to_string());
+                        Ok(AsyncActionPayload::Text(format!(
+                            "/goal: {} · {} · tokens {}/{} · subcommands: status, pause, resume, clear, edit",
+                            goal.status.as_str(),
+                            goal.objective,
+                            goal.tokens_used,
+                            budget
+                        )))
+                    }
+                    cockpit_core::daemon::proto::Response::GoalStatus { goal: None } => Ok(
+                        AsyncActionPayload::Text(
+                            "/goal: no goal. Usage: /goal <objective> | status | pause | resume | clear | edit"
+                                .to_string(),
+                        ),
+                    ),
+                    cockpit_core::daemon::proto::Response::GoalUpdated { goal } => {
+                        Ok(AsyncActionPayload::Text(format!(
+                            "/goal: goal is now {}.",
+                            goal.status.as_str()
+                        )))
+                    }
+                    cockpit_core::daemon::proto::Response::GoalCleared { cleared: true } => Ok(
+                        AsyncActionPayload::Text("/goal clear: cleared current goal.".to_string()),
+                    ),
+                    cockpit_core::daemon::proto::Response::GoalCleared { cleared: false } => Ok(
+                        AsyncActionPayload::Text("/goal clear: no open goal.".to_string()),
+                    ),
+                    other => Err(format!("unexpected goal response: {other:?}")),
+                }
+            },
+        );
     }
 
     pub(super) fn dispatch_goal_turn(&mut self, display: &str, wire: String) {

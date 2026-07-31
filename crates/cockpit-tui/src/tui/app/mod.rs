@@ -480,6 +480,12 @@ fn daemon_autostart_notice(
 }
 
 impl App {
+    /// The sole database connection opened during TUI startup. UI surfaces clone
+    /// this handle instead of reopening SQLite and revalidating migrations.
+    pub(super) fn shared_db(&self) -> Option<cockpit_db::Db> {
+        self.startup_background.db.clone()
+    }
+
     pub(super) fn apply_workspace_trust_choice(
         &mut self,
         root: cockpit_config::trust::TrustRoot,

@@ -131,10 +131,7 @@ impl App {
                         connector: None,
                     });
                 };
-                let db = match db {
-                    Some(db) => db,
-                    None => cockpit_db::Db::open_default().map_err(|e| e.to_string())?,
-                };
+                let db = db.ok_or_else(|| "database unavailable during startup".to_string())?;
                 let org = db
                     .org_sync_disclosure_for_server(&credential.server_url)
                     .await

@@ -157,27 +157,17 @@ impl CredentialStore {
             .map(|(name, value)| (name.as_str(), value.as_str()))
     }
 
-    pub(crate) fn provider_credential_entries(
-        &self,
-    ) -> impl Iterator<Item = (String, String)> + '_ {
-        const TOKEN_FIELDS: &[&str] = &[
-            "api_key",
-            "access_token",
-            "refresh_token",
-            "token",
-            "secret",
-            "id_token",
-        ];
-        self.records.iter().flat_map(|(provider, record)| {
-            TOKEN_FIELDS.iter().filter_map(move |field| {
-                record.get(*field).and_then(Value::as_str).map(|value| {
-                    (
-                        format!("$credentials:{provider}.{field}"),
-                        value.to_string(),
-                    )
-                })
-            })
-        })
+    pub(crate) fn provider_credential_entries(&self) -> impl Iterator<Item = (String, String)> {
+        let mut entries = Vec::new();
+        for (provider, record) in &self.records {
+            collect_credential_values(
+                record,
+                &format!("$credentials:{provider}"),
+                true,
+                &mut entries,
+            );
+        }
+        entries.into_iter()
     }
 
     pub fn save(&mut self) -> Result<()> {
@@ -226,6 +216,56 @@ impl CredentialStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// Collect strings whose JSON key is secret-shaped from a provider record.
+/// A top-level string is also a credential because the MCP credential resolver
+/// deliberately accepts that compact record form. Non-secret metadata such as
+/// account IDs and expiry timestamps stays out of the redaction table.
+fn collect_credential_values(
+    value: &Value,
+    origin: &str,
+    is_record_root: bool,
+    out: &mut Vec<(String, String)>,
+) {
+    match value {
+        Value::String(value) if is_record_root => out.push((origin.to_string(), value.clone())),
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                let field_origin = format!("{origin}.{key}");
+                if crate::redact::is_secret_shaped_key(key) {
+                    collect_all_strings(value, &field_origin, out);
+                } else {
+                    collect_credential_values(value, &field_origin, false, out);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                collect_credential_values(value, &format!("{origin}[{index}]"), false, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A secret-shaped field can validly carry a string list (for example an
+/// OAuth token set); every string below that field must be registered.
+fn collect_all_strings(value: &Value, origin: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::String(value) => out.push((origin.to_string(), value.clone())),
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                collect_all_strings(value, &format!("{origin}.{key}"), out);
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                collect_all_strings(value, &format!("{origin}[{index}]"), out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -347,6 +387,46 @@ fn repair_existing_file_permissions(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn provider_credential_entries_collect_nested_and_compact_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = CredentialStore::open(tmp.path().join("credentials.json")).unwrap();
+        store.set(
+            "provider",
+            serde_json::json!({
+                "client_secret": "nested-client-secret-123456",
+                "oauth": { "instanceToken": "nested-instance-token-123456" },
+                "email": "not-a-credential.test"
+            }),
+        );
+        store.set(
+            "mcp:header",
+            serde_json::json!("compact-header-secret-123456"),
+        );
+
+        let entries: Vec<_> = store.provider_credential_entries().collect();
+        assert!(
+            entries
+                .iter()
+                .any(|(_, value)| value == "nested-client-secret-123456")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(_, value)| value == "nested-instance-token-123456")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(_, value)| value == "compact-header-secret-123456")
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|(_, value)| value == "not-a-credential.test")
+        );
+    }
 
     #[test]
     fn round_trips_an_api_key() {

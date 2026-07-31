@@ -190,7 +190,13 @@ pub async fn check_gitignore_read(
     let mut allow = crate::config::extended::resolve_gitignore_allow(&ctx.cwd);
     allow.extend(ctx.session.gitignore_session_allow());
 
-    if crate::gitignore::is_permitted(resolved, &root, &allow) {
+    let secret_path = ctx
+        .session
+        .secret_path_matcher(&ctx.config.extended().redact)
+        .is_secret_path(resolved);
+    if (secret_path && crate::gitignore::allowlist_matches(resolved, &root, &allow))
+        || (!secret_path && crate::gitignore::is_permitted(resolved, &root, &allow))
+    {
         return Ok(None);
     }
 
@@ -248,7 +254,7 @@ pub async fn check_gitignore_read(
 /// (token economy §10: one sentence, no rationale dump).
 fn gitignore_refusal(display: &str) -> ToolOutput {
     ToolOutput::text(format!(
-        "Refused: `{display}` is gitignored and the user declined to allow reading it; use a different file or ask the user to allowlist it with `/gitignore-allow`."
+        "Refused: `{display}` is secret-bearing or gitignored and the user declined to allow reading it; use a different file or ask the user to allowlist it with `/gitignore-allow`."
     ))
 }
 
@@ -1040,6 +1046,33 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_none(), "tracked file must read silently");
+    }
+
+    /// A committed secret path still uses the same approval gate.
+    #[tokio::test]
+    async fn secret_path_gate_denies_non_gitignored_env_file_headless() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = gitignore_ctx(tmp.path());
+        ctx.approver = None;
+        let path = tmp.path().join(".env.production");
+        std::fs::write(&path, "TOKEN=long-secret-value").unwrap();
+        let refusal = check_gitignore_read(&ctx, &path)
+            .await
+            .unwrap()
+            .expect("secret path must be gated");
+        assert!(refusal.content.contains("secret-bearing"));
+        assert!(refusal.content.contains(".env.production"));
+    }
+
+    #[tokio::test]
+    async fn secret_path_gate_honors_explicit_session_allow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = gitignore_ctx(tmp.path());
+        ctx.approver = None;
+        let path = tmp.path().join(".env.production");
+        std::fs::write(&path, "TOKEN=long-secret-value").unwrap();
+        ctx.session.add_gitignore_session_allow(".env.production");
+        assert!(check_gitignore_read(&ctx, &path).await.unwrap().is_none());
     }
 
     /// A session-allowlisted gitignored path reads silently (no prompt).

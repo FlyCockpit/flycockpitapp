@@ -363,6 +363,25 @@ impl InterruptHub {
         Ok(Some(table))
     }
 
+    /// Register parsed values from an approved secret-bearing file in the
+    /// worker's live redaction table before its contents return to a model.
+    /// Detached hubs return `None`; callers then retain a local table.
+    pub fn register_approved_secret_file(
+        &self,
+        session: &crate::session::Session,
+        cfg: &crate::config::extended::RedactConfig,
+        path: &std::path::Path,
+    ) -> anyhow::Result<Option<Arc<crate::redact::RedactionTable>>> {
+        let Some(redaction) = &self.redaction else {
+            return Ok(None);
+        };
+        let table = current_redaction(redaction).with_approved_secret_file(cfg, path)?;
+        let table = Arc::new(table);
+        session.persist_redaction_table(&table)?;
+        set_current_redaction(redaction, table.clone());
+        Ok(Some(table))
+    }
+
     /// Register a wakeup for `interrupt_id` and return the guard the
     /// caller awaits. The guard removes its registry entry on drop, so a
     /// tool whose future is cancelled (e.g. the worker shuts down) never

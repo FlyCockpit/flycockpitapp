@@ -103,7 +103,30 @@ impl Tool for ReadTool {
             {
                 return Ok(refusal);
             }
-            return read_impl_with_path(args, ctx, false, checked).await;
+            let mut output = read_impl_with_path(args, ctx, false, checked.clone()).await?;
+            if ctx
+                .session
+                .secret_path_matcher(&ctx.config.extended().redact)
+                .is_secret_path(&checked)
+            {
+                let cfg = &ctx.config.extended().redact;
+                let updated = match ctx.interrupts.register_approved_secret_file(
+                    &ctx.session,
+                    cfg,
+                    &checked,
+                )? {
+                    Some(table) => table,
+                    None => {
+                        let table = ctx.redact.with_approved_secret_file(cfg, &checked)?;
+                        ctx.session.persist_redaction_table(&table)?;
+                        std::sync::Arc::new(table)
+                    }
+                };
+                match &mut output {
+                    ToolOutput { content, .. } => *content = updated.scrub(content),
+                }
+            }
+            return Ok(output);
         }
         read_impl(args, ctx, false).await
     }
@@ -373,6 +396,37 @@ async fn read_range(
 mod tests {
     use super::*;
     use crate::tools::common::test_ctx;
+
+    #[tokio::test]
+    async fn approved_secret_read_registers_redaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join(".env.production");
+        let secret = "long-approved-secret";
+        std::fs::write(&file, format!("TOKEN={secret}\n")).unwrap();
+        let ctx = test_ctx(tmp.path());
+        ctx.session.add_gitignore_session_allow(".env.production");
+        let out = ReadTool
+            .call(serde_json::json!({ "path": file }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.content.contains(secret), "{}", out.content);
+        let origins = ctx.session.persisted_disk_redaction_origins().unwrap();
+        assert!(
+            origins
+                .iter()
+                .any(|origin| origin.contains(".env.production"))
+        );
+        let persisted = ctx
+            .session
+            .persisted_redaction_table()
+            .unwrap()
+            .expect("approved read persists metadata");
+        assert_eq!(
+            persisted.scrub(secret),
+            secret,
+            "disk-derived values must not persist"
+        );
+    }
 
     #[tokio::test]
     async fn range_mode_prepends_hash_header() {

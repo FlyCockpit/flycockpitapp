@@ -104,11 +104,22 @@ impl Tool for SearchTool {
             None => SearchTarget::Dir(search_path),
         };
         let single_file = matches!(target, SearchTarget::File(_));
-        let (search_root, display_root) = match &target {
-            SearchTarget::Dir(dir) => (dir.clone(), dir.clone()),
-            SearchTarget::File(file) => normalize_display_root(file),
+        let (search_root, display_root, requested_file) = match &target {
+            SearchTarget::Dir(dir) => (dir.clone(), dir.clone(), None),
+            SearchTarget::File(file) => {
+                let (root, display) = normalize_display_root(file);
+                (root, display, Some(file.clone()))
+            }
         };
         let guard_root = search_root.clone();
+        if let Some(refusal) = crate::tools::sandbox::check_gitignore_read(
+            ctx,
+            requested_file.as_deref().unwrap_or(&guard_root),
+        )
+        .await?
+        {
+            return Ok(refusal);
+        }
         let options = SearchOptions {
             pattern: pattern.to_string(),
             case_insensitive,
@@ -119,9 +130,15 @@ impl Tool for SearchTool {
             hidden: false,
             parents: true,
         };
+        let secret_paths = ctx
+            .session
+            .secret_path_matcher(&ctx.config.extended().redact)
+            .clone();
         let outcome = tokio::task::spawn_blocking(move || {
             search_records_blocking(&search_root, &display_root, &options, |path| {
-                path == guard_root || path.starts_with(&guard_root)
+                (path == guard_root || path.starts_with(&guard_root))
+                    && requested_file.as_ref().is_none_or(|file| path == file)
+                    && !secret_paths.is_secret_path(path)
             })
         })
         .await
@@ -304,6 +321,23 @@ fn format_search_records(outcome: &SearchOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn search_cannot_bypass_secret_path_gate() {
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join(".env.production");
+        std::fs::write(&file, "TOKEN=long-secret-value").unwrap();
+        let ctx = crate::tools::common::test_ctx(project.path());
+        let out = SearchTool
+            .call(
+                serde_json::json!({ "pattern": "(?s).", "path": file }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("secret-bearing"), "{out:?}");
+        assert!(!out.content.contains("long-secret-value"), "{out:?}");
+    }
 
     #[tokio::test]
     async fn intel_search_stops_at_first_denied_path() {

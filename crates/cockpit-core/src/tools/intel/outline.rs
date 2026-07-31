@@ -46,14 +46,15 @@ impl Tool for OutlineTool {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_input("`path` is required"))?;
-        // Native-tool boundary check (sandboxing part 2): outline targets a
-        // single file, so one pre-read check gates the only filesystem read.
-        crate::tools::sandbox::check_native_access(
+        let checked = crate::tools::sandbox::check_native_access(
             ctx,
             &crate::tools::common::resolve(path_arg, &ctx.cwd),
             crate::tools::shell_sandbox::SandboxPathAccess::Read,
         )
         .await?;
+        if let Some(refusal) = crate::tools::sandbox::check_gitignore_read(ctx, &checked).await? {
+            return Ok(refusal);
+        }
         let rel = rel_path(path_arg, ctx);
         let index = index_of(ctx);
         let freshen = index

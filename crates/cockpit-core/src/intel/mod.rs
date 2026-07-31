@@ -89,6 +89,9 @@ pub struct DiskMetaRow {
 pub struct FreshenReport {
     pub indexed: usize,
     pub discovered: usize,
+    /// Secret-bearing files omitted from the current disk scan. Bulk index
+    /// work never prompts, so callers need an observable record instead.
+    pub skipped_secret_paths: usize,
     pub truncated: bool,
     pub max_files: usize,
 }
@@ -99,6 +102,15 @@ impl FreshenReport {
             format!(
                 "note: intel index bounded to {} of {} discovered files — narrow your target for full coverage",
                 self.indexed, self.discovered
+            )
+        })
+    }
+
+    pub fn secret_path_note(&self) -> Option<String> {
+        (self.skipped_secret_paths > 0).then(|| {
+            format!(
+                "note: intel index skipped {} secret-bearing file(s)",
+                self.skipped_secret_paths
             )
         })
     }
@@ -605,11 +617,13 @@ impl Index {
         let allow = self.gitignore_allow.clone();
         let scan_scope = scope.clone();
         let exclude_dirs = self.exclude_dirs.clone();
-        let disk = tokio::task::spawn_blocking(move || {
+        let scan = tokio::task::spawn_blocking(move || {
             scan_disk(&root, &allow, &exclude_dirs, scan_scope.as_deref())
         })
         .await
         .context("intel scan worker joined")??;
+        let skipped_secret_paths = scan.skipped_secret_paths;
+        let disk = scan.files;
         check_cancelled(cancel.as_ref())?;
         let disk_paths: HashSet<String> = disk.iter().map(|d| d.rel.clone()).collect();
         let full_disk_meta = disk_meta_rows(&disk);
@@ -659,6 +673,7 @@ impl Index {
         let report = FreshenReport {
             indexed: indexed_count,
             discovered,
+            skipped_secret_paths,
             truncated,
             max_files: self.max_cold_index_files,
         };
@@ -1377,16 +1392,26 @@ fn parse_files_capped(files: Vec<DiskFile>) -> Result<Vec<ParsedFile>> {
 /// supplementary gitignore-off pass, so allowlisted-but-gitignored files
 /// surface in `search`/`tree`/`outline`/`symbol_find`
 /// (implementation note).
+struct DiskScan {
+    files: Vec<DiskFile>,
+    skipped_secret_paths: usize,
+}
+
 fn scan_disk(
     root: &Path,
     gitignore_allow: &[String],
     exclude_dirs: &[String],
     scope: Option<&str>,
-) -> Result<Vec<DiskFile>> {
+) -> Result<DiskScan> {
     let mut out = Vec::new();
+    let mut skipped_secret_paths = 0;
     let mut seen: HashSet<String> = HashSet::new();
+    let secret_paths = crate::secret_paths::SecretPathMatcher::default();
     if scope.is_some_and(invalid_intel_scope) {
-        return Ok(out);
+        return Ok(DiskScan {
+            files: out,
+            skipped_secret_paths,
+        });
     }
     let walk_root = scope.map_or_else(|| root.to_path_buf(), |scope| root.join(scope));
 
@@ -1403,6 +1428,11 @@ fn scan_disk(
     record_disk_walk(root);
     for dent in walker.build().flatten() {
         if !dent.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        if secret_paths.is_secret_path(dent.path()) {
+            skipped_secret_paths += 1;
+            tracing::debug!(path = %dent.path().display(), "skipping secret-bearing path during index scan");
             continue;
         }
         if let Some(df) = disk_file_for(dent.path(), root) {
@@ -1437,6 +1467,11 @@ fn scan_disk(
                 if !crate::gitignore::allowlist_matches(abs, root, gitignore_allow) {
                     continue;
                 }
+                if secret_paths.is_secret_path(abs) {
+                    skipped_secret_paths += 1;
+                    tracing::debug!(path = %abs.display(), "skipping secret-bearing path during index scan");
+                    continue;
+                }
                 if let Some(df) = disk_file_for(abs, root)
                     && seen.insert(df.rel.clone())
                 {
@@ -1445,7 +1480,10 @@ fn scan_disk(
             }
         }
     }
-    Ok(out)
+    Ok(DiskScan {
+        files: out,
+        skipped_secret_paths,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2903,6 +2941,30 @@ mod tests {
         assert_eq!(
             allowed.symbol_find("keep", true, None).await.unwrap().len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn indexer_skips_secret_paths_and_reports() {
+        let db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_file(&root, "src/lib.rs", "pub fn visible() {}\n");
+        write_file(&root, "credentials", "TOKEN=not-for-the-index\n");
+
+        let index = Index::new(db.clone(), root.clone());
+        let report = index.ensure_fresh().await.unwrap();
+
+        assert_eq!(report.skipped_secret_paths, 1);
+        assert!(
+            report
+                .secret_path_note()
+                .unwrap()
+                .contains("1 secret-bearing")
+        );
+        assert_eq!(
+            indexed_paths(&db, root.to_string_lossy().as_ref()).await,
+            vec!["src/lib.rs"]
         );
     }
 

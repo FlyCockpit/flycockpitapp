@@ -35,3 +35,15 @@ impl Session {
             .insert(path.into());
     }
 }
+
+impl Session {
+    /// Compiled once per session so every reader shares identical secret-path
+    /// classification without rebuilding globsets in hot loops.
+    pub fn secret_path_matcher(
+        &self,
+        cfg: &crate::config::extended::RedactConfig,
+    ) -> &crate::secret_paths::SecretPathMatcher {
+        self.secret_path_matcher
+            .get_or_init(|| crate::secret_paths::SecretPathMatcher::from_redact_config(cfg))
+    }
+}

@@ -97,6 +97,10 @@ impl Tool for GlobTool {
             _ => canonical_root.clone(),
         };
 
+        if let Some(refusal) = sandbox::check_gitignore_read(ctx, &walk_root).await? {
+            return Ok(refusal);
+        }
+
         let glob = Glob::new(&pattern)
             .map_err(|e| invalid_input(format!("invalid glob `{pattern}`: {e}")))?;
         let mut builder = GlobSetBuilder::new();
@@ -105,10 +109,16 @@ impl Tool for GlobTool {
             .build()
             .map_err(|e| invalid_input(format!("invalid glob `{pattern}`: {e}")))?;
 
+        let secret_paths = ctx
+            .session
+            .secret_path_matcher(&ctx.config.extended().redact)
+            .clone();
         let root = canonical_root.clone();
-        let out = tokio::task::spawn_blocking(move || glob_blocking(&set, &walk_root, &root))
-            .await
-            .map_err(|e| anyhow::anyhow!("glob worker joined: {e}"))??;
+        let out = tokio::task::spawn_blocking(move || {
+            glob_blocking(&set, &walk_root, &root, &secret_paths)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("glob worker joined: {e}"))??;
         Ok(out)
     }
 }
@@ -117,6 +127,7 @@ fn glob_blocking(
     set: &globset::GlobSet,
     walk_root: &Path,
     canonical_root: &Path,
+    secret_paths: &crate::secret_paths::SecretPathMatcher,
 ) -> Result<ToolOutput> {
     let mut writer = BudgetedWriter::new(GLOB_TOKEN_CAP);
     let mut count = 0usize;
@@ -136,7 +147,7 @@ fn glob_blocking(
             continue;
         }
         let path = entry.path();
-        if !sandbox::within_root(canonical_root, path) {
+        if !sandbox::within_root(canonical_root, path) || secret_paths.is_secret_path(path) {
             continue;
         }
         let rel = path

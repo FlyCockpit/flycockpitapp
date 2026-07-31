@@ -862,9 +862,14 @@ async fn in_process_text_hits(
         hidden: false,
         parents: true,
     };
+    let secret_paths = ctx
+        .session
+        .secret_path_matcher(&ctx.config.extended().redact)
+        .clone();
     let outcome = tokio::task::spawn_blocking(move || {
         search_records_blocking(&search_root, &display_root, &options, |path| {
-            path == guard_root || path.starts_with(&guard_root)
+            (path == guard_root || path.starts_with(&guard_root))
+                && !secret_paths.is_secret_path(path)
         })
     })
     .await

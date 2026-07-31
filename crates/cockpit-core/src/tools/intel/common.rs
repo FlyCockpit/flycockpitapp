@@ -105,6 +105,13 @@ pub(super) fn append_freshen_note(out: &mut ToolOutput, report: &FreshenReport) 
         out.content.push_str(&note);
         out.content.push('\n');
     }
+    if let Some(note) = report.secret_path_note() {
+        if !out.content.ends_with('\n') {
+            out.content.push('\n');
+        }
+        out.content.push_str(&note);
+        out.content.push('\n');
+    }
 }
 
 pub(super) fn freshen_options(ctx: &ToolCtx, scope: Option<String>) -> FreshenOptions {

@@ -23,8 +23,8 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -199,6 +199,7 @@ pub struct Session {
     tool_surface_override_json: Mutex<Option<String>>,
     goal_settings_override_json: Mutex<Option<String>>,
     redaction_table_json: Mutex<Option<String>>,
+    secret_path_matcher: OnceLock<crate::secret_paths::SecretPathMatcher>,
     model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
     /// Last time a `[time: ...]` prelude was injected onto a user
     /// message (GOALS §17g). `None` means no prelude has fired yet

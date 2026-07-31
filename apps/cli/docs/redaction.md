@@ -31,6 +31,6 @@ Forced entries are intentionally different:
 
 Use `redact.denylist` only for literal values at least four bytes long that must be scrubbed everywhere.
 
-`redact.secret_path_patterns` adds gitignore-style path patterns to the built-in secret-bearing path floor (`.env*`, PEM/key files, common credential files, Terraform vars, npm/netrc files, and `.ssh`, `.aws`, `.gnupg` directories). The matcher itself never reads files; an authorized read registers only parsed values, never the whole file body.
+`redact.secret_path_patterns` adds gitignore-style path patterns to the built-in secret-bearing path floor (`.env*`, PEM/key files, common credential files, Terraform vars, npm/netrc files, and `.ssh`, `.aws`, `.gnupg` directories). The matcher itself never reads files; an authorized read registers only parsed values, never the whole file body. Bulk index scans skip matching paths without prompting and report the skip count in their freshness note.
 Use `redact.allowlist` only for environment variable names that should be
 excluded from automatic scanning.

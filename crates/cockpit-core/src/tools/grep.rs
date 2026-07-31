@@ -102,6 +102,14 @@ impl Tool for GrepTool {
             _ => canonical_root.clone(),
         };
 
+        if let Some(refusal) = sandbox::check_gitignore_read(ctx, &search_root).await? {
+            return Ok(refusal);
+        }
+
+        let secret_paths = ctx
+            .session
+            .secret_path_matcher(&ctx.config.extended().redact)
+            .clone();
         let display_root = canonical_root.clone();
         let guard_root = canonical_root.clone();
         let query = pattern.clone();
@@ -117,7 +125,7 @@ impl Tool for GrepTool {
         };
         let out = tokio::task::spawn_blocking(move || {
             search_records_blocking(&search_root, &display_root, &options, |path| {
-                sandbox::within_root(&guard_root, path)
+                sandbox::within_root(&guard_root, path) && !secret_paths.is_secret_path(path)
             })
             .map(|outcome| render_search_outcome(outcome, &query))
         })

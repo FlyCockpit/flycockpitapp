@@ -232,7 +232,7 @@ pub(crate) fn is_not_dot_git_dir(entry: &ignore::DirEntry) -> bool {
 pub fn normalize_display_root(target: &Path) -> (PathBuf, PathBuf) {
     if target.is_file() {
         let parent = target.parent().unwrap_or(Path::new(".")).to_path_buf();
-        (target.to_path_buf(), parent)
+        (parent.clone(), parent)
     } else {
         (target.to_path_buf(), target.to_path_buf())
     }
@@ -330,6 +330,19 @@ mod tests {
 
         assert!(found.contains(&"visible.txt"), "{found:?}");
         assert!(!found.contains(&"ignored.txt"), "{found:?}");
+    }
+
+    #[test]
+    fn file_rooted_search_respects_ignore_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".gitignore", "ignored.txt\n");
+        let file = tmp.path().join("ignored.txt");
+        write(tmp.path(), "ignored.txt", NEEDLE);
+        let (root, display) = normalize_display_root(&file);
+        let outcome =
+            search_records_blocking(&root, &display, &options(NEEDLE), |path| path == file)
+                .unwrap();
+        assert!(outcome.records.is_empty(), "{outcome:?}");
     }
 
     #[test]

@@ -256,6 +256,7 @@ impl Session {
             tool_surface_override_json: Mutex::new(row.tool_surface_override_json),
             goal_settings_override_json: Mutex::new(row.goal_settings_override_json),
             redaction_table_json: Mutex::new(row.redaction_table_json),
+            secret_path_matcher: std::sync::OnceLock::new(),
             model_system_prompt_snapshot,
             last_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(row.user_content_tokens.max(0) as usize),

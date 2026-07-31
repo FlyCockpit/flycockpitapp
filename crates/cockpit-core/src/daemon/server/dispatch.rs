@@ -1150,20 +1150,38 @@ pub(super) async fn handle_serialized_request(
             // the resulting state (→ toast + mirror). Session-only — no
             // config-file write.
             let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
-                .send_work(SessionWork::SetPreflight { enabled })
+                .send_work(SessionWork::SetPreflight {
+                    enabled,
+                    respond_to,
+                })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            Ok(Response::PreflightState {
+                enabled: response_rx
+                    .await
+                    .map_err(internal)?
+                    .map_err(|error| internal(anyhow::anyhow!(error)))?,
+            })
         }
 
         Request::SetLongcache { enabled } => {
             let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
-                .send_work(SessionWork::SetLongcache { enabled })
+                .send_work(SessionWork::SetLongcache {
+                    enabled,
+                    respond_to,
+                })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            Ok(Response::LongcacheState {
+                enabled: response_rx
+                    .await
+                    .map_err(internal)?
+                    .map_err(|error| internal(anyhow::anyhow!(error)))?,
+            })
         }
 
         Request::SetRedaction {
@@ -1177,15 +1195,25 @@ pub(super) async fn handle_serialized_request(
             // broadcasts the resulting state (→ toast). Session-only — no
             // config-file write. `scrub()` stays non-bypassable.
             let att = require_attached(state)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::SetRedaction {
                     scan_environment,
                     scan_dotenv,
                     scan_ssh_keys,
+                    respond_to,
                 })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            let (scan_environment, scan_dotenv, scan_ssh_keys) = response_rx
+                .await
+                .map_err(internal)?
+                .map_err(|error| internal(anyhow::anyhow!(error)))?;
+            Ok(Response::RedactionState {
+                scan_environment,
+                scan_dotenv,
+                scan_ssh_keys,
+            })
         }
 
         Request::SetTandemModels { models } => {

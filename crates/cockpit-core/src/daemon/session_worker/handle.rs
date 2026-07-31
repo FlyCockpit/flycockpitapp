@@ -1337,6 +1337,7 @@ pub enum SessionWork {
         scan_environment: Option<bool>,
         scan_dotenv: Option<bool>,
         scan_ssh_keys: Option<bool>,
+        respond_to: oneshot::Sender<std::result::Result<(bool, bool, bool), String>>,
     },
     /// Set (or toggle) request preflight for the running session
     /// (`/preflight`, implementation note). Routes the override to
@@ -1345,12 +1346,14 @@ pub enum SessionWork {
     /// toggles the driver's current effective state.
     SetPreflight {
         enabled: Option<bool>,
+        respond_to: oneshot::Sender<std::result::Result<bool, String>>,
     },
     /// Set (or toggle) long prompt-cache retention intent for the running
     /// session. The driver owns the session-only override and capability
     /// resolution. **Session-only** — no config-file write.
     SetLongcache {
         enabled: Option<bool>,
+        respond_to: oneshot::Sender<std::result::Result<bool, String>>,
     },
     /// Set the session's model-comparison tandem (shadow) set.
     /// (`/model-comparison`, implementation note).

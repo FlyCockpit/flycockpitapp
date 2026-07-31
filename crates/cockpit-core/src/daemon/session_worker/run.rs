@@ -405,6 +405,11 @@ pub(super) async fn run_worker(
     // models so a tandem request — itself a new provider round-trip — refuses
     // to dispatch once a drain begins (`model-comparison-tandem-
     // inference.md`).
+    let active_model_for_toggles = model_override.as_ref().unwrap_or(&model);
+    let mut active_model_for_toggles = (
+        active_model_for_toggles.provider_id().to_string(),
+        active_model_for_toggles.model_id_ref().to_string(),
+    );
     let shutdown_gate = model.shutdown_gate();
     let spawn_args = SpawnArgs {
         model,
@@ -941,6 +946,8 @@ pub(super) async fn run_worker(
     // request; these overrides preserve any live toggles without writing them
     // to disk.
     let mut redaction_overrides = RedactionSourceOverrides::default();
+    let mut preflight_override = None;
+    let mut longcache_enabled = false;
     let mut unsupported_redaction_notified: HashSet<PathBuf> = HashSet::new();
 
     // Spawn the driver loop.
@@ -1537,6 +1544,7 @@ pub(super) async fn run_worker(
                     thinking_mode,
                     prompt_cache_retention,
                 } => {
+                    active_model_for_toggles = (provider.clone(), model.clone());
                     // Mid-session model switch (implementation note):
                     // route the new `(provider, model)` to the running driver. The
                     // driver owns the whole daemon-side transaction: build first,
@@ -1775,6 +1783,7 @@ pub(super) async fn run_worker(
                     scan_environment,
                     scan_dotenv,
                     scan_ssh_keys,
+                    respond_to,
                 } => {
                     // `/toggle-redaction`: mutate the session's in-memory
                     // effective `RedactConfig`, rebuild the newly discoverable
@@ -1864,6 +1873,8 @@ pub(super) async fn run_worker(
                             )
                             .await
                             {
+                                let _ = respond_to
+                                    .send(Err("session driver is unavailable".to_string()));
                                 break WorkerStop::DriverFailed;
                             }
                             send_current_event(
@@ -1876,21 +1887,38 @@ pub(super) async fn run_worker(
                                     scan_ssh_keys: effective_redact.scan_ssh_keys,
                                 },
                             );
+                            let _ = respond_to.send(Ok((
+                                effective_redact.scan_environment,
+                                effective_redact.scan_dotenv,
+                                effective_redact.scan_ssh_keys,
+                            )));
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "rebuilding redaction table failed");
+                            let _ = respond_to.send(Err(e.to_string()));
                         }
                     }
                 }
-                SessionWork::SetPreflight { enabled } => {
-                    // `/preflight`: route the override to the driver, which holds
-                    // it (precedence over config), resolves the toggle against its
-                    // authoritative current value, and broadcasts the resulting
-                    // state via `TurnEvent::PreflightState`. Session-only — never
+                SessionWork::SetPreflight {
+                    enabled,
+                    respond_to,
+                } => {
+                    // `/preflight`: resolve the effective value in the worker so the
+                    // RPC remains responsive during a running turn, then queue an
+                    // explicit driver override and its existing state broadcast. Session-only — never
                     // persisted (mirrors `/toggle-redaction`).
+                    let configured = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extended
+                        .preflight
+                        .enabled;
+                    let target = enabled.unwrap_or(!preflight_override.unwrap_or(configured));
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
-                        crate::engine::driver::DriverControl::SetPreflight { enabled },
+                        crate::engine::driver::DriverControl::SetPreflight {
+                            enabled: Some(target),
+                        },
                         &event_tx,
                         &turn_completions,
                         &redaction,
@@ -1899,13 +1927,39 @@ pub(super) async fn run_worker(
                     )
                     .await
                     {
+                        let _ = respond_to.send(Err("session driver is unavailable".to_string()));
                         break WorkerStop::DriverFailed;
                     }
+                    preflight_override = Some(target);
+                    let _ = respond_to.send(Ok(target));
                 }
-                SessionWork::SetLongcache { enabled } => {
+                SessionWork::SetLongcache {
+                    enabled,
+                    respond_to,
+                } => {
+                    let providers_cfg = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .providers
+                        .clone();
+                    let target = enabled.unwrap_or(!longcache_enabled);
+                    let supported = providers_cfg
+                        .resolve_prompt_cache_retention(
+                            &active_model_for_toggles.0,
+                            &active_model_for_toggles.1,
+                            Some(crate::config::providers::PromptCacheRetention::Extended),
+                        )
+                        .is_some();
+                    let effective = if target && !supported {
+                        longcache_enabled
+                    } else {
+                        target
+                    };
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
-                        crate::engine::driver::DriverControl::SetLongcache { enabled },
+                        crate::engine::driver::DriverControl::SetLongcache {
+                            enabled: Some(target),
+                        },
                         &event_tx,
                         &turn_completions,
                         &redaction,
@@ -1914,8 +1968,11 @@ pub(super) async fn run_worker(
                     )
                     .await
                     {
+                        let _ = respond_to.send(Err("session driver is unavailable".to_string()));
                         break WorkerStop::DriverFailed;
                     }
+                    longcache_enabled = effective;
+                    let _ = respond_to.send(Ok(effective));
                 }
                 SessionWork::SetTandemModels { models } => {
                     // `/model-comparison`: build a completion model for each

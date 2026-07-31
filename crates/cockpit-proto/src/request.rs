@@ -688,8 +688,8 @@ pub enum Request {
     /// toggles the current effective state; `Some(true)`/`Some(false)` set it
     /// explicitly. The driver holds the session-only override (precedence over
     /// config). **Session-only / in-memory** — no config-file write; reverts
-    /// on restart. Acked with the resulting state via
-    /// [`Response::PreflightState`] (and the broadcast [`Event::PreflightState`]).
+    /// on restart. Returns the resulting [`Response::PreflightState`] and broadcasts
+    /// [`Event::PreflightState`].
     SetPreflight {
         #[serde(default)]
         enabled: Option<bool>,
@@ -697,7 +697,7 @@ pub enum Request {
 
     /// Set (or toggle) extended prompt-cache retention intent for the attached
     /// session (`/longcache`). Session-only; the driver re-resolves support
-    /// against the active model's curated capability before sending a wire key.
+    /// against the active model's curated capability before sending a wire key. Returns the effective [`Response::LongcacheState`].
     SetLongcache {
         #[serde(default)]
         enabled: Option<bool>,

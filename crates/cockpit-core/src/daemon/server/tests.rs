@@ -6445,11 +6445,25 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert!(enabled);
                     assert_eq!(default_depth, 3);
                 }
-                ("set_preflight", SessionWork::SetPreflight { enabled }) => {
+                (
+                    "set_preflight",
+                    SessionWork::SetPreflight {
+                        enabled,
+                        respond_to,
+                    },
+                ) => {
                     assert_eq!(enabled, Some(true));
+                    respond_to.send(Ok(true)).unwrap();
                 }
-                ("set_longcache", SessionWork::SetLongcache { enabled }) => {
+                (
+                    "set_longcache",
+                    SessionWork::SetLongcache {
+                        enabled,
+                        respond_to,
+                    },
+                ) => {
                     assert_eq!(enabled, Some(true));
+                    respond_to.send(Ok(true)).unwrap();
                 }
                 (
                     "set_redaction",
@@ -6457,11 +6471,13 @@ async fn assert_worker_delivery_happy(kind: &str) {
                         scan_environment,
                         scan_dotenv,
                         scan_ssh_keys,
+                        respond_to,
                     },
                 ) => {
                     assert_eq!(scan_environment, Some(false));
                     assert_eq!(scan_dotenv, Some(true));
                     assert_eq!(scan_ssh_keys, None);
+                    respond_to.send(Ok((false, true, true))).unwrap();
                 }
                 ("set_tandem_models", SessionWork::SetTandemModels { models }) => {
                     assert_eq!(models, vec![("openai".to_string(), "gpt-5".to_string())]);
@@ -6509,8 +6525,42 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 Response::DelegationRecursionState { .. }
             ));
         }
+        "set_preflight" => assert!(matches!(
+            response,
+            Response::PreflightState { enabled: true }
+        )),
+        "set_longcache" => assert!(matches!(
+            response,
+            Response::LongcacheState { enabled: true }
+        )),
+        "set_redaction" => assert!(matches!(
+            response,
+            Response::RedactionState {
+                scan_environment: false,
+                scan_dotenv: true,
+                scan_ssh_keys: true,
+            }
+        )),
         _ => assert!(matches!(response, Response::Ack), "{kind}: {response:?}"),
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn set_preflight_returns_preflight_state() {
+    assert_worker_delivery_happy("set_preflight").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn set_redaction_returns_redaction_state() {
+    assert_worker_delivery_happy("set_redaction").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn set_longcache_returns_longcache_state() {
+    assert_worker_delivery_happy("set_longcache").await;
 }
 
 #[cfg(unix)]

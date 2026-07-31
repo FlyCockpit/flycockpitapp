@@ -404,6 +404,11 @@ fn url_encode(bytes: &[u8]) -> String {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct PersistedRedactionTable {
     entries: Vec<(String, String)>,
+    /// Origin-only coverage markers for values collected from files on disk.
+    /// These deliberately carry no values, so session resume can detect lost
+    /// coverage without turning the database into a copy of file secrets.
+    #[serde(default)]
+    disk_derived_origins: Vec<String>,
     placeholder: String,
     disabled: bool,
     unsupported_files: Vec<String>,
@@ -753,10 +758,18 @@ impl RedactionTable {
         )
     }
 
-    /// Serialize this accumulated table for session-local persistence. The
-    /// payload intentionally contains literal values: it is stored in the
-    /// same private session DB that now stores raw transcript content.
+    /// Serialize this accumulated table for session-local persistence. Disk-derived
+    /// values are excluded; their origin-only markers retain resume coverage checks.
     pub fn to_persisted_json(&self) -> Result<String> {
+        let mut disk_derived_origins: Vec<String> = self
+            .entries
+            .iter()
+            .map(|(_, origin)| origin)
+            .filter(|origin| origin_is_disk_derived(origin))
+            .cloned()
+            .collect();
+        disk_derived_origins.sort();
+        disk_derived_origins.dedup();
         let snapshot = PersistedRedactionTable {
             entries: self
                 .entries
@@ -764,6 +777,7 @@ impl RedactionTable {
                 .filter(|(_, origin)| !origin_is_disk_derived(origin))
                 .cloned()
                 .collect(),
+            disk_derived_origins,
             placeholder: self.placeholder.clone(),
             disabled: self.disabled,
             unsupported_files: self
@@ -797,16 +811,20 @@ impl RedactionTable {
         )
     }
 
-    /// Return disk-origin markers from a legacy snapshot without exposing any value.
+    /// Return disk-origin markers without exposing any value. For snapshots
+    /// written before origin-only markers existed, recover them from the
+    /// legacy disk-derived entries so they are purged on the next persist.
     pub fn persisted_disk_derived_origins(json: &str) -> Result<Vec<String>> {
         let snapshot: PersistedRedactionTable =
             serde_json::from_str(json).context("deserializing redaction table")?;
-        let mut origins: Vec<String> = snapshot
-            .entries
-            .into_iter()
-            .map(|(_, origin)| origin)
-            .filter(|origin| origin_is_disk_derived(origin))
-            .collect();
+        let mut origins: Vec<String> = snapshot.disk_derived_origins;
+        origins.extend(
+            snapshot
+                .entries
+                .into_iter()
+                .map(|(_, origin)| origin)
+                .filter(|origin| origin_is_disk_derived(origin)),
+        );
         origins.sort();
         origins.dedup();
         Ok(origins)

@@ -1716,7 +1716,15 @@ fn dotenv_entries_are_not_persisted() {
     let mut cfg = enabled_cfg();
     cfg.scan_dotenv = true;
     let table = RedactionTable::build(&cfg, dir.path()).unwrap();
-    assert!(!table.to_persisted_json().unwrap().contains(secret));
+    let persisted = table.to_persisted_json().unwrap();
+    assert!(!persisted.contains(secret));
+    assert_eq!(
+        RedactionTable::persisted_disk_derived_origins(&persisted).unwrap(),
+        vec![format!(
+            "$dotenv:{}:TOKEN",
+            dir.path().join(".env").display()
+        )],
+    );
     assert_ne!(table.scrub(secret), secret);
 }
 

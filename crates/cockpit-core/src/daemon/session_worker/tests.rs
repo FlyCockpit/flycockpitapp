@@ -4,7 +4,48 @@ use super::lifecycle::*;
 use super::run::*;
 use super::*;
 use crate::db::Db;
+use std::io;
 use std::sync::Mutex as StdMutex;
+use tracing::Level;
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone)]
+struct CaptureWriter(Arc<StdMutex<Vec<u8>>>);
+
+struct CaptureGuard(Arc<StdMutex<Vec<u8>>>);
+
+impl io::Write for CaptureGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CaptureGuard(self.0.clone())
+    }
+}
+
+fn capture_warn_log<T>(f: impl FnOnce() -> T) -> (T, String) {
+    let bytes = Arc::new(StdMutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(Level::WARN)
+        .with_ansi(false)
+        .with_writer(CaptureWriter(bytes.clone()))
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, f);
+    (
+        result,
+        String::from_utf8(bytes.lock().unwrap().clone()).unwrap(),
+    )
+}
 
 fn text_delta(agent: &str, delta: &str) -> proto::Event {
     proto::Event::AssistantTextDelta {
@@ -724,6 +765,107 @@ async fn absent_scheduler_is_not_an_error() {
         .await
         .expect("worker shuts down")
         .expect("worker task does not panic");
+}
+
+#[tokio::test]
+async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_disappears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+    let env_path = tmp.path().join(".env");
+    let secret = "worker-resume-dotenv-secret-123456";
+    std::fs::write(&env_path, format!("TOKEN={secret}\n")).unwrap();
+
+    let mut redaction_cfg = crate::config::extended::RedactConfig::default();
+    redaction_cfg.scan_environment = false;
+    redaction_cfg.scan_dotenv = true;
+    redaction_cfg.scan_ssh_keys = false;
+    let env = HashMap::new();
+    let initial =
+        Arc::new(RedactionTable::build_with_env(&redaction_cfg, tmp.path(), &env).unwrap());
+    session.persist_redaction_table(&initial).unwrap();
+    let persisted = initial.to_persisted_json().unwrap();
+    assert!(!persisted.contains(secret));
+    assert_eq!(
+        RedactionTable::persisted_disk_derived_origins(&persisted).unwrap(),
+        vec![format!("$dotenv:{}:TOKEN", env_path.display())]
+    );
+
+    let providers = lmstudio_test_providers();
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+    let trust_policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::TrustRoot {
+            opened_path: tmp.path().to_path_buf(),
+            root: tmp.path().to_path_buf(),
+            kind: crate::config::trust::TrustRootKind::Directory,
+        },
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    let start_worker = |resumed: Arc<Session>, redaction: Arc<RedactionTable>| {
+        let model = Arc::new(
+            crate::engine::model::Model::from_config(&providers, redaction.clone()).unwrap(),
+        );
+        spawn(
+            resumed,
+            Arc::new(LockManager::in_memory(db.clone())),
+            redaction,
+            model,
+            None,
+            None,
+            tmp.path().to_path_buf(),
+            false,
+            false,
+            &extended,
+            Arc::new(crate::daemon::lsp::LspManager::new()),
+            None,
+            Arc::new(StdMutex::new(None)),
+            None,
+            trust_policy.clone(),
+            None,
+            EnvSnapshot::new(
+                crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                Default::default(),
+            ),
+            SessionConfigSnapshot::new(0, providers.clone(), extended.clone()),
+        )
+    };
+
+    let resumed = Arc::new(Session::resume(db.clone(), session.id).unwrap().unwrap());
+    let rederived =
+        Arc::new(RedactionTable::build_with_env(&redaction_cfg, tmp.path(), &env).unwrap());
+    let ((handle, join), success_log) = capture_warn_log(|| start_worker(resumed, rederived));
+    assert_ne!(handle.redaction_table().scrub(secret), secret);
+    assert!(!success_log.contains("could not be re-derived"));
+    handle
+        .send_work(SessionWork::Shutdown {
+            pause_for_resume: false,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), join)
+        .await
+        .unwrap()
+        .unwrap();
+
+    std::fs::remove_file(&env_path).unwrap();
+    let resumed = Arc::new(Session::resume(db.clone(), session.id).unwrap().unwrap());
+    let empty_rederive =
+        Arc::new(RedactionTable::build_with_env(&redaction_cfg, tmp.path(), &env).unwrap());
+    let ((handle, join), warning_log) = capture_warn_log(|| start_worker(resumed, empty_rederive));
+    assert!(warning_log.contains("disk-derived redaction entry could not be re-derived"));
+    assert!(warning_log.contains(&env_path.display().to_string()));
+    assert!(!warning_log.contains(secret));
+    handle
+        .send_work(SessionWork::Shutdown {
+            pause_for_resume: false,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), join)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 /// An [`ExtendedConfig`] pinning `defaultPrimaryAgent` for fallback tests.

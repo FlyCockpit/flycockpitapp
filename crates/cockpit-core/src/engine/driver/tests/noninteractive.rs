@@ -290,6 +290,7 @@ fn single_task(
         write_scope: None,
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),
+        sealed_fetch: None,
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         repair_notes: Vec::new(),
         task_call_id: task_call_id.to_string(),
@@ -967,6 +968,7 @@ async fn pending_noninteractive_completion_routes_by_task_call_id() {
     tx.send(BackgroundNoninteractiveCompletion::Single {
         task_call_id: "task-a".to_string(),
         task_function_call_id: Some("fn-task-a".to_string()),
+        sealed_fetch: None,
         result: Box::new(Ok(single_noninteractive_completion("task-a", "a done"))),
     })
     .await
@@ -974,6 +976,7 @@ async fn pending_noninteractive_completion_routes_by_task_call_id() {
     tx.send(BackgroundNoninteractiveCompletion::Single {
         task_call_id: "task-b".to_string(),
         task_function_call_id: Some("fn-task-b".to_string()),
+        sealed_fetch: None,
         result: Box::new(Ok(single_noninteractive_completion("task-b", "b done"))),
     })
     .await
@@ -1066,6 +1069,7 @@ async fn inline_background_completion_error_keeps_original_task_pairing() {
             Some(BackgroundNoninteractiveCompletion::Single {
                 task_call_id: "task-inline".to_string(),
                 task_function_call_id: Some("fn-inline".to_string()),
+                sealed_fetch: None,
                 result: Box::new(Err(anyhow::anyhow!("child crashed"))),
             }),
             &tx,
@@ -1117,6 +1121,7 @@ async fn backgrounded_completion_error_becomes_async_failed_result_once() {
             Some(BackgroundNoninteractiveCompletion::Single {
                 task_call_id: "task-bg-error".to_string(),
                 task_function_call_id: Some("fn-bg-error".to_string()),
+                sealed_fetch: None,
                 result: Box::new(Err(anyhow::anyhow!("late child crashed"))),
             }),
             &tx,
@@ -1141,6 +1146,7 @@ async fn backgrounded_completion_error_becomes_async_failed_result_once() {
             Some(BackgroundNoninteractiveCompletion::Single {
                 task_call_id: "task-bg-error".to_string(),
                 task_function_call_id: Some("fn-bg-error".to_string()),
+                sealed_fetch: None,
                 result: Box::new(Err(anyhow::anyhow!("late child crashed again"))),
             }),
             &tx,
@@ -1292,6 +1298,7 @@ async fn noninteractive_single_inline_result_shape_is_unchanged() {
                 shrink: None,
                 repair_notes: Vec::new(),
                 child_routing: None,
+                sealed_fetch: None,
             },
             &tx,
             true,
@@ -1325,6 +1332,7 @@ async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_r
                 shrink: Some(pending_test_shrink()),
                 repair_notes: Vec::new(),
                 child_routing: None,
+                sealed_fetch: None,
             },
             &tx,
             true,
@@ -1411,6 +1419,7 @@ async fn noninteractive_report_stamps_child_model() {
                 shrink: Some(pending_test_shrink()),
                 repair_notes: Vec::new(),
                 child_routing: Some(child_routing_for("child-report")),
+                sealed_fetch: None,
             },
             &tx,
             true,
@@ -1631,6 +1640,7 @@ async fn noninteractive_single_result_includes_task_repair_notes() {
                         .to_string(),
                 ],
                 child_routing: None,
+                sealed_fetch: None,
             },
             &tx,
             true,
@@ -1643,6 +1653,124 @@ async fn noninteractive_single_result_includes_task_repair_notes() {
     let text = tool_result_text(&result);
     assert!(text.starts_with("dropped `action`"), "{text}");
     assert!(text.contains("\n\nsingle report"), "{text}");
+}
+
+#[tokio::test]
+async fn sealed_fetch_discards_child_report_and_returns_store_state() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let marker = "SEALED_FETCH_CHILD_SECRET";
+    driver
+        .session
+        .set_sealed_value(
+            &crate::redact::RedactionTable::empty(),
+            "deploy_token",
+            marker,
+            "test",
+            "subagent",
+        )
+        .await
+        .unwrap();
+    let mut completion = single_noninteractive_completion("sealed-fetch", marker);
+    completion.snapshot =
+        NoninteractiveDelegationSnapshot::from_history(vec![Message::assistant(marker)]);
+    completion.sealed_fetch = Some(SealedFetch {
+        value_id: "deploy_token".to_string(),
+        existed_before: false,
+    });
+    let result = driver
+        .finalize_single_noninteractive_task(completion, &tx, true)
+        .await
+        .unwrap();
+    let text = tool_result_text(&result);
+    assert!(!text.contains(marker));
+    let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(payload["type"], "sealed_fetch");
+    assert_eq!(payload["value_id"], "deploy_token");
+    assert_eq!(payload["status"], "sealed");
+    assert!(payload.get("report").is_none());
+    assert!(payload.get("error_class").is_none());
+    let entry = driver
+        .noninteractive_delegations
+        .entries
+        .get(&NoninteractiveDelegationKey::new("sealed-fetch", "default"))
+        .expect("sealed-fetch child audit entry");
+    assert!(
+        serde_json::to_string(&entry.snapshot.history)
+            .unwrap()
+            .contains(marker)
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "sealed fetch must not emit a raw child report"
+    );
+}
+
+#[tokio::test]
+async fn sealed_fetch_not_sealed_and_failed_results_do_not_expose_child_text() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+
+    let marker = "SEALED_FETCH_UNSEALED_SECRET";
+    let mut unsealed = single_noninteractive_completion("sealed-fetch-unsealed", marker);
+    unsealed.sealed_fetch = Some(SealedFetch {
+        value_id: "missing_token".to_string(),
+        existed_before: false,
+    });
+    let unsealed = driver
+        .finalize_single_noninteractive_task(unsealed, &tx, true)
+        .await
+        .unwrap();
+    let unsealed_text = tool_result_text(&unsealed);
+    assert!(!unsealed_text.contains(marker));
+    let unsealed: serde_json::Value = serde_json::from_str(&unsealed_text).unwrap();
+    assert_eq!(unsealed["status"], "not_sealed");
+    assert!(unsealed.get("error_class").is_none());
+
+    let failure_marker = "SEALED_FETCH_FAILURE_DETAIL";
+    let mut failed = single_noninteractive_completion("sealed-fetch-failed", failure_marker);
+    failed.failed = true;
+    failed.sealed_fetch = Some(SealedFetch {
+        value_id: "failed_token".to_string(),
+        existed_before: false,
+    });
+    let failed = driver
+        .finalize_single_noninteractive_task(failed, &tx, true)
+        .await
+        .unwrap();
+    let failed_text = tool_result_text(&failed);
+    assert!(!failed_text.contains(failure_marker));
+    let failed: serde_json::Value = serde_json::from_str(&failed_text).unwrap();
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["error_class"], "subagent_failed");
+}
+
+#[tokio::test]
+async fn sealed_fetch_preexisting_value_is_not_reported_as_newly_sealed() {
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let mut completion = single_noninteractive_completion("sealed-fetch-existing", "child report");
+    completion.sealed_fetch = Some(SealedFetch {
+        value_id: "already_there".to_string(),
+        existed_before: true,
+    });
+    driver
+        .session
+        .set_sealed_value(
+            &crate::redact::RedactionTable::empty(),
+            "already_there",
+            "existing secret",
+            "test",
+            "prior",
+        )
+        .await
+        .unwrap();
+    let result = driver
+        .finalize_single_noninteractive_task(completion, &tx, true)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&tool_result_text(&result)).unwrap();
+    assert_eq!(payload["status"], "not_sealed");
 }
 
 #[tokio::test]

@@ -533,11 +533,34 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
     pub(in crate::engine::driver) write_scope: Option<String>,
     pub(in crate::engine::driver) granted_tools: Vec<String>,
     pub(in crate::engine::driver) todo_ids: Vec<uuid::Uuid>,
+    pub(in crate::engine::driver) sealed_fetch: Option<SealedFetch>,
     pub(in crate::engine::driver) child_recursion:
         crate::engine::builtin::DelegationRecursionContext,
     pub(in crate::engine::driver) repair_notes: Vec<String>,
     pub(in crate::engine::driver) task_call_id: String,
     pub(in crate::engine::driver) task_function_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::engine::driver) struct SealedFetch {
+    pub(in crate::engine::driver) value_id: String,
+    pub(in crate::engine::driver) existed_before: bool,
+}
+
+pub(in crate::engine::driver) fn sealed_fetch_report(value_id: &str, status: &str) -> String {
+    let mut payload = serde_json::json!({
+        "type": "sealed_fetch",
+        "value_id": value_id,
+        "status": status,
+    });
+    if status == "failed" {
+        payload["error_class"] = serde_json::json!("subagent_failed");
+    }
+    serde_json::to_string(&payload).expect("sealed-fetch payload is serializable")
+}
+
+pub(in crate::engine::driver) fn sealed_fetch_failure_report(value_id: &str) -> String {
+    sealed_fetch_report(value_id, "failed")
 }
 
 pub(in crate::engine::driver) struct SingleNoninteractiveCompletion {
@@ -553,6 +576,7 @@ pub(in crate::engine::driver) struct SingleNoninteractiveCompletion {
     pub(in crate::engine::driver) shrink: Option<PendingDelegationShrink>,
     pub(in crate::engine::driver) repair_notes: Vec<String>,
     pub(in crate::engine::driver) child_routing: Option<ChildRoutingMetadata>,
+    pub(in crate::engine::driver) sealed_fetch: Option<SealedFetch>,
 }
 
 pub(in crate::engine::driver) struct BatchNoninteractiveTask {
@@ -585,6 +609,7 @@ pub(in crate::engine::driver) enum BackgroundNoninteractiveCompletion {
     Single {
         task_call_id: String,
         task_function_call_id: Option<String>,
+        sealed_fetch: Option<SealedFetch>,
         result: Box<Result<SingleNoninteractiveCompletion>>,
     },
     Batch {
@@ -804,6 +829,24 @@ impl Driver {
     ) -> Result<Message> {
         let task_call_id = task.task_call_id.clone();
         let task_function_call_id = task.task_function_call_id.clone();
+        if let Some(sealed_fetch) = task.sealed_fetch.as_mut() {
+            sealed_fetch.existed_before = match self
+                .session
+                .db
+                .resolve_sealed_value_for_injection(self.session.id, &sealed_fetch.value_id)
+                .await
+            {
+                Ok(value) => value.is_some(),
+                Err(error) => {
+                    tracing::warn!(error = %error, task_call_id, "inspect sealed-fetch target failed");
+                    return Ok(Message::tool_result_with_call_id(
+                        task_call_id,
+                        task_function_call_id,
+                        sealed_fetch_failure_report(&sealed_fetch.value_id),
+                    ));
+                }
+            };
+        }
         let resolved_cwd_display = task.child_cwd.resolved_display();
         let task_args_json = serde_json::to_string(&serde_json::json!({
             "child_agent": &task.child_agent,
@@ -862,9 +905,14 @@ impl Driver {
                 return Ok(Message::tool_result_with_call_id(
                     task_call_id,
                     task_function_call_id,
-                    prepend_task_repair_notes(
-                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                        &task.repair_notes,
+                    task.sealed_fetch.as_ref().map_or_else(
+                        || {
+                            prepend_task_repair_notes(
+                                DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                                &task.repair_notes,
+                            )
+                        },
+                        |sealed_fetch| sealed_fetch_failure_report(&sealed_fetch.value_id),
                     ),
                 ));
             }
@@ -880,6 +928,7 @@ impl Driver {
         let tx_for_task = tx.clone();
         let completion_task_call_id = task_call_id.clone();
         let completion_task_function_call_id = task_function_call_id.clone();
+        let completion_sealed_fetch = task.sealed_fetch.clone();
         let handle = tokio::spawn(async move {
             let result = runner
                 .execute_single_noninteractive_task(task, &tx_for_task, cancel)
@@ -888,6 +937,7 @@ impl Driver {
                 .send(BackgroundNoninteractiveCompletion::Single {
                     task_call_id: completion_task_call_id,
                     task_function_call_id: completion_task_function_call_id,
+                    sealed_fetch: completion_sealed_fetch,
                     result: Box::new(result),
                 })
                 .await;
@@ -982,6 +1032,7 @@ impl Driver {
             repair_notes,
             task_call_id,
             task_function_call_id,
+            sealed_fetch,
         } = task;
 
         self.noninteractive_delegations.register_running(
@@ -1015,6 +1066,7 @@ impl Driver {
                 shrink: None,
                 repair_notes,
                 child_routing: None,
+                sealed_fetch: sealed_fetch.clone(),
             });
         }
 
@@ -1048,6 +1100,7 @@ impl Driver {
                         shrink: None,
                         repair_notes,
                         child_routing: None,
+                        sealed_fetch: sealed_fetch.clone(),
                     });
                 }
             }
@@ -1141,6 +1194,7 @@ impl Driver {
                         }),
                         repair_notes,
                         child_routing: None,
+                        sealed_fetch: sealed_fetch.clone(),
                     });
                 }
             };
@@ -1172,6 +1226,7 @@ impl Driver {
                         }),
                         repair_notes,
                         child_routing: None,
+                        sealed_fetch: sealed_fetch.clone(),
                     });
                 }
             }
@@ -1218,7 +1273,7 @@ impl Driver {
                     self.interrupts.clone(),
                     cancel.clone(),
                     Some(self.tandem_set.clone()),
-                    Some(tx.clone()),
+                    sealed_fetch.is_none().then(|| tx.clone()),
                     Some(NoninteractiveSteerTarget::new(
                         task_call_id.clone(),
                         "default",
@@ -1278,6 +1333,7 @@ impl Driver {
                                 }),
                                 repair_notes,
                                 child_routing: None,
+                                sealed_fetch: sealed_fetch.clone(),
                             });
                         }
                     };
@@ -1352,7 +1408,7 @@ impl Driver {
                         self.loop_guard_threshold,
                         EXPLORE_MAX_TURNS,
                         Some(self.tandem_set.clone()),
-                        Some(tx.clone()),
+                        sealed_fetch.is_none().then(|| tx.clone()),
                         Some(NoninteractiveSteerTarget::new(
                             task_call_id.clone(),
                             "default",
@@ -1451,6 +1507,7 @@ impl Driver {
             }),
             repair_notes,
             child_routing: outcome.child_routing,
+            sealed_fetch: sealed_fetch.clone(),
         })
     }
 
@@ -1473,7 +1530,65 @@ impl Driver {
             shrink,
             repair_notes,
             child_routing,
+            sealed_fetch,
         } = completion;
+
+        if let Some(sealed_fetch) = sealed_fetch {
+            let lookup = if failed || sealed_fetch.existed_before {
+                Ok(false)
+            } else {
+                self.session
+                    .db
+                    .resolve_sealed_value_for_injection(self.session.id, &sealed_fetch.value_id)
+                    .await
+                    .map(|value| value.is_some())
+            };
+            let sealed_fetch_failed = failed || lookup.is_err();
+            if let Err(error) = &lookup {
+                tracing::warn!(error = %error, task_call_id, "resolve sealed-fetch target after child failed");
+            }
+            let status = if sealed_fetch_failed {
+                "failed"
+            } else if lookup.as_ref().ok().copied().unwrap_or(false) {
+                "sealed"
+            } else {
+                "not_sealed"
+            };
+            let parent_report = sealed_fetch_report(&sealed_fetch.value_id, status);
+            let result = Message::tool_result_with_call_id(
+                task_call_id.clone(),
+                task_function_call_id,
+                parent_report.clone(),
+            );
+            self.noninteractive_delegations
+                .set_snapshot(&task_call_id, "default", snapshot);
+            self.noninteractive_delegations.complete(
+                &task_call_id,
+                "default",
+                parent_report.clone(),
+                sealed_fetch_failed,
+                Some(result.clone()),
+            );
+            if let Err(error) = self
+                .session
+                .db
+                .complete_task_delegation_child(
+                    &task_call_id,
+                    "default",
+                    &parent_report,
+                    sealed_fetch_failed,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(error = %error, task_call_id, "complete sealed-fetch delegation child failed");
+            }
+            let _ = self
+                .noninteractive_delegations
+                .mark_delivered(&task_call_id, "default");
+            Self::discard_delegation_shrink(shrink);
+            return Ok(result);
+        }
 
         let emit_report_event = shrink.is_some();
         if !emit_report_event {
@@ -1735,6 +1850,7 @@ impl Driver {
             BackgroundNoninteractiveCompletion::Single {
                 task_call_id,
                 task_function_call_id,
+                sealed_fetch,
                 result,
             } => match *result {
                 Ok(completion) => {
@@ -1770,6 +1886,9 @@ impl Driver {
                 }
                 Err(e) => {
                     let body = format!("Error: {e:#}");
+                    let sealed_fetch_report = sealed_fetch
+                        .as_ref()
+                        .map(|sealed_fetch| sealed_fetch_failure_report(&sealed_fetch.value_id));
                     let was_backgrounded = self
                         .noninteractive_delegations
                         .is_backgrounded_job(&task_call_id);
@@ -1780,8 +1899,32 @@ impl Driver {
                         job.delivered = true;
                     }
                     if was_backgrounded {
-                        self.record_background_noninteractive_error(&task_call_id, &body)
-                            .await;
+                        if let Some(report) = sealed_fetch_report.as_ref() {
+                            self.noninteractive_delegations.complete(
+                                &task_call_id,
+                                "default",
+                                report.clone(),
+                                true,
+                                None,
+                            );
+                            if let Err(error) = self
+                                .session
+                                .db
+                                .complete_task_delegation_child(
+                                    &task_call_id,
+                                    "default",
+                                    report,
+                                    true,
+                                    None,
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %error, task_call_id, "complete failed sealed-fetch child failed");
+                            }
+                        } else {
+                            self.record_background_noninteractive_error(&task_call_id, &body)
+                                .await;
+                        }
                         Ok(self
                             .async_delegation_result(&task_call_id)
                             .await
@@ -1792,7 +1935,7 @@ impl Driver {
                             Message::tool_result_with_call_id(
                                 task_call_id,
                                 task_function_call_id,
-                                body,
+                                sealed_fetch_report.unwrap_or(body),
                             ),
                         ))
                     }

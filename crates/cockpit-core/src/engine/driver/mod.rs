@@ -31,7 +31,8 @@ use noninteractive::*;
 use noninteractive::{
     BackgroundNoninteractiveCompletion, BackgroundNoninteractiveJob, BatchNoninteractiveTask,
     DelegationPartialProgress, NoninteractiveDelegationRegistry, PartialProgressCommand,
-    PartialProgressFileEdit, SingleNoninteractiveTask, handle_footer, stale_handle_error,
+    PartialProgressFileEdit, SealedFetch, SingleNoninteractiveTask, handle_footer,
+    sealed_fetch_failure_report, stale_handle_error,
 };
 pub(crate) use noninteractive::{NoninteractiveSteerTarget, run_noninteractive};
 use queue::*;
@@ -6760,6 +6761,7 @@ impl Driver {
                     context,
                     granted_tools,
                     todo_ids,
+                    sealed_fetch_value_id,
                     repair_notes,
                     task_call_id,
                     task_function_call_id,
@@ -6768,7 +6770,10 @@ impl Driver {
                         next_prompt = Message::tool_result_with_call_id(
                             task_call_id,
                             task_function_call_id,
-                            prepend_task_repair_notes(err, &repair_notes),
+                            sealed_fetch_value_id.as_deref().map_or_else(
+                                || prepend_task_repair_notes(err, &repair_notes),
+                                sealed_fetch_failure_report,
+                            ),
                         );
                         continue;
                     }
@@ -6779,7 +6784,10 @@ impl Driver {
                                 next_prompt = Message::tool_result_with_call_id(
                                     task_call_id,
                                     task_function_call_id,
-                                    prepend_task_repair_notes(err, &repair_notes),
+                                    sealed_fetch_value_id.as_deref().map_or_else(
+                                        || prepend_task_repair_notes(err, &repair_notes),
+                                        sealed_fetch_failure_report,
+                                    ),
                                 );
                                 continue;
                             }
@@ -6790,7 +6798,10 @@ impl Driver {
                             next_prompt = Message::tool_result_with_call_id(
                                 task_call_id,
                                 task_function_call_id,
-                                prepend_task_repair_notes(err, &repair_notes),
+                                sealed_fetch_value_id.as_deref().map_or_else(
+                                    || prepend_task_repair_notes(err, &repair_notes),
+                                    sealed_fetch_failure_report,
+                                ),
                             );
                             continue;
                         }
@@ -6809,7 +6820,10 @@ impl Driver {
                         next_prompt = Message::tool_result_with_call_id(
                             task_call_id,
                             task_function_call_id,
-                            prepend_task_repair_notes(err, &repair_notes),
+                            sealed_fetch_value_id.as_deref().map_or_else(
+                                || prepend_task_repair_notes(err, &repair_notes),
+                                sealed_fetch_failure_report,
+                            ),
                         );
                         continue;
                     }
@@ -6827,6 +6841,10 @@ impl Driver {
                                 write_scope,
                                 granted_tools,
                                 todo_ids,
+                                sealed_fetch: sealed_fetch_value_id.map(|value_id| SealedFetch {
+                                    value_id,
+                                    existed_before: false,
+                                }),
                                 child_recursion,
                                 repair_notes,
                                 task_call_id,

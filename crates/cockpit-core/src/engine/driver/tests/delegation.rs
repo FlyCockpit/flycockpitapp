@@ -491,6 +491,7 @@ async fn resolved_cwd_unknown_agent_refuses_before_load() {
         write_scope: None,
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),
+        sealed_fetch: None,
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         repair_notes: Vec::new(),
         task_call_id: "task-resolved-cwd".to_string(),

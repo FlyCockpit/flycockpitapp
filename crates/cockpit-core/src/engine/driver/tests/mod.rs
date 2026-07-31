@@ -1067,6 +1067,7 @@ fn single_noninteractive_completion(
         shrink: None,
         repair_notes: Vec::new(),
         child_routing: None,
+        sealed_fetch: None,
     }
 }
 

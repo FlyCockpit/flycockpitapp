@@ -72,6 +72,7 @@ type SleepFn<'a> = &'a mut (dyn FnMut(Duration) -> SleepFuture + Send);
 pub enum OrgSyncOnceOutcome {
     NoCredential,
     Disabled,
+    EnrollmentRequired { org_id: String },
     Idle,
     Filtered { cursor_seq: i64 },
     Uploaded { events: usize, cursor_seq: i64 },
@@ -204,14 +205,23 @@ async fn sync_once_with_client(
         }
     };
 
+    let enrolled = db
+        .org_sync_state(&credential.server_url, &policy.org_id)
+        .await?
+        .is_some_and(|state| state.enabled && state.policy_version == policy.policy_version);
     db.upsert_org_sync_policy(
         &credential.server_url,
         &policy.org_id,
         policy.policy_version.as_deref(),
         &policy.raw,
-        true,
+        enrolled,
     )
     .await?;
+    if !enrolled {
+        return Ok(OrgSyncOnceOutcome::EnrollmentRequired {
+            org_id: policy.org_id,
+        });
+    }
     let state = db
         .org_sync_state(&credential.server_url, &policy.org_id)
         .await?
@@ -521,6 +531,9 @@ mod tests {
         db.set_connector_enabled(&server, &credential.instance_id, true)
             .await
             .unwrap();
+        db.upsert_org_sync_policy(&server, "org-1", Some("v1"), &json!({}), true)
+            .await
+            .unwrap();
         let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())
             .await
             .unwrap()
@@ -604,6 +617,134 @@ mod tests {
             .unwrap();
         assert!(client.is_none());
         assert!(requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mandatory_policy_without_enrollment_does_not_upload() {
+        let db = Db::open_in_memory().unwrap();
+        insert_event(
+            &db,
+            SessionEventKind::UserMessage,
+            "must remain local until enrolled",
+        )
+        .await;
+        let (server, requests) = start_test_server(vec![response(200, active_policy())]).await;
+        let credential = credential(server.clone());
+        db.set_connector_enabled(&server, &credential.instance_id, true)
+            .await
+            .unwrap();
+        let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
+
+        assert_eq!(
+            sync_once_with_client(&db, &credential, &client, &mut sleeper)
+                .await
+                .unwrap(),
+            OrgSyncOnceOutcome::EnrollmentRequired {
+                org_id: "org-1".to_string()
+            }
+        );
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET "));
+        assert!(!requests.iter().any(|request| request.starts_with("POST ")));
+    }
+
+    #[tokio::test]
+    async fn explicit_enrollment_permits_upload() {
+        let db = Db::open_in_memory().unwrap();
+        insert_event(
+            &db,
+            SessionEventKind::UserMessage,
+            "upload after explicit consent",
+        )
+        .await;
+        let (server, requests) = start_test_server(vec![
+            response(200, active_policy()),
+            response(200, active_policy()),
+            response(200, "{}"),
+        ])
+        .await;
+        let credential = credential(server.clone());
+        db.set_connector_enabled(&server, &credential.instance_id, true)
+            .await
+            .unwrap();
+        let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
+
+        assert!(matches!(
+            sync_once_with_client(&db, &credential, &client, &mut sleeper)
+                .await
+                .unwrap(),
+            OrgSyncOnceOutcome::EnrollmentRequired { .. }
+        ));
+        db.set_org_sync_enrolled(&server, "org-1").await.unwrap();
+        assert!(matches!(
+            sync_once_with_client(&db, &credential, &client, &mut sleeper)
+                .await
+                .unwrap(),
+            OrgSyncOnceOutcome::Uploaded { events: 1, .. }
+        ));
+        assert!(
+            requests
+                .lock()
+                .await
+                .iter()
+                .any(|request| request.starts_with("POST "))
+        );
+    }
+
+    #[tokio::test]
+    async fn midsession_policy_change_requires_enrollment() {
+        let db = Db::open_in_memory().unwrap();
+        insert_event(
+            &db,
+            SessionEventKind::UserMessage,
+            "must not upload under a new policy",
+        )
+        .await;
+        let changed_policy = json!({
+            "orgId": "org-1",
+            "policyVersion": "v2",
+            "sessionLogSync": {"enabled": true, "mandatory": true}
+        })
+        .to_string();
+        let (server, requests) = start_test_server(vec![response(200, changed_policy)]).await;
+        let credential = credential(server.clone());
+        db.set_connector_enabled(&server, &credential.instance_id, true)
+            .await
+            .unwrap();
+        db.upsert_org_sync_policy(&server, "org-1", Some("v1"), &json!({}), true)
+            .await
+            .unwrap();
+        let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
+
+        assert!(matches!(
+            sync_once_with_client(&db, &credential, &client, &mut sleeper)
+                .await
+                .unwrap(),
+            OrgSyncOnceOutcome::EnrollmentRequired { .. }
+        ));
+        let state = db.org_sync_state(&server, "org-1").await.unwrap().unwrap();
+        assert!(!state.enabled);
+        assert_eq!(state.policy_version.as_deref(), Some("v2"));
+        assert!(
+            !requests
+                .lock()
+                .await
+                .iter()
+                .any(|request| request.starts_with("POST "))
+        );
     }
 
     #[tokio::test]
@@ -858,6 +999,7 @@ mod tests {
             .unwrap();
         let policy = json!({
             "orgId": "org-1",
+            "policyVersion": "v1",
             "sessionLogSync": {
                 "enabled": true,
                 "mandatory": true,
@@ -912,6 +1054,9 @@ mod tests {
         .await
         .unwrap();
         db.set_connector_enabled(&server, &credential.instance_id, true)
+            .await
+            .unwrap();
+        db.upsert_org_sync_policy(&server, "org-1", Some("v1"), &json!({}), true)
             .await
             .unwrap();
         let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())

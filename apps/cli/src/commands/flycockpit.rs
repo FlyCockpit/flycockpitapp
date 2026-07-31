@@ -75,10 +75,20 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         }
     }
     store_credential_via_daemon_or_direct(&credential).await?;
-    if let Some(db) = db.as_ref()
-        && let Err(error) = crate::daemon::org_sync::sync_current_credential_once(db).await
-    {
-        tracing::warn!(error = %error, "FlyCockpit account login: best-effort org sync policy check failed");
+    if let Some(db) = db.as_ref() {
+        match crate::daemon::org_sync::sync_current_credential_once(db).await {
+            Ok(crate::daemon::org_sync::OrgSyncOnceOutcome::EnrollmentRequired { org_id }) => {
+                if org_logging_enrollment_choice()? {
+                    db.set_org_sync_enrolled(&credential.server_url, &org_id)
+                        .await?;
+                    let _ = crate::daemon::org_sync::sync_current_credential_once(db).await?;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "FlyCockpit account login: best-effort org sync policy check failed")
+            }
+        }
     }
     Ok(())
 }
@@ -272,6 +282,29 @@ pub fn render_whoami_with_sync_and_connector(
     out
 }
 
+fn org_logging_enrollment_choice() -> Result<bool> {
+    let mut stdin = std::io::stdin().lock();
+    let mut stderr = std::io::stderr();
+    org_logging_enrollment_choice_with_io(&mut stdin, &mut stderr)
+}
+
+fn org_logging_enrollment_choice_with_io<R: std::io::BufRead, W: std::io::Write>(
+    input: &mut R,
+    output: &mut W,
+) -> Result<bool> {
+    writeln!(
+        output,
+        "Your organization requires session logging. Full model requests, including file contents, will be uploaded to the organization. Redaction is best-effort pattern matching, not a guarantee."
+    )?;
+    write!(output, "Enroll in organization logging? [y/N] ")?;
+    output.flush()?;
+    let mut answer = String::new();
+    let read = input
+        .read_line(&mut answer)
+        .context("reading organization logging enrollment")?;
+    Ok(read > 0 && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
 fn remote_access_choice(args: &LoginArgs) -> Result<bool> {
     let mut stdin = std::io::stdin().lock();
     let mut stderr = std::io::stderr();
@@ -426,6 +459,46 @@ mod tests {
 
         assert!(!remote_access_choice_with_io(&args, &mut input, &mut output).unwrap());
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn eof_means_not_enrolled() {
+        let mut input = std::io::Cursor::new(b"".as_slice());
+        let mut output = Vec::new();
+
+        assert!(!org_logging_enrollment_choice_with_io(&mut input, &mut output).unwrap());
+    }
+
+    #[test]
+    fn declining_enrollment_still_permits_local_use() {
+        let mut input = std::io::Cursor::new(b"no\n".as_slice());
+        let mut output = Vec::new();
+
+        assert!(!org_logging_enrollment_choice_with_io(&mut input, &mut output).unwrap());
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Enroll in organization logging?")
+        );
+    }
+
+    #[test]
+    fn explicit_enrollment_is_accepted() {
+        let mut input = std::io::Cursor::new(b"yes\n".as_slice());
+        let mut output = Vec::new();
+
+        assert!(org_logging_enrollment_choice_with_io(&mut input, &mut output).unwrap());
+    }
+
+    #[test]
+    fn enrollment_text_discloses_payload_contents() {
+        let mut input = std::io::Cursor::new(b"no\n".as_slice());
+        let mut output = Vec::new();
+
+        assert!(!org_logging_enrollment_choice_with_io(&mut input, &mut output).unwrap());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Full model requests, including file contents"));
+        assert!(output.contains("Redaction is best-effort"));
     }
 
     #[test]

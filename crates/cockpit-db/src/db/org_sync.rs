@@ -147,6 +147,21 @@ impl Db {
         .await
     }
 
+    pub async fn set_org_sync_enrolled(&self, server_url: &str, org_id: &str) -> Result<()> {
+        let now = now_ms();
+        let server_url = server_url.to_owned();
+        let org_id = org_id.to_owned();
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE sync_state SET enabled = 1, updated_at_ms = ?3 WHERE server_url = ?1 AND org_id = ?2",
+                params![server_url, org_id, now],
+            )
+            .context("recording org sync enrollment")?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn mark_org_sync_disabled(&self, server_url: &str) -> Result<()> {
         let updated_at_ms = now_ms();
         let server_url = server_url.to_owned();

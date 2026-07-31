@@ -261,23 +261,9 @@ Cost columns stay `—` until this file exists. It is a JSON object keyed by mod
 running daemon when you need the exact version. This is useful when two shells
 appear to see different trust or session state.
 
-### Development schema resets
+### Database migration recovery
 
-Before the first public release, the SQLite schema is deliberately squashed
-into `0001_initial.sql`. A binary refuses to open a development database made
-from an older amendment instead of silently running against missing tables or
-columns. Preserve the old data by moving the database and its WAL sidecars
-aside, then restart Cockpit to create the current schema:
-
-```sh
-cockpit_data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/cockpit"
-mkdir -p "$cockpit_data_dir/pre-schema-reset"
-mv "$cockpit_data_dir"/cockpit.db* "$cockpit_data_dir/pre-schema-reset"/
-```
-
-Run `cockpit daemon status --json` first if you use a non-default data layout;
-move the exact `database_path` it reports and the adjacent `-wal` / `-shm`
-files. This is a pre-release development reset, not a production migration.
+Cockpit creates a private, timestamped backup beside the SQLite database before applying a pending migration and retains the three newest backups. If it detects a database from the pre-0.1.0 squashed-schema format, it automatically moves that database and its WAL/SHM sidecars aside, recreates a fresh database, and reports the moved path. No interactive action is required.
 
 ## Providers
 

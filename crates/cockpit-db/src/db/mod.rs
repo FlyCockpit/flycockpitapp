@@ -80,13 +80,14 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const MIGRATION_BACKUP_LIMIT: usize = 3;
 
 thread_local! {
     static OPEN_DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -313,6 +314,7 @@ impl Db {
     /// Open a database at an arbitrary path.
     pub fn open(path: &Path) -> Result<Self> {
         let mut timer = files::PhaseTimer::start("Db::open");
+        let existed_before_open = path.exists();
         files::ensure_parent_dir_private(path)
             .with_context(|| format!("securing parent of {}", path.display()))?;
         files::create_private_file_if_missing(path)?;
@@ -321,6 +323,33 @@ impl Db {
         apply_connection_pragmas(&conn, true)
             .with_context(|| format!("setting pragmas on {}", path.display()))?;
         repair_db_file_permissions(path);
+        // Remove in 0.2.0: carries only pre-0.1.0 databases whose old squash used user_version > 1.
+        if sqlite_schema_version(&conn)? > MIGRATIONS.len() as i64
+            && current_schema_version(&conn)? <= 1
+        {
+            drop(conn);
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let moved = path.with_extension(format!("pre-0.1.0-{stamp}.sqlite"));
+            std::fs::rename(path, &moved)
+                .with_context(|| format!("moving obsolete database to {}", moved.display()))?;
+            for suffix in ["-wal", "-shm"] {
+                let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
+                if sidecar.exists() {
+                    let _ = std::fs::rename(
+                        &sidecar,
+                        PathBuf::from(format!("{}{}", moved.display(), suffix)),
+                    );
+                }
+            }
+            tracing::warn!(old_path = %moved.display(), "recreated obsolete database automatically");
+            return Self::open(path);
+        }
+        if existed_before_open {
+            backup_before_pending_migration(&conn, path, MIGRATIONS.len())?;
+        }
         timer.phase("connect_and_pragmas");
         migrate(&conn)?;
         timer.phase("migrate");
@@ -710,6 +739,58 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
 /// is the version number.
 const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_initial.sql")];
 
+fn backup_before_pending_migration(
+    conn: &Connection,
+    path: &Path,
+    migration_count: usize,
+) -> Result<()> {
+    if current_schema_version(conn)? >= migration_count as i64 {
+        return Ok(());
+    }
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .context("checkpointing database before migration backup")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let backup = path.with_extension(format!("backup-{stamp}.sqlite"));
+    std::fs::copy(path, &backup).with_context(|| {
+        format!(
+            "backing up {} before migration to {}",
+            path.display(),
+            backup.display()
+        )
+    })?;
+    files::repair_private_file(&backup, "database backup")?;
+    prune_migration_backups(path)?;
+    Ok(())
+}
+
+fn prune_migration_backups(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let prefix = format!(
+        "{}{}",
+        path.file_stem().unwrap_or_default().to_string_lossy(),
+        ".backup-"
+    );
+    let mut backups = std::fs::read_dir(parent)?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .collect::<Vec<_>>();
+    backups.sort();
+    for stale in backups.into_iter().rev().skip(MIGRATION_BACKUP_LIMIT) {
+        std::fs::remove_file(stale)?;
+    }
+    Ok(())
+}
+
 fn migrate(conn: &Connection) -> Result<()> {
     migrate_with(conn, MIGRATIONS)
 }
@@ -939,6 +1020,122 @@ mod tests {
             .unwrap();
         assert_eq!(ledger.0, "0001_initial.sql");
         assert!(!ledger.1.is_empty());
+    }
+
+    #[test]
+    fn pending_migration_writes_backup_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let conn = Connection::open(&path).unwrap();
+        migrate_with(
+            &conn,
+            &["CREATE TABLE first_backup_probe (id INTEGER PRIMARY KEY);"],
+        )
+        .unwrap();
+        backup_before_pending_migration(&conn, &path, 2).unwrap();
+        let backup = std::fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "sqlite")
+            })
+            .unwrap();
+        let copied = Connection::open(backup).unwrap();
+        assert_eq!(current_schema_version(&copied).unwrap(), 1);
+    }
+
+    #[test]
+    fn open_without_pending_migration_writes_no_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let _db = Db::open(&path).unwrap();
+        assert!(
+            !std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "sqlite"))
+        );
+    }
+
+    #[test]
+    fn pre_reset_database_is_recreated_and_old_path_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 9_i64).unwrap();
+        drop(conn);
+        let db = Db::open(&path).unwrap();
+        drop(db);
+        assert!(
+            temp.path()
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains("pre-0.1.0"))
+        );
+    }
+
+    #[test]
+    fn backup_failure_aborts_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(
+            &conn,
+            &["CREATE TABLE backup_failure_probe (id INTEGER PRIMARY KEY);"],
+        )
+        .unwrap();
+        let missing = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("missing/cockpit.db");
+        assert!(
+            backup_before_pending_migration(&conn, &missing, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("backing up")
+        );
+    }
+
+    #[test]
+    fn backups_are_pruned_to_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        for index in 0..5 {
+            std::fs::write(
+                temp.path().join(format!("cockpit.backup-{index}.sqlite")),
+                b"backup",
+            )
+            .unwrap();
+        }
+        prune_migration_backups(&path).unwrap();
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".backup-"))
+                .count(),
+            MIGRATION_BACKUP_LIMIT
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_permissions_match_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        std::fs::write(&path, b"db").unwrap();
+        let backup = temp.path().join("cockpit.backup-1.sqlite");
+        std::fs::copy(&path, &backup).unwrap();
+        files::repair_private_file(&backup, "database backup").unwrap();
+        assert_eq!(
+            std::fs::metadata(backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

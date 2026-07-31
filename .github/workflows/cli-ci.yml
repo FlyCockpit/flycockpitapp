@@ -27,6 +27,9 @@ concurrency:
   group: cli-ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

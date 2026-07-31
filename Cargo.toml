@@ -126,3 +126,6 @@ opt-level = 1
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[profile.dist]
+inherits = "release"

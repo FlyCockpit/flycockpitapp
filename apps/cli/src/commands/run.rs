@@ -48,6 +48,23 @@ struct RunUsageError(String);
 #[error("{0}")]
 struct RunTurnFailure(String);
 
+async fn emit_org_logging_indicator(db: &crate::db::Db) {
+    let Some(credential) = crate::auth::flycockpit::maybe_load_credential() else {
+        return;
+    };
+    match db
+        .org_sync_disclosure_for_server(&credential.server_url)
+        .await
+    {
+        Ok(Some(disclosure)) => eprintln!(
+            "Organization logging is active for {}: session content may be uploaded.",
+            disclosure.org_id
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(error = %error, "reading organization logging disclosure"),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RunPumpOptions<'a> {
     pub(crate) verbose_json: bool,
@@ -81,6 +98,7 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
         Ok(db) => db,
         Err(error) => exit_run_error(format, 2, "configuration", &format!("{error:#}")),
     };
+    emit_org_logging_indicator(&db).await;
     if let Err(error) =
         crate::config::trust::enforce_noninteractive_workspace_trust(&db, &cwd).await
     {

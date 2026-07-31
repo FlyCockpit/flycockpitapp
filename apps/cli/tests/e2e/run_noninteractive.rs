@@ -158,6 +158,57 @@ async fn ephemeral_flag_combinations_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn org_logging_indicator_does_not_corrupt_ndjson() {
+    let provider = repeating_text_provider("run dispatched").await;
+    let home = IsolatedHome::new();
+    home.write_local_provider_config(&provider.base_url());
+    home.trust_project();
+
+    let credential = cockpit_core::auth::flycockpit::StoredFlycockpitCredential {
+        server_url: "https://app.example.test".to_string(),
+        instance_id: "instance-1".to_string(),
+        instance_token: "fci_test_token".to_string(),
+        account: cockpit_core::auth::flycockpit::AccountInfo {
+            user_id: "user-1".to_string(),
+            email: "user.test".to_string(),
+        },
+        display_name: None,
+        relay_choice: None,
+    };
+    let mut store =
+        cockpit_core::credentials::CredentialStore::open(home.credentials_path()).unwrap();
+    store.set(
+        cockpit_core::auth::flycockpit::CREDENTIAL_KEY,
+        serde_json::to_value(credential).unwrap(),
+    );
+    store.save().unwrap();
+    let db = cockpit_db::Db::open(&home.db_path()).unwrap();
+    db.upsert_org_sync_policy(
+        "https://app.example.test",
+        "org-1",
+        Some("v1"),
+        &serde_json::json!({}),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let mut command = home.cockpit();
+    command.args(["--no-sandbox", "run", "--ephemeral", "--json", "message"]);
+    let output = spawn_run(command);
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Organization logging is active for org-1")
+    );
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|error| panic!("stdout must remain NDJSON: {error}; line={line}"));
+        assert!(value.is_object());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inference_failure_is_loud() {
     // Keep the provider alive for the spawned run processes; dropping it closes the listener.
     let provider = run_provider(vec![inference_failure_turn(), inference_failure_turn()]).await;

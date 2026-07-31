@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_remote_suppresses_upload_despite_mandatory_policy() {
+    async fn no_remote_blocks_enrollment() {
         let db = Db::open_in_memory().unwrap();
         insert_event(&db, SessionEventKind::UserMessage, "must remain local").await;
         let (server, requests) =
@@ -745,6 +745,35 @@ mod tests {
                 .iter()
                 .any(|request| request.starts_with("POST "))
         );
+    }
+
+    #[tokio::test]
+    async fn enrollment_persists_across_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let db = Db::open(&path).unwrap();
+        db.upsert_org_sync_policy(
+            "https://app.example.test",
+            "org-1",
+            Some("v1"),
+            &json!({}),
+            false,
+        )
+        .await
+        .unwrap();
+        db.set_org_sync_enrolled("https://app.example.test", "org-1")
+            .await
+            .unwrap();
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        let state = reopened
+            .org_sync_state("https://app.example.test", "org-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.enabled);
+        assert_eq!(state.policy_version.as_deref(), Some("v1"));
     }
 
     #[tokio::test]

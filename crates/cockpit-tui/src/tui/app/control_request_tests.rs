@@ -4,8 +4,11 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{App, ControlApplied};
-use crate::tui::agent_runner::{AgentRunner, ClientTasks, ControlRequest, UsageCounts};
+use crate::tui::agent_runner::{
+    AgentRunner, ClientTasks, ControlRequest, UsageCounts, control_response_outcome,
+};
 use crate::tui::history::HistoryEntry;
+use cockpit_core::config::extended::ApprovalMode;
 use cockpit_core::daemon::proto::{Request, Response};
 use cockpit_core::engine::message::UserSubmission;
 use cockpit_core::engine::{
@@ -206,6 +209,46 @@ async fn control_request_ack_reports_applied() {
         vec!["Switched primary agent to `Plan`"]
     );
     assert!(app.pending_control_requests.is_empty());
+}
+
+#[test]
+fn control_response_outcome_table() {
+    let successful = [
+        Response::Ack,
+        Response::RedactionState {
+            scan_environment: true,
+            scan_dotenv: false,
+            scan_ssh_keys: true,
+        },
+        Response::PreflightState { enabled: true },
+        Response::LongcacheState { enabled: true },
+        Response::ApprovalModeState {
+            mode: ApprovalMode::Auto,
+        },
+        Response::DelegationRecursionState {
+            enabled: true,
+            default_depth: 3,
+        },
+        Response::CaffeinateState {
+            active: true,
+            lid_close_guaranteed: false,
+            message: "active".to_string(),
+        },
+    ];
+    for response in successful {
+        assert!(matches!(
+            control_response_outcome(Ok(response)),
+            ControlRequestOutcome::Applied
+        ));
+    }
+    assert!(matches!(
+        control_response_outcome(Ok(Response::Unknown)),
+        ControlRequestOutcome::Rejected(message) if message.contains("Unknown")
+    ));
+    assert!(matches!(
+        control_response_outcome(Err("daemon error".to_string())),
+        ControlRequestOutcome::Rejected(message) if message == "daemon error"
+    ));
 }
 
 #[tokio::test]

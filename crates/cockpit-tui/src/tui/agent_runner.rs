@@ -1307,11 +1307,7 @@ pub fn send_control_request(
                 let event_notify = event_notify.clone();
                 handle.spawn(async move {
                     let outcome = match response_rx.await {
-                        Ok(Ok(Response::Ack)) => ControlRequestOutcome::Applied,
-                        Ok(Ok(other)) => ControlRequestOutcome::Rejected(format!(
-                            "unexpected daemon response: {other:?}"
-                        )),
-                        Ok(Err(error)) => ControlRequestOutcome::Rejected(error),
+                        Ok(result) => control_response_outcome(result),
                         Err(_) => ControlRequestOutcome::NotDelivered(
                             ControlRequestNotDelivered::RunnerTeardown,
                         ),
@@ -1334,6 +1330,16 @@ pub fn send_control_request(
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
             Err(ControlRequestNotDelivered::ChannelClosed)
         }
+    }
+}
+
+pub(crate) fn control_response_outcome(result: Result<Response, String>) -> ControlRequestOutcome {
+    match result {
+        Ok(Response::Unknown) => {
+            ControlRequestOutcome::Rejected("unexpected daemon response: Unknown".to_string())
+        }
+        Ok(_) => ControlRequestOutcome::Applied,
+        Err(error) => ControlRequestOutcome::Rejected(error),
     }
 }
 

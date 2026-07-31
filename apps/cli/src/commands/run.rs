@@ -1779,6 +1779,33 @@ mod tests {
     }
 
     #[test]
+    fn default_handler_surfaces_generic_notice_on_stderr() {
+        let session_id = Uuid::new_v4();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut outcome = RunOutcome::new(false);
+        let action = handle_run_event(
+            session_id,
+            &proto::Event::Notice {
+                session_id,
+                text: "Firecrawl request leaves this machine".into(),
+            },
+            OutputFormat::Default,
+            false,
+            false,
+            &mut stdout,
+            &mut stderr,
+            &mut outcome,
+        );
+        assert_eq!(action, RunEventAction::Continue);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "[notice: Firecrawl request leaves this machine]\n"
+        );
+    }
+
+    #[test]
     fn default_handler_surfaces_drained_tool_error() {
         let session_id = Uuid::new_v4();
         let mut out = Vec::new();

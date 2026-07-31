@@ -28,10 +28,11 @@ impl HttpClient {
         headers: BTreeMap<String, String>,
         timeouts: McpTimeouts,
     ) -> Result<Self> {
+        let endpoint = endpoint.into();
         Ok(Self {
-            endpoint: endpoint.into(),
+            http: crate::mcp::transport::timeout::client(timeouts, &endpoint)?,
+            endpoint,
             headers,
-            http: crate::mcp::transport::timeout::client(timeouts)?,
             next_id: 1,
         })
     }

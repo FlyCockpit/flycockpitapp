@@ -40,10 +40,11 @@ impl SseClient {
         headers: BTreeMap<String, String>,
         timeouts: McpTimeouts,
     ) -> Result<Self> {
+        let endpoint = endpoint.into();
         Ok(Self {
-            endpoint: endpoint.into(),
+            http: crate::mcp::transport::timeout::client(timeouts, &endpoint)?,
+            endpoint,
             headers,
-            http: crate::mcp::transport::timeout::client(timeouts)?,
             timeouts,
             next_id: 1,
             post_url: None,
@@ -85,7 +86,7 @@ impl SseClient {
                 if let Some((event, data)) = parse_sse_frame(&frame)?
                     && event.as_deref() == Some("endpoint")
                 {
-                    post_url = Some(absolutize(&self.endpoint, &data));
+                    post_url = Some(absolutize(&self.endpoint, &data)?);
                     break 'outer;
                 }
             }
@@ -220,23 +221,17 @@ pub(crate) fn parse_sse_frame(
     Ok(Some((event, data)))
 }
 
-/// Resolve a possibly-relative `endpoint` event URL against the SSE base.
-fn absolutize(base: &str, target: &str) -> String {
-    if target.starts_with("http://") || target.starts_with("https://") {
-        return target.to_string();
+/// Resolve an SSE endpoint event only when it stays on the SSE origin.
+fn absolutize(base: &str, target: &str) -> Result<String> {
+    let base = crate::mcp::transport::timeout::validate_remote_endpoint(base)?;
+    let resolved = base
+        .join(target)
+        .or_else(|_| reqwest::Url::parse(target))
+        .with_context(|| format!("invalid MCP SSE endpoint `{target}`"))?;
+    if !crate::mcp::transport::timeout::same_origin(&base, &resolved) {
+        bail!("refusing MCP SSE endpoint on different origin or scheme: {resolved}");
     }
-    // Relative path: take scheme+host from base.
-    if let Some(scheme_end) = base.find("://") {
-        let after = &base[scheme_end + 3..];
-        if let Some(slash) = after.find('/') {
-            let origin = &base[..scheme_end + 3 + slash];
-            if target.starts_with('/') {
-                return format!("{origin}{target}");
-            }
-            return format!("{origin}/{target}");
-        }
-    }
-    target.to_string()
+    Ok(resolved.to_string())
 }
 
 #[async_trait]
@@ -297,12 +292,10 @@ mod tests {
     #[test]
     fn absolutizes_relative_endpoint() {
         assert_eq!(
-            absolutize("https://h.example.com/sse", "/messages?s=1"),
+            absolutize("https://h.example.com/sse", "/messages?s=1").unwrap(),
             "https://h.example.com/messages?s=1"
         );
-        assert_eq!(
-            absolutize("https://h.example.com/sse", "https://other/x"),
-            "https://other/x"
-        );
+        let err = absolutize("https://h.example.com/sse", "https://other/x").unwrap_err();
+        assert!(err.to_string().contains("https://other/x"));
     }
 }

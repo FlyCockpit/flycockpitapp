@@ -618,7 +618,11 @@ fn invoked_as_jq() -> bool {
 }
 
 fn error_exit_code(err: &anyhow::Error) -> u8 {
-    if err.is::<commands::RemovedCommandError>() {
+    if err.is::<commands::doctor::DoctorCouldNotRun>() {
+        2
+    } else if err.is::<commands::doctor::DoctorChecksFailed>() {
+        1
+    } else if err.is::<commands::RemovedCommandError>() {
         commands::REMOVED_COMMAND_EXIT_CODE
     } else if err.is::<commands::CommandUsageError>() {
         commands::USAGE_EXIT_CODE

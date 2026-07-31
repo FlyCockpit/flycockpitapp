@@ -386,6 +386,13 @@ cockpit debug config
 cockpit debug context
 ```
 
+`cockpit doctor` is a pass/fail health check. It reports the database path,
+openability, schema/migration state, database size and retention policy, the
+effective default agent, provider credential availability, and daemon status.
+It never starts a daemon; missing or incompatible daemon state is reported as a
+finding. Its output is safe to paste into issue reports: credential values are
+never printed.
+
 ## Security Model
 
 Cockpit is built around explicit trust and scoped execution:

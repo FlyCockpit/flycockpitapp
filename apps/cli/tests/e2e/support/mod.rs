@@ -104,7 +104,10 @@ impl IsolatedHome {
   "auth": "none",
   "wire_api": "completions",
   "allow_insecure_http": true,
-  "models": [{{"id": "scripted", "manual": true}}]
+  "models": [
+    {{"id": "scripted", "manual": true, "can_delegate": false, "subagent_invokable": true}},
+    {{"id": "fallback", "manual": true, "subagent_invokable": true}}
+  ]
 }}"#,
                 base_url
             ),

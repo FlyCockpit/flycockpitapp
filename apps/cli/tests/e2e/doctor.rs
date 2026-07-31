@@ -1,0 +1,143 @@
+use crate::support::{IsolatedHome, SpawnedDaemon, output_text};
+
+#[test]
+fn reports_unopenable_database() {
+    let mut home = IsolatedHome::new();
+    home.set_env("XDG_DATA_HOME", "/dev/null");
+
+    let output = home
+        .cockpit()
+        .args(["doctor", "--offline"])
+        .output()
+        .unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("database:"), "{text}");
+    assert!(text.contains("openability: FAILED"), "{text}");
+    assert!(text.contains("schema: unavailable"), "{text}");
+}
+
+#[test]
+fn reports_schema_version_mismatch() {
+    let home = IsolatedHome::new();
+    let first = home
+        .cockpit()
+        .args(["doctor", "--offline"])
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(1), "{}", output_text(&first));
+
+    let conn = rusqlite::Connection::open(home.db_path()).unwrap();
+    conn.execute_batch("PRAGMA user_version = 0;").unwrap();
+    drop(conn);
+
+    let output = home
+        .cockpit()
+        .args(["doctor", "--offline"])
+        .output()
+        .unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("openability: ok (SQLite opened"), "{text}");
+    assert!(text.contains("schema: FAILED"), "{text}");
+    assert!(text.contains("database schema version mismatch"), "{text}");
+}
+
+#[test]
+fn reports_daemon_status_without_starting_it() {
+    let home = IsolatedHome::new();
+    assert!(!home.socket_path().exists());
+    assert!(!home.pid_file().exists());
+
+    let output = home
+        .cockpit()
+        .args(["doctor", "--offline"])
+        .output()
+        .unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("daemon:"), "{text}");
+    assert!(text.contains("doctor did not start it"), "{text}");
+    assert!(
+        !home.socket_path().exists(),
+        "doctor must not start a daemon"
+    );
+    assert!(!home.pid_file().exists(), "doctor must not start a daemon");
+}
+
+#[test]
+fn no_providers_exits_one() {
+    let home = IsolatedHome::new();
+    let output = home
+        .cockpit()
+        .args(["doctor", "--offline"])
+        .output()
+        .unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("no providers configured"), "{text}");
+}
+
+#[test]
+fn output_is_secret_free() {
+    let home = IsolatedHome::new();
+    let config = home.config_dir();
+    std::fs::create_dir_all(config.join("providers")).unwrap();
+    std::fs::write(config.join("config.json"), "{}").unwrap();
+    std::fs::write(
+        config.join("providers/diagnostic.json"),
+        r#"{"url":"https://provider.example/v1","headers":[{"name":"authorization","value":"Bearer doctor-secret-value-12345"}]}"#,
+    )
+    .unwrap();
+
+    let output = home
+        .cockpit()
+        .args(["doctor", "--offline"])
+        .output()
+        .unwrap();
+    let text = output_text(&output);
+    assert!(
+        text.contains("diagnostic credentials: ok (literal header)"),
+        "{text}"
+    );
+    assert!(!text.contains("doctor-secret-value-12345"), "{text}");
+}
+
+#[tokio::test]
+async fn exit_codes() {
+    let clean_home = IsolatedHome::new();
+    clean_home.write_local_provider_config("http://127.0.0.1:9/v1");
+    let daemon = SpawnedDaemon::start_with_home(clean_home).await;
+    let clean = daemon
+        .command()
+        .args(["doctor", "--offline"])
+        .output()
+        .unwrap();
+    assert_eq!(clean.status.code(), Some(0), "{}", output_text(&clean));
+
+    let problem = IsolatedHome::new()
+        .cockpit()
+        .args(["doctor", "--offline"])
+        .output()
+        .unwrap();
+    assert_eq!(problem.status.code(), Some(1), "{}", output_text(&problem));
+
+    let mut unable_home = IsolatedHome::new();
+    unable_home.set_env("COCKPIT_TEST_DOCTOR_FORCE_FAILURE", "1");
+    let unable = unable_home
+        .cockpit()
+        .args(["doctor", "--offline"])
+        .output()
+        .unwrap();
+    let text = output_text(&unable);
+    assert_eq!(unable.status.code(), Some(2), "{text}");
+    assert!(text.contains("doctor itself could not run"), "{text}");
+    assert!(
+        !unable_home.socket_path().exists(),
+        "an execution failure must not start a daemon"
+    );
+    assert!(
+        !unable_home.pid_file().exists(),
+        "an execution failure must not create a daemon pid file"
+    );
+}

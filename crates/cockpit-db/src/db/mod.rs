@@ -392,6 +392,13 @@ impl Db {
         self.read(sqlite_schema_version).await
     }
 
+    /// Return the latest migration recorded by the legacy squashed-schema
+    /// runner. This remains useful to read-only diagnostics until the
+    /// checksum-backed migration ledger replaces `schema_version`.
+    pub async fn applied_migration_version(&self) -> Result<i64> {
+        self.read(current_schema_version).await
+    }
+
     pub async fn read<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,

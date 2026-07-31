@@ -30,6 +30,8 @@ pub struct DiagnosticsSnapshot {
     pub container_harness: String,
     pub container_available: String,
     pub approval_mode: String,
+    pub database: Vec<String>,
+    pub daemon: Vec<String>,
     pub providers: Vec<String>,
     pub git: Vec<String>,
     pub network: Vec<String>,
@@ -43,19 +45,34 @@ pub async fn cli_snapshot(
     no_sandbox: bool,
     offline: bool,
 ) -> Result<DiagnosticsSnapshot> {
-    let launch = crate::welcome::load(path, false);
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("COCKPIT_TEST_DOCTOR_FORCE_FAILURE").is_some() {
+        anyhow::bail!("doctor snapshot forced to fail by test support");
+    }
+
+    let launch = crate::welcome::load_bundle_bootstrap(path, false);
+    let extended = launch.extended;
     let mut snapshot = build_snapshot(DiagnosticsInput {
-        cwd: launch.cwd,
+        cwd: launch.launch.cwd,
         session_id: None,
         session_short_id: None,
-        active_agent: launch.agent_name,
-        active_model: launch.active_model,
+        // A fresh daemon session resolves its root primary through the LLM
+        // mode, which makes the default Defensive mode start as Careful
+        // rather than the narrower `default_primary_agent` config value.
+        active_agent: effective_default_agent(&extended),
+        active_model: launch.launch.active_model,
         sandbox_enabled: Some(!no_sandbox),
     })?;
-    let providers = crate::secret_ref::load_effective(Path::new(&snapshot.cwd));
+    let providers = crate::config::providers::ConfigDoc::load_effective(Path::new(&snapshot.cwd));
     let (network, network_failed) = provider_network_lines(&providers, offline).await;
     snapshot.network = network;
     snapshot.has_failures |= network_failed;
+    let (database, database_failed) = database_lines(&extended).await;
+    snapshot.database = database;
+    snapshot.has_failures |= database_failed;
+    let (daemon, daemon_failed) = daemon_lines().await;
+    snapshot.daemon = daemon;
+    snapshot.has_failures |= daemon_failed;
     Ok(snapshot)
 }
 
@@ -83,6 +100,8 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
         ],
     );
     out.push_str(&format!("approval: {}\n", snapshot.approval_mode));
+    push_section(&mut out, "database", &snapshot.database);
+    push_section(&mut out, "daemon", &snapshot.daemon);
     push_section(&mut out, "providers", &snapshot.providers);
     push_section(&mut out, concat!("net", "work"), &snapshot.network);
     push_section(&mut out, "git", &snapshot.git);
@@ -92,8 +111,8 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
 }
 
 fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
-    let trust_root = crate::config::trust::resolve_trust_root(&input.cwd)?;
-    let providers = crate::secret_ref::load_effective(&input.cwd);
+    let trust_root = crate::config::trust::resolve_trust_root(&input.cwd).ok();
+    let providers = crate::config::providers::ConfigDoc::load_effective(&input.cwd);
     let extended = crate::config::extended::load_for_cwd(&input.cwd);
     let harnesses = crate::config::extended::resolve_harnesses(&input.cwd);
     let trust_mode = workspace_trust_mode(&input.cwd);
@@ -115,12 +134,22 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
             .map(|(p, m)| format!("{p}/{m}"))
             .unwrap_or_else(|| "none".to_string()),
         cwd: input.cwd.display().to_string(),
-        project_root: trust_root.root.display().to_string(),
-        workspace_trust: format!(
-            "{trust_mode} ({}: {})",
-            trust_root.kind.as_str(),
-            trust_root.root.display()
-        ),
+        project_root: trust_root
+            .as_ref()
+            .map(|root| root.root.display().to_string())
+            .unwrap_or_else(|| input.cwd.display().to_string()),
+        workspace_trust: trust_root
+            .as_ref()
+            .map(|root| {
+                format!(
+                    "{trust_mode} ({}: {})",
+                    root.kind.as_str(),
+                    root.root.display()
+                )
+            })
+            .unwrap_or_else(|| {
+                "unresolved (workspace trust root could not be resolved)".to_string()
+            }),
         sandbox: input
             .sandbox_enabled
             .map(|enabled| if enabled { "on" } else { "off" }.to_string())
@@ -136,6 +165,8 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
             format!("false ({container_reason})")
         },
         approval_mode: extended.default_approval_mode.as_str().to_string(),
+        database: Vec::new(),
+        daemon: Vec::new(),
         providers,
         git: git_lines(&input.cwd),
         network: Vec::new(),
@@ -148,6 +179,158 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
         ),
         has_failures: provider_failures,
     })
+}
+
+fn effective_default_agent(extended: &crate::config::extended::ExtendedConfig) -> String {
+    crate::daemon::session_worker::initial_active_agent_for_llm_mode(extended, extended.llm_mode)
+}
+
+async fn database_lines(extended: &crate::config::extended::ExtendedConfig) -> (Vec<String>, bool) {
+    let path = match crate::db::Db::default_path() {
+        Ok(path) => path,
+        Err(error) => {
+            return (
+                vec![format!(
+                    "path: unavailable ({})",
+                    one_line(&format!("{error:#}"))
+                )],
+                true,
+            );
+        }
+    };
+    let mut lines = vec![format!("path: {}", path.display())];
+    match crate::db::Db::open_default() {
+        Ok(db) => {
+            lines.push("openability: ok".to_string());
+            match (
+                db.schema_version().await,
+                db.applied_migration_version().await,
+            ) {
+                (Ok(schema), Ok(migration)) => {
+                    lines.push(format!(
+                        "schema: ok (actual {schema}, expected {})",
+                        crate::db::EXPECTED_SCHEMA_VERSION
+                    ));
+                    lines.push(format!(
+                        "ledger: legacy schema_version migration {migration}; checksums unavailable (squashed-schema runner)"
+                    ));
+                }
+                (schema, migration) => {
+                    let error = schema
+                        .err()
+                        .or(migration.err())
+                        .expect("one database read failed");
+                    lines.push(format!("schema: FAILED ({})", one_line(&error.to_string())));
+                    return (lines, true);
+                }
+            }
+            match std::fs::metadata(&path) {
+                Ok(metadata) => lines.push(format!("size: {} bytes", metadata.len())),
+                Err(error) => lines.push(format!(
+                    "size: unavailable ({})",
+                    one_line(&error.to_string())
+                )),
+            }
+            lines.push(retention_line(&extended.retention));
+            (lines, false)
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            if message.contains("database schema version mismatch") {
+                lines.push(
+                    "openability: ok (SQLite opened, but Cockpit rejected its schema)".to_string(),
+                );
+                lines.push(format!("schema: FAILED ({})", one_line(&message)));
+            } else {
+                lines.push(format!("openability: FAILED ({})", one_line(&message)));
+                lines.push(
+                    "schema: unavailable because the database could not be opened".to_string(),
+                );
+            }
+            lines.push(retention_line(&extended.retention));
+            (lines, true)
+        }
+    }
+}
+
+fn retention_line(retention: &crate::db::retention::RetentionConfig) -> String {
+    let sessions = if retention.session_window_days == 0 {
+        "disabled".to_string()
+    } else {
+        format!("{} days", retention.session_window_days)
+    };
+    let payloads = if retention.payload_window_days == 0 {
+        "disabled".to_string()
+    } else {
+        format!("{} days", retention.payload_window_days)
+    };
+    format!("retention: session pruning {sessions}; payload pruning {payloads}")
+}
+
+async fn daemon_lines() -> (Vec<String>, bool) {
+    let probe = crate::daemon::discover().await;
+    let socket = probe.paths.socket.display();
+    let pid_file = probe.paths.pid_file.display();
+    match probe.status {
+        crate::daemon::DaemonStatus::Running => {
+            let version = probe
+                .hello
+                .as_ref()
+                .map(|hello| {
+                    format!(
+                        " (daemon {}, protocol v{})",
+                        hello.daemon_version, hello.protocol_version
+                    )
+                })
+                .unwrap_or_default();
+            (
+                vec![
+                    format!("status: running{version}"),
+                    format!("socket: {socket}"),
+                    format!("pid file: {pid_file}"),
+                ],
+                false,
+            )
+        }
+        crate::daemon::DaemonStatus::IncompatibleProtocol => (
+            vec![
+                "status: FAILED (daemon protocol is incompatible; run `cockpit daemon restart`)"
+                    .to_string(),
+                format!("socket: {socket}"),
+            ],
+            true,
+        ),
+        crate::daemon::DaemonStatus::NotRunning => (
+            vec![
+                "status: FAILED (canonical daemon is not running; doctor did not start it)"
+                    .to_string(),
+                format!("socket: {socket}"),
+                format!("pid file: {pid_file}"),
+            ],
+            true,
+        ),
+        status => (
+            vec![
+                format!("status: FAILED ({})", daemon_status_label(status)),
+                format!("socket: {socket}"),
+                format!("pid file: {pid_file}"),
+            ],
+            true,
+        ),
+    }
+}
+
+fn daemon_status_label(status: crate::daemon::DaemonStatus) -> &'static str {
+    match status {
+        crate::daemon::DaemonStatus::Running => "running",
+        crate::daemon::DaemonStatus::IncompatibleProtocol => "incompatible protocol",
+        crate::daemon::DaemonStatus::LivePidSocketUnreachable => {
+            "live daemon pid but socket is unreachable"
+        }
+        crate::daemon::DaemonStatus::UnverifiedPid => "pid identity could not be verified",
+        crate::daemon::DaemonStatus::Stale => "stale daemon pid or socket",
+        crate::daemon::DaemonStatus::NotRunning => "not running",
+    }
 }
 
 fn push_section(out: &mut String, label: &str, lines: &[String]) {
@@ -1105,6 +1288,29 @@ mod tests {
         );
         assert!(!rendered.contains("sk-present-secret"), "{rendered}");
         assert!(!rendered.contains("sk-named-secret-value"), "{rendered}");
+    }
+
+    #[test]
+    fn reports_effective_default_agent() {
+        let extended = crate::config::extended::ExtendedConfig::default();
+        assert_eq!(effective_default_agent(&extended), "Careful");
+    }
+
+    #[test]
+    fn delegation_coverage_uses_effective_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extended = crate::config::extended::ExtendedConfig::default();
+        let effective = effective_default_agent(&extended);
+        let input = DiagnosticsInput {
+            active_agent: effective.clone(),
+            ..base_input(tmp.path())
+        };
+        assert_eq!(effective, "Careful");
+        assert!(delegation_enabled_for_coverage(
+            &ProvidersConfig::default(),
+            &extended,
+            &input
+        ));
     }
 
     async fn one_shot_server(status: &'static str, body: &'static str) -> String {

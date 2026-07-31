@@ -14,6 +14,8 @@ mod daemon_lifecycle_replay;
 #[cfg(unix)]
 mod daemon_state_freshness;
 mod debug;
+#[cfg(unix)]
+mod doctor;
 mod mangen;
 #[cfg(unix)]
 mod multi_client_queue;

@@ -218,6 +218,9 @@ pub struct WebConfig {
     pub provider: WebProvider,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firecrawl_base_url: Option<String>,
+    // Persisted only in the global user config after the first Firecrawl disclosure.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub firecrawl_notice_acknowledged: bool,
     #[serde(default, skip_serializing_if = "WebCustomConfig::is_default")]
     pub custom: WebCustomConfig,
 }
@@ -275,6 +278,7 @@ mod web_custom_tests {
         let blank = WebConfig {
             provider: WebProvider::Custom,
             firecrawl_base_url: None,
+            firecrawl_notice_acknowledged: false,
             custom: WebCustomConfig {
                 fetch_command: Some("   ".to_string()),
                 search_command: None,
@@ -285,6 +289,7 @@ mod web_custom_tests {
         let fetch = WebConfig {
             provider: WebProvider::Custom,
             firecrawl_base_url: None,
+            firecrawl_notice_acknowledged: false,
             custom: WebCustomConfig {
                 fetch_command: Some("curl https://example.com".to_string()),
                 search_command: None,
@@ -299,6 +304,7 @@ mod web_custom_tests {
         let search = WebConfig {
             provider: WebProvider::Custom,
             firecrawl_base_url: None,
+            firecrawl_notice_acknowledged: false,
             custom: WebCustomConfig {
                 fetch_command: None,
                 search_command: Some("search-cli".to_string()),

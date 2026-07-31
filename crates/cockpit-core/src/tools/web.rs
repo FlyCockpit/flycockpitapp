@@ -32,6 +32,80 @@ const MAX_RATE_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(10);
 const DEFAULT_SEARCH_LIMIT: usize = 5;
 const MAX_SEARCH_LIMIT: usize = 10;
 
+const FIRECRAWL_NOTICE_KEYLESS: &str = "Firecrawl web request: your query or URL leaves this machine. You are using Firecrawl’s keyless tier, which is attributed to your IP.";
+const FIRECRAWL_NOTICE_KEYED: &str = "Firecrawl web request: your query or URL leaves this machine. You are using a configured Firecrawl API key.";
+
+fn global_web_notice_config_path(cwd: &std::path::Path) -> Result<std::path::PathBuf> {
+    use crate::config::dirs::{
+        CONFIG_FILE, ConfigDirKind, creatable_config_dirs, discover_config_dirs,
+    };
+    if let Some(dir) = discover_config_dirs(cwd)
+        .into_iter()
+        .find(|dir| matches!(dir.kind, ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot))
+    {
+        return Ok(dir.path.join(CONFIG_FILE));
+    }
+    let dir = creatable_config_dirs().into_iter().next().ok_or_else(|| {
+        anyhow::anyhow!("no home directory to persist Firecrawl notice acknowledgement")
+    })?;
+    std::fs::create_dir_all(&dir.path)?;
+    Ok(dir.path.join(CONFIG_FILE))
+}
+
+fn firecrawl_notice_acknowledged(ctx: &ToolCtx) -> bool {
+    let Ok(path) = global_web_notice_config_path(&ctx.cwd) else {
+        return false;
+    };
+    crate::config::extended::ExtendedConfigDoc::load(&path)
+        .map(|doc| doc.config().web.firecrawl_notice_acknowledged)
+        .unwrap_or(false)
+}
+
+fn persist_firecrawl_notice_acknowledgement(ctx: &ToolCtx) {
+    let Ok(path) = global_web_notice_config_path(&ctx.cwd) else {
+        return;
+    };
+    let Ok(mut doc) = crate::config::extended::ExtendedConfigDoc::load(&path) else {
+        return;
+    };
+    let mut config = doc.config();
+    config.web.firecrawl_notice_acknowledged = true;
+    if let Err(error) = doc.write(&config) {
+        tracing::warn!(%error, "could not persist Firecrawl notice acknowledgement");
+    }
+}
+
+async fn emit_firecrawl_notice_if_first(selected: &SelectedBackend, ctx: &ToolCtx) {
+    static NOTICE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    if selected.kind != SelectedBackendKind::Firecrawl {
+        return;
+    }
+    let _guard = NOTICE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    if firecrawl_notice_acknowledged(ctx) {
+        return;
+    }
+    let text = if selected.has_api_key() {
+        FIRECRAWL_NOTICE_KEYED
+    } else {
+        FIRECRAWL_NOTICE_KEYLESS
+    };
+    let Some(events) = &ctx.events else {
+        return;
+    };
+    if events
+        .send(crate::engine::agent::TurnEvent::Notice {
+            text: text.to_string(),
+        })
+        .await
+        .is_ok()
+    {
+        persist_firecrawl_notice_acknowledgement(ctx);
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SearchResult {
     pub title: String,
@@ -268,6 +342,7 @@ impl Tool for WebSearchTool {
         let limit = search_limit(args.get("limit"));
         let cfg = ctx.config.extended();
         let selected = select_backend(&cfg.web, ctx);
+        emit_firecrawl_notice_if_first(&selected, ctx).await;
         let out = match selected.kind {
             SelectedBackendKind::Custom => {
                 return Err(invalid_input(
@@ -358,6 +433,7 @@ impl Tool for WebFetchTool {
         validate_http_url(url)?;
         let cfg = ctx.config.extended();
         let selected = select_backend(&cfg.web, ctx);
+        emit_firecrawl_notice_if_first(&selected, ctx).await;
         let out = match selected.kind {
             SelectedBackendKind::Custom => {
                 return Err(invalid_input(
@@ -1256,6 +1332,7 @@ mod tests {
         let tiny = WebConfig {
             provider: WebProvider::Tinyfish,
             firecrawl_base_url: None,
+            firecrawl_notice_acknowledged: false,
             custom: Default::default(),
         };
         let selected = select_backend_with(
@@ -1269,6 +1346,7 @@ mod tests {
         let custom = WebConfig {
             provider: WebProvider::Custom,
             firecrawl_base_url: None,
+            firecrawl_notice_acknowledged: false,
             custom: Default::default(),
         };
         assert_eq!(
@@ -1344,6 +1422,7 @@ mod tests {
         let cfg = WebConfig {
             provider: WebProvider::Firecrawl,
             firecrawl_base_url: Some("https://config.example".to_string()),
+            firecrawl_notice_acknowledged: false,
             custom: Default::default(),
         };
         assert_eq!(
@@ -1475,6 +1554,7 @@ mod tests {
         let cfg = WebConfig {
             provider: WebProvider::Tinyfish,
             firecrawl_base_url: None,
+            firecrawl_notice_acknowledged: false,
             custom: Default::default(),
         };
         let selected = select_backend_with(&cfg, |_| None, |_| None);

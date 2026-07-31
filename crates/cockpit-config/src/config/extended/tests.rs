@@ -124,6 +124,7 @@ fn fully_populated_config_json_round_trips_byte_identically() {
     cfg.web = WebConfig {
         provider: WebProvider::Tinyfish,
         firecrawl_base_url: Some("https://firecrawl.test".into()),
+        firecrawl_notice_acknowledged: false,
         custom: WebCustomConfig {
             fetch_command: Some("custom-fetch {url}".into()),
             search_command: Some("custom-search {query}".into()),

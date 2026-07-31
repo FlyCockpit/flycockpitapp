@@ -13,6 +13,34 @@ We aim to acknowledge reports within 72 hours.
 FlyCockpit ships from `main`. Only the latest code on `main` receives
 security fixes; if you self-host, pull updates regularly.
 
+## Cockpit CLI threat model
+
+The Rust CLI (`apps/cli`) is a local coding harness with a persistent daemon.
+Its security boundaries and limitations are deliberately explicit:
+
+- Credentials are plaintext JSON in `credentials.json` under the XDG state
+  directory (`$XDG_STATE_HOME/cockpit/`, normally `~/.local/state/cockpit/`).
+  Cockpit does not use an OS keyring. On Unix, the directory is kept at `0700`
+  and the file at `0600`; writes are atomic and opening the store repairs broad
+  permissions. Windows does not provide these Unix permission guarantees.
+- Agent-run shell commands receive the session environment. Unconfined commands
+  clear and reconstruct that environment, excluding explicit and name-matched
+  sensitive variables; this is a heuristic, not an isolation boundary. Confined
+  commands use the sandbox environment instead.
+- The shell sandbox confines filesystem access only. It does **not** confine
+  network access: sandboxed commands can still reach the internet. Confined
+  commands are not separately approval-prompted because the filesystem sandbox
+  is their execution boundary; unconfined execution follows the grant-or-ask
+  path.
+- There is no native Windows sandbox backend, so shell commands on Windows run
+  unconfined. The Windows PowerShell installer does not change that limitation.
+- On Unix, the daemon uses a `0600` socket under `$XDG_RUNTIME_DIR/cockpit/`
+  when available (otherwise its private state directory), rather than `/tmp`,
+  and validates the connecting peer's UID on every accepted connection.
+- Cockpit has no telemetry, analytics, crash-reporting service, or self-update
+  client. See the CLI [egress and local-storage disclosure](apps/cli/README.md#what-leaves-your-machine)
+  for what can leave the machine.
+
 ## Security controls shipped by default
 
 Defaults in this repository:

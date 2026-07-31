@@ -38,14 +38,28 @@ requests with unsigned commits will be asked to rebase.
 
 ## Development setup
 
-See [README.md](README.md) for local setup. Before opening a pull request,
-run the repository checks:
+See [README.md](README.md) for local setup. Before opening a pull request, run the checks that apply to the code you changed.
+
+For TypeScript and pnpm-workspace scopes, run:
 
 ```sh
 pnpm check:ci
 pnpm check-types
 pnpm test
 ```
+
+For Rust changes in `apps/cli`, `apps/relay-rs`, or `crates/*`, run the Rust
+gate from the repository root:
+
+```sh
+cargo fmt --check
+cargo nextest run --locked --workspace --test-threads=1
+cargo clippy --locked --tests -- -D warnings
+```
+
+Keep `--test-threads=1`: the workspace has daemon and filesystem tests that
+share process-level state, so parallel execution can produce intermittent
+failures unrelated to a contributor's change.
 
 Also read [AGENTS.md](AGENTS.md) — its safety and code-standard rules apply
 to human contributors as much as to coding agents. Never include secrets,

@@ -194,12 +194,12 @@ cockpit packages prune --dry-run
 | `cockpit import <file>` | Import a session export. |
 | `cockpit stats` | Show token and cost statistics. |
 | `cockpit debug paths` | Show resolved global paths for debugging. |
+| `cockpit debug config` | Print effective configuration with credentials redacted. |
+| `cockpit debug context` | Print bounded, redacted assembled diagnostic context. |
 | `cockpit config export-policy` | Export portable non-secret provider/model policy JSON. |
-| `cockpit meta [message]` | Invoke another local harness from Cockpit. |
 | `cockpit mcp list` | List configured MCP servers. |
 | `cockpit sync status` | Show session-log sync and remote-audit upload state. |
 | `cockpit connect status` | Show outbound relay connector status. |
-| `cockpit pr <number>` | Fetch and check out a GitHub PR, then launch Cockpit in the worktree. |
 | `cockpit packages add <id> --git <url>` | Register dependency package source for the docs agent. |
 | `cockpit kcl import` | Import packages from a local `kcl` registry. |
 | `cockpit init` | Explore the project and write an instructions file. |

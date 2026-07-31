@@ -10,10 +10,148 @@ use crate::session::project_id_for;
 pub async fn run(cmd: DebugCommand) -> Result<()> {
     match cmd {
         DebugCommand::FailedCalls(args) => failed_calls(args).await,
-        _ => anyhow::bail!(
-            "cockpit debug is not implemented yet (planned: config / paths / skill / agent / file / redact / context / wait)"
-        ),
+        DebugCommand::Paths => paths(),
+        DebugCommand::Config => config(),
+        DebugCommand::Context => context().await,
     }
+}
+
+fn cwd() -> Result<std::path::PathBuf> {
+    std::env::current_dir().map_err(Into::into)
+}
+
+fn exists(path: &std::path::Path) -> &'static str {
+    if path.exists() { "present" } else { "absent" }
+}
+
+fn paths() -> Result<()> {
+    let cwd = cwd()?;
+    let db = Db::default_path()?;
+    let daemon = crate::daemon::DaemonPaths::resolve_canonical()?;
+    let log = dirs::cache_dir()
+        .ok_or_else(|| anyhow::anyhow!("could not locate cache directory"))?
+        .join("cockpit/cockpit.log");
+    println!("database: {} ({})", db.display(), exists(&db));
+    println!("config directories (least to most specific):");
+    for path in config_dirs_in_precedence(&cwd) {
+        println!("  {} ({})", path.display(), exists(&path));
+    }
+    println!(
+        "daemon socket: {} ({})",
+        daemon.socket.display(),
+        exists(&daemon.socket)
+    );
+    println!("log: {} ({})", log.display(), exists(&log));
+    Ok(())
+}
+
+/// Show the locations Cockpit can load from, including locations that have
+/// not been created yet. `config_file_paths_for_load` intentionally excludes
+/// absent files, which is right for loading but unhelpful in a diagnostic.
+fn config_dirs_in_precedence(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os(crate::config::config::dirs::COCKPIT_CONFIG_ENV)
+        && !path.is_empty()
+    {
+        return vec![std::path::PathBuf::from(path)];
+    }
+
+    let mut paths: Vec<_> = crate::config::config::dirs::creatable_config_dirs()
+        .into_iter()
+        .map(|dir| dir.path)
+        .collect();
+    let cwd_scoped = crate::config::config::dirs::cwd_scoped_creatable_dirs(cwd);
+    if let Some(local) = cwd_scoped
+        .iter()
+        .find(|dir| dir.kind == crate::config::config::dirs::ConfigDirKind::MachineLocal)
+    {
+        paths.push(local.path.clone());
+    }
+
+    paths.extend(
+        crate::config::config::dirs::walk_up_to_stops(cwd)
+            .into_iter()
+            .rev()
+            .map(|dir| dir.join(".cockpit")),
+    );
+    paths
+}
+
+fn redact_config(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let header_value = map.contains_key("name") && map.contains_key("value");
+            for (key, value) in map {
+                let lower = key.to_ascii_lowercase();
+                if lower.contains("secret")
+                    || lower.contains("credential")
+                    || lower.contains("token")
+                    || lower.contains("api_key")
+                    || lower == "key"
+                    || lower == "auth"
+                    || (header_value && lower == "value")
+                {
+                    *value = serde_json::Value::String("[redacted]".into());
+                } else {
+                    redact_config(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => values.iter_mut().for_each(redact_config),
+        _ => {}
+    }
+}
+
+fn effective_config() -> Result<serde_json::Value> {
+    let cwd = cwd()?;
+    let mut value = serde_json::json!({
+        "providers": crate::config::config::providers::ConfigDoc::load_effective(&cwd),
+        "extended": crate::config::config::extended::load_for_cwd(&cwd),
+    });
+    redact_config(&mut value);
+    Ok(value)
+}
+
+fn config() -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(&effective_config()?)?);
+    Ok(())
+}
+
+const CONTEXT_OUTPUT_LIMIT: usize = 16 * 1024;
+
+async fn context() -> Result<()> {
+    let cwd = cwd()?;
+    let config = crate::config::config::extended::load_for_cwd(&cwd);
+    let env = crate::env_snapshot::EnvSnapshot::from_process(
+        crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
+    );
+    let redact =
+        crate::redact::RedactionTable::build_with_env_and_store(&config.redact, &cwd, env.vars())?;
+    let mut rendered = format!(
+        "System prompt:\n{}",
+        crate::engine::builtin::default_chat_system_prompt(&cwd, "")
+    );
+    if let Some((path, guidance)) = crate::engine::builtin::load_agent_guidance(&cwd) {
+        rendered.push_str("\n\nProject guidance (user-role prelude): ");
+        rendered.push_str(&path.display().to_string());
+        rendered.push('\n');
+        rendered.push_str(&guidance);
+    }
+    let output = truncate_for_debug(&redact.scrub(&rendered), CONTEXT_OUTPUT_LIMIT);
+    println!("assembled context (fresh-session baseline):\n{output}");
+    Ok(())
+}
+
+fn truncate_for_debug(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let cut = text
+        .char_indices()
+        .take_while(|(index, _)| *index < limit)
+        .map(|(index, ch)| index + ch.len_utf8())
+        .last()
+        .unwrap_or(0);
+    format!("{}\n[truncated at {limit} bytes]", &text[..cut])
 }
 
 /// `cockpit debug failed-calls` — see GOALS §12. Pulls recent rows where

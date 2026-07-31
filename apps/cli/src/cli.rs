@@ -1,7 +1,6 @@
 //! Clap definitions for the `cockpit` CLI surface.
 //!
-//! The shape mirrors opencode's CLI plus the `cockpit`-specific additions:
-//! `meta`, `connect`, and `--agent-file`.
+//! The shape defines FlyCockpit's command-line surface.
 
 use std::path::PathBuf;
 
@@ -147,9 +146,6 @@ pub enum Command {
     #[command(subcommand)]
     Config(ConfigCommand),
 
-    /// Invoke another local harness from Cockpit.
-    Meta(MetaArgs),
-
     /// Manage MCP servers: add, list, and smoke-test.
     #[command(subcommand)]
     Mcp(McpCommand),
@@ -172,9 +168,6 @@ pub enum Command {
 
     /// Toggle outbound relay access for remote control on this instance; requires `cockpit account login`.
     Connect(ConnectArgs),
-
-    /// Fetch and check out a GitHub PR, then launch cockpit in the worktree.
-    Pr(PrArgs),
 
     /// Manage the package registry the `docs` agent reads from.
     #[command(
@@ -923,25 +916,11 @@ pub enum DebugCommand {
     Config,
     /// Show the resolved global paths.
     Paths,
-    /// List all known projects.
-    Scrap,
-    /// List all available skills.
-    Skill,
-    /// Show details for a specific agent.
-    Agent { name: String },
-    /// File-system debugging utilities.
-    File,
-    /// Cockpit-specific: dump the redaction table that would apply to the
-    /// next request.
-    Redact,
-    /// Cockpit-specific: dump the full prompt (system + tools + history)
-    /// that would be sent for the next turn, with token counts.
+    /// Print the bounded, redacted fresh-session system and project-guidance context.
     Context,
     /// Cockpit-specific: list recent tool calls that hard-failed
     /// (and optionally those that fired any recovery).
     FailedCalls(FailedCallsArgs),
-    /// Wait indefinitely (for debugging).
-    Wait,
 }
 
 #[derive(Debug, clap::Args)]
@@ -970,17 +949,7 @@ pub struct FailedCallsArgs {
     pub json: bool,
 }
 
-// ---- meta / connect / pr / init ----
-
-#[derive(Debug, clap::Args)]
-pub struct MetaArgs {
-    /// Message to seed the meta-harness with. If absent, drop into the TUI.
-    pub message: Vec<String>,
-
-    /// Use a specific harness as the meta agent's executor (defaults to cockpit).
-    #[arg(long)]
-    pub harness: Option<String>,
-}
+// ---- connect / init ----
 
 // ---- packages / kcl import ----
 
@@ -1135,15 +1104,6 @@ pub enum ConnectCommand {
 }
 
 #[derive(Debug, clap::Args)]
-pub struct PrArgs {
-    pub number: u32,
-
-    /// Repo override (`owner/name`); defaults to the current repo.
-    #[arg(long)]
-    pub repo: Option<String>,
-}
-
-#[derive(Debug, clap::Args)]
 pub struct InitArgs {
     /// Target instructions file (defaults to the first configured
     /// `agent_guidance_files`, i.e. `AGENTS.md`).
@@ -1270,15 +1230,6 @@ mod tests {
         match cli.command {
             Some(Command::Run(args)) => assert_eq!(args.message, ["hi", "there"]),
             other => panic!("expected run command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn meta_message_varargs_do_not_compete_with_global_project() {
-        let cli = Cli::try_parse_from(["cockpit", "meta", "hi", "there"]).unwrap();
-        match cli.command {
-            Some(Command::Meta(args)) => assert_eq!(args.message, ["hi", "there"]),
-            other => panic!("expected meta command, got {other:?}"),
         }
     }
 
@@ -1536,16 +1487,11 @@ mod tests {
     }
 
     #[test]
-    fn run_and_meta_help_return_clap_help() {
+    fn run_help_returns_clap_help() {
         let run = Cli::command()
             .try_get_matches_from(["cockpit", "run", "--help"])
             .unwrap_err();
         assert_eq!(run.kind(), ErrorKind::DisplayHelp);
-
-        let meta = Cli::command()
-            .try_get_matches_from(["cockpit", "meta", "--help"])
-            .unwrap_err();
-        assert_eq!(meta.kind(), ErrorKind::DisplayHelp);
     }
 
     #[test]
@@ -1700,12 +1646,9 @@ mod tests {
     }
 
     #[test]
-    fn invalid_run_and_meta_invocations_return_clap_errors() {
+    fn invalid_run_invocation_returns_clap_error() {
         let run = Cli::try_parse_from(["cockpit", "run", "--definitely-not-a-flag"]).unwrap_err();
         assert_eq!(run.kind(), ErrorKind::UnknownArgument);
-
-        let meta = Cli::try_parse_from(["cockpit", "meta", "--definitely-not-a-flag"]).unwrap_err();
-        assert_eq!(meta.kind(), ErrorKind::UnknownArgument);
     }
 
     fn parse_run(args: &[&str]) -> RunArgs {

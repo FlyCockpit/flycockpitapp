@@ -3,9 +3,9 @@ use super::*;
 #[cfg(test)]
 use super::recheck::{RecheckAction, result_recheck_action};
 
-pub(super) const AUTO_GATE_UNSET_NOTICE: &str = "Auto approval needs a utility model to pre-screen commands; falling back to manual approval — \
-     set utility_model (provider:model) in your config to enable it.";
-pub(super) const AUTO_GATE_UNUSABLE_NOTICE: &str = "The configured utility model is unreachable; Auto approval is falling back to manual asks until it recovers.";
+pub(super) const AUTO_GATE_UNSET_NOTICE: &str = "No utility model configured; asking you instead. Set utility_model (provider:model) in your config to enable Auto approval.";
+pub(super) const AUTO_GATE_UNUSABLE_NOTICE: &str =
+    "The configured utility model is unavailable; asking you instead until it recovers.";
 
 /// What the command-safety gate decided for one call.
 #[derive(Clone)]
@@ -82,9 +82,8 @@ fn set_safety_gate_evaluate_outcomes(
 ///   this mode's engine. Run (no per-call gate here).
 /// - `yolo` → run everything unprompted.
 /// - `auto` → judge the single call (no history) via the utility model:
-///   `safe` runs; `unsafe` escalates to the user; utility-model unavailable
-///   degrades to the manual-equivalent downstream approval path. A user
-///   denial blocks dispatch.
+///   `safe` runs; every other result escalates to the user. A user denial
+///   blocks dispatch.
 ///
 /// The evaluator also reports whether the result needs an injection
 /// re-check; that flag is threaded back on [`GateOutcome::Run`].
@@ -147,7 +146,7 @@ pub(super) async fn safety_gate_decision_with_configs(
 
     if model_ref.is_none() {
         emit_degrade_notice_if_needed(ctx, tx, SafetyUnavailableReason::Unset, model_ref).await;
-        return GateOutcome::Run { recheck: false };
+        return unavailable_gate_outcome(tool, args, ctx, tx).await;
     }
 
     // `auto` mode. The utility model judges this single call with no
@@ -195,7 +194,22 @@ pub(super) async fn safety_gate_decision_with_configs(
         }
         SafetyOutcome::Unavailable(reason) => {
             emit_degrade_notice_if_needed(ctx, tx, reason, model_ref).await;
-            GateOutcome::Run { recheck: false }
+            unavailable_gate_outcome(tool, args, ctx, tx).await
+        }
+    }
+}
+
+async fn unavailable_gate_outcome(
+    tool: &str,
+    args: &Value,
+    ctx: &ToolCtx,
+    tx: &mpsc::Sender<TurnEvent>,
+) -> GateOutcome {
+    match escalate_gated_call(tool, args, ctx, true, tx, true).await {
+        GateApproval::Allow => GateOutcome::Run { recheck: false },
+        GateApproval::Parked => GateOutcome::Parked,
+        GateApproval::Deny | GateApproval::NoninteractiveDeny => {
+            GateOutcome::Block(gate_block(tool, true))
         }
     }
 }
@@ -210,7 +224,9 @@ async fn emit_degrade_notice_if_needed(
         crate::engine::safety_gate::SafetyUnavailableReason::Unset => {
             ("unset", AUTO_GATE_UNSET_NOTICE)
         }
-        crate::engine::safety_gate::SafetyUnavailableReason::Unusable => {
+        crate::engine::safety_gate::SafetyUnavailableReason::Unusable
+        | crate::engine::safety_gate::SafetyUnavailableReason::Timeout
+        | crate::engine::safety_gate::SafetyUnavailableReason::Malformed => {
             ("unusable", AUTO_GATE_UNUSABLE_NOTICE)
         }
     };
@@ -801,14 +817,10 @@ mod safety_gate_tests {
         )
         .await;
 
-        match outcome {
-            GateOutcome::Run { recheck: false } => {}
-            GateOutcome::Run { recheck: true } => panic!("degraded gate must not request recheck"),
-            GateOutcome::Block(block) => {
-                panic!("degraded gate must not block, got {}", block.status)
-            }
-            GateOutcome::Parked => panic!("degraded gate must not park"),
-        }
+        assert!(
+            matches!(outcome, GateOutcome::Block(_)),
+            "unavailable gate must fail closed without an approver"
+        );
         assert_eq!(safety_gate_evaluate_calls(), 1);
     }
 
@@ -984,6 +996,95 @@ mod safety_gate_tests {
         );
     }
 
+    async fn assert_unavailable_asks_user(
+        model_ref: Option<&str>,
+        outcome: Option<crate::engine::safety_gate::SafetyOutcome>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let hub = attached_interrupt_hub(&ctx);
+        attach_approver_with_hub(&mut ctx, hub.clone());
+        let ctx = Arc::new(ctx);
+        let (tx, _rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "git status" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+        reset_safety_gate_evaluate_calls();
+        if let Some(outcome) = outcome {
+            set_safety_gate_evaluate_outcomes([outcome]);
+        }
+        let model_ref = model_ref.map(ToOwned::to_owned);
+        let task_ctx = ctx.clone();
+        let task_args = args.clone();
+        let task_tx = tx.clone();
+        let task = tokio::spawn(async move {
+            safety_gate_decision_with_configs(
+                "bash",
+                &task_args,
+                &task_ctx,
+                &task_tx,
+                model_ref.as_deref(),
+                &providers,
+            )
+            .await
+        });
+        let interrupt_id = wait_for_open_interrupt(&ctx).await;
+        let row = ctx
+            .session
+            .db
+            .get_interrupt(interrupt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.parked.is_none(),
+            "ordinary gate escalation must await an open user interrupt"
+        );
+        assert_eq!(hub.park_all_registered().await, 1);
+        assert!(matches!(task.await.unwrap(), GateOutcome::Parked));
+    }
+
+    #[tokio::test]
+    async fn unset_utility_model_asks_user() {
+        assert_unavailable_asks_user(None, None).await;
+    }
+
+    #[tokio::test]
+    async fn unavailable_utility_model_asks_user() {
+        assert_unavailable_asks_user(
+            Some("openai:gpt-test"),
+            Some(crate::engine::safety_gate::SafetyOutcome::Unavailable(
+                crate::engine::safety_gate::SafetyUnavailableReason::Unusable,
+            )),
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn utility_model_timeout_asks_user() {
+        assert_eq!(
+            crate::engine::model::UtilityCallSite::SafetyGate.timeout(),
+            crate::engine::model::UTILITY_TURN_BLOCKING_TIMEOUT
+        );
+        assert_unavailable_asks_user(
+            Some("openai:gpt-test"),
+            Some(crate::engine::safety_gate::SafetyOutcome::Unavailable(
+                crate::engine::safety_gate::SafetyUnavailableReason::Timeout,
+            )),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn malformed_verdict_asks_user() {
+        assert_unavailable_asks_user(
+            Some("openai:gpt-test"),
+            Some(crate::engine::safety_gate::SafetyOutcome::Unavailable(
+                crate::engine::safety_gate::SafetyUnavailableReason::Malformed,
+            )),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn gate_degrade_unset_warns_once_and_asks_manual_equivalent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -997,8 +1098,8 @@ mod safety_gate_tests {
             let outcome =
                 safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
             assert!(
-                matches!(outcome, GateOutcome::Run { recheck: false }),
-                "degraded auto should hand off to downstream manual-equivalent approval"
+                matches!(outcome, GateOutcome::Block(_)),
+                "unavailable gate must fail closed when no interactive approver is available"
             );
             if i == 0 {
                 assert_next_notice(&mut rx, AUTO_GATE_UNSET_NOTICE);
@@ -1056,7 +1157,7 @@ mod safety_gate_tests {
                 &providers,
             )
             .await;
-            assert!(matches!(outcome, GateOutcome::Run { recheck: false }));
+            assert!(matches!(outcome, GateOutcome::Block(_)));
             assert_eq!(safety_gate_evaluate_calls(), i + 1);
             if i == 0 {
                 assert_next_notice(&mut rx, AUTO_GATE_UNUSABLE_NOTICE);
@@ -1102,7 +1203,7 @@ mod safety_gate_tests {
             &providers,
         )
         .await;
-        assert!(matches!(first, GateOutcome::Run { recheck: false }));
+        assert!(matches!(first, GateOutcome::Block(_)));
         assert_next_notice(&mut rx, AUTO_GATE_UNUSABLE_NOTICE);
 
         let recovered = safety_gate_decision_with_configs(
@@ -1126,7 +1227,7 @@ mod safety_gate_tests {
             &providers,
         )
         .await;
-        assert!(matches!(regressed, GateOutcome::Run { recheck: false }));
+        assert!(matches!(regressed, GateOutcome::Block(_)));
         assert_next_notice(&mut rx, AUTO_GATE_UNUSABLE_NOTICE);
 
         let still_regressed = safety_gate_decision_with_configs(
@@ -1163,7 +1264,7 @@ mod safety_gate_tests {
 
         reset_safety_gate_evaluate_calls();
         let unset = safety_gate_decision("bash", &args, &ctx, &tx).await;
-        assert!(matches!(unset, GateOutcome::Run { recheck: false }));
+        assert!(matches!(unset, GateOutcome::Block(_)));
         assert_next_notice(&mut rx, AUTO_GATE_UNSET_NOTICE);
         assert_eq!(safety_gate_evaluate_calls(), 0);
 
@@ -1202,7 +1303,7 @@ mod safety_gate_tests {
 
         reset_safety_gate_evaluate_calls();
         let first = safety_gate_decision("bash", &args, &ctx, &tx).await;
-        assert!(matches!(first, GateOutcome::Run { recheck: false }));
+        assert!(matches!(first, GateOutcome::Block(_)));
         assert_next_notice(&mut rx, AUTO_GATE_UNSET_NOTICE);
 
         {
@@ -1213,7 +1314,7 @@ mod safety_gate_tests {
         }
 
         let second = safety_gate_decision("bash", &args, &ctx, &tx).await;
-        assert!(matches!(second, GateOutcome::Run { recheck: false }));
+        assert!(matches!(second, GateOutcome::Block(_)));
         assert_no_notice(&mut rx);
         assert_eq!(safety_gate_evaluate_calls(), 0);
     }
@@ -1425,6 +1526,64 @@ mod safety_gate_tests {
         let fetch = serde_json::json!({ "url": "https://x.com/foo" });
         let p = gate_payload("webfetch", &fetch);
         assert!(p.contains("https://x.com/foo"), "got: {p}");
+    }
+
+    #[tokio::test]
+    async fn fail_closed_without_approver_denies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let (tx, _rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "git status" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+        for (model_ref, outcome) in [
+            (None, None),
+            (
+                Some("openai:gpt-test"),
+                Some(crate::engine::safety_gate::SafetyOutcome::Unavailable(
+                    crate::engine::safety_gate::SafetyUnavailableReason::Unusable,
+                )),
+            ),
+        ] {
+            reset_safety_gate_evaluate_calls();
+            if let Some(outcome) = outcome {
+                set_safety_gate_evaluate_outcomes([outcome]);
+            }
+            let decision =
+                safety_gate_decision_with_configs("bash", &args, &ctx, &tx, model_ref, &providers)
+                    .await;
+            assert!(
+                matches!(decision, GateOutcome::Block(_)),
+                "unavailable gate must deny without an approver"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_verdict_runs_without_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let (tx, _rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "git status" });
+        let providers = crate::config::providers::ProvidersConfig::default();
+        reset_safety_gate_evaluate_calls();
+        set_safety_gate_evaluate_outcomes([crate::engine::safety_gate::SafetyOutcome::Rated(
+            crate::engine::safety_gate::SafetyVerdict {
+                safe: true,
+                recheck_result: false,
+            },
+        )]);
+        assert!(matches!(
+            safety_gate_decision_with_configs(
+                "bash",
+                &args,
+                &ctx,
+                &tx,
+                Some("openai:gpt-test"),
+                &providers
+            )
+            .await,
+            GateOutcome::Run { recheck: false }
+        ));
     }
 
     #[test]

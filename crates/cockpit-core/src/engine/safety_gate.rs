@@ -241,13 +241,10 @@ mod tests {
                 recheck_result: false
             })
         );
-        // Missing `recheck_result` defaults to false (don't re-check).
+        // Missing `recheck_result` is malformed and must fail closed.
         assert_eq!(
             parse_verdict(&[mk("safety", json!({ "safe": true }))]),
-            Some(SafetyVerdict {
-                safe: true,
-                recheck_result: false
-            })
+            None
         );
     }
 

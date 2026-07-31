@@ -1093,6 +1093,9 @@ CREATE TABLE task_todo_notes (
 CREATE INDEX idx_task_todo_notes_todo_kind_time
     ON task_todo_notes(todo_id, kind, created_at);
 
+CREATE INDEX idx_task_todo_notes_session
+    ON task_todo_notes(session_id);
+
 CREATE TABLE task_todo_assignments (
     id TEXT PRIMARY KEY,
     todo_id TEXT NOT NULL REFERENCES task_todos(id) ON DELETE CASCADE,
@@ -1196,7 +1199,8 @@ CREATE TABLE task_delegation_jobs (
     ack_delivered INTEGER NOT NULL DEFAULT 0 CHECK (ack_delivered IN (0, 1)),
     final_delivered INTEGER NOT NULL DEFAULT 0 CHECK (final_delivered IN (0, 1)),
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
 CREATE TABLE task_delegation_children (
@@ -1264,6 +1268,7 @@ CREATE TABLE task_delegation_payloads (
     delivered_at INTEGER,
     PRIMARY KEY (task_call_id, label),
     FOREIGN KEY (task_call_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
     CHECK ((body_inline IS NOT NULL) OR (sidecar_path IS NOT NULL))
 );
 
@@ -1434,12 +1439,13 @@ CREATE TABLE remote_principal_audit (
     session_id   TEXT,
     verdict      TEXT    NOT NULL,
     path         TEXT,                              -- path attribution for project-file audit rows
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE SET NULL
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_remote_principal_audit_ts        ON remote_principal_audit (ts_ms);
 CREATE INDEX idx_remote_principal_audit_principal ON remote_principal_audit (principal, ts_ms);
 CREATE INDEX idx_remote_principal_audit_path      ON remote_principal_audit (path);
+CREATE INDEX idx_remote_principal_audit_session   ON remote_principal_audit (session_id);
 
 -- ---- session_plan_docs -------------------------------------------------------------------------------------
 -- The session's living plan document (plan mode), one row per session.

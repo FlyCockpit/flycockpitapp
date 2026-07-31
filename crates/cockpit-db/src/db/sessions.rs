@@ -1540,8 +1540,34 @@ impl Db {
     /// descendant fork (depth-unbounded). FK CASCADE on tool_call_events
     /// / inference_calls / lock state takes care of dependent rows.
     pub async fn delete_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
+        let session_ids = if cascade {
+            self.read(move |conn| collect_subtree(conn, session_id))
+                .await?
+        } else {
+            vec![session_id]
+        };
+        let mut sidecars = Vec::new();
+        for id in session_ids {
+            for payload in self.list_task_delegation_payloads(id).await? {
+                if let Some(path) = self.task_delegation_payload_sidecar_abs_path(&payload)? {
+                    sidecars.push(path);
+                }
+            }
+        }
         self.write(move |conn| delete_session_conn(conn, session_id, cascade))
-            .await
+            .await?;
+        for path in sidecars {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("removing delegation payload sidecar {}", path.display())
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Discard a single ephemeral side-conversation session (`/side`),

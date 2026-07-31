@@ -997,6 +997,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Instant;
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn migrate_idempotent() {
@@ -2062,6 +2063,181 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    fn session_tables_missing_cascade(conn: &Connection) -> Result<Vec<String>> {
+        let mut tables = conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?;
+        let names = tables.query_map([], |row| row.get::<_, String>(0))?;
+        let mut missing = Vec::new();
+        for name in names {
+            let name = name?;
+            let mut columns = conn.prepare(&format!("PRAGMA table_info({name})"))?;
+            let has_session_id = columns
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .iter()
+                .any(|column| column == "session_id");
+            if !has_session_id || name == "sessions" {
+                continue;
+            }
+            let mut foreign_keys = conn.prepare(&format!("PRAGMA foreign_key_list({name})"))?;
+            let cascades = foreign_keys
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if !cascades.iter().any(|(table, from, on_delete)| {
+                table == "sessions"
+                    && from == "session_id"
+                    && on_delete.eq_ignore_ascii_case("cascade")
+            }) {
+                missing.push(name);
+            }
+        }
+        Ok(missing)
+    }
+
+    #[tokio::test]
+    async fn every_session_scoped_table_cascades() {
+        let db = Db::open_in_memory().unwrap();
+        let missing = db.read(session_tables_missing_cascade).await.unwrap();
+        assert!(
+            missing.is_empty(),
+            "session-scoped tables without cascading FK: {missing:?}"
+        );
+        db.write(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE unprotected_session_fixture (session_id TEXT NOT NULL)",
+            )?;
+            assert_eq!(
+                session_tables_missing_cascade(conn)?,
+                vec!["unprotected_session_fixture"]
+            );
+            conn.execute_batch("DROP TABLE unprotected_session_fixture")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreign_keys_enforced_on_open() {
+        let db = Db::open_in_memory().unwrap();
+        let enabled: i64 = db
+            .read(|conn| {
+                conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                    .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(enabled, 1);
+    }
+
+    #[tokio::test]
+    async fn session_delete_cascades_to_all_tables() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = Uuid::new_v4();
+        let id = session_id.to_string();
+        db.write(move |conn| {
+            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
+            conn.execute("INSERT INTO remote_principal_audit (ts_ms, principal, request_kind, session_id, verdict) VALUES (1, 'p', 'request', ?1, 'allow')", [&id])?;
+            Ok(())
+        }).await.unwrap();
+        db.delete_session(session_id, false).await.unwrap();
+        let remaining: i64 = db
+            .read(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM remote_principal_audit", [], |row| {
+                    row.get(0)
+                })
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    fn session_foreign_keys_missing_index(conn: &Connection) -> Result<Vec<String>> {
+        let mut tables = conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?;
+        let names = tables.query_map([], |row| row.get::<_, String>(0))?;
+        let mut missing = Vec::new();
+        for name in names {
+            let name = name?;
+            let mut foreign_keys = conn.prepare(&format!("PRAGMA foreign_key_list({name})"))?;
+            let has_session_cascade = foreign_keys
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .iter()
+                .any(|(table, from, on_delete)| {
+                    table == "sessions"
+                        && from == "session_id"
+                        && on_delete.eq_ignore_ascii_case("cascade")
+                });
+            if !has_session_cascade {
+                continue;
+            }
+            let mut indexes = conn.prepare(&format!("PRAGMA index_list({name})"))?;
+            let index_names = indexes
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let indexed = index_names.into_iter().any(|index| {
+                conn.prepare(&format!("PRAGMA index_info({index})"))
+                    .and_then(|mut info| {
+                        info.query_map([], |row| row.get::<_, String>(2))?
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                    })
+                    .map(|columns| columns.first().is_some_and(|column| column == "session_id"))
+                    .unwrap_or(false)
+            });
+            if !indexed {
+                missing.push(name);
+            }
+        }
+        Ok(missing)
+    }
+
+    #[tokio::test]
+    async fn session_foreign_keys_are_indexed() {
+        let db = Db::open_in_memory().unwrap();
+        let missing = db.read(session_foreign_keys_missing_index).await.unwrap();
+        assert!(
+            missing.is_empty(),
+            "session cascading foreign keys without indexes: {missing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_delete_removes_delegation_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let session_id = Uuid::new_v4();
+        let id = session_id.to_string();
+        let relative = format!("delegation_payloads/{id}/payload.txt");
+        let sidecar = tmp.path().join(&relative);
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, "payload").unwrap();
+        let relative_for_db = relative.clone();
+        db.write(move |conn| {
+            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
+            conn.execute("INSERT INTO task_delegation_jobs (task_call_id, parent_session_id, parent_agent, status, created_at, updated_at) VALUES ('task', ?1, 'agent', 'completed', 1, 1)", [&id])?;
+            conn.execute("INSERT INTO task_delegation_payloads (task_call_id, label, payload_hash, parent_session_id, parent_agent, child_agent, prompt_byte_len, sidecar_path, created_at) VALUES ('task', 'default', 'hash', ?1, 'agent', 'child', 7, ?2, 1)", rusqlite::params![id, relative_for_db])?;
+            Ok(())
+        }).await.unwrap();
+        db.delete_session(session_id, false).await.unwrap();
+        assert!(!sidecar.exists());
     }
 
     #[test]

@@ -758,6 +758,53 @@ impl RedactionTable {
         )
     }
 
+    /// Register parsed values from one already-approved secret-bearing file.
+    /// This does not decide whether a path is secret and never reads any other
+    /// path; callers pair it with `SecretPathMatcher` after their read gate.
+    pub fn with_approved_secret_file(&self, cfg: &RedactConfig, path: &Path) -> Result<Self> {
+        let EnvFileScan::Candidates(candidates) = collect_env_file_candidates(path, &cfg.allowlist)
+        else {
+            return self.union(&Self::from_entries(
+                Vec::new(),
+                self.placeholder.clone(),
+                self.disabled,
+                Vec::new(),
+                self.protected.clone(),
+            )?);
+        };
+        let mut entries = Vec::new();
+        for candidate in candidates {
+            if candidate.prunable
+                && is_pruned_candidate(
+                    &candidate.value,
+                    cfg.min_secret_length,
+                    candidate.length_exempt,
+                )
+            {
+                continue;
+            }
+            if candidate.register_variants {
+                for variant in encoded_secret_variants(&candidate.value) {
+                    entries.push((variant, candidate.origin.clone()));
+                }
+            }
+            if candidate.register_case_variants {
+                for variant in case_secret_variants(&candidate.value) {
+                    entries.push((variant, candidate.origin.clone()));
+                }
+            }
+            entries.push((candidate.value, candidate.origin));
+        }
+        let addition = Self::from_entries(
+            entries,
+            self.placeholder.clone(),
+            self.disabled,
+            Vec::new(),
+            self.protected.clone(),
+        )?;
+        self.union(&addition)
+    }
+
     /// Serialize this accumulated table for session-local persistence. Disk-derived
     /// values are excluded; their origin-only markers retain resume coverage checks.
     pub fn to_persisted_json(&self) -> Result<String> {

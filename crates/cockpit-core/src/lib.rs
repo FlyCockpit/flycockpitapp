@@ -46,6 +46,7 @@ pub mod private_fs;
 pub mod process;
 pub mod providers;
 pub mod redact;
+pub mod secret_paths;
 pub mod secret_ref;
 pub mod session;
 pub mod skills;

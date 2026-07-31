@@ -1403,6 +1403,10 @@ pub struct RedactConfig {
     pub dotenv_patterns: Vec<String>,
     #[serde(default)]
     pub extra_dotenv_paths: Vec<PathBuf>,
+    /// Extra glob patterns for secret-bearing paths. These extend, never
+    /// replace, Cockpit's built-in secret-path floor.
+    #[serde(default)]
+    pub secret_path_patterns: Vec<String>,
     /// Minimum length for prunable candidate values. The effective floor is
     /// always at least four bytes; filesystem paths are never registered by
     /// automatic scanning regardless of this value.
@@ -1432,6 +1436,7 @@ impl Default for RedactConfig {
             ssh_key_dir: None,
             dotenv_patterns: default_dotenv_patterns(),
             extra_dotenv_paths: vec![],
+            secret_path_patterns: vec![],
             min_secret_length: 8,
             placeholder: "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**".to_string(),
             denylist: vec![],

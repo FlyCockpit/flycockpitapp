@@ -2690,6 +2690,7 @@ fn secret_table() -> (tempfile::TempDir, TestArc<RedactionTable>) {
         ssh_key_dir: None,
         dotenv_patterns: crate::config::extended::default_dotenv_patterns(),
         extra_dotenv_paths: vec![],
+        secret_path_patterns: vec![],
         min_secret_length: 8,
         placeholder: PLACEHOLDER.into(),
         denylist: vec![],

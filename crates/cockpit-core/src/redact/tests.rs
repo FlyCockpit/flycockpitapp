@@ -11,6 +11,7 @@ fn enabled_cfg() -> RedactConfig {
         ssh_key_dir: None,
         dotenv_patterns: crate::config::extended::default_dotenv_patterns(),
         extra_dotenv_paths: vec![],
+        secret_path_patterns: vec![],
         min_secret_length: 8,
         placeholder: "***REDACT***".into(),
         denylist: vec![],
@@ -684,6 +685,7 @@ fn env_var_value_redacted_with_default_placeholder() {
         ssh_key_dir: None,
         dotenv_patterns: crate::config::extended::default_dotenv_patterns(),
         extra_dotenv_paths: vec![],
+        secret_path_patterns: vec![],
         min_secret_length: 8,
         placeholder: RedactConfig::default().placeholder,
         denylist: vec![],
@@ -906,6 +908,7 @@ fn allowlisted_env_var_names_not_in_table() {
         ssh_key_dir: None,
         dotenv_patterns: crate::config::extended::default_dotenv_patterns(),
         extra_dotenv_paths: vec![],
+        secret_path_patterns: vec![],
         min_secret_length: 1,
         placeholder: "***".into(),
         denylist: vec![],
@@ -990,6 +993,7 @@ fn long_numeric_env_value_is_redacted() {
         ssh_key_dir: None,
         dotenv_patterns: crate::config::extended::default_dotenv_patterns(),
         extra_dotenv_paths: vec![],
+        secret_path_patterns: vec![],
         min_secret_length: 8,
         placeholder: "***REDACT***".into(),
         denylist: vec![],
@@ -1810,4 +1814,41 @@ fn legacy_persisted_disk_entries_are_purged() {
     let restored = RedactionTable::from_persisted_json(&legacy.to_string()).unwrap();
     assert_eq!(restored.scrub(secret), secret);
     assert!(!restored.to_persisted_json().unwrap().contains(secret));
+}
+
+#[test]
+fn approved_secret_file_read_registers_values() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("credentials");
+    std::fs::write(&path, "TOKEN=long-approved-secret\n").unwrap();
+    let cfg = enabled_cfg();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new())
+        .with_approved_secret_file(&cfg, &path)
+        .unwrap();
+    assert_eq!(table.scrub("long-approved-secret"), "***REDACT***");
+}
+
+#[test]
+fn short_values_from_secret_files_are_not_registered() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("credentials");
+    std::fs::write(&path, "TOKEN=x\n").unwrap();
+    let cfg = enabled_cfg();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new())
+        .with_approved_secret_file(&cfg, &path)
+        .unwrap();
+    assert_eq!(table.scrub("x"), "x");
+}
+
+#[test]
+fn secret_file_registration_uses_parsed_values() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("credentials");
+    let contents = "TOKEN=long-approved-secret\n";
+    std::fs::write(&path, contents).unwrap();
+    let cfg = enabled_cfg();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new())
+        .with_approved_secret_file(&cfg, &path)
+        .unwrap();
+    assert_eq!(table.scrub(contents), "TOKEN=***REDACT***\n");
 }

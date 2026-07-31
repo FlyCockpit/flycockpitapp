@@ -87,6 +87,9 @@ jobs:
       - name: Test
         run: cargo nextest run --locked --workspace
 
+      - name: Check released migrations are append-only
+        run: bash scripts/check-append-only-migrations.sh
+
       - name: Doc tests
         run: cargo test --locked --workspace --doc
 

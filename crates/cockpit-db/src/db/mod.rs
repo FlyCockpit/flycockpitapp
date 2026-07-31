@@ -1023,6 +1023,42 @@ mod tests {
     }
 
     #[test]
+    fn fixtures_migrate_forward_cleanly() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/schema");
+        let fixture_paths: Vec<_> = std::fs::read_dir(&fixtures)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "sqlite")
+            })
+            .collect();
+        if fixture_paths.is_empty() {
+            eprintln!(
+                "skipping fixture upgrade test: no released schema fixtures exist before v0.1.0"
+            );
+            return;
+        }
+        for fixture in fixture_paths {
+            let tmp = tempfile::tempdir().unwrap();
+            let copy = tmp.path().join("fixture.sqlite");
+            std::fs::copy(&fixture, &copy).unwrap();
+            let conn = Connection::open(&copy).unwrap();
+            migrate_with(&conn, MIGRATIONS).unwrap();
+            assert_eq!(
+                current_schema_version(&conn).unwrap(),
+                MIGRATIONS.len() as i64
+            );
+            assert_eq!(
+                sqlite_schema_version(&conn).unwrap(),
+                MIGRATIONS.len() as i64
+            );
+            foreign_key_check(&conn).unwrap();
+        }
+    }
+
+    #[test]
     fn pending_migration_writes_backup_first() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("cockpit.db");

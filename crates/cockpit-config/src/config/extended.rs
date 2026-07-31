@@ -33,9 +33,9 @@ pub use daemon::{DaemonAutostart, DaemonConfig, DaemonUploadLimitsConfig, Retent
 pub use data_syntax::DataSyntaxConfig;
 #[allow(unused_imports)]
 pub use delegation::{
-    DEFAULT_DELEGATION_MAX_PARALLEL, DEFAULT_SWARM_MAX_CONCURRENCY, DEFAULT_SWARM_MAX_DEPTH,
-    DeepthinkConfig, DelegationConfig, DelegationRecursionPolicy, ReviewConfig, SwarmConfig,
-    persist_review_default_participants,
+    DEFAULT_DELEGATION_MAX_PARALLEL, DEFAULT_RECURSIVE_SPAWN_MAX_CONCURRENCY,
+    DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH, DeepthinkConfig, DelegationConfig,
+    DelegationRecursionPolicy, ReviewConfig, persist_review_default_participants,
 };
 #[allow(unused_imports)]
 pub use guards::{
@@ -266,11 +266,6 @@ pub struct ExtendedConfig {
     /// expensive.
     #[serde(default)]
     pub deepthink: DeepthinkConfig,
-
-    /// `Swarm` recursive-agent knobs (GOALS §24): the depth ceiling +
-    /// global concurrency cap on recursive `Swarm` subagents.
-    #[serde(default)]
-    pub swarm: SwarmConfig,
 
     /// `/multireview` defaults: participants pre-selected on the next review.
     #[serde(default)]
@@ -1569,7 +1564,6 @@ impl Default for ExtendedConfig {
             retention: RetentionConfig::default(),
             delegation: DelegationConfig::default(),
             deepthink: DeepthinkConfig::default(),
-            swarm: SwarmConfig::default(),
             review: ReviewConfig::default(),
             goal_verification: GoalVerificationConfig::default(),
             lsp: LspConfig::default(),
@@ -1916,7 +1910,6 @@ impl ExtendedConfigDoc {
         parse_field!("sandbox", sandbox);
         parse_field!("delegation", delegation);
         parse_field!("deepthink", deepthink);
-        parse_field!("swarm", swarm);
         parse_field!("review", review);
         parse_field!("goalVerification", goal_verification);
         parse_field!("lsp", lsp);

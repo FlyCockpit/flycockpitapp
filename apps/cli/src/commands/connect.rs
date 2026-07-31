@@ -28,7 +28,7 @@ pub async fn run(args: ConnectArgs) -> Result<()> {
             let state = db
                 .connector_state(&credential.server_url, &credential.instance_id)
                 .await?;
-            println!("Flycockpit remote access");
+            println!("FlyCockpit remote access");
             println!("  server:   {}", credential.server_url);
             println!("  instance: {}", credential.instance_id);
             match state {

@@ -9,6 +9,7 @@ use serde_json::json;
 
 use crate::cli::AskArgs;
 use crate::commands::CommandUsageError;
+use crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH;
 use crate::engine::builtin::{DelegationRecursionContext, SpawnArgs};
 use crate::engine::model::{Model, ModelParams};
 use crate::env_snapshot::{EnvSnapshot, EnvSnapshotSource};
@@ -89,7 +90,7 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
         delegated: true,
         delegation_recursion: DelegationRecursionContext::default(),
         swarm_depth: 0,
-        swarm_max_depth: extended.swarm.max_depth,
+        swarm_max_depth: DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,

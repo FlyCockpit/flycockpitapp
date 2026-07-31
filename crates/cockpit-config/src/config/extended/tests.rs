@@ -193,10 +193,6 @@ fn fully_populated_config_json_round_trips_byte_identically() {
         },
     );
     cfg.deepthink.enabled = true;
-    cfg.swarm = SwarmConfig {
-        max_depth: 2,
-        max_concurrency: 4,
-    };
     cfg.review.default_participants = vec!["scout".into(), "critic".into()];
     cfg.lsp.enabled = true;
     cfg.lsp.auto_install = LspAutoInstall::On;

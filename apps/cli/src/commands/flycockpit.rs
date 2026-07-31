@@ -17,7 +17,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         && !args.force
     {
         anyhow::bail!(
-            "already logged in to Flycockpit as {} on {}; run `cockpit account logout` first or pass `--force`",
+            "already logged in to FlyCockpit as {} on {}; run `cockpit account logout` first or pass `--force`",
             existing.account.email,
             existing.server_url
         );
@@ -38,7 +38,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     let existing_instance_id = maybe_load_credential().map(|credential| credential.instance_id);
 
     let login = client.begin_device_code_login().await?;
-    eprintln!("Open this URL to authorize Flycockpit account access:");
+    eprintln!("Open this URL to authorize FlyCockpit account access:");
     eprintln!("{}", login.open_url());
     eprintln!(
         "Enter this one-time code in any browser: {}",
@@ -52,7 +52,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         .complete_device_code_login_without_store(login, Some(display_name), existing_instance_id)
         .await?;
     println!(
-        "Logged in to Flycockpit as {} on {}",
+        "Logged in to FlyCockpit as {} on {}",
         credential.account.email, credential.server_url
     );
     println!("Instance: {}", credential.instance_id);
@@ -67,7 +67,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
             )
             .await
         {
-            tracing::warn!(error = %error, "Flycockpit account login: updating remote access setting failed");
+            tracing::warn!(error = %error, "FlyCockpit account login: updating remote access setting failed");
         } else if enable_remote_access {
             println!("Remote access: enabled (use `cockpit connect off` to disable)");
         } else {
@@ -78,7 +78,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     if let Some(db) = db.as_ref()
         && let Err(error) = crate::daemon::org_sync::sync_current_credential_once(db).await
     {
-        tracing::warn!(error = %error, "Flycockpit account login: best-effort org sync policy check failed");
+        tracing::warn!(error = %error, "FlyCockpit account login: best-effort org sync policy check failed");
     }
     Ok(())
 }
@@ -87,22 +87,22 @@ pub async fn logout() -> Result<()> {
     let credential = match load_credential() {
         Ok(credential) => credential,
         Err(_) => {
-            println!("Not logged in to Flycockpit.");
+            println!("Not logged in to FlyCockpit.");
             return Ok(());
         }
     };
     if let Ok(client) = FlycockpitClient::new(&credential.server_url)
         && let Err(error) = client.revoke_instance(&credential).await
     {
-        tracing::warn!(error = %error, "Flycockpit account logout: best-effort instance revoke failed");
+        tracing::warn!(error = %error, "FlyCockpit account logout: best-effort instance revoke failed");
     }
     clear_credential_via_daemon_or_direct().await?;
     if let Ok(db) = crate::db::Db::open_default()
         && let Err(error) = db.mark_org_sync_disabled(&credential.server_url).await
     {
-        tracing::warn!(error = %error, "Flycockpit account logout: disabling org sync state failed");
+        tracing::warn!(error = %error, "FlyCockpit account logout: disabling org sync state failed");
     }
-    println!("Logged out of Flycockpit.");
+    println!("Logged out of FlyCockpit.");
     Ok(())
 }
 
@@ -114,9 +114,9 @@ async fn running_persistent_daemon_client() -> Result<Option<DaemonClient>> {
     match DaemonClient::connect(&discovered.paths.socket).await {
         Ok(client) => Ok(Some(client)),
         Err(error) => {
-            tracing::warn!(error = %error, "Flycockpit credential RPC: running daemon disappeared; falling back to direct credential file write");
+            tracing::warn!(error = %error, "FlyCockpit credential RPC: running daemon disappeared; falling back to direct credential file write");
             eprintln!(
-                "Flycockpit credential RPC failed because the daemon disappeared; writing credentials directly."
+                "FlyCockpit credential RPC failed because the daemon disappeared; writing credentials directly."
             );
             Ok(None)
         }
@@ -135,18 +135,18 @@ async fn store_credential_via_daemon_or_direct(
         {
             Ok(Ok(Response::Ack)) => return Ok(()),
             Ok(Ok(other)) => anyhow::bail!(
-                "daemon returned unexpected response to Flycockpit credential store: {other:?}"
+                "daemon returned unexpected response to FlyCockpit credential store: {other:?}"
             ),
             Ok(Err(error)) => {
-                anyhow::bail!("daemon rejected Flycockpit credential store: {error}")
+                anyhow::bail!("daemon rejected FlyCockpit credential store: {error}")
             }
             Err(error) => {
-                tracing::warn!(error = %error, "Flycockpit credential RPC failed; falling back to direct credential file write");
-                eprintln!("Flycockpit credential RPC failed; writing credentials directly.");
+                tracing::warn!(error = %error, "FlyCockpit credential RPC failed; falling back to direct credential file write");
+                eprintln!("FlyCockpit credential RPC failed; writing credentials directly.");
             }
         }
     }
-    store_credential(credential).context("storing Flycockpit credentials")
+    store_credential(credential).context("storing FlyCockpit credentials")
 }
 
 async fn clear_credential_via_daemon_or_direct() -> Result<()> {
@@ -154,25 +154,25 @@ async fn clear_credential_via_daemon_or_direct() -> Result<()> {
         match client.request(Request::ClearFlycockpitCredential).await {
             Ok(Ok(Response::Ack)) => return Ok(()),
             Ok(Ok(other)) => anyhow::bail!(
-                "daemon returned unexpected response to Flycockpit credential clear: {other:?}"
+                "daemon returned unexpected response to FlyCockpit credential clear: {other:?}"
             ),
             Ok(Err(error)) => {
-                anyhow::bail!("daemon rejected Flycockpit credential clear: {error}")
+                anyhow::bail!("daemon rejected FlyCockpit credential clear: {error}")
             }
             Err(error) => {
-                tracing::warn!(error = %error, "Flycockpit credential clear RPC failed; falling back to direct credential file write");
-                eprintln!("Flycockpit credential clear RPC failed; clearing credentials directly.");
+                tracing::warn!(error = %error, "FlyCockpit credential clear RPC failed; falling back to direct credential file write");
+                eprintln!("FlyCockpit credential clear RPC failed; clearing credentials directly.");
             }
         }
     }
-    clear_credential().context("clearing Flycockpit credentials")
+    clear_credential().context("clearing FlyCockpit credentials")
 }
 
 pub async fn whoami() -> Result<()> {
     let credential = match load_credential() {
         Ok(credential) => credential,
         Err(_) => {
-            println!("Not logged in to Flycockpit.");
+            println!("Not logged in to FlyCockpit.");
             return Ok(());
         }
     };
@@ -229,7 +229,7 @@ pub fn render_whoami_with_sync_and_connector(
     connector: Option<&ConnectorDisclosure>,
 ) -> String {
     let mut out = String::new();
-    out.push_str("Flycockpit account\n");
+    out.push_str("FlyCockpit account\n");
     out.push_str(&format!("  server:     {}\n", credential.server_url));
     out.push_str(&format!("  account:    {}\n", credential.account.email));
     out.push_str(&format!("  user id:    {}\n", credential.account.user_id));

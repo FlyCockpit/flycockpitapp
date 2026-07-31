@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::banner::render_unconditional;
 use crate::git::{self, RepoStatus, repo_counts};
 
-pub const APP_NAME: &str = "Cockpit CLI";
+pub const APP_NAME: &str = "FlyCockpit";
 pub const INPUT_PREFIX: &str = "❯ ";
 
 const RESET: &str = "\x1b[0m";

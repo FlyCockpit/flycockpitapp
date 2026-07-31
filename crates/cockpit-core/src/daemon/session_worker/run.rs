@@ -451,7 +451,7 @@ pub(super) async fn run_worker(
         // each `bee` fan-out spawn advances it. The ceiling rides along so
         // the `spawn` description shows the remaining budget.
         swarm_depth: 0,
-        swarm_max_depth: extended_cfg.swarm.max_depth,
+        swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
         // The root primary carries no per-delegation grants — grants attach to
         // an individual `task` delegation, never to the root spawn.
         granted_tools: Vec::new(),
@@ -695,8 +695,8 @@ pub(super) async fn run_worker(
     // concurrency cap on simultaneously-running `bee` workers, enforced
     // centrally by the single async-job authority.
     driver.set_swarm_config(
-        extended_cfg.swarm.max_depth,
-        extended_cfg.swarm.max_concurrency,
+        crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
+        crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_CONCURRENCY,
     );
     driver.set_lsp_manager(lsp);
     if let Some(scheduler) = resource_scheduler {

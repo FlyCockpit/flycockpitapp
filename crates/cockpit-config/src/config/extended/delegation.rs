@@ -70,33 +70,6 @@ pub struct DeepthinkConfig {
     pub enabled: bool,
 }
 
-/// `Swarm` recursive-agent config (GOALS §24). Bounds the recursive
-/// self-delegation `Swarm` (and only `Swarm`) may perform: a hard
-/// depth ceiling and a global cap on simultaneously-running `Swarm`
-/// subagents across the whole tree.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SwarmConfig {
-    /// Hard ceiling on recursion depth (levels of Swarm-spawning-Swarm;
-    /// root = depth 0). A spawn that would exceed it is refused and the branch
-    /// does the work itself as a leaf. Default 3, user-raisable.
-    #[serde(rename = "maxDepth", default = "default_swarm_max_depth")]
-    pub max_depth: u32,
-    /// Global cap on simultaneously-running `Swarm` subagents across the
-    /// entire tree (not per-level). Spawns beyond it queue and start as slots
-    /// free. `0` = unlimited. Default 8.
-    #[serde(rename = "maxConcurrency", default = "default_swarm_max_concurrency")]
-    pub max_concurrency: usize,
-}
-
-impl Default for SwarmConfig {
-    fn default() -> Self {
-        Self {
-            max_depth: default_swarm_max_depth(),
-            max_concurrency: default_swarm_max_concurrency(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReviewConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -111,15 +84,6 @@ pub fn persist_review_default_participants(cwd: &Path, participants: Vec<String>
     doc.write(&cfg)
 }
 
-/// Default `Swarm` depth ceiling (GOALS §24).
-pub const DEFAULT_SWARM_MAX_DEPTH: u32 = 3;
-/// Default `Swarm` global concurrency cap (GOALS §24).
-pub const DEFAULT_SWARM_MAX_CONCURRENCY: usize = 8;
-
-default_const!(default_swarm_max_depth, u32, DEFAULT_SWARM_MAX_DEPTH);
-
-default_const!(
-    default_swarm_max_concurrency,
-    usize,
-    DEFAULT_SWARM_MAX_CONCURRENCY
-);
+// Fixed recursion bounds for the internal recursive-spawn scheduler.
+pub const DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH: u32 = 3;
+pub const DEFAULT_RECURSIVE_SPAWN_MAX_CONCURRENCY: usize = 8;

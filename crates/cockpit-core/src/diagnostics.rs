@@ -704,10 +704,6 @@ fn delegation_lines(
             extended.delegation.default_recursion_depth,
             extended.delegation.max_parallel
         ),
-        format!(
-            "swarm recursion: max depth {}, max concurrency {}",
-            extended.swarm.max_depth, extended.swarm.max_concurrency
-        ),
     ]
 }
 
@@ -811,8 +807,7 @@ mod tests {
                     "maxParallel": 3,
                     "recursionEnabled": true,
                     "defaultRecursionDepth": 2
-                },
-                "swarm": { "maxDepth": 4, "maxConcurrency": 5 }
+                }
             }"#,
         )
         .unwrap();
@@ -851,10 +846,6 @@ mod tests {
         );
         assert!(
             rendered.contains("task recursion: enabled, default child budget 2, batch max 3"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("swarm recursion: max depth 4, max concurrency 5"),
             "{rendered}"
         );
     }

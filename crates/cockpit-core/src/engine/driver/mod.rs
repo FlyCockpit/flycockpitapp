@@ -742,7 +742,7 @@ pub struct Driver {
     /// to the whole delegation tree — builder, merge-resolver, any subagent.
     /// `None` outside a plan run.
     model_override: Option<Arc<crate::engine::model::Model>>,
-    /// Recursive-`Swarm` depth ceiling (GOALS §24, `swarm.max_depth`).
+    /// Fixed recursive-spawn depth ceiling.
     /// Hard ceiling on Swarm-spawning-Swarm; a `spawn` that
     /// would exceed it is refused (the branch degrades to a leaf). Baked into
     /// the `spawn` description so the model can self-limit.
@@ -1618,8 +1618,8 @@ impl Driver {
             daemon_scheduler: None,
             deleg_shrinks: std::collections::HashMap::new(),
             model_override: None,
-            swarm_max_depth: crate::config::extended::DEFAULT_SWARM_MAX_DEPTH,
-            swarm_max_concurrency: crate::config::extended::DEFAULT_SWARM_MAX_CONCURRENCY,
+            swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
+            swarm_max_concurrency: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_CONCURRENCY,
             rehydrated_ctx_estimate: None,
             skill_pairs: Vec::new(),
             active_skills: Vec::new(),

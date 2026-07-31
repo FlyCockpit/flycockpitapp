@@ -392,8 +392,6 @@ pub(super) enum SettingId {
     ScheduleMaxConcurrent,
     ScheduleAllowUnboundedLoops,
     DelegationMaxParallel,
-    SwarmMaxDepth,
-    SwarmMaxConcurrency,
     GoalVerificationEnabled,
     GoalVerificationSkepticCount,
     GoalVerificationModel,
@@ -490,8 +488,6 @@ const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::ScheduleMaxConcurrent,
     SettingId::ScheduleAllowUnboundedLoops,
     SettingId::DelegationMaxParallel,
-    SettingId::SwarmMaxDepth,
-    SettingId::SwarmMaxConcurrency,
     SettingId::GoalVerificationEnabled,
     SettingId::GoalVerificationSkepticCount,
     SettingId::GoalVerificationModel,
@@ -591,8 +587,6 @@ impl SettingId {
             SettingId::ScheduleMaxConcurrent => "max concurrent scheduled tasks",
             SettingId::ScheduleAllowUnboundedLoops => "allow unbounded schedule loops",
             SettingId::DelegationMaxParallel => "max parallel task delegations",
-            SettingId::SwarmMaxDepth => "swarm max depth",
-            SettingId::SwarmMaxConcurrency => "swarm max concurrency",
             SettingId::GoalVerificationEnabled => "goal completion verification",
             SettingId::GoalVerificationSkepticCount => "goal skeptic count",
             SettingId::GoalVerificationModel => "goal skeptic model",
@@ -925,17 +919,6 @@ impl SettingId {
                  call. Larger batches are refused before any child starts. Must \
                  be at least 1."
             }
-            SettingId::SwarmMaxDepth => {
-                "Hard ceiling on recursive `spawn` fan-out depth (the root is \
-                 depth 0). \
-                 A spawn past the ceiling is refused and that branch does the work \
-                 itself. Default 3."
-            }
-            SettingId::SwarmMaxConcurrency => {
-                "Global cap on recursive `spawn` subagents running at once across the whole \
-                 tree (not per level). Spawns beyond it queue and start as slots \
-                 free. `0` means unlimited. Default 8."
-            }
             SettingId::GoalVerificationEnabled => {
                 "Verify model-claimed goal completion before closing budgeted goals. On \
                  (default) means a complete update on a token-budgeted goal runs \
@@ -1138,8 +1121,6 @@ impl SettingId {
             | SettingId::MaxPrimaryRounds
             | SettingId::ScheduleMaxConcurrent
             | SettingId::DelegationMaxParallel
-            | SettingId::SwarmMaxDepth
-            | SettingId::SwarmMaxConcurrency
             | SettingId::GoalVerificationSkepticCount
             | SettingId::GoalVerificationMaxRounds
             | SettingId::DialogLockoutMs
@@ -1621,8 +1602,6 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::ScheduleMaxConcurrent),
             Setting(S::ScheduleAllowUnboundedLoops),
             Setting(S::DelegationMaxParallel),
-            Setting(S::SwarmMaxDepth),
-            Setting(S::SwarmMaxConcurrency),
             Setting(S::GoalVerificationEnabled),
             Setting(S::GoalVerificationSkepticCount),
             Setting(S::GoalVerificationModel),
@@ -1848,16 +1827,6 @@ impl SettingsCx {
             S::DelegationMaxParallel => format!(
                 "{} (cap on inline task parallel entries; >= 1)",
                 e.delegation.max_parallel
-            ),
-            S::SwarmMaxDepth => {
-                format!(
-                    "{} (recursive spawn depth ceiling; default 3)",
-                    e.swarm.max_depth
-                )
-            }
-            S::SwarmMaxConcurrency => format!(
-                "{} (global recursive spawn cap; 0 = unlimited)",
-                e.swarm.max_concurrency
             ),
             S::GoalVerificationEnabled => on_off(
                 e.goal_verification.enabled,
@@ -2527,8 +2496,6 @@ impl SettingsCx {
             S::MaxPrimaryRounds => e.max_primary_rounds.to_string(),
             S::ScheduleMaxConcurrent => e.schedule.max_concurrent.to_string(),
             S::DelegationMaxParallel => e.delegation.max_parallel.to_string(),
-            S::SwarmMaxDepth => e.swarm.max_depth.to_string(),
-            S::SwarmMaxConcurrency => e.swarm.max_concurrency.to_string(),
             S::GoalVerificationSkepticCount => {
                 e.goal_verification.effective_skeptic_count().to_string()
             }
@@ -2604,15 +2571,6 @@ impl SettingsCx {
             S::DelegationMaxParallel => {
                 let v = parse_min_usize(trimmed, 1)?;
                 self.extended.delegation.max_parallel = v;
-            }
-            S::SwarmMaxDepth => {
-                let v = parse_min_u32(trimmed, 1)?;
-                self.extended.swarm.max_depth = v;
-            }
-            S::SwarmMaxConcurrency => {
-                // 0 = unlimited, so the floor is 0.
-                let v = parse_min_usize(trimmed, 0)?;
-                self.extended.swarm.max_concurrency = v;
             }
             S::GoalVerificationSkepticCount => {
                 let v = parse_min_usize(trimmed, 1)?;
@@ -2895,7 +2853,6 @@ impl SettingsCx {
                 e.max_primary_rounds = d.max_primary_rounds;
                 e.concurrency = d.concurrency;
                 e.schedule = d.schedule;
-                e.swarm = d.swarm;
                 e.goal_verification = d.goal_verification;
                 e.dialog = d.dialog;
                 e.system_prompt = d.system_prompt;
@@ -3003,8 +2960,6 @@ fn numeric_text_setting(id: SettingId) -> bool {
             | SettingId::MaxPrimaryRounds
             | SettingId::ScheduleMaxConcurrent
             | SettingId::DelegationMaxParallel
-            | SettingId::SwarmMaxDepth
-            | SettingId::SwarmMaxConcurrency
             | SettingId::GoalVerificationSkepticCount
             | SettingId::GoalVerificationMaxRounds
             | SettingId::DialogLockoutMs
@@ -3100,8 +3055,6 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::ScheduleMaxConcurrent => &["schedule", "max_concurrent"],
         S::ScheduleAllowUnboundedLoops => &["schedule", "allow_unbounded_loops"],
         S::DelegationMaxParallel => &["delegation", "max_parallel"],
-        S::SwarmMaxDepth => &["swarm", "max_depth"],
-        S::SwarmMaxConcurrency => &["swarm", "max_concurrency"],
         S::GoalVerificationEnabled => &["goalVerification", "enabled"],
         S::GoalVerificationSkepticCount => &["goalVerification", "skepticCount"],
         S::GoalVerificationModel => &["goalVerification", "skepticModel"],

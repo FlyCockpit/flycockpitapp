@@ -14,7 +14,7 @@ use crate::agents::AgentMode;
 #[command(
     name = "cockpit",
     version,
-    about = "AI coding harness with a codex-style TUI",
+    about = "AI coding harness with an interactive terminal UI",
     propagate_version = true
 )]
 pub struct Cli {
@@ -38,7 +38,7 @@ pub struct Cli {
     #[arg(long, global = true, hide = true)]
     pub pure: bool,
 
-    /// **Debugging:** write each outbound inference request (system
+    /// Debugging: write each outbound inference request (system
     /// prompt, tool definitions, history, new prompt, params) as
     /// pretty-printed JSON to `<cwd>/.lastmessage`. Overwritten on
     /// every turn. The file is the *content* we hand to rig, not the
@@ -63,7 +63,7 @@ pub enum Command {
     /// Ask a registered dependency package using the read-only docs agent.
     Ask(AskArgs),
 
-    /// Run a one-shot prompt non-interactively (matches `opencode run`).
+    /// Run a one-shot prompt non-interactively.
     #[command(
         after_long_help = "Exit codes:\n  0  turn succeeded\n  1  turn failed\n  2  usage or configuration error\n  3  workspace trust refused\n  4  daemon or connection error"
     )]
@@ -77,7 +77,7 @@ pub enum Command {
     #[command(subcommand)]
     Assistant(AssistantCommand),
 
-    /// Manage the Flycockpit account used for SaaS sync and relay access.
+    /// Manage the FlyCockpit account used for SaaS sync and relay access.
     #[command(subcommand)]
     Account(AccountCommand),
 
@@ -388,11 +388,11 @@ pub enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum AccountCommand {
-    /// Sign in to a Flycockpit account using browser device authorization.
+    /// Sign in to a FlyCockpit account using browser device authorization.
     Login(LoginArgs),
-    /// Sign out of the active Flycockpit account on this machine.
+    /// Sign out of the active FlyCockpit account on this machine.
     Logout,
-    /// Show the active Flycockpit account and instance.
+    /// Show the active FlyCockpit account and instance.
     Whoami,
 }
 
@@ -485,8 +485,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub agent: Option<String>,
 
-    /// **cockpit-specific:** load an agent definition from an arbitrary file
-    /// path. The file does not need to live in `~/.config/opencode/agents/`.
+    /// Cockpit-specific: load an agent definition from an arbitrary file
+    /// path. The file does not need to live in a standard configuration directory.
     #[arg(long, value_name = "PATH")]
     pub agent_file: Option<PathBuf>,
 
@@ -707,15 +707,15 @@ pub enum DaemonCommand {
   1   network/auth/server failure, denied approval, or expired device code
   64  invalid command usage")]
 pub struct LoginArgs {
-    /// Flycockpit server origin. HTTPS is required except for localhost development.
+    /// FlyCockpit server origin. HTTPS is required except for localhost development.
     #[arg(long, default_value = "https://app.flycockpit.dev", value_name = "URL")]
     pub server: String,
 
-    /// Display name for this machine in Flycockpit. Defaults to the hostname.
+    /// Display name for this machine in FlyCockpit. Defaults to the hostname.
     #[arg(long, value_name = "DISPLAY_NAME")]
     pub name: Option<String>,
 
-    /// Replace the currently logged-in Flycockpit account without prompting.
+    /// Replace the currently logged-in FlyCockpit account without prompting.
     #[arg(long)]
     pub force: bool,
 
@@ -931,13 +931,13 @@ pub enum DebugCommand {
     Agent { name: String },
     /// File-system debugging utilities.
     File,
-    /// **cockpit-specific:** dump the redaction table that would apply to the
+    /// Cockpit-specific: dump the redaction table that would apply to the
     /// next request.
     Redact,
-    /// **cockpit-specific:** dump the full prompt (system + tools + history)
+    /// Cockpit-specific: dump the full prompt (system + tools + history)
     /// that would be sent for the next turn, with token counts.
     Context,
-    /// **cockpit-specific:** list recent tool calls that hard-failed
+    /// Cockpit-specific: list recent tool calls that hard-failed
     /// (and optionally those that fired any recovery).
     FailedCalls(FailedCallsArgs),
     /// Wait indefinitely (for debugging).
@@ -1451,6 +1451,20 @@ mod tests {
         assert!(!help.contains("  login"), "{help}");
         assert!(!help.contains("  logout"), "{help}");
         assert!(!help.contains("  whoami"), "{help}");
+    }
+
+    #[test]
+    fn help_output_has_no_literal_markdown() {
+        let mut help_pages = Vec::new();
+        collect_visible_help(Cli::command(), vec!["cockpit".to_string()], &mut help_pages);
+        for page in help_pages {
+            for marker in ["**", "`*", "*`"] {
+                assert!(
+                    !page.contains(marker),
+                    "clap help contains literal Markdown emphasis marker `{marker}`:\n{page}"
+                );
+            }
+        }
     }
 
     #[test]

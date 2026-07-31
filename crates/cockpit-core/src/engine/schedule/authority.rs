@@ -263,7 +263,7 @@ impl ScheduleAuthority {
             cmd_tx,
             turn_tx,
             ctx,
-            swarm_max_concurrency: crate::config::extended::DEFAULT_SWARM_MAX_CONCURRENCY,
+            swarm_max_concurrency: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_CONCURRENCY,
             running_swarm: 0,
             swarm_queue: std::collections::VecDeque::new(),
         }
@@ -1166,7 +1166,7 @@ mod tests {
         assert_eq!(auth.queued_swarm(), 0);
     }
 
-    /// `swarm.max_concurrency = 0` means unlimited (GOALS §24): every
+    /// An internal zero concurrency cap means unlimited: every
     /// spawn starts immediately, nothing queues.
     #[tokio::test(start_paused = true)]
     async fn swarm_concurrency_zero_is_unlimited() {

@@ -9,11 +9,9 @@ use crate::credentials::CredentialStore;
 pub async fn run(cmd: ProvidersCommand) -> Result<()> {
     match cmd {
         ProvidersCommand::List => {
-            println!("API-key provider templates (configure with `cockpit provider add`):");
+            println!("Built-in provider templates (configure with `cockpit provider add`):");
             for t in crate::providers::TEMPLATES {
-                if matches!(t.auth, crate::config::providers::AuthKind::ApiKey) {
-                    println!("  {} — {}", t.id, t.display);
-                }
+                println!("  {} — {}", t.id, t.display);
             }
             Ok(())
         }

@@ -46,7 +46,7 @@ impl RemovedCommandError {
         };
         Self {
             message: format!(
-                "`cockpit {command}` was split: use `{account_command}` for Flycockpit account access or `cockpit provider add` for model provider API keys/OAuth"
+                "`cockpit {command}` was split: use `{account_command}` for FlyCockpit account access or `cockpit provider add` for model provider API keys/OAuth"
             ),
         }
     }

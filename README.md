@@ -1,11 +1,11 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/header/graph.svg?title=Flycockpit&subtitle=Instance+operations+console+for+remote+AI+workspaces&mode=dark" />
-  <img alt="Flycockpit" src="https://shieldcn.dev/header/graph.svg?title=Flycockpit&subtitle=Instance+operations+console+for+remote+AI+workspaces&mode=light" width="100%" />
+  <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/header/graph.svg?title=FlyCockpit&subtitle=Instance+operations+console+for+remote+AI+workspaces&mode=dark" />
+  <img alt="FlyCockpit" src="https://shieldcn.dev/header/graph.svg?title=FlyCockpit&subtitle=Instance+operations+console+for+remote+AI+workspaces&mode=light" width="100%" />
 </picture>
 
-# Flycockpit
+# FlyCockpit
 
-Flycockpit is an instance operations console for remote AI workspaces. This monorepo includes a web console, API server, background worker, native app shell, relay service, Prisma data layer, shared UI package, and operational tooling for assets, video, users, devices, jobs, and enterprise instance workflows.
+FlyCockpit is an instance operations console for remote AI workspaces. This monorepo includes a web console, API server, background worker, native app shell, relay service, Prisma data layer, shared UI package, and operational tooling for assets, video, users, devices, jobs, and enterprise instance workflows.
 
 ## Applications
 

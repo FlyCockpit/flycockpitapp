@@ -832,7 +832,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         swarm_depth: 0,
-        swarm_max_depth: crate::config::extended::DEFAULT_SWARM_MAX_DEPTH,
+        swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,

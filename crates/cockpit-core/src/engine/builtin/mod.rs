@@ -2464,7 +2464,7 @@ mod tests {
             delegated: false,
             delegation_recursion: DelegationRecursionContext::default(),
             swarm_depth: 0,
-            swarm_max_depth: crate::config::extended::DEFAULT_SWARM_MAX_DEPTH,
+            swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
             granted_tools: Vec::new(),
             lock_identity: None,
             write_scope: None,

@@ -1002,7 +1002,8 @@ fn handle_run_event(
                     "[reconnecting: {provider}/{model} unreachable at {url} (attempt {attempt})]"
                 );
             }
-            proto::Event::CommandCapabilityUnavailable { text, .. } => {
+            proto::Event::Notice { text, .. }
+            | proto::Event::CommandCapabilityUnavailable { text, .. } => {
                 let _ = writeln!(stderr, "[notice: {text}]");
             }
             proto::Event::SessionEnded { reason, .. } => {

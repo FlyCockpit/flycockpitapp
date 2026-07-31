@@ -335,8 +335,8 @@ fn resolve_utility_token_limit(entry: &ProviderEntry, model_id: &str) -> Option<
 /// the existing `cache.ttl_secs` lever selects the TTL mode — `>= 3600`
 /// (`CacheConfig::wants_one_hour_ttl`) builds the client with the
 /// `extended-cache-ttl-2025-04-11` beta header and enables top-level
-/// `with_automatic_caching_1h()` (rig 0.37's only 1-hour mechanism; honors
-/// the no-serialization-fork rule); anything below enables per-block
+/// `with_automatic_caching_1h()` (rig's 1-hour mechanism; honors the
+/// no-serialization-fork rule); anything below enables per-block
 /// `with_prompt_caching()` (system prompt + last content block of the last
 /// message, 5-min ephemeral). No new config field — `ttl_secs` is the lever.
 #[cfg(test)]
@@ -820,6 +820,12 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
 #[derive(Debug, Clone, Default)]
 pub struct ModelParams {
     pub temperature: Option<f64>,
+    /// Optional completion length bound. On Anthropic native, a missing value
+    /// is filled from the model's resolved limit before dispatch. On OpenAI-
+    /// compatible endpoints (including Ollama), `None` is left as omission so
+    /// the provider applies its own default: rig 0.41 maps a present
+    /// `max_tokens` to Ollama `options.num_predict` and enforces it. Utility
+    /// paths always set an explicit cap via [`UTILITY_MAX_TOKENS_CAP`].
     pub max_tokens: Option<u64>,
     /// When true, on the first turn force `tool_choice = required` so
     /// the model has to call a tool rather than answer from priors. We
@@ -920,80 +926,43 @@ impl UtilityCallSite {
     }
 }
 
-/// Build a `rig::agent::Agent` (we only use its `.completion()` builder,
-/// not its `.prompt()` convenience layer). The construction is identical
-/// across providers; only the client type differs, so this lives here
-/// rather than in each variant.
-///
-/// `AgentBuilder` is type-stated — `.tool()` transitions from
-/// `NoToolConfig` to `WithBuilderTools`, which is why we use the plural
-/// `.tools()` (accepts `Vec<Box<dyn ToolDyn>>`) so the transition is one
-/// step and we don't have to reassign across types.
-pub(super) fn build_agent<C: CompletionClient>(
+/// The raw Rig request builder owns provider transport serialization; Cockpit
+/// owns the conversation transcript, tool definitions, and completion-request
+/// assembly. No Rig agent APIs participate in this path.
+pub(super) fn build_completion_model<C: CompletionClient>(
     client: &C,
     model_id: &str,
-    system: &str,
-    tools: &[ToolDefinition],
-    params: &ModelParams,
-) -> rig::agent::Agent<C::CompletionModel> {
-    let boxed: Vec<Box<dyn rig::tool::ToolDyn>> = tools
-        .iter()
-        .map(|def| Box::new(StaticTool(def.clone())) as Box<dyn rig::tool::ToolDyn>)
-        .collect();
-    let mut b = client.agent(model_id);
-    if !system.is_empty() {
-        b = b.preamble(system);
-    }
-    let mut b = b.tools(boxed);
-    if let Some(t) = params.temperature {
-        b = b.temperature(t);
-    }
-    if let Some(m) = params.max_tokens {
-        b = b.max_tokens(m);
-    }
-    // Vendor reasoning controls (and any other config-driven extra body
-    // params) ride through rig's `additional_params`, which serializes
-    // `#[serde(flatten)]` into the chat/completions body — so the fragment's
-    // keys land flat alongside `model`/`messages`/`temperature`, exactly the
-    // shape the vendor expects. We strip cockpit-owned keys first so the
-    // fragment can only ever add vendor keys, never override the
-    // temperature/max_tokens/messages/tools cockpit already set. The
-    // `prompt_cache_key` (decision 3) is injected on top for the OpenAI arm
-    // so the session id rides the body as a top-level key.
-    if let Some(extra) = openai_additional_params(params) {
-        b = b.additional_params(extra);
-    }
-    b.build()
+) -> C::CompletionModel {
+    client.completion_model(model_id)
 }
 
-pub(super) fn build_openai_responses_agent(
+/// Build a raw OpenAI Responses completion model with strict tool schemas.
+/// Request-level system messages, tools, parameters, and additional parameters
+/// belong on its `completion_request` builder.
+pub(super) fn build_openai_responses_completion_model(
     client: openai::Client<UsageAliasHttpClient>,
     model_id: &str,
-    system: &str,
-    tools: &[ToolDefinition],
-    params: &ModelParams,
-) -> rig::agent::Agent<openai::responses_api::ResponsesCompletionModel<UsageAliasHttpClient>> {
-    let boxed: Vec<Box<dyn rig::tool::ToolDyn>> = tools
-        .iter()
-        .map(|def| Box::new(StaticTool(def.clone())) as Box<dyn rig::tool::ToolDyn>)
-        .collect();
-    let model =
-        openai::responses_api::ResponsesCompletionModel::new(client, model_id).with_strict_tools();
-    let mut b = rig::agent::AgentBuilder::new(model);
-    if !system.is_empty() {
-        b = b.preamble(system);
-    }
-    let mut b = b.tools(boxed);
-    if let Some(t) = params.temperature {
-        b = b.temperature(t);
-    }
-    if let Some(m) = params.max_tokens {
-        b = b.max_tokens(m);
-    }
-    if let Some(extra) = openai_additional_params(params) {
-        b = b.additional_params(extra);
-    }
-    b.build()
+) -> openai::responses_api::ResponsesCompletionModel<UsageAliasHttpClient> {
+    openai::responses_api::ResponsesCompletionModel::new(client, model_id).with_strict_tools()
+}
+
+/// Return the pre-built native Anthropic completion model. Its caching mode is
+/// selected while constructing the provider client above; request-specific
+/// system messages, tools, and parameters are configured through
+/// `CompletionModel::completion_request`.
+pub(super) fn build_anthropic_completion_model(
+    model: AnthropicCompletionModel,
+) -> AnthropicCompletionModel {
+    model
+}
+
+/// Return the pre-built native ChatGPT/Codex Responses model with strict tool
+/// schemas. Request-specific system messages, tools, and parameters are
+/// configured through `CompletionModel::completion_request`.
+pub(super) fn build_chatgpt_completion_model(
+    model: ChatGptResponsesModel,
+) -> ChatGptResponsesModel {
+    model.with_strict_tools()
 }
 
 /// Compose the OpenAI-compat outbound `additional_params` object. rig >=0.40
@@ -1010,10 +979,7 @@ pub(super) fn build_openai_responses_agent(
 /// providers with no extra params and no cache params stay byte-for-byte
 /// unchanged.
 pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_json::Value> {
-    let vendor = sanitized_extra_params(params.additional_params.as_ref());
-    let vendor = merge_native_computer_tools(vendor, params, |contract| {
-        contract == crate::computer::ComputerToolContract::OpenAiResponses
-    });
+    let vendor = chatgpt_additional_params(params);
     let cache_key = params
         .prompt_cache_key
         .as_ref()
@@ -1047,6 +1013,19 @@ pub(super) fn openai_additional_params(params: &ModelParams) -> Option<serde_jso
         );
     }
     Some(serde_json::Value::Object(map))
+}
+
+/// Native ChatGPT/Codex subscription backend extras: sanitized vendor fragment
+/// plus OpenAI-Responses native computer tools. **Does not** inject
+/// `prompt_cache_key` / `prompt_cache_retention` — those are OpenAI-compatible
+/// body keys only. The ChatGPT path hits `chatgpt.com/backend-api/codex`, a
+/// distinct API that must not receive OpenAI cache fields (pre-0.41
+/// `build_chatgpt_agent` used this same composition).
+pub(super) fn chatgpt_additional_params(params: &ModelParams) -> Option<serde_json::Value> {
+    let vendor = sanitized_extra_params(params.additional_params.as_ref());
+    merge_native_computer_tools(vendor, params, |contract| {
+        contract == crate::computer::ComputerToolContract::OpenAiResponses
+    })
 }
 
 pub(super) fn anthropic_additional_params(params: &ModelParams) -> Option<serde_json::Value> {
@@ -1093,106 +1072,4 @@ fn merge_native_computer_tools(
         }
     }
     Some(serde_json::Value::Object(map))
-}
-
-/// Build a native-Anthropic `rig::agent::Agent` from the pre-built,
-/// caching-enabled [`anthropic::completion::CompletionModel`]. Mirrors
-/// [`build_agent`]
-/// but wraps the concrete model with `AgentBuilder::new` so the model's
-/// `with_prompt_caching` / `with_automatic_caching_1h` flags are preserved.
-/// Re-built every attempt, so the per-block last-message cache marker
-/// re-applies over the grown history each turn. The `prompt_cache_key`
-/// (OpenAI-only) is intentionally **not** forwarded here — Anthropic uses
-/// provider-concrete per-block caching, not a top-level key.
-pub(super) fn build_anthropic_agent(
-    model: AnthropicCompletionModel,
-    system: &str,
-    tools: &[ToolDefinition],
-    params: &ModelParams,
-) -> rig::agent::Agent<AnthropicCompletionModel> {
-    let boxed: Vec<Box<dyn rig::tool::ToolDyn>> = tools
-        .iter()
-        .map(|def| Box::new(StaticTool(def.clone())) as Box<dyn rig::tool::ToolDyn>)
-        .collect();
-    let mut b = rig::agent::AgentBuilder::new(model);
-    if !system.is_empty() {
-        b = b.preamble(system);
-    }
-    let mut b = b.tools(boxed);
-    if let Some(t) = params.temperature {
-        b = b.temperature(t);
-    }
-    if let Some(m) = params.max_tokens {
-        b = b.max_tokens(m);
-    }
-    if let Some(extra) = anthropic_additional_params(params) {
-        b = b.additional_params(extra);
-    }
-    b.build()
-}
-
-/// Build a native ChatGPT/Codex `rig::agent::Agent` from the pre-built
-/// [`ChatGptResponsesModel`]. This mirrors [`build_anthropic_agent`] because
-/// the native model is already constructed with Cockpit-resolved OAuth
-/// credentials and must not go back through a client/model-id factory.
-pub(super) fn build_chatgpt_agent(
-    model: ChatGptResponsesModel,
-    system: &str,
-    tools: &[ToolDefinition],
-    params: &ModelParams,
-) -> rig::agent::Agent<ChatGptResponsesModel> {
-    let boxed: Vec<Box<dyn rig::tool::ToolDyn>> = tools
-        .iter()
-        .map(|def| Box::new(StaticTool(def.clone())) as Box<dyn rig::tool::ToolDyn>)
-        .collect();
-    let mut b = rig::agent::AgentBuilder::new(model.with_strict_tools());
-    if !system.is_empty() {
-        b = b.preamble(system);
-    }
-    let mut b = b.tools(boxed);
-    if let Some(t) = params.temperature {
-        b = b.temperature(t);
-    }
-    if let Some(m) = params.max_tokens {
-        b = b.max_tokens(m);
-    }
-    let extra = merge_native_computer_tools(
-        sanitized_extra_params(params.additional_params.as_ref()),
-        params,
-        |contract| contract == crate::computer::ComputerToolContract::OpenAiResponses,
-    );
-    if let Some(extra) = extra {
-        b = b.additional_params(extra);
-    }
-    b.build()
-}
-
-struct StaticTool(ToolDefinition);
-
-#[derive(Debug, thiserror::Error)]
-#[error("StaticTool::call should never be invoked — cockpit dispatches through ToolBox")]
-struct StaticToolError;
-
-impl rig::tool::Tool for StaticTool {
-    const NAME: &'static str = "static-cockpit-tool";
-
-    type Error = StaticToolError;
-    type Args = serde_json::Value;
-    type Output = String;
-
-    fn name(&self) -> String {
-        self.0.name.clone()
-    }
-
-    fn description(&self) -> String {
-        self.0.description.clone()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        self.0.parameters.clone()
-    }
-
-    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
-        Err(StaticToolError)
-    }
 }

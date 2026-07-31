@@ -626,7 +626,7 @@ async fn grant_command(ctx: &ToolCtx, command: &str, scope: Scope) {
 async fn sandbox_off_ctx_with_grant(cwd: &std::path::Path, command: &str) -> ToolCtx {
     let ctx = ctx_with_store(cwd);
     ctx.session.set_sandbox_enabled(false);
-    grant_command(&ctx, &command, Scope::Session).await;
+    grant_command(&ctx, command, Scope::Session).await;
     ctx
 }
 

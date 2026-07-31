@@ -1,12 +1,12 @@
 //! Tool abstraction for cockpit.
 //!
-//! Why we wrap rig's `Tool`/`ToolDyn` rather than using them directly:
-//! the §12 repair layer needs a seam between rig's JSON-deserialized
-//! arguments and the typed dispatcher. We pin `type Args = Value` on
-//! every tool — rig's `ToolDyn` just `serde_json::from_str`s into
-//! `Args`, which is infallible for `Value` — so by the time `call()`
-//! runs we have a `serde_json::Value` we can mutate in place via
-//! [`crate::engine::repair`].
+//! Cockpit owns the tool loop: providers receive only
+//! [`ToolDefinition`](crate::engine::message::ToolDefinition) schemas on
+//! the completion request, and the host dispatches calls through this
+//! module (not Rig's agent/`Tool` execution path). The §12 repair layer
+//! needs a seam between JSON tool arguments and the typed dispatcher, so
+//! every tool pins `type Args = Value` and can mutate arguments in place
+//! via [`crate::engine::repair`] before `call()` runs.
 //!
 //! Concrete tools implement [`Tool`]; the dispatcher holds a
 //! `BTreeMap<String, Arc<dyn Tool>>`.

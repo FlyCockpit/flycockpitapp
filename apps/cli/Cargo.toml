@@ -76,10 +76,9 @@ portable-pty = "0.9"
 
 # HTTP / providers
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
-# Provider layer — used as request-builder primitives, not as an agent framework.
-# The crate was renamed to `rig_core` in 0.37 (was `rig` through 0.36); we
-# rename it back to `rig` via the `package` key so the existing
-# `use rig::…` imports keep working.
+# Provider layer — request-builder primitives only, not an agent framework.
+# Workspace pin is `package = "rig-core"` under the `rig` dep name (see root
+# Cargo.toml); Cockpit never enables Rig agent/companion features.
 rig = { workspace = true }
 tokio-tungstenite = { workspace = true }
 

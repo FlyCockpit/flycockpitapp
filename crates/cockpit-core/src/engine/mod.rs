@@ -1,10 +1,11 @@
 //! The agent loop — cockpit's conversation engine.
 //!
-//! Drives a manual rig conversation loop (the `manual_tool_calls.rs`
-//! pattern, not `agent.prompt()`): we build [`rig::completion::CompletionRequest`]
-//! values ourselves, dispatch tool calls through the [`tool`] layer,
-//! and persist `original_input` / `wire_input` / `recovery` on each
-//! tool-call row per GOALS §14.
+//! Drives Cockpit's host-owned completion-request conversation loop: it builds
+//! [`rig::completion::CompletionRequest`] values directly, dispatches tool calls
+//! through the [`tool`] layer, and persists `original_input` / `wire_input` /
+//! `recovery` on each tool-call row per GOALS §14. Rig supplies provider
+//! transport and message types only; Cockpit owns turn control and never uses
+//! Rig agent APIs.
 //!
 //! Layering:
 //!

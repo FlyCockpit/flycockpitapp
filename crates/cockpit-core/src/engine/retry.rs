@@ -132,8 +132,9 @@ pub(crate) fn is_usage_limit_failure(
 
 /// Classify a [`CompletionError`] into the retry taxonomy.
 ///
-/// Built on how rig 0.37 + reqwest 0.13 surface errors (verified via
-/// `kcl ask rig` and reading `rig-core` / `reqwest` sources):
+/// Built on how rig 0.41 + reqwest 0.13 surface errors (verified against
+/// `rig-core` / `reqwest` sources). Match arms stay non-exhaustive (`_`) so
+/// future rig error variants fail closed rather than breaking the build:
 ///
 /// | rig error | meaning | decision |
 /// |-----------|---------|----------|
@@ -280,7 +281,7 @@ fn classify_reqwest(err: &reqwest::Error) -> RetryDecision {
 /// (`"120"`) or an HTTP-date. Returns the delay from now, clamped to be
 /// non-negative; `None` for an unparseable value or a date in the past.
 ///
-/// Not currently fed by the streaming path (rig 0.37 discards response
+/// Not currently fed by the streaming path (rig may discard response
 /// headers on status errors — see [`classify`]), but implemented +
 /// tested so a future provider variant that surfaces the header (or a
 /// rig version that preserves it) wires in with a one-line change to

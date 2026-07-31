@@ -1901,7 +1901,8 @@ fn openai_additional_params_unchanged_when_retention_unset() {
 }
 
 /// The captured/as-sent body reflects the cache key for the OpenAI flavor
-/// but omits it for the native Anthropic flavor (which caches per-block).
+/// but omits it for native Anthropic (per-block cache) and native ChatGPT/
+/// Codex subscription (`codex-oauth` — distinct backend, no OpenAI cache keys).
 #[test]
 fn assembled_request_cache_key_is_openai_only() {
     let params = ModelParams {
@@ -1932,6 +1933,47 @@ fn assembled_request_cache_key_is_openai_only() {
     );
     // No top-level cache key in the native Anthropic capture.
     assert_eq!(anthropic["additional_params"], serde_json::Value::Null);
+
+    let chatgpt = assembled_request(
+        "gpt-5.3-codex",
+        "codex-oauth",
+        "SYS",
+        &[],
+        &Message::user("hi"),
+        &[],
+        &params,
+    );
+    assert!(
+        chatgpt["additional_params"]
+            .get("prompt_cache_key")
+            .is_none(),
+        "native ChatGPT/Codex must not receive OpenAI prompt_cache_key: {}",
+        chatgpt["additional_params"]
+    );
+    assert!(
+        chatgpt["additional_params"]
+            .get("prompt_cache_retention")
+            .is_none(),
+        "native ChatGPT/Codex must not receive prompt_cache_retention: {}",
+        chatgpt["additional_params"]
+    );
+}
+
+#[test]
+fn chatgpt_additional_params_omits_cache_keys_but_keeps_vendor() {
+    let params = ModelParams {
+        prompt_cache_key: Some("sess-abc".into()),
+        prompt_cache_retention: Some("24h".into()),
+        additional_params: Some(json!({ "vendor_knob": "on" })),
+        ..ModelParams::default()
+    };
+    let fragment = chatgpt_additional_params(&params).expect("vendor fragment present");
+    assert_eq!(fragment["vendor_knob"], json!("on"));
+    assert!(fragment.get("prompt_cache_key").is_none(), "{fragment}");
+    assert!(
+        fragment.get("prompt_cache_retention").is_none(),
+        "{fragment}"
+    );
 }
 
 #[test]
@@ -4564,6 +4606,41 @@ async fn utility_openai_arm_applies_max_tokens_cap() {
     }
 }
 
+/// Rig 0.41 maps OpenAI-compat `max_tokens` to Ollama's `options.num_predict`
+/// (and enforces it). Main turns must not invent a default from capability
+/// metadata — only explicit policy (e.g. utility caps) may set it.
+#[tokio::test]
+async fn openai_compat_main_turn_omits_max_tokens_by_default() {
+    // Streaming path (complete_captured) needs SSE turns, not RawJson.
+    let mut provider = ScriptedProvider::builder()
+        .turn(Turn::Text("ok".into()))
+        .start()
+        .await;
+    let url = provider.base_url();
+    // A non-None utility limit must not leak into ordinary complete() turns.
+    let model =
+        openai_model_at_with_wire_and_utility_limit(&url, WireApi::Completions, true, Some(128));
+    model
+        .complete_captured(
+            "system",
+            &[],
+            Message::user("hi"),
+            &[],
+            ModelParams::default(),
+            "Build",
+            None,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    let body = provider.next_request().await.body;
+    assert!(
+        body.get("max_tokens").is_none() || body["max_tokens"].is_null(),
+        "main OpenAI-compat/Ollama turns must omit max_tokens so providers keep their own defaults (rig 0.41 enforces num_predict when set): {body}"
+    );
+}
+
 #[tokio::test]
 async fn utility_max_tokens_respects_model_limits() {
     let mut provider =
@@ -5615,4 +5692,94 @@ fn every_model_carries_a_redaction_table() {
     // send methods scrub through; a table-less `Model` is unconstructible.
     assert!(model.redact().scrub(SECRET).contains(PLACEHOLDER));
     assert!(!model.redact().scrub(SECRET).contains(SECRET));
+}
+
+#[test]
+fn redact_preserves_opaque_reasoning_and_every_tool_result_part() {
+    let (_tmp, redact) = secret_table();
+    let opaque_encrypted = format!("encrypted:{SECRET}");
+    let opaque_redacted = format!("redacted:{SECRET}");
+    let message = Message::Assistant {
+        id: None,
+        content: OneOrMany::one(AssistantContent::Reasoning({
+            let mut reasoning = Reasoning::new("placeholder");
+            reasoning.id = Some("reasoning-id".into());
+            reasoning.content = vec![
+                ReasoningContent::Text {
+                    text: format!("text:{SECRET}"),
+                    signature: Some("signature".into()),
+                },
+                ReasoningContent::Encrypted(opaque_encrypted.clone()),
+                ReasoningContent::Redacted {
+                    data: opaque_redacted.clone(),
+                },
+                ReasoningContent::Summary(format!("summary:{SECRET}")),
+            ];
+            reasoning
+        })),
+    };
+    let scrubbed = scrub_message(&redact, &message);
+    let Message::Assistant { content, .. } = scrubbed else {
+        panic!("expected assistant message");
+    };
+    let AssistantContent::Reasoning(reasoning) = content.first() else {
+        panic!("expected reasoning content");
+    };
+    assert!(matches!(
+        &reasoning.content[0],
+        ReasoningContent::Text { text, signature: Some(signature) }
+            if text.contains(PLACEHOLDER) && signature == "signature"
+    ));
+    assert!(matches!(
+        &reasoning.content[1],
+        ReasoningContent::Encrypted(data) if data == &opaque_encrypted
+    ));
+    assert!(matches!(
+        &reasoning.content[2],
+        ReasoningContent::Redacted { data } if data == &opaque_redacted
+    ));
+    assert!(matches!(
+        &reasoning.content[3],
+        ReasoningContent::Summary(text) if text.contains(PLACEHOLDER)
+    ));
+
+    // Rig 0.41 represents one tool result as a non-empty ordered collection,
+    // not one flattened string. Preserve opaque JSON while scrubbing every
+    // text member so multipart results retain their provider meaning.
+    let tool_result = Message::User {
+        content: OneOrMany::one(UserContent::tool_result_with_call_id(
+            "tool-call",
+            "provider-call".to_string(),
+            OneOrMany::many(vec![
+                ToolResultContent::text(format!("first:{SECRET}")),
+                ToolResultContent::Json {
+                    value: json!({"secret": SECRET}),
+                },
+                ToolResultContent::text(format!("last:{SECRET}")),
+            ])
+            .expect("multipart tool result is non-empty"),
+        )),
+    };
+    let scrubbed = scrub_message(&redact, &tool_result);
+    let Message::User { content } = scrubbed else {
+        panic!("expected user message");
+    };
+    let UserContent::ToolResult(result) = content.first() else {
+        panic!("expected tool result");
+    };
+    assert_eq!(result.call_id.as_deref(), Some("provider-call"));
+    let parts: Vec<_> = result.content.iter().collect();
+    assert_eq!(parts.len(), 3);
+    assert!(matches!(
+        parts[0],
+        ToolResultContent::Text(text) if text.text.contains(PLACEHOLDER)
+    ));
+    assert!(matches!(
+        parts[1],
+        ToolResultContent::Json { value } if *value == json!({"secret": SECRET})
+    ));
+    assert!(matches!(
+        parts[2],
+        ToolResultContent::Text(text) if text.text.contains(PLACEHOLDER)
+    ));
 }

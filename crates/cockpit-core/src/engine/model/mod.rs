@@ -1,14 +1,24 @@
 //! Provider-side completion model dispatch.
 //!
+//! Host-owned inference boundary (rig 0.41): Cockpit builds
+//! [`rig::completion::CompletionRequest`] values via
+//! `CompletionModel::completion_request` and streams or sends them. Rig
+//! owns transport, SSE parsing, and message types; Cockpit owns the tool
+//! loop, multi-agent driver, redaction, retry, and wire-API recovery.
+//! There is no Rig `Agent` / `AgentRunner` on this path — tools are
+//! advertised as `ToolDefinition`s on the request and executed by
+//! Cockpit's `ToolBox`.
+//!
 //! `CompletionModel` in rig isn't object-safe (associated types +
 //! `impl Trait` returns + `Self` in return position), so we can't hold a
-//! `Box<dyn CompletionModel>`. The pattern upstream now recommends is an
-//! enum dispatch — see rig's `examples/enum_dispatch.rs`. We ship two
-//! variants: `OpenAi` (every OpenAI-compatible endpoint in the user's
-//! [`crate::providers`] templates — including Claude reached via
-//! OpenRouter/Copilot/etc.) and `Anthropic` (the native
-//! `api.anthropic.com` endpoint, which gets rig's provider-concrete
-//! per-block prompt caching, prompt `prompt-caching-strategy.md`).
+//! `Box<dyn CompletionModel>`. The pattern upstream recommends is enum
+//! dispatch — see rig's `examples/enum_dispatch.rs` and
+//! `examples/manual_tool_calls`. Variants: `OpenAi` (every OpenAI-
+//! compatible endpoint in the user's [`crate::providers`] templates —
+//! including Claude reached via OpenRouter/Copilot/etc.), `ChatGpt`
+//! (native ChatGPT/Codex Responses), and `Anthropic` (native
+//! `api.anthropic.com`, which gets rig's provider-concrete per-block
+//! prompt caching, prompt `prompt-caching-strategy.md`).
 //!
 //! Routing: a build site picks the native Anthropic path **only** when
 //! the resolved base URL's host is `api.anthropic.com` (see
@@ -36,7 +46,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures::{future::BoxFuture, future::Shared};
 use rig::client::CompletionClient;
-use rig::completion::Completion;
 use rig::message::{
     Message, Reasoning, ReasoningContent, ToolChoice, ToolResultContent, UserContent,
 };

@@ -43,8 +43,10 @@ pub(crate) fn sanitized_extra_params(
 /// and the stringified arguments of every assistant tool call. Static,
 /// harness-defined tool *schemas* are not part of a message and are never
 /// scrubbed here (they carry no user secrets). Opaque non-text parts (images,
-/// audio, video, documents, encrypted/redacted reasoning) pass through
-/// untouched.
+/// audio, video, documents, encrypted/redacted reasoning, and JSON tool-result
+/// members) pass through untouched. Rig 0.41 tool results are ordered non-empty
+/// multipart collections, so each text member is scrubbed independently without
+/// flattening, reordering, or altering opaque members.
 ///
 /// `scrub` is deterministic + idempotent, so re-scrubbing already-scrubbed
 /// cached history each turn yields byte-stable output — prompt caching is

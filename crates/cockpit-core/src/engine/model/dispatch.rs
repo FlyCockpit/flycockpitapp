@@ -1,5 +1,41 @@
 use super::*;
 use futures::StreamExt;
+use rig::completion::{CompletionModel, CompletionRequestBuilder};
+
+fn configured_completion_request<M: CompletionModel>(
+    model: M,
+    system: &str,
+    history: &[Message],
+    prompt: Message,
+    tools: &[ToolDefinition],
+    params: &ModelParams,
+    additional_params: Option<serde_json::Value>,
+) -> CompletionRequestBuilder<M> {
+    let mut request = model
+        .completion_request(prompt)
+        .messages(history.iter().cloned())
+        .tools(tools.to_vec())
+        .temperature_opt(params.temperature)
+        .max_tokens_opt(params.max_tokens)
+        .additional_params_opt(additional_params);
+    if !system.is_empty() {
+        request = request.preamble(system.to_string());
+    }
+    if params.tools_required && !tools.is_empty() {
+        request = request.tool_choice(ToolChoice::Required);
+    }
+    request
+}
+
+fn choice_text(choice: &OneOrMany<AssistantContent>) -> String {
+    choice
+        .iter()
+        .filter_map(|content| match content {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
 
 impl Model {
     /// One-shot, non-streaming, no-tools text completion. Used by
@@ -24,7 +60,6 @@ impl Model {
         params: ModelParams,
         prompt: &str,
     ) -> Result<String> {
-        use rig::completion::Prompt;
         let guard = self.outbound_guard();
         // Inference-dispatch chokepoint: refuse a *new* provider request once
         // the daemon has begun draining. Background utility calls are abandoned
@@ -57,20 +92,34 @@ impl Model {
                     .await
                 }
                 Model::ChatGpt { model, .. } => {
-                    let agent = build_chatgpt_agent(model.clone(), "", &[], &params);
-                    let response = agent
-                        .prompt(prompt)
-                        .await
-                        .context("text_completion: prompt failed")?;
-                    Ok(response.trim().to_string())
+                    let response = configured_completion_request(
+                        build_chatgpt_completion_model(model.clone()),
+                        "",
+                        &[],
+                        Message::user(prompt),
+                        &[],
+                        &params,
+                        chatgpt_additional_params(&params),
+                    )
+                    .send()
+                    .await
+                    .context("text_completion: send failed")?;
+                    Ok(choice_text(&response.choice).trim().to_string())
                 }
                 Model::Anthropic { model, .. } => {
-                    let agent = build_anthropic_agent(model.clone(), "", &[], &params);
-                    let response = agent
-                        .prompt(prompt)
-                        .await
-                        .context("text_completion: prompt failed")?;
-                    Ok(response.trim().to_string())
+                    let response = configured_completion_request(
+                        build_anthropic_completion_model(model.clone()),
+                        "",
+                        &[],
+                        Message::user(prompt),
+                        &[],
+                        &params,
+                        anthropic_additional_params(&params),
+                    )
+                    .send()
+                    .await
+                    .context("text_completion: send failed")?;
+                    Ok(choice_text(&response.choice).trim().to_string())
                 }
             }
         })
@@ -105,7 +154,6 @@ impl Model {
         system: &str,
         prompt: &str,
     ) -> Result<String> {
-        use rig::completion::Prompt;
         let guard = self.outbound_guard();
         // Inference-dispatch chokepoint: refuse a *new* provider request once
         // the daemon has begun draining. Background utility calls are abandoned
@@ -139,20 +187,34 @@ impl Model {
                     .await
                 }
                 Model::ChatGpt { model, .. } => {
-                    let agent = build_chatgpt_agent(model.clone(), system, &[], &params);
-                    let response = agent
-                        .prompt(prompt)
-                        .await
-                        .context("text_completion_with_system: prompt failed")?;
-                    Ok(response.trim().to_string())
+                    let response = configured_completion_request(
+                        build_chatgpt_completion_model(model.clone()),
+                        system,
+                        &[],
+                        Message::user(prompt),
+                        &[],
+                        &params,
+                        chatgpt_additional_params(&params),
+                    )
+                    .send()
+                    .await
+                    .context("text_completion_with_system: send failed")?;
+                    Ok(choice_text(&response.choice).trim().to_string())
                 }
                 Model::Anthropic { model, .. } => {
-                    let agent = build_anthropic_agent(model.clone(), system, &[], &params);
-                    let response = agent
-                        .prompt(prompt)
-                        .await
-                        .context("text_completion_with_system: prompt failed")?;
-                    Ok(response.trim().to_string())
+                    let response = configured_completion_request(
+                        build_anthropic_completion_model(model.clone()),
+                        system,
+                        &[],
+                        Message::user(prompt),
+                        &[],
+                        &params,
+                        anthropic_additional_params(&params),
+                    )
+                    .send()
+                    .await
+                    .context("text_completion_with_system: send failed")?;
+                    Ok(choice_text(&response.choice).trim().to_string())
                 }
             }
         })
@@ -198,7 +260,6 @@ impl Model {
         prompt: &str,
         tool: &ToolDefinition,
     ) -> Result<Vec<crate::engine::message::ToolCall>> {
-        use rig::completion::Completion;
         let guard = self.outbound_guard();
         // Inference-dispatch chokepoint: refuse a *new* provider request once
         // the daemon has begun draining. Background utility calls are abandoned
@@ -228,27 +289,35 @@ impl Model {
                     .await
                 }
                 Model::ChatGpt { model, .. } => {
-                    let agent = build_chatgpt_agent(model.clone(), system, &[], &params);
-                    let response = agent
-                        .completion(Message::user(prompt), Vec::<Message>::new())
-                        .await?
-                        .tool(tool.clone())
-                        .tool_choice(ToolChoice::Required)
-                        .send()
-                        .await
-                        .context("tool_completion: send failed")?;
+                    let response = configured_completion_request(
+                        build_chatgpt_completion_model(model.clone()),
+                        system,
+                        &[],
+                        Message::user(prompt),
+                        std::slice::from_ref(tool),
+                        &params,
+                        chatgpt_additional_params(&params),
+                    )
+                    .tool_choice(ToolChoice::Required)
+                    .send()
+                    .await
+                    .context("tool_completion: send failed")?;
                     Ok(crate::engine::message::collect_tool_calls(&response.choice))
                 }
                 Model::Anthropic { model, .. } => {
-                    let agent = build_anthropic_agent(model.clone(), system, &[], &params);
-                    let response = agent
-                        .completion(Message::user(prompt), Vec::<Message>::new())
-                        .await?
-                        .tool(tool.clone())
-                        .tool_choice(ToolChoice::Required)
-                        .send()
-                        .await
-                        .context("tool_completion: send failed")?;
+                    let response = configured_completion_request(
+                        build_anthropic_completion_model(model.clone()),
+                        system,
+                        &[],
+                        Message::user(prompt),
+                        std::slice::from_ref(tool),
+                        &params,
+                        anthropic_additional_params(&params),
+                    )
+                    .tool_choice(ToolChoice::Required)
+                    .send()
+                    .await
+                    .context("tool_completion: send failed")?;
                     Ok(crate::engine::message::collect_tool_calls(&response.choice))
                 }
             }
@@ -385,6 +454,12 @@ impl Model {
         .await
     }
 
+    /// `max_tokens` is deliberately not inferred for normal OpenAI-compatible
+    /// turns (including Ollama): their capability metadata can be stale or
+    /// describe context rather than completion capacity. Callers send an
+    /// explicit value only when policy requires it (for example utilities,
+    /// whose cap is tested below); omission lets each endpoint apply its own
+    /// model-specific default.
     fn with_resolved_model_params(&self, mut params: ModelParams) -> ModelParams {
         if params.max_tokens.is_none()
             && let Model::Anthropic { max_tokens, .. } = self
@@ -539,24 +614,28 @@ impl Model {
                         retry_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let wire_tools = wire_schema::definitions_for_wire(endpoint, tools);
                         let wire_tools = wire_tools.as_ref();
-                        // Build the OpenAI-compat agent against the *current*
-                        // endpoint: the kept `CompletionsClient` directly, or a
-                        // cheap O(1) `.responses_api()` swap of a clone (only the
-                        // provider extension changes; base URL/headers/HTTP are
-                        // reused). Re-built every attempt so a transient retry
-                        // rebuilds a fresh stream.
+                        // Build the OpenAI-compat completion request against
+                        // the *current* endpoint: the kept `CompletionsClient`
+                        // directly, or a cheap O(1) `.responses_api()` swap of
+                        // a clone (only the provider extension changes; base
+                        // URL/headers/HTTP are reused). Re-built every attempt
+                        // so a transient retry rebuilds a fresh stream.
                         match endpoint {
                             crate::config::providers::WireApi::Responses => {
                                 let responses = client.clone().responses_api();
-                                let agent = build_openai_responses_agent(
-                                    responses, model_id, system, wire_tools, &params,
+                                let completion =
+                                    build_openai_responses_completion_model(responses, model_id);
+                                let request = configured_completion_request(
+                                    completion,
+                                    system,
+                                    &history,
+                                    prompt.clone(),
+                                    wire_tools,
+                                    &params,
+                                    openai_additional_params(&params),
                                 );
                                 drain_completion_stream(
-                                    agent,
-                                    &prompt,
-                                    &history,
-                                    &params,
-                                    wire_tools,
+                                    request,
                                     agent_name,
                                     provider_id,
                                     model_id,
@@ -575,14 +654,18 @@ impl Model {
                             // `Completions` (and the defensive `Auto`, never the
                             // resolved value) use the kept completions client.
                             _ => {
-                                let agent =
-                                    build_agent(client, model_id, system, wire_tools, &params);
-                                drain_completion_stream(
-                                    agent,
-                                    &prompt,
+                                let completion = build_completion_model(client, model_id);
+                                let request = configured_completion_request(
+                                    completion,
+                                    system,
                                     &history,
-                                    &params,
+                                    prompt.clone(),
                                     wire_tools,
+                                    &params,
+                                    openai_additional_params(&params),
+                                );
+                                drain_completion_stream(
+                                    request,
                                     agent_name,
                                     provider_id,
                                     model_id,
@@ -746,13 +829,18 @@ impl Model {
                         tools,
                     );
                     let wire_tools = wire_tools.as_ref();
-                    let agent = build_chatgpt_agent(model.clone(), system, wire_tools, &params);
-                    drain_completion_stream(
-                        agent,
-                        &prompt,
+                    let completion = build_chatgpt_completion_model(model.clone());
+                    let request = configured_completion_request(
+                        completion,
+                        system,
                         &history,
-                        &params,
+                        prompt.clone(),
                         wire_tools,
+                        &params,
+                        chatgpt_additional_params(&params),
+                    );
+                    drain_completion_stream(
+                        request,
                         agent_name,
                         provider_id,
                         model_id,
@@ -787,13 +875,18 @@ impl Model {
                 // Native Anthropic: no wire-API selector, single retry unit.
                 let attempt = || async {
                     retry_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let agent = build_anthropic_agent(model.clone(), system, tools, &params);
-                    drain_completion_stream(
-                        agent,
-                        &prompt,
+                    let completion = build_anthropic_completion_model(model.clone());
+                    let request = configured_completion_request(
+                        completion,
+                        system,
                         &history,
-                        &params,
+                        prompt.clone(),
                         tools,
+                        &params,
+                        anthropic_additional_params(&params),
+                    );
+                    drain_completion_stream(
+                        request,
                         agent_name,
                         provider_id,
                         model_id,
@@ -1239,7 +1332,7 @@ impl Model {
     }
 
     /// Build + send one non-streaming tandem completion, returning the
-    /// aggregated choice + usage. Mirrors the agent-build of
+    /// aggregated choice + usage. Mirrors the completion-request construction of
     /// [`Self::complete_captured`] per provider flavor (so tools + params ride
     /// the request identically), but uses the single-shot `.send()` path: a
     /// tandem call never streams to the UI and never retries.
@@ -1263,23 +1356,31 @@ impl Model {
                         let wire_tools = wire_schema::definitions_for_wire(wire_api, tools);
                         let wire_tools = wire_tools.as_ref();
                         let responses = client.clone().responses_api();
-                        let agent = build_openai_responses_agent(
-                            responses, model_id, system, wire_tools, params,
-                        );
-                        let mut req = agent.completion(prompt.clone(), history.to_vec()).await?;
-                        if params.tools_required && !wire_tools.is_empty() {
-                            req = req.tool_choice(ToolChoice::Required);
-                        }
-                        let r = req.send().await?;
+                        let r = configured_completion_request(
+                            build_openai_responses_completion_model(responses, model_id),
+                            system,
+                            history,
+                            prompt.clone(),
+                            wire_tools,
+                            params,
+                            openai_additional_params(params),
+                        )
+                        .send()
+                        .await?;
                         Ok(tandem_choice_usage(r.choice, r.usage))
                     }
                     _ => {
-                        let agent = build_agent(client, model_id, system, tools, params);
-                        let mut req = agent.completion(prompt.clone(), history.to_vec()).await?;
-                        if params.tools_required && !tools.is_empty() {
-                            req = req.tool_choice(ToolChoice::Required);
-                        }
-                        let r = req.send().await?;
+                        let r = configured_completion_request(
+                            build_completion_model(client, model_id),
+                            system,
+                            history,
+                            prompt.clone(),
+                            tools,
+                            params,
+                            openai_additional_params(params),
+                        )
+                        .send()
+                        .await?;
                         Ok(tandem_choice_usage(r.choice, r.usage))
                     }
                 }
@@ -1290,21 +1391,31 @@ impl Model {
                     tools,
                 );
                 let wire_tools = wire_tools.as_ref();
-                let agent = build_chatgpt_agent(model.clone(), system, wire_tools, params);
-                let mut req = agent.completion(prompt.clone(), history.to_vec()).await?;
-                if params.tools_required && !wire_tools.is_empty() {
-                    req = req.tool_choice(ToolChoice::Required);
-                }
-                let r = req.send().await?;
+                let r = configured_completion_request(
+                    build_chatgpt_completion_model(model.clone()),
+                    system,
+                    history,
+                    prompt.clone(),
+                    wire_tools,
+                    params,
+                    chatgpt_additional_params(params),
+                )
+                .send()
+                .await?;
                 Ok(tandem_choice_usage(r.choice, r.usage))
             }
             Model::Anthropic { model, .. } => {
-                let agent = build_anthropic_agent(model.clone(), system, tools, params);
-                let mut req = agent.completion(prompt.clone(), history.to_vec()).await?;
-                if params.tools_required && !tools.is_empty() {
-                    req = req.tool_choice(ToolChoice::Required);
-                }
-                let r = req.send().await?;
+                let r = configured_completion_request(
+                    build_anthropic_completion_model(model.clone()),
+                    system,
+                    history,
+                    prompt.clone(),
+                    tools,
+                    params,
+                    anthropic_additional_params(params),
+                )
+                .send()
+                .await?;
                 Ok(tandem_choice_usage(r.choice, r.usage))
             }
         }
@@ -1320,25 +1431,42 @@ async fn openai_text_completion(
     prompt: &str,
     context: &'static str,
 ) -> Result<String> {
-    use rig::completion::Prompt;
-
-    let response = match wire_api {
+    let choice = match wire_api {
         crate::config::providers::WireApi::Responses => {
             let responses = client.clone().responses_api();
-            build_openai_responses_agent(responses, model_id, system.unwrap_or(""), &[], params)
-                .prompt(prompt)
-                .await
+            configured_completion_request(
+                build_openai_responses_completion_model(responses, model_id),
+                system.unwrap_or(""),
+                &[],
+                Message::user(prompt),
+                &[],
+                params,
+                openai_additional_params(params),
+            )
+            .send()
+            .await
+            .context(context)?
+            .choice
         }
         crate::config::providers::WireApi::Completions
         | crate::config::providers::WireApi::Auto => {
-            build_agent(client, model_id, system.unwrap_or(""), &[], params)
-                .prompt(prompt)
-                .await
+            configured_completion_request(
+                build_completion_model(client, model_id),
+                system.unwrap_or(""),
+                &[],
+                Message::user(prompt),
+                &[],
+                params,
+                openai_additional_params(params),
+            )
+            .send()
+            .await
+            .context(context)?
+            .choice
         }
-    }
-    .context(context)?;
+    };
 
-    Ok(response.trim().to_string())
+    Ok(choice_text(&choice).trim().to_string())
 }
 
 async fn openai_tool_completion(
@@ -1350,39 +1478,48 @@ async fn openai_tool_completion(
     prompt: &str,
     tool: &ToolDefinition,
 ) -> Result<Vec<crate::engine::message::ToolCall>> {
-    use rig::completion::Completion;
-
     let wire_tool = wire_schema::definitions_for_wire(wire_api, std::slice::from_ref(tool))
         .as_ref()
         .first()
         .cloned()
         .unwrap_or_else(|| tool.clone());
-    match wire_api {
+    let choice = match wire_api {
         crate::config::providers::WireApi::Responses => {
             let responses = client.clone().responses_api();
-            let response = build_openai_responses_agent(responses, model_id, system, &[], params)
-                .completion(Message::user(prompt), Vec::<Message>::new())
-                .await?
-                .tool(wire_tool)
-                .tool_choice(ToolChoice::Required)
-                .send()
-                .await
-                .context("tool_completion: send failed")?;
-            Ok(crate::engine::message::collect_tool_calls(&response.choice))
+            configured_completion_request(
+                build_openai_responses_completion_model(responses, model_id),
+                system,
+                &[],
+                Message::user(prompt),
+                std::slice::from_ref(&wire_tool),
+                params,
+                openai_additional_params(params),
+            )
+            .tool_choice(ToolChoice::Required)
+            .send()
+            .await
+            .context("tool_completion: send failed")?
+            .choice
         }
         crate::config::providers::WireApi::Completions
         | crate::config::providers::WireApi::Auto => {
-            let response = build_agent(client, model_id, system, &[], params)
-                .completion(Message::user(prompt), Vec::<Message>::new())
-                .await?
-                .tool(wire_tool)
-                .tool_choice(ToolChoice::Required)
-                .send()
-                .await
-                .context("tool_completion: send failed")?;
-            Ok(crate::engine::message::collect_tool_calls(&response.choice))
+            configured_completion_request(
+                build_completion_model(client, model_id),
+                system,
+                &[],
+                Message::user(prompt),
+                std::slice::from_ref(&wire_tool),
+                params,
+                openai_additional_params(params),
+            )
+            .tool_choice(ToolChoice::Required)
+            .send()
+            .await
+            .context("tool_completion: send failed")?
+            .choice
         }
-    }
+    };
+    Ok(crate::engine::message::collect_tool_calls(&choice))
 }
 
 pub(super) fn assembled_request(
@@ -1406,16 +1543,15 @@ pub(super) fn assembled_request(
         },
         // The exact extra fragment that gets flattened into the wire body —
         // computed the same way the live request computes it, so what's
-        // recorded is what's sent. The native Anthropic arm flattens only the
-        // sanitized vendor fragment (it caches per-block, no OpenAI-compatible
-        // prompt-cache keys); every OpenAI-compat arm also injects the
-        // top-level `prompt_cache_key` (`prompt-caching-strategy.md` decision
-        // 3) and optional retention. Omitted when there's nothing to add, so
-        // existing providers' captured bodies are unchanged.
-        "additional_params": if provider == "anthropic" {
-            anthropic_additional_params(params)
-        } else {
-            openai_additional_params(params)
+        // recorded is what's sent:
+        // - OpenAI-compat: vendor + native computer tools + prompt cache keys
+        // - codex-oauth (native ChatGPT): vendor + native computer tools only
+        // - anthropic: vendor + anthropic computer tools (per-block cache)
+        // Omitted when there's nothing to add.
+        "additional_params": match provider {
+            "anthropic" => anthropic_additional_params(params),
+            "codex-oauth" => chatgpt_additional_params(params),
+            _ => openai_additional_params(params),
         },
         "native_computer_beta_headers": native_computer_beta_headers(params),
         "history": history,
@@ -1483,11 +1619,11 @@ pub struct TandemOutcome {
     pub status: InferenceRequestStatus,
 }
 
-/// Drain one streaming completion attempt over a built `rig::agent::Agent`,
+/// Drain one streaming completion attempt from a configured raw Rig request,
 /// emitting text/reasoning deltas and aggregating the final choice + usage.
 /// Generic over the model flavor so both the OpenAI-compat and native
 /// Anthropic arms of [`Model::complete_captured`] share one body — the only
-/// per-provider difference is how the agent is built.
+/// per-provider difference is how the `CompletionRequestBuilder` is built.
 ///
 /// rig's `StreamingCompletionResponse` aggregates `choice` / `message_id`
 /// internally as the stream advances; the post-loop reads pick them up. The
@@ -1506,11 +1642,7 @@ pub struct TandemOutcome {
 /// records exactly where it stopped.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn drain_completion_stream<M>(
-    agent: rig::agent::Agent<M>,
-    prompt: &Message,
-    history: &[Message],
-    params: &ModelParams,
-    tools: &[ToolDefinition],
+    request: CompletionRequestBuilder<M>,
     agent_name: &str,
     provider_id: &str,
     model_id: &str,
@@ -1527,18 +1659,14 @@ pub(super) async fn drain_completion_stream<M>(
 where
     M: rig::completion::CompletionModel,
 {
-    let mut req = agent.completion(prompt.clone(), history.to_vec()).await?;
-    if params.tools_required && !tools.is_empty() {
-        req = req.tool_choice(ToolChoice::Required);
-    }
-    // Build the stream, racing the build against cancellation so a ctrl+c
+    // Build the stream, racing the request dispatch against cancellation so a ctrl+c
     // during the initial round-trip aborts promptly. The request is now on
     // the wire: record `Dispatched` so a stall before the first token is
     // attributed to the dispatched (not prep) phase.
     let mut stream = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(attempt_cancelled()),
-        built = req.stream() => built?,
+        built = request.stream() => built?,
     };
     bump_phase(phase, InferencePhase::Dispatched);
     await_pre_drain_record(pre_drain).await?;

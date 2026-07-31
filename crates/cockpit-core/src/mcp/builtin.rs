@@ -3093,10 +3093,9 @@ mod tests {
                     .unwrap()
                     .into_iter()
                     .next()
+                    && hub.has_waiter(row.interrupt_id)
                 {
-                    if hub.has_waiter(row.interrupt_id) {
-                        return row;
-                    }
+                    return row;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -3176,10 +3175,9 @@ mod tests {
                     .unwrap()
                     .into_iter()
                     .next()
+                    && hub.has_waiter(row.interrupt_id)
                 {
-                    if hub.has_waiter(row.interrupt_id) {
-                        return row;
-                    }
+                    return row;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }

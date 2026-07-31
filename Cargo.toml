@@ -61,7 +61,15 @@ regex = "1"
 # workspace entry featureless-with-no-defaults prevents one member's feature
 # needs from silently growing another member's build.
 reqwest = { version = "0.13", default-features = false }
-rig = { version = "0.40", package = "rig-core", features = ["image"] }
+# Portable Rig contracts + provider transport only (completion/message/providers).
+# Depend on `rig-core` directly — not the `rig` facade umbrella, which locks
+# unused companion crates (agent, lancedb, fastembed, …) into Cargo.lock even
+# when their features are off. Dependency key stays `rig` so `use rig::…`
+# keeps working against lib target `rig_core` (renamed in 0.37). Features:
+# `image` (message/provider image paths), `rustls` (TLS stance), `reqwest`
+# (http2/system-proxy/charset; not enabled by default-features = false alone).
+# Never enable facade `agent` / companion features — Cockpit owns the tool loop.
+rig = { version = "0.41", package = "rig-core", default-features = false, features = ["image", "rustls", "reqwest"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

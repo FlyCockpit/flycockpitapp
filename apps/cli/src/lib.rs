@@ -4,6 +4,11 @@
 //! target exists so process-boundary tests can exercise the daemon protocol
 //! without duplicating wire types.
 
+// rig 0.41's completion/message types deepen the async layout of long CLI
+// command futures (notably `commands::ask::run`) past rustc's default query
+// depth of 128. 256 matches the compiler's own suggestion for this crate.
+#![recursion_limit = "256"]
+
 mod cli;
 mod commands;
 pub use cockpit_config as config;

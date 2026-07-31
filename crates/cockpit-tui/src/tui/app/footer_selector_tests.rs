@@ -288,6 +288,7 @@ fn config_drift_hover_restyles_span() {
         app.llm_mode,
         &app.agent_path,
         app.hovered_footer_control,
+        app.sandbox_mode,
         app.sandbox_escalation_enabled,
         false,
         true,

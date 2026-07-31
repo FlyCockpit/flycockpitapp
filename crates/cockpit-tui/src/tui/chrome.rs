@@ -14,7 +14,7 @@ use ratatui::text::Span;
 use crate::tui::theme::{
     FAVORITE_MODEL, MUTED_COLOR_INDEX, PLAN_YELLOW, STATUS_BRANCH_BADGE, WARNING_TEXT,
 };
-use cockpit_config::extended::LlmMode;
+use cockpit_config::{extended::LlmMode, sandbox_mode::SandboxMode};
 use cockpit_core::git::repo_counts;
 use cockpit_core::welcome::LaunchInfo;
 use cockpit_db::connector::ConnectorDisclosure;
@@ -77,6 +77,7 @@ pub fn left_status(
     llm_mode: LlmMode,
     agent_path: &[String],
     selected: Option<FooterControl>,
+    sandbox_mode: SandboxMode,
     sandbox_escalation_enabled: bool,
     longcache_enabled: bool,
     longcache_supported: bool,
@@ -191,27 +192,26 @@ pub fn left_status(
         push_span(&mut spans, &mut col, Span::styled(label, style));
     }
 
-    push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
-    let escalation_style = if sandbox_escalation_enabled {
-        muted
-    } else {
-        Style::default().fg(Color::Yellow)
+    let (sandbox_label, sandbox_style) = match sandbox_mode {
+        SandboxMode::Off => ("sandbox off", Style::default().fg(WARNING_TEXT)),
+        SandboxMode::Sandbox => ("sandbox", muted),
+        SandboxMode::Container => ("container", muted),
+        SandboxMode::ContainerReadonly => ("container readonly", muted),
     };
+    push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
     push_span(
         &mut spans,
         &mut col,
-        Span::styled(
-            format!(
-                "esc {}",
-                if sandbox_escalation_enabled {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            escalation_style,
-        ),
+        Span::styled(sandbox_label.to_string(), sandbox_style),
     );
+    if sandbox_mode.enabled() && !sandbox_escalation_enabled {
+        push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
+        push_span(
+            &mut spans,
+            &mut col,
+            Span::styled("esc off".to_string(), Style::default().fg(WARNING_TEXT)),
+        );
+    }
 
     LeftStatus { spans, hits }
 }
@@ -429,6 +429,7 @@ mod tests {
             LlmMode::Defensive,
             std::slice::from_ref(&info.agent_name),
             None,
+            SandboxMode::Sandbox,
             true,
             false,
             true,
@@ -454,6 +455,7 @@ mod tests {
             LlmMode::Defensive,
             std::slice::from_ref(&info.agent_name),
             None,
+            SandboxMode::Sandbox,
             true,
             false,
             true,
@@ -476,6 +478,7 @@ mod tests {
             LlmMode::Defensive,
             std::slice::from_ref(&info.agent_name),
             None,
+            SandboxMode::Sandbox,
             true,
             false,
             true,
@@ -488,7 +491,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             text,
-            "Build · openai/gpt-test model ≠ config · defensive · esc on"
+            "Build · openai/gpt-test model ≠ config · defensive · sandbox"
         );
         let drift_idx = spans
             .iter()
@@ -507,6 +510,7 @@ mod tests {
             LlmMode::Defensive,
             std::slice::from_ref(&info.agent_name),
             None,
+            SandboxMode::Sandbox,
             true,
             false,
             true,
@@ -528,6 +532,7 @@ mod tests {
             LlmMode::Defensive,
             std::slice::from_ref(&info.agent_name),
             Some(FooterControl::ConfigDrift),
+            SandboxMode::Sandbox,
             true,
             false,
             true,
@@ -585,6 +590,7 @@ mod tests {
             LlmMode::Frontier,
             &path,
             Some(FooterControl::Mode),
+            SandboxMode::Sandbox,
             true,
             false,
             true,
@@ -597,7 +603,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "Build › explore · openai/gpt-test · frontier · esc on"
+            "Build › explore · openai/gpt-test · frontier · sandbox"
         );
         assert_eq!(
             status
@@ -628,7 +634,16 @@ mod tests {
         let info = launch_info("Build");
         let path = vec!["Build".to_string()];
 
-        let off = left_status(&info, LlmMode::Normal, &path, None, true, false, true);
+        let off = left_status(
+            &info,
+            LlmMode::Normal,
+            &path,
+            None,
+            SandboxMode::Sandbox,
+            true,
+            false,
+            true,
+        );
         let off_text = off
             .spans
             .iter()
@@ -636,7 +651,16 @@ mod tests {
             .collect::<String>();
         assert!(!off_text.contains("longcache"), "{off_text}");
 
-        let supported = left_status(&info, LlmMode::Normal, &path, None, true, true, true);
+        let supported = left_status(
+            &info,
+            LlmMode::Normal,
+            &path,
+            None,
+            SandboxMode::Sandbox,
+            true,
+            true,
+            true,
+        );
         let supported_text = supported
             .spans
             .iter()
@@ -645,7 +669,16 @@ mod tests {
         assert!(supported_text.contains("longcache"), "{supported_text}");
         assert!(!supported_text.contains("unsupported"), "{supported_text}");
 
-        let unsupported = left_status(&info, LlmMode::Normal, &path, None, true, true, false);
+        let unsupported = left_status(
+            &info,
+            LlmMode::Normal,
+            &path,
+            None,
+            SandboxMode::Sandbox,
+            true,
+            true,
+            false,
+        );
         let unsupported_text = unsupported
             .spans
             .iter()
@@ -655,6 +688,56 @@ mod tests {
             unsupported_text.contains("longcache unsupported"),
             "{unsupported_text}"
         );
+    }
+
+    fn sandbox_status_text(mode: SandboxMode, escalation_enabled: bool) -> String {
+        let info = launch_info("Build");
+        left_status(
+            &info,
+            LlmMode::Normal,
+            std::slice::from_ref(&info.agent_name),
+            None,
+            mode,
+            escalation_enabled,
+            false,
+            true,
+        )
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+    }
+
+    #[test]
+    fn left_status_sandbox_off_shows_sandbox_off() {
+        let text = sandbox_status_text(SandboxMode::Off, true);
+        assert!(text.contains("sandbox off"), "{text}");
+        assert!(!text.contains("esc "), "{text}");
+    }
+
+    #[test]
+    fn left_status_sandbox_on_omits_esc_on() {
+        let text = sandbox_status_text(SandboxMode::Sandbox, true);
+        assert!(text.contains("sandbox"), "{text}");
+        assert!(!text.contains("esc "), "{text}");
+    }
+
+    #[test]
+    fn left_status_sandbox_on_esc_off() {
+        assert!(sandbox_status_text(SandboxMode::Sandbox, false).contains("sandbox · esc off"));
+    }
+
+    #[test]
+    fn left_status_container_mode_label() {
+        let text = sandbox_status_text(SandboxMode::Container, false);
+        assert!(text.contains("container · esc off"), "{text}");
+    }
+
+    #[test]
+    fn left_status_container_readonly_mode_label() {
+        let text = sandbox_status_text(SandboxMode::ContainerReadonly, true);
+        assert!(text.contains("container readonly"), "{text}");
+        assert!(!text.contains("esc "), "{text}");
     }
 }
 

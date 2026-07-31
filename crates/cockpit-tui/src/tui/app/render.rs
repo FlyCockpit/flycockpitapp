@@ -4042,6 +4042,7 @@ impl App {
             self.llm_mode,
             &self.agent_path,
             self.hovered_footer_control.or(self.footer_selection),
+            self.sandbox_mode,
             self.sandbox_escalation_enabled,
             self.longcache_enabled,
             self.longcache_supported,

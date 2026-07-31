@@ -15,7 +15,6 @@
 -- Exact identity for the amended pre-release squash. Unlike the
 -- `schema_version` migration ledger, this changes whenever 0001 is amended so
 -- an older development database cannot silently masquerade as current.
-PRAGMA user_version = 9;
 
 -- ---- assistants ------------------------------------------------------------
 

@@ -84,18 +84,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
+use sha2::{Digest, Sha256};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Exact identity of the pre-release squashed schema in `0001_initial.sql`.
-///
-/// The migration ledger cannot detect edits to an already-applied squashed
-/// migration, so every amendment to `0001_initial.sql` must also increment
-/// this value and the matching `PRAGMA user_version` in that file. This gate
-/// is intentionally strict until the first public release: developers move a
-/// stale database aside and let Cockpit recreate it rather than running a
-/// compatibility migration.
-pub const EXPECTED_SCHEMA_VERSION: i64 = 9;
 
 thread_local! {
     static OPEN_DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -333,8 +324,7 @@ impl Db {
         timer.phase("connect_and_pragmas");
         migrate(&conn)?;
         timer.phase("migrate");
-        validate_schema_version(&conn, Some(path))?;
-        timer.phase("schema_version");
+
         drop(conn);
         let writer = Writer::start(path.to_path_buf())?;
         let db = Self {
@@ -353,7 +343,7 @@ impl Db {
         let conn = Connection::open_in_memory().context("opening in-memory sqlite")?;
         apply_connection_pragmas(&conn, false).context("setting pragmas on in-memory db")?;
         migrate(&conn)?;
-        validate_schema_version(&conn, None)?;
+
         let db = Self {
             memory: Some(Arc::new(Mutex::new(conn))),
             writer: None,
@@ -724,6 +714,61 @@ fn migrate(conn: &Connection) -> Result<()> {
     migrate_with(conn, MIGRATIONS)
 }
 
+fn migration_name(version: usize) -> String {
+    format!("{version:04}_initial.sql")
+}
+fn migration_hash(sql: &str) -> String {
+    Sha256::digest(sql.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn verify_ledger(conn: &Connection, migrations: &[&str]) -> Result<()> {
+    let mut stmt =
+        conn.prepare("SELECT version, name, sha256 FROM schema_version ORDER BY version")?;
+    for row in stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (version, name, hash) = row?;
+        if version > migrations.len() as i64 {
+            anyhow::bail!("database migration ledger is newer than this binary");
+        }
+        let expected_name = migration_name(version as usize);
+        let expected_hash = migration_hash(migrations[(version - 1) as usize]);
+        if name != expected_name || hash != expected_hash {
+            anyhow::bail!(
+                "migration checksum mismatch for {expected_name}: applied migration was amended"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn upgrade_legacy_ledger(conn: &Connection, migrations: &[&str]) -> Result<()> {
+    let mut names = Vec::new();
+    let mut stmt = conn.prepare("PRAGMA table_info(schema_version)")?;
+    for row in stmt.query_map([], |row| row.get::<_, String>(1))? {
+        names.push(row?);
+    }
+    for (column, kind) in [("name", "TEXT"), ("sha256", "TEXT"), ("applied_at", "TEXT")] {
+        if !names.iter().any(|name| name == column) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE schema_version ADD COLUMN {column} {kind}"
+            ))?;
+        }
+    }
+    for (index, sql) in migrations.iter().enumerate() {
+        let version = (index + 1) as i64;
+        conn.execute("UPDATE schema_version SET name=?2, sha256=?3, applied_at=COALESCE(applied_at, CURRENT_TIMESTAMP) WHERE version=?1 AND (name IS NULL OR sha256 IS NULL)", rusqlite::params![version, migration_name(index + 1), migration_hash(sql)])?;
+    }
+    Ok(())
+}
+
 /// Apply pending migrations under one `BEGIN IMMEDIATE` writer lock.
 ///
 /// Pending migration work runs with SQLite foreign-key enforcement
@@ -733,8 +778,8 @@ fn migrate(conn: &Connection) -> Result<()> {
 /// because that pragma is a no-op inside a transaction.
 fn migrate_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
     let current_before_lock = current_schema_version(conn)?;
-    if current_before_lock >= migrations.len() as i64 {
-        return Ok(());
+    if current_before_lock > migrations.len() as i64 {
+        anyhow::bail!("database migration ledger is newer than this binary");
     }
 
     let fk_was_on = foreign_keys_enabled(conn).context("reading foreign_keys pragma")?;
@@ -745,10 +790,12 @@ fn migrate_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
             .context("database is busy applying migrations")?;
 
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, applied_at TEXT);",
         )
         .context("creating schema_version table")?;
 
+        upgrade_legacy_ledger(conn, migrations)?;
+        verify_ledger(conn, migrations)?;
         let current = current_schema_version(conn)?;
 
         for (i, sql) in migrations.iter().enumerate() {
@@ -759,11 +806,13 @@ fn migrate_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
             conn.execute_batch(sql)
                 .with_context(|| format!("applying migration {version}"))?;
             conn.execute(
-                "INSERT INTO schema_version (version) VALUES (?1)",
-                [version],
+                "INSERT INTO schema_version (version, name, sha256, applied_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
+                rusqlite::params![version, migration_name(version as usize), migration_hash(sql)],
             )
             .with_context(|| format!("recording migration {version}"))?;
         }
+
+        conn.pragma_update(None, "user_version", migrations.len() as i64)?;
 
         if fk_was_on {
             foreign_key_check(conn).context("validating migration foreign keys")?;
@@ -813,22 +862,6 @@ fn current_schema_version(conn: &Connection) -> Result<i64> {
 fn sqlite_schema_version(conn: &Connection) -> Result<i64> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
         .context("reading SQLite schema version")
-}
-
-fn validate_schema_version(conn: &Connection, path: Option<&Path>) -> Result<()> {
-    let actual = sqlite_schema_version(conn)?;
-    if actual == EXPECTED_SCHEMA_VERSION {
-        return Ok(());
-    }
-    let location = path
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "<in-memory>".to_string());
-    anyhow::bail!(
-        "database schema version mismatch for {location}: found {actual}, expected \
-         {EXPECTED_SCHEMA_VERSION}. This pre-release build uses a squashed schema; move the \
-         database and its -wal/-shm sidecars aside, then restart Cockpit. See Cockpit CLI \
-         README: Development schema resets"
-    )
 }
 
 fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {
@@ -894,6 +927,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
+        let ledger: (String, String) = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT name, sha256 FROM schema_version WHERE version = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ledger.0, "0001_initial.sql");
+        assert!(!ledger.1.is_empty());
+    }
+
+    #[test]
+    fn runner_writes_user_version_mirror() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, MIGRATIONS).unwrap();
+        assert_eq!(
+            sqlite_schema_version(&conn).unwrap(),
+            MIGRATIONS.len() as i64
+        );
+    }
+
+    #[test]
+    fn amended_migration_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ledger.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            migrate_with(&conn, MIGRATIONS).unwrap();
+        }
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE schema_version SET sha256 = ?1 WHERE version = 1",
+            ["amended"],
+        )
+        .unwrap();
+        let error = migrate_with(&conn, MIGRATIONS).unwrap_err();
+        assert!(error.to_string().contains("0001_initial.sql"));
+    }
+
+    #[test]
+    fn newer_database_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, MIGRATIONS).unwrap();
+        conn.execute("INSERT INTO schema_version (version, name, sha256, applied_at) VALUES (99, \"future\", \"future\", \"now\")", []).unwrap();
+        assert!(
+            migrate_with(&conn, MIGRATIONS)
+                .unwrap_err()
+                .to_string()
+                .contains("newer")
+        );
+    }
+
+    #[test]
+    fn second_migration_applies_to_existing_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        let first = "CREATE TABLE first_migration (id INTEGER PRIMARY KEY);";
+        let second = "CREATE TABLE second_migration (id INTEGER PRIMARY KEY);";
+        migrate_with(&conn, &[first]).unwrap();
+        migrate_with(&conn, &[first, second]).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 2);
+        assert_eq!(sqlite_schema_version(&conn).unwrap(), 2);
     }
 
     #[tokio::test]
@@ -909,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn db_async_ops_schema_version_available_through_async_api() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), EXPECTED_SCHEMA_VERSION);
+        assert_eq!(db.schema_version().await.unwrap(), MIGRATIONS.len() as i64);
     }
 
     #[test]

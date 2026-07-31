@@ -1,4 +1,4 @@
-use super::oauth_flow::OAuthBrowserBegin;
+use super::oauth_flow::{OAuthBrowserBegin, OAuthOption, oauth_options};
 use super::*;
 use cockpit_config::providers::{AuthKind, ProvidersConfig};
 use cockpit_config::providers::{ConfigDoc, ProviderEntry};
@@ -2009,6 +2009,47 @@ fn oauth_grok_ssh_begin_binds_no_listener() {
 }
 
 #[test]
+fn subscription_oauth_acknowledgement_blocks_login_until_chosen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut state = OAuthFlowState::new(OAuthProvider::Codex);
+
+    assert_eq!(state.option_count(OAuthHost::AddWizard), 1);
+    assert_eq!(
+        oauth_options(&state, OAuthHost::AddWizard),
+        vec![OAuthOption::Acknowledge]
+    );
+
+    let outcome = handle_oauth_flow_key_with(
+        press(KeyCode::Enter),
+        &mut state,
+        OAuthHost::AddWizard,
+        fake_oauth_effects(),
+    );
+    assert_eq!(outcome.nav, OAuthNav::Stay);
+    assert!(outcome.action.is_none());
+    assert!(
+        cockpit_core::auth::subscription_ack::acknowledged(
+            cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER
+        )
+        .unwrap()
+    );
+    assert_ne!(
+        oauth_options(&state, OAuthHost::AddWizard),
+        vec![OAuthOption::Acknowledge]
+    );
+
+    let grok = OAuthFlowState::new(OAuthProvider::Grok);
+    assert_eq!(
+        oauth_options(&grok, OAuthHost::AddWizard),
+        vec![OAuthOption::Acknowledge]
+    );
+
+    let body = oauth_body_text(&state, OAuthHost::AddWizard);
+    assert!(!body.contains("I acknowledge the risk"));
+}
+
+#[test]
 fn oauth_grok_manual_paste_option_focuses_without_rebeginning_state() {
     let _guard = OAUTH_EFFECTS_TEST_LOCK
         .lock()
@@ -2035,7 +2076,7 @@ fn oauth_grok_manual_paste_option_focuses_without_rebeginning_state() {
 
 #[test]
 fn oauth_grok_manual_paste_starts_session_then_focuses_input() {
-    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.logged_in = false;
     state.cursor = 1;
 
@@ -2062,7 +2103,7 @@ fn oauth_grok_manual_paste_starts_session_then_focuses_input() {
 
 #[test]
 fn oauth_grok_manual_paste_preserves_existing_session_and_input() {
-    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.set_browser_session_for_test("https://example.test/oauth");
     state.manual_input.set("already pasted");
     state.cursor = 1;
@@ -2078,7 +2119,7 @@ fn oauth_grok_manual_paste_preserves_existing_session_and_input() {
 
 #[test]
 fn oauth_grok_login_after_failed_manual_begin_does_not_focus_paste() {
-    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.logged_in = false;
     state.cursor = 1;
     handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::AddWizard);
@@ -2100,7 +2141,7 @@ fn oauth_grok_login_after_failed_manual_begin_does_not_focus_paste() {
 
 #[test]
 fn oauth_grok_manual_paste_rendering_and_no_session_error_explain_recovery() {
-    let mut focused = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut focused = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     focused.set_browser_session_for_test("https://example.test/oauth");
     focused.paste_focused = true;
     let focused_body = oauth_body_text(&focused, OAuthHost::AddWizard);
@@ -2111,7 +2152,8 @@ fn oauth_grok_manual_paste_rendering_and_no_session_error_explain_recovery() {
     let menu_body = oauth_body_text(&focused, OAuthHost::AddWizard);
     assert!(menu_body.contains("c copy URL"));
 
-    let mut without_session = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut without_session =
+        OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     without_session.paste_focused = true;
     handle_oauth_flow_key(
         press(KeyCode::Enter),
@@ -2219,7 +2261,9 @@ fn codex_copy_keys_are_ssh_aware() {
 #[test]
 fn add_grok_oauth_paste_focus_reports_active_text_field() {
     let mut state = AddState::new();
-    state.enter_oauth_for_test(OAuthFlowState::new(OAuthProvider::Grok));
+    state.enter_oauth_for_test(OAuthFlowState::new_without_acknowledgement_for_test(
+        OAuthProvider::Grok,
+    ));
     let mut page = ProvidersPage::Add(state);
 
     assert!(page.active_text_field().is_none());
@@ -2244,7 +2288,7 @@ fn add_grok_oauth_paste_focus_reports_active_text_field() {
 
 #[test]
 fn grok_paste_focus_char_c_inserts_instead_of_copying_url() {
-    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.paste_focused = true;
     state.set_browser_session_for_test("https://example.test/oauth");
 
@@ -2258,7 +2302,7 @@ fn grok_paste_focus_char_c_inserts_instead_of_copying_url() {
 
 #[test]
 fn grok_paste_focus_char_by_char_callback_keeps_shortcut_letters() {
-    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.paste_focused = true;
     let callback = "http://127.0.0.1:56121/callback?code=abc123&state=s";
 
@@ -2271,7 +2315,7 @@ fn grok_paste_focus_char_by_char_callback_keeps_shortcut_letters() {
 
 #[test]
 fn codex_oauth_logged_in_renders_single_continue_row() {
-    let mut state = OAuthFlowState::new(OAuthProvider::Codex);
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     state.logged_in = true;
     state.status = Some(Ok("Codex OAuth login complete".to_string()));
     let mut lines = Vec::new();
@@ -2292,7 +2336,7 @@ fn codex_oauth_logged_in_renders_single_continue_row() {
 
 #[test]
 fn codex_oauth_logged_out_renders_start_or_poll_menu() {
-    let mut state = OAuthFlowState::new(OAuthProvider::Codex);
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     state.logged_in = false;
     let mut lines = Vec::new();
 
@@ -2323,7 +2367,7 @@ fn codex_oauth_logged_out_renders_start_or_poll_menu() {
 
 #[test]
 fn grok_oauth_logged_in_renders_single_continue_row() {
-    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.logged_in = true;
     state.status = Some(Ok("xAI OAuth login complete".to_string()));
     let mut lines = Vec::new();
@@ -2344,7 +2388,7 @@ fn grok_oauth_logged_in_renders_single_continue_row() {
 
 #[test]
 fn grok_oauth_logged_out_renders_full_menu() {
-    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.logged_in = false;
     let mut lines = Vec::new();
 
@@ -2363,13 +2407,13 @@ fn grok_oauth_logged_out_renders_full_menu() {
 
 #[test]
 fn logged_in_oauth_navigation_clamps_to_single_continue_row() {
-    let mut codex = OAuthFlowState::new(OAuthProvider::Codex);
+    let mut codex = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     codex.logged_in = true;
     codex.cursor = 99;
     handle_oauth_flow_key(press(KeyCode::Down), &mut codex, OAuthHost::AddWizard);
     assert_eq!(codex.cursor, 0);
 
-    let mut grok = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut grok = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     grok.logged_in = true;
     grok.cursor = 99;
     handle_oauth_flow_key(press(KeyCode::Up), &mut grok, OAuthHost::AddWizard);
@@ -2378,7 +2422,7 @@ fn logged_in_oauth_navigation_clamps_to_single_continue_row() {
 
 #[test]
 fn oauth_grok_login_option_still_begins() {
-    let mut state = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.logged_in = false;
     state.ssh = false;
     state.cursor = 0;
@@ -2398,7 +2442,7 @@ fn oauth_grok_login_option_still_begins() {
 fn standalone_oauth_enter_on_continue_returns_to_edit() {
     for provider in [OAuthProvider::Codex, OAuthProvider::Grok] {
         let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
-        let mut state = OAuthFlowState::new(provider);
+        let mut state = OAuthFlowState::new_without_acknowledgement_for_test(provider);
         state.logged_in = true;
         state.cursor = 0;
         let mut page = standalone_oauth_page(provider, state);
@@ -2423,7 +2467,7 @@ fn add_wizard_oauth_enter_saves_without_backing_out() {
         ("grok-oauth", OAuthProvider::Grok),
     ] {
         let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
-        let mut oauth = OAuthFlowState::new(provider);
+        let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(provider);
         oauth.logged_in = true;
         oauth.cursor = 0;
         let mut state = add_state_for_oauth(template_id, oauth);
@@ -2445,14 +2489,14 @@ fn add_wizard_oauth_enter_saves_without_backing_out() {
 #[test]
 fn standalone_oauth_body_hides_skip_continue_row() {
     for provider in [OAuthProvider::Codex, OAuthProvider::Grok] {
-        let mut logged_out = OAuthFlowState::new(provider);
+        let mut logged_out = OAuthFlowState::new_without_acknowledgement_for_test(provider);
         logged_out.logged_in = false;
         assert!(
             !oauth_body_text(&logged_out, OAuthHost::Standalone).contains("skip / continue"),
             "{provider:?} logged-out standalone body should hide skip"
         );
 
-        let mut active = OAuthFlowState::new(provider);
+        let mut active = OAuthFlowState::new_without_acknowledgement_for_test(provider);
         match provider {
             OAuthProvider::Grok => {
                 active.set_browser_session_for_test("https://example.test/oauth");
@@ -2472,7 +2516,7 @@ fn standalone_oauth_body_hides_skip_continue_row() {
             "{provider:?} active standalone body should hide skip"
         );
 
-        let mut confirming = OAuthFlowState::new(provider);
+        let mut confirming = OAuthFlowState::new_without_acknowledgement_for_test(provider);
         confirming.logged_in = true;
         assert!(
             !oauth_body_text(&confirming, OAuthHost::Standalone).contains("skip / continue"),
@@ -2483,7 +2527,7 @@ fn standalone_oauth_body_hides_skip_continue_row() {
 
 #[test]
 fn add_host_oauth_body_keeps_skip_continue_row() {
-    let mut codex = OAuthFlowState::new(OAuthProvider::Codex);
+    let mut codex = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     codex.logged_in = false;
     assert!(oauth_body_text(&codex, OAuthHost::AddWizard).contains("skip / continue"));
     codex.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
@@ -2492,7 +2536,7 @@ fn add_host_oauth_body_keeps_skip_continue_row() {
     ));
     assert!(oauth_body_text(&codex, OAuthHost::AddWizard).contains("skip / continue"));
 
-    let mut grok = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut grok = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     grok.logged_in = false;
     assert!(oauth_body_text(&grok, OAuthHost::AddWizard).contains("skip / continue"));
     grok.set_browser_session_for_test("https://example.test/oauth");
@@ -2503,14 +2547,16 @@ fn add_host_oauth_body_keeps_skip_continue_row() {
 #[test]
 fn oauth_option_count_matches_rendered_rows_per_host() {
     for host in [OAuthHost::Standalone, OAuthHost::AddWizard] {
-        let mut grok_logged_out = OAuthFlowState::new(OAuthProvider::Grok);
+        let mut grok_logged_out =
+            OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
         grok_logged_out.logged_in = false;
         assert_eq!(
             grok_logged_out.option_count(host),
             oauth_option_rows(&grok_logged_out, host)
         );
 
-        let mut grok_pending = OAuthFlowState::new(OAuthProvider::Grok);
+        let mut grok_pending =
+            OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
         grok_pending.set_browser_session_for_test("https://example.test/oauth");
         grok_pending.pending = true;
         assert_eq!(
@@ -2518,14 +2564,16 @@ fn oauth_option_count_matches_rendered_rows_per_host() {
             oauth_option_rows(&grok_pending, host)
         );
 
-        let mut codex_logged_out = OAuthFlowState::new(OAuthProvider::Codex);
+        let mut codex_logged_out =
+            OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
         codex_logged_out.logged_in = false;
         assert_eq!(
             codex_logged_out.option_count(host),
             oauth_option_rows(&codex_logged_out, host)
         );
 
-        let mut codex_device = OAuthFlowState::new(OAuthProvider::Codex);
+        let mut codex_device =
+            OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
         codex_device.set_device_login_for_test(
             cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
                 "https://example.test/device",
@@ -2537,7 +2585,8 @@ fn oauth_option_count_matches_rendered_rows_per_host() {
             oauth_option_rows(&codex_device, host)
         );
 
-        let mut confirming = OAuthFlowState::new(OAuthProvider::Codex);
+        let mut confirming =
+            OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
         confirming.logged_in = true;
         assert_eq!(
             confirming.option_count(host),
@@ -2575,7 +2624,8 @@ fn every_visible_oauth_row_acts_on_enter() {
     for host in [OAuthHost::Standalone, OAuthHost::AddWizard] {
         assert_enter_effect(
             {
-                let mut s = OAuthFlowState::new(OAuthProvider::Grok);
+                let mut s =
+                    OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
                 s.logged_in = false;
                 s
             },
@@ -2585,7 +2635,8 @@ fn every_visible_oauth_row_acts_on_enter() {
         );
         assert_enter_effect(
             {
-                let mut s = OAuthFlowState::new(OAuthProvider::Grok);
+                let mut s =
+                    OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
                 s.logged_in = false;
                 s
             },
@@ -2596,7 +2647,8 @@ fn every_visible_oauth_row_acts_on_enter() {
         if host == OAuthHost::AddWizard {
             assert_enter_effect(
                 {
-                    let mut s = OAuthFlowState::new(OAuthProvider::Grok);
+                    let mut s =
+                        OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
                     s.logged_in = false;
                     s
                 },
@@ -2608,7 +2660,8 @@ fn every_visible_oauth_row_acts_on_enter() {
 
         assert_enter_effect(
             {
-                let mut s = OAuthFlowState::new(OAuthProvider::Grok);
+                let mut s =
+                    OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
                 s.set_browser_session_for_test("https://example.test/oauth");
                 s.pending = true;
                 s
@@ -2620,7 +2673,8 @@ fn every_visible_oauth_row_acts_on_enter() {
         if host == OAuthHost::AddWizard {
             assert_enter_effect(
                 {
-                    let mut s = OAuthFlowState::new(OAuthProvider::Grok);
+                    let mut s =
+                        OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
                     s.set_browser_session_for_test("https://example.test/oauth");
                     s.pending = true;
                     s
@@ -2633,7 +2687,8 @@ fn every_visible_oauth_row_acts_on_enter() {
 
         assert_enter_effect(
             {
-                let mut s = OAuthFlowState::new(OAuthProvider::Codex);
+                let mut s =
+                    OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
                 s.logged_in = false;
                 s
             },
@@ -2644,7 +2699,8 @@ fn every_visible_oauth_row_acts_on_enter() {
         if host == OAuthHost::AddWizard {
             assert_enter_effect(
                 {
-                    let mut s = OAuthFlowState::new(OAuthProvider::Codex);
+                    let mut s =
+                        OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
                     s.logged_in = false;
                     s
                 },
@@ -2656,7 +2712,8 @@ fn every_visible_oauth_row_acts_on_enter() {
 
         assert_enter_effect(
             {
-                let mut s = OAuthFlowState::new(OAuthProvider::Codex);
+                let mut s =
+                    OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
                 s.set_device_login_for_test(
                     cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
                         "https://example.test/device",
@@ -2671,7 +2728,8 @@ fn every_visible_oauth_row_acts_on_enter() {
         );
         assert_enter_effect(
             {
-                let mut s = OAuthFlowState::new(OAuthProvider::Codex);
+                let mut s =
+                    OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
                 s.set_device_login_for_test(
                     cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
                         "https://example.test/device",
@@ -2688,7 +2746,8 @@ fn every_visible_oauth_row_acts_on_enter() {
         if host == OAuthHost::AddWizard {
             assert_enter_effect(
                 {
-                    let mut s = OAuthFlowState::new(OAuthProvider::Codex);
+                    let mut s =
+                        OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
                     s.set_device_login_for_test(
                         cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
                             "https://example.test/device",
@@ -2705,7 +2764,8 @@ fn every_visible_oauth_row_acts_on_enter() {
 
         assert_enter_effect(
             {
-                let mut s = OAuthFlowState::new(OAuthProvider::Codex);
+                let mut s =
+                    OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
                 s.logged_in = true;
                 s
             },
@@ -2719,7 +2779,7 @@ fn every_visible_oauth_row_acts_on_enter() {
 #[test]
 fn codex_skip_row_saves_with_device_code_present() {
     let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
-    let mut oauth = OAuthFlowState::new(OAuthProvider::Codex);
+    let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     oauth.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/device",
         "CODE-123",
@@ -2737,7 +2797,7 @@ fn codex_skip_row_saves_with_device_code_present() {
 #[test]
 fn grok_pending_skip_row_saves_at_rendered_index() {
     let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
-    let mut oauth = OAuthFlowState::new(OAuthProvider::Grok);
+    let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     oauth.set_browser_session_for_test("https://example.test/oauth");
     oauth.pending = true;
     oauth.cursor = 1;
@@ -2752,7 +2812,7 @@ fn grok_pending_skip_row_saves_at_rendered_index() {
 
 fn codex_standalone_dialog() -> SettingsDialog {
     let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
-    let mut codex = OAuthFlowState::new(OAuthProvider::Codex);
+    let mut codex = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     codex.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/very/long/device/login/path/that/must/be/clipped",
         "ABCD-EFGH",
@@ -2824,7 +2884,7 @@ fn standalone_oauth_link_region_survives_scroll_and_clipping() {
 fn oauth_help_legend_matches_bindings_for_every_host_and_state() {
     for host in [OAuthHost::Standalone, OAuthHost::AddWizard] {
         for provider in [OAuthProvider::Codex, OAuthProvider::Grok] {
-            let mut logged_out = OAuthFlowState::new(provider);
+            let mut logged_out = OAuthFlowState::new_without_acknowledgement_for_test(provider);
             logged_out.logged_in = false;
             let legend = oauth_help_legend(host, &logged_out);
             assert!(!legend.contains("enter: continue"), "{host:?} {provider:?}");
@@ -2834,7 +2894,7 @@ fn oauth_help_legend_matches_bindings_for_every_host_and_state() {
             );
             assert!(legend.contains("esc: back"), "{legend}");
 
-            let mut active = OAuthFlowState::new(provider);
+            let mut active = OAuthFlowState::new_without_acknowledgement_for_test(provider);
             match provider {
                 OAuthProvider::Grok => {
                     active.set_browser_session_for_test("https://example.test/oauth");
@@ -2863,7 +2923,7 @@ fn oauth_help_legend_matches_bindings_for_every_host_and_state() {
                 "{legend}"
             );
 
-            let mut confirming = OAuthFlowState::new(provider);
+            let mut confirming = OAuthFlowState::new_without_acknowledgement_for_test(provider);
             confirming.logged_in = true;
             let legend = oauth_help_legend(host, &confirming);
             assert!(legend.contains("enter: continue"), "{legend}");
@@ -2873,7 +2933,7 @@ fn oauth_help_legend_matches_bindings_for_every_host_and_state() {
             );
 
             if provider == OAuthProvider::Grok {
-                let mut paste = OAuthFlowState::new(provider);
+                let mut paste = OAuthFlowState::new_without_acknowledgement_for_test(provider);
                 paste.paste_focused = true;
                 let legend = oauth_help_legend(host, &paste);
                 assert_eq!(legend, "type/paste code  enter: submit  esc: options");
@@ -2893,13 +2953,15 @@ fn logged_in_oauth_enter_advances_add_wizard() {
         state.url_field.set(template.url);
         let oauth = match template_id {
             "codex-oauth" => {
-                let mut oauth = OAuthFlowState::new(OAuthProvider::Codex);
+                let mut oauth =
+                    OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
                 oauth.logged_in = true;
                 oauth.cursor = 0;
                 oauth
             }
             "grok-oauth" => {
-                let mut oauth = OAuthFlowState::new(OAuthProvider::Grok);
+                let mut oauth =
+                    OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
                 oauth.logged_in = true;
                 oauth.cursor = 0;
                 oauth

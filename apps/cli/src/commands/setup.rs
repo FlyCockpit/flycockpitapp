@@ -424,6 +424,7 @@ impl ProviderSetupActions {
                 self.headers = crate::providers::default_headers_for(template);
             }
             "grok-oauth" => {
+                require_oauth_acknowledgement("grok-oauth", io)?;
                 io.write_line("Starting Grok OAuth login.")?;
                 let login = crate::auth::xai_oauth::begin_manual_login().await?;
                 io.write_line("Open this URL and approve access:")?;
@@ -437,6 +438,7 @@ impl ProviderSetupActions {
                 io.write_line("Grok OAuth login complete.")?;
             }
             "codex-oauth" => {
+                require_oauth_acknowledgement("codex-oauth", io)?;
                 io.write_line("Starting Codex device-code login.")?;
                 let login = crate::auth::codex_oauth::begin_device_code_login().await?;
                 io.write_line(&login.verification_uri)?;
@@ -704,6 +706,44 @@ impl TerminalActionHandler for ProviderSetupActions {
     }
 }
 
+fn subscription_oauth_provider(step_id: &str) -> Option<&'static str> {
+    match step_id {
+        "codex-oauth" => Some(crate::auth::subscription_ack::CODEX_OAUTH_PROVIDER),
+        "grok-oauth" => Some(crate::auth::subscription_ack::GROK_OAUTH_PROVIDER),
+        _ => None,
+    }
+}
+
+fn require_oauth_acknowledgement(step_id: &str, io: &mut dyn TerminalIo) -> Result<()> {
+    let Some(provider) = subscription_oauth_provider(step_id) else {
+        return Ok(());
+    };
+    require_subscription_oauth_acknowledgement(provider, io)
+}
+
+fn require_subscription_oauth_acknowledgement(
+    provider: &str,
+    io: &mut dyn TerminalIo,
+) -> Result<()> {
+    if crate::auth::subscription_ack::acknowledged(provider)? {
+        return Ok(());
+    }
+
+    io.write_line(crate::auth::subscription_ack::ACKNOWLEDGEMENT_TEXT)?;
+    io.write("Type `I acknowledge` to continue: ")?;
+    let response = io
+        .read_line()
+        .context("reading subscription OAuth acknowledgement")?;
+    if response.trim().eq_ignore_ascii_case("I acknowledge") {
+        crate::auth::subscription_ack::record(provider)?;
+        return Ok(());
+    }
+
+    bail!(
+        "subscription OAuth login requires acknowledgement; run `cockpit setup` interactively and type `I acknowledge` to continue"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +844,96 @@ mod tests {
             guard.set_var("XDG_STATE_HOME", state_home);
             Self { _guard: guard }
         }
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_requires_acknowledgement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        let state_home = tmp.path().join("state");
+        let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+        let mut io = ScriptIo::new(&["no"]);
+
+        let error = require_oauth_acknowledgement("codex-oauth", &mut io).unwrap_err();
+
+        assert!(error.to_string().contains("requires acknowledgement"));
+        assert!(io.output.contains("third-party client"));
+        assert!(io.output.contains("may violate the provider terms"));
+        assert!(io.output.contains("may result in account suspension"));
+    }
+
+    #[tokio::test]
+    async fn grok_oauth_requires_acknowledgement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        let state_home = tmp.path().join("state");
+        let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+        let mut io = ScriptIo::new(&["no"]);
+
+        let error = require_oauth_acknowledgement("grok-oauth", &mut io).unwrap_err();
+
+        assert!(error.to_string().contains("requires acknowledgement"));
+        assert!(io.output.contains("third-party client"));
+        assert!(io.output.contains("may violate the provider terms"));
+        assert!(io.output.contains("may result in account suspension"));
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_is_recorded_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        let state_home = tmp.path().join("state");
+        let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+        let mut first = ScriptIo::new(&["I acknowledge"]);
+
+        require_oauth_acknowledgement("codex-oauth", &mut first).unwrap();
+        assert!(
+            crate::auth::subscription_ack::acknowledged(
+                crate::auth::subscription_ack::CODEX_OAUTH_PROVIDER
+            )
+            .unwrap()
+        );
+        assert_eq!(first.reads, 1);
+
+        let mut second = ScriptIo::default();
+        require_oauth_acknowledgement("codex-oauth", &mut second).unwrap();
+        assert_eq!(second.reads, 0);
+        assert!(second.output.is_empty());
+
+        let mut grok = ScriptIo::default();
+        let error = require_oauth_acknowledgement("grok-oauth", &mut grok).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reading subscription OAuth acknowledgement")
+        );
+        assert_eq!(grok.reads, 1);
+    }
+
+    #[test]
+    fn api_key_setup_has_no_acknowledgement() {
+        assert_eq!(subscription_oauth_provider("headers"), None);
+        assert_eq!(subscription_oauth_provider("saving"), None);
+        assert_eq!(subscription_oauth_provider("test-key"), None);
+    }
+
+    #[tokio::test]
+    async fn noninteractive_oauth_refuses_without_acknowledgement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        let state_home = tmp.path().join("state");
+        let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+        let mut io = ScriptIo::default();
+
+        let error = require_oauth_acknowledgement("codex-oauth", &mut io).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("reading subscription OAuth acknowledgement")
+        );
+        assert_eq!(io.reads, 1);
+        assert!(io.output.contains("third-party client"));
     }
 
     fn write_model_wizard_provider(cwd: &std::path::Path) -> PathBuf {

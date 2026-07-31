@@ -13,4 +13,5 @@ pub mod codex_oauth;
 pub mod copilot_setup;
 pub mod flycockpit;
 mod refresh_guard;
+pub mod subscription_ack;
 pub mod xai_oauth;

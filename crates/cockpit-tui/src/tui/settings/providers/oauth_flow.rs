@@ -241,12 +241,13 @@ impl OAuthKeyOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OAuthOption {
+pub(crate) enum OAuthOption {
     Login,
     ManualPaste,
     Poll,
     SkipContinue,
     Continue,
+    Acknowledge,
 }
 
 impl OAuthOption {
@@ -257,6 +258,7 @@ impl OAuthOption {
             OAuthOption::Poll => "poll for approval",
             OAuthOption::SkipContinue => "skip / continue",
             OAuthOption::Continue => "continue",
+            OAuthOption::Acknowledge => "I acknowledge the risk",
         }
     }
 }
@@ -330,9 +332,17 @@ pub(crate) struct OAuthFlowState {
     pub(crate) polling: bool,
     pub(crate) ssh: bool,
     pub(crate) spinner_tick: usize,
+    acknowledgement_required: bool,
 }
 
 impl OAuthFlowState {
+    #[cfg(test)]
+    pub(crate) fn new_without_acknowledgement_for_test(provider: OAuthProvider) -> Self {
+        let mut state = Self::new(provider);
+        state.acknowledgement_required = false;
+        state
+    }
+
     pub(crate) fn new(provider: OAuthProvider) -> Self {
         Self::new_with_effects(provider, OAuthEffects::production())
     }
@@ -380,6 +390,7 @@ impl OAuthFlowState {
             polling: false,
             ssh: (effects.is_ssh)(),
             spinner_tick: 0,
+            acknowledgement_required: acknowledgement_required(provider),
         }
     }
 
@@ -690,7 +701,9 @@ pub(super) fn handle_oauth_flow_key_with(
             OAuthKeyOutcome::stay(None)
         }
         KeyCode::Enter => handle_oauth_enter(s, host),
-        KeyCode::Char('s') if host == OAuthHost::AddWizard => OAuthKeyOutcome::confirm(),
+        KeyCode::Char('s') if host == OAuthHost::AddWizard && !s.acknowledgement_required => {
+            OAuthKeyOutcome::confirm()
+        }
         _ => OAuthKeyOutcome::stay(None),
     }
 }
@@ -702,6 +715,20 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
     };
 
     match (s.provider, option) {
+        (_, OAuthOption::Acknowledge) => {
+            match cockpit_core::auth::subscription_ack::record(oauth_acknowledgement_provider(
+                s.provider,
+            )) {
+                Ok(()) => {
+                    s.acknowledgement_required = false;
+                    s.status = Some(Ok("Subscription OAuth risk acknowledged.".to_string()));
+                }
+                Err(error) => {
+                    s.status = Some(Err(format!("Could not record acknowledgement: {error}")));
+                }
+            }
+            OAuthKeyOutcome::stay(None)
+        }
         (_, OAuthOption::Continue | OAuthOption::SkipContinue) => OAuthKeyOutcome::confirm(),
         (OAuthProvider::Grok, OAuthOption::ManualPaste) => {
             if s.has_browser_session() {
@@ -761,6 +788,18 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
     }
 }
 
+fn oauth_acknowledgement_provider(provider: OAuthProvider) -> &'static str {
+    match provider {
+        OAuthProvider::Grok => cockpit_core::auth::subscription_ack::GROK_OAUTH_PROVIDER,
+        OAuthProvider::Codex => cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER,
+    }
+}
+
+fn acknowledgement_required(provider: OAuthProvider) -> bool {
+    !cockpit_core::auth::subscription_ack::acknowledged(oauth_acknowledgement_provider(provider))
+        .unwrap_or(false)
+}
+
 fn selected_oauth_option(s: &mut OAuthFlowState, host: OAuthHost) -> Option<OAuthOption> {
     let count = s.option_count(host);
     if count == 0 {
@@ -773,7 +812,11 @@ fn selected_oauth_option(s: &mut OAuthFlowState, host: OAuthHost) -> Option<OAut
     oauth_options(s, host).get(s.cursor).copied()
 }
 
-fn oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<OAuthOption> {
+pub(crate) fn oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<OAuthOption> {
+    if s.acknowledgement_required {
+        return vec![OAuthOption::Acknowledge];
+    }
+
     let mut opts = Vec::new();
     if s.confirming() {
         opts.push(OAuthOption::Continue);
@@ -807,6 +850,9 @@ fn rendered_cursor(s: &OAuthFlowState, host: OAuthHost) -> usize {
 }
 
 pub(super) fn oauth_help_legend(host: OAuthHost, s: &OAuthFlowState) -> &'static str {
+    if s.acknowledgement_required {
+        return "enter: acknowledge  esc: back";
+    }
     if s.provider == OAuthProvider::Grok && s.paste_focused {
         return "type/paste code  enter: submit  esc: options";
     }
@@ -921,12 +967,41 @@ fn render_provider_oauth(lines: &mut Vec<Line<'static>>, s: &OAuthFlowState, hos
         }
     }
     lines.push(Line::default());
+    if s.acknowledgement_required {
+        lines.push(Line::from(Span::styled(
+            cockpit_core::auth::subscription_ack::ACKNOWLEDGEMENT_TEXT.to_string(),
+            yellow,
+        )));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Choose [I acknowledge the risk] to start subscription OAuth.".to_string(),
+            muted,
+        )));
+        lines.push(Line::default());
+    }
     if let Some(status) = &s.status {
         match status {
             Ok(msg) => lines.push(Line::from(Span::styled(msg.clone(), cyan))),
             Err(msg) => lines.push(Line::from(Span::styled(format!("Failed: {msg}"), red))),
         }
         lines.push(Line::default());
+    }
+
+    if s.acknowledgement_required {
+        let cursor = rendered_cursor(s, host);
+        for (i, option) in oauth_options(s, host).iter().enumerate() {
+            let marker = if i == cursor { "▸ " } else { "  " };
+            let style = if i == cursor {
+                yellow.add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(marker),
+                Span::styled(format!("[{}]", option.label()), style),
+            ]));
+        }
+        return;
     }
 
     match s.provider {

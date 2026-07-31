@@ -739,6 +739,12 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
 /// is the version number.
 const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_initial.sql")];
 
+/// Latest schema version understood by this build.
+///
+/// Kept as a public compatibility constant for daemon protocol and diagnostics
+/// consumers; the migration runner remains the source of truth.
+pub const EXPECTED_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
 fn backup_before_pending_migration(
     conn: &Connection,
     path: &Path,

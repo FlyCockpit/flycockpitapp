@@ -640,6 +640,29 @@ fn providers_from_paths_merges_layers_with_project_model_setting_winning() {
 }
 
 #[test]
+fn project_url_override_does_not_inherit_home_credential() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home/config.json");
+    let project = tmp.path().join("project/config.json");
+    std::fs::create_dir_all(home.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+    std::fs::write(&home, "{}").unwrap();
+    std::fs::write(&project, "{}").unwrap();
+    write_provider_file(
+        &home,
+        "p",
+        r#"{ "url": "https://home.example/v1", "credential_ref": "home-token", "headers": [{"name":"Authorization","value":"Bearer :home-token"}] }"#,
+    );
+    write_provider_file(&project, "p", r#"{ "url": "https://project.example/v1" }"#);
+
+    let cfg = ConfigDoc::providers_from_paths(&[home, project]);
+    let provider = cfg.providers.get("p").unwrap();
+    assert_eq!(provider.url, "https://project.example/v1");
+    assert!(provider.credential_ref.is_none());
+    assert!(provider.headers.is_empty());
+}
+
+#[test]
 fn providers_from_paths_merges_model_arrays_by_id_without_dropping_home_models() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home").join("config.json");

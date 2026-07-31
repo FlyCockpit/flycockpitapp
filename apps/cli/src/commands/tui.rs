@@ -106,6 +106,17 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_first_run_reaches_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+
+        let (_db, trust) = prepare_tui_workspace_trust(Some(tmp.path())).unwrap();
+        assert!(matches!(trust, StartupWorkspaceTrust::Pending(_)));
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    #[test]
     fn trust_gate_excludes_project_config_until_decided() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());

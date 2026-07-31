@@ -187,7 +187,7 @@ where
 
 pub fn project_config_allowed(cockpit_dir: &Path) -> bool {
     let Some(policy) = runtime_policy() else {
-        return true;
+        return false;
     };
     if policy.mode == WorkspaceTrustMode::Trust {
         return true;
@@ -259,7 +259,7 @@ pub fn path_is_project_cockpit_layer(path: &Path, trust_root: &Path) -> bool {
 
 pub fn path_blocked_by_workspace_trust(path: &Path) -> bool {
     let Some(policy) = runtime_policy() else {
-        return false;
+        return true;
     };
     if policy.mode == WorkspaceTrustMode::Trust {
         return false;
@@ -370,6 +370,22 @@ mod tests {
         let variant = resolve_trust_root(&subdir.join("..")).unwrap();
 
         assert_eq!(direct.root, variant.root);
+    }
+
+    #[test]
+    fn absent_policy_disallows_project_config() {
+        let _env = crate::test_env::lock();
+        clear_runtime_policy_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!project_config_allowed(&tmp.path().join(".cockpit")));
+    }
+
+    #[test]
+    fn absent_policy_blocks_trust_gated_paths() {
+        let _env = crate::test_env::lock();
+        clear_runtime_policy_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(path_blocked_by_workspace_trust(tmp.path()));
     }
 
     #[tokio::test]

@@ -34,6 +34,7 @@ pub use cockpit_core::{
 pub use cockpit_db as db;
 mod terminal_host;
 
+use anyhow::Context;
 use clap::Parser;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -633,6 +634,34 @@ fn error_exit_code(err: &anyhow::Error) -> u8 {
     }
 }
 
+async fn install_cli_trust_policy(project: Option<&Path>) -> anyhow::Result<()> {
+    let opened = match project {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().context("resolving workspace for trust policy")?,
+    };
+    let root = config::trust::resolve_trust_root(&opened)?;
+    let mode = match db::Db::open_default() {
+        Ok(db) => match db.workspace_trust_by_root(&root.root).await {
+            Ok(Some(decision))
+                if decision.mode != db::workspace_trust::WorkspaceTrustMode::Untrusted =>
+            {
+                decision.mode
+            }
+            Ok(_) => db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            Err(error) => {
+                tracing::warn!(error = %error, "reading workspace trust policy; ignoring project config");
+                db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
+            }
+        },
+        Err(error) => {
+            tracing::warn!(error = %error, "opening workspace trust database; ignoring project config");
+            db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
+        }
+    };
+    config::trust::set_runtime_policy(root, mode);
+    Ok(())
+}
+
 fn error_stderr_line(err: &anyhow::Error) -> String {
     if let Some(removed) = err.downcast_ref::<commands::RemovedCommandError>() {
         format!("error: {}", removed.message())
@@ -654,6 +683,8 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             Err(e) => tracing::warn!(error = %e, "--debug-last-message: cwd unavailable"),
         }
     }
+
+    install_cli_trust_policy(cli.project.as_deref()).await?;
 
     match cli.command {
         None => {
@@ -864,6 +895,37 @@ fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_free_commands_do_not_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::lock();
+        _env.set_var("XDG_DATA_HOME", tmp.path().join("data"));
+        _env.set_var("XDG_STATE_HOME", tmp.path().join("state"));
+        crate::config::trust::clear_runtime_policy_for_tests();
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(install_cli_trust_policy(Some(tmp.path())))
+            .unwrap();
+        assert_eq!(
+            crate::config::trust::runtime_policy().unwrap().mode,
+            db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
+        );
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    #[test]
+    fn every_subcommand_installs_trust_policy() {
+        let source = include_str!("lib.rs");
+        let installation = source
+            .find("install_cli_trust_policy(cli.project.as_deref()).await?;")
+            .expect("all CLI dispatch must follow the trust-policy install");
+        let dispatch = source
+            .find("match cli.command {")
+            .expect("CLI command dispatch exists");
+        assert!(installation < dispatch);
+    }
 
     #[test]
     fn usage_errors_map_to_exit_64_and_lowercase_error_prefix() {

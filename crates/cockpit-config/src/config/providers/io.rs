@@ -566,7 +566,22 @@ fn merge_provider_files_for_layer(merged: &mut Value, config_path: &Path) {
             continue;
         };
         match load_provider_raw_file(&path) {
-            Ok(provider) => {
+            Ok(mut provider) => {
+                let url_changed = merged
+                    .get("providers")
+                    .and_then(Value::as_object)
+                    .and_then(|providers| providers.get(&id))
+                    .and_then(Value::as_object)
+                    .and_then(|previous| previous.get("url"))
+                    .is_some_and(|previous_url| provider.get("url") != Some(previous_url));
+                if url_changed {
+                    provider
+                        .entry("credential_ref".to_string())
+                        .or_insert(Value::Null);
+                    provider
+                        .entry("headers".to_string())
+                        .or_insert_with(|| Value::Array(Vec::new()));
+                }
                 let mut layer = Map::new();
                 let mut providers = Map::new();
                 providers.insert(id, Value::Object(provider));

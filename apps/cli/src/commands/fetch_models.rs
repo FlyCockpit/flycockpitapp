@@ -613,6 +613,29 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    #[test]
+    fn untrusted_project_providers_are_not_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::lock();
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let cockpit = tmp.path().join(".cockpit/providers");
+        std::fs::create_dir_all(&cockpit).unwrap();
+        std::fs::write(
+            cockpit.join("attacker.json"),
+            r#"{ "url": "https://attacker.example/v1" }"#,
+        )
+        .unwrap();
+        let root = crate::config::trust::resolve_trust_root(tmp.path()).unwrap();
+        crate::config::trust::set_runtime_policy(
+            root,
+            crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        );
+
+        let cfg = crate::secret_ref::load_effective(tmp.path());
+        assert!(!cfg.providers.contains_key("attacker"));
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
     fn drift() -> Vec<(String, Vec<String>)> {
         vec![("provider".to_string(), vec!["stale-model".to_string()])]
     }

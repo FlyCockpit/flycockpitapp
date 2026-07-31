@@ -34,6 +34,7 @@ use crate::providers::registry::{
 
 const COPILOT_TOKEN_ENV_VARS: [&str; 3] = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
 const COPILOT_DIRECT_API_TOKEN_ENV: &str = "GITHUB_COPILOT_API_TOKEN";
+pub const COPILOT_TOKEN_CREDENTIAL_KEY: &str = "copilot-github-token";
 const COPILOT_API_URL_ENV: &str = "COPILOT_API_URL";
 const ERROR_BODY_SNIPPET_CHARS: usize = 256;
 const MAX_MODELS_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -380,7 +381,7 @@ fn resolve_provider_request_inner_with_sources(
     } else if let Some(auth) = auth_header {
         headers.push(auth);
     } else if is_copilot {
-        match resolve_copilot_token_with_env(env_lookup)? {
+        match resolve_copilot_token_with_sources(env_lookup, secret_lookup)? {
             Some(token) => headers.push(ResolvedHeader {
                 name: "Authorization".to_string(),
                 value: format!("Bearer {token}"),
@@ -1298,12 +1299,29 @@ fn is_loopback_or_local_url(url: &Url) -> bool {
 }
 
 fn resolve_copilot_token() -> Result<Option<String>> {
-    resolve_copilot_token_with_env(|name| std::env::var(name).ok())
+    let store = crate::credentials::CredentialStore::open_default_readonly().ok();
+    resolve_copilot_token_with_sources(
+        |name| std::env::var(name).ok(),
+        |name| {
+            store
+                .as_ref()
+                .and_then(|store| store.named_secret(name))
+                .map(str::to_string)
+        },
+    )
 }
 
 fn resolve_copilot_token_with_env<F>(lookup: F) -> Result<Option<String>>
 where
     F: Fn(&str) -> Option<String>,
+{
+    resolve_copilot_token_with_sources(&lookup, |_| None)
+}
+
+fn resolve_copilot_token_with_sources<F, S>(lookup: F, secret_lookup: S) -> Result<Option<String>>
+where
+    F: Fn(&str) -> Option<String>,
+    S: Fn(&str) -> Option<String>,
 {
     for name in COPILOT_TOKEN_ENV_VARS {
         if let Some(token) = env_var_nonempty_with(name, &lookup) {
@@ -1314,6 +1332,13 @@ where
 
     if let Some(token) = env_var_nonempty_with(COPILOT_DIRECT_API_TOKEN_ENV, &lookup) {
         validate_copilot_token(COPILOT_DIRECT_API_TOKEN_ENV, &token)?;
+        return Ok(Some(token));
+    }
+
+    if let Some(token) =
+        secret_lookup(COPILOT_TOKEN_CREDENTIAL_KEY).filter(|token| !token.trim().is_empty())
+    {
+        validate_copilot_token(COPILOT_TOKEN_CREDENTIAL_KEY, &token)?;
         return Ok(Some(token));
     }
 
@@ -1835,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn copilot_falls_back_to_gh_token_when_default_header_var_is_missing() {
+    fn github_token_from_environment_still_supported() {
         let env = crate::test_env::lock();
         clear_copilot_env(&env);
         let entry = ProviderEntry {
@@ -1854,6 +1879,28 @@ mod tests {
             .find(|h| h.name.eq_ignore_ascii_case("authorization"))
             .unwrap();
         assert_eq!(auth.value, "Bearer ghu_test");
+    }
+
+    #[test]
+    fn copilot_uses_stored_github_token_when_environment_is_unset() {
+        let entry = ProviderEntry {
+            url: "https://api.githubcopilot.com".into(),
+            headers: vec![],
+            ..ProviderEntry::default()
+        };
+        let resolved = resolve_provider_request_with_sources(
+            "copilot",
+            &entry,
+            |_| None,
+            |name| (name == COPILOT_TOKEN_CREDENTIAL_KEY).then(|| "ghu_stored".to_string()),
+        )
+        .unwrap();
+        let auth = resolved
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("authorization"))
+            .unwrap();
+        assert_eq!(auth.value, "Bearer ghu_stored");
     }
 
     #[test]

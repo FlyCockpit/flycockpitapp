@@ -724,6 +724,8 @@ impl SessionRegistry {
         let cleanup_inner = Arc::downgrade(&self.inner);
         let cleanup =
             Box::new(move || cleanup_worker_on_exit(cleanup_inner, session_id, generation));
+        let daemon_no_sandbox =
+            session_worker::daemon_no_sandbox().context("reading COCKPIT_DAEMON_NO_SANDBOX")?;
         let (handle, join) = session_worker::spawn(
             session,
             self.inner.locks.clone(),
@@ -733,6 +735,7 @@ impl SessionRegistry {
             thinking_params,
             project_root.clone(),
             client_no_sandbox,
+            daemon_no_sandbox,
             extended_cfg,
             self.inner.lsp.clone(),
             self.inner.resource_scheduler.clone(),

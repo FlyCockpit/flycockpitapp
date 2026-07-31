@@ -463,6 +463,7 @@ pub use handle::{
     SessionWorkerHandle, TurnOutcome, spawn,
 };
 pub use helpers::DAEMON_NO_SANDBOX_ENV;
+pub(crate) use helpers::daemon_no_sandbox;
 #[allow(unused_imports)]
 pub(crate) use helpers::{
     removed_primary_notice, resolve_new_session_llm_mode, resolve_root_agent,

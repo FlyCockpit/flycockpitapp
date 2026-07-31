@@ -44,7 +44,7 @@ pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSet
             }
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
-                "We'll also run `gh auth token` once and set GH_TOKEN in this cockpit session so Copilot works without restarting.".to_string(),
+                "We'll also run `gh auth token` once and store its token in Cockpit credentials so Copilot works without restarting.".to_string(),
                 muted,
             )));
             lines.push(Line::default());

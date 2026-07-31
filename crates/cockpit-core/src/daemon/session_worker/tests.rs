@@ -699,6 +699,7 @@ async fn absent_scheduler_is_not_an_error() {
         None,
         tmp.path().to_path_buf(),
         false,
+        false,
         &extended,
         Arc::new(crate::daemon::lsp::LspManager::new()),
         None,
@@ -1143,6 +1144,29 @@ async fn sandbox_default_precedence_client_then_on() {
         resolve_sandbox_default_with(false, false, SandboxMode::Sandbox),
         SandboxMode::Sandbox
     );
+}
+
+#[test]
+fn sandbox_flag_zero_does_not_disable() {
+    let env = crate::test_env::lock();
+    env.set_var(DAEMON_NO_SANDBOX_ENV, "0");
+    assert!(!daemon_no_sandbox().unwrap());
+}
+
+#[test]
+fn sandbox_flag_one_disables() {
+    let env = crate::test_env::lock();
+    env.set_var(DAEMON_NO_SANDBOX_ENV, "1");
+    assert!(daemon_no_sandbox().unwrap());
+}
+
+#[test]
+fn sandbox_flag_invalid_value_is_rejected() {
+    let env = crate::test_env::lock();
+    env.set_var(DAEMON_NO_SANDBOX_ENV, "sometimes");
+    let error = daemon_no_sandbox().unwrap_err().to_string();
+    assert!(error.contains("COCKPIT_DAEMON_NO_SANDBOX"));
+    assert!(error.contains("sometimes"));
 }
 
 /// The concurrent-write-during-plan warning fires once per plan episode per

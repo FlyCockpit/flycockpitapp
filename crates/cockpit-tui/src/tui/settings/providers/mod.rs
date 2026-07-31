@@ -1434,7 +1434,11 @@ impl SettingsCx {
                     if can_apply {
                         let shell = state.shell.unwrap();
                         let rc_path = state.rc_path.clone().unwrap();
-                        state.outcome = Some(apply_copilot_setup(shell, &rc_path));
+                        state.outcome = Some(apply_copilot_setup(
+                            shell,
+                            &rc_path,
+                            self.credential_store_path.as_deref(),
+                        ));
                     } else {
                         // Skip — move to save + fetch.
                         let template = s.template.expect("template chosen");
@@ -2338,7 +2342,11 @@ impl SettingsCx {
                     return back_to_edit(parent, None);
                 };
 
-                s.outcome = Some(apply_copilot_setup(shell, &rc_path));
+                s.outcome = Some(apply_copilot_setup(
+                    shell,
+                    &rc_path,
+                    self.credential_store_path.as_deref(),
+                ));
             }
             _ => {}
         }
@@ -3793,22 +3801,41 @@ pub(super) fn valid_url(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
 }
 
-/// Execute the "Set up Copilot auth" action: append the export to the
-/// shell rc file and inject `GH_TOKEN` into the running process so the
-/// resolver picks it up without a restart. Returns a user-facing
-/// status string on success, or an error message on failure.
-fn apply_copilot_setup(shell: CopilotShell, rc_path: &std::path::Path) -> Result<String, String> {
+/// Store a Copilot token in Cockpit credentials so the provider resolver can
+/// use it immediately without mutating the running process environment.
+fn store_copilot_token(
+    credential_store_path: Option<&std::path::Path>,
+    token: String,
+) -> Result<(), String> {
+    let mut store = match credential_store_path {
+        Some(path) => cockpit_core::credentials::CredentialStore::open(path.to_path_buf()),
+        None => cockpit_core::credentials::CredentialStore::open_default(),
+    }
+    .map_err(|error| format!("could not open Cockpit credential store: {error}"))?;
+    store.set_named_secret(
+        cockpit_core::providers::models_fetch::COPILOT_TOKEN_CREDENTIAL_KEY,
+        token,
+    );
+    store
+        .save()
+        .map_err(|error| format!("could not save Cockpit credential store: {error}"))
+}
+
+/// Execute the "Set up Copilot auth" action: append the export to the shell rc
+/// file and persist the token in Cockpit credentials so the resolver picks it up
+/// without a restart. Returns a user-facing status string on success, or an
+/// error message on failure.
+fn apply_copilot_setup(
+    shell: CopilotShell,
+    rc_path: &std::path::Path,
+    credential_store_path: Option<&std::path::Path>,
+) -> Result<String, String> {
     // Fetch the token first — if `gh` isn't installed or the user
     // isn't logged in, we want to fail before mutating the rc file.
     let token = copilot_setup::fetch_gh_token().map_err(|e| e.to_string())?;
     let wrote = copilot_setup::append_to_rc(rc_path, shell).map_err(|e| e.to_string())?;
 
-    // SAFETY: `set_var` mutates process-global env state. The settings
-    // dialog runs on the main thread before any inference request fires
-    // for this session, so no concurrent reader observes the racy state.
-    unsafe {
-        std::env::set_var("GH_TOKEN", &token);
-    }
+    store_copilot_token(credential_store_path, token)?;
 
     let suffix = if wrote {
         format!("added export to {}", rc_path.display())
@@ -3816,7 +3843,7 @@ fn apply_copilot_setup(shell: CopilotShell, rc_path: &std::path::Path) -> Result
         format!("export already in {}", rc_path.display())
     };
     Ok(format!(
-        "Copilot auth ready — {suffix}; GH_TOKEN set for this session"
+        "Copilot auth ready — {suffix}; Cockpit credential stored for this session"
     ))
 }
 

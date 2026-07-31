@@ -1399,6 +1399,7 @@ pub fn spawn(
     thinking_params: Option<serde_json::Value>,
     project_root: PathBuf,
     client_no_sandbox: bool,
+    daemon_no_sandbox: bool,
     extended_cfg: &crate::config::extended::ExtendedConfig,
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
@@ -1437,7 +1438,8 @@ pub fn spawn(
     //       sessions it creates.
     //   (c) else ON.
     // A later `/sandbox` flip overrides this for the session.
-    session.set_sandbox_mode(resolve_sandbox_default(
+    session.set_sandbox_mode(resolve_sandbox_default_with(
+        daemon_no_sandbox,
         client_no_sandbox,
         extended_cfg.sandbox.default_mode,
     ));

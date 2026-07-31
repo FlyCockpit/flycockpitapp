@@ -257,23 +257,27 @@ pub(super) fn persist_llm_mode(
     Ok(())
 }
 
-/// Env var the daemon sets at boot when launched with `--no-sandbox`
-/// (sandboxing part 2). Read per session-spawn to apply the
-/// highest-precedence "OFF for ALL sessions" rule. Set internally only
-/// (Layer B style); never a user-facing surface.
+/// Environment override for the daemon sandbox default.
+///
+/// The daemon writes this to `1` when launched with `--no-sandbox`, and it is
+/// also read from the daemon process environment at each session spawn. Its
+/// value must be an explicit truthy value; malformed values fail closed with a
+/// configuration error rather than silently disabling sandboxing.
 pub const DAEMON_NO_SANDBOX_ENV: &str = "COCKPIT_DAEMON_NO_SANDBOX";
 
-/// Whether the running daemon was launched with `--no-sandbox`.
-pub(super) fn daemon_no_sandbox() -> bool {
-    std::env::var_os(DAEMON_NO_SANDBOX_ENV).is_some()
-}
-
-/// Resolve the new-session sandbox default from the live daemon flag.
-pub(super) fn resolve_sandbox_default(
-    client_no_sandbox: bool,
-    configured_default: crate::tools::sandbox_mode::SandboxMode,
-) -> crate::tools::sandbox_mode::SandboxMode {
-    resolve_sandbox_default_with(daemon_no_sandbox(), client_no_sandbox, configured_default)
+/// Whether the daemon environment explicitly disables sandboxing.
+pub(crate) fn daemon_no_sandbox() -> anyhow::Result<bool> {
+    let Some(value) = std::env::var_os(DAEMON_NO_SANDBOX_ENV) else {
+        return Ok(false);
+    };
+    let value = value.to_string_lossy();
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!(
+            "{DAEMON_NO_SANDBOX_ENV} must be one of 1, true, yes, on, 0, false, no, or off; got `{value}`"
+        ),
+    }
 }
 
 /// Pure precedence resolver (highest wins): daemon `--no-sandbox` ->

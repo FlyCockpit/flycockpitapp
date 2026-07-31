@@ -412,6 +412,40 @@ fn literal_key_entry_writes_secret_ref() {
 }
 
 #[test]
+fn github_token_applies_without_env_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_path = tmp.path().join("credentials.json");
+    let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+    for name in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
+        env.remove_var(name);
+    }
+
+    store_copilot_token(Some(&store_path), "ghu_session_token".to_string()).unwrap();
+
+    for name in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
+        assert!(std::env::var_os(name).is_none(), "{name} was mutated");
+    }
+    let store = cockpit_core::credentials::CredentialStore::open(store_path).unwrap();
+    let entry = ProviderEntry {
+        url: "https://api.githubcopilot.com".into(),
+        ..ProviderEntry::default()
+    };
+    let resolved = cockpit_core::providers::models_fetch::resolve_provider_request_with_sources(
+        "copilot",
+        &entry,
+        |_| None,
+        |name| store.named_secret(name).map(str::to_owned),
+    )
+    .unwrap();
+    let authorization = resolved
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("authorization"))
+        .unwrap();
+    assert_eq!(authorization.value, "Bearer ghu_session_token");
+}
+
+#[test]
 fn header_delete_requires_second_press_on_same_row() {
     let mut editor = HeaderEditor::new(
         vec![

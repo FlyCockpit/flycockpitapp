@@ -576,6 +576,18 @@ impl Dialog {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_provider_add_status(&self) -> Option<&str> {
+        let Dialog::Settings(settings) = self else {
+            return None;
+        };
+        let page = settings.page.as_any().downcast_ref::<ProvidersPage>()?;
+        let ProvidersPage::Add(add) = page else {
+            return None;
+        };
+        add.error.as_deref()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_mark_provider_add_done(&mut self, provider_id: &str) {
         let Dialog::Settings(settings) = self else {
             panic!("expected settings dialog");
@@ -591,6 +603,21 @@ impl Dialog {
         add.run
             .return_to("done")
             .expect("provider done step exists");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_mark_setup_complete(&mut self, step_id: &str) {
+        let Dialog::SetupWizard(wizard) = self else {
+            panic!("expected setup wizard");
+        };
+        wizard
+            .run
+            .return_to(step_id)
+            .expect("setup completion step exists");
+        wizard
+            .run
+            .submit(cockpit_core::wizard::WizardAnswer::Acknowledged)
+            .expect("setup completion step accepts acknowledgement");
     }
 
     #[cfg(test)]
@@ -728,18 +755,34 @@ impl Dialog {
     }
 
     pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
-        let mut d = Self::open(cwd);
-        if let Dialog::PickConfig { dirs, .. } = &d
-            && let Some(dir) = dirs.first()
-        {
-            let path = dir.path.join(CONFIG_FILE);
-            let mut s = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
-            let mut add = AddState::new();
-            add.error = status;
-            s.page = providers_page(ProvidersPage::Add(add));
-            d = Dialog::Settings(Box::new(s));
+        // The provider wizard is the first-run destination, not the generic
+        // config-location picker. A clean install has no discovered layer,
+        // so materialize the normal first global layer before opening Add.
+        // This deliberately does not create project config and is reached
+        // only after the caller has obtained an explicit trust decision.
+        let path = match discover_config_dirs(cwd).first() {
+            Some(dir) => Ok(dir.path.join(CONFIG_FILE)),
+            None => creatable_config_dirs()
+                .first()
+                .ok_or_else(|| std::io::Error::other("no Cockpit config directory is available"))
+                .and_then(|dir| scaffold_config_dir(&dir.path)),
+        };
+
+        match path {
+            Ok(path) => {
+                let mut s = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
+                let mut add = AddState::new();
+                add.error = status;
+                s.page = providers_page(ProvidersPage::Add(add));
+                Dialog::Settings(Box::new(s))
+            }
+            Err(error) => Dialog::CreateConfig {
+                choices: creatable_config_dirs(),
+                cursor: 0,
+                cwd: cwd.to_path_buf(),
+                status: Some(format!("could not create initial Cockpit config: {error}")),
+            },
         }
-        d
     }
 
     pub fn open_setup(cwd: &std::path::Path) -> Self {

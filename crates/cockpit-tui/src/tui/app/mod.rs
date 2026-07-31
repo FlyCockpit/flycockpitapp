@@ -319,6 +319,14 @@ enum FirstRunFlow {
     AwaitModel,
 }
 
+/// Required launch modals share one precedence order for drawing and input.
+/// A trust decision gates all startup work, so it is above a daemon prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartupModal {
+    WorkspaceTrust,
+    Daemon,
+}
+
 struct StartupDaemonState {
     prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
     connected: bool,
@@ -480,6 +488,19 @@ fn daemon_autostart_notice(
 }
 
 impl App {
+    /// The required startup modal that is both rendered and allowed to
+    /// consume keys. Keep this as the single ordering source; duplicating it
+    /// in render and input caused trust choices to be recorded invisibly.
+    pub(super) fn startup_modal_on_top(&self) -> Option<StartupModal> {
+        if self.dialog.is_workspace_trust() {
+            Some(StartupModal::WorkspaceTrust)
+        } else if self.daemon_prompt.is_some() {
+            Some(StartupModal::Daemon)
+        } else {
+            None
+        }
+    }
+
     /// The sole database connection opened during TUI startup. UI surfaces clone
     /// this handle instead of reopening SQLite and revalidating migrations.
     pub(super) fn shared_db(&self) -> Option<cockpit_db::Db> {

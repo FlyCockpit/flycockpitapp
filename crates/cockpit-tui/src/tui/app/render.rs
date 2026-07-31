@@ -39,8 +39,8 @@ use crate::tui::theme::{
 
 use super::{
     AUTOCOMPLETE_ROWS, AffordanceTarget, App, DirtyScan, HistoryEntryId, HistoryRenderCacheEntry,
-    PaneSide, PrewrappedEntry, ScrollAnchor, Selection, SuggestionBoxKind, SuggestionBoxRowHit,
-    SuggestionBoxTarget, Toast, ToastKind, TranscriptFind, WORKING_MESSAGES,
+    PaneSide, PrewrappedEntry, ScrollAnchor, Selection, StartupModal, SuggestionBoxKind,
+    SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind, TranscriptFind, WORKING_MESSAGES,
 };
 
 /// Startup grace before the working indicator first appears — prevents
@@ -1260,7 +1260,12 @@ impl App {
             self.footer_picker_row_hits.clear();
         }
 
-        if let Some(prompt) = self.daemon_prompt.as_ref() {
+        if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
+            self.dialog
+                .render(frame, rects.body, &mut self.link_registry);
+        } else if self.startup_modal_on_top() == Some(StartupModal::Daemon)
+            && let Some(prompt) = self.daemon_prompt.as_ref()
+        {
             prompt.render(frame, rects.body);
         } else if self.question_dialog.is_some() {
             // Answering dialog (GOALS §3b): a compact, bottom-anchored

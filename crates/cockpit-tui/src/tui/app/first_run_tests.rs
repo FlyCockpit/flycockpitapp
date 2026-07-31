@@ -2,6 +2,8 @@ use super::*;
 use cockpit_config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersConfig};
 use cockpit_test_support::TestEnvGuard;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 fn daemon_paths(tmp: &tempfile::TempDir) -> cockpit_core::daemon::DaemonPaths {
     cockpit_core::daemon::DaemonPaths {
@@ -144,6 +146,58 @@ fn first_run_chains_provider_then_model() {
 }
 
 #[test]
+fn first_run_flow_completes_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new_with_db(
+        Some(tmp.path()),
+        false,
+        cockpit_db::Db::open_in_memory().unwrap(),
+    );
+    app.daemon_prompt = None;
+    app.dialog = crate::tui::settings::Dialog::open_providers_add(tmp.path());
+    write_config(tmp.path(), &config_with_provider("p", "m"));
+    app.dialog.test_mark_provider_add_done("p");
+
+    assert!(app.service_first_run_flow());
+    assert_eq!(
+        app.dialog.test_page_name(),
+        Some(cockpit_core::wizard::MODEL_WIZARD_ID)
+    );
+    app.dialog.test_mark_setup_complete("model-save");
+    assert!(app.service_first_run_flow());
+    assert_eq!(app.dialog.test_page_name(), Some("first_run_complete"));
+}
+
+#[test]
+fn no_provider_status_is_surfaced_and_draft_preserved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new_with_db(
+        Some(tmp.path()),
+        false,
+        cockpit_db::Db::open_in_memory().unwrap(),
+    );
+    app.daemon_prompt = None;
+    app.dialog = crate::tui::settings::Dialog::None;
+    app.composer.set("draft message".to_string());
+
+    assert!(!app.submit_input());
+    assert_eq!(app.composer.text(), "draft message");
+    assert!(app.queue.is_empty());
+    assert!(app.history.is_empty());
+    assert!(app.dialog.test_provider_is_add());
+    assert_eq!(
+        app.dialog.test_provider_add_status(),
+        Some(
+            "No provider is configured yet. Add one before sending; your message is still in the composer."
+        )
+    );
+}
+
+#[test]
 fn no_model_send_opens_wizard_preserves_input() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
@@ -163,6 +217,101 @@ fn no_model_send_opens_wizard_preserves_input() {
     assert!(app.queue.is_empty());
     assert!(app.history.is_empty());
     assert!(app.dialog.test_provider_is_add());
+}
+
+fn daemon_prompt(tmp: &tempfile::TempDir) -> crate::tui::daemon_prompt::DaemonPromptDialog {
+    crate::tui::daemon_prompt::DaemonPromptDialog::new(
+        cockpit_core::daemon::DaemonStatus::NotRunning,
+        daemon_paths(tmp),
+    )
+}
+
+#[test]
+fn stacked_modal_focus_matches_render_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
+    let mut app = App::new_with_db_and_workspace_trust(
+        Some(tmp.path()),
+        false,
+        cockpit_db::Db::open_in_memory().unwrap(),
+        StartupWorkspaceTrust::Pending(root),
+    );
+    app.daemon_prompt = Some(daemon_prompt(&tmp));
+
+    assert_eq!(
+        app.startup_modal_on_top(),
+        Some(StartupModal::WorkspaceTrust)
+    );
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(rendered.contains("workspace trust"), "{rendered}");
+    assert!(!rendered.contains("cockpit daemon"), "{rendered}");
+}
+
+#[tokio::test]
+async fn keypress_does_not_record_hidden_trust_decision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    let db = cockpit_db::Db::open_in_memory().unwrap();
+    let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
+    let mut app = App::new_with_db_and_workspace_trust(
+        Some(tmp.path()),
+        false,
+        db.clone(),
+        StartupWorkspaceTrust::Pending(root.clone()),
+    );
+    app.daemon_prompt = Some(daemon_prompt(&tmp));
+
+    assert_eq!(
+        app.startup_modal_on_top(),
+        Some(StartupModal::WorkspaceTrust)
+    );
+    assert!(
+        db.workspace_trust_by_root(&root.root)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    assert!(
+        db.workspace_trust_by_root(&root.root)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    cockpit_config::trust::clear_runtime_policy_for_tests();
+}
+
+#[tokio::test]
+async fn onboarding_never_auto_trusts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    let db = cockpit_db::Db::open_in_memory().unwrap();
+    let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
+    let mut app = App::new_with_db_and_workspace_trust(
+        Some(tmp.path()),
+        false,
+        db.clone(),
+        StartupWorkspaceTrust::Pending(root.clone()),
+    );
+
+    app.service_first_run_flow();
+    assert_eq!(app.dialog.test_page_name(), Some("workspace_trust"));
+    assert!(
+        db.workspace_trust_by_root(&root.root)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    cockpit_config::trust::clear_runtime_policy_for_tests();
 }
 
 #[tokio::test]

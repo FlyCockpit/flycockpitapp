@@ -1,5 +1,6 @@
 use super::*;
 use cockpit_config::providers::{ModelEntry, ProviderEntry};
+use cockpit_test_support::TestEnvGuard;
 use providers::{FetchAllState, valid_url};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, TestBackend};
@@ -1280,7 +1281,7 @@ fn profile_name_edit_and_persist() {
 fn global_name_edit_prompts_to_remove_shadowing_project_value() {
     use cockpit_config::extended::ExtendedConfigDoc;
     let tmp = TempDir::new().unwrap();
-    let global = tmp.path().join(".config/cockpit/config.json");
+    let global = tmp.path().join("home/.config/cockpit/config.json");
     let project = tmp.path().join("repo");
     let project_config = project.join(".cockpit/config.json");
     std::fs::create_dir_all(global.parent().unwrap()).unwrap();
@@ -1771,6 +1772,22 @@ fn has_no_providers_true_when_config_dir_empty() {
     // Just exercising the codepath — the answer depends on the
     // host's $HOME, so we only assert it returns *some* bool.
     let _ = Dialog::has_no_providers(tmp.path());
+}
+
+#[test]
+fn fresh_install_reaches_add_provider() {
+    let tmp = TempDir::new().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+
+    let dialog = Dialog::open_providers_add(tmp.path());
+
+    assert!(dialog.test_provider_is_add());
+    assert!(
+        tmp.path()
+            .join("home/.config/cockpit/config.json")
+            .is_file()
+    );
+    assert!(!tmp.path().join(".cockpit").exists());
 }
 
 #[test]

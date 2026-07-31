@@ -10,7 +10,9 @@ use crate::tui::composer::{FindSpec, Operator, Register, VimMode};
 use crate::tui::history::HistoryEntry;
 use crate::tui::textfield::normalize_shift_char;
 
-use super::{App, ControlApplied, FirstRunFlow, LocalChoiceSelection, Overlay, TranscriptFind};
+use super::{
+    App, ControlApplied, FirstRunFlow, LocalChoiceSelection, Overlay, StartupModal, TranscriptFind,
+};
 use crate::tui::settings::Dialog;
 use cockpit_core::daemon::proto::{self, Request, Response};
 use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
@@ -309,7 +311,7 @@ impl App {
         //   1. let inner handle the key
         //   2. if it requested close: drain its result, close it
         //   3. unconditionally `return false`
-        if self.dialog.is_workspace_trust() {
+        if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
             let should_close = self.dialog.handle_key(key);
             if should_close && let Some((root, mode)) = self.dialog.take_workspace_trust_choice() {
                 return self.apply_workspace_trust_choice(root, mode);
@@ -317,7 +319,9 @@ impl App {
             return false;
         }
 
-        if let Some(prompt) = self.daemon_prompt.as_mut() {
+        if self.startup_modal_on_top() == Some(StartupModal::Daemon)
+            && let Some(prompt) = self.daemon_prompt.as_mut()
+        {
             let should_close = prompt.handle_key(key);
             if !should_close {
                 return false;

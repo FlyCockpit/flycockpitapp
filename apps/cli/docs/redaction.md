@@ -6,8 +6,9 @@ session environment, dotenv-style files, stored Cockpit secrets, private SSH key
 material, and explicit `redact.denylist` values.
 
 `redact.min_secret_length` applies only to prunable candidates from automatic
-scans. Values shorter than the threshold are skipped unless they come from a
-credential-shaped variable name or a forced source.
+scans, but the table enforces a hard four-byte floor for every entry. Values
+shorter than the applicable threshold are skipped, including forced sources
+that fall below the hard floor.
 
 `redact.allowlist` is an environment-variable name allowlist. It prevents values
 from matching names such as `PATH` or a user-specified variable name from being
@@ -22,10 +23,10 @@ table is merged into the current session table.
 
 Forced entries are intentionally different:
 
-- `redact.denylist` values always redact, even if they equal a filesystem path.
-- Stored named secrets and the FlyCockpit instance token always redact.
-- Private SSH key material always redacts.
+- `redact.denylist` values at least four bytes long redact even if they equal a filesystem path.
+- Stored named secrets and the FlyCockpit instance token at least four bytes long redact.
+- Private SSH key material at least four bytes long redacts.
 
-Use `redact.denylist` only for literal values that must be scrubbed everywhere.
+Use `redact.denylist` only for literal values at least four bytes long that must be scrubbed everywhere.
 Use `redact.allowlist` only for environment variable names that should be
 excluded from automatic scanning.

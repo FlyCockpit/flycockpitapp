@@ -1056,8 +1056,7 @@ impl SettingId {
             SettingId::RedactMinSecretLength => {
                 "Shortest value length that may be auto-added to the redaction \
                  table. Values shorter than this are skipped to avoid scrubbing \
-                 common short strings. Default 8. (The denylist always redacts \
-                 regardless of length.)"
+                 common short strings. Default 8. The table never registers values shorter than four bytes."
             }
             SettingId::RedactPlaceholder => {
                 "The string each redacted secret is replaced with in outbound \
@@ -1065,10 +1064,10 @@ impl SettingId {
                  real data or tries to work around it."
             }
             SettingId::RedactDenylist => {
-                "Literal values that must always be redacted, even if shorter than \
-                 the minimum length or sourced from an allowlisted variable. \
+                "Literal values redacted when at least four bytes long, even if shorter than \
+                 the configured minimum length or sourced from an allowlisted variable. \
                  Base64, hex, and URL-encoded forms are also scrubbed. \
-                 Security-sensitive: anything you add here is scrubbed everywhere. \
+                 Security-sensitive: entries below four bytes are rejected; accepted entries are scrubbed everywhere. \
                  Drill in to manage the list."
             }
             SettingId::RedactAllowlist => {
@@ -2713,8 +2712,8 @@ impl SettingsCx {
                 };
             }
             S::RedactMinSecretLength => {
-                // 0 would add every value; keep a floor of 1 to stay useful.
-                let v = parse_min_usize(trimmed, 1)?;
+                // The table has a hard four-byte floor; keep the editor aligned with it.
+                let v = parse_min_usize(trimmed, 4)?;
                 self.extended.redact.min_secret_length = v;
             }
             S::RedactPlaceholder => {

@@ -115,6 +115,11 @@ const DISABLE_MARKER: &str = "COCKPIT_DISABLE_REDACT";
 /// matcher without bound.
 const MAX_FORCED_SECRET_VARIANTS: usize = 3;
 
+/// Hard lower bound for every redaction pattern. Values below this length can
+/// corrupt unrelated output (for example, a timeout rendered as `120s`) and are
+/// therefore never safe to register, regardless of their source.
+const MIN_REDACTION_ENTRY_LENGTH: usize = 4;
+
 /// PEM private-key opening headers. A file under the SSH dir is treated as a
 /// private key — and its content registered as a forced secret — iff its
 /// (leading-whitespace-trimmed) content starts with one of these. This is
@@ -344,6 +349,10 @@ fn case_secret_variants(value: &str) -> Vec<String> {
 }
 
 fn encoded_secret_variants(value: &str) -> Vec<String> {
+    if value.len() < MIN_REDACTION_ENTRY_LENGTH {
+        return Vec::new();
+    }
+
     let mut variants = Vec::with_capacity(MAX_FORCED_SECRET_VARIANTS);
     let bytes = value.as_bytes();
     variants.push(base64::engine::general_purpose::STANDARD.encode(bytes));
@@ -622,6 +631,19 @@ impl RedactionTable {
         unsupported_files: Vec<PathBuf>,
         protected: ProtectedPaths,
     ) -> Result<Self> {
+        entries.retain(|(value, origin)| {
+            if value.len() < MIN_REDACTION_ENTRY_LENGTH {
+                tracing::warn!(
+                    origin = %origin,
+                    min_length = MIN_REDACTION_ENTRY_LENGTH,
+                    "dropping redaction entry below the hard minimum length"
+                );
+                false
+            } else {
+                true
+            }
+        });
+
         let protected_conflicting_origins: HashSet<String> = entries
             .iter()
             .filter(|(value, origin)| {

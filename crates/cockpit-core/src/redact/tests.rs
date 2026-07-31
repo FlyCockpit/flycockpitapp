@@ -809,17 +809,56 @@ fn allowlisted_path_not_redacted_even_when_long() {
 }
 
 #[test]
-fn denylisted_value_always_redacted_including_short() {
+fn denylist_bypasses_configured_floor_but_not_hard_floor() {
     let mut cfg = enabled_cfg();
     cfg.scan_environment = false;
     cfg.scan_dotenv = false;
     cfg.min_secret_length = 16; // huge threshold so length can't help
-    cfg.denylist = vec!["sek".into()]; // 3 chars — would normally fail
+    cfg.denylist = vec!["sekr".into()];
     let dir = TempDir::new().unwrap();
     let t = RedactionTable::build(&cfg, dir.path()).unwrap();
-    let scrubbed = t.scrub("the keyword sek appears here");
-    assert!(scrubbed.contains("***REDACT***"));
-    assert!(!scrubbed.contains(" sek "));
+    assert_eq!(
+        t.scrub("the keyword sekr appears here"),
+        format!("the keyword {} appears here", cfg.placeholder)
+    );
+}
+
+#[test]
+fn hard_floor_rejects_short_entries_from_every_table_ingress() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = enabled_cfg();
+    cfg.min_secret_length = 1;
+    cfg.denylist = vec!["0".into()];
+    let from_build = build_with_session_env(
+        &cfg,
+        dir.path(),
+        &HashMap::from([("API_SECRET".into(), "1".into())]),
+    );
+    assert!(from_build.is_empty());
+
+    let from_forced = from_build
+        .with_forced_literal("2".into(), "sealed:test".into())
+        .unwrap();
+    assert!(from_forced.is_empty());
+
+    let restored = RedactionTable::from_persisted_json(
+        r#"{"entries":[["3","legacy"]],"placeholder":"***REDACT***","disabled":false,"unsupported_files":[],"protected":[]}"#,
+    )
+    .unwrap();
+    assert!(restored.is_empty());
+
+    let table = from_forced.union(&restored).unwrap();
+
+    assert!(
+        table
+            .entries
+            .iter()
+            .all(|(value, _)| value.len() >= MIN_REDACTION_ENTRY_LENGTH)
+    );
+    assert_eq!(
+        table.scrub("tool `x` did not return within 120s and was abandoned"),
+        "tool `x` did not return within 120s and was abandoned"
+    );
 }
 
 #[test]

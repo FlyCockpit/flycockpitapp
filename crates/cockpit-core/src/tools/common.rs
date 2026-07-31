@@ -235,8 +235,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
     // logic build their own ctx or flip the flag explicitly.
     session.set_sandbox_enabled(false);
     let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
-    let cfg = crate::config::extended::RedactConfig::default();
-    let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, root).unwrap());
+    let redact = Arc::new(crate::redact::RedactionTable::empty());
     (
         ToolCtx {
             agent_id: "builder".to_string(),

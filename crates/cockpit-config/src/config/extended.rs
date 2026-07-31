@@ -1408,12 +1408,13 @@ pub struct RedactConfig {
     pub dotenv_patterns: Vec<String>,
     #[serde(default)]
     pub extra_dotenv_paths: Vec<PathBuf>,
-    /// Minimum length for prunable candidate values. Filesystem paths are
-    /// never registered by automatic scanning regardless of this value.
+    /// Minimum length for prunable candidate values. The effective floor is
+    /// always at least four bytes; filesystem paths are never registered by
+    /// automatic scanning regardless of this value.
     pub min_secret_length: usize,
     pub placeholder: String,
-    /// User-supplied literal values that must *always* be redacted, even
-    /// if shorter than `min_secret_length` or sourced from an
+    /// User-supplied literal values redacted when they meet the table's four-byte
+    /// hard minimum, even if shorter than `min_secret_length` or sourced from an
     /// allowlisted env var. Forced denylist values can intentionally match
     /// filesystem paths; automatic scanning still never registers paths.
     /// Per spec §2b merging.

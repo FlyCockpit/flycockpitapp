@@ -12,6 +12,7 @@
 //! through one socket while also reading the event stream, without
 //! any locking ceremony in user code.
 
+#[cfg(unix)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -25,15 +26,17 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::daemon::proto::{
-    self, Body, Envelope, ErrorPayload, ProtoStream, RecvFrame, Request, Response,
-};
+use crate::daemon::proto::{self, ErrorPayload, Request, Response};
+#[cfg(unix)]
+use crate::daemon::proto::{Body, Envelope, ProtoStream, RecvFrame};
 
 static OWN_EPHEMERAL_PATHS: OnceLock<Mutex<Option<crate::daemon::DaemonPaths>>> = OnceLock::new();
 
+#[cfg(unix)]
 /// Outbound queue depth. Generous — request payloads are tiny.
 const REQUEST_QUEUE: usize = 64;
 
+#[cfg(unix)]
 /// Inbound event queue depth. Lagging consumers drop incoming events and get a
 /// typed lag marker once capacity returns. If the TUI cannot keep up, the
 /// right answer is "reattach" (the server re-sends the current session state
@@ -44,6 +47,7 @@ const EVENT_QUEUE: usize = 1024;
 /// generous ceiling so a hung daemon causes a loud error rather than
 /// a stalled TUI.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
 const MAX_BIASED_INBOUND_FRAMES: usize = 32;
 
 thread_local! {
@@ -161,8 +165,10 @@ impl DaemonClient {
         request: Request,
     ) -> Result<std::result::Result<Response, ErrorPayload>> {
         let (tx, rx) = oneshot::channel();
+        #[cfg(unix)]
         let id = Uuid::new_v4();
         match &self.backend {
+            #[cfg(unix)]
             ClientBackend::Wire(request_tx) => {
                 request_tx
                     .send(IoCommand::Request(Box::new(Pending {

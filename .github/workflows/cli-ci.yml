@@ -74,7 +74,12 @@ jobs:
           workspaces: . -> target
 
       - name: Build
+        if: matrix.os != 'windows-latest'
         run: cargo build --locked --workspace
+
+      - name: Build Windows target
+        if: matrix.os == 'windows-latest'
+        run: cargo build --locked --workspace --target x86_64-pc-windows-msvc
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
@@ -86,7 +91,12 @@ jobs:
         run: cargo test --locked --workspace --doc
 
       - name: Clippy
+        if: matrix.os != 'windows-latest'
         run: cargo clippy --locked --workspace --tests -- -D warnings
+
+      - name: Clippy Windows target
+        if: matrix.os == 'windows-latest'
+        run: cargo clippy --locked --workspace --tests --target x86_64-pc-windows-msvc -- -D warnings
 
       - name: Format
         run: cargo fmt --all -- --check

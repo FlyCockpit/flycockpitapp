@@ -578,6 +578,15 @@ async fn socket_responds(socket: &Path) -> Option<SocketHelloResponse> {
     }
 }
 
+/// A recorded endpoint can only name a Unix-domain socket. Keep the discovery
+/// path intact on platforms without that transport, but honestly report that
+/// no daemon is reachable rather than attempting to interpret the path as a
+/// different kind of endpoint.
+#[cfg(not(unix))]
+async fn socket_responds(_socket: &Path) -> Option<SocketHelloResponse> {
+    None
+}
+
 #[cfg(unix)]
 fn socket_responds_blocking(socket: &Path) -> Option<SocketHelloResponse> {
     use std::os::unix::net::UnixStream as StdUnixStream;
@@ -600,6 +609,11 @@ fn socket_responds_blocking(socket: &Path) -> Option<SocketHelloResponse> {
         }
         Err(_) => None,
     }
+}
+
+#[cfg(not(unix))]
+fn socket_responds_blocking(_socket: &Path) -> Option<SocketHelloResponse> {
+    None
 }
 
 #[cfg(unix)]
@@ -2541,5 +2555,25 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod non_unix_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_discovery_reports_no_daemon_without_socket_transport() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = DaemonPaths {
+            socket: dir.path().join("daemon.sock"),
+            pid_file: dir.path().join("daemon.pid"),
+            ephemeral: false,
+        };
+
+        let probe = discover_blocking_with_canonical(paths);
+
+        assert_eq!(probe.status, DaemonStatus::NotRunning);
+        assert!(probe.hello.is_none());
     }
 }

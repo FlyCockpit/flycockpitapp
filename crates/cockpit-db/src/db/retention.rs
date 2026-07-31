@@ -38,7 +38,7 @@ impl Default for RetentionConfig {
 }
 
 fn default_retention_payload_window_days() -> u32 {
-    30
+    0
 }
 
 fn default_retention_sweep_interval_hours() -> u32 {
@@ -497,6 +497,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = Db::open(&tmp.path().join("retention.db")).unwrap();
         assert!(db.vacuum_retention_database().await.unwrap());
+    }
+
+    #[test]
+    fn pruning_is_off_by_default() {
+        let cfg = RetentionConfig::default();
+        assert_eq!(cfg.payload_window_days, 0);
+        assert_eq!(cfg.session_window_days, 0);
     }
 
     #[tokio::test]

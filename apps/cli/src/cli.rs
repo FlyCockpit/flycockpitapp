@@ -771,6 +771,21 @@ pub enum SessionCommand {
     Delete {
         #[arg(value_name = "SESSION_ID")]
         session_id: String,
+        /// Confirm irreversible deletion. Required outside an interactive terminal.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Permanently delete ended sessions before an absolute date or relative duration such as 30d.
+    Purge {
+        /// Absolute YYYY-MM-DD date or relative duration such as 30d.
+        #[arg(long, value_name = "WHEN")]
+        before: String,
+        /// Report matching sessions without deleting them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm irreversible deletion. Required outside an interactive terminal.
+        #[arg(long)]
+        yes: bool,
     },
     /// Answer a pending question or approval interrupt.
     Answer(SessionAnswerArgs),

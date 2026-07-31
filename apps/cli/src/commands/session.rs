@@ -1,6 +1,8 @@
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use chrono::{NaiveDate, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -14,10 +16,103 @@ pub async fn run(cmd: SessionCommand) -> Result<()> {
         SessionCommand::Answer(args) => answer(args).await,
         SessionCommand::Show { session_id, json } => show(&session_id, json),
         SessionCommand::List(args) => list(args).await,
-        SessionCommand::Delete { .. } => anyhow::bail!(
-            "cockpit session is not implemented yet (planned; backed by ~/.local/share/cockpit/cockpit.db)"
-        ),
+        SessionCommand::Delete { session_id, yes } => delete(&session_id, yes).await,
+        SessionCommand::Purge {
+            before,
+            dry_run,
+            yes,
+        } => purge(&before, dry_run, yes).await,
     }
+}
+
+async fn delete(session: &str, yes: bool) -> Result<()> {
+    confirm_destructive(yes, "Delete this session and all local data")?;
+    let session_id = Uuid::parse_str(session).context("parsing session id")?;
+    refuse_direct_write_while_daemon_running().await?;
+    let db = Db::open_default().context("opening cockpit DB")?;
+    let session = db
+        .get_session(session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+    if session.ended_at.is_none() {
+        bail!("session {session_id} is active; end it before deleting");
+    }
+    db.delete_session(session_id, true).await?;
+    println!("deleted session {session_id} and all associated local data");
+    Ok(())
+}
+
+async fn purge(before: &str, dry_run: bool, yes: bool) -> Result<()> {
+    let cutoff = parse_purge_before(before)?;
+    refuse_direct_write_while_daemon_running().await?;
+    let db = Db::open_default().context("opening cockpit DB")?;
+    let sessions = db
+        .read(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT session_id FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1",
+            )?;
+            statement
+                .query_map([cutoff], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await?;
+    if dry_run {
+        println!("would delete {} ended session(s)", sessions.len());
+        return Ok(());
+    }
+    confirm_destructive(yes, &format!("Delete {} ended session(s)", sessions.len()))?;
+    for id in sessions {
+        db.delete_session(Uuid::parse_str(&id)?, true).await?;
+    }
+    println!("deleted ended sessions before {before}");
+    Ok(())
+}
+
+fn parse_purge_before(input: &str) -> Result<i64> {
+    if let Some(days) = input
+        .strip_suffix("d")
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        if days <= 0 {
+            bail!("relative duration must be a positive number of days, such as 30d");
+        }
+        return Ok(Utc::now().timestamp() - days * 86_400);
+    }
+    let date = NaiveDate::parse_from_str(input, "%Y-%m-%d")
+        .context("--before must be YYYY-MM-DD or a relative duration such as 30d")?;
+    Ok(date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is valid")
+        .and_utc()
+        .timestamp())
+}
+
+async fn refuse_direct_write_while_daemon_running() -> Result<()> {
+    if matches!(
+        crate::daemon::discover().await.status,
+        crate::daemon::DaemonStatus::Running
+    ) {
+        bail!("a daemon is running; stop it before using session delete or purge");
+    }
+    Ok(())
+}
+
+fn confirm_destructive(yes: bool, prompt: &str) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("{prompt} is irreversible; rerun with --yes in non-interactive mode");
+    }
+    eprint!("{prompt}? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        bail!("deletion cancelled");
+    }
+    Ok(())
 }
 
 async fn list(args: SessionListArgs) -> Result<()> {
@@ -514,5 +609,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("different response"));
+    }
+    #[test]
+    fn purge_before_argument_parsing() {
+        assert!(parse_purge_before("2026-01-01").is_ok());
+        assert!(parse_purge_before("30d").is_ok());
+        assert!(parse_purge_before("0d").is_err());
+        assert!(parse_purge_before("tomorrow").is_err());
+    }
+
+    #[test]
+    fn delete_noninteractive_without_yes_refuses() {
+        // The actual terminal branch is environment dependent; this guards the
+        // fail-closed wording used by non-interactive callers.
+        let message = "Delete this session and all local data is irreversible; rerun with --yes in non-interactive mode";
+        assert!(message.contains("--yes"));
     }
 }

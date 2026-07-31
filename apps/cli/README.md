@@ -187,6 +187,8 @@ cockpit packages prune --dry-run
 | `cockpit daemon stop` | Stop the daemon. |
 | `cockpit doctor [path]` | Print a read-only diagnostics snapshot. |
 | `cockpit session list` | List recorded sessions. |
+| `cockpit session delete <session> [--yes]` | Permanently delete one session and its local data; prompts unless `--yes` is supplied. |
+| `cockpit session purge --before <YYYY-MM-DD|30d> [--dry-run] [--yes]` | Permanently delete ended sessions before a cutoff; `--dry-run` reports the count only. |
 | `cockpit schedule list` | List durable scheduler jobs. |
 | `cockpit skill curator status` | Show skill curation and snapshot state. |
 | `cockpit trust status [path]` | Show workspace trust state. |
@@ -419,13 +421,9 @@ Cockpit stores durable session data in
 `~/.local/share/cockpit/cockpit.db` (or
 `$XDG_DATA_HOME/cockpit/cockpit.db`; run `cockpit daemon status --json` to
 see the exact resolved path). It includes session events and the full assembled
-post-redaction payload for model requests. For closed sessions, inference-request payloads, session events, tool-call events, and inference-call records are currently pruned after 30 days; session records themselves have no time-based expiration by default.
+post-redaction payload for model requests. Retention is disabled by default: no session payloads are pruned unless an operator explicitly configures a positive retention window.
 
-There is not yet a working `cockpit session delete` command. When connected to
-the daemon, the TUI Sessions pane can delete an individual session and its
-dependent records. To remove all local session history, stop the daemon and
-remove the database together with its adjacent `-wal` and `-shm` files at the
-resolved data path. Exporting is not deletion: exports are redacted by default,
+Use `cockpit session delete <session>` to permanently remove one session and all local associated data. The command prompts by default and requires `--yes` when non-interactive. Use `cockpit session purge --before <YYYY-MM-DD|30d>` for ended sessions; start with `--dry-run`. Exporting is not deletion: exports are redacted by default,
 while `--include-sensitive` intentionally includes exact captured payloads.
 
 ### Limits of the protections

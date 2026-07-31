@@ -16,7 +16,7 @@ Flycockpit is an instance operations console for remote AI workspaces. This mono
 | Worker | `apps/worker` | BullMQ worker for asset analysis, cleanup, seed jobs, video transcoding, and enterprise log exports. |
 | Native | `apps/native` | Expo Router app wired to the same auth and API contracts. |
 | Relay | `apps/relay` | Remote-session relay service. |
-| CLI | `apps/cli` | `cockpit`, the Rust AI coding harness with a codex-style TUI, session daemon, and multi-agent execution. |
+| CLI | `apps/cli` | `cockpit`, the Rust AI coding harness with an interactive full-screen terminal UI, session daemon, and multi-agent execution. |
 | Docs | `apps/docs` | Starlight documentation app retained for now. |
 
 ## Packages
@@ -49,6 +49,8 @@ brew install flycockpit/tap/cockpit
 ```
 
 See [`apps/cli/README.md`](apps/cli/README.md) for Windows install, usage, and configuration. The CLI is a standalone Rust crate; the pnpm workspace and turbo tasks do not build it. Its CI and releases run through `.github/workflows/cli-ci.yml` and `.github/workflows/release.yml`.
+
+FlyCockpit is not affiliated with or endorsed by OpenAI, xAI, GitHub, or Anthropic.
 
 ## Local Development
 

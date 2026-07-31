@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://shieldcn.dev/header/gradient.svg?title=Cockpit%20CLI&subtitle=AI%20coding%20harness%20with%20a%20Codex-style%20TUI%2C%20daemon%20sessions%2C%20and%20multi-agent%20execution&theme=slate&font=geist&align=center" alt="Cockpit CLI" />
+  <img src="https://shieldcn.dev/header/gradient.svg?title=FlyCockpit&subtitle=AI%20coding%20harness%20with%20an%20interactive%20terminal%20UI%2C%20daemon%20sessions%2C%20and%20multi-agent%20execution&theme=slate&font=geist&align=center" alt="FlyCockpit" />
 </p>
 
 <p align="center">
@@ -12,11 +12,13 @@
 
 `cockpit` is a Rust-native AI coding harness. It combines an interactive terminal UI, a persistent session daemon, OpenAI-compatible provider configuration, file-locking write tools, MCP integration, and built-in agent roles for planning, coding, review, package research, and background execution.
 
+FlyCockpit is not affiliated with or endorsed by OpenAI, xAI, GitHub, or Anthropic.
+
 The project is early (`0.1.0`), but the codebase already has a broad surface: durable SQLite-backed sessions, prompt/context pruning, provider model catalogs, workspace trust controls, multi-agent delegation, session export/import, and diagnostics.
 
 ## Highlights
 
-- Codex-style TUI: run `cockpit` to open an interactive project session.
+- Interactive terminal UI: run `cockpit` to open an interactive project session.
 - Headless automation: `cockpit run` streams assistant output or NDJSON events for scripts and CI.
 - Persistent daemon: sessions survive client exits and can be listed, resumed, forked, exported, and imported.
 - Multi-agent workflow: bundled `Auto`, `Build`, `builder`, `Plan`, `Swarm`, `bee`, `Multireview`, `explore`, and `scout` agents.

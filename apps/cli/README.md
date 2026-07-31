@@ -385,6 +385,55 @@ Cockpit is built around explicit trust and scoped execution:
 - Credentials are stored outside project config and written with private file permissions on Unix.
 - Session exports are redacted by default; `--include-sensitive` is an explicit opt-in for exact captured payloads.
 
+## What Leaves Your Machine
+
+Cockpit can send data to the destinations below. This table describes the
+current CLI behavior, not a future privacy policy.
+
+| Destination | What can leave | When | Default |
+| --- | --- | --- | --- |
+| Configured model provider | Prompts, conversation history, and tool results; redacted for the default untrusted models, but unsanitized for a model marked trusted | You send a message to a configured remote model | Opt-in: you configure and select the provider |
+| [Firecrawl](https://firecrawl.dev/) (`api.firecrawl.dev`) | A model-authored web-search query or URL | The built-in `websearch` or `webfetch` tool runs | Default-on for the built-in web tools; the keyless tier is attributed to your IP |
+| [TinyFish](https://tinyfish.ai/) (`api.search.tinyfish.ai`, `api.fetch.tinyfish.ai`) | A web-search query or URL and its configured API credential | You select TinyFish and configure `TINYFISH_API_KEY` | Opt-in; without its key Cockpit falls back to Firecrawl keyless tier |
+| crates.io, npm, and PyPI | A package name | The docs/package workflow resolves a package official source repository | Default-on when that model-triggered workflow runs |
+| A registry-declared git host | A `git clone` request for a package repository | The package workflow has resolved the repository from crates.io, npm, or PyPI | Approval-gated |
+| `app.flycockpit.dev` account login | OAuth device-login and instance-registration data, including hostname, OS, architecture, and CLI version | You run `cockpit account login` | Opt-in |
+| `app.flycockpit.dev` enterprise session-log sync | Post-redaction session-log data, including recorded model-request payloads when selected by policy | After account login, an organization policy has both session-log sync `enabled` and `mandatory` | Account opt-in; sync is policy-controlled |
+| `app.flycockpit.dev` remote audit | Connector audit rows | A signed-in account has remote connector access enabled | Opt-in |
+| A configured relay | The daemon RPC surface, including the project-root path | You log in and enable/connect the relay | Opt-in |
+| Configured MCP servers | The requests and data required by that server | You configure and invoke an MCP server | Opt-in; none are configured by default |
+| OAuth and provider endpoints | OAuth device-login data, model catalog requests, or embedding/project-text requests | You explicitly add or use that provider or command; embeddings are separately gated | Opt-in |
+
+Cockpit has no telemetry, analytics, crash-reporting service, or self-update
+client. The User-Agent identifies Cockpit version, operating system, and
+architecture. A FlyCockpit account login always includes the machine hostname in the instance-registration payload, along with OS, architecture, and CLI version. The optional display name defaults to the hostname when none is supplied. Hostname is not included in the model system prompt.
+
+### Local storage and retention
+
+Cockpit stores durable session data in
+`~/.local/share/cockpit/cockpit.db` (or
+`$XDG_DATA_HOME/cockpit/cockpit.db`; run `cockpit daemon status --json` to
+see the exact resolved path). It includes session events and the full assembled
+post-redaction payload for model requests. For closed sessions, inference-request payloads, session events, tool-call events, and inference-call records are currently pruned after 30 days; session records themselves have no time-based expiration by default.
+
+There is not yet a working `cockpit session delete` command. When connected to
+the daemon, the TUI Sessions pane can delete an individual session and its
+dependent records. To remove all local session history, stop the daemon and
+remove the database together with its adjacent `-wal` and `-shm` files at the
+resolved data path. Exporting is not deletion: exports are redacted by default,
+while `--include-sensitive` intentionally includes exact captured payloads.
+
+### Limits of the protections
+
+Redaction is best-effort pattern matching, enabled by default for untrusted
+models; trusted models receive unsanitized outbound content. It has an
+allowlist and denylist. Automatic candidates default to an eight-character
+minimum; every redaction entry has a hard four-byte minimum. Treat it as a
+safeguard, not a guarantee that every secret is removed.
+
+The shell sandbox is filesystem-only and does not restrict network access. It
+has no native Windows backend, so shell commands on Windows run unconfined.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

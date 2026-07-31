@@ -12,12 +12,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::header::RETRY_AFTER;
-use reqwest::{StatusCode, Url};
+use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::auth::flycockpit::{StoredFlycockpitCredential, maybe_load_credential};
-use crate::config::extended::RedactConfig;
+use crate::daemon::egress::{FirstPartyEgressClient, redaction_for_session};
 use crate::daemon::server::DaemonContext;
 use crate::db::Db;
 use crate::db::session_log::SessionEventRow;
@@ -57,12 +57,12 @@ pub async fn sync_current_credential_once(db: &Db) -> Result<OrgSyncOnceOutcome>
     let Some(credential) = maybe_load_credential() else {
         return Ok(OrgSyncOnceOutcome::NoCredential);
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let redaction = RedactionTable::build(&RedactConfig::default(), &cwd)
-        .unwrap_or_else(|_| RedactionTable::empty());
-    let client = OrgSyncHttpClient::new(&credential.server_url)?;
+    let Some(client) = FirstPartyEgressClient::connect(db.clone(), credential.clone()).await?
+    else {
+        return Ok(OrgSyncOnceOutcome::Disabled);
+    };
     let mut sleeper = |duration| -> SleepFuture { Box::pin(tokio::time::sleep(duration)) };
-    sync_once_with_client(db, &credential, &client, &redaction, &mut sleeper).await
+    sync_once_with_client(db, &credential, &client, &mut sleeper).await
 }
 
 pub type SleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -122,104 +122,77 @@ enum PolicyFetchOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IngestOutcome {
+    Disabled,
     Accepted,
     Revoked,
 }
 
-#[derive(Clone)]
-struct OrgSyncHttpClient {
-    http: reqwest::Client,
-    server_url: String,
+async fn fetch_policy(client: &FirstPartyEgressClient) -> Result<PolicyFetchOutcome> {
+    let Some(resp) = client
+        .send_json(Method::GET, POLICY_PATH, &[], None)
+        .await?
+    else {
+        return Ok(PolicyFetchOutcome::Disabled);
+    };
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    match status {
+        StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => Ok(PolicyFetchOutcome::Disabled),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Ok(PolicyFetchOutcome::Revoked),
+        status if status.is_success() => parse_policy(&body),
+        _ => Err(anyhow!(
+            "Flycockpit org policy request failed ({status}): {}",
+            response_hint(&body)
+        )),
+    }
 }
 
-impl OrgSyncHttpClient {
-    fn new(server_url: &str) -> Result<Self> {
-        let server_url = crate::auth::flycockpit::normalize_server_url(server_url)?;
-        Ok(Self {
-            http: reqwest::Client::new(),
-            server_url,
-        })
-    }
-
-    async fn fetch_policy(
-        &self,
-        credential: &StoredFlycockpitCredential,
-    ) -> Result<PolicyFetchOutcome> {
-        let resp = self
-            .http
-            .get(endpoint(&self.server_url, POLICY_PATH)?)
-            .bearer_auth(&credential.instance_token)
-            .header("x-flycockpit-instance-id", &credential.instance_id)
-            .header("x-csrf-token", crate::auth::flycockpit::CLIENT_ID)
-            .send()
-            .await
-            .context("fetching Flycockpit org policy")?;
+async fn post_batch_with_retries(
+    client: &FirstPartyEgressClient,
+    policy: &OrgLogSyncPolicy,
+    payload: &Value,
+    sleep: &mut (dyn FnMut(Duration) -> SleepFuture + Send),
+) -> Result<IngestOutcome> {
+    for attempt in 0..MAX_INGEST_ATTEMPTS {
+        let headers = [("x-flycockpit-org-id", policy.org_id.as_str())];
+        let Some(resp) = client
+            .send_json(Method::POST, INGEST_PATH, &headers, Some(payload))
+            .await?
+        else {
+            return Ok(IngestOutcome::Disabled);
+        };
         let status = resp.status();
+        if status.is_success() {
+            return Ok(IngestOutcome::Accepted);
+        }
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Ok(IngestOutcome::Revoked);
+        }
+        let retry_after = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after);
         let body = resp.text().await.unwrap_or_default();
-        match status {
-            StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => Ok(PolicyFetchOutcome::Disabled),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Ok(PolicyFetchOutcome::Revoked),
-            status if status.is_success() => parse_policy(&body),
-            _ => Err(anyhow!(
-                "Flycockpit org policy request failed ({status}): {}",
-                response_hint(&body)
-            )),
+        if is_retryable(status) && attempt + 1 < MAX_INGEST_ATTEMPTS {
+            sleep(retry_after.unwrap_or_else(|| backoff_delay(attempt))).await;
+            continue;
         }
+        return Err(anyhow!(
+            "Flycockpit session-log ingest failed ({status}): {}",
+            response_hint(&body)
+        ));
     }
-
-    async fn post_batch_with_retries(
-        &self,
-        credential: &StoredFlycockpitCredential,
-        policy: &OrgLogSyncPolicy,
-        payload: &Value,
-        sleep: SleepFn<'_>,
-    ) -> Result<IngestOutcome> {
-        for attempt in 0..MAX_INGEST_ATTEMPTS {
-            let resp = self
-                .http
-                .post(endpoint(&self.server_url, INGEST_PATH)?)
-                .bearer_auth(&credential.instance_token)
-                .header("x-flycockpit-instance-id", &credential.instance_id)
-                .header("x-flycockpit-org-id", &policy.org_id)
-                .header("x-csrf-token", crate::auth::flycockpit::CLIENT_ID)
-                .json(payload)
-                .send()
-                .await
-                .context("posting Flycockpit session-log sync batch")?;
-            let status = resp.status();
-            if status.is_success() {
-                return Ok(IngestOutcome::Accepted);
-            }
-            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-                return Ok(IngestOutcome::Revoked);
-            }
-            let retry_after = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(parse_retry_after);
-            let body = resp.text().await.unwrap_or_default();
-            if is_retryable(status) && attempt + 1 < MAX_INGEST_ATTEMPTS {
-                sleep(retry_after.unwrap_or_else(|| backoff_delay(attempt))).await;
-                continue;
-            }
-            return Err(anyhow!(
-                "Flycockpit session-log ingest failed ({status}): {}",
-                response_hint(&body)
-            ));
-        }
-        Err(anyhow!("Flycockpit session-log ingest exhausted retries"))
-    }
+    Err(anyhow!("Flycockpit session-log ingest exhausted retries"))
 }
 
 async fn sync_once_with_client(
     db: &Db,
     credential: &StoredFlycockpitCredential,
-    client: &OrgSyncHttpClient,
-    redaction: &RedactionTable,
+    client: &FirstPartyEgressClient,
     sleep: SleepFn<'_>,
 ) -> Result<OrgSyncOnceOutcome> {
-    let policy = match client.fetch_policy(credential).await? {
+    let policy = match fetch_policy(client).await? {
         PolicyFetchOutcome::Active(policy) => policy,
         PolicyFetchOutcome::Disabled => {
             db.mark_org_sync_disabled(&credential.server_url).await?;
@@ -243,7 +216,7 @@ async fn sync_once_with_client(
         .org_sync_state(&credential.server_url, &policy.org_id)
         .await?
         .ok_or_else(|| anyhow!("org sync state missing after policy upsert"))?;
-    let built = build_batch(db, credential, &policy, state.cursor_seq, redaction).await?;
+    let built = build_batch(db, credential, &policy, state.cursor_seq).await?;
     match built {
         BatchBuild::Idle => Ok(OrgSyncOnceOutcome::Idle),
         BatchBuild::Filtered { cursor_seq } => {
@@ -256,10 +229,7 @@ async fn sync_once_with_client(
             cursor_seq,
             event_count,
         } => {
-            let ingest = match client
-                .post_batch_with_retries(credential, &policy, &payload, sleep)
-                .await
-            {
+            let ingest = match post_batch_with_retries(client, &policy, &payload, sleep).await {
                 Ok(ingest) => ingest,
                 Err(error) => {
                     db.update_org_sync_error(
@@ -272,6 +242,7 @@ async fn sync_once_with_client(
                 }
             };
             match ingest {
+                IngestOutcome::Disabled => Ok(OrgSyncOnceOutcome::Disabled),
                 IngestOutcome::Accepted => {
                     db.update_org_sync_cursor(&credential.server_url, &policy.org_id, cursor_seq)
                         .await?;
@@ -306,7 +277,6 @@ async fn build_batch(
     credential: &StoredFlycockpitCredential,
     policy: &OrgLogSyncPolicy,
     cursor_seq: i64,
-    redaction: &RedactionTable,
 ) -> Result<BatchBuild> {
     let rows = db
         .list_org_sync_events_after(cursor_seq, MAX_BATCH_EVENTS)
@@ -323,7 +293,16 @@ async fn build_batch(
             batch_cursor_seq = row.seq;
             continue;
         }
-        let event = sync_event_json(db, row, redaction).await?;
+        if !policy.include_local_model_transcripts && row.model_trust.as_deref() == Some("trusted")
+        {
+            batch_cursor_seq = row.seq;
+            continue;
+        }
+        let Some(event) = sync_event_json(db, row).await? else {
+            batch_cursor_seq = row.seq;
+            tracing::warn!(session_id = %row.session_id, seq = row.seq, "skipping org sync event without a loadable session redaction table");
+            continue;
+        };
         let size = serde_json::to_vec(&event)
             .map(|bytes| bytes.len())
             .unwrap_or(0);
@@ -357,11 +336,10 @@ async fn build_batch(
     })
 }
 
-async fn sync_event_json(
-    db: &Db,
-    row: &SessionEventRow,
-    redaction: &RedactionTable,
-) -> Result<Value> {
+async fn sync_event_json(db: &Db, row: &SessionEventRow) -> Result<Option<Value>> {
+    let Some(redaction) = redaction_for_session(db, row.session_id).await? else {
+        return Ok(None);
+    };
     let mut event = json!({
         "idempotencyKey": format!("session_event:{}", row.seq),
         "sourceTable": "session_events",
@@ -382,7 +360,7 @@ async fn sync_event_json(
             "payload": payload,
         });
     }
-    Ok(scrub_json_value(event, redaction))
+    Ok(Some(scrub_json_value(event, &redaction)))
 }
 
 fn scrub_json_value(value: Value, redaction: &RedactionTable) -> Value {
@@ -473,12 +451,6 @@ fn string_vec(container: Option<&Value>, names: &[&str]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn endpoint(server_url: &str, path: &str) -> Result<Url> {
-    let base = Url::parse(server_url).context("parsing Flycockpit server URL")?;
-    base.join(path.trim_start_matches('/'))
-        .with_context(|| format!("building Flycockpit endpoint {path}"))
-}
-
 fn is_retryable(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
@@ -509,7 +481,8 @@ mod tests {
 
     use super::*;
     use crate::auth::flycockpit::{AccountInfo, with_redaction_token_override};
-    use crate::db::session_log::SessionEventKind;
+    use crate::config::extended::RedactConfig;
+    use crate::db::session_log::{SessionEventContext, SessionEventKind};
     use serde_json::json;
     use std::collections::VecDeque;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -545,8 +518,13 @@ mod tests {
     ) -> (OrgSyncOnceOutcome, Vec<String>, Vec<Duration>) {
         let (server, requests) = start_test_server(responses).await;
         let credential = credential(server.clone());
-        let client = OrgSyncHttpClient::new(&server).unwrap();
-        let redaction = RedactionTable::empty();
+        db.set_connector_enabled(&server, &credential.instance_id, true)
+            .await
+            .unwrap();
+        let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())
+            .await
+            .unwrap()
+            .unwrap();
         let sleeps = std::sync::Arc::new(Mutex::new(Vec::new()));
         let sleep_log = sleeps.clone();
         let mut sleeper = move |duration| -> SleepFuture {
@@ -555,7 +533,7 @@ mod tests {
                 sleep_log.lock().await.push(duration);
             })
         };
-        let outcome = sync_once_with_client(db, &credential, &client, &redaction, &mut sleeper)
+        let outcome = sync_once_with_client(db, &credential, &client, &mut sleeper)
             .await
             .unwrap();
         let requests = requests.lock().await.clone();
@@ -577,6 +555,12 @@ mod tests {
                 )
             })
             .unwrap();
+        db.set_session_redaction_table_json(
+            session.session_id,
+            Some(RedactionTable::empty().to_persisted_json().unwrap()),
+        )
+        .await
+        .unwrap();
         db.insert_session_event(
             session.session_id,
             kind,
@@ -586,6 +570,40 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn no_remote_suppresses_policy_poll() {
+        let db = Db::open_in_memory().unwrap();
+        let (server, requests) = start_test_server(vec![response(200, active_policy())]).await;
+        let credential = credential(server.clone());
+        db.set_connector_enabled(&server, &credential.instance_id, false)
+            .await
+            .unwrap();
+
+        let client = FirstPartyEgressClient::connect(db.clone(), credential)
+            .await
+            .unwrap();
+        assert!(client.is_none());
+        assert!(requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_remote_suppresses_upload_despite_mandatory_policy() {
+        let db = Db::open_in_memory().unwrap();
+        insert_event(&db, SessionEventKind::UserMessage, "must remain local").await;
+        let (server, requests) =
+            start_test_server(vec![response(200, active_policy()), response(200, "{}")]).await;
+        let credential = credential(server.clone());
+        db.set_connector_enabled(&server, &credential.instance_id, false)
+            .await
+            .unwrap();
+
+        let client = FirstPartyEgressClient::connect(db.clone(), credential)
+            .await
+            .unwrap();
+        assert!(client.is_none());
+        assert!(requests.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -628,10 +646,15 @@ mod tests {
             .await
             .unwrap();
         let credential = credential(server.clone());
-        let client = OrgSyncHttpClient::new(&server).unwrap();
-        let redaction = RedactionTable::empty();
+        db.set_connector_enabled(&server, &credential.instance_id, true)
+            .await
+            .unwrap();
+        let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())
+            .await
+            .unwrap()
+            .unwrap();
         let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
-        let outcome = sync_once_with_client(&db, &credential, &client, &redaction, &mut sleeper)
+        let outcome = sync_once_with_client(&db, &credential, &client, &mut sleeper)
             .await
             .unwrap();
         assert_eq!(
@@ -706,10 +729,15 @@ mod tests {
             .await
             .unwrap();
         let credential = credential(server.clone());
-        let client = OrgSyncHttpClient::new(&server).unwrap();
-        let redaction = RedactionTable::empty();
+        db.set_connector_enabled(&server, &credential.instance_id, true)
+            .await
+            .unwrap();
+        let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())
+            .await
+            .unwrap()
+            .unwrap();
         let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
-        let outcome = sync_once_with_client(&db, &credential, &client, &redaction, &mut sleeper)
+        let outcome = sync_once_with_client(&db, &credential, &client, &mut sleeper)
             .await
             .unwrap();
         assert_eq!(outcome, OrgSyncOnceOutcome::Revoked);
@@ -745,9 +773,7 @@ mod tests {
             raw: json!({}),
         };
         let credential = credential("http://localhost:1".to_string());
-        let built = build_batch(&db, &credential, &policy, 0, &RedactionTable::empty())
-            .await
-            .unwrap();
+        let built = build_batch(&db, &credential, &policy, 0).await.unwrap();
         match built {
             BatchBuild::Ready {
                 cursor_seq,
@@ -794,6 +820,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_model_transcripts_excluded_when_disabled() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("p", "/tmp/project", "builder")
+            .await
+            .unwrap();
+        db.set_session_redaction_table_json(
+            session.session_id,
+            Some(RedactionTable::empty().to_persisted_json().unwrap()),
+        )
+        .await
+        .unwrap();
+        let local = db
+            .insert_session_event_with_context(
+                session.session_id,
+                SessionEventKind::AssistantMessage,
+                Some("builder"),
+                None,
+                SessionEventContext {
+                    model_trust: Some("trusted"),
+                    ..SessionEventContext::default()
+                },
+                &json!({"text": "local transcript"}),
+            )
+            .await
+            .unwrap();
+        let remote = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::AssistantMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "remote transcript"}),
+            )
+            .await
+            .unwrap();
+        let policy = json!({
+            "orgId": "org-1",
+            "sessionLogSync": {
+                "enabled": true,
+                "mandatory": true,
+                "includeLocalModelTranscripts": false
+            }
+        })
+        .to_string();
+        let (outcome, requests, _) =
+            sync_with_responses(&db, vec![response(200, policy), response(200, "{}")]).await;
+        assert_eq!(
+            outcome,
+            OrgSyncOnceOutcome::Uploaded {
+                events: 1,
+                cursor_seq: remote,
+            }
+        );
+        let ingest = requests
+            .iter()
+            .find(|request| request.starts_with("POST "))
+            .unwrap();
+        assert!(!ingest.contains(&format!(r#""seq":{local}"#)));
+        assert!(ingest.contains(&format!(r#""seq":{remote}"#)));
+    }
+
+    #[tokio::test]
     async fn redacted_values_never_appear_in_payloads() {
         let db = Db::open_in_memory().unwrap();
         let session = db
@@ -812,13 +901,25 @@ mod tests {
         let (server, requests) =
             start_test_server(vec![response(200, active_policy()), response(200, "{}")]).await;
         let credential = credential(server.clone());
-        let client = OrgSyncHttpClient::new(&server).unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
         let redaction = with_redaction_token_override("fci_instance_secret", || {
             RedactionTable::build(&RedactConfig::default(), tmp.path()).unwrap()
         });
+        db.set_session_redaction_table_json(
+            session.session_id,
+            Some(redaction.to_persisted_json().unwrap()),
+        )
+        .await
+        .unwrap();
+        db.set_connector_enabled(&server, &credential.instance_id, true)
+            .await
+            .unwrap();
+        let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())
+            .await
+            .unwrap()
+            .unwrap();
         let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
-        sync_once_with_client(&db, &credential, &client, &redaction, &mut sleeper)
+        sync_once_with_client(&db, &credential, &client, &mut sleeper)
             .await
             .unwrap();
         let seen = requests.lock().await;

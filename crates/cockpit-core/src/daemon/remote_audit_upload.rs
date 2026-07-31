@@ -5,17 +5,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use reqwest::header::RETRY_AFTER;
-use reqwest::{StatusCode, Url};
+use reqwest::{Method, StatusCode};
 use serde_json::{Map, Value, json};
 
 use crate::auth::flycockpit::{StoredFlycockpitCredential, maybe_load_credential};
-use crate::config::extended::RedactConfig;
+use crate::daemon::egress::{FirstPartyEgressClient, connector_enabled};
 use crate::daemon::server::DaemonContext;
 use crate::db::Db;
 use crate::db::principals::RemoteAuditRow;
-use crate::redact::RedactionTable;
 
 const INGEST_PATH: &str = "/api/relay/audit-ingest";
 const MAX_BATCH_EVENTS: usize = 100;
@@ -80,15 +79,12 @@ pub async fn sync_current_credential_once(db: &Db) -> Result<RemoteAuditUploadOn
     let Some(credential) = maybe_load_credential() else {
         return Ok(RemoteAuditUploadOnceOutcome::NoCredential);
     };
-    if !audit_upload_enabled(db, &credential).await? {
+    let Some(client) = FirstPartyEgressClient::connect(db.clone(), credential.clone()).await?
+    else {
         return Ok(RemoteAuditUploadOnceOutcome::Disabled);
-    }
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let redaction = RedactionTable::build(&RedactConfig::default(), &cwd)
-        .unwrap_or_else(|_| RedactionTable::empty());
-    let client = RemoteAuditUploadHttpClient::new(&credential.server_url)?;
+    };
     let mut sleeper = |duration| -> SleepFuture { Box::pin(tokio::time::sleep(duration)) };
-    sync_once_with_client(db, &credential, &client, &redaction, &mut sleeper).await
+    sync_once_with_client(db, &credential, &client, &mut sleeper).await
 }
 
 pub type SleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -110,74 +106,49 @@ enum IngestOutcome {
     Revoked,
 }
 
-#[derive(Clone)]
-struct RemoteAuditUploadHttpClient {
-    http: reqwest::Client,
-    server_url: String,
-}
-
-impl RemoteAuditUploadHttpClient {
-    fn new(server_url: &str) -> Result<Self> {
-        let server_url = crate::auth::flycockpit::normalize_server_url(server_url)?;
-        Ok(Self {
-            http: reqwest::Client::new(),
-            server_url,
-        })
-    }
-
-    async fn post_batch_with_retries(
-        &self,
-        payload: &Value,
-        sleep: SleepFn<'_>,
-    ) -> Result<IngestOutcome> {
-        for attempt in 0..MAX_INGEST_ATTEMPTS {
-            let resp = self
-                .http
-                .post(endpoint(&self.server_url, INGEST_PATH)?)
-                .header("x-csrf-token", crate::auth::flycockpit::CLIENT_ID)
-                .json(payload)
-                .send()
-                .await
-                .context("posting Flycockpit remote audit batch")?;
-            let status = resp.status();
-            if status.is_success() {
-                return Ok(IngestOutcome::Accepted);
-            }
-            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-                return Ok(IngestOutcome::Revoked);
-            }
-            let retry_after = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(parse_retry_after);
-            let body = resp.text().await.unwrap_or_default();
-            if is_retryable(status) && attempt + 1 < MAX_INGEST_ATTEMPTS {
-                sleep(retry_after.unwrap_or_else(|| backoff_delay(attempt))).await;
-                continue;
-            }
-            return Err(anyhow!(
-                "Flycockpit remote audit ingest failed ({status}): {}",
-                response_hint(&body)
-            ));
+async fn post_batch_with_retries(
+    client: &FirstPartyEgressClient,
+    payload: &Value,
+    sleep: SleepFn<'_>,
+) -> Result<IngestOutcome> {
+    for attempt in 0..MAX_INGEST_ATTEMPTS {
+        let resp = client
+            .send_json(Method::POST, INGEST_PATH, &[], Some(payload))
+            .await?
+            .ok_or_else(|| anyhow!("connector disabled before remote audit upload"))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(IngestOutcome::Accepted);
         }
-        Err(anyhow!("Flycockpit remote audit ingest exhausted retries"))
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Ok(IngestOutcome::Revoked);
+        }
+        let retry_after = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after);
+        let body = resp.text().await.unwrap_or_default();
+        if is_retryable(status) && attempt + 1 < MAX_INGEST_ATTEMPTS {
+            sleep(retry_after.unwrap_or_else(|| backoff_delay(attempt))).await;
+            continue;
+        }
+        return Err(anyhow!(
+            "Flycockpit remote audit ingest failed ({status}): {}",
+            response_hint(&body)
+        ));
     }
+    Err(anyhow!("Flycockpit remote audit ingest exhausted retries"))
 }
 
 async fn audit_upload_enabled(db: &Db, credential: &StoredFlycockpitCredential) -> Result<bool> {
-    Ok(db
-        .connector_state(&credential.server_url, &credential.instance_id)
-        .await?
-        .map(|state| state.enabled)
-        .unwrap_or(false))
+    connector_enabled(db, credential).await
 }
 
 async fn sync_once_with_client(
     db: &Db,
     credential: &StoredFlycockpitCredential,
-    client: &RemoteAuditUploadHttpClient,
-    redaction: &RedactionTable,
+    client: &FirstPartyEgressClient,
     sleep: SleepFn<'_>,
 ) -> Result<RemoteAuditUploadOnceOutcome> {
     if !audit_upload_enabled(db, credential).await? {
@@ -189,7 +160,7 @@ async fn sync_once_with_client(
         .remote_audit_upload_state(&credential.server_url, &credential.instance_id)
         .await?
         .ok_or_else(|| anyhow!("remote audit upload state missing after upsert"))?;
-    let built = build_batch(db, credential, state.cursor_audit_id, redaction).await?;
+    let built = build_batch(db, credential, state.cursor_audit_id).await?;
     match built {
         BatchBuild::Idle => Ok(RemoteAuditUploadOnceOutcome::Idle),
         BatchBuild::Skipped { cursor_audit_id } => {
@@ -206,7 +177,7 @@ async fn sync_once_with_client(
             cursor_audit_id,
             event_count,
         } => {
-            let ingest = match client.post_batch_with_retries(&payload, sleep).await {
+            let ingest = match post_batch_with_retries(client, &payload, sleep).await {
                 Ok(ingest) => ingest,
                 Err(error) => {
                     db.update_remote_audit_upload_error(
@@ -261,7 +232,6 @@ async fn build_batch(
     db: &Db,
     credential: &StoredFlycockpitCredential,
     cursor_audit_id: i64,
-    redaction: &RedactionTable,
 ) -> Result<BatchBuild> {
     let rows = db
         .list_remote_audit_after(cursor_audit_id, MAX_BATCH_EVENTS)
@@ -272,8 +242,16 @@ async fn build_batch(
     let mut batch_cursor = cursor_audit_id;
     let mut events = Vec::new();
     for row in &rows {
-        let event = match audit_event_json(credential, row, redaction) {
-            Ok(event) => event,
+        let event = match audit_event_json(db, credential, row).await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                batch_cursor = row.audit_id;
+                tracing::warn!(
+                    audit_id = row.audit_id,
+                    "skipping remote audit row without a loadable session redaction table"
+                );
+                continue;
+            }
             Err(error) => {
                 batch_cursor = row.audit_id;
                 tracing::warn!(
@@ -325,11 +303,18 @@ fn audit_payload(credential: &StoredFlycockpitCredential, events: Vec<Value>) ->
     })
 }
 
-fn audit_event_json(
+async fn audit_event_json(
+    db: &Db,
     credential: &StoredFlycockpitCredential,
     row: &RemoteAuditRow,
-    redaction: &RedactionTable,
-) -> Result<Value> {
+) -> Result<Option<Value>> {
+    let Some(session_id) = row.session_id else {
+        return Ok(None);
+    };
+    let Some(redaction) = crate::daemon::egress::redaction_for_session(db, session_id).await?
+    else {
+        return Ok(None);
+    };
     let kind = row.request_kind.trim();
     if kind.is_empty() {
         return Err(anyhow!("remote audit kind is empty"));
@@ -371,7 +356,7 @@ fn audit_event_json(
         metadata.insert("path".to_string(), Value::String(redaction.scrub(path)));
     }
     event.insert("metadata".to_string(), Value::Object(metadata));
-    Ok(Value::Object(event))
+    Ok(Some(Value::Object(event)))
 }
 
 fn actor_user_id(principal: &str) -> Option<String> {
@@ -380,12 +365,6 @@ fn actor_user_id(principal: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
-}
-
-fn endpoint(server_url: &str, path: &str) -> Result<Url> {
-    let base = Url::parse(server_url).context("parsing Flycockpit server URL")?;
-    base.join(path.trim_start_matches('/'))
-        .with_context(|| format!("building Flycockpit endpoint {path}"))
 }
 
 fn is_retryable(status: StatusCode) -> bool {
@@ -418,6 +397,7 @@ mod tests {
 
     use super::*;
     use crate::auth::flycockpit::AccountInfo;
+    use crate::config::extended::RedactConfig;
     use std::collections::VecDeque;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -451,8 +431,10 @@ mod tests {
         db.set_connector_enabled(&server, &credential.instance_id, true)
             .await
             .unwrap();
-        let client = RemoteAuditUploadHttpClient::new(&server).unwrap();
-        let redaction = RedactionTable::empty();
+        let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())
+            .await
+            .unwrap()
+            .unwrap();
         let sleeps = std::sync::Arc::new(Mutex::new(Vec::new()));
         let sleep_log = sleeps.clone();
         let mut sleeper = move |duration| -> SleepFuture {
@@ -461,7 +443,7 @@ mod tests {
                 sleep_log.lock().await.push(duration);
             })
         };
-        let outcome = sync_once_with_client(db, &credential, &client, &redaction, &mut sleeper)
+        let outcome = sync_once_with_client(db, &credential, &client, &mut sleeper)
             .await
             .unwrap();
         let requests = requests.lock().await.clone();
@@ -484,6 +466,16 @@ mod tests {
             })
             .await
             .unwrap();
+        db.set_session_redaction_table_json(
+            session.session_id,
+            Some(
+                crate::redact::RedactionTable::empty()
+                    .to_persisted_json()
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
         db.insert_remote_audit_with_path(
             "flycockpit:user-1",
             kind,
@@ -550,10 +542,12 @@ mod tests {
         db.set_connector_enabled(&server, &credential.instance_id, true)
             .await
             .unwrap();
-        let client = RemoteAuditUploadHttpClient::new(&server).unwrap();
-        let redaction = RedactionTable::empty();
+        let client = FirstPartyEgressClient::connect(db.clone(), credential.clone())
+            .await
+            .unwrap()
+            .unwrap();
         let mut sleeper = |_duration| -> SleepFuture { Box::pin(async {}) };
-        let error = sync_once_with_client(&db, &credential, &client, &redaction, &mut sleeper)
+        let error = sync_once_with_client(&db, &credential, &client, &mut sleeper)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("remote audit ingest failed"));
@@ -589,9 +583,7 @@ mod tests {
         }
         let credential = credential("http://127.0.0.1:1".to_string());
         let rows = db.list_remote_audit_after(0, 101).await.unwrap();
-        let built = build_batch(&db, &credential, 0, &RedactionTable::empty())
-            .await
-            .unwrap();
+        let built = build_batch(&db, &credential, 0).await.unwrap();
         match built {
             BatchBuild::Ready {
                 payload,
@@ -619,8 +611,17 @@ mod tests {
             denylist: vec!["project-secret-token".to_string()],
             ..RedactConfig::default()
         };
-        let redaction = RedactionTable::build(&config, tmp.path()).unwrap();
-        let built = build_batch(&db, &credential, 0, &redaction).await.unwrap();
+        let redaction = crate::redact::RedactionTable::build(&config, tmp.path()).unwrap();
+        let session_id = db.list_remote_audit_after(0, 1).await.unwrap()[0]
+            .session_id
+            .unwrap();
+        db.set_session_redaction_table_json(
+            session_id,
+            Some(redaction.to_persisted_json().unwrap()),
+        )
+        .await
+        .unwrap();
+        let built = build_batch(&db, &credential, 0).await.unwrap();
         match built {
             BatchBuild::Ready { payload, .. } => {
                 let body = payload.to_string();
@@ -636,9 +637,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let audit_id = insert_remote(&db, "", None).await;
         let credential = credential("http://127.0.0.1:1".to_string());
-        let built = build_batch(&db, &credential, 0, &RedactionTable::empty())
-            .await
-            .unwrap();
+        let built = build_batch(&db, &credential, 0).await.unwrap();
         match built {
             BatchBuild::Skipped { cursor_audit_id } => assert_eq!(cursor_audit_id, audit_id),
             BatchBuild::Idle | BatchBuild::Ready { .. } => panic!("expected skipped row"),

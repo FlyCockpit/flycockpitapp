@@ -33,6 +33,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 ## Off Machine
 
 - `crates/cockpit-core/src/session/export/mod.rs`: export payloads scrub session/config/MCP/file content regardless of model trust or principal.
+- `crates/cockpit-core/src/daemon/egress.rs`: connector-gated first-party requests recheck remote consent and load each session's persisted redaction table fail-closed.
 - `crates/cockpit-core/src/daemon/org_sync.rs`: organization sync JSON is scrubbed before upload.
 - `crates/cockpit-core/src/daemon/remote_audit_upload.rs`: remote audit metadata paths are scrubbed before upload.
 

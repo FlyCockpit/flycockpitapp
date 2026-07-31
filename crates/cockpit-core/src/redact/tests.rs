@@ -213,7 +213,7 @@ fn short_values_skipped() {
 }
 
 #[test]
-fn short_credential_shaped_key_value_is_redacted() {
+fn short_credential_shaped_key_value_respects_hard_floor() {
     let dir = TempDir::new().unwrap();
     let env_path = dir.path().join(".env");
     std::fs::write(&env_path, "MY_PIN=abc\nSHORT=def\n").unwrap();
@@ -222,7 +222,7 @@ fn short_credential_shaped_key_value_is_redacted() {
     cfg.min_secret_length = 8;
     let t = RedactionTable::build(&cfg, dir.path()).unwrap();
 
-    assert_eq!(t.scrub("pin abc"), "pin ***REDACT***");
+    assert_eq!(t.scrub("pin abc"), "pin abc");
     assert_eq!(t.scrub("short def"), "short def");
 }
 
@@ -362,15 +362,15 @@ LAST=shared/secret/0001
 fn denylisted_value_redacts_encoded_variants() {
     let mut cfg = enabled_cfg();
     cfg.min_secret_length = 8;
-    cfg.denylist = vec!["a/b".into()];
+    cfg.denylist = vec!["a/bc".into()];
     let dir = TempDir::new().unwrap();
     let t = RedactionTable::build(&cfg, dir.path()).unwrap();
 
-    let scrubbed = t.scrub("raw a/b base64 YS9i hex 612f62 url a%2Fb");
-    assert!(!scrubbed.contains("YS9i"));
-    assert!(!scrubbed.contains("612f62"));
-    assert!(!scrubbed.contains("a%2Fb"));
-    assert!(!scrubbed.contains(" raw a/b "));
+    let scrubbed = t.scrub("raw a/bc base64 YS9iYw== hex 612f6263 url a%2Fbc");
+    assert!(!scrubbed.contains("YS9iYw=="));
+    assert!(!scrubbed.contains("612f6263"));
+    assert!(!scrubbed.contains("a%2Fbc"));
+    assert!(!scrubbed.contains(" raw a/bc "));
 }
 
 #[test]
@@ -1695,4 +1695,111 @@ fn configured_denylist_scrubs_multiple_layer_values() {
     assert!(!scrubbed.contains("home-secret"));
     assert!(!scrubbed.contains("project-secret"));
     assert_eq!(scrubbed.matches("[redacted]").count(), 2);
+}
+
+#[test]
+fn ssh_entries_are_not_persisted() {
+    let dir = TempDir::new().unwrap();
+    let key = "-----BEGIN PRIVATE KEY-----\nvery-private-ssh-material-123456789\n-----END PRIVATE KEY-----\n";
+    std::fs::write(dir.path().join("id_test"), key).unwrap();
+    let table = RedactionTable::build(&ssh_cfg(dir.path()), dir.path()).unwrap();
+    let json = table.to_persisted_json().unwrap();
+    assert!(!json.contains("very-private-ssh-material-123456789"));
+    assert_ne!(table.scrub(key), key);
+}
+
+#[test]
+fn dotenv_entries_are_not_persisted() {
+    let dir = TempDir::new().unwrap();
+    let secret = "dotenv-persistence-secret-123456";
+    std::fs::write(dir.path().join(".env"), format!("TOKEN={secret}\n")).unwrap();
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    let table = RedactionTable::build(&cfg, dir.path()).unwrap();
+    assert!(!table.to_persisted_json().unwrap().contains(secret));
+    assert_ne!(table.scrub(secret), secret);
+}
+
+#[test]
+fn resumed_session_redacts_disk_derived_values() {
+    let dir = TempDir::new().unwrap();
+    let secret = "dotenv-resume-secret-123456";
+    std::fs::write(dir.path().join(".env"), format!("TOKEN={secret}\n")).unwrap();
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    let fresh = RedactionTable::build(&cfg, dir.path()).unwrap();
+    let resumed = RedactionTable::from_persisted_json(&fresh.to_persisted_json().unwrap()).unwrap();
+    let rederived = resumed
+        .union(&RedactionTable::build(&cfg, dir.path()).unwrap())
+        .unwrap();
+    assert_ne!(rederived.scrub(secret), secret);
+}
+
+#[test]
+fn failed_rederivation_is_reported() {
+    let secret = "legacy-file-secret-123456";
+    let legacy = serde_json::json!({
+        "entries": [[secret, "$ssh:id_missing"]],
+        "placeholder": "***REDACT***", "disabled": false, "unsupported_files": []
+    });
+    let origins = RedactionTable::persisted_disk_derived_origins(&legacy.to_string()).unwrap();
+    assert_eq!(origins, vec!["$ssh:id_missing"]);
+    let purged = RedactionTable::from_persisted_json(&legacy.to_string()).unwrap();
+    assert_eq!(purged.scrub(secret), secret);
+}
+
+#[test]
+fn provider_credentials_are_redacted() {
+    let dir = TempDir::new().unwrap();
+    let api_key = "provider-api-key-123456";
+    let oauth_token = "oauth-access-token-123456";
+    let table = RedactionTable::build_with_env_and_secrets(
+        &enabled_cfg(),
+        dir.path(),
+        &HashMap::new(),
+        vec![
+            ("$credentials:openai.api_key".into(), api_key.into()),
+            (
+                "$credentials:codex-oauth.access_token".into(),
+                oauth_token.into(),
+            ),
+        ],
+    )
+    .unwrap();
+    assert_ne!(table.scrub(api_key), api_key);
+    assert_ne!(table.scrub(oauth_token), oauth_token);
+}
+
+#[test]
+fn short_entries_are_refused_from_all_sources() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join(".env"), "TOKEN=x\n").unwrap();
+    std::fs::write(
+        dir.path().join("id_test"),
+        "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    let mut cfg = ssh_cfg(dir.path());
+    cfg.scan_dotenv = true;
+    cfg.min_secret_length = 1;
+    let table = RedactionTable::build_with_env_and_secrets(
+        &cfg,
+        dir.path(),
+        &HashMap::new(),
+        vec![("$credentials:openai.api_key".into(), "x".into())],
+    )
+    .unwrap();
+    assert_eq!(table.scrub("x"), "x");
+}
+
+#[test]
+fn legacy_persisted_disk_entries_are_purged() {
+    let secret = "legacy-dotenv-secret-123456";
+    let legacy = serde_json::json!({
+        "entries": [[secret, "$TOKEN (/project/.env)"]],
+        "placeholder": "***REDACT***", "disabled": false, "unsupported_files": []
+    });
+    let restored = RedactionTable::from_persisted_json(&legacy.to_string()).unwrap();
+    assert_eq!(restored.scrub(secret), secret);
+    assert!(!restored.to_persisted_json().unwrap().contains(secret));
 }

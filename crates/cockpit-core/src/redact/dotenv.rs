@@ -222,7 +222,7 @@ pub(super) fn parse_dotenv(
         }
         out.push(Candidate::prunable(
             value,
-            format!("${name} ({display})"),
+            format!("$dotenv:{display}:{name}"),
             credential_shaped_key(name),
         ));
     }

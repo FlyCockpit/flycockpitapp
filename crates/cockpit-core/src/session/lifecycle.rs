@@ -408,6 +408,16 @@ impl Session {
             .context("loading persisted session redaction table")
     }
 
+    /// Legacy file-origin markers are used only to warn when a resumed
+    /// session cannot rebuild coverage. They never reveal a secret value.
+    pub fn persisted_disk_redaction_origins(&self) -> Result<Vec<String>> {
+        let Some(json) = self.redaction_table_json.lock().unwrap().clone() else {
+            return Ok(Vec::new());
+        };
+        crate::redact::RedactionTable::persisted_disk_derived_origins(&json)
+            .context("loading persisted disk-derived redaction origins")
+    }
+
     /// Touch `last_active_at`. Called by the daemon on every
     /// interaction so `cockpit -c` lands on the right session.
     pub fn touch(&self) -> Result<()> {

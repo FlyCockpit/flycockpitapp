@@ -333,6 +333,12 @@ fn origin_is_forced(origin: &str) -> bool {
         || origin.starts_with("$ssh:")
 }
 
+fn origin_is_disk_derived(origin: &str) -> bool {
+    origin.starts_with("$ssh:")
+        || origin.starts_with("$dotenv:")
+        || (origin.starts_with('$') && origin.contains(" (") && origin.ends_with(')'))
+}
+
 fn case_secret_variants(value: &str) -> Vec<String> {
     let mut variants = Vec::with_capacity(2);
     let lower = value.to_ascii_lowercase();
@@ -465,6 +471,11 @@ impl RedactionTable {
                 )
             })
             .collect();
+        #[cfg(test)]
+        {
+            return Self::build_with_env(cfg, cwd, &env);
+        }
+        #[cfg(not(test))]
         Self::build_with_env_and_store(cfg, cwd, &env)
     }
 
@@ -489,10 +500,12 @@ impl RedactionTable {
     ) -> Result<Self> {
         let stored_secrets = crate::credentials::CredentialStore::open_default()
             .map(|store| {
-                store
+                let mut entries = store
                     .named_secret_entries()
                     .map(|(name, value)| (name.to_string(), value.to_string()))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                entries.extend(store.provider_credential_entries());
+                entries
             })
             .unwrap_or_default();
         Self::build_with_env_and_secrets(cfg, cwd, env, stored_secrets)
@@ -573,7 +586,12 @@ impl RedactionTable {
         }
 
         for (name, value) in stored_secrets {
-            candidates.push(Candidate::forced(value, format!("$secret:{name}"), true));
+            let origin = if name.starts_with('$') {
+                name
+            } else {
+                format!("$secret:{name}")
+            };
+            candidates.push(Candidate::forced(value, origin, true));
         }
 
         // (3) Prune: drop candidates that aren't plausibly secrets. The
@@ -740,7 +758,12 @@ impl RedactionTable {
     /// same private session DB that now stores raw transcript content.
     pub fn to_persisted_json(&self) -> Result<String> {
         let snapshot = PersistedRedactionTable {
-            entries: self.entries.clone(),
+            entries: self
+                .entries
+                .iter()
+                .filter(|(_, origin)| !origin_is_disk_derived(origin))
+                .cloned()
+                .collect(),
             placeholder: self.placeholder.clone(),
             disabled: self.disabled,
             unsupported_files: self
@@ -758,7 +781,11 @@ impl RedactionTable {
         let snapshot: PersistedRedactionTable =
             serde_json::from_str(json).context("deserializing redaction table")?;
         Self::from_entries(
-            snapshot.entries,
+            snapshot
+                .entries
+                .into_iter()
+                .filter(|(_, origin)| !origin_is_disk_derived(origin))
+                .collect(),
             snapshot.placeholder,
             snapshot.disabled,
             snapshot
@@ -768,6 +795,27 @@ impl RedactionTable {
                 .collect(),
             ProtectedPaths::from_persisted(snapshot.protected),
         )
+    }
+
+    /// Return disk-origin markers from a legacy snapshot without exposing any value.
+    pub fn persisted_disk_derived_origins(json: &str) -> Result<Vec<String>> {
+        let snapshot: PersistedRedactionTable =
+            serde_json::from_str(json).context("deserializing redaction table")?;
+        let mut origins: Vec<String> = snapshot
+            .entries
+            .into_iter()
+            .map(|(_, origin)| origin)
+            .filter(|origin| origin_is_disk_derived(origin))
+            .collect();
+        origins.sort();
+        origins.dedup();
+        Ok(origins)
+    }
+
+    pub fn has_origin(&self, origin: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|(_, candidate_origin)| candidate_origin == origin)
     }
 
     /// Scrub every secret in `body`. Returns the cleaned string. The
@@ -783,7 +831,6 @@ impl RedactionTable {
         let replacements = vec![self.placeholder.as_str(); self.origins.len()];
         Cow::Owned(matcher.replace_all(body, &replacements))
     }
-
     /// Scrub every secret in `body`. Returns the cleaned string.
     pub fn scrub(&self, body: &str) -> String {
         self.scrub_cow(body).into_owned()

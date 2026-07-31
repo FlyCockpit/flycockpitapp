@@ -1455,6 +1455,13 @@ pub fn spawn(
     let (work_tx, work_rx) = mpsc::channel::<SessionWork>(WORK_QUEUE_CAPACITY);
     let (event_tx, _initial_rx) =
         broadcast::channel::<crate::daemon::EventEnvelope>(EVENT_BROADCAST_CAPACITY);
+    let legacy_disk_origins = match session.persisted_disk_redaction_origins() {
+        Ok(origins) => origins,
+        Err(error) => {
+            tracing::warn!(error = %error, %session_id, "loading persisted disk-derived redaction markers failed");
+            Vec::new()
+        }
+    };
     let redact = match session.persisted_redaction_table() {
         Ok(Some(persisted)) => match persisted.union(&redact) {
             Ok(unioned) => Arc::new(unioned),
@@ -1471,6 +1478,12 @@ pub fn spawn(
     };
     if let Err(error) = session.persist_redaction_table(&redact) {
         tracing::warn!(error = %error, %session_id, "persisting initial redaction table failed");
+    }
+    for origin in legacy_disk_origins
+        .iter()
+        .filter(|origin| !redact.has_origin(origin))
+    {
+        tracing::warn!(%session_id, origin = %origin, "disk-derived redaction entry could not be re-derived; redaction coverage may be reduced");
     }
     let redaction: SharedRedactionTable = Arc::new(RwLock::new(redact.clone()));
     let turn_completions = Arc::new(Mutex::new(TurnCompletions::default()));

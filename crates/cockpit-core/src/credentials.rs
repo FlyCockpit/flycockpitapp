@@ -157,6 +157,29 @@ impl CredentialStore {
             .map(|(name, value)| (name.as_str(), value.as_str()))
     }
 
+    pub(crate) fn provider_credential_entries(
+        &self,
+    ) -> impl Iterator<Item = (String, String)> + '_ {
+        const TOKEN_FIELDS: &[&str] = &[
+            "api_key",
+            "access_token",
+            "refresh_token",
+            "token",
+            "secret",
+            "id_token",
+        ];
+        self.records.iter().flat_map(|(provider, record)| {
+            TOKEN_FIELDS.iter().filter_map(move |field| {
+                record.get(*field).and_then(Value::as_str).map(|value| {
+                    (
+                        format!("$credentials:{provider}.{field}"),
+                        value.to_string(),
+                    )
+                })
+            })
+        })
+    }
+
     pub fn save(&mut self) -> Result<()> {
         ensure_parent_dir_private(&self.path)?;
         let _lock = lock_credential_file(&self.path)?;

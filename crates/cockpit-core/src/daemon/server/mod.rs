@@ -454,6 +454,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::AssistantUpserted { assistant } => {
             scrub_assistant_summary(assistant, redact)
         }
+        proto::Response::ImportSessionArchive { .. } => {}
         proto::Response::Unknown => {}
     }
 }

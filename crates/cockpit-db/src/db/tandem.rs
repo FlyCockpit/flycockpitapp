@@ -48,6 +48,53 @@ pub struct TandemRecord {
 }
 
 impl Db {
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_tandem_inference_conn(
+        conn: &Connection,
+        id: &str,
+        session_id: Uuid,
+        parent_call_id: &str,
+        parent_seq: Option<i64>,
+        agent: Option<&str>,
+        provider: &str,
+        model: &str,
+        ts_ms: i64,
+        request: &Value,
+        response: Option<&Value>,
+        usage: Option<&Value>,
+        status: &str,
+    ) -> Result<()> {
+        if !matches!(
+            status,
+            "pending" | "completed" | "errored" | "timed_out" | "cancelled"
+        ) {
+            anyhow::bail!("invalid imported tandem inference status `{status}`");
+        }
+        let request_json = serde_json::to_string(request).context("serializing tandem request")?;
+        let response_json = response
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serializing tandem response")?;
+        let usage_json = usage
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serializing tandem usage")?;
+        conn.execute(
+            "INSERT INTO tandem_inference
+               (id, session_id, parent_call_id, parent_seq, agent, provider, model, ts_ms,
+                request_json, response_json, usage_json, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(id) DO UPDATE SET
+               session_id=excluded.session_id, parent_call_id=excluded.parent_call_id,
+               parent_seq=excluded.parent_seq, agent=excluded.agent, provider=excluded.provider,
+               model=excluded.model, ts_ms=excluded.ts_ms, request_json=excluded.request_json,
+               response_json=excluded.response_json, usage_json=excluded.usage_json, status=excluded.status",
+            params![id, session_id.to_string(), parent_call_id, parent_seq, agent, provider, model,
+                ts_ms, request_json, response_json, usage_json, status],
+        ).context("restoring tandem_inference")?;
+        Ok(())
+    }
+
     /// Insert (or update) a tandem inference record. Keyed by the per-row
     /// `id`, so the dispatch-time `pending` write and the terminal update for
     /// the same row land on one row (`INSERT OR REPLACE`); the dispatch

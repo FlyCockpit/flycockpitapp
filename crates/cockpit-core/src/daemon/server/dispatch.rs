@@ -596,6 +596,11 @@ pub(super) async fn handle_serialized_request(
             .await
         }
 
+        Request::ImportSessionArchive {
+            archive_base64,
+            as_new,
+        } => import_session_archive(ctx, &archive_base64, as_new).await,
+
         Request::Curator {
             project_root,
             action,
@@ -1613,6 +1618,11 @@ pub(super) async fn handle_concurrent_request(
             )
             .await
         }
+
+        Request::ImportSessionArchive {
+            archive_base64,
+            as_new,
+        } => import_session_archive(&ctx, &archive_base64, as_new).await,
         Request::FsList {
             project_root,
             path,
@@ -2800,6 +2810,31 @@ pub(super) async fn stats_rollup(
         .await
         .map_err(internal)?;
     Ok(Response::StatsRollup { rollup })
+}
+
+pub(super) async fn import_session_archive(
+    ctx: &Arc<DaemonContext>,
+    archive_base64: &str,
+    as_new: bool,
+) -> std::result::Result<Response, ErrorPayload> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(archive_base64)
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: format!("invalid session import archive encoding: {error}"),
+        })?;
+    let archive =
+        crate::session::import::read_archive_bytes(&bytes).map_err(|error| ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: format!("invalid session import archive: {error:#}"),
+        })?;
+    let result = crate::session::import::import_archive(&ctx.db, archive, as_new)
+        .await
+        .map_err(internal)?;
+    Ok(Response::ImportSessionArchive {
+        imported: result.imported,
+        redacted: result.redacted,
+    })
 }
 
 pub(super) async fn export_session_data(

@@ -39,35 +39,54 @@ pub struct InferenceCallRow {
 impl Db {
     pub async fn insert_inference_call(&self, row: &InferenceCallRow) -> Result<()> {
         let row = row.clone();
-        self.write(move |conn| {
-            conn.execute(
-                "INSERT INTO inference_calls (
-                    call_id, session_id, project_id, project_root,
-                    model, provider, timestamp,
-                    input_tokens, output_tokens, cached_input_tokens,
-                    cache_creation_input_tokens,
-                    cost_usd_micros, is_utility
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
-                    row.call_id.to_string(),
-                    row.session_id.to_string(),
-                    row.project_id,
-                    row.project_root,
-                    row.model,
-                    row.provider,
-                    row.timestamp,
-                    row.input_tokens,
-                    row.output_tokens,
-                    row.cached_input_tokens,
-                    row.cache_creation_input_tokens,
-                    row.cost_usd_micros,
-                    row.is_utility,
-                ],
-            )
-            .context("inserting inference_call")?;
-            Ok(())
-        })
-        .await
+        self.write(move |conn| Self::insert_inference_call_conn(conn, &row))
+            .await
+    }
+
+    pub fn insert_inference_call_conn(conn: &Connection, row: &InferenceCallRow) -> Result<()> {
+        conn.execute(
+            "INSERT INTO inference_calls (call_id, session_id, project_id, project_root, model, provider, timestamp, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens, cost_usd_micros, is_utility) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![row.call_id.to_string(), row.session_id.to_string(), row.project_id, row.project_root, row.model, row.provider, row.timestamp, row.input_tokens, row.output_tokens, row.cached_input_tokens, row.cache_creation_input_tokens, row.cost_usd_micros, row.is_utility],
+        ).context("inserting inference_call")?;
+        Ok(())
+    }
+
+    pub fn list_inference_calls_for_session_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<Vec<InferenceCallRow>> {
+        let mut stmt = conn.prepare("SELECT call_id, session_id, project_id, project_root, model, provider, timestamp, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens, cost_usd_micros, is_utility FROM inference_calls WHERE session_id = ?1 ORDER BY timestamp ASC, rowid ASC").context("preparing list_inference_calls")?;
+        let rows = stmt.query_map([session_id.to_string()], |row| {
+            Ok(InferenceCallRow {
+                call_id: Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                session_id: Uuid::parse_str(&row.get::<_, String>(1)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                project_id: row.get(2)?,
+                project_root: row.get(3)?,
+                model: row.get(4)?,
+                provider: row.get(5)?,
+                timestamp: row.get(6)?,
+                input_tokens: row.get(7)?,
+                output_tokens: row.get(8)?,
+                cached_input_tokens: row.get(9)?,
+                cache_creation_input_tokens: row.get(10)?,
+                cost_usd_micros: row.get(11)?,
+                is_utility: row.get::<_, i64>(12)? != 0,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("querying inference_calls")
     }
 
     /// The set of `call_id`s among `call_ids` whose `inference_calls` row has

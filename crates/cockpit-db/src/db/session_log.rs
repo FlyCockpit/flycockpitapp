@@ -17,7 +17,7 @@
 //!
 //! [`TurnEvent`]: crate::engine::TurnEvent
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use uuid::Uuid;
@@ -52,6 +52,8 @@ pub enum SessionEventKind {
     /// / approval scope) so an export is diagnosable across all four
     /// sandbox states. Data/export only; never enters the model's context.
     ToolCall,
+    /// A model-comparison shadow inference record linked to its primary call.
+    TandemInference,
     /// A model-requested tool call passed dispatch validation and entered the
     /// execution flow. Carries intent/input fields only so exports can measure
     /// queue/approval/gating time separately from runtime.
@@ -142,6 +144,7 @@ impl SessionEventKind {
             SessionEventKind::UserNote => "user_note",
             SessionEventKind::AssistantMessage => "assistant_message",
             SessionEventKind::InferenceRequest => "inference_request",
+            SessionEventKind::TandemInference => "tandem_inference",
             SessionEventKind::ToolCall => "tool_call",
             SessionEventKind::ToolCallStarted => "tool_call_started",
             SessionEventKind::ToolCallCompleted => "tool_call_completed",
@@ -317,6 +320,39 @@ impl Db {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e).context("querying inference_request"),
         }
+    }
+
+    /// Restore an exported inference request within an existing transaction.
+    /// The archive timestamp is authoritative; unlike live dispatch this does
+    /// not substitute the current clock.
+    pub fn insert_inference_request_conn(
+        conn: &Connection,
+        call_id: &str,
+        session_id: Uuid,
+        ts_ms: i64,
+        payload: &Value,
+        status: &str,
+    ) -> Result<()> {
+        if !matches!(
+            status,
+            "pending" | "completed" | "errored" | "timed_out" | "cancelled"
+        ) {
+            bail!("invalid imported inference request status `{status}`");
+        }
+        let payload_json = serde_json::to_string(payload).context("serializing request payload")?;
+        conn.execute(
+            "INSERT INTO inference_requests
+               (call_id, session_id, ts_ms, payload_json, status)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(call_id) DO UPDATE SET
+               session_id = excluded.session_id,
+               ts_ms = excluded.ts_ms,
+               payload_json = excluded.payload_json,
+               status = excluded.status",
+            params![call_id, session_id.to_string(), ts_ms, payload_json, status],
+        )
+        .context("restoring inference_request")?;
+        Ok(())
     }
 
     /// Store the full assembled (post-redaction) request body for one

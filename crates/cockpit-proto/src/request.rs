@@ -281,6 +281,13 @@ pub enum Request {
         include_sensitive: bool,
     },
 
+    // Import a ZIP archive through the daemon-owned database writer.
+    ImportSessionArchive {
+        archive_base64: String,
+        #[serde(default)]
+        as_new: bool,
+    },
+
     /// Execute a daemon-owned skill curator operation for a trusted project.
     Curator {
         project_root: String,
@@ -892,6 +899,7 @@ macro_rules! request_variants {
             (Request::CreateAssistantSession { .. }, "create_assistant_session");
             (Request::AutoTitle { .. }, "auto_title");
             (Request::ExportSessionData { .. }, "export_session_data");
+            (Request::ImportSessionArchive { .. }, "import_session_archive");
             (Request::Curator { .. }, "curator");
             (Request::CancelTurn, "cancel_turn");
             (Request::FsList { .. }, "fs_list");
@@ -1026,6 +1034,7 @@ macro_rules! command {
             (Request::CreateAssistantSession { .. }, "create_assistant_session", owner_only, none, true, serialized, none);
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, serialized, none);
             (Request::ExportSessionData { session_id, .. }, "export_session_data", owner_only, field(session_id), false, concurrent, none);
+            (Request::ImportSessionArchive { .. }, "import_session_archive", owner_only, none, true, serialized, none);
             (Request::Curator { project_root, .. }, "curator", owner_only, none, true, serialized, path(project_root));
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, serialized, none);
             (Request::FsList { project_root, .. }, "fs_list", project_files(project_root), none, false, concurrent, none);

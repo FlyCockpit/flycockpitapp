@@ -40,6 +40,7 @@ use crate::model_system_prompt::ModelSystemPromptSnapshot;
 
 pub mod export;
 mod gitignore;
+pub mod import;
 mod lifecycle;
 mod recording;
 pub mod sealed_values;

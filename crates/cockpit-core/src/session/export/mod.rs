@@ -73,6 +73,7 @@ const TOOL_OUTPUT_DIR: &str = "tool_outputs";
 const COMPRESSED_TOOL_RESULTS_DIR: &str = "compressed_tool_results";
 const DELEGATION_PAYLOADS_DIR: &str = "delegation_payloads";
 const DELEGATION_STEERS_DIR: &str = "delegation_steers";
+const DELEGATIONS_DIR: &str = "delegations";
 
 /// Build the user-facing `/export` transcript from durable session history.
 ///
@@ -594,7 +595,11 @@ fn test_export_env() -> HashMap<String, String> {
 }
 
 #[cfg(test)]
-async fn build_zip(db: &Db, target: &SessionRow, bundle: &[SessionRow]) -> Result<Vec<u8>> {
+pub(crate) async fn build_zip(
+    db: &Db,
+    target: &SessionRow,
+    bundle: &[SessionRow],
+) -> Result<Vec<u8>> {
     build_zip_with_options_and_env(
         db,
         target,
@@ -731,9 +736,37 @@ fn build_zip_with_options_and_env_conn_with_redactor(
     let mut delegation_payload_files: Vec<(String, String)> = Vec::new(); // (path, content)
     let mut delegation_payload_index: Vec<Value> = Vec::new();
     let mut delegation_steer_index: Vec<Value> = Vec::new();
+    let mut delegation_index: Vec<Value> = Vec::new();
     let mut tool_identity_by_call: BTreeMap<(Uuid, String), Value> = BTreeMap::new();
+    let mut inference_call_index: Vec<Value> = Vec::new();
+    let mut tool_call_index: Vec<Value> = Vec::new();
     for s in bundle {
+        for job in Db::list_task_delegation_export_jobs_conn(conn, s.session_id)? {
+            delegation_index.push(json!({
+                "task_call_id": job.task_call_id, "function_call_id": job.function_call_id,
+                "parent_session_id": job.parent_session_id, "parent_agent": job.parent_agent,
+                "original_args_json": job.original_args_json, "status": job.status,
+                "ack_delivered": job.ack_delivered, "final_delivered": job.final_delivered,
+                "created_at": job.created_at, "updated_at": job.updated_at,
+                "children": job.children.into_iter().map(|child| json!({
+                    "label": child.label, "child_agent": child.child_agent, "model": child.model,
+                    "status": child.status, "report": child.report, "output_dir": child.output_dir,
+                    "todo_ids_json": child.todo_ids_json, "result_delivered": child.result_delivered,
+                    "started_at": child.started_at, "finished_at": child.finished_at,
+                    "created_at": child.created_at, "updated_at": child.updated_at,
+                    "requested_cwd": child.requested_cwd, "resolved_cwd": child.resolved_cwd,
+                })).collect::<Vec<_>>(),
+            }));
+        }
+        for inference_call in Db::list_inference_calls_for_session_conn(conn, s.session_id)? {
+            let mut value = inference_call_export_json(&inference_call);
+            redact_value_for_export(&mut value, export_redactor, options.include_sensitive);
+            inference_call_index.push(value);
+        }
         for tool_call in Db::list_tool_calls_for_session_conn(conn, s.session_id)? {
+            let mut value = tool_call_export_json(&tool_call);
+            redact_value_for_export(&mut value, export_redactor, options.include_sensitive);
+            tool_call_index.push(value);
             let identity = tool_provider_identity_json(&tool_call)?;
             tool_identity_by_call
                 .insert((tool_call.session_id, tool_call.call_id.clone()), identity);
@@ -1090,6 +1123,20 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 .with_context(|| format!("zip: writing tool output `{path}`"))?;
         }
 
+        if !inference_call_index.is_empty() {
+            let path = "inference_calls/index.json";
+            zw.start_file(path, opts)
+                .context("zip: inference call index")?;
+            zw.write_all(serde_json::to_string_pretty(&inference_call_index)?.as_bytes())
+                .context("zip: writing inference call index")?;
+        }
+        if !tool_call_index.is_empty() {
+            let path = "tool_calls/index.json";
+            zw.start_file(path, opts).context("zip: tool call index")?;
+            zw.write_all(serde_json::to_string_pretty(&tool_call_index)?.as_bytes())
+                .context("zip: writing tool call index")?;
+        }
+
         if !compressed_result_index.is_empty() {
             let path = format!("{COMPRESSED_TOOL_RESULTS_DIR}/index.json");
             zw.start_file(&path, opts)
@@ -1104,6 +1151,14 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 redact_string_for_export(body.clone(), export_redactor, options.include_sensitive);
             zw.write_all(body.as_bytes())
                 .with_context(|| format!("zip: writing compressed result `{path}`"))?;
+        }
+
+        if !delegation_index.is_empty() {
+            let path = format!("{DELEGATIONS_DIR}/index.json");
+            zw.start_file(&path, opts)
+                .with_context(|| format!("zip: delegation index `{path}`"))?;
+            zw.write_all(serde_json::to_string_pretty(&delegation_index)?.as_bytes())
+                .context("zip: writing delegation index")?;
         }
 
         if !delegation_payload_index.is_empty() {
@@ -1344,6 +1399,15 @@ fn export_resume_repair_state_conn(conn: &Connection, target: &SessionRow) -> Op
         ],
         "detail": repair.detail,
     }))
+}
+
+fn inference_call_export_json(row: &crate::db::inference_calls::InferenceCallRow) -> Value {
+    json!({"call_id": row.call_id, "session_id": row.session_id, "project_id": row.project_id, "project_root": row.project_root, "model": row.model, "provider": row.provider, "timestamp": row.timestamp, "input_tokens": row.input_tokens, "output_tokens": row.output_tokens, "cached_input_tokens": row.cached_input_tokens, "cache_creation_input_tokens": row.cache_creation_input_tokens, "cost_usd_micros": row.cost_usd_micros, "is_utility": row.is_utility})
+}
+
+fn tool_call_export_json(row: &ToolCallEvent) -> Value {
+    let (recovery_kind, recovery_stage) = row.recovery.raw_db_fields();
+    json!({"event_id": row.event_id, "session_id": row.session_id, "call_id": row.call_id, "parent_call_id": row.parent_call_id, "parent_child_index": row.parent_child_index, "provider_item_id": row.provider_item_id, "provider_call_id": row.provider_call_id, "provider_call_id_source": row.provider_call_id_source, "wire_api": row.wire_api, "provider_family": row.provider_family, "timestamp": row.timestamp, "model": row.model, "provider": row.provider, "project_id": row.project_id, "project_root": row.project_root, "agent": row.agent, "tool": row.tool, "mcp_server": row.mcp_server, "path": row.path, "recovery_kind": recovery_kind, "recovery_stage": recovery_stage, "hard_fail": row.hard_fail, "exit_code": row.exit_code, "sandbox_enabled": row.sandbox_enabled, "sandboxed": row.sandboxed, "sandbox_unavailable_reason": row.sandbox_unavailable_reason, "original_input_json": row.original_input_json, "wire_input_json": row.wire_input_json, "output": row.output, "truncated": row.truncated, "duration_ms": row.duration_ms, "cockpit_version": row.cockpit_version, "llm_mode": row.llm_mode, "shape_fingerprint": row.shape_fingerprint, "hint": row.hint})
 }
 
 fn tool_provider_identity_json(tool_call: &ToolCallEvent) -> Result<Value> {

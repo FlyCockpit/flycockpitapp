@@ -415,6 +415,21 @@ impl Db {
         }
         Ok(out)
     }
+    pub fn insert_tool_call_conn(conn: &Connection, ev: &ToolCallEvent) -> Result<()> {
+        let language = ev.path.as_deref().and_then(language_for_path);
+        let (recovery_kind, recovery_stage) = ev.recovery.raw_db_fields();
+        let original_json =
+            serde_json::to_string(&ev.original_input_json).context("serializing original_input")?;
+        let wire_json =
+            serde_json::to_string(&ev.wire_input_json).context("serializing wire_input")?;
+        let hint_json = ev
+            .hint
+            .as_ref()
+            .map(|h| serde_json::to_string(h).context("serializing hint"))
+            .transpose()?;
+        conn.execute("INSERT INTO tool_call_events (event_id, session_id, call_id, parent_call_id, parent_child_index, timestamp, provider_item_id, provider_call_id, provider_call_id_source, wire_api, provider_family, model, provider, project_id, project_root, agent, tool, mcp_server, path, language, recovery_kind, recovery_stage, hard_fail, exit_code, sandbox_enabled, sandboxed, sandbox_unavailable_reason, original_input_json, wire_input_json, output, truncated, duration_ms, cockpit_version, llm_mode, shape_fingerprint, hint) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)", params![ev.event_id.to_string(), ev.session_id.to_string(), ev.call_id, ev.parent_call_id, ev.parent_child_index, ev.timestamp, ev.provider_item_id, ev.provider_call_id, ev.provider_call_id_source, ev.wire_api, ev.provider_family, ev.model, ev.provider, ev.project_id, ev.project_root, ev.agent, ev.tool, ev.mcp_server, ev.path, language, recovery_kind.as_deref(), recovery_stage.as_deref(), ev.hard_fail as i64, ev.exit_code.map(i64::from), ev.sandbox_enabled as i64, ev.sandboxed as i64, ev.sandbox_unavailable_reason, original_json, wire_json, ev.output, ev.truncated as i64, ev.duration_ms as i64, ev.cockpit_version, ev.llm_mode, ev.shape_fingerprint, hint_json]).context("inserting tool_call_event")?;
+        Ok(())
+    }
 }
 
 /// Filter for [`Db::list_failed_tool_calls`].

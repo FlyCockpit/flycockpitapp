@@ -133,6 +133,39 @@ pub struct DelegationChildRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct DelegationExportChild {
+    pub label: String,
+    pub child_agent: String,
+    pub model: Option<String>,
+    pub status: String,
+    pub report: Option<String>,
+    pub output_dir: Option<String>,
+    pub todo_ids_json: Option<String>,
+    pub result_delivered: bool,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub requested_cwd: Option<String>,
+    pub resolved_cwd: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DelegationExportJob {
+    pub task_call_id: String,
+    pub function_call_id: Option<String>,
+    pub parent_session_id: Uuid,
+    pub parent_agent: String,
+    pub original_args_json: Option<String>,
+    pub status: String,
+    pub ack_delivered: bool,
+    pub final_delivered: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub children: Vec<DelegationExportChild>,
+}
+
+#[derive(Debug, Clone)]
 pub struct TaskDelegationSteerRow {
     pub id: i64,
     pub task_call_id: String,
@@ -474,6 +507,80 @@ impl Db {
             )
         })
         .await
+    }
+
+    pub fn list_task_delegation_export_jobs_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<Vec<DelegationExportJob>> {
+        let mut jobs = conn.prepare("SELECT task_call_id, function_call_id, parent_session_id, parent_agent, original_args_json, status, ack_delivered, final_delivered, created_at, updated_at FROM task_delegation_jobs WHERE parent_session_id = ?1 ORDER BY created_at, task_call_id").context("preparing delegation export jobs")?;
+        let job_rows = jobs.query_map([session_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get(1)?,
+                row.get::<_, String>(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get::<_, i64>(6)? != 0,
+                row.get::<_, i64>(7)? != 0,
+                row.get(8)?,
+                row.get(9)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for job in job_rows {
+            let (
+                task_call_id,
+                function_call_id,
+                parent_session_id,
+                parent_agent,
+                original_args_json,
+                status,
+                ack_delivered,
+                final_delivered,
+                created_at,
+                updated_at,
+            ) = job.context("decoding delegation export job")?;
+            let parent_session_id = Uuid::parse_str(&parent_session_id)
+                .context("decoding delegation export session id")?;
+            let mut children_stmt = conn.prepare("SELECT label, child_agent, model, status, report, output_dir, todo_ids_json, result_delivered, started_at, finished_at, created_at, updated_at, requested_cwd, resolved_cwd FROM task_delegation_children WHERE task_call_id = ?1 ORDER BY label")?;
+            let children = children_stmt
+                .query_map([&task_call_id], |row| {
+                    Ok(DelegationExportChild {
+                        label: row.get(0)?,
+                        child_agent: row.get(1)?,
+                        model: row.get(2)?,
+                        status: row.get(3)?,
+                        report: row.get(4)?,
+                        output_dir: row.get(5)?,
+                        todo_ids_json: row.get(6)?,
+                        result_delivered: row.get::<_, i64>(7)? != 0,
+                        started_at: row.get(8)?,
+                        finished_at: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
+                        requested_cwd: row.get(12)?,
+                        resolved_cwd: row.get(13)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("decoding delegation export children")?;
+            out.push(DelegationExportJob {
+                task_call_id,
+                function_call_id,
+                parent_session_id,
+                parent_agent,
+                original_args_json,
+                status,
+                ack_delivered,
+                final_delivered,
+                created_at,
+                updated_at,
+                children,
+            });
+        }
+        Ok(out)
     }
 
     pub async fn list_task_delegation_children(

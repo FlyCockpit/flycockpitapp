@@ -44,6 +44,44 @@ pub fn compressed_result_hash(content: &str) -> String {
 }
 
 impl Db {
+    pub fn insert_compressed_tool_results_conn(
+        conn: &Connection,
+        entries: &[CompressedToolResultEntry],
+    ) -> Result<()> {
+        for entry in entries {
+            let existing: Option<String> = conn.query_row(
+                "SELECT content FROM compressed_tool_results WHERE session_id = ?1 AND hash = ?2",
+                params![entry.session_id.to_string(), entry.hash],
+                |row| row.get(0),
+            ).optional().context("querying compressed_tool_results collision candidate")?;
+            if let Some(existing) = existing {
+                if existing == entry.content {
+                    continue;
+                }
+                bail!("compressed tool result hash collision for {}", entry.hash);
+            }
+            conn.execute(
+                "INSERT INTO compressed_tool_results (hash, session_id, agent_id, tool, call_id,
+                   original_byte_len, compressed_byte_len, created_at, kind, content)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    entry.hash,
+                    entry.session_id.to_string(),
+                    entry.agent_id,
+                    entry.tool,
+                    entry.call_id,
+                    entry.original_byte_len as i64,
+                    entry.compressed_byte_len.map(|n| n as i64),
+                    entry.created_at,
+                    entry.kind,
+                    entry.content
+                ],
+            )
+            .context("restoring compressed_tool_result")?;
+        }
+        Ok(())
+    }
+
     pub async fn insert_compressed_tool_result(
         &self,
         hash: &str,

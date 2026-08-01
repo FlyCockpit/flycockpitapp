@@ -193,7 +193,7 @@ cockpit packages prune --dry-run
 | `cockpit skill curator status` | Show skill curation and snapshot state. |
 | `cockpit trust status [path]` | Show workspace trust state. |
 | `cockpit export <session>` | Export a redacted session/fork tree debug bundle. |
-| `cockpit import <file>` | Import a session export. |
+| `cockpit import <file>` | Import a session export (never restores approval grants or other authorization state). |
 | `cockpit stats` | Show token and cost statistics. |
 | `cockpit debug paths` | Show resolved global paths for debugging. |
 | `cockpit debug config` | Print effective configuration with credentials redacted. |

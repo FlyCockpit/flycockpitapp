@@ -8597,6 +8597,16 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: false,
         },
         CommandMetadataCase {
+            request: Request::ImportSessionArchive {
+                archive_base64: "UEsDB".into(),
+                as_new: false,
+            },
+            kind: "import_session_archive",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::Curator {
                 project_root: project_root.clone(),
                 action: proto::CuratorAction::Status,
@@ -9448,6 +9458,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CreateAssistantSession,
         AutoTitle,
         ExportSessionData,
+        ImportSessionArchive,
         Curator,
         CancelTurn,
         FsList,

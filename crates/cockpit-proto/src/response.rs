@@ -215,6 +215,11 @@ pub enum Response {
         data: ExportSessionData,
     },
 
+    ImportSessionArchive {
+        imported: Vec<Uuid>,
+        redacted: bool,
+    },
+
     Curator {
         result: CuratorResult,
     },
@@ -477,6 +482,7 @@ macro_rules! response_variants {
             (Response::AssistantSessionCreated { .. }, "assistant_session_created");
             (Response::AutoTitle { .. }, "auto_title");
             (Response::ExportSessionData { .. }, "export_session_data");
+            (Response::ImportSessionArchive { .. }, "import_session_archive");
             (Response::Curator { .. }, "curator");
             (Response::SessionLiveStatus { .. }, "session_live_status");
             (Response::Forked { .. }, "forked");

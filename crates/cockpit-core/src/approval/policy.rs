@@ -368,6 +368,104 @@ impl Approver {
         Ok(decision)
     }
 
+    /// Gate server connection before stdio spawn or remote network egress.
+    /// The grant key includes the resolved, non-secret connection identity.
+    pub(super) async fn approve_mcp_server_connect_inner(
+        &self,
+        server: &str,
+        identity: &str,
+    ) -> Result<Decision> {
+        let target = crate::approval::store::mcp_server_connect_key(server, identity);
+        let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
+        if let Some(scope) = self
+            .store
+            .mcp_server_connect_reject_scope(server, identity)
+            .await
+        {
+            let decision = Decision::StandingReject { scope };
+            self.record_permission_decision(
+                "mcp_server_connect",
+                &target,
+                &offered,
+                decision,
+                DecisionSource::StandingReject,
+            )
+            .await;
+            return Ok(decision);
+        }
+        if let Some(scope) = self
+            .store
+            .mcp_server_connect_grant_scope(server, identity)
+            .await
+        {
+            let decision = Decision::Allow { scope };
+            self.record_permission_decision(
+                "mcp_server_connect",
+                &target,
+                &offered,
+                decision,
+                DecisionSource::AlreadyGranted,
+            )
+            .await;
+            return Ok(decision);
+        }
+        let prompt = mcp_server_connect_prompt(server, identity);
+        let question = approval_question(
+            &target,
+            false,
+            GrantKind::McpTool,
+            Some(&prompt),
+            None,
+            None,
+            &offered,
+            None,
+        );
+        let set = approval_option_set("mcp_server_connect_approval", false, &offered, None);
+        let choice = self
+            .raise_and_decode(&prompt, question, |response| {
+                response_to_approval_choice(response, &set)
+            })
+            .await?;
+        let decision = match choice {
+            ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
+            ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
+            ApprovalChoice::Approve(scope) => {
+                if let Err(error) = self
+                    .store
+                    .record_mcp_server_connect(server, identity, scope)
+                    .await
+                {
+                    tracing::warn!(%error, server, identity, ?scope, "recording MCP server connect grant failed; applying once");
+                    Decision::Allow { scope: Scope::Once }
+                } else {
+                    Decision::Allow { scope }
+                }
+            }
+            ApprovalChoice::Reject(scope) => {
+                if let Err(error) = self
+                    .store
+                    .record_mcp_server_connect_reject(server, identity, scope)
+                    .await
+                {
+                    tracing::warn!(%error, server, identity, ?scope, "recording MCP server connect reject failed; denying once");
+                }
+                Decision::Deny
+            }
+            ApprovalChoice::Deny
+            | ApprovalChoice::ApproveAllOnce
+            | ApprovalChoice::GrantPaths(_) => Decision::Deny,
+        };
+        self.record_permission_decision(
+            "mcp_server_connect",
+            &target,
+            &offered,
+            decision,
+            DecisionSource::UserPrompt,
+        )
+        .await;
+        Ok(decision)
+    }
+
     /// Gate the `docs` pipeline's auto-clone of a NEW dependency package
     /// (implementation note). Docs.1 runs
     /// noninteractively, but adding/cloning a package into the registry is a
@@ -423,5 +521,25 @@ impl Approver {
         )
         .await;
         Ok(decision)
+    }
+}
+
+fn mcp_server_connect_prompt(server: &str, identity: &str) -> String {
+    format!("Connect MCP server `{server}`? This runs or contacts: {identity}")
+}
+
+#[cfg(test)]
+mod mcp_server_connect_tests {
+    use super::*;
+
+    #[test]
+    fn server_connect_label_includes_command_and_args() {
+        let prompt = mcp_server_connect_prompt(
+            "filesystem",
+            "stdio command=npx args=[\"-y\",\"@modelcontextprotocol/server-filesystem\"]",
+        );
+        assert!(prompt.contains("filesystem"));
+        assert!(prompt.contains("command=npx"));
+        assert!(prompt.contains("server-filesystem"));
     }
 }

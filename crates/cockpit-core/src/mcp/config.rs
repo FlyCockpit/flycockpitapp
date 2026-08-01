@@ -229,6 +229,25 @@ impl ServerConfig {
             .unwrap_or(DEFAULT_MCP_CONNECT_TIMEOUT_SECS)
     }
 
+    /// Stable, user-visible identity for a connection authorization. It
+    /// deliberately includes the executable and every argument for stdio, or
+    /// the exact remote endpoint for network transports, but never headers or
+    /// credential values.
+    pub fn connect_identity(&self, name: &str) -> Result<String> {
+        match self.transport {
+            Transport::Stdio => Ok(format!(
+                "stdio command={} args={}",
+                self.require_command(name)?,
+                serde_json::to_string(&self.args).expect("String args serialize"),
+            )),
+            Transport::Streamable | Transport::Sse => Ok(format!(
+                "{} endpoint={}",
+                self.transport.as_str(),
+                self.require_endpoint(name)?,
+            )),
+        }
+    }
+
     pub fn request_timeout_secs(&self) -> u64 {
         self.timeout_secs
             .unwrap_or(DEFAULT_MCP_REQUEST_TIMEOUT_SECS)

@@ -1,7 +1,12 @@
 //! Construct an [`McpClient`] for a configured server, resolving auth
 //! (static headers/env + OAuth bearer) per transport.
 
+use std::sync::Arc;
+
 use anyhow::{Result, bail};
+
+use crate::approval::{Approver, AuthorizationRequest, Decision};
+use crate::config::extended::ApprovalMode;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +24,8 @@ use super::transport::{
 pub struct McpConnectContext {
     cancel: Option<CancellationToken>,
     stdio_abandon_scope: Option<StdioAbandonScope>,
+    approver: Option<Arc<Approver>>,
+    approval_mode: ApprovalMode,
 }
 
 impl McpConnectContext {
@@ -29,6 +36,41 @@ impl McpConnectContext {
                 session_id: ctx.session.id,
                 tool_call_id: ctx.current_tool_call_id.clone(),
             }),
+            approver: ctx.approver.clone(),
+            approval_mode: ctx.session.approval_mode(),
+        }
+    }
+
+    async fn authorize_connect(&self, name: &str, cfg: &ServerConfig) -> Result<()> {
+        if matches!(self.approval_mode, ApprovalMode::Yolo) {
+            return Ok(());
+        }
+        let Some(approver) = self.approver.as_ref() else {
+            bail!("MCP server `{name}` was not connected: no approval client is attached");
+        };
+        let identity = cfg.connect_identity(name)?;
+        match approver
+            .authorize(AuthorizationRequest::McpServerConnect {
+                server: name,
+                identity: &identity,
+            })
+            .await?
+        {
+            Decision::Allow { .. } => Ok(()),
+            Decision::NoninteractiveDeny => bail!(crate::approval::NONINTERACTIVE_RUN_DENIAL),
+            Decision::StandingReject { scope } => bail!(crate::approval::standing_reject_refusal(
+                "mcp server",
+                scope
+            )),
+            Decision::Deny => bail!("MCP server `{name}` connection was not approved"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn yolo_for_tests() -> Self {
+        Self {
+            approval_mode: ApprovalMode::Yolo,
+            ..Self::default()
         }
     }
 
@@ -52,6 +94,7 @@ pub async fn connect_with_context(
     cfg: &ServerConfig,
     context: McpConnectContext,
 ) -> Result<Box<dyn McpClient>> {
+    context.authorize_connect(name, cfg).await?;
     let mut resolved = auth::resolve_static_for_server(name, cfg);
     // OAuth bearer (async; refreshes if expired) → Authorization header.
     if let Some(bearer) = auth::oauth_bearer(name, cfg).await? {
@@ -148,11 +191,87 @@ mod tests {
         }
     }
 
+    fn denied_stdio_server(marker: &std::path::Path) -> ServerConfig {
+        ServerConfig {
+            transport: Transport::Stdio,
+            endpoint: None,
+            command: Some("sh".into()),
+            args: vec!["-c".into(), format!("touch {}", marker.display())],
+            env: Default::default(),
+            env_credential_refs: Default::default(),
+            auth: Default::default(),
+            mode: Default::default(),
+            enabled: true,
+            cache_ttl_secs: 0,
+            connect_timeout_secs: None,
+            timeout_secs: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_server_connect_requires_approval() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("spawned");
+        let error = match connect("stdio", &denied_stdio_server(&marker)).await {
+            Ok(_) => panic!("connection unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no approval client"));
+        assert!(
+            !marker.exists(),
+            "connect authorization must happen before spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_server_connect_requires_approval() {
+        let error = match connect("remote", &remote_server_with_header("Bearer public")).await {
+            Ok(_) => panic!("connection unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no approval client"));
+    }
+
+    #[test]
+    fn configured_servers_are_not_approved_eagerly() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::mcp::config::McpConfig::default();
+        let markers = [
+            temp.path().join("one"),
+            temp.path().join("two"),
+            temp.path().join("three"),
+        ];
+        for (index, marker) in markers.iter().enumerate() {
+            cfg.servers
+                .insert(format!("server-{index}"), denied_stdio_server(marker));
+        }
+        // Configuration/discovery enumerates all servers but does not call the
+        // connection seam, so no command is spawned or approval requested.
+        assert_eq!(cfg.enabled_servers().len(), 3);
+        assert!(markers.iter().all(|marker| !marker.exists()));
+    }
+
+    #[tokio::test]
+    async fn connect_without_approver_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("spawned");
+        let error = match connect("stdio", &denied_stdio_server(&marker)).await {
+            Ok(_) => panic!("connection unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no approval client"));
+        assert!(!marker.exists());
+    }
+
     #[tokio::test]
     async fn remote_header_auth_missing_env_fails_before_connect() {
         let cfg = remote_server_with_header("Bearer $COCKPIT_TEST_MISSING_MCP_HEADER_TOKEN");
 
-        let message = match connect("remote", &cfg).await {
+        let context = McpConnectContext {
+            approval_mode: ApprovalMode::Yolo,
+            ..McpConnectContext::default()
+        };
+        let message = match connect_with_context("remote", &cfg, context).await {
             Ok(_) => panic!("connection unexpectedly succeeded"),
             Err(error) => error.to_string(),
         };

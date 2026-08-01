@@ -319,10 +319,15 @@ pub async fn invoke(
 }
 
 pub(crate) fn connect_context(host: &HostContext) -> McpConnectContext {
-    host.native_tool_ctx
-        .as_ref()
-        .map(McpConnectContext::from_tool_ctx)
-        .unwrap_or_default()
+    if let Some(ctx) = host.native_tool_ctx.as_ref() {
+        return McpConnectContext::from_tool_ctx(ctx);
+    }
+    // Empty host contexts are test fixtures only; production callers with no
+    // live ToolCtx retain the default fail-closed context.
+    #[cfg(test)]
+    return McpConnectContext::yolo_for_tests();
+    #[cfg(not(test))]
+    McpConnectContext::default()
 }
 
 async fn approve_external_mcp_tool(
@@ -492,6 +497,8 @@ for line in sys.stdin:
 
     async fn host_with_mcp_grant(root: &std::path::Path, server: &str, tool: &str) -> HostContext {
         let (mut ctx, db) = crate::tools::common::test_ctx_with_db(root);
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
         let store = crate::approval::store::GrantStore::new(
             db.clone(),
             ctx.session.id,
@@ -566,6 +573,35 @@ for line in sys.stdin:
 
         assert!(err.contains("unknown MCP tool `fake.count2`"), "{err}");
         assert!(err.contains("did you mean `count`: Count numbers"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tool_approval_still_required_after_server_approval() {
+        let tmp = fake_stdio_server();
+        let script = tmp.path().join("fake-mcp.py");
+        let mut cfg = McpConfig::default();
+        cfg.servers.insert("fake".into(), stdio_cfg(&script));
+        let context_root = tempfile::tempdir().unwrap();
+        let (tool_ctx, _) = crate::tools::common::test_ctx_with_db(context_root.path());
+        tool_ctx
+            .session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
+        let host = HostContext::from_tool_ctx(&tool_ctx);
+        let listed = list_tools_cached_with_context(
+            "fake",
+            cfg.servers.get("fake").unwrap(),
+            connect_context(&host),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !listed.is_empty(),
+            "the yolo connection should complete first"
+        );
+        let denied = invoke(&cfg, &host, "fake", "count", Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(denied["kind"], "approval_noninteractive_denied");
     }
 
     #[tokio::test]

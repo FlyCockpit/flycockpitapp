@@ -216,6 +216,11 @@ pub enum AuthorizationRequest<'a> {
     CustomTool {
         tool: &'a str,
     },
+    /// Connect to a configured external MCP server before it spawns or egresses.
+    McpServerConnect {
+        server: &'a str,
+        identity: &'a str,
+    },
 }
 
 pub struct Approver {
@@ -243,6 +248,10 @@ impl Approver {
                 self.approve_mcp_tool_inner(server, tool).await
             }
             AuthorizationRequest::CustomTool { tool } => self.approve_custom_tool_inner(tool).await,
+            AuthorizationRequest::McpServerConnect { server, identity } => {
+                self.approve_mcp_server_connect_inner(server, identity)
+                    .await
+            }
         }
     }
 }

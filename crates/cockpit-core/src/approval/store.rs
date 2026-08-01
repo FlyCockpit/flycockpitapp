@@ -438,7 +438,7 @@ impl GrantStore {
             .session_has(GrantKind::Command, &s, Verdict::Reject)
             .await
         {
-            return Some(Scope::Session);
+            return Some(Scope::Project);
         }
         if self
             .project_file()
@@ -499,6 +499,103 @@ impl GrantStore {
             return Some(Scope::Global);
         }
         None
+    }
+
+    /// Scope of the persisted connection grant for one exact server identity.
+    /// This is distinct from ordinary MCP tool lookup because the second key
+    /// component is namespaced and is derived only from the transport identity.
+    pub async fn mcp_server_connect_grant_scope(
+        &self,
+        server: &str,
+        identity: &str,
+    ) -> Option<Scope> {
+        let key = mcp_server_connect_key(server, identity);
+        if self
+            .session_has(GrantKind::McpTool, &key, Verdict::Allow)
+            .await
+        {
+            return Some(Scope::Session);
+        }
+        if self
+            .project_file()
+            .is_some_and(|file| file.mcp_tools.contains(&key))
+        {
+            return Some(Scope::Project);
+        }
+        if self
+            .global_file()
+            .is_some_and(|file| file.mcp_tools.contains(&key))
+        {
+            return Some(Scope::Global);
+        }
+        None
+    }
+
+    pub async fn mcp_server_connect_reject_scope(
+        &self,
+        server: &str,
+        identity: &str,
+    ) -> Option<Scope> {
+        let key = mcp_server_connect_key(server, identity);
+        if self
+            .session_has(GrantKind::McpTool, &key, Verdict::Reject)
+            .await
+        {
+            return Some(Scope::Session);
+        }
+        if self
+            .project_file()
+            .is_some_and(|file| file.mcp_tools_reject.contains(&key))
+        {
+            return Some(Scope::Project);
+        }
+        if self
+            .global_file()
+            .is_some_and(|file| file.mcp_tools_reject.contains(&key))
+        {
+            return Some(Scope::Global);
+        }
+        None
+    }
+
+    pub async fn record_mcp_server_connect(
+        &self,
+        server: &str,
+        identity: &str,
+        scope: Scope,
+    ) -> Result<(), StoreError> {
+        if scope == Scope::Once {
+            return Err(StoreError::OnceNotPersistable);
+        }
+        self.record(
+            GrantKind::McpTool,
+            &mcp_server_connect_key(server, identity),
+            scope,
+            Verdict::Allow,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn record_mcp_server_connect_reject(
+        &self,
+        server: &str,
+        identity: &str,
+        scope: Scope,
+    ) -> Result<(), StoreError> {
+        if scope == Scope::Once {
+            return Err(StoreError::OnceNotPersistable);
+        }
+        self.record(
+            GrantKind::McpTool,
+            &mcp_server_connect_key(server, identity),
+            scope,
+            Verdict::Reject,
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn is_harness_granted(&self, harness: &str) -> bool {
@@ -1253,6 +1350,12 @@ fn path_access_from_storage(value: Option<&str>) -> SandboxPathAccess {
     }
 }
 
+pub fn mcp_server_connect_key(server: &str, identity: &str) -> String {
+    // This prefix cannot be produced by MCP tool-name sanitization, keeping
+    // server-connect grants disjoint from `(server, tool)` grants.
+    mcp_tool_key(server, &format!("\u{0}connect:{identity}"))
+}
+
 pub fn mcp_tool_key(server: &str, tool: &str) -> String {
     // MCP tool names may legally contain `/` after cockpit sanitization, so
     // encode separators before storing the exact `(server, tool)` key. This
@@ -1605,7 +1708,7 @@ mod tests {
 
     /// Build a store backed by an in-memory DB, with project root + file
     /// approval dirs pointed at temp dirs so scopes are exercised hermetically.
-    fn test_store(project: &Path, global: PathBuf) -> (GrantStore, uuid::Uuid) {
+    pub(super) fn test_store(project: &Path, global: PathBuf) -> (GrantStore, uuid::Uuid) {
         let db = Db::open_in_memory().unwrap();
         let session =
             crate::session::Session::create(db.clone(), project.to_path_buf(), "builder").unwrap();
@@ -1631,7 +1734,7 @@ mod tests {
         let info = cmd_info("cargo", Some("test"), false);
 
         store
-            .record_command(&info, RiskTier::Mutating, Scope::Session)
+            .record_command(&info, RiskTier::Mutating, Scope::Project)
             .await
             .unwrap();
 
@@ -3373,5 +3476,37 @@ mod tests {
 
         // The static policy resolves to the same value on every read.
         assert_eq!(store.approval_policy(), store.approval_policy());
+    }
+}
+
+#[cfg(test)]
+mod mcp_server_connect_grant_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn server_grant_does_not_survive_command_change() {
+        let root = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = super::tests::test_store(root.path(), global.path().to_path_buf());
+        let original = "stdio command=first args=[\"--safe\"]";
+        let changed = "stdio command=second args=[\"--safe\"]";
+        store
+            .record_mcp_server_connect("server", original, Scope::Project)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .mcp_server_connect_grant_scope("server", original)
+                .await,
+            Some(Scope::Project)
+        );
+        assert_eq!(
+            store
+                .mcp_server_connect_grant_scope("server", changed)
+                .await,
+            None
+        );
+        // A server-connect grant cannot become an external tool grant.
+        assert_eq!(store.mcp_tool_grant_scope("server", original).await, None);
     }
 }

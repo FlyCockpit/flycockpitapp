@@ -32,8 +32,10 @@ Its security boundaries and limitations are deliberately explicit:
   commands are not separately approval-prompted because the filesystem sandbox
   is their execution boundary; unconfined execution follows the grant-or-ask
   path.
-- There is no native Windows sandbox backend, so shell commands on Windows run
-  unconfined. The Windows PowerShell installer does not change that limitation.
+- There is no native Windows filesystem sandbox backend. Every Windows shell command is
+  unconfined and follows grant-or-ask: it requires approval unless a matching session,
+  project, or global grant exists. The Windows PowerShell installer does not change that
+  limitation.
 - On Unix, the daemon uses a `0600` socket under `$XDG_RUNTIME_DIR/cockpit/`
   when available (otherwise its private state directory), rather than `/tmp`,
   and validates the connecting peer's UID on every accepted connection.

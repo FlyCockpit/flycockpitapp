@@ -46,14 +46,6 @@ pub(crate) const SHELL_WRITE_NATIVE_TOOL_HINT: &str = "Use `write` to create or 
 const UNCONFINED_COMMAND_DENIAL: &str =
     "Error: `bash` was not run: unconfined command approval was denied.";
 
-/// One-shot guard so the Windows "shell sandboxing unavailable" notice
-/// prints at most once per process (≈ per session — the daemon runs one
-/// process). Token economy §10: a single terse line, never repeated.
-#[cfg(windows)]
-static WINDOWS_NOTICE_SHOWN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// `description` is the cached string returned by [`Tool::description`].
 /// Binary-specific availability hints are appended by the capability layer
 /// when a toolbox is rebuilt with the effective `PATH`.
 pub struct BashTool {
@@ -471,8 +463,7 @@ async fn call_bash_inner(
     //     outside), even when the command key is already granted. A grant
     //     authorizes a later unconfined rerun only if the confined attempt
     //     fails with trusted sandbox-escalation metadata.
-    let sandbox_enabled =
-        ctx.session.sandbox_enabled() && crate::tools::shell_sandbox::shell_sandbox_supported();
+    let sandbox_enabled = ctx.session.sandbox_enabled();
     if ctx.write_scope.is_some() && options.force_unconfined {
         return Ok(ToolOutput::text(
             "Error: scoped task children cannot run `bash` unconfined; keep shell writes inside the assigned write_scope or report the shared-file edit to the parent",
@@ -483,11 +474,6 @@ async fn call_bash_inner(
     } else {
         sandbox_enabled && !options.force_unconfined
     };
-
-    // Windows has no zerobox backend: show the one-time per-session
-    // notice that the shell runs unconfined. The flag is only ever
-    // `Some` on Windows; elsewhere it stays `None`.
-    let windows_notice: Option<&'static str> = windows_shell_notice(ctx);
 
     let escalation_preauthorized_scope = if ctx.write_scope.is_none() {
         command_escalation_preauthorized(ctx, command).await
@@ -627,9 +613,9 @@ async fn call_bash_inner(
         escalated: options.escalated,
         escalation_preauthorized,
         approval_scope_recorded: options.approval_scope_recorded.clone(),
-        // Not the refuse path — the sandbox initialized (or was off), so
-        // there's no unavailable remedy to surface.
-        unavailable_reason: None,
+        // Unsupported platforms run unconfined but still surface the persistent
+        // user-facing availability notice out of band.
+        unavailable_reason: availability_notice_reason(&availability),
         resource_profiles: command_resource_plan.metas.clone(),
     };
 
@@ -955,7 +941,7 @@ async fn call_bash_inner(
         command,
         &cwd,
         BashOutputAnnotations {
-            notice: windows_notice,
+            notice: None,
             tip,
             native_write_hint,
             timeout_note,
@@ -1520,6 +1506,18 @@ async fn sandbox_availability_for_bash(
     crate::tools::shell_sandbox::sandbox_available(cwd)
         .await
         .clone()
+}
+
+fn availability_notice_reason(
+    availability: &crate::tools::shell_sandbox::SandboxAvailability,
+) -> Option<String> {
+    match availability {
+        crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform { reason } => {
+            Some(reason.clone())
+        }
+        crate::tools::shell_sandbox::SandboxAvailability::Available
+        | crate::tools::shell_sandbox::SandboxAvailability::Unavailable { .. } => None,
+    }
 }
 
 async fn command_resource_plan_with_user_grants(
@@ -2742,26 +2740,6 @@ fn format_combined(stdout: &str, stderr: &str, exit: i32, signaled: bool) -> Str
     out
 }
 
-/// The one-time per-process "shell sandboxing unavailable on Windows"
-/// notice (sandboxing part 2). Returns `Some(...)` at most once, and only
-/// when the session wanted sandboxing on. A no-op (`None`) on every other
-/// platform.
-#[cfg(windows)]
-fn windows_shell_notice(ctx: &ToolCtx) -> Option<&'static str> {
-    if ctx.session.sandbox_enabled()
-        && !WINDOWS_NOTICE_SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-        Some("Note: shell sandboxing is unavailable on Windows; commands run unconfined.")
-    } else {
-        None
-    }
-}
-
-#[cfg(not(windows))]
-fn windows_shell_notice(_ctx: &ToolCtx) -> Option<&'static str> {
-    None
-}
-
 /// The env-scrub list from plan §3c, as `(key, "")` pairs.
 ///
 /// Returned as a list so both run paths apply it identically: the
@@ -2802,11 +2780,6 @@ mod sandbox_escalation_signal_tests;
 
 #[cfg(test)]
 mod schema_tests;
-
-/// Windows-only: the shell-sandbox notice fires at most once per process
-/// and only when the session wanted sandboxing on (sandboxing part 2).
-#[cfg(all(test, windows))]
-mod windows_tests;
 
 #[cfg(all(test, unix))]
 mod tests;

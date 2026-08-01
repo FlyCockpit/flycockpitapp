@@ -1,6 +1,32 @@
 use super::*;
 
+fn should_clear_sandbox_down_notice(enabled: bool, sandbox_supported: bool) -> bool {
+    !enabled && sandbox_supported
+}
+
 impl App {
+    pub(super) fn apply_sandbox_state(
+        &mut self,
+        mode: cockpit_core::tools::sandbox_mode::SandboxMode,
+        container_network_enabled: bool,
+        container_availability: cockpit_core::container::ContainerAvailability,
+        sandbox_supported: bool,
+    ) {
+        let enabled = mode.enabled();
+        self.no_sandbox = !enabled;
+        self.sandbox_mode = mode;
+        self.container_network_enabled = container_network_enabled;
+        self.container_availability = container_availability;
+        let toast = match mode {
+            cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox => "sandbox on".to_string(),
+            other => format!("sandbox {}", sandbox_mode_label(other)),
+        };
+        self.show_toast(&toast, ToastKind::Info);
+        if should_clear_sandbox_down_notice(enabled, sandbox_supported) {
+            self.sandbox_down_notice = None;
+        }
+    }
+
     /// Drain any [`TurnEvent`]s the engine has produced into the
     /// pending+history state machine. Runs each tick.
     pub(super) fn drain_agent_events(&mut self) -> bool {
@@ -1231,23 +1257,12 @@ impl App {
                 mode,
                 container_network_enabled,
                 container_availability,
-            } => {
-                let enabled = mode.enabled();
-                self.no_sandbox = !enabled;
-                self.sandbox_mode = mode;
-                self.container_network_enabled = container_network_enabled;
-                self.container_availability = container_availability;
-                let toast = match mode {
-                    cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox => {
-                        "sandbox on".to_string()
-                    }
-                    other => format!("sandbox {}", sandbox_mode_label(other)),
-                };
-                self.show_toast(&toast, ToastKind::Info);
-                if !enabled {
-                    self.sandbox_down_notice = None;
-                }
-            }
+            } => self.apply_sandbox_state(
+                mode,
+                container_network_enabled,
+                container_availability,
+                cockpit_core::tools::shell_sandbox::shell_sandbox_supported(),
+            ),
             TurnEvent::SandboxUnavailable {
                 remedy,
                 fix_command,

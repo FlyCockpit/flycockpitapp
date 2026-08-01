@@ -332,8 +332,7 @@ impl Driver {
             .read()
             .map(|env| env.clone())
             .unwrap_or_default();
-        let sandbox_on = self.session.sandbox_enabled()
-            && crate::tools::shell_sandbox::shell_sandbox_supported();
+        let sandbox_on = self.session.sandbox_enabled();
         let availability = if sandbox_on {
             background_sandbox_availability(cwd).await
         } else {

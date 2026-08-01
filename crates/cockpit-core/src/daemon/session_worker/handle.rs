@@ -542,6 +542,12 @@ pub(super) fn sandbox_unavailable_notice_from_availability(
                 .clone()
                 .or_else(|| crate::tools::shell_sandbox::fix_command_for_reason(reason)),
         }),
+        crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform { reason } => {
+            Some(SandboxUnavailableNotice {
+                remedy: reason.clone(),
+                fix_command: None,
+            })
+        }
     }
 }
 
@@ -1225,21 +1231,27 @@ impl SessionWorkerHandle {
         let notice_store = self.sandbox_unavailable_notice.clone();
         let armed = self.sandbox_notice_armed.clone();
         handle.spawn(async move {
-            if !session.sandbox_mode().enabled() {
+            let availability = crate::tools::shell_sandbox::sandbox_available(&project_root)
+                .await
+                .clone();
+            let platform_unsupported = matches!(
+                availability,
+                crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform { .. }
+            );
+            if !session.sandbox_mode().enabled() && !platform_unsupported {
                 *notice_store
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                 return;
             }
-            let availability = crate::tools::shell_sandbox::sandbox_available(&project_root)
-                .await
-                .clone();
             match sandbox_unavailable_notice_from_availability(&availability) {
                 Some(notice) => {
                     *notice_store
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(notice.clone());
-                    if session.sandbox_mode().enabled() && forward_sandbox_unavailable(&armed) {
+                    if (session.sandbox_mode().enabled() || platform_unsupported)
+                        && forward_sandbox_unavailable(&armed)
+                    {
                         send_sandbox_unavailable_notice(&event_tx, &redaction, session_id, &notice);
                     }
                 }

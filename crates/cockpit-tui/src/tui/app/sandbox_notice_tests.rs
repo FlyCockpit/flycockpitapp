@@ -254,3 +254,29 @@ fn notice_height_matches_ratatui_wrap_for_unicode_display_width() {
         );
     }
 }
+
+#[test]
+fn sandbox_down_notice_survives_off_transition_when_platform_has_no_backend() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_event(TurnEvent::SandboxUnavailable {
+        remedy: "filesystem confinement is unavailable on this platform".to_string(),
+        fix_command: None,
+    });
+
+    app.apply_sandbox_state(
+        cockpit_core::tools::sandbox_mode::SandboxMode::Off,
+        false,
+        cockpit_core::container::availability_snapshot(),
+        false,
+    );
+    assert!(app.sandbox_down_notice.is_some());
+
+    app.apply_sandbox_state(
+        cockpit_core::tools::sandbox_mode::SandboxMode::Off,
+        false,
+        cockpit_core::container::availability_snapshot(),
+        true,
+    );
+    assert!(app.sandbox_down_notice.is_none());
+}

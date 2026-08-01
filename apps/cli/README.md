@@ -435,7 +435,8 @@ minimum; every redaction entry has a hard four-byte minimum. Treat it as a
 safeguard, not a guarantee that every secret is removed.
 
 The shell sandbox is filesystem-only and does not restrict network access. It
-has no native Windows backend, so shell commands on Windows run unconfined.
+has no native Windows backend: Windows shell commands are unconfined and require
+explicit approval unless a matching session, project, or global grant exists.
 
 ## License
 

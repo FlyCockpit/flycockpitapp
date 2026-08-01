@@ -3163,3 +3163,101 @@ async fn spawn_error_diagnostic_includes_command_cwd_and_error() {
     assert!(body.contains("missing_binary: sh"));
     assert!(body.contains("not found in cockpit's command environment"));
 }
+
+/// An unsupported platform is deliberately modeled as unconfined rather than
+/// as a failed sandbox. This Linux-run seam pins the Windows grant-or-ask
+/// policy without requiring a Windows host in the test harness.
+#[tokio::test]
+async fn windows_unconfined_shell_takes_grant_or_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    let db = ctx.session.db.clone();
+    let sid = ctx.session.id;
+    let hub = ctx.interrupts.clone();
+    let resolver =
+        tokio::spawn(
+            async move { resolve_next_interrupt(db, sid, hub, ID_APPROVE_ONCE, None).await },
+        );
+    let _guard = set_bash_test_overrides(
+        Some(
+            crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform {
+                reason: "filesystem confinement is unavailable on Windows".to_string(),
+            },
+        ),
+        None,
+        [(false, shell_out("approved", "", 0))],
+    );
+
+    let output = BashTool::new()
+        .call(serde_json::json!({ "command": "printf approved" }), &ctx)
+        .await
+        .expect("unconfined bash call returns");
+    resolver.await.unwrap();
+
+    assert!(output.content.contains("approved"));
+    let meta = output.sandbox.expect("bash records sandbox metadata");
+    assert!(!meta.confined);
+    assert_eq!(meta.approval_scope_recorded.as_deref(), Some("once"));
+}
+
+#[tokio::test]
+async fn windows_grant_suppresses_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    let command = "printf granted";
+    grant_command(&ctx, command, Scope::Session).await;
+    let _guard = set_bash_test_overrides(
+        Some(
+            crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform {
+                reason: "filesystem confinement is unavailable on Windows".to_string(),
+            },
+        ),
+        None,
+        [(false, shell_out("granted", "", 0))],
+    );
+
+    let output = tokio::time::timeout(
+        Duration::from_millis(500),
+        BashTool::new().call(serde_json::json!({ "command": command }), &ctx),
+    )
+    .await
+    .expect("matching grant must suppress the approval interaction")
+    .expect("granted unconfined bash call returns");
+
+    assert!(output.content.contains("granted"));
+    let meta = output.sandbox.expect("bash records sandbox metadata");
+    assert!(!meta.confined);
+    assert!(meta.escalation_preauthorized);
+}
+
+#[tokio::test]
+async fn windows_no_approver_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with_store(tmp.path());
+    ctx.approver = None;
+    let _guard = set_bash_test_overrides(
+        Some(
+            crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform {
+                reason: "filesystem confinement is unavailable on Windows".to_string(),
+            },
+        ),
+        None,
+        [(false, shell_out("must not run", "", 0))],
+    );
+
+    let output = BashTool::new()
+        .call(
+            serde_json::json!({ "command": "printf must-not-run" }),
+            &ctx,
+        )
+        .await
+        .expect("denial is a tool output");
+
+    assert_eq!(output.content, UNCONFINED_COMMAND_DENIAL);
+    assert!(
+        !output
+            .sandbox
+            .expect("bash records sandbox metadata")
+            .confined
+    );
+}

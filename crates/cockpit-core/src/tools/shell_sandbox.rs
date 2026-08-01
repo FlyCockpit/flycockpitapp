@@ -290,6 +290,11 @@ pub enum SandboxAvailability {
         reason: String,
         fix_command: Option<String>,
     },
+    // The platform has no shell-sandbox backend. Commands remain usable but
+    // must take the normal unconfined grant-or-ask authorization path.
+    UnsupportedPlatform {
+        reason: String,
+    },
 }
 
 /// The gating decision for a single `bash` run, derived purely from
@@ -326,6 +331,7 @@ pub fn gate_decision(sandbox_on: bool, availability: &SandboxAvailability) -> Sa
         SandboxAvailability::Unavailable { reason, .. } => SandboxGate::Refuse {
             reason: reason.clone(),
         },
+        SandboxAvailability::UnsupportedPlatform { .. } => SandboxGate::Unconfined,
     }
 }
 
@@ -352,6 +358,11 @@ pub async fn sandbox_available(probe_cwd: &std::path::Path) -> &'static SandboxA
 /// Run the actual probe (no caching). Split out so the cache wrapper stays
 /// trivial; the cwd fallback to a fresh temp dir lives here.
 async fn probe_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {
+    if !shell_sandbox_supported() {
+        return SandboxAvailability::UnsupportedPlatform {
+            reason: "filesystem confinement is unavailable on this platform; shell commands run unconfined and require approval unless granted".to_string(),
+        };
+    }
     // Prefer the supplied (session) cwd; if it is not a usable directory,
     // fall back to a fresh temp dir so the probe always has a real cwd.
     let _fallback = if probe_cwd.is_dir() {
@@ -561,6 +572,14 @@ mod tests {
             }
             other => panic!("expected Refuse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gate_unsupported_platform_runs_unconfined_when_enabled() {
+        let availability = SandboxAvailability::UnsupportedPlatform {
+            reason: "no Windows backend".to_string(),
+        };
+        assert_eq!(gate_decision(true, &availability), SandboxGate::Unconfined);
     }
 
     #[test]

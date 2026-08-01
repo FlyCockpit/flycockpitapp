@@ -174,8 +174,7 @@ impl Tool for CustomBashTool {
 
         let cmd = render_template(&selected.tpl.command, &args)?;
         let (session_env, scrub) = custom_tool_environment(ctx);
-        let sandbox_on =
-            ctx.session.sandbox_enabled() && crate::tools::shell_sandbox::shell_sandbox_supported();
+        let sandbox_on = ctx.session.sandbox_enabled();
         let confine = match crate::tools::shell_sandbox::gate_decision(
             sandbox_on,
             crate::tools::shell_sandbox::sandbox_available(&ctx.cwd).await,

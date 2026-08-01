@@ -221,6 +221,12 @@ pub enum AuthorizationRequest<'a> {
         server: &'a str,
         identity: &'a str,
     },
+    /// Replace existing file contents after a visible approval.
+    FileWrite {
+        path: &'a std::path::Path,
+        previous: &'a [u8],
+        next: &'a [u8],
+    },
 }
 
 pub struct Approver {
@@ -252,6 +258,11 @@ impl Approver {
                 self.approve_mcp_server_connect_inner(server, identity)
                     .await
             }
+            AuthorizationRequest::FileWrite {
+                path,
+                previous,
+                next,
+            } => self.approve_file_write(path, previous, next).await,
         }
     }
 }

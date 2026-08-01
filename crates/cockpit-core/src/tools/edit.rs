@@ -134,20 +134,6 @@ impl Tool for EditTool {
                     return Ok(crate::assistants::identity::tool_refusal(message));
                 }
             };
-        let acquire =
-            crate::tools::lock_wait::acquire_waiting(ctx, &path, self.name(), false).await?;
-        let write_guard = ctx
-            .locks
-            .begin_write_after_wait(
-                &path,
-                &ctx.lock_identity,
-                ctx.session.id,
-                self.name(),
-                !acquire.preexisting_hold,
-                true,
-            )
-            .await?;
-
         let existing =
             std::fs::read(&path).map_err(|e| anyhow::anyhow!("read `{}`: {e}", path.display()))?;
         let want_crlf = detect_crlf(&existing);
@@ -189,6 +175,27 @@ impl Tool for EditTool {
                 "background skill review must load `{}` with `skill` before editing its package files",
                 validation.name
             )));
+        }
+        crate::tools::write::authorize_existing_write(ctx, &path, &existing, normalized.as_bytes())
+            .await?;
+        let acquire =
+            crate::tools::lock_wait::acquire_waiting(ctx, &path, self.name(), false).await?;
+        let write_guard = ctx
+            .locks
+            .begin_write_after_wait(
+                &path,
+                &ctx.lock_identity,
+                ctx.session.id,
+                self.name(),
+                !acquire.preexisting_hold,
+                true,
+            )
+            .await?;
+        if std::fs::read(&path)? != existing {
+            return Err(anyhow::anyhow!(
+                "`{}` changed while approval was pending; read it again before editing",
+                path.display()
+            ));
         }
         let outcome = write_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?;
         crate::assistants::identity::record_identity_write(ctx, &path).await?;

@@ -282,3 +282,318 @@ impl Approver {
         .await
     }
 }
+
+/// Build the bounded preview shown before replacing an existing file. Core
+/// deliberately produces plain text; terminal styling remains a TUI concern.
+pub(crate) fn file_write_preview(previous: &[u8], next: &[u8]) -> WriteContentPreview {
+    const CAP: usize = 12 * 1024;
+    if crate::tools::common::looks_binary(previous) || crate::tools::common::looks_binary(next) {
+        use sha2::{Digest as _, Sha256};
+        let hash = |bytes: &[u8]| {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        return WriteContentPreview {
+            content: format!(
+                "binary replacement: {} bytes (sha256 {}) → {} bytes (sha256 {})",
+                previous.len(),
+                hash(previous),
+                next.len(),
+                hash(next)
+            ),
+            dynamic: true,
+        };
+    }
+    let before = String::from_utf8_lossy(previous);
+    let after = String::from_utf8_lossy(next);
+    let diff = similar::TextDiff::from_lines(before.as_ref(), after.as_ref())
+        .unified_diff()
+        .context_radius(3)
+        .header("before", "after")
+        .to_string();
+    let content = if diff.len() > CAP {
+        format!(
+            "{}\n… [diff truncated; {} bytes omitted]",
+            crate::tools::common::truncate_head_tail(&diff, CAP),
+            diff.len() - CAP
+        )
+    } else {
+        diff
+    };
+    WriteContentPreview {
+        content,
+        dynamic: false,
+    }
+}
+
+impl Approver {
+    /// Authorize replacement of an existing non-empty file. Exact-file and
+    /// parent-directory session grants share the existing path-grant store.
+    pub(super) async fn approve_file_write(
+        &self,
+        path: &std::path::Path,
+        previous: &[u8],
+        next: &[u8],
+    ) -> Result<Decision> {
+        const FILE_SESSION: &str = "write_grant_file_session";
+        const DIRECTORY_SESSION: &str = "write_grant_directory_session";
+        if self.store.is_path_rejected(path).await {
+            return Ok(Decision::Deny);
+        }
+        if self
+            .store
+            .is_path_granted_for(path, SandboxPathAccess::ReadWrite)
+            .await
+        {
+            return Ok(Decision::Allow {
+                scope: Scope::Session,
+            });
+        }
+        let target = path.display().to_string();
+        let question = InterruptQuestion::Single {
+            prompt: format!("Replace existing file `{target}`?"),
+            options: vec![
+                InterruptOption {
+                    id: "approve_once".to_string(),
+                    label: "Approve once".to_string(),
+                    description: None,
+                    secondary: false,
+                },
+                InterruptOption {
+                    id: FILE_SESSION.to_string(),
+                    label: "Approve this file for this session".to_string(),
+                    description: None,
+                    secondary: false,
+                },
+                InterruptOption {
+                    id: DIRECTORY_SESSION.to_string(),
+                    label: "Approve this directory for this session".to_string(),
+                    description: None,
+                    secondary: false,
+                },
+                InterruptOption {
+                    id: "reject".to_string(),
+                    label: "Deny".to_string(),
+                    description: None,
+                    secondary: false,
+                },
+            ],
+            allow_freetext: false,
+            command_detail: Some(Box::new(CommandDetail {
+                full_command: format!("replace {target}"),
+                highlight: None,
+                step: 1,
+                step_count: 1,
+                cwd: Some(self.store.cwd().display().to_string()),
+                remembered_key: Some(target.clone()),
+                write_content: Some(file_write_preview(previous, next)),
+                risk_tier: Some("mutating".to_string()),
+                risk_reasons: vec!["replaces existing file contents".to_string()],
+                affected_targets: vec![target],
+                native_tool_hints: Vec::new(),
+                offered_scopes: vec![
+                    "file".to_string(),
+                    "directory".to_string(),
+                    "session".to_string(),
+                ],
+                policy_cap: Some("session".to_string()),
+            })),
+            permission: true,
+            approval_class: Some(GrantKind::Path),
+            sandbox_escalation: None,
+        };
+        let choice = self
+            .raise_and_decode(
+                "Existing file modification requires approval",
+                question,
+                |response| {
+                    let selected = response_single_id(response).map(str::to_owned);
+                    match selected.as_deref() {
+                        None
+                        | Some("approve_once" | FILE_SESSION | DIRECTORY_SESSION | "reject") => {
+                            Ok(selected)
+                        }
+                        Some(received) => Err(ForeignOptionId {
+                            kind: "file_write_approval",
+                            offered: vec![
+                                "approve_once",
+                                FILE_SESSION,
+                                DIRECTORY_SESSION,
+                                "reject",
+                            ],
+                            received: received.to_string(),
+                        }),
+                    }
+                },
+            )
+            .await?;
+        match choice.as_deref() {
+            Some("approve_once") => Ok(Decision::Allow { scope: Scope::Once }),
+            Some(FILE_SESSION) => {
+                self.store
+                    .record_path(path, Scope::Session, SandboxPathAccess::ReadWrite)
+                    .await?;
+                Ok(Decision::Allow {
+                    scope: Scope::Session,
+                })
+            }
+            Some(DIRECTORY_SESSION) => {
+                self.store
+                    .record_path(
+                        path.parent().unwrap_or(path),
+                        Scope::Session,
+                        SandboxPathAccess::ReadWrite,
+                    )
+                    .await?;
+                Ok(Decision::Allow {
+                    scope: Scope::Session,
+                })
+            }
+            _ => Ok(Decision::Deny),
+        }
+    }
+}
+
+#[cfg(test)]
+mod file_write_preview_tests {
+    use super::file_write_preview;
+
+    #[test]
+    fn small_diff_includes_added_and_removed_lines() {
+        let preview = file_write_preview(b"old\nkeep\n", b"new\nkeep\n");
+        assert!(preview.content.contains("-old"), "{}", preview.content);
+        assert!(preview.content.contains("+new"), "{}", preview.content);
+    }
+
+    #[test]
+    fn large_diff_is_truncated_and_marked() {
+        let before = "old\n".repeat(5000);
+        let after = "new\n".repeat(5000);
+        let preview = file_write_preview(before.as_bytes(), after.as_bytes());
+        assert!(
+            preview.content.contains("diff truncated"),
+            "{}",
+            preview.content
+        );
+    }
+
+    #[test]
+    fn binary_write_reports_summary() {
+        let preview = file_write_preview(b"\0old", b"\0new");
+        assert!(preview.content.contains("binary replacement"));
+        assert!(preview.content.contains("sha256"));
+    }
+}
+
+#[cfg(test)]
+mod file_write_grant_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn approver(cwd: &std::path::Path) -> Arc<Approver> {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session =
+            crate::session::Session::create(db.clone(), cwd.to_path_buf(), "builder").unwrap();
+        let store = GrantStore::new(
+            db.clone(),
+            session.id,
+            cwd.to_path_buf(),
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
+        );
+        Arc::new(Approver::new(
+            store,
+            db,
+            session.id,
+            "builder",
+            Arc::new(InterruptHub::detached()),
+        ))
+    }
+
+    async fn resolve_next(approver: &Approver, selected_id: &str) {
+        loop {
+            let open = approver
+                .db
+                .list_open_interrupts(approver.session_id)
+                .await
+                .unwrap();
+            if let Some(row) = open.first() {
+                if !approver.interrupts.has_waiter(row.interrupt_id) {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                let response = ResolveResponse::Single {
+                    selected_id: selected_id.to_string(),
+                };
+                approver
+                    .db
+                    .resolve_interrupt(row.interrupt_id, &response)
+                    .await
+                    .unwrap();
+                assert!(approver.interrupts.resolve(row.interrupt_id, response));
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn write_grant_scopes_suppress_prompts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("a.txt");
+        let file_approver = approver(tmp.path());
+        let task_approver = file_approver.clone();
+        let task = tokio::spawn(async move {
+            task_approver
+                .approve_file_write(&first, b"old", b"new")
+                .await
+                .unwrap()
+        });
+        resolve_next(&file_approver, "write_grant_file_session").await;
+        assert_eq!(
+            task.await.unwrap(),
+            Decision::Allow {
+                scope: Scope::Session
+            }
+        );
+        assert_eq!(
+            file_approver
+                .approve_file_write(&tmp.path().join("a.txt"), b"old", b"new")
+                .await
+                .unwrap(),
+            Decision::Allow {
+                scope: Scope::Session
+            }
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("a.txt");
+        let sibling = directory.path().join("b.txt");
+        let directory_approver = approver(directory.path());
+        let task_approver = directory_approver.clone();
+        let task = tokio::spawn(async move {
+            task_approver
+                .approve_file_write(&first, b"old", b"new")
+                .await
+                .unwrap()
+        });
+        resolve_next(&directory_approver, "write_grant_directory_session").await;
+        assert_eq!(
+            task.await.unwrap(),
+            Decision::Allow {
+                scope: Scope::Session
+            }
+        );
+        assert_eq!(
+            directory_approver
+                .approve_file_write(&sibling, b"old", b"new")
+                .await
+                .unwrap(),
+            Decision::Allow {
+                scope: Scope::Session
+            }
+        );
+        let _ = sibling;
+    }
+}

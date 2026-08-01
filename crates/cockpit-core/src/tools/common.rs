@@ -1,5 +1,6 @@
 //! Shared utilities for the file tools.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -200,12 +201,46 @@ pub async fn write_and_release(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, bytes).map_err(|e| anyhow::anyhow!("write `{}`: {e}", path.display()))?;
+    atomic_write(path, bytes)?;
     let persist_ok = guard.release_after_write().await;
     ctx.locks
         .note_read(path, &ctx.lock_identity, ctx.session.id)
         .await;
     Ok(WriteReleaseOutcome { persist_ok })
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with(path, bytes, |_| Ok(()))
+}
+
+fn atomic_write_with(
+    path: &Path,
+    bytes: &[u8],
+    before_rename: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("write `{}`: no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let metadata = std::fs::metadata(path)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.as_file().set_permissions(metadata.permissions())?;
+    before_rename(temp.path())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+        let rc =
+            unsafe { libc::fchown(temp.as_file().as_raw_fd(), metadata.uid(), metadata.gid()) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    temp.persist(path)
+        .map_err(|error| anyhow::anyhow!("write `{}`: {}", path.display(), error.error))?;
+    Ok(())
 }
 
 /// Build a minimal in-memory [`ToolCtx`] for tool tests: a fresh
@@ -234,6 +269,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
     // session sandbox OFF — tests that exercise sandbox config/decision
     // logic build their own ctx or flip the flag explicitly.
     session.set_sandbox_enabled(false);
+    session.set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
     let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
     let redact = Arc::new(crate::redact::RedactionTable::empty());
     (
@@ -456,5 +492,38 @@ mod tests {
         assert!(out.starts_with("xxxx"));
         assert!(out.ends_with("TAILMARKER"));
         assert!(out.contains("truncated"));
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_write_leaves_original_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("target");
+        std::fs::write(&path, b"original").unwrap();
+        let error = atomic_write_with(&path, b"replacement", |_| {
+            Err(std::io::Error::other("interrupted"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("interrupted"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("private");
+        std::fs::write(&path, b"before").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        atomic_write(&path, b"after").unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

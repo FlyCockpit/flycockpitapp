@@ -666,7 +666,7 @@ mod safety_gate_tests {
     }
 
     #[test]
-    fn gate_scope_covers_shell_and_mcp_only() {
+    fn gate_scope_covers_shell_mcp_and_existing_file_writes() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         assert!(is_gated_tool("bash"));
@@ -674,7 +674,8 @@ mod safety_gate_tests {
         assert!(!is_gated_tool("webfetch"));
         assert!(!is_gated_tool("websearch"));
         assert!(!is_gated_tool("read"));
-        assert!(!is_gated_tool("edit"));
+        assert!(is_gated_tool("edit"));
+        assert!(is_gated_tool("write"));
         assert!(!is_gated_tool("search"));
         assert!(!is_gated_tool("task"));
 
@@ -749,6 +750,32 @@ mod safety_gate_tests {
         let args = serde_json::json!({ "command": "rm -rf /" });
         let outcome = safety_gate_decision("bash", &args, &ctx, &tx).await;
         assert!(matches!(outcome, GateOutcome::Run { recheck: false }));
+    }
+
+    #[tokio::test]
+    async fn auto_mode_routes_write_through_safety_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let (tx, _rx) = mpsc::channel(8);
+        let providers = crate::config::providers::ProvidersConfig::default();
+        reset_safety_gate_evaluate_calls();
+        set_safety_gate_evaluate_outcomes([crate::engine::safety_gate::SafetyOutcome::Rated(
+            crate::engine::safety_gate::SafetyVerdict {
+                safe: true,
+                recheck_result: false,
+            },
+        )]);
+        let outcome = safety_gate_decision_with_configs(
+            "write",
+            &serde_json::json!({"path":"x","content":"y"}),
+            &ctx,
+            &tx,
+            Some("openai:gpt-test"),
+            &providers,
+        )
+        .await;
+        assert!(matches!(outcome, GateOutcome::Run { .. }));
+        assert_eq!(safety_gate_evaluate_calls(), 1);
     }
 
     #[tokio::test]

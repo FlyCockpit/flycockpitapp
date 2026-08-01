@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::config::extended::ApprovalMode;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args};
 use crate::tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release};
 
@@ -99,6 +100,16 @@ impl Tool for WriteTool {
             };
 
         let exists = path.exists();
+        let existing_before = if exists {
+            Some(std::fs::read(&path)?)
+        } else {
+            None
+        };
+        let want_crlf = existing_before.as_deref().is_some_and(detect_crlf);
+        let normalized = normalize_line_endings(content, want_crlf);
+        if let Some(previous) = existing_before.as_deref().filter(|bytes| !bytes.is_empty()) {
+            authorize_existing_write(ctx, &path, previous, normalized.as_bytes()).await?;
+        }
         let acquire =
             crate::tools::lock_wait::acquire_waiting(ctx, &path, self.name(), false).await?;
         let write_guard = ctx
@@ -113,18 +124,14 @@ impl Tool for WriteTool {
             )
             .await?;
 
-        // Decide line-ending mode based on the existing file (when
-        // present). For new files default to LF on every platform —
-        // Rust source, Markdown, JSON; the user's project is
-        // overwhelmingly LF.
-        let want_crlf = if exists {
-            let existing = std::fs::read(&path)?;
-            detect_crlf(&existing)
-        } else {
-            false
-        };
-
-        let normalized = normalize_line_endings(content, want_crlf);
+        if let Some(previous) = &existing_before
+            && std::fs::read(&path)? != *previous
+        {
+            return Err(anyhow::anyhow!(
+                "`{}` changed while approval was pending; read it again before overwriting",
+                path.display()
+            ));
+        }
         let config = ctx.config.extended();
         let skill_validation = crate::skills::validate_skill_package_write_for_paths(
             &requested_path,
@@ -1417,5 +1424,106 @@ mod tests {
             .unwrap();
 
         assert!(out.content.contains("syntax OK (JSON)"), "{}", out.content);
+    }
+}
+
+/// Existing non-empty files are destructive writes. Manual mode asks through
+/// the central authorization chokepoint; Auto and Yolo are decided by the
+/// dispatch safety gate (or intentionally bypass it) before this tool runs.
+pub(crate) async fn authorize_existing_write(
+    ctx: &ToolCtx,
+    path: &std::path::Path,
+    previous: &[u8],
+    next: &[u8],
+) -> Result<()> {
+    if !matches!(ctx.session.approval_mode(), ApprovalMode::Manual) {
+        return Ok(());
+    }
+    let decision = if let Some(approver) = ctx.approver.as_ref() {
+        approver
+            .authorize(crate::approval::AuthorizationRequest::FileWrite {
+                path,
+                previous,
+                next,
+            })
+            .await?
+    } else {
+        crate::approval::Decision::NoninteractiveDeny
+    };
+    match decision {
+        crate::approval::Decision::Allow { .. } => Ok(()),
+        crate::approval::Decision::NoninteractiveDeny => {
+            Err(anyhow::anyhow!(crate::approval::NONINTERACTIVE_RUN_DENIAL))
+        }
+        crate::approval::Decision::Deny | crate::approval::Decision::StandingReject { .. } => {
+            Err(anyhow::anyhow!("existing file modification denied"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod write_approval_regressions {
+    use super::*;
+    use crate::engine::tool::Tool;
+    use crate::tools::common::test_ctx;
+
+    #[tokio::test]
+    async fn creating_new_file_is_not_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        ctx.session.set_approval_mode(ApprovalMode::Manual);
+        WriteTool
+            .call(serde_json::json!({"path":"new.txt","content":"new"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("new.txt")).unwrap(),
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn overwriting_empty_file_is_not_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+        let ctx = test_ctx(tmp.path());
+        ctx.session.set_approval_mode(ApprovalMode::Manual);
+        ctx.locks
+            .note_read(&path, &ctx.lock_identity, ctx.session.id)
+            .await;
+        WriteTool
+            .call(
+                serde_json::json!({"path":"empty.txt","content":"filled"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "filled");
+    }
+
+    #[tokio::test]
+    async fn write_without_approver_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("existing.txt");
+        std::fs::write(&path, "before").unwrap();
+        let ctx = test_ctx(tmp.path());
+        ctx.session.set_approval_mode(ApprovalMode::Manual);
+        ctx.locks
+            .note_read(&path, &ctx.lock_identity, ctx.session.id)
+            .await;
+        let err = WriteTool
+            .call(
+                serde_json::json!({"path":"existing.txt","content":"after"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("noninteractive run: approval auto-denied"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
     }
 }

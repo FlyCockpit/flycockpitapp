@@ -935,12 +935,12 @@ impl DefaultPrimaryAgent {
     }
 }
 
-/// Command-approval mode (implementation note).
-/// Governs whether — and how — a gated tool call (`bash`, `mcp`)
-/// prompts the user before it runs.
+/// Human-permission ladder for every grant-or-ask surface.
 ///
-/// Deliberately distinct from [`LlmMode`]: this is the *approval* `auto`, the
-/// safety-gate engine.
+/// Manual asks after applicable grants are checked; Auto routes ungranted work
+/// through the safety gate before asking; Yolo is unattended and opens no human
+/// permission interrupt. Successful confined commands remain silent under all
+/// modes — the sandbox is their gate. Deliberately distinct from [`LlmMode`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMode {

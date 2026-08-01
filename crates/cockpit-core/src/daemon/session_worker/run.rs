@@ -743,10 +743,11 @@ pub(super) async fn run_worker(
         // effect without rebuilding the store.
         SessionConfigHandle::new(config_snapshot.clone()),
     );
-    let approver = Arc::new(crate::approval::Approver::new(
+    let approver = Arc::new(crate::approval::Approver::new_for_session(
         grant_store,
         session.db.clone(),
-        session_id,
+        session.clone(),
+        redaction.clone(),
         &root_agent_name,
         interrupts.clone(),
     ));

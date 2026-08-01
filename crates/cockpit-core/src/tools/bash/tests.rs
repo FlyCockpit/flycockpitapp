@@ -545,13 +545,17 @@ use crate::daemon::proto::ResolveResponse;
 /// Build a sandbox-enabled ctx with an approver + grant store.
 fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
     let db = crate::db::Db::open_in_memory().unwrap();
-    let session =
-        crate::session::Session::create(db.clone(), cwd.to_path_buf(), "builder").unwrap();
+    let session = Arc::new(
+        crate::session::Session::create(db.clone(), cwd.to_path_buf(), "builder").unwrap(),
+    );
     session.set_sandbox_enabled(true);
     let sid = session.id;
     let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
     let cfg = crate::config::extended::RedactConfig::default();
-    let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, cwd).unwrap());
+    let redaction_slot = Arc::new(std::sync::RwLock::new(Arc::new(
+        crate::redact::RedactionTable::build(&cfg, cwd).unwrap(),
+    )));
+    let redact = redaction_slot.read().unwrap().clone();
     let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
     let store = GrantStore::new(
         db.clone(),
@@ -559,7 +563,14 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
         cwd.to_path_buf(),
         crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
     );
-    let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
+    let approver = Arc::new(Approver::new_for_session(
+        store,
+        db,
+        session.clone(),
+        redaction_slot,
+        "builder",
+        hub.clone(),
+    ));
     ToolCtx {
         agent_id: "builder".to_string(),
         lock_identity: "builder".to_string().clone(),
@@ -567,7 +578,7 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
         current_tool_call_id: None,
         llm_mode: crate::config::extended::LlmMode::Normal,
         locks,
-        session: Arc::new(session),
+        session,
         cwd: cwd.to_path_buf(),
         redact,
         interrupts: hub,
@@ -1708,6 +1719,62 @@ async fn sandbox_off_ungranted_command_prompts_and_deny_blocks_run() {
     assert!(!meta.escalation_preauthorized);
     assert!(out.content.contains("approval was denied"));
     assert!(!marker.exists(), "denied unconfined command must not run");
+}
+
+#[tokio::test]
+async fn yolo_sandbox_off_ungranted_bash_runs_without_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_enabled(false);
+    ctx.session
+        .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
+    let _guard = set_bash_test_overrides(None, None, [(false, shell_out("yolo", "", 0))]);
+
+    let out = BashTool::new()
+        .call(serde_json::json!({ "command": "printf yolo" }), &ctx)
+        .await
+        .expect("yolo bash call returns");
+
+    assert!(out.content.contains("yolo"));
+    assert!(
+        ctx.session
+            .db
+            .list_open_interrupts(ctx.session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn auto_unconfined_bash_unsafe_gate_prompts_or_denies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_enabled(false);
+    ctx.session
+        .set_approval_mode(crate::config::extended::ApprovalMode::Auto);
+    let _guard = set_bash_test_overrides(None, None, [(false, shell_out("must-not-run", "", 0))]);
+    let db = ctx.session.db.clone();
+    let sid = ctx.session.id;
+    let hub = ctx.interrupts.clone();
+    let resolver = tokio::spawn(async move {
+        resolve_next_interrupt_with_response(db, sid, hub, ResolveResponse::Cancel, None).await
+    });
+
+    let out = BashTool::new()
+        .call(
+            serde_json::json!({ "command": "printf must-not-run" }),
+            &ctx,
+        )
+        .await
+        .expect("auto bash call returns");
+    resolver.await.unwrap();
+
+    assert!(
+        out.content.contains("approval was denied"),
+        "{}",
+        out.content
+    );
 }
 
 #[tokio::test]

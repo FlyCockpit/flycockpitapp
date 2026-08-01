@@ -14,7 +14,62 @@ impl Approver {
             session_id,
             agent_id: agent_id.into(),
             interrupts,
+            session: None,
+            redact: None,
         }
+    }
+
+    /// Construct the live session approver. The session supplies the shared
+    /// Manual→Auto→Yolo mode for every agent context.
+    pub fn new_for_session(
+        store: GrantStore,
+        db: crate::db::Db,
+        session: Arc<crate::session::Session>,
+        redact: Arc<std::sync::RwLock<Arc<crate::redact::RedactionTable>>>,
+        agent_id: impl Into<String>,
+        interrupts: Arc<InterruptHub>,
+    ) -> Self {
+        Self {
+            store,
+            db,
+            session_id: session.id,
+            agent_id: agent_id.into(),
+            interrupts,
+            session: Some(session),
+            redact: Some(redact),
+        }
+    }
+
+    pub(crate) fn approval_mode(&self) -> crate::config::extended::ApprovalMode {
+        self.session
+            .as_deref()
+            .map(crate::session::Session::approval_mode)
+            .unwrap_or(crate::config::extended::ApprovalMode::Manual)
+    }
+
+    pub(crate) fn yolo_mode(&self) -> bool {
+        matches!(
+            self.approval_mode(),
+            crate::config::extended::ApprovalMode::Yolo
+        )
+    }
+
+    pub(crate) async fn auto_allows(&self, effect: &str, payload: &str) -> bool {
+        if !matches!(
+            self.approval_mode(),
+            crate::config::extended::ApprovalMode::Auto
+        ) {
+            return false;
+        }
+        let Some(redact) = self.redact.as_ref().map(|slot| {
+            slot.read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }) else {
+            return false;
+        };
+        let (extended, providers) = self.store.configs();
+        matches!(crate::engine::safety_gate::evaluate(extended.guard_model_ref(), &providers, redact, None, effect, payload).await, crate::engine::safety_gate::SafetyOutcome::Rated(verdict) if verdict.safe)
     }
 
     /// Read-only access to the underlying store (the §4 query API).
@@ -157,6 +212,9 @@ impl Approver {
     }
 
     pub(super) async fn approve_tool_call_inner(&self, label: &str) -> Result<Decision> {
+        if self.yolo_mode() || self.auto_allows("native_tool", label).await {
+            return Ok(Decision::Allow { scope: Scope::Once });
+        }
         // `wrapper = true` makes the prompt offer only "Yes, once" — the
         // right shape for a non-persistable per-call approval. Nothing is
         // recorded; a later identical call prompts again.
@@ -235,6 +293,9 @@ impl Approver {
             return Ok(decision);
         }
 
+        if self.yolo_mode() || self.auto_allows("mcp_tool", &target).await {
+            return Ok(Decision::Allow { scope: Scope::Once });
+        }
         let prompt = format!(
             "`{tool}` on MCP server `{server}` wants to run. This server is external to cockpit."
         );
@@ -318,6 +379,9 @@ impl Approver {
             return Ok(decision);
         }
 
+        if self.yolo_mode() || self.auto_allows("custom_tool", &target).await {
+            return Ok(Decision::Allow { scope: Scope::Once });
+        }
         let prompt = format!(
             "Configured custom tool `{tool}` for agent `{agent}` wants to run outside Cockpit\x27s sandbox."
         );
@@ -410,6 +474,9 @@ impl Approver {
             .await;
             return Ok(decision);
         }
+        if self.yolo_mode() || self.auto_allows("mcp_server_connect", &target).await {
+            return Ok(Decision::Allow { scope: Scope::Once });
+        }
         let prompt = mcp_server_connect_prompt(server, identity);
         let question = approval_question(
             &target,
@@ -486,6 +553,9 @@ impl Approver {
         clone_url: &str,
         rationale: &str,
     ) -> Result<Decision> {
+        if self.yolo_mode() || self.auto_allows("package_clone", clone_url).await {
+            return Ok(Decision::Allow { scope: Scope::Once });
+        }
         let prompt = format!(
             "Clone a new dependency `{identifier}` to answer a docs question?\n\nURL: {clone_url}\nWhy: {rationale}"
         );
@@ -542,5 +612,45 @@ mod mcp_server_connect_tests {
         assert!(prompt.contains("filesystem"));
         assert!(prompt.contains("command=npx"));
         assert!(prompt.contains("server-filesystem"));
+    }
+}
+
+#[cfg(test)]
+mod approval_mode_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_approval_mode_shared_with_approver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create(db.clone(), tmp.path().to_path_buf(), "builder")
+                .unwrap(),
+        );
+        let store = GrantStore::new(
+            db.clone(),
+            session.id,
+            tmp.path().to_path_buf(),
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+        );
+        let approver = Approver::new_for_session(
+            store,
+            db,
+            session.clone(),
+            Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::redact::RedactionTable::empty(),
+            ))),
+            "builder",
+            Arc::new(InterruptHub::detached()),
+        );
+        session.set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
+        assert_eq!(
+            approver.approval_mode(),
+            crate::config::extended::ApprovalMode::Yolo
+        );
+        assert_eq!(
+            approver.approve_mcp_tool("untrusted", "run").await.unwrap(),
+            Decision::Allow { scope: Scope::Once }
+        );
     }
 }

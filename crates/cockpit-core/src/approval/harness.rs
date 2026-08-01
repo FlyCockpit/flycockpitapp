@@ -8,6 +8,9 @@ impl Approver {
         policy: crate::harness::run::WritePolicy,
     ) -> Result<Decision> {
         let target = format!("harness:{harness}");
+        if self.yolo_mode() || self.auto_allows("harness_invoke", &target).await {
+            return Ok(Decision::Allow { scope: Scope::Once });
+        }
         let offered = [Scope::Once, Scope::Session];
         let writes = match policy {
             crate::harness::run::WritePolicy::Direct => "directly into this project",

@@ -23,7 +23,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::approval::Decision;
-use crate::config::extended::{ApprovalMode, ExtendedConfigDoc, HarnessConfig, resolve_harnesses};
+#[cfg(test)]
+use crate::config::extended::ApprovalMode;
+use crate::config::extended::{ExtendedConfigDoc, HarnessConfig, resolve_harnesses};
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 use crate::engine::validation_hint::ValidationCorrection;
 use crate::harness::run::{RunContext, WritePolicy, run_harness};
@@ -406,7 +408,6 @@ impl Tool for HarnessInvokeTool {
         let policy = write_override.unwrap_or_else(|| WritePolicy::for_primary(&ctx.agent_id));
 
         if let Some(approver) = &ctx.approver
-            && ctx.session.approval_mode() != ApprovalMode::Yolo
             && !hc.always_allow
             && !approver.store().is_harness_granted(&harness_name).await
         {

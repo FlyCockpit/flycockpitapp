@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
 
+#[cfg(test)]
 use crate::config::extended::ApprovalMode;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolPresentation, path_or_readable_args};
 use crate::tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release};
@@ -1446,9 +1447,6 @@ pub(crate) async fn authorize_existing_write(
     previous: &[u8],
     next: &[u8],
 ) -> Result<()> {
-    if !matches!(ctx.session.approval_mode(), ApprovalMode::Manual) {
-        return Ok(());
-    }
     let decision = if let Some(approver) = ctx.approver.as_ref() {
         approver
             .authorize(crate::approval::AuthorizationRequest::FileWrite {

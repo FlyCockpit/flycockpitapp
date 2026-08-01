@@ -48,6 +48,9 @@ impl Approver {
             .await;
             return Ok(decision);
         }
+        if self.yolo_mode() || self.auto_allows("path", &target).await {
+            return Ok(Decision::Allow { scope: Scope::Once });
+        }
         // Paths are never wrappers → all four scopes are offered.
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
         let label = path_prompt_label(&target, required);
@@ -116,6 +119,9 @@ impl Approver {
         file_glob: &str,
         parent_glob: &str,
     ) -> Result<GitignoreReadOutcome> {
+        if self.yolo_mode() || self.auto_allows("gitignore_read", display_path).await {
+            return Ok(GitignoreReadOutcome::ApproveOnce);
+        }
         // Stage 1 — scope (file / parent dir / reject).
         let shape = self
             .prompt_gitignore_stage1(display_path, parent_label)
@@ -353,6 +359,9 @@ impl Approver {
             });
         }
         let target = path.display().to_string();
+        if self.yolo_mode() || self.auto_allows("file_write", &target).await {
+            return Ok(Decision::Allow { scope: Scope::Once });
+        }
         let question = InterruptQuestion::Single {
             prompt: format!("Replace existing file `{target}`?"),
             options: vec![

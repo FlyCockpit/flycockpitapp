@@ -317,6 +317,11 @@ impl Approver {
             return self.finish_command_approval(command, decision).await;
         }
 
+        if self.yolo_mode() || self.auto_allows("bash", command).await {
+            return self
+                .finish_command_approval(command, Decision::Allow { scope: Scope::Once })
+                .await;
+        }
         // A prompt is required for at least one constituent. The offered
         // scopes describe what the prompt presents (all four, unless every
         // prompting constituent is a wrapper → once only).

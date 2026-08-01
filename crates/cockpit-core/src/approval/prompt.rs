@@ -91,7 +91,20 @@ impl Approver {
             return Ok(repeat);
         }
 
-        // 2. No human to ask → reject the repeat (the guidance error lets
+        // 2. Yolo is fully unattended, but standing rules above still win.
+        if self.yolo_mode() {
+            self.record_permission_decision(
+                tool,
+                &target,
+                &loop_offered,
+                Decision::Allow { scope: Scope::Once },
+                DecisionSource::ModeAutoAllow,
+            )
+            .await;
+            return Ok(RepeatDecision::Accept);
+        }
+
+        // 3. No human to ask → reject the repeat (the guidance error lets
         //    the model change course; re-running would bleed the window).
         if !interactive {
             self.record_permission_decision(

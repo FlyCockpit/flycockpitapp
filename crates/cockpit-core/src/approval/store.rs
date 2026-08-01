@@ -356,6 +356,15 @@ impl GrantStore {
     /// never falls open to a more permissive outcome (security requirement).
     /// A single approval decision reads this once at the start, so a change
     /// landing mid-decision never re-evaluates an in-flight prompt.
+    pub fn configs(
+        &self,
+    ) -> (
+        crate::config::extended::ExtendedConfig,
+        crate::config::providers::ProvidersConfig,
+    ) {
+        self.config.configs()
+    }
+
     pub fn approval_policy(&self) -> ApprovalPolicyConfig {
         let candidate = self.config.extended().approval_policy;
         let mut last_good = self

@@ -153,6 +153,8 @@ pub enum DecisionSource {
     UserPrompt,
     /// No interactive client to answer → auto-rejected without blocking.
     HeadlessAutoReject,
+    // Allowed by the session's unattended approval mode without a prompt.
+    ModeAutoAllow,
     /// A standing loop-guard always-accept/always-reject rule decided it
     /// without prompting.
     LoopGuardRule,
@@ -169,6 +171,7 @@ impl DecisionSource {
             DecisionSource::AlreadyGranted => "already_granted",
             DecisionSource::UserPrompt => "user_prompt",
             DecisionSource::HeadlessAutoReject => "headless_auto_reject",
+            DecisionSource::ModeAutoAllow => "mode_auto_allow",
             DecisionSource::LoopGuardRule => "loop_guard_rule",
             DecisionSource::StandingReject => "standing_reject",
         }
@@ -235,6 +238,8 @@ pub struct Approver {
     session_id: uuid::Uuid,
     agent_id: String,
     interrupts: Arc<InterruptHub>,
+    session: Option<Arc<crate::session::Session>>,
+    redact: Option<Arc<std::sync::RwLock<Arc<crate::redact::RedactionTable>>>>,
 }
 
 impl Approver {

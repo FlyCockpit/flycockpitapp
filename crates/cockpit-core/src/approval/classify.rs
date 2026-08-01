@@ -28,6 +28,7 @@
 //! command-substitution `$(...)` and process-substitution force a prompt:
 //! the substituted program isn't statically knowable.
 
+use std::collections::BTreeSet;
 use std::io::Cursor;
 
 use brush_parser::ast::{
@@ -92,14 +93,18 @@ pub struct SimpleCommandInfo {
     /// for no-subcommand commands (`ls`, `./script`).
     pub subcommand: Option<String>,
     /// Static suffix argv words after `argv[0]`, preserving source order.
-    /// The approval key intentionally ignores these, but per-invocation risk
+    /// Option names contribute to the approval key while values remain absent;
+    /// per-invocation risk
     /// classifiers use them to raise the tier for dangerous flags.
     pub args: Vec<String>,
-    /// The approval key derived from `normalized_program` + `subcommand`.
+    /// The approval key derived from `normalized_program`, `subcommand`, and option names.
     pub key: ApprovalKey,
     /// Whether this command is a wrapper/eval that hides behavior the
     /// parser can't inspect (§1). Wrappers are never persistable (§2).
     pub wrapper: bool,
+    /// Whether an option value can name executable behavior. These commands
+    /// are once-only even though their option names participate in shape keys.
+    pub execution_bearing_option: bool,
     /// Structured risk/effect metadata used by the approval policy and
     /// prompt. This is conservative static analysis: only literal operands
     /// become affected paths; dynamic/globbed operands become risk reasons.
@@ -168,34 +173,62 @@ impl RiskTier {
     }
 }
 
-/// The store key for a command-key grant: `argv[0]` plus the first
-/// subcommand token. Arguments beyond the subcommand are **not** part of the
-/// key: grants stay coarse so users do not approve a new key for every flag
-/// spelling. Per-invocation risk tiers remain separate metadata and may be
-/// raised by built-in or configured dangerous-flag rules before the approval
-/// policy decides what scopes can be offered.
+/// The store key for a command grant. It records the normalized executable,
+/// first subcommand, and a sorted set of option names (never values). The
+/// versioned storage format deliberately invalidates the pre-shape coarse
+/// grant format rather than allowing an old grant to cover a new option.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ApprovalKey {
     pub program: String,
     pub subcommand: Option<String>,
+    /// Normalized option names, in sorted order. Values are intentionally
+    /// absent so persisted grants cannot retain credentials or other secrets.
+    pub option_names: BTreeSet<String>,
 }
 
 impl ApprovalKey {
-    /// Stable string form for persistence + display: `"gh pr"` or just
-    /// `"ls"` when there's no subcommand. The space join is unambiguous
-    /// because a program token is never empty and a subcommand token
-    /// never contains a space (it's a single shell word).
+    /// Versioned persistence identity. JSON escaping makes the delimiter
+    /// unambiguous even for unusual quoted executable names; `v2:` ensures
+    /// every pre-shape grant fails closed instead of matching.
     pub fn as_storage_str(&self) -> String {
+        let shape = serde_json::json!({
+            "program": self.program,
+            "subcommand": self.subcommand,
+            "options": self.option_names,
+        });
+        format!("v2:{shape}")
+    }
+
+    /// Coarse identity used only for configuration policy lookup and human
+    /// labels. It is never persisted as a command grant.
+    pub fn as_policy_str(&self) -> String {
         match &self.subcommand {
             Some(sub) => format!("{} {}", self.program, sub),
             None => self.program.clone(),
         }
     }
+
+    /// Human-readable grant shape, without any option values.
+    pub fn as_display_str(&self) -> String {
+        let mut display = self.as_policy_str();
+        if !self.option_names.is_empty() {
+            display.push(' ');
+            display.push_str(
+                &self
+                    .option_names
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+        display
+    }
 }
 
 impl std::fmt::Display for ApprovalKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.as_storage_str())
+        f.write_str(&self.as_display_str())
     }
 }
 
@@ -397,7 +430,7 @@ impl Decomposer {
         }
     }
 
-    /// Extract argv[0] + first subcommand from a simple command and
+    /// Extract argv[0], first subcommand, and option-name shape from a simple command and
     /// record it. Command/process substitution anywhere in the command
     /// marks the source compound (a substituted program isn't statically
     /// knowable) but the outer program is still keyed and evaluated.
@@ -476,9 +509,12 @@ impl Decomposer {
             .flat_map(command_substitutions)
             .collect();
 
+        let option_names = option_names(&args, &normalized_program);
+        let execution_bearing_option = has_execution_bearing_option(&args, &normalized_program);
         let key = ApprovalKey {
             program: normalized_program.clone(),
             subcommand: subcommand.clone(),
+            option_names,
         };
         // Source span of this simple command within the original string,
         // from the AST's `SourceLocation`. `index` counts chars (the
@@ -495,6 +531,7 @@ impl Decomposer {
             args,
             key,
             wrapper,
+            execution_bearing_option,
             risk,
             span,
         });
@@ -623,6 +660,94 @@ fn is_subcommand_token(word: &str) -> bool {
         && word
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Derive a stable option-name set from argv suffixes. Values never enter the
+/// set: --flag=value and --flag value intentionally normalize to --flag.
+/// `--` ends parsing, and repeated names collapse in the BTreeSet.
+fn option_names(args: &[String], program: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut parse_options = true;
+    for arg in args {
+        if !parse_options {
+            continue;
+        }
+        if arg == "--" {
+            parse_options = false;
+            continue;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            names.insert(normalize_option_name(program, &format!("--{name}")));
+            continue;
+        }
+        // Numeric short forms (for example git log -5) carry a value, not
+        // an option identity, so exclude them from the shape.
+        if arg[1..].chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        // Short option clusters are represented as their component names so
+        // -vv and -v -v converge. This is conservative for short options
+        // with attached values: it may prompt more often, never less.
+        for short in arg[1..].chars() {
+            names.insert(normalize_option_name(program, &format!("-{short}")));
+        }
+    }
+    names
+}
+
+/// Cheap aliases shared by common CLIs. Expanding this list affects only
+/// prompt volume, never authority: omitted aliases merely produce a fresh key.
+fn normalize_option_name(_program: &str, option: &str) -> String {
+    match option {
+        "-m" => "--message".to_string(),
+        "-v" => "--verbose".to_string(),
+        _ => option.to_string(),
+    }
+}
+
+/// Values of these options can install a command string or executable path,
+/// so their invocations are always once-only. Keep this narrow and explicit;
+/// the shape key still protects every other novel option.
+fn has_execution_bearing_option(args: &[String], program: &str) -> bool {
+    let mut parse_options = true;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if !parse_options {
+            break;
+        }
+        if arg == "--" {
+            parse_options = false;
+            index += 1;
+            continue;
+        }
+        match program {
+            "git" if arg == "-c" || arg.starts_with("-c") && arg.len() > 2 => return true,
+            "git" if arg == "--config-env" || arg.starts_with("--config-env=") => return true,
+            "rsync" if arg == "-e" || arg.starts_with("-e") && arg.len() > 2 => return true,
+            "rsync" if arg == "--rsh" || arg.starts_with("--rsh=") => return true,
+            "scp" if arg == "-S" || arg.starts_with("-S") && arg.len() > 2 => return true,
+            "ssh" if arg == "-o" => {
+                if let Some(value) = args.get(index + 1) {
+                    if value.starts_with("ProxyCommand=") || value.starts_with("LocalCommand=") {
+                        return true;
+                    }
+                }
+            }
+            "ssh" if let Some(value) = arg.strip_prefix("-o") => {
+                if value.starts_with("ProxyCommand=") || value.starts_with("LocalCommand=") {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
 }
 
 /// Whether `program` (argv[0]) is a wrapper/eval command. Matches the
@@ -1116,7 +1241,7 @@ mod tests {
     fn keys(c: &Classification) -> Vec<String> {
         c.simple_commands()
             .iter()
-            .map(|s| s.key.as_storage_str())
+            .map(|s| s.key.as_display_str())
             .collect()
     }
 
@@ -1140,14 +1265,14 @@ mod tests {
     #[test]
     fn options_are_not_a_subcommand() {
         let c = classify("ls -la");
-        assert_eq!(keys(&c), vec!["ls"]);
+        assert_eq!(keys(&c), vec!["ls -a -l"]);
         assert!(!matches!(c, Classification::Parsed { compound: true, .. }));
     }
 
     #[test]
     fn subcommand_key_drops_args() {
         let c = classify("gh pr create --title x");
-        assert_eq!(keys(&c), vec!["gh pr"]);
+        assert_eq!(keys(&c), vec!["gh pr --title"]);
         let sc = &c.simple_commands()[0];
         assert_eq!(sc.program, "gh");
         assert_eq!(sc.subcommand.as_deref(), Some("pr"));
@@ -1191,7 +1316,7 @@ mod tests {
     fn pipe_decomposes_each_stage() {
         let c = classify("cat file | grep foo | wc -l");
         assert!(matches!(c, Classification::Parsed { compound: true, .. }));
-        assert_eq!(keys(&c), vec!["cat file", "grep foo", "wc"]);
+        assert_eq!(keys(&c), vec!["cat file", "grep foo", "wc -l"]);
     }
 
     #[test]
@@ -1386,7 +1511,7 @@ mod tests {
         let info = first_info(r#""rm" -rf foo"#);
         assert_eq!(info.program, r#""rm""#);
         assert_eq!(info.normalized_program, "rm");
-        assert_eq!(info.key.as_storage_str(), "rm foo");
+        assert_eq!(info.key.as_display_str(), "rm foo -f -r");
         assert_eq!(info.risk.tier, RiskTier::Destructive);
         assert!(info.risk.reasons.contains(&"removes files".to_string()));
     }
@@ -1445,7 +1570,7 @@ mod tests {
         let info = &c.simple_commands()[0];
         assert_eq!(info.program, r#"/bin/"rm""#);
         assert_eq!(info.normalized_program, "/bin/rm");
-        assert_eq!(info.key.as_storage_str(), "/bin/rm foo");
+        assert_eq!(info.key.as_display_str(), "/bin/rm foo -f -r");
         assert_eq!(info.risk.tier, RiskTier::Destructive);
         assert_eq!(span_text(cmd, 0), cmd);
     }

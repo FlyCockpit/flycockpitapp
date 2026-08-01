@@ -1,7 +1,7 @@
 //! Approval-decision store (sandboxing part 1, §2).
 //!
 //! Records grants so a future access skips the prompt. Grant kinds cover
-//! command-key (the §1 `argv[0]`+subcommand key), path (an absolute path or
+//! command-shape key (normalized argv[0], subcommand, and option names), path (an absolute path or
 //! prefix, for part 2's native confinement), and external MCP tool keys
 //! (`server/tool`) across four
 //! scopes:
@@ -438,7 +438,7 @@ impl GrantStore {
             .session_has(GrantKind::Command, &s, Verdict::Reject)
             .await
         {
-            return Some(Scope::Project);
+            return Some(Scope::Session);
         }
         if self
             .project_file()
@@ -674,7 +674,8 @@ impl GrantStore {
         self.path_reject_matches(matches).await
     }
 
-    /// Record a command-key **allow** grant at `scope`. Rejects wrappers at
+    /// Record a command-shape **allow** grant at `scope`. Rejects wrappers and
+    /// execution-bearing option values at
     /// any non-`Once` scope (priority #1). `Once` is a no-op error — the
     /// caller shouldn't record it, but rejecting loudly catches misuse.
     /// Clears any standing **reject** for this key across every reachable
@@ -688,7 +689,7 @@ impl GrantStore {
         if scope == Scope::Once {
             return Err(StoreError::OnceNotPersistable);
         }
-        if info.wrapper {
+        if info.wrapper || info.execution_bearing_option {
             return Err(StoreError::WrapperNotPersistable(info.key.as_storage_str()));
         }
         self.record(
@@ -702,9 +703,8 @@ impl GrantStore {
         .await
     }
 
-    /// Record a command-key **reject** grant at `scope` — the allow
-    /// recorder's mirror. Same `Once`/wrapper rules (a wrapper is never
-    /// persistable in either polarity). Clears any standing **allow** for
+    /// Record a command-shape **reject** grant at `scope` — the allow
+    /// recorder's mirror. Same `Once`/non-persistable rules. Clears any standing **allow** for
     /// this key across every reachable scope first, then writes the reject.
     pub async fn record_command_reject(
         &self,
@@ -714,7 +714,7 @@ impl GrantStore {
         if scope == Scope::Once {
             return Err(StoreError::OnceNotPersistable);
         }
-        if info.wrapper {
+        if info.wrapper || info.execution_bearing_option {
             return Err(StoreError::WrapperNotPersistable(info.key.as_storage_str()));
         }
         self.record(
@@ -1396,7 +1396,7 @@ pub fn project_approvals_dir(root: &Path) -> Option<PathBuf> {
 /// every persisted entry — not just commands and paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedGrantKind {
-    /// A command-key grant (`commands` set).
+    /// A command-shape grant (`commands` set).
     Command,
     /// A path grant (`paths` set).
     Path,
@@ -1420,6 +1420,34 @@ impl ManagedGrantKind {
             ManagedGrantKind::LoopReject => "Loop always-reject",
         }
     }
+}
+
+#[derive(Deserialize)]
+struct StoredCommandShape {
+    program: String,
+    subcommand: Option<String>,
+    options: BTreeSet<String>,
+}
+
+/// Convert a versioned command storage key into the non-secret shape the user
+/// approved. Legacy keys remain readable so they can be removed, but never
+/// match at authorization time.
+fn command_shape_display(storage: &str) -> String {
+    let Some(json) = storage.strip_prefix("v2:") else {
+        return storage.to_string();
+    };
+    let Ok(shape) = serde_json::from_str::<StoredCommandShape>(json) else {
+        return storage.to_string();
+    };
+    let mut display = match shape.subcommand {
+        Some(subcommand) => format!("{} {}", shape.program, subcommand),
+        None => shape.program,
+    };
+    if !shape.options.is_empty() {
+        display.push(' ');
+        display.push_str(&shape.options.into_iter().collect::<Vec<_>>().join(" "));
+    }
+    display
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1496,9 +1524,10 @@ pub fn list_managed_grants(dir: &Path) -> ManagedGrants {
             .commands
             .into_iter()
             .filter_map(|(key, record)| {
-                record
-                    .tier()
-                    .map(|risk_tier| ManagedCommandGrant { key, risk_tier })
+                record.tier().map(|risk_tier| ManagedCommandGrant {
+                    key: command_shape_display(&key),
+                    risk_tier,
+                })
             })
             .collect(),
         paths: file
@@ -1523,7 +1552,18 @@ pub fn list_managed_grants(dir: &Path) -> ManagedGrants {
 pub fn delete_managed_grant(dir: &Path, kind: ManagedGrantKind, key: &str) -> Result<bool> {
     let mut file = load_approvals(dir).unwrap_or_default();
     let removed = match kind {
-        ManagedGrantKind::Command => file.commands.remove(key).is_some(),
+        ManagedGrantKind::Command => {
+            if file.commands.remove(key).is_some() {
+                true
+            } else {
+                let stored = file
+                    .commands
+                    .keys()
+                    .find(|stored| command_shape_display(stored) == key)
+                    .cloned();
+                stored.is_some_and(|stored| file.commands.remove(&stored).is_some())
+            }
+        }
         ManagedGrantKind::Path => file.paths.remove(key).is_some(),
         ManagedGrantKind::McpTool => file.mcp_tools.remove(key),
         ManagedGrantKind::LoopAccept => file.loop_accept.remove(key),
@@ -1676,6 +1716,7 @@ mod tests {
         let key = ApprovalKey {
             program: program.to_string(),
             subcommand: sub.map(str::to_string),
+            option_names: std::collections::BTreeSet::new(),
         };
         SimpleCommandInfo {
             program: program.to_string(),
@@ -1684,6 +1725,7 @@ mod tests {
             args: sub.into_iter().map(str::to_string).collect(),
             key,
             wrapper,
+            execution_bearing_option: false,
             risk: Default::default(),
             span: None,
         }
@@ -1742,7 +1784,7 @@ mod tests {
         assert_eq!(
             store.command_grant(&info.key).await,
             Some(CommandGrant {
-                scope: Scope::Session,
+                scope: Scope::Project,
                 granted_tier: RiskTier::Mutating,
             })
         );
@@ -2388,13 +2430,14 @@ mod tests {
             .unwrap();
 
         let session_id = store.session_id;
+        let grant_key = cmd_info("grep", None, false).key.as_storage_str();
         let (value, sqlite_type): (i64, String) = store
             .db
             .read(move |conn| {
                 conn.query_row(
                     "SELECT granted_at, typeof(granted_at) FROM approval_grants \
-                     WHERE session_id = ?1 AND grant_kind = 'command' AND grant_key = 'grep'",
-                    [session_id.to_string()],
+                     WHERE session_id = ?1 AND grant_kind = 'command' AND grant_key = ?2",
+                    rusqlite::params![session_id.to_string(), grant_key],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(Into::into)
@@ -2786,6 +2829,7 @@ mod tests {
         let unknown = ApprovalKey {
             program: "nevergranted".into(),
             subcommand: None,
+            option_names: std::collections::BTreeSet::new(),
         };
         assert!(!store.is_command_granted(&unknown).await);
     }
@@ -3055,8 +3099,14 @@ mod tests {
             .unwrap();
         let project_dir = test_project_dir(&store).to_path_buf();
 
-        // Deleting one command leaves the other intact.
-        assert!(delete_managed_grant(&project_dir, ManagedGrantKind::Command, "gh pr").unwrap());
+        // Deleting by the readable v2 command label leaves the other intact.
+        let gh_key = list_managed_grants(&project_dir)
+            .commands
+            .into_iter()
+            .find(|grant| grant.key == "gh pr")
+            .expect("recorded grant")
+            .key;
+        assert!(delete_managed_grant(&project_dir, ManagedGrantKind::Command, &gh_key).unwrap());
         let grants = list_managed_grants(&project_dir);
         assert_eq!(
             grants.commands,
@@ -3072,6 +3122,7 @@ mod tests {
                 .is_command_granted(&ApprovalKey {
                     program: "gh".into(),
                     subcommand: Some("pr".into()),
+                    option_names: std::collections::BTreeSet::new(),
                 })
                 .await
         );
@@ -3080,6 +3131,7 @@ mod tests {
                 .is_command_granted(&ApprovalKey {
                     program: "cargo".into(),
                     subcommand: Some("build".into()),
+                    option_names: std::collections::BTreeSet::new(),
                 })
                 .await
         );
@@ -3451,7 +3503,10 @@ mod tests {
 
         // Delete the grant straight from the file, as the permissions pane does.
         let dir = test_project_dir(&store).to_path_buf();
-        assert!(delete_managed_grant(&dir, ManagedGrantKind::Command, "gh pr").unwrap());
+        assert!(
+            delete_managed_grant(&dir, ManagedGrantKind::Command, &info.key.as_display_str())
+                .unwrap()
+        );
 
         // The same store sees the deletion on its next check (no rebuild).
         assert!(!store.is_command_granted(&info.key).await);

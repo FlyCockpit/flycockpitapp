@@ -2819,6 +2819,7 @@ async fn escalate_approve_session_carries_confined_detail_and_records_scope() {
     let key = crate::approval::classify::ApprovalKey {
         program: "cat".into(),
         subcommand: None,
+        option_names: std::collections::BTreeSet::new(),
     };
     assert!(approver.store().is_command_granted(&key).await);
 }
@@ -2860,6 +2861,7 @@ async fn escalate_deny_keeps_confined_failure_and_records_no_scope() {
     let key = crate::approval::classify::ApprovalKey {
         program: "cat".into(),
         subcommand: None,
+        option_names: std::collections::BTreeSet::new(),
     };
     assert!(!approver.store().is_command_granted(&key).await);
 }

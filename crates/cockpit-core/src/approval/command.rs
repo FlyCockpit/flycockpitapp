@@ -264,6 +264,7 @@ impl Approver {
         let mut standing_reject = None;
         for info in &simple_commands {
             if !info.wrapper
+                && !info.execution_bearing_option
                 && let Some(scope) = self.store.command_reject_scope(&info.key).await
             {
                 standing_reject = Some(scope);
@@ -472,6 +473,7 @@ impl Approver {
     /// issue tier that cover this invocation.
     async fn will_prompt(&self, info: &SimpleCommandInfo, policy: &ApprovalPromptPolicy) -> bool {
         info.wrapper
+            || info.execution_bearing_option
             || !self
                 .store
                 .command_grant(&info.key)
@@ -498,6 +500,7 @@ impl Approver {
         // persistable in either polarity, so it can never carry a standing
         // reject — only non-wrappers are queried.
         if !info.wrapper
+            && !info.execution_bearing_option
             && let Some(scope) = self.store.command_reject_scope(&info.key).await
         {
             // Auto-deny with no prompt; the caller surfaces the terse guidance
@@ -507,7 +510,7 @@ impl Approver {
                 scope,
             }));
         }
-        let stored_grant = if info.wrapper {
+        let stored_grant = if info.wrapper || info.execution_bearing_option {
             None
         } else {
             self.store.command_grant(&info.key).await
@@ -526,7 +529,7 @@ impl Approver {
         // would cover (`gh pr`, `cargo build`, `ls`) — so a "remember" choice
         // records the key, not the arg-laden command line. The full command
         // rides alongside as presentational detail (`CommandDetail`).
-        let label = info.key.as_storage_str();
+        let label = info.key.as_display_str();
         let detail = command_detail(
             info,
             policy,
@@ -544,7 +547,7 @@ impl Approver {
         let choice = self
             .prompt(
                 &label,
-                info.wrapper,
+                info.wrapper || info.execution_bearing_option,
                 detail,
                 context.escalation.clone(),
                 &policy.offered_scopes,
@@ -601,7 +604,7 @@ fn out_tiered_prompt_notice(
     let reasons = display_risk_reasons(info);
     format!(
         "`{full_command}` is riskier than what you approved for `{}`\n({} vs {}): {reasons}.",
-        info.key.as_storage_str(),
+        info.key.as_display_str(),
         info.risk.tier.as_str(),
         granted_tier.as_str()
     )
@@ -665,7 +668,7 @@ mod tests {
 
         assert_eq!(
             out_tiered_prompt_notice("git push --force origin main", &info, RiskTier::Ordinary,),
-            "`git push --force origin main` is riskier than what you approved for `git push`\n(destructive vs ordinary): --force."
+            "`git push --force origin main` is riskier than what you approved for `git push --force`\n(destructive vs ordinary): --force."
         );
     }
 }

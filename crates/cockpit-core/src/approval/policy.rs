@@ -26,6 +26,7 @@ impl Approver {
         let classification = crate::approval::classify::classify(command);
         for info in classification.simple_commands() {
             if !info.wrapper
+                && !info.execution_bearing_option
                 && let Some(scope) = self.store.command_reject_scope(&info.key).await
             {
                 return Some(scope);

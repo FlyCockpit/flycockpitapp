@@ -639,7 +639,7 @@ async fn call_bash_inner(
             // nobody to ask, so fail closed rather than silently spawning.
             return Ok(ToolOutput::text(UNCONFINED_COMMAND_DENIAL).with_sandbox(meta));
         };
-        // This is the same coarse command-key approval path used elsewhere:
+        // This is the same command-shape approval path used elsewhere:
         // users can remember `cargo build`/`gh pr` at a scope instead of
         // approving every unconfined invocation while the sandbox is off.
         match approver

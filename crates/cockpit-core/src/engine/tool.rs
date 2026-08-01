@@ -1183,7 +1183,7 @@ impl ToolBox {
                 adapter.into_function().ok()
             })
             .collect();
-        Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(funcs))
+        Arc::new(crate::mcp::builtin::BuiltinRegistry::for_agent(funcs))
     }
 
     pub(crate) fn discoverable_mcp_tool_names(&self) -> Vec<String> {

@@ -22,6 +22,108 @@ pub(crate) struct DispatchEnv<'a> {
     pub(crate) loop_guard_threshold: u32,
     pub(crate) cwd: &'a std::path::Path,
 }
+/// The authorization portion of ordinary dispatch, reused by Monty's builtin
+/// adapter. Monty is a transport, not a second tool-execution authority: a
+/// host invocation must consume the same safety gate, standing rejects,
+/// review cage, and repeat budget as a model-issued native call.
+pub(crate) async fn authorize_monty_native_call(
+    tool: &dyn crate::engine::tool::Tool,
+    args: &Value,
+    ctx: &crate::engine::tool::ToolCtx,
+) -> Result<MontyNativeAuthorization> {
+    let fallback_events;
+    let tx = if let Some(events) = ctx.events.as_ref() {
+        events
+    } else {
+        let (events, _receiver) = mpsc::channel(8);
+        fallback_events = events;
+        &fallback_events
+    };
+
+    match safety_gate_decision(tool.name(), args, ctx, tx).await {
+        GateOutcome::Run { .. } => {}
+        GateOutcome::Parked => return Err(crate::engine::interrupt::InterruptParked.into()),
+        GateOutcome::Block(block) => {
+            return Ok(MontyNativeAuthorization::Denied(serde_json::json!({
+                "denied": true,
+                "kind": "authorization_blocked",
+                "tool": tool.name(),
+                "message": block.message,
+            })));
+        }
+    }
+
+    if let Some(cage) = ctx.review_cage.as_ref()
+        && let Err(error) = cage.allow_dispatch(tool.name())
+    {
+        return Ok(MontyNativeAuthorization::Denied(serde_json::json!({
+            "denied": true,
+            "kind": "review_cage_denied",
+            "tool": tool.name(),
+            "message": error.to_string(),
+        })));
+    }
+
+    if let Some(approver) = ctx.approver.as_ref() {
+        let signature = crate::approval::store::GrantStore::loop_signature(tool.name(), args);
+        let consecutive = ctx.session.bump_consecutive_call(&signature);
+        let threshold = ctx.config.extended().loop_guard.effective_threshold();
+        if consecutive >= threshold {
+            let interactive = ctx.interrupts.is_interactive_attached();
+            if !approver
+                .approve_repeat(tool.name(), args, interactive)
+                .await?
+                .is_accept()
+            {
+                let available: Vec<&str> = ctx.available_tools.iter().map(String::as_str).collect();
+                return Ok(MontyNativeAuthorization::Denied(serde_json::json!({
+                    "denied": true,
+                    "kind": "loop_guard_denied",
+                    "tool": tool.name(),
+                    "message": loop_guard_message(tool.name(), args, consecutive, &available),
+                })));
+            }
+        }
+    }
+
+    if !crate::engine::tool::tool_requires_permission(tool) {
+        return Ok(MontyNativeAuthorization::Allowed);
+    }
+
+    let label = format!("`{}` via cockpit MCP {}", tool.name(), args);
+    let decision = if let Some(approver) = ctx.approver.as_ref() {
+        approver
+            .authorize(crate::approval::AuthorizationRequest::NativeTool { label: &label })
+            .await?
+    } else {
+        crate::approval::Decision::NoninteractiveDeny
+    };
+    let denied = match decision {
+        crate::approval::Decision::Allow { .. } => return Ok(MontyNativeAuthorization::Allowed),
+        crate::approval::Decision::Deny => {
+            ("approval_denied", "native tool call denied".to_string())
+        }
+        crate::approval::Decision::StandingReject { scope } => (
+            "approval_denied",
+            crate::approval::standing_reject_refusal(tool.name(), scope),
+        ),
+        crate::approval::Decision::NoninteractiveDeny => (
+            "approval_noninteractive_denied",
+            crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+        ),
+    };
+    Ok(MontyNativeAuthorization::Denied(serde_json::json!({
+        "denied": true,
+        "kind": denied.0,
+        "tool": tool.name(),
+        "message": denied.1,
+    })))
+}
+
+pub(crate) enum MontyNativeAuthorization {
+    Allowed,
+    Denied(Value),
+}
 
 pub(crate) async fn execute_ordinary_call(
     env: &DispatchEnv<'_>,

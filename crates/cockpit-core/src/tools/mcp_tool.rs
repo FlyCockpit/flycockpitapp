@@ -6,8 +6,9 @@
 //! `mcp.grep_tool_names(regex)`, `mcp.grep_tool_definitions(regex)`,
 //! `mcp.describe(server, tool)`, and `mcp.invoke(server, tool, args)`.
 //! The script's final value is returned as JSON. If the script returns
-//! `None`, captured `print(...)` output is returned as a fallback. The sandbox
-//! has no filesystem, network, or env access.
+//! `None`, captured `print(...)` output is returned as a fallback. The VM has no direct
+//! filesystem, network, or environment access; host functions remain subject to the same
+//! authorization as native tool calls.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -31,8 +32,8 @@ const DEFENSIVE_DESCRIPTION: &str = "Execute a Python script in an isolated sand
      expression for the value you want back, for example `hits = mcp.search(\"calendar\")` then \
      `hits`. For batch invokes, wrap each `mcp.invoke` in try/except and collect per-item \
      `{ok|err}` results so one failure does not abort the loop. If the script returns `None`, \
-     printed output is captured and returned as a fallback. The sandbox has no filesystem, \
-     network, or environment access.";
+     printed output is captured and returned as a fallback. The VM has no direct filesystem, \
+     network, or environment access; every host function remains subject to the same authorization as a native tool call.";
 
 pub(crate) async fn turn_start_advert_message(
     _toolbox: &ToolBox,

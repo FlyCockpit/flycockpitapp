@@ -685,6 +685,15 @@ impl BuiltinRegistry {
         Self::new(funcs)
     }
 
+    /// Build the host-function registry for one agent. The caller has
+    /// already selected every native tool this agent may reach; do not add
+    /// global tool defaults here or Monty becomes an authorization bypass.
+    pub fn for_agent(mut native_tools: Vec<BuiltinFunction>) -> Self {
+        let mut funcs = control_functions();
+        funcs.append(&mut native_tools);
+        Self::new(funcs)
+    }
+
     fn iter(&self) -> impl Iterator<Item = &BuiltinFunction> {
         self.funcs.values()
     }
@@ -808,8 +817,8 @@ fn default_registry() -> Arc<BuiltinRegistry> {
         .clone()
 }
 
-fn default_functions() -> Vec<BuiltinFunction> {
-    let mut funcs = vec![
+fn control_functions() -> Vec<BuiltinFunction> {
+    let funcs = vec![
         BuiltinFunction::new(
             "rename_session",
             "Set an auto-generated session title when this session needs one",
@@ -871,6 +880,11 @@ fn default_functions() -> Vec<BuiltinFunction> {
             Arc::new(set_sealed_value),
         ),
     ];
+    funcs
+}
+
+fn default_functions() -> Vec<BuiltinFunction> {
+    let mut funcs = control_functions();
     for tool in [
         Arc::new(crate::tools::session_search::SessionSearchTool) as Arc<dyn Tool>,
         Arc::new(crate::tools::session_read::SessionReadTool),
@@ -1018,41 +1032,16 @@ async fn invoke_native_tool(ctx: &HostContext, tool: Arc<dyn Tool>, args: Value)
         .native_tool_ctx
         .clone()
         .context("native Monty tool requires a live tool context")?;
-    if tool_requires_permission(tool.as_ref()) {
-        let label = format!("`{}` via cockpit MCP", tool.name());
-        let decision = if let Some(approver) = tool_ctx.approver.as_ref() {
-            approver
-                .authorize(crate::approval::AuthorizationRequest::NativeTool { label: &label })
-                .await?
-        } else {
-            crate::approval::Decision::NoninteractiveDeny
-        };
-        match decision {
-            crate::approval::Decision::Allow { .. } => {}
-            crate::approval::Decision::Deny => {
-                return Ok(serde_json::json!({
-                    "denied": true,
-                    "kind": "approval_denied",
-                    "tool": tool.name(),
-                    "message": "native tool call denied"
-                }));
-            }
-            crate::approval::Decision::StandingReject { scope } => {
-                return Ok(serde_json::json!({
-                    "denied": true,
-                    "kind": "approval_denied",
-                    "tool": tool.name(),
-                    "message": crate::approval::standing_reject_refusal(tool.name(), scope)
-                }));
-            }
-            crate::approval::Decision::NoninteractiveDeny => {
-                return Ok(serde_json::json!({
-                    "denied": true,
-                    "kind": "approval_noninteractive_denied",
-                    "tool": tool.name(),
-                    "message": crate::approval::NONINTERACTIVE_RUN_DENIAL
-                }));
-            }
+    match crate::engine::agent::tool_dispatch::authorize_monty_native_call(
+        tool.as_ref(),
+        &args,
+        &tool_ctx,
+    )
+    .await?
+    {
+        crate::engine::agent::tool_dispatch::MontyNativeAuthorization::Allowed => {}
+        crate::engine::agent::tool_dispatch::MontyNativeAuthorization::Denied(value) => {
+            return Ok(value);
         }
     }
 
@@ -2299,6 +2288,94 @@ mod tests {
         assert_gated_builtin_returns_availability_reason_not_suggestion().await;
     }
 
+    #[test]
+    fn monty_registry_respects_agent_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let denied_registry = crate::engine::tool::ToolBox::new().mcp_builtin_registry();
+        let denied = HostContext::from_tool_ctx(&crate::tools::common::test_ctx(tmp.path()))
+            .with_builtin_registry(denied_registry);
+        assert!(describe(&denied, "session_read").is_err());
+        assert!(search(&denied, "session_read").is_empty());
+
+        let allowed_registry = crate::engine::tool::ToolBox::new()
+            .with(Arc::new(crate::tools::session_read::SessionReadTool))
+            .mcp_builtin_registry();
+        let allowed = HostContext::from_tool_ctx(&crate::tools::common::test_ctx(tmp.path()))
+            .with_builtin_registry(allowed_registry);
+        assert!(describe(&allowed, "session_read").is_ok());
+    }
+
+    #[tokio::test]
+    async fn monty_invoke_uses_full_dispatch_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = Arc::new(MontyAdapterTool::new("bash", "must not run"));
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+        let host = HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool));
+
+        let out = invoke(
+            &host,
+            "bash",
+            serde_json::json!({ "command": "echo blocked" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["kind"], "review_cage_denied");
+    }
+
+    #[tokio::test]
+    async fn standing_reject_blocks_monty_invoke() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = Arc::new(MontyAdapterTool::new("bash", "must not run"));
+        let seen = tool.seen_ctx.clone();
+        let (ctx, _db, _hub) = approvable_ctx(tmp.path());
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Auto);
+        let classification = crate::approval::classify::classify("gh pr create");
+        let info = classification.simple_commands().first().unwrap();
+        ctx.approver
+            .as_ref()
+            .unwrap()
+            .store()
+            .record_command_reject(info, crate::approval::store::Scope::Session)
+            .await
+            .unwrap();
+        let host = HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool));
+
+        let out = crate::mcp::sandbox::run_with_host(
+            "prefix = 'ba'\nname = prefix + 'sh'\nmcp.invoke('cockpit', name, {'command': 'gh pr create'})",
+            &crate::mcp::config::McpConfig::default(),
+            &host,
+        )
+        .await
+        .unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["denied"], true, "{value}");
+        assert_eq!(value["kind"], "authorization_blocked", "{value}");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn monty_invocations_count_against_loop_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = Arc::new(MontyAdapterTool::new("repeat_probe", "ok"));
+        let (mut ctx, _db, _hub) = approvable_ctx(tmp.path());
+        // The production guard must reject a repeat without parking when no
+        // interactive client can answer. Make that condition explicit here:
+        // `approvable_ctx` otherwise models an attached client for the tests
+        // that exercise approval/resume.
+        ctx.interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+        let args = serde_json::json!({ "text": "same" });
+        let host = HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool));
+
+        assert_eq!(
+            invoke(&host, "repeat_probe", args.clone()).await.unwrap(),
+            Value::String("ok".to_string())
+        );
+        let blocked = invoke(&host, "repeat_probe", args).await.unwrap();
+        assert_eq!(blocked["denied"], true);
+        assert_eq!(blocked["kind"], "loop_guard_denied");
+    }
     #[tokio::test(start_paused = true)]
     async fn monty_adapter_native_tool_invoke_uses_dispatch_timeout() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2442,7 +2519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monty_adapter_in_script_approval_blocks_and_resumes_with_native_identity() {
+    async fn monty_approval_label_includes_arguments() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = Arc::new(MontyAdapterTool::new("mutating_probe", "approved output").mutating());
         let (ctx, db, hub) = approvable_ctx(tmp.path());
@@ -2481,7 +2558,11 @@ mod tests {
             "{}",
             row.description
         );
-        assert!(!row.description.contains("mcp"), "{}", row.description);
+        assert!(
+            row.description.contains("via cockpit MCP {}"),
+            "{}",
+            row.description
+        );
         let questions = row.questions.as_ref().expect("approval questions");
         let question = questions.questions.first().expect("approval question");
         let crate::daemon::proto::InterruptQuestion::Single {
@@ -2494,7 +2575,7 @@ mod tests {
             panic!("approval must be a single-choice prompt");
         };
         assert!(prompt.contains("mutating_probe"), "{prompt}");
-        assert!(!prompt.contains("mcp"), "{prompt}");
+        assert!(prompt.contains("via cockpit MCP {}"), "{prompt}");
         assert!(*permission);
         assert!(
             options

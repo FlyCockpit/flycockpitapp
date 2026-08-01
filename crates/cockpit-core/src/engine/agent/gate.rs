@@ -460,10 +460,14 @@ async fn escalate_gated_call(
 
     let decision = if tool == "bash" {
         let command = args.get("command").and_then(Value::as_str).unwrap_or("");
-        approver.approve_command(command).await
+        approver
+            .authorize(crate::approval::AuthorizationRequest::Command { command })
+            .await
     } else {
         let label = format!("{tool} {}", gate_payload(tool, args));
-        approver.approve_tool_call(&label).await
+        approver
+            .authorize(crate::approval::AuthorizationRequest::NativeTool { label: &label })
+            .await
     };
     match decision {
         Ok(crate::approval::Decision::Allow { .. }) => GateApproval::Allow,

@@ -1851,34 +1851,41 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        crate::config::trust::clear_runtime_policy_for_tests();
-
-        let db = Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), project.path().to_path_buf(), "builder")
-                .unwrap();
-        let store = GrantStore::new(
-            db,
-            session.id,
-            project.path().to_path_buf(),
-            SessionConfigHandle::from_disk_for_tests(project.path()),
-        );
-        let project_dir = project_approvals_dir(project.path()).unwrap();
-        assert_eq!(
-            store.project_approvals_dir.as_deref(),
-            Some(project_dir.as_path())
-        );
-
-        let info = cmd_info("gh", Some("pr"), false);
-        store
-            .record_command(&info, info.risk.tier, Scope::Project)
-            .await
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(project.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let db = Db::open_in_memory().unwrap();
+            let session = crate::session::Session::create(
+                db.clone(),
+                project.path().to_path_buf(),
+                "builder",
+            )
             .unwrap();
+            let store = GrantStore::new(
+                db,
+                session.id,
+                project.path().to_path_buf(),
+                SessionConfigHandle::from_disk_for_tests(project.path()),
+            );
+            let project_dir = project_approvals_dir(project.path()).unwrap();
+            assert_eq!(
+                store.project_approvals_dir.as_deref(),
+                Some(project_dir.as_path())
+            );
 
-        assert!(project_dir.join(APPROVALS_FILE).exists());
-        assert!(!project.path().join(".cockpit/approvals.json").exists());
-        assert!(!project_dir.starts_with(project.path()));
-        crate::config::trust::clear_runtime_policy_for_tests();
+            let info = cmd_info("gh", Some("pr"), false);
+            store
+                .record_command(&info, info.risk.tier, Scope::Project)
+                .await
+                .unwrap();
+
+            assert!(project_dir.join(APPROVALS_FILE).exists());
+            assert!(!project.path().join(".cockpit/approvals.json").exists());
+            assert!(!project_dir.starts_with(project.path()));
+        })
+        .await;
     }
 
     #[tokio::test]

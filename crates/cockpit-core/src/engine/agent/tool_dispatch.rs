@@ -430,7 +430,9 @@ pub(crate) async fn execute_ordinary_call(
         {
             let label = format!("`{resolved_name}` in /btw side conversation");
             let decision = if let Some(approver) = env.ctx.approver.as_ref() {
-                approver.approve_tool_call(&label).await?
+                approver
+                    .authorize(crate::approval::AuthorizationRequest::NativeTool { label: &label })
+                    .await?
             } else {
                 crate::approval::Decision::NoninteractiveDeny
             };

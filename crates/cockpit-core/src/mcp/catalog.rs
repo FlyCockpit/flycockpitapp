@@ -338,7 +338,9 @@ async fn approve_external_mcp_tool(
     let Some(approver) = tool_ctx.approver.as_ref() else {
         return Ok(crate::approval::Decision::NoninteractiveDeny);
     };
-    approver.approve_mcp_tool(server, tool).await
+    approver
+        .authorize(crate::approval::AuthorizationRequest::ExternalMcpTool { server, tool })
+        .await
 }
 
 fn mcp_tool_denial(server: &str, tool: &str, noninteractive: bool) -> Value {

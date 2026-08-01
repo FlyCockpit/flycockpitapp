@@ -1021,7 +1021,9 @@ async fn invoke_native_tool(ctx: &HostContext, tool: Arc<dyn Tool>, args: Value)
     if tool_requires_permission(tool.as_ref()) {
         let label = format!("`{}` via cockpit MCP", tool.name());
         let decision = if let Some(approver) = tool_ctx.approver.as_ref() {
-            approver.approve_tool_call(&label).await?
+            approver
+                .authorize(crate::approval::AuthorizationRequest::NativeTool { label: &label })
+                .await?
         } else {
             crate::approval::Decision::NoninteractiveDeny
         };

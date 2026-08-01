@@ -33,7 +33,8 @@ impl Approver {
     /// Empty/unparseable input is never auto-allowed — it returns `Deny`
     /// (the caller surfaces the parse error).
     pub async fn approve_command(&self, command: &str) -> Result<Decision> {
-        self.approve_command_inner(command, None).await
+        self.authorize(AuthorizationRequest::Command { command })
+            .await
     }
 
     /// Like [`Self::approve_command`], but for the `bash` run-fail-escalate
@@ -71,7 +72,11 @@ impl Approver {
             suggested_access: None,
             denial,
         };
-        self.approve_command_inner(command, Some(escalation)).await
+        self.authorize(AuthorizationRequest::EscalatedCommand {
+            command,
+            escalation,
+        })
+        .await
     }
 
     /// Decide the explicit `escalate` tool's human prompt. When the agent
@@ -224,20 +229,17 @@ impl Approver {
     /// The shared command-approval core. `escalation` is `Some` only on the
     /// run-fail-escalate path; it rides on the first prompting constituent's
     /// prompt so the dialog renders the distinct escalation variant once.
-    async fn approve_command_inner(
+    pub(super) async fn approve_command_inner(
         &self,
         command: &str,
         escalation: Option<SandboxEscalation>,
     ) -> Result<Decision> {
-        if let Some(decision) = self.approve_shell_write_targets(command).await? {
-            return Ok(decision);
-        }
-
         let classification = classify::classify(command);
-        let mut simple_commands = match &classification {
+        let (mut simple_commands, compound) = match &classification {
             Classification::Parsed {
-                simple_commands, ..
-            } => simple_commands.clone(),
+                simple_commands,
+                compound,
+            } => (simple_commands.clone(), *compound),
             // Nothing to run / can't reason about it → deny, don't guess.
             Classification::Empty | Classification::Unparseable(_) => return Ok(Decision::Deny),
         };
@@ -289,7 +291,7 @@ impl Approver {
         // "M = constituents that actually trigger a prompt".
         let mut prompting: Vec<(&SimpleCommandInfo, &ApprovalPromptPolicy)> = Vec::new();
         for (info, policy) in simple_commands.iter().zip(policies.iter()) {
-            if self.will_prompt(info, policy).await {
+            if compound || self.will_prompt(info, policy).await {
                 prompting.push((info, policy));
             }
         }
@@ -311,7 +313,7 @@ impl Approver {
                 DecisionSource::AlreadyGranted,
             )
             .await;
-            return Ok(decision);
+            return self.finish_command_approval(command, decision).await;
         }
 
         // A prompt is required for at least one constituent. The offered
@@ -328,7 +330,7 @@ impl Approver {
         let mut step: u32 = 0;
         for (idx, info) in simple_commands.iter().enumerate() {
             let policy = &policies[idx];
-            let prompts = self.will_prompt(info, policy).await;
+            let prompts = compound || self.will_prompt(info, policy).await;
             if prompts {
                 step += 1;
             }
@@ -346,7 +348,9 @@ impl Approver {
                 escalation: esc,
                 batch_count: (prompts && step == 1).then_some(batch_count).flatten(),
             };
-            let step_decision = self.approve_one(info, policy, command, &context).await?;
+            let step_decision = self
+                .approve_one(info, policy, command, &context, compound)
+                .await?;
             if matches!(step_decision, CommandStepDecision::ApproveAllOnce) {
                 let decision = Decision::Allow { scope: Scope::Once };
                 self.record_permission_decision_with_audit(
@@ -358,7 +362,7 @@ impl Approver {
                     Some(audit),
                 )
                 .await;
-                return Ok(decision);
+                return self.finish_command_approval(command, decision).await;
             }
             let CommandStepDecision::Decision(decision) = step_decision else {
                 unreachable!()
@@ -396,7 +400,30 @@ impl Approver {
             Some(audit),
         )
         .await;
-        Ok(decision)
+        self.finish_command_approval(command, decision).await
+    }
+
+    // Redirect-target approval is additive to command approval. A path grant
+    // can never stand in for authorizing the program that writes to it.
+    async fn finish_command_approval(
+        &self,
+        command: &str,
+        command_decision: Decision,
+    ) -> Result<Decision> {
+        match self.approve_shell_write_targets(command).await? {
+            Some(Decision::Allow { scope }) => match command_decision {
+                Decision::Allow {
+                    scope: command_scope,
+                } => Ok(Decision::Allow {
+                    scope: narrowest(command_scope, scope),
+                }),
+                Decision::Deny | Decision::StandingReject { .. } | Decision::NoninteractiveDeny => {
+                    unreachable!("only allowed command decisions reach redirect approval")
+                }
+            },
+            Some(decision) => Ok(decision),
+            None => Ok(command_decision),
+        }
     }
 
     async fn approve_shell_write_targets(&self, command: &str) -> Result<Option<Decision>> {
@@ -464,6 +491,7 @@ impl Approver {
         policy: &ApprovalPromptPolicy,
         full_command: &str,
         context: &CommandPromptContext,
+        force_prompt: bool,
     ) -> Result<CommandStepDecision> {
         // Standing reject short-circuit (checked before allow; the two are
         // mutually exclusive, so order is a safety belt). A wrapper is never
@@ -484,7 +512,8 @@ impl Approver {
         } else {
             self.store.command_grant(&info.key).await
         };
-        if let Some(grant) = stored_grant
+        if !force_prompt
+            && let Some(grant) = stored_grant
             && grant.scope.within(policy.max_scope)
             && info.risk.tier <= grant.granted_tier
         {

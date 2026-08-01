@@ -740,7 +740,7 @@ async fn translate_final_response(
 /// `web.provider == custom` materializes them as configured shell-command
 /// shims. Under the settled approval model, configuring that custom web command
 /// is itself the approval; do not add a custom-provider carve-out here.
-fn is_gated_tool(name: &str) -> bool {
+pub(crate) fn is_gated_tool(name: &str) -> bool {
     matches!(name, "bash" | "mcp")
 }
 

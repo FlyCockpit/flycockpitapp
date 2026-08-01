@@ -642,7 +642,10 @@ async fn call_bash_inner(
         // This is the same coarse command-key approval path used elsewhere:
         // users can remember `cargo build`/`gh pr` at a scope instead of
         // approving every unconfined invocation while the sandbox is off.
-        match approver.approve_command(command).await? {
+        match approver
+            .authorize(crate::approval::AuthorizationRequest::Command { command })
+            .await?
+        {
             crate::approval::Decision::Allow { scope } => {
                 meta.approval_scope_recorded = Some(scope.as_str().to_string());
             }

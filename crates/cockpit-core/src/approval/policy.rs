@@ -151,6 +151,11 @@ impl Approver {
     /// MCP server/tool call). Returns `Allow { Once }` on approval,
     /// `Deny` on dismissal.
     pub async fn approve_tool_call(&self, label: &str) -> Result<Decision> {
+        self.authorize(AuthorizationRequest::NativeTool { label })
+            .await
+    }
+
+    pub(super) async fn approve_tool_call_inner(&self, label: &str) -> Result<Decision> {
         // `wrapper = true` makes the prompt offer only "Yes, once" — the
         // right shape for a non-persistable per-call approval. Nothing is
         // recorded; a later identical call prompts again.
@@ -193,6 +198,15 @@ impl Approver {
     /// each prompt before either records a grant; that matches command/path
     /// behavior and avoids a per-key in-flight lock.
     pub async fn approve_mcp_tool(&self, server: &str, tool: &str) -> Result<Decision> {
+        self.authorize(AuthorizationRequest::ExternalMcpTool { server, tool })
+            .await
+    }
+
+    pub(super) async fn approve_mcp_tool_inner(
+        &self,
+        server: &str,
+        tool: &str,
+    ) -> Result<Decision> {
         let target = crate::approval::store::mcp_tool_key(server, tool);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
         if let Some(scope) = self.store.mcp_tool_reject_scope(server, tool).await {

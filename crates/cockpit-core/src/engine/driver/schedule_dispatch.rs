@@ -301,7 +301,10 @@ impl Driver {
                     .to_string(),
             ));
         };
-        match approver.approve_command(command).await? {
+        match approver
+            .authorize(crate::approval::AuthorizationRequest::Command { command })
+            .await?
+        {
             crate::approval::Decision::Allow { .. } => Ok(None),
             crate::approval::Decision::NoninteractiveDeny => {
                 Ok(Some(crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string()))

@@ -471,6 +471,11 @@ impl Decomposer {
             wrapper,
             !executable.persistable,
         );
+        let substitution_sources: Vec<String> = std::iter::once(program.as_str())
+            .chain(args.iter().map(String::as_str))
+            .flat_map(command_substitutions)
+            .collect();
+
         let key = ApprovalKey {
             program: normalized_program.clone(),
             subcommand: subcommand.clone(),
@@ -493,6 +498,24 @@ impl Decomposer {
             risk,
             span,
         });
+
+        // Command substitutions execute their bodies before the outer command.
+        // Parse every statically recoverable body so grants for the outer
+        // command never authorize an embedded program.  An unparseable body
+        // remains compound and therefore still fails closed by prompting.
+        for source in substitution_sources {
+            match classify(&source) {
+                Classification::Parsed {
+                    simple_commands, ..
+                } => {
+                    self.compound = true;
+                    self.simple_commands.extend(simple_commands);
+                }
+                Classification::Empty | Classification::Unparseable(_) => {
+                    self.compound = true;
+                }
+            }
+        }
     }
 
     /// Scan prefix/suffix items: a redirect to a process-substitution, or
@@ -548,6 +571,44 @@ fn for_body(f: &ast::ForClauseCommand) -> Option<&ast::CompoundList> {
 /// safe direction.
 fn word_has_substitution(word: &str) -> bool {
     word.contains("$(") || word.contains('`')
+}
+
+/// Extract balanced $(...) bodies for recursive classification. Backticks remain
+/// compound and prompt fail-closed because decoding their shell quoting here would
+/// duplicate the parser.
+fn command_substitutions(word: &str) -> Vec<String> {
+    let bytes = word.as_bytes();
+    let mut bodies = Vec::new();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] != b'$' || bytes[index + 1] != b'(' {
+            index += 1;
+            continue;
+        }
+        let start = index + 2;
+        let mut depth = 1_u32;
+        let mut cursor = start;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        bodies.push(word[start..cursor].to_owned());
+                        index = cursor;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        if depth != 0 {
+            break;
+        }
+        index += 1;
+    }
+    bodies
 }
 
 /// Whether a suffix word reads as a clean subcommand verb rather than an
@@ -1190,9 +1251,9 @@ mod tests {
     fn command_substitution_marks_compound() {
         let c = classify("echo $(whoami)");
         assert!(matches!(c, Classification::Parsed { compound: true, .. }));
-        // The outer `echo` is still keyed; the substitution forces a
-        // prompt by marking the whole thing compound.
-        assert_eq!(keys(&c), vec!["echo"]);
+        // The outer command and each statically recoverable substitution
+        // constituent are keyed; the compound flag still forces prompts.
+        assert_eq!(keys(&c), vec!["echo", "whoami"]);
     }
 
     #[test]

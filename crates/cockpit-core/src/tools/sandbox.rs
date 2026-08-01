@@ -292,6 +292,17 @@ fn normalize_slashes(p: &Path) -> String {
 /// Whether `path` is inside the session boundary: at/under the canonical
 /// session cwd or per-session tmp dir. `path` must already be the
 /// syscall-effective path returned by [`effective_native_path`].
+/// True when an in-workspace path targets the workspace configuration
+/// directory. Callers use this only for write authorization; reads remain silent.
+pub(crate) fn is_workspace_cockpit_path(cwd: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(cwd) else {
+        return false;
+    };
+    relative
+        .components()
+        .any(|component| component.as_os_str() == ".cockpit")
+}
+
 fn within_boundary(ctx: &ToolCtx, path: &Path) -> bool {
     path_inside_boundary(path, &ctx.cwd, ctx.session.tmp_dir().as_deref())
 }
@@ -1230,5 +1241,19 @@ mod tests {
             .find(|event| event.kind == "permission_decision")
             .expect("permission decision audit event");
         assert_eq!(event.data["source"], "headless_auto_reject");
+    }
+}
+
+#[cfg(test)]
+mod cockpit_path_tests {
+    use super::is_workspace_cockpit_path;
+
+    #[test]
+    fn cockpit_dir_traversal_is_caught() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = cwd.join(".cockpit").join("mcp.json");
+        assert!(is_workspace_cockpit_path(&cwd, &path));
+        assert!(!is_workspace_cockpit_path(&cwd, &cwd.join("src/main.rs")));
     }
 }

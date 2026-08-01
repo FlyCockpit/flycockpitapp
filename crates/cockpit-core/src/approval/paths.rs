@@ -342,10 +342,11 @@ impl Approver {
         if self.store.is_path_rejected(path).await {
             return Ok(Decision::Deny);
         }
-        if self
-            .store
-            .is_path_granted_for(path, SandboxPathAccess::ReadWrite)
-            .await
+        if !is_workspace_cockpit_path(self.store.cwd(), path)
+            && self
+                .store
+                .is_path_granted_for(path, SandboxPathAccess::ReadWrite)
+                .await
         {
             return Ok(Decision::Allow {
                 scope: Scope::Session,
@@ -596,4 +597,34 @@ mod file_write_grant_tests {
         );
         let _ = sibling;
     }
+
+    #[tokio::test]
+    async fn workspace_grant_excludes_cockpit_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver(tmp.path());
+        approver
+            .store()
+            .record_path(tmp.path(), Scope::Session, SandboxPathAccess::ReadWrite)
+            .await
+            .unwrap();
+        let target = tmp.path().join(".cockpit/mcp.json");
+        let task_approver = approver.clone();
+        let task = tokio::spawn(async move {
+            task_approver
+                .approve_file_write(&target, b"old", b"new")
+                .await
+                .unwrap()
+        });
+        resolve_next(&approver, "reject").await;
+        assert_eq!(task.await.unwrap(), Decision::Deny);
+    }
+}
+
+fn is_workspace_cockpit_path(cwd: &std::path::Path, path: &std::path::Path) -> bool {
+    let Ok(relative) = path.strip_prefix(cwd) else {
+        return false;
+    };
+    relative
+        .components()
+        .any(|component| component.as_os_str() == ".cockpit")
 }

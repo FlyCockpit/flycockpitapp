@@ -107,8 +107,18 @@ impl Tool for WriteTool {
         };
         let want_crlf = existing_before.as_deref().is_some_and(detect_crlf);
         let normalized = normalize_line_endings(content, want_crlf);
-        if let Some(previous) = existing_before.as_deref().filter(|bytes| !bytes.is_empty()) {
-            authorize_existing_write(ctx, &path, previous, normalized.as_bytes()).await?;
+        if existing_before
+            .as_deref()
+            .is_some_and(|bytes| !bytes.is_empty())
+            || crate::tools::sandbox::is_workspace_cockpit_path(&ctx.cwd, &path)
+        {
+            authorize_existing_write(
+                ctx,
+                &path,
+                existing_before.as_deref().unwrap_or_default(),
+                normalized.as_bytes(),
+            )
+            .await?;
         }
         let acquire =
             crate::tools::lock_wait::acquire_waiting(ctx, &path, self.name(), false).await?;
@@ -1500,6 +1510,21 @@ mod write_approval_regressions {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "filled");
+    }
+
+    #[tokio::test]
+    async fn cockpit_dir_creation_requires_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        ctx.session.set_approval_mode(ApprovalMode::Manual);
+        let args = serde_json::json!({"path": ".cockpit/mcp.json", "content": "{}"});
+        let err = WriteTool.call(args, &ctx).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("noninteractive run: approval auto-denied"),
+            "{err}"
+        );
+        assert!(!tmp.path().join(".cockpit/mcp.json").exists());
     }
 
     #[tokio::test]

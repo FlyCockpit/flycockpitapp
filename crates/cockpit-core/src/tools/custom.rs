@@ -13,7 +13,7 @@
 //! web tools are the exception: their model-facing descriptions stay
 //! backend-neutral even when their runtime command is Firecrawl/TinyFish/etc.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::process::Stdio;
 
 use anyhow::Result;
@@ -62,6 +62,8 @@ pub struct CustomBashTool {
     build_provenance: ToolTemplateProvenance,
     /// Stable-ordered list of placeholder names the template uses.
     params: Vec<String>,
+    // `web\.custom\.\*` is explicitly authorized by configuration itself.
+    approval_exempt: bool,
 }
 
 impl CustomBashTool {
@@ -81,6 +83,7 @@ impl CustomBashTool {
             template: tpl.command.clone(),
             build_provenance: provenance,
             params,
+            approval_exempt: matches!(name, WEBFETCH | WEBSEARCH),
         }
     }
 
@@ -132,6 +135,14 @@ impl Tool for CustomBashTool {
         &self.description
     }
 
+    fn effect(&self) -> crate::engine::tool::ToolEffect {
+        if self.approval_exempt {
+            crate::engine::tool::ToolEffect::ReadOnly
+        } else {
+            crate::engine::tool::ToolEffect::Dynamic
+        }
+    }
+
     fn parameters(&self) -> Value {
         self.build_schema()
     }
@@ -161,18 +172,81 @@ impl Tool for CustomBashTool {
             .with_output_sidecar(self.provenance_sidecar(&selected, None, false)));
         }
 
-        let params = extract_placeholders(&selected.tpl.command);
-        let mut cmd = selected.tpl.command.clone();
-        for p in &params {
-            let raw = args.get(p).and_then(Value::as_str).unwrap_or("");
-            let quoted = shell_quote(raw);
-            cmd = cmd.replace(&format!("{{{p}}}"), &quoted);
+        let cmd = render_template(&selected.tpl.command, &args)?;
+        let (session_env, scrub) = custom_tool_environment(ctx);
+        let sandbox_on =
+            ctx.session.sandbox_enabled() && crate::tools::shell_sandbox::shell_sandbox_supported();
+        let confine = match crate::tools::shell_sandbox::gate_decision(
+            sandbox_on,
+            crate::tools::shell_sandbox::sandbox_available(&ctx.cwd).await,
+        ) {
+            crate::tools::shell_sandbox::SandboxGate::Confine => true,
+            crate::tools::shell_sandbox::SandboxGate::Unconfined => false,
+            crate::tools::shell_sandbox::SandboxGate::Refuse { reason } => {
+                return Ok(ToolOutput::text(format!(
+                    "Error: the shell sandbox cannot start here ({reason}); custom tools will not run until the user turns the sandbox off explicitly"
+                )));
+            }
+        };
+
+        if custom_tool_requires_approval(confine, self.approval_exempt)
+            && !matches!(
+                ctx.session.approval_mode(),
+                crate::config::extended::ApprovalMode::Yolo
+            )
+        {
+            let Some(approver) = ctx.approver.as_ref() else {
+                return Ok(ToolOutput::text(
+                    "custom tool was not run: unconfined execution requires an attached approval client",
+                ));
+            };
+            match approver
+                .authorize(crate::approval::AuthorizationRequest::CustomTool { tool: &self.name })
+                .await?
+            {
+                crate::approval::Decision::Allow { .. } => {}
+                crate::approval::Decision::NoninteractiveDeny => {
+                    return Ok(ToolOutput::text(crate::approval::NONINTERACTIVE_RUN_DENIAL));
+                }
+                crate::approval::Decision::StandingReject { scope } => {
+                    return Ok(ToolOutput::text(crate::approval::standing_reject_refusal(
+                        &self.name, scope,
+                    )));
+                }
+                crate::approval::Decision::Deny => {
+                    return Ok(ToolOutput::text(format!(
+                        "custom tool `{}` was not run: unconfined execution was not approved",
+                        self.name
+                    )));
+                }
+            }
         }
 
-        let mut command = tokio::process::Command::new("/bin/sh");
+        let mut command = if confine {
+            crate::tools::shell_sandbox::build_sandboxed_command(
+                &cmd,
+                &ctx.cwd,
+                ctx.session.tmp_dir().as_deref(),
+                &scrub,
+                &session_env,
+                &[],
+                ctx.write_scope.as_deref(),
+            )
+            .await?
+        } else {
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .arg("-c")
+                .arg(&cmd)
+                .current_dir(&ctx.cwd)
+                .env_clear()
+                .envs(&session_env);
+            for (key, _) in &scrub {
+                command.env_remove(key);
+            }
+            command
+        };
         command
-            .arg("-c")
-            .arg(&cmd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -312,6 +386,71 @@ fn render_failure_diagnostic(
         exit_code
             .map(|code| code.to_string())
             .unwrap_or_else(|| "signal".to_string()),
+    )
+}
+
+/// Render valid template placeholders in one left-to-right pass. Emitted values
+/// are never scanned again, so a value such as `x{other}y` cannot rewrite a
+/// later placeholder.
+fn render_template(template: &str, args: &Value) -> Result<String> {
+    let mut rendered = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'{'
+            && let Some(relative_end) = template[cursor + 1..].find('}')
+        {
+            let end = cursor + relative_end + 1;
+            let name = &template[cursor + 1..end];
+            if is_ident(name) {
+                let value = args.get(name).and_then(Value::as_str).ok_or_else(|| {
+                    crate::engine::tool::invalid_input(format!(
+                        "custom tool template references unknown placeholder `{{{name}}}`"
+                    ))
+                })?;
+                rendered.push_str(&shell_quote(value));
+                cursor = end + 1;
+                continue;
+            }
+        }
+        let ch = template[cursor..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 boundary");
+        rendered.push(ch);
+        cursor += ch.len_utf8();
+    }
+    Ok(rendered)
+}
+
+fn custom_tool_requires_approval(confined: bool, approval_exempt: bool) -> bool {
+    !confined && !approval_exempt
+}
+
+/// Custom tools inherit only Cockpit's explicit session overlay. Sensitive
+/// names are removed before either the plain `env_clear` child or the sandbox
+/// builder sees them. The scrub list also clears an inherited sensitive name
+/// in zerobox's filtered child environment.
+fn custom_tool_environment(ctx: &ToolCtx) -> (HashMap<String, String>, Vec<(String, String)>) {
+    let mut env = ctx
+        .env_overlay
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let sensitive = std::env::vars()
+        .map(|(name, _)| name)
+        .chain(env.keys().cloned())
+        .filter(|name| crate::redact::env_scrub_patterns(name))
+        .collect::<BTreeSet<_>>();
+    for name in &sensitive {
+        env.remove(name);
+    }
+    (
+        env,
+        sensitive
+            .into_iter()
+            .map(|name| (name, String::new()))
+            .collect(),
     )
 }
 
@@ -464,6 +603,99 @@ mod tests {
         assert_eq!(shell_quote("hi there"), "'hi there'");
         assert_eq!(shell_quote("$(rm -rf /)"), "'$(rm -rf /)'");
         assert_eq!(shell_quote("it's a trap"), "'it'\\''s a trap'");
+    }
+
+    #[test]
+    fn substituted_value_is_not_rescanned() {
+        let command = render_template(
+            "echo {a} {b}",
+            &serde_json::json!({ "a": "x{b}y", "b": ";touch /tmp/pwned;" }),
+        )
+        .expect("template renders");
+        assert_eq!(command, "echo 'x{b}y' ';touch /tmp/pwned;'");
+        assert!(!command.contains("'x';touch"));
+    }
+
+    #[test]
+    fn metacharacters_remain_one_argument() {
+        let command = render_template(
+            "printf %s {value}",
+            &serde_json::json!({ "value": "a; echo injected $(id)" }),
+        )
+        .expect("template renders");
+        assert_eq!(command, "printf %s 'a; echo injected $(id)'");
+    }
+
+    #[test]
+    fn repeated_placeholder_substitutes_everywhere() {
+        let command = render_template(
+            "printf '%s:%s' {value} {value}",
+            &serde_json::json!({ "value": "same value" }),
+        )
+        .expect("template renders");
+        assert_eq!(command, "printf '%s:%s' 'same value' 'same value'");
+    }
+
+    #[test]
+    fn empty_value_is_inert() {
+        let command = render_template("printf '<%s>' {value}", &serde_json::json!({ "value": "" }))
+            .expect("template renders");
+        assert_eq!(command, "printf '<%s>' ''");
+    }
+
+    #[test]
+    fn unknown_placeholder_is_an_error() {
+        let error = render_template("echo {missing}", &serde_json::json!({})).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown placeholder `{missing}`")
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfined_custom_tool_requires_grant_or_ask() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let tpl = ToolCommandTemplate {
+            enabled: true,
+            command: "printf should-not-run".into(),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            "configured-shell",
+            &tpl,
+            ToolTemplateProvenance::Configured {
+                source: "test".into(),
+            },
+        );
+        let out = tool.call(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(out.content.contains("requires an attached approval client"));
+    }
+
+    #[test]
+    fn confined_custom_tool_is_not_gated() {
+        assert!(!custom_tool_requires_approval(true, false));
+    }
+
+    #[tokio::test]
+    async fn custom_web_provider_is_never_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let tpl = ToolCommandTemplate {
+            enabled: true,
+            command: "printf configured-web-ran".into(),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            WEBSEARCH,
+            &tpl,
+            ToolTemplateProvenance::Configured {
+                source: "web.custom.search_command".into(),
+            },
+        );
+        let out = tool.call(serde_json::json!({}), &ctx).await.unwrap();
+        assert_eq!(out.content, "configured-web-ran");
     }
 
     #[test]
@@ -638,10 +870,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_tool_env_is_cleared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let ctx = crate::tools::common::test_ctx(cwd);
+        {
+            let mut env = ctx.env_overlay.write().unwrap();
+            env.insert("OPENAI_API_KEY".to_string(), "should-not-leak".to_string());
+            env.insert("GH_TOKEN".to_string(), "should-not-leak".to_string());
+        }
+        let tpl = ToolCommandTemplate {
+            enabled: true,
+            command: format!(
+                "printf '<%s><%s>' \"{}OPENAI_API_KEY\" \"{}GH_TOKEN\"",
+                char::from(36),
+                char::from(36),
+            ),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            WEBFETCH,
+            &tpl,
+            ToolTemplateProvenance::Configured {
+                source: "web.custom.fetch_command".into(),
+            },
+        );
+        let out = tool.call(serde_json::json!({}), &ctx).await.unwrap();
+        assert_eq!(out.content, "<><>");
+    }
+
+    #[tokio::test]
     async fn custom_tool_output_is_byte_bounded() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         let ctx = crate::tools::common::test_ctx(cwd);
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
         let tpl = ToolCommandTemplate {
             enabled: true,
             command: "yes 0123456789 | head -c 1000000".into(),
@@ -667,6 +931,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         let ctx = crate::tools::common::test_ctx(cwd);
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
         let tpl = ToolCommandTemplate {
             enabled: true,
             command: "yes 0123456789 | head -c 1000000".into(),
@@ -697,6 +963,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         let ctx = crate::tools::common::test_ctx(cwd);
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
         let tpl = ToolCommandTemplate {
             enabled: true,
             command: "printf small".into(),

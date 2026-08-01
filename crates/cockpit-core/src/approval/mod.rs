@@ -212,6 +212,10 @@ pub enum AuthorizationRequest<'a> {
         server: &'a str,
         tool: &'a str,
     },
+    /// A configured shell tool, keyed by the calling agent and tool name.
+    CustomTool {
+        tool: &'a str,
+    },
 }
 
 pub struct Approver {
@@ -238,6 +242,7 @@ impl Approver {
             AuthorizationRequest::ExternalMcpTool { server, tool } => {
                 self.approve_mcp_tool_inner(server, tool).await
             }
+            AuthorizationRequest::CustomTool { tool } => self.approve_custom_tool_inner(tool).await,
         }
     }
 }

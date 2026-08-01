@@ -285,6 +285,89 @@ impl Approver {
         Ok(decision)
     }
 
+    /// Gate a configured shell tool that would otherwise run outside the
+    /// filesystem sandbox. Grants are exact `(agent, tool)` pairs; command
+    /// text and arguments never broaden the authority.
+    pub(super) async fn approve_custom_tool_inner(&self, tool: &str) -> Result<Decision> {
+        let agent = self.agent_id.as_str();
+        let target = crate::approval::store::mcp_tool_key(agent, tool);
+        let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
+        if let Some(scope) = self.store.mcp_tool_reject_scope(agent, tool).await {
+            let decision = Decision::StandingReject { scope };
+            self.record_permission_decision(
+                "custom_tool",
+                &target,
+                &offered,
+                decision,
+                DecisionSource::StandingReject,
+            )
+            .await;
+            return Ok(decision);
+        }
+        if let Some(scope) = self.store.mcp_tool_grant_scope(agent, tool).await {
+            let decision = Decision::Allow { scope };
+            self.record_permission_decision(
+                "custom_tool",
+                &target,
+                &offered,
+                decision,
+                DecisionSource::AlreadyGranted,
+            )
+            .await;
+            return Ok(decision);
+        }
+
+        let prompt = format!(
+            "Configured custom tool `{tool}` for agent `{agent}` wants to run outside Cockpit\x27s sandbox."
+        );
+        let question = approval_question(
+            &target,
+            false,
+            GrantKind::McpTool,
+            Some(&prompt),
+            None,
+            None,
+            &offered,
+            None,
+        );
+        let set = approval_option_set("custom_tool_approval", false, &offered, None);
+        let choice = self
+            .raise_and_decode(&prompt, question, |response| {
+                response_to_approval_choice(response, &set)
+            })
+            .await?;
+        let decision = match choice {
+            ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
+            ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
+            ApprovalChoice::Approve(scope) => {
+                if let Err(e) = self.store.record_mcp_tool(agent, tool, scope).await {
+                    tracing::warn!(error = %e, agent, tool, ?scope, "recording custom tool grant failed; applying once");
+                    Decision::Allow { scope: Scope::Once }
+                } else {
+                    Decision::Allow { scope }
+                }
+            }
+            ApprovalChoice::Reject(scope) => {
+                if let Err(e) = self.store.record_mcp_tool_reject(agent, tool, scope).await {
+                    tracing::warn!(error = %e, agent, tool, ?scope, "recording custom tool reject failed; denying once");
+                }
+                Decision::Deny
+            }
+            ApprovalChoice::Deny
+            | ApprovalChoice::ApproveAllOnce
+            | ApprovalChoice::GrantPaths(_) => Decision::Deny,
+        };
+        self.record_permission_decision(
+            "custom_tool",
+            &target,
+            &offered,
+            decision,
+            DecisionSource::UserPrompt,
+        )
+        .await;
+        Ok(decision)
+    }
+
     /// Gate the `docs` pipeline's auto-clone of a NEW dependency package
     /// (implementation note). Docs.1 runs
     /// noninteractively, but adding/cloning a package into the registry is a

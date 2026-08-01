@@ -639,6 +639,24 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             diverged,
             generation,
         }],
+        TurnEvent::ModelSelectionResult {
+            selection_id,
+            provider,
+            model,
+            reasoning_effort,
+            thinking_mode,
+            prompt_cache_retention,
+            outcome,
+        } => vec![Event::ModelSelectionResult {
+            session_id,
+            selection_id,
+            provider,
+            model,
+            reasoning_effort,
+            thinking_mode,
+            prompt_cache_retention,
+            outcome,
+        }],
         TurnEvent::ConnectorStatus { .. } => vec![],
     }
 }

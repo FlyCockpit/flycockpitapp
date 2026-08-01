@@ -67,6 +67,16 @@ pub enum TurnEvent {
         diverged: bool,
         generation: u64,
     },
+    /// Terminal result for a client-correlated active-model selection.
+    ModelSelectionResult {
+        selection_id: uuid::Uuid,
+        provider: String,
+        model: String,
+        reasoning_effort: Option<String>,
+        thinking_mode: Option<String>,
+        prompt_cache_retention: Option<crate::config::providers::PromptCacheRetention>,
+        outcome: crate::daemon::proto::ModelSelectionOutcome,
+    },
     /// Authoritative daemon-resolved config snapshot for the attached
     /// session (`tui-config-single-source`). Delivered on attach and on every
     /// daemon re-resolution; the TUI renders from it instead of re-reading

@@ -106,6 +106,10 @@ impl App {
     }
 
     pub(super) fn open_model_picker(&mut self) {
+        self.open_model_picker_highlighting(None);
+    }
+
+    pub(super) fn open_model_picker_highlighting(&mut self, requested: Option<(&str, &str)>) {
         self.footer_selection = None;
         self.footer_agent_picker = None;
         self.footer_mode_picker = None;
@@ -118,11 +122,34 @@ impl App {
         ) {
             Ok(mut picker) => {
                 picker.set_config_drift(self.model_picker_drift());
+                if let Some((provider, model)) = requested {
+                    picker.highlight_requested_model(provider, model);
+                }
                 self.overlay = Overlay::ModelPicker(picker);
             }
             Err(e) => {
                 self.push_plain(format!("/model: {e}"));
             }
+        }
+    }
+
+    pub(super) fn open_model_picker_for_provider(&mut self, provider: &str) {
+        self.footer_selection = None;
+        self.footer_agent_picker = None;
+        self.footer_mode_picker = None;
+        match crate::tui::model_picker::ModelPickerDialog::open_for_provider_with_failures(
+            self.config_snapshot.providers.clone(),
+            provider,
+            self.launch.active_model.clone(),
+            &self.usage_models,
+            &self.auth_failure_annotations,
+            chrono::Utc::now().timestamp(),
+        ) {
+            Ok(mut picker) => {
+                picker.set_config_drift(self.model_picker_drift());
+                self.overlay = Overlay::ModelPicker(picker);
+            }
+            Err(error) => self.push_plain(format!("/model: {error}")),
         }
     }
 
@@ -307,34 +334,24 @@ impl App {
         if let Some((active, persist_as_default)) = selected {
             let provider = active.provider.clone();
             let model = active.model.clone();
-            let default_error = if persist_as_default {
-                write_active_model_preference(&self.launch.cwd, &active).err()
-            } else {
-                None
-            };
-            let selected_active = active.clone();
             self.notify_active_model_selected(
                 active,
+                persist_as_default,
                 cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
             );
-            if let Some(error) = default_error {
-                self.push_plain(format!("Selected model for this session: {provider}/{model}; default was not updated: {error}"));
-            } else if persist_as_default {
-                self.config_snapshot.providers.active_model = Some(selected_active);
-                self.push_plain(format!(
-                    "Selected model for this session and as default: {provider}/{model}"
-                ));
+            let scope = if persist_as_default {
+                " and make default"
             } else {
-                self.push_plain(format!(
-                    "Selected model for this session only: {provider}/{model}"
-                ));
-            }
+                ""
+            };
+            self.push_plain(format!("Selecting {provider}/{model}{scope}…"));
         }
     }
 
     pub(super) fn notify_active_model_selected(
         &mut self,
         active: cockpit_config::providers::ActiveModelRef,
+        persist_as_default: bool,
         trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
     ) {
         let provider = active.provider.clone();
@@ -344,10 +361,46 @@ impl App {
             format!("{provider}/{model}"),
             None,
         );
-        self.send_daemon_request(
+        self.request_model_selection(
             "/model",
-            active_model_request(active, trigger),
+            active,
+            persist_as_default,
+            trigger,
             ControlApplied::None,
+        );
+    }
+
+    pub(super) fn request_model_selection(
+        &mut self,
+        label: &str,
+        active: cockpit_config::providers::ActiveModelRef,
+        persist_as_default: bool,
+        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+        applied: ControlApplied,
+    ) {
+        if !matches!(self.agent_runner.as_ref(), Some(Ok(_))) {
+            self.report_control_not_delivered(label, ControlRequestNotDelivered::NoRunner);
+            self.open_model_picker_highlighting(Some((&active.provider, &active.model)));
+            return;
+        }
+        let selection_id = uuid::Uuid::new_v4();
+        self.pending_model_selection = Some(super::PendingModelSelection {
+            session_id: self.launch.session_id,
+            selection_id,
+            provider: active.provider.clone(),
+            model: active.model.clone(),
+            trigger,
+            minimum_generation: self.active_model_state_generation,
+            started_at: std::time::Instant::now(),
+            queued_submission: None,
+        });
+        self.send_daemon_request(
+            label,
+            active_model_request(selection_id, active, persist_as_default, trigger),
+            match applied {
+                ControlApplied::None => ControlApplied::ModelSelection { selection_id },
+                other => other,
+            },
         );
     }
 
@@ -362,9 +415,10 @@ impl App {
                 let model = active.model.clone();
                 self.notify_active_model_selected(
                     active,
+                    false,
                     cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Cycle,
                 );
-                self.push_plain(format!("/model: active model is now {provider}/{model} ★"));
+                self.push_plain(format!("/model: selecting {provider}/{model} ★"));
             }
             Ok(None) => {
                 self.push_plain(
@@ -466,20 +520,13 @@ impl App {
                 return;
             };
             active.prompt_cache_retention = (!retention.is_default()).then_some(retention);
-            match write_active_model_preference(&self.launch.cwd, &active) {
-                Ok(()) => {
-                    self.config_snapshot.providers.active_model = Some(active.clone());
-                    self.send_daemon_request(
-                        "/quick",
-                        active_model_request(
-                            active,
-                            cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
-                        ),
-                        ControlApplied::None,
-                    );
-                }
-                Err(error) => self.push_plain(format!("/quick: {error}")),
-            }
+            self.request_model_selection(
+                "/quick",
+                active,
+                true,
+                cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+                ControlApplied::None,
+            );
         }
         if let Some((provider, model)) = commit.active_model {
             self.record_usage(
@@ -487,18 +534,17 @@ impl App {
                 format!("{provider}/{model}"),
                 None,
             );
-            self.send_daemon_request(
+            self.request_model_selection(
                 "/quick",
-                active_model_request(
-                    cockpit_config::providers::ActiveModelRef {
-                        provider: provider.clone(),
-                        model: model.clone(),
-                        reasoning_effort: None,
-                        thinking_mode: None,
-                        prompt_cache_retention: None,
-                    },
-                    cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
-                ),
+                cockpit_config::providers::ActiveModelRef {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                    prompt_cache_retention: None,
+                },
+                true,
+                cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
                 ControlApplied::QuickActiveModel { provider, model },
             );
         }
@@ -561,7 +607,16 @@ impl App {
             req,
         );
         if let Err(reason) = result {
-            self.pending_control_requests.remove(&request_id);
+            let pending = self.pending_control_requests.remove(&request_id);
+            if let Some(PendingControlRequest {
+                applied: ControlApplied::ModelSelection { selection_id },
+                ..
+            }) = pending
+                && let Some((provider, model)) =
+                    self.clear_pending_model_selection(Some(selection_id))
+            {
+                self.open_model_picker_highlighting(Some((&provider, &model)));
+            }
             self.report_control_not_delivered(label, reason);
         }
     }
@@ -574,21 +629,46 @@ impl App {
         let Some(pending) = self.pending_control_requests.remove(&request_id) else {
             return;
         };
+        let selection_id = match pending.applied {
+            ControlApplied::ModelSelection { selection_id } => Some(selection_id),
+            _ => None,
+        };
         match outcome {
             ControlRequestOutcome::Applied => self.apply_control_success(pending.applied),
-            ControlRequestOutcome::Rejected(error) => self.push_plain(format!(
-                "{}: daemon rejected request: {error}",
-                pending.label
-            )),
+            ControlRequestOutcome::Rejected(error) => {
+                if let Some((provider, model)) = self.clear_pending_model_selection(selection_id) {
+                    self.open_model_picker_highlighting(Some((&provider, &model)));
+                }
+                self.push_plain(format!(
+                    "{}: daemon rejected request: {error}",
+                    pending.label
+                ));
+            }
             ControlRequestOutcome::NotDelivered(reason) => {
+                if let Some((provider, model)) = self.clear_pending_model_selection(selection_id) {
+                    self.open_model_picker_highlighting(Some((&provider, &model)));
+                }
                 self.report_control_not_delivered(&pending.label, reason);
             }
         }
     }
 
+    fn clear_pending_model_selection(
+        &mut self,
+        selection_id: Option<uuid::Uuid>,
+    ) -> Option<(String, String)> {
+        let pending = self.pending_model_selection.as_ref()?;
+        if Some(pending.selection_id) != selection_id {
+            return None;
+        }
+        let pending = self.pending_model_selection.take()?;
+        Some((pending.provider, pending.model))
+    }
+
     fn apply_control_success(&mut self, applied: ControlApplied) {
         match applied {
             ControlApplied::None => {}
+            ControlApplied::ModelSelection { .. } => {}
             ControlApplied::CacheBreakWarning => {
                 if let Some(warning) = self.cache_break_warning() {
                     self.push_plain(warning);
@@ -691,26 +771,17 @@ impl App {
     }
 }
 
-fn write_active_model_preference(
-    cwd: &std::path::Path,
-    active: &cockpit_config::providers::ActiveModelRef,
-) -> anyhow::Result<()> {
-    let path = cockpit_config::dirs::config_write_target_for_provider(cwd, &active.provider)
-        .or_else(|| cockpit_config::dirs::most_specific_config_write_target(cwd))
-        .ok_or_else(|| {
-            anyhow::anyhow!("no cockpit config found - run `/settings` to create one")
-        })?;
-    let mut doc = cockpit_config::providers::ConfigDoc::load(&path)?;
-    doc.write_active_model(Some(active))
-}
-
 fn active_model_request(
+    selection_id: uuid::Uuid,
     active: cockpit_config::providers::ActiveModelRef,
+    persist_as_default: bool,
     trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
 ) -> cockpit_core::daemon::proto::Request {
     cockpit_core::daemon::proto::Request::SetActiveModel {
+        selection_id,
         provider: active.provider,
         model: active.model,
+        persist_as_default,
         trigger,
         reasoning_effort: active.reasoning_effort.map(|effort| effort.value),
         thinking_mode: active.thinking_mode.and_then(|mode| {

@@ -485,6 +485,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             diverged: _,
             generation: _,
         }
+        | proto::Event::ModelSelectionResult { .. }
         | proto::Event::PreflightStarted { session_id: _ }
         | proto::Event::UserMessageRetracted { session_id: _ }
         | proto::Event::Usage {

@@ -27,6 +27,12 @@ cockpit provider-catalog-status
 cockpit models
 ```
 
+## In The TUI
+
+`/model` only chooses an already configured model for the current session. Choose **Use for this session** for a session-only switch, or **Use and make default** to persist that active model for future sessions. It never changes provider/model configuration.
+
+`/setup model` is the sole model-configuration flow. It starts with a choice to configure the confirmed session model or choose a different provider and one of that provider’s models. Choosing a current model does not switch the live session, and making a model the default remains an explicit configuration choice.
+
 ## Templates
 
 - OpenAI-compatible: generic `/v1` endpoints with `Authorization: Bearer ...`.

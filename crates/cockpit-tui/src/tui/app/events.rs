@@ -127,6 +127,7 @@ impl App {
             TurnEvent::ControlRequestFinished {
                 request_id,
                 outcome,
+                ..
             } => {
                 self.apply_control_request_outcome(request_id, outcome);
             }
@@ -257,6 +258,108 @@ impl App {
                     diverged,
                     generation,
                 );
+            }
+            TurnEvent::ModelSelectionResult {
+                selection_id,
+                provider,
+                model,
+                outcome,
+                ..
+            } => {
+                let (applied, user_message, generation, applied_state) = match &outcome {
+                    cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
+                        active_state,
+                    } => (
+                        true,
+                        None,
+                        active_state.generation,
+                        Some(active_state.clone()),
+                    ),
+                    cockpit_core::daemon::proto::ModelSelectionOutcome::Rejected {
+                        user_message,
+                        ..
+                    } => (false, Some(user_message.clone()), 0, None),
+                };
+                let matching = self
+                    .pending_model_selection
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.selection_id == selection_id
+                            && pending.session_id == self.launch.session_id
+                            // A rejection is terminal for this exact intent
+                            // even when it was emitted by the worker before a
+                            // newer state snapshot could be produced. Only an
+                            // Applied result needs a generation at least as
+                            // new as the request's confirmed baseline.
+                            && (!applied || generation >= pending.minimum_generation)
+                    });
+                let pending = matching
+                    .then(|| self.pending_model_selection.take())
+                    .flatten();
+                let requested = pending
+                    .as_ref()
+                    .map(|selection| (selection.provider.clone(), selection.model.clone()));
+                if let Some(selection) = pending.as_ref() {
+                    tracing::info!(
+                        session_id = ?selection.session_id,
+                        %selection_id,
+                        provider = %selection.provider,
+                        model = %selection.model,
+                        trigger = ?selection.trigger,
+                        generation,
+                        applied,
+                        "model selection terminal result received by tui"
+                    );
+                }
+                let queued = pending.and_then(|selection| selection.queued_submission);
+                if !matching {
+                    return;
+                }
+                if let Some(active_state) = applied_state {
+                    self.apply_active_model_state(
+                        active_state.provider,
+                        active_state.model,
+                        active_state.config_provider,
+                        active_state.config_model,
+                        active_state.diverged,
+                        active_state.generation,
+                    );
+                }
+                if !applied {
+                    self.push_plain(user_message.unwrap_or_else(|| {
+                        format!("Could not switch to `{provider}/{model}`; keeping the confirmed model active.")
+                    }));
+                    if let Some((requested_provider, requested_model)) = requested {
+                        self.open_model_picker_highlighting(Some((
+                            &requested_provider,
+                            &requested_model,
+                        )));
+                    }
+                } else if let Some(queued) = queued {
+                    tracing::info!(
+                        session_id = ?self.launch.session_id,
+                        %selection_id,
+                        provider,
+                        model,
+                        generation,
+                        "releasing queued message after model selection"
+                    );
+                    let clear_held_draft = self.composer.text() == queued.composer_text;
+                    if clear_held_draft {
+                        self.composer.clear();
+                        self.paste_registry.clear();
+                        self.at_dismissed = false;
+                        self.at_selected = 0;
+                        self.at_scroll = 0;
+                    }
+                    self.dispatch_optimistic_user_submission(
+                        queued.display,
+                        queued.submission,
+                        "engine",
+                        true,
+                        &queued.tag_expansions,
+                    );
+                }
             }
             TurnEvent::ConfigSnapshot { snapshot } => {
                 self.apply_config_snapshot(*snapshot);

@@ -16,24 +16,46 @@ use super::*;
 impl Driver {
     pub(in crate::engine::driver) async fn set_active_model_live(
         &mut self,
+        selection_id: uuid::Uuid,
         target: crate::config::providers::ActiveModelRef,
+        persist_as_default: bool,
+        deadline: Option<std::time::Instant>,
+        terminal_claimed: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
         trigger: crate::session::ModelSwitchTrigger,
         tx: &mpsc::Sender<TurnEvent>,
-    ) {
+    ) -> bool {
         let provider = target.provider.as_str();
         let model = target.model.as_str();
+        tracing::info!(
+            session_id = %self.session.id,
+            %selection_id,
+            provider,
+            model,
+            trigger = trigger.as_str(),
+            generation = self.active_model_state_generation,
+            "model selection received by driver"
+        );
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            self.emit_model_selection_result(selection_id, &target, false, terminal_claimed, tx)
+                .await;
+            return false;
+        }
         let old_session_provider = self.session.active_provider();
         let old_session_model = self.session.active_model();
         let Some(active_idx) = self.active_frame_index() else {
-            return;
+            self.emit_model_selection_result(selection_id, &target, false, terminal_claimed, tx)
+                .await;
+            return false;
         };
         let current = &self.stack[active_idx].agent.model;
         let old_llm_mode = self.stack[active_idx].agent.llm_mode;
         let old_prompt_cache_retention_preference = self.prompt_cache_retention_preference;
         self.prompt_cache_retention_preference = target.prompt_cache_retention;
         if current.provider_id() == provider && current.model_id_ref() == model {
-            if self.live_config_active_model().as_ref() != Some(&target) {
+            let mut applied = true;
+            if persist_as_default && self.live_config_active_model().as_ref() != Some(&target) {
                 if let Err(e) = self.write_active_model_config(&target) {
+                    applied = false;
                     self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
                     let _ = tx
                         .send(TurnEvent::Notice {
@@ -64,7 +86,9 @@ impl Driver {
             if self.prompt_cache_retention_override.is_some() {
                 self.emit_longcache_state(tx).await;
             }
-            return;
+            self.emit_model_selection_result(selection_id, &target, applied, terminal_claimed, tx)
+                .await;
+            return applied;
         }
         // The new model inherits the running model's shutdown gate so a daemon
         // drain still refuses its dispatch.
@@ -93,7 +117,15 @@ impl Driver {
                     })
                     .await;
                 self.emit_active_model_state(tx).await;
-                return;
+                self.emit_model_selection_result(
+                    selection_id,
+                    &target,
+                    false,
+                    terminal_claimed,
+                    tx,
+                )
+                .await;
+                return false;
             }
         };
         let llm_mode = self.effective_llm_mode_for(provider, model);
@@ -125,9 +157,23 @@ impl Driver {
                         })
                         .await;
                     self.emit_active_model_state(tx).await;
-                    return;
+                    self.emit_model_selection_result(
+                        selection_id,
+                        &target,
+                        false,
+                        terminal_claimed,
+                        tx,
+                    )
+                    .await;
+                    return false;
                 }
             };
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
+            self.emit_model_selection_result(selection_id, &target, false, terminal_claimed, tx)
+                .await;
+            return false;
+        }
         if let Err(e) = self.persist_active_model_session(provider, model) {
             let error = format!("{e:#}");
             self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
@@ -154,9 +200,11 @@ impl Driver {
                 })
                 .await;
             self.emit_active_model_state(tx).await;
-            return;
+            self.emit_model_selection_result(selection_id, &target, false, terminal_claimed, tx)
+                .await;
+            return false;
         }
-        if let Err(e) = self.write_active_model_config(&target) {
+        if persist_as_default && let Err(e) = self.write_active_model_config(&target) {
             let error = format!("{e:#}");
             self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
             if let (Some(old_provider), Some(old_model)) = (
@@ -191,7 +239,15 @@ impl Driver {
                         })
                         .await;
                     self.emit_active_model_state(tx).await;
-                    return;
+                    self.emit_model_selection_result(
+                        selection_id,
+                        &target,
+                        false,
+                        terminal_claimed,
+                        tx,
+                    )
+                    .await;
+                    return false;
                 }
             } else {
                 self.session
@@ -218,7 +274,9 @@ impl Driver {
                 })
                 .await;
             self.emit_active_model_state(tx).await;
-            return;
+            self.emit_model_selection_result(selection_id, &target, false, terminal_claimed, tx)
+                .await;
+            return false;
         }
         self.record_model_switch_audit(crate::session::ModelSwitchAudit {
             from_provider: old_session_provider.as_deref(),
@@ -244,6 +302,76 @@ impl Driver {
         if self.prompt_cache_retention_override.is_some() {
             self.emit_longcache_state(tx).await;
         }
+        self.emit_model_selection_result(selection_id, &target, true, terminal_claimed, tx)
+            .await;
+        true
+    }
+
+    async fn emit_model_selection_result(
+        &self,
+        selection_id: uuid::Uuid,
+        target: &crate::config::providers::ActiveModelRef,
+        applied: bool,
+        terminal_claimed: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        if terminal_claimed
+            .is_some_and(|claimed| claimed.swap(true, std::sync::atomic::Ordering::AcqRel))
+        {
+            return;
+        }
+        tracing::info!(
+            session_id = %self.session.id,
+            %selection_id,
+            provider = %target.provider,
+            model = %target.model,
+            generation = self.active_model_state_generation,
+            applied,
+            "model selection terminal result"
+        );
+        let _ = tx
+            .send(TurnEvent::ModelSelectionResult {
+                selection_id,
+                provider: target.provider.clone(),
+                model: target.model.clone(),
+                reasoning_effort: target
+                    .reasoning_effort
+                    .as_ref()
+                    .map(|effort| effort.value.clone()),
+                thinking_mode: target.thinking_mode.as_ref().and_then(|mode| {
+                    serde_json::to_value(mode)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_string))
+                }),
+                prompt_cache_retention: target.prompt_cache_retention,
+                outcome: if applied {
+                    crate::daemon::proto::ModelSelectionOutcome::Applied {
+                        active_state: crate::daemon::proto::ModelSelectionActiveState {
+                            provider: target.provider.clone(),
+                            model: target.model.clone(),
+                            config_provider: self
+                                .live_config_active_model()
+                                .as_ref()
+                                .map(|model| model.provider.clone()),
+                            config_model: self
+                                .live_config_active_model()
+                                .as_ref()
+                                .map(|model| model.model.clone()),
+                            diverged: self.live_config_active_model().as_ref() != Some(target),
+                            generation: self.active_model_state_generation,
+                        },
+                    }
+                } else {
+                    crate::daemon::proto::ModelSelectionOutcome::Rejected {
+                        user_message: format!(
+                            "Could not switch to `{}/{}`; keeping the confirmed model active.",
+                            target.provider, target.model
+                        ),
+                        diagnostic_code: "model_switch_rejected".to_string(),
+                    }
+                },
+            })
+            .await;
     }
 
     /// Build a fresh [`Model`](crate::engine::model::Model) for `(provider,
@@ -334,10 +462,10 @@ impl Driver {
             *model = active.model.clone();
             return Ok(());
         }
-        let path =
-            crate::config::dirs::config_write_target_for_provider(&self.cwd, &active.provider)
-                .or_else(|| crate::config::dirs::most_specific_config_write_target(&self.cwd))
-                .context("no cockpit config found — run `/settings` to create one")?;
+        // `active_model` is a cross-provider resolution default, not provider configuration.
+        // It belongs in the canonical config layer, never a provider sidecar.
+        let path = crate::config::dirs::most_specific_config_write_target(&self.cwd)
+            .context("no cockpit config found — run `/settings` to create one")?;
         let mut doc = crate::config::providers::ConfigDoc::load(&path)?;
         doc.write_active_model(Some(active))
     }

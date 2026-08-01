@@ -167,7 +167,9 @@ fn help_lines(inner_width: u16) -> Vec<Line<'static>> {
         &mut lines,
         Line::from(vec![
             Span::styled("/setup", command),
-            Span::raw(" opens provider and workspace setup wizards."),
+            Span::raw(
+                " lists provider, model-configuration, and workspace setup wizards; use /setup model to configure models.",
+            ),
         ]),
         width,
     );

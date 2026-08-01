@@ -16,6 +16,30 @@ const CLASS_PROVIDER_NOT_CONFIGURED: &str = "provider_not_configured";
 const CLASS_PROVIDER_RATE_LIMIT: &str = "provider_rate_limit";
 const DEFAULT_MISSING_TOOL_FEATURE: &str = "client_side_tools";
 
+/// Authoritative active-model state embedded in a completed selection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelSelectionActiveState {
+    pub provider: String,
+    pub model: String,
+    pub config_provider: Option<String>,
+    pub config_model: Option<String>,
+    pub diverged: bool,
+    pub generation: u64,
+}
+
+/// Explicit terminal outcome for a client-correlated model selection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ModelSelectionOutcome {
+    Applied {
+        active_state: ModelSelectionActiveState,
+    },
+    Rejected {
+        user_message: String,
+        diagnostic_code: String,
+    },
+}
+
 /// Why a turn's inference failed.
 ///
 /// The flat string produced by [`Self::as_str`] remains the stable display
@@ -544,6 +568,21 @@ pub enum Event {
         config_model: Option<String>,
         diverged: bool,
         generation: u64,
+    },
+
+    /// Terminal outcome for one client-correlated active-model selection.
+    ModelSelectionResult {
+        session_id: Uuid,
+        selection_id: Uuid,
+        provider: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_cache_retention: Option<PromptCacheRetention>,
+        outcome: ModelSelectionOutcome,
     },
 
     /// Model inference started. TUI shows `Thinking…` until the first
@@ -1327,6 +1366,7 @@ macro_rules! event_variants {
             (Event::QueueUpdated { .. }, "queue_updated");
             (Event::ForegroundInputTarget { .. }, "foreground_input_target");
             (Event::ActiveModelState { .. }, "active_model_state");
+            (Event::ModelSelectionResult { .. }, "model_selection_result");
             (Event::ThinkingStarted { .. }, "thinking_started");
             (Event::Reconnecting { .. }, "reconnecting");
             (Event::InferenceWarning { .. }, "inference_warning");

@@ -449,8 +449,10 @@ async fn live_model_switch_routes_next_request_to_new_model() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -515,8 +517,10 @@ async fn model_switch_carries_prompt_cache_retention() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -572,8 +576,10 @@ async fn llm_mode_reresolved_on_model_switch() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -610,8 +616,10 @@ async fn live_model_switch_commits_config_and_session_together() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -632,6 +640,55 @@ async fn live_model_switch_commits_config_and_session_together() {
     assert_one_model_switch_event(&driver, "ok", false).await;
     drain_until_active_model_state(&mut rx);
 }
+#[tokio::test]
+async fn expired_model_selection_deadline_rejects_without_mutating_session() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let selection_id = uuid::Uuid::new_v4();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    driver
+        .run_control(
+            DriverControl::SetActiveModelWithDeadline {
+                selection_id,
+                deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
+                terminal_claimed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                completion: completion_tx,
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: false,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
+    completion_rx.await.expect("driver completion signal");
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-a")
+    );
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
+    match rx.try_recv().expect("deadline rejection") {
+        TurnEvent::ModelSelectionResult {
+            selection_id: actual,
+            outcome:
+                crate::daemon::proto::ModelSelectionOutcome::Rejected {
+                    diagnostic_code, ..
+                },
+            ..
+        } => {
+            assert_eq!(actual, selection_id);
+            assert_eq!(diagnostic_code, "model_switch_rejected");
+        }
+        other => panic!("expected deadline rejection, got {other:?}"),
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "deadline emits exactly one terminal result"
+    );
+}
 
 /// A switch requested while a child frame is foregrounded is applied to that
 /// active frame and never to the parked root frame.
@@ -644,8 +701,10 @@ async fn live_model_switch_from_subagent_frame_applies_to_active_child() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -677,8 +736,10 @@ async fn live_model_switch_persists_requested_reasoning_options() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: Some("xhigh".into()),
                 thinking_mode: Some("high".into()),
@@ -718,8 +779,10 @@ async fn live_model_switch_failure_leaves_config_and_session_on_old_model() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-c".into(), // never configured
                 model: "model-c".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -755,6 +818,7 @@ async fn live_model_switch_failure_leaves_config_and_session_on_old_model() {
     assert_config_active_model(&driver, "provider-a", "model-a");
     assert_one_model_switch_event(&driver, "build_failed", true).await;
     drain_until_active_model_state(&mut rx);
+    assert_terminal_model_selection(&mut rx, false);
 }
 
 /// A session-row persistence failure aborts before config commit and restores
@@ -768,8 +832,10 @@ async fn live_model_switch_session_persist_failure_rolls_back() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -790,6 +856,7 @@ async fn live_model_switch_session_persist_failure_rolls_back() {
     assert_config_active_model(&driver, "provider-a", "model-a");
     assert_one_model_switch_event(&driver, "send_failed", true).await;
     drain_until_active_model_state(&mut rx);
+    assert_terminal_model_selection(&mut rx, false);
 }
 
 /// A config write failure rolls the session row back and keeps the live root
@@ -803,8 +870,10 @@ async fn live_model_switch_config_write_failure_rolls_back() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -837,8 +906,10 @@ async fn live_model_switch_to_unconfigured_keeps_current_model() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-c".into(),
                 model: "model-c".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -880,8 +951,10 @@ async fn live_model_switch_same_model_emits_state_without_rebuild() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-a".into(),
                 model: "model-a".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -918,10 +991,26 @@ async fn live_model_switch_same_model_emits_state_without_rebuild() {
         }
         other => panic!("expected ActiveModelState, got {other:?}"),
     }
-    assert!(
-        rx.try_recv().is_err(),
-        "same-model re-select emits no notice or projection"
-    );
+    match rx
+        .try_recv()
+        .expect("same-model re-select emits a correlated terminal result")
+    {
+        TurnEvent::ModelSelectionResult {
+            selection_id,
+            provider,
+            model,
+            outcome: crate::daemon::proto::ModelSelectionOutcome::Applied { active_state },
+            ..
+        } => {
+            assert_eq!(selection_id, uuid::Uuid::nil());
+            assert_eq!(provider, "provider-a");
+            assert_eq!(model, "model-a");
+            assert_eq!(active_state.provider, "provider-a");
+            assert_eq!(active_state.model, "model-a");
+        }
+        other => panic!("expected ModelSelectionResult, got {other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "one terminal result is emitted");
 }
 
 /// Same-model selection preserves the historical no-op invariant.
@@ -934,8 +1023,10 @@ async fn live_model_switch_same_model_is_noop() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-a".into(),
                 model: "model-a".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -959,8 +1050,10 @@ async fn live_model_switch_emits_active_model_state_event() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1002,8 +1095,10 @@ async fn live_model_switch_audit_record_failure_does_not_roll_back() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1065,6 +1160,36 @@ fn assert_notice_contains(rx: &mut mpsc::Receiver<TurnEvent>, expected: &str) {
             );
         }
         other => panic!("expected Notice, got {other:?}"),
+    }
+}
+
+fn assert_terminal_model_selection(rx: &mut mpsc::Receiver<TurnEvent>, applied: bool) {
+    match rx
+        .try_recv()
+        .expect("a dispatch-accepted selection emits one terminal result")
+    {
+        TurnEvent::ModelSelectionResult {
+            selection_id,
+            outcome,
+            ..
+        } => {
+            assert_eq!(selection_id, uuid::Uuid::nil());
+            match (applied, outcome) {
+                (true, crate::daemon::proto::ModelSelectionOutcome::Applied { active_state }) => {
+                    assert_eq!(active_state.generation, 1);
+                }
+                (
+                    false,
+                    crate::daemon::proto::ModelSelectionOutcome::Rejected {
+                        diagnostic_code, ..
+                    },
+                ) => {
+                    assert_eq!(diagnostic_code, "model_switch_rejected");
+                }
+                (expected, actual) => panic!("expected applied={expected}, got {actual:?}"),
+            }
+        }
+        other => panic!("expected ModelSelectionResult, got {other:?}"),
     }
 }
 
@@ -1451,8 +1576,10 @@ async fn model_switch_inside_subagent_frame_rebuilds_that_frame() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1492,8 +1619,10 @@ async fn model_switch_inside_subagent_frame_rebuild_failure_keeps_child() {
     driver
         .run_control(
             DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
                 provider: "provider-b".into(),
                 model: "model-b".into(),
+                persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,

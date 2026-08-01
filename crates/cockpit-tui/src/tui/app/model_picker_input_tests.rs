@@ -20,8 +20,30 @@ fn ctrl_press(code: KeyCode) -> KeyEvent {
     }
 }
 
+fn snapshot_picker(app: &App) -> crate::tui::model_picker::ModelPickerDialog {
+    let mut cfg = cockpit_config::providers::ProvidersConfig::default();
+    cfg.providers.insert(
+        "p".to_string(),
+        cockpit_config::providers::ProviderEntry {
+            models: vec![cockpit_config::providers::ModelEntry {
+                id: "a".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    crate::tui::model_picker::ModelPickerDialog::open_with_failures(
+        cfg,
+        app.launch.active_model.clone(),
+        &app.usage_models,
+        &Default::default(),
+        chrono::Utc::now().timestamp(),
+    )
+    .expect("model picker opens from snapshot")
+}
+
 fn write_config(path: &std::path::Path) {
-    fs::write(path, "{}").unwrap();
+    fs::write(path, r#"{"providers":{"p":{}}}"#).unwrap();
     let provider_path =
         cockpit_config::providers::provider_file_path_for_config(path, "p").unwrap();
     fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
@@ -43,17 +65,15 @@ fn model_picker_selection_closes_without_local_config_write() {
 
     let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
-    app.overlay = Overlay::ModelPicker(
-        crate::tui::model_picker::ModelPickerDialog::open(tmp.path(), &app.usage_models)
-            .expect("model picker opens from valid config"),
-    );
+    app.dialog = crate::tui::settings::Dialog::None;
+    app.overlay = Overlay::ModelPicker(snapshot_picker(&app));
     let history_len = app.history.len();
     let usage_len = app.pending_usage.len();
 
     let exit = app.handle_key(press(KeyCode::Enter));
 
     assert!(!exit);
-    assert!(!matches!(app.overlay, Overlay::ModelPicker(_)));
+    assert!(matches!(app.overlay, Overlay::ModelPicker(_)));
     assert!(app.history.len() > history_len);
     assert_eq!(app.pending_usage.len(), usage_len + 1);
     assert_eq!(app.usage_models.get("p/a"), Some(&1));
@@ -88,22 +108,18 @@ fn model_picker_session_and_default_writes_config() {
     app.overlay = Overlay::ModelPicker(picker);
     app.close_model_picker(true);
     assert!(
-        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("session and as default")),
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("Selecting p/a and make default")),
         "history: {:?}",
         app.history.last()
     );
     let active = cockpit_config::providers::ConfigDoc::providers_from_paths(
         &cockpit_config::dirs::config_file_paths_for_load(tmp.path()),
     )
-    .active_model
-    .unwrap();
-    assert_eq!(
-        (active.provider.as_str(), active.model.as_str()),
-        ("p", "a")
-    );
+    .active_model;
+    assert_eq!(active, None);
     assert_eq!(app.usage_models.get("p/a"), Some(&1));
     assert!(
-        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("session and as default"))
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("Selecting p/a and make default"))
     );
 }
 
@@ -132,7 +148,7 @@ fn model_picker_default_write_failure_still_applies_session() {
     app.close_model_picker(true);
     assert_eq!(app.usage_models.get("p/a"), Some(&1));
     assert!(
-        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("default was not updated"))
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("Selecting p/a and make default"))
     );
 }
 
@@ -148,10 +164,7 @@ fn chrome_active_model_unchanged_on_rejected_switch() {
     let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
     app.launch.active_model = Some(("old-provider".to_string(), "old-model".to_string()));
-    app.overlay = Overlay::ModelPicker(
-        crate::tui::model_picker::ModelPickerDialog::open(tmp.path(), &app.usage_models)
-            .expect("model picker opens from valid config"),
-    );
+    app.overlay = Overlay::ModelPicker(snapshot_picker(&app));
 
     let exit = app.handle_key(press(KeyCode::Enter));
 
@@ -178,17 +191,15 @@ fn model_picker_selection_records_summary() {
 
     let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
-    app.overlay = Overlay::ModelPicker(
-        crate::tui::model_picker::ModelPickerDialog::open(tmp.path(), &app.usage_models)
-            .expect("model picker opens from valid config"),
-    );
+    app.dialog = crate::tui::settings::Dialog::None;
+    app.overlay = Overlay::ModelPicker(snapshot_picker(&app));
 
     let exit = app.handle_key(press(KeyCode::Enter));
 
     assert!(!exit);
     assert!(
-        !matches!(app.overlay, Overlay::ModelPicker(_)),
-        "picker stayed open with error {:?}",
+        matches!(app.overlay, Overlay::ModelPicker(_)),
+        "picker recovery with error {:?}",
         match &app.overlay {
             Overlay::ModelPicker(picker) => picker.error_text(),
             _ => None,
@@ -196,7 +207,7 @@ fn model_picker_selection_records_summary() {
     );
     assert_eq!(app.usage_models.get("p/a"), Some(&1));
     assert!(
-        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("model")),
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("Selecting p/a")),
         "expected model summary line, got {:?}",
         app.history.last()
     );

@@ -598,8 +598,12 @@ pub enum Request {
 
     /// Switch the attached session to a different model.
     SetActiveModel {
+        selection_id: Uuid,
         provider: String,
         model: String,
+        /// Persist this model as the resolution default after the live session
+        /// switch commits. Session-only selection must not modify config.
+        persist_as_default: bool,
         #[serde(default)]
         trigger: ActiveModelSwitchTrigger,
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -118,8 +118,18 @@ pub enum Dialog {
         cursor: usize,
         cwd: PathBuf,
     },
+    /// Entry point for `/setup model`. Only a confirmed session model may
+    /// seed configuration; a pending selection is never treated as confirmed.
+    ModelSetupChoice {
+        cwd: PathBuf,
+        confirmed: Option<(String, String)>,
+        pending: Option<(String, String)>,
+        cursor: usize,
+    },
     SetupWizard(Box<SetupWizardDialog>),
-    FirstRunComplete,
+    FirstRunComplete {
+        summary: String,
+    },
     /// Boxed because [`SettingsDialog`] dwarfs the other variants
     /// (~1.1KB vs <100 bytes), which would otherwise bloat every
     /// [`Dialog`] on the stack.
@@ -475,7 +485,7 @@ use lsp_page::{
 };
 use mcp_page::McpPage;
 pub(crate) use mcp_page::row_color as mcp_row_color;
-use providers::{AddState, EditState, ProvidersPage};
+use providers::{AddState, EditState, ModelEditor, ProvidersPage};
 pub(crate) use providers::{
     GrokBrowserStart, OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest, OAuthProvider,
     prepare_grok_browser_start,
@@ -546,7 +556,7 @@ impl Dialog {
             Dialog::WorkspaceTrust { .. } => Some("workspace_trust"),
             Dialog::WizardMenu { .. } => Some("wizard_menu"),
             Dialog::SetupWizard(wizard) => Some(wizard.run.descriptor().id),
-            Dialog::FirstRunComplete => Some("first_run_complete"),
+            Dialog::FirstRunComplete { .. } => Some("first_run_complete"),
             _ => None,
         }
     }
@@ -816,8 +826,21 @@ impl Dialog {
         setup_wizard_dialog(cwd, descriptor, status)
     }
 
-    pub fn open_first_run_complete() -> Self {
-        Dialog::FirstRunComplete
+    pub fn open_model_setup_choice(
+        cwd: &std::path::Path,
+        confirmed: Option<(String, String)>,
+        pending: Option<(String, String)>,
+    ) -> Self {
+        Self::ModelSetupChoice {
+            cwd: cwd.to_path_buf(),
+            confirmed,
+            pending,
+            cursor: 0,
+        }
+    }
+
+    pub fn open_first_run_complete(summary: String) -> Self {
+        Dialog::FirstRunComplete { summary }
     }
 
     pub fn take_completed_provider_id(&mut self) -> Option<String> {
@@ -888,6 +911,29 @@ impl Dialog {
         } else {
             providers_page(ProvidersPage::Edit(parent))
         };
+        Dialog::Settings(Box::new(settings))
+    }
+
+    /// Open the existing provider-model editor directly for one configured provider.
+    /// This is the canonical add-model surface used by scoped model recovery.
+    pub fn open_provider_models(cwd: &std::path::Path, provider_id: &str) -> Self {
+        let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
+        let cfg = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
+        let Some(entry) = cfg.providers.get(provider_id).cloned() else {
+            return Self::open(cwd);
+        };
+        let Some(path) = config_write_target_for_provider(cwd, provider_id) else {
+            return Self::open(cwd);
+        };
+        let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
+        let parent = EditState::new(provider_id.to_string(), entry.clone());
+        settings.page = providers_page(ProvidersPage::Models {
+            editor: Box::new(ModelEditor::new(
+                entry.effective_template(provider_id).map(str::to_owned),
+                entry.models.clone(),
+            )),
+            parent: Box::new(parent),
+        });
         Dialog::Settings(Box::new(settings))
     }
 
@@ -985,7 +1031,7 @@ impl Dialog {
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match self {
             Dialog::None => false,
-            Dialog::FirstRunComplete => {
+            Dialog::FirstRunComplete { .. } => {
                 matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q'))
             }
             Dialog::WorkspaceTrust { cursor, chosen, .. } => {
@@ -1099,6 +1145,32 @@ impl Dialog {
                     false
                 }
             },
+            Dialog::ModelSetupChoice {
+                cwd,
+                confirmed,
+                cursor,
+                ..
+            } => {
+                let choices = if confirmed.is_some() { 2 } else { 1 };
+                match list_key_action(key, cursor, choices) {
+                    ListAction::Stay => false,
+                    ListAction::Close => true,
+                    ListAction::Select(index) => {
+                        let next = if confirmed.is_some() && index == 0 {
+                            let (provider, model) = confirmed
+                                .as_ref()
+                                .expect("confirmed choice must have a pair");
+                            Self::open_model_setup_preselected(cwd, provider, model, None)
+                        } else {
+                            Self::open_setup_wizard(cwd, cockpit_core::wizard::MODEL_WIZARD_ID)
+                        };
+                        if let Ok(next) = next {
+                            *self = next;
+                        }
+                        false
+                    }
+                }
+            }
             Dialog::SetupWizard(wizard) => handle_setup_wizard_key(wizard, key),
             Dialog::Settings(s) => {
                 let close = s.handle_key(key);
@@ -1206,8 +1278,20 @@ impl Dialog {
             Dialog::WizardMenu {
                 wizards, cursor, ..
             } => render_wizard_menu(frame, area, wizards, *cursor),
+            Dialog::ModelSetupChoice {
+                confirmed,
+                pending,
+                cursor,
+                ..
+            } => render_model_setup_choice(
+                frame,
+                area,
+                confirmed.as_ref(),
+                pending.as_ref(),
+                *cursor,
+            ),
             Dialog::SetupWizard(wizard) => render_setup_wizard(frame, area, wizard),
-            Dialog::FirstRunComplete => render_first_run_complete(frame, area),
+            Dialog::FirstRunComplete { summary } => render_first_run_complete(frame, area, summary),
             Dialog::Settings(s) => s.render(frame, area, links),
         }
     }
@@ -2173,7 +2257,8 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
         return false;
     };
     match step.kind {
-        cockpit_core::wizard::StepKind::Select { options } => {
+        cockpit_core::wizard::StepKind::Select { .. } => {
+            let options = run.select_options();
             match list_key_action(key, cursor, options.len()) {
                 ListAction::Close => return true,
                 ListAction::Stay => {}
@@ -2230,10 +2315,12 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                 }
             } else if step.id == "model-save" {
                 match cockpit_core::wizard::apply_model_answers(cwd, run) {
-                    Ok(Some(path)) => *status = Some(format!("Saved {}", path.display())),
-                    Ok(None) => *status = Some("Model settings unchanged.".to_string()),
+                    Ok(Some(path)) => {
+                        *status = Some(format!("Saved model settings to {}.", path.display()))
+                    }
+                    Ok(None) => *status = Some("No model-setting changes were needed.".to_string()),
                     Err(error) => {
-                        *status = Some(error.to_string());
+                        *status = Some(format!("Could not save model settings: {error}"));
                         return false;
                     }
                 }
@@ -2424,13 +2511,13 @@ fn setup_wizard_cursor_for_current_prefill(run: &cockpit_core::wizard::WizardRun
     let Some(step) = run.current_step() else {
         return 0;
     };
-    let cockpit_core::wizard::StepKind::Select { options } = &step.kind else {
+    let cockpit_core::wizard::StepKind::Select { .. } = &step.kind else {
         return 0;
     };
     let Some(cockpit_core::wizard::WizardAnswer::Select(value)) = run.prefill() else {
         return 0;
     };
-    options
+    run.select_options()
         .iter()
         .position(|option| option.id == value)
         .unwrap_or(0)
@@ -2669,6 +2756,89 @@ fn render_wizard_menu(
     frame.render_widget(help_line("↑/↓  enter: select  esc: close"), layout[1]);
 }
 
+fn render_model_setup_choice(
+    frame: &mut Frame,
+    area: Rect,
+    confirmed: Option<&(String, String)>,
+    pending: Option<&(String, String)>,
+    cursor: usize,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Setup — model ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let selected = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            "Configure which model?",
+            Style::default().fg(Color::White),
+        )),
+        Line::default(),
+    ];
+    if let Some((provider, model)) = confirmed {
+        for (index, (label, description)) in [
+            (
+                format!("Use the currently selected model: {provider}/{model}"),
+                "Configure this exact pair; it does not change the live session model.".to_string(),
+            ),
+            (
+                "Choose a different model".to_string(),
+                "Choose a provider, then one of that provider’s models.".to_string(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let marker = if index == cursor { "▸ " } else { "  " };
+            let style = if index == cursor {
+                selected
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(marker),
+                Span::styled(label, style),
+                Span::raw("  "),
+                Span::styled(description, muted),
+            ]));
+        }
+    } else {
+        if let Some((provider, model)) = pending {
+            lines.push(Line::from(Span::styled(
+                format!("{provider}/{model} is still being selected. Wait for confirmation or choose a different model."),
+                muted,
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "No model is confirmed for this session; choose a provider and model to configure.",
+                muted,
+            )));
+        }
+        lines.push(Line::default());
+        let style = if cursor == 0 {
+            selected
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(if cursor == 0 { "▸ " } else { "  " }),
+            Span::styled("Choose a different model", style),
+            Span::raw("  "),
+            Span::styled(
+                "Choose a provider, then one of that provider’s models.",
+                muted,
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
+    frame.render_widget(help_line("↑/↓  enter: select  esc: close"), layout[1]);
+}
+
 fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog) {
     let SetupWizardDialog {
         run,
@@ -2699,7 +2869,12 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
     lines.push(Line::default());
 
     if run.is_complete() {
-        lines.push(Line::from("Security setup complete."));
+        let complete = match run.descriptor().id {
+            cockpit_core::wizard::MODEL_WIZARD_ID => "Model setup complete.",
+            "security" => "Security setup complete.",
+            _ => "Setup complete.",
+        };
+        lines.push(Line::from(complete));
     } else if let Some(step) = run.current_step() {
         lines.push(Line::from(Span::styled(
             step.prompt.to_string(),
@@ -2711,7 +2886,8 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
         }
         lines.push(Line::default());
         match &step.kind {
-            cockpit_core::wizard::StepKind::Select { options } => {
+            cockpit_core::wizard::StepKind::Select { .. } => {
+                let options = run.select_options();
                 for (index, option) in options.iter().enumerate() {
                     let marker = if index == *cursor { "▸ " } else { "  " };
                     let style = if index == *cursor {
@@ -2840,7 +3016,7 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
     );
 }
 
-fn render_first_run_complete(frame: &mut Frame, area: Rect) {
+fn render_first_run_complete(frame: &mut Frame, area: Rect, summary: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Setup complete ");
@@ -2849,6 +3025,7 @@ fn render_first_run_complete(frame: &mut Frame, area: Rect) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let lines = vec![
         Line::from("Cockpit is ready."),
+        Line::from(summary.to_string()),
         Line::default(),
         Line::from("Next: run /setup security to choose project trust and approval defaults."),
         Line::from("Use /help any time to see available commands."),

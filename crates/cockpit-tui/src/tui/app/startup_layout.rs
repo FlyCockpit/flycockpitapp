@@ -59,7 +59,21 @@ impl App {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();
-                self.dialog = crate::tui::settings::Dialog::open_first_run_complete();
+                let summary = self
+                    .config_snapshot
+                    .providers
+                    .active_model
+                    .as_ref()
+                    .map(|active| {
+                        format!(
+                            "Configured {}/{} as the default model for future sessions.",
+                            active.provider, active.model
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "Model configuration finished; no default model was selected.".to_string()
+                    });
+                self.dialog = crate::tui::settings::Dialog::open_first_run_complete(summary);
                 self.first_run_flow = FirstRunFlow::None;
                 true
             }

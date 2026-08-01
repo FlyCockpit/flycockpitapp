@@ -294,9 +294,37 @@ pub(crate) struct PendingControlRequest {
     applied: ControlApplied,
 }
 
+pub(crate) struct PendingModelSelection {
+    /// The session this request was issued for. A reattach/session replacement
+    /// invalidates this local intent rather than letting a late result release
+    /// input into a different conversation.
+    pub session_id: Option<uuid::Uuid>,
+    pub selection_id: uuid::Uuid,
+    pub provider: String,
+    pub model: String,
+    // Origin retained for lifecycle diagnostics. It is metadata only: the
+    // daemon remains the authority for the resulting session state.
+    pub trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+    /// Any terminal result from an older authoritative state is stale and
+    /// cannot release input into this selection.
+    pub minimum_generation: u64,
+    pub started_at: std::time::Instant,
+    pub queued_submission: Option<QueuedModelSubmission>,
+}
+
+pub(crate) struct QueuedModelSubmission {
+    /// Composer buffer at the instant this submission was held. A matching
+    /// applied result may clear only this exact draft; later edits remain.
+    pub composer_text: String,
+    pub display: String,
+    pub submission: cockpit_core::engine::message::UserSubmission,
+    pub tag_expansions: Vec<cockpit_core::daemon::proto::TagExpansionMeta>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlApplied {
     None,
+    ModelSelection { selection_id: uuid::Uuid },
     CacheBreakWarning,
     LlmModeSwitchWarning,
     PrimaryAgentSwitch { name: String },
@@ -1897,6 +1925,7 @@ pub struct App {
     pub(super) pending_agent_switch_log: Option<PendingAgentSwitchLog>,
     /// TUI-issued daemon control requests awaiting a response-bearing ack.
     pub(super) pending_control_requests: HashMap<ControlRequestId, PendingControlRequest>,
+    pub(super) pending_model_selection: Option<PendingModelSelection>,
     pub(super) next_control_request_seq: u64,
     /// The live set of wire-side elided tool-result `call_id`s on the
     /// foreground agent (from the daemon's `Pruned` event). The scrollback
@@ -3016,6 +3045,7 @@ impl App {
             footer_picker_row_hits: Vec::new(),
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),
+            pending_model_selection: None,
             next_control_request_seq: 0,
             elided_event_ids: std::collections::HashSet::new(),
             pending_compact: None,

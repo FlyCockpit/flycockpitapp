@@ -1305,8 +1305,13 @@ pub enum SessionWork {
         respond_to: oneshot::Sender<u64>,
     },
     SetActiveModel {
+        selection_id: Uuid,
+        /// Fixed daemon-owned deadline assigned when dispatch accepts the
+        /// request. It is intentionally not client configuration.
+        selection_deadline: std::time::Instant,
         provider: String,
         model: String,
+        persist_as_default: bool,
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<String>,

@@ -449,8 +449,12 @@ impl App {
                 let should_close = picker.handle_key(key);
                 if should_close {
                     let accepted = picker.is_done();
+                    let add_model_provider = picker.take_add_model_provider();
                     self.overlay = Overlay::ModelPicker(picker);
                     self.close_model_picker(accepted);
+                    if let Some(provider) = add_model_provider {
+                        self.dialog = Dialog::open_provider_models(&self.launch.cwd, &provider);
+                    }
                 } else {
                     self.overlay = Overlay::ModelPicker(picker);
                 }
@@ -2023,9 +2027,40 @@ impl App {
         if submitted.is_empty() && self.paste_registry.is_empty() {
             return false;
         }
-        if let Err(reason) = self.check_send_model_ready() {
-            self.open_missing_model_setup(reason);
-            return false;
+        // A selection in flight is deliberately *not* a missing-model state.
+        // Build the exact submission below and hold it behind that correlated
+        // transaction instead of opening configuration or losing paste/tag
+        // metadata before it can be released.
+        match self.model_readiness() {
+            ModelReadiness::Ready(confirmed_model) => {
+                let _ = confirmed_model;
+            }
+            ModelReadiness::WaitingForModelSelection(selection_id) => {
+                if self
+                    .pending_model_selection
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.selection_id == selection_id
+                            && pending.started_at.elapsed() >= std::time::Duration::from_secs(60)
+                    })
+                {
+                    self.push_plain(
+                        "Model selection is still pending after 60 seconds; open `/model` to retry. Your draft will be retained.".to_string(),
+                    );
+                }
+            }
+            ModelReadiness::NeedsProvider => {
+                self.open_missing_model_setup(MissingModelReason::NoProviders);
+                return false;
+            }
+            ModelReadiness::NeedsModelForConfiguredProvider => {
+                self.open_missing_model_setup(MissingModelReason::NoActiveModel);
+                return false;
+            }
+            ModelReadiness::SelectedProviderMissing(provider) => {
+                self.open_missing_model_setup(MissingModelReason::MissingProvider(provider));
+                return false;
+            }
         }
 
         // Build the paste-side wire from the live (untrimmed) buffer +
@@ -2095,6 +2130,49 @@ impl App {
         // submit copy has consumed it.
         self.accepted_tags.clear();
 
+        let tag_expansions = expanded
+            .expansions
+            .into_iter()
+            .map(cockpit_core::daemon::proto::TagExpansionMeta::from)
+            .collect::<Vec<_>>();
+        let submission = cockpit_core::engine::message::UserSubmission {
+            kind: cockpit_core::engine::message::UserSubmissionKind::User,
+            text: wire.clone(),
+            display_text: Some(submitted.clone()),
+            tag_expansions: tag_expansions.clone(),
+            images: paste_images,
+            forced_skill: None,
+            origin_principal: None,
+            job_id: None,
+            preflight_cleaned: None,
+            queue_item_ids: Vec::new(),
+            queue_target: None,
+        };
+        if let Some(pending) = self.pending_model_selection.as_mut() {
+            if pending.queued_submission.is_some() {
+                // The direct model-selection hold is intentionally one deep.
+                // Further input follows the normal busy-message rules rather
+                // than silently replacing the first exact submission.
+                self.push_plain(
+                    "A message is already waiting for the model switch; send again after it is released."
+                        .to_string(),
+                );
+                return false;
+            }
+            let status = format!(
+                "Switching to {}/{}; message will send when ready.",
+                pending.provider, pending.model
+            );
+            pending.queued_submission = Some(super::QueuedModelSubmission {
+                composer_text: self.composer.text().to_string(),
+                display: submitted,
+                submission,
+                tag_expansions,
+            });
+            self.push_plain(status);
+            return false;
+        }
+
         // If a turn is in flight, the daemon will queue this message
         // and fold it into the next inference call (GOALS §1c). Track
         // it locally so the user sees what's pending; cleared when the
@@ -2108,11 +2186,6 @@ impl App {
         // can't be handed off. The busy/queue path didn't start a span,
         // so it must never tear one down.
         let was_busy = self.busy;
-        let tag_expansions = expanded
-            .expansions
-            .into_iter()
-            .map(cockpit_core::daemon::proto::TagExpansionMeta::from)
-            .collect::<Vec<_>>();
         let fresh_tag_expansions = if was_busy {
             self.queue.push(optimistic_queue_item_with_display(
                 wire.clone(),
@@ -2132,23 +2205,6 @@ impl App {
             tag_expansions.clone()
         };
         let owns_working_span = !was_busy;
-
-        // Carry the wire text together with any real image parts (vision
-        // only — non-vision folded the images into `wire` as text notes,
-        // leaving `paste_images` empty).
-        let submission = cockpit_core::engine::message::UserSubmission {
-            kind: cockpit_core::engine::message::UserSubmissionKind::User,
-            text: wire.clone(),
-            display_text: Some(submitted.clone()),
-            tag_expansions: tag_expansions.clone(),
-            images: paste_images,
-            forced_skill: None,
-            origin_principal: None,
-            job_id: None,
-            preflight_cleaned: None,
-            queue_item_ids: Vec::new(),
-            queue_target: None,
-        };
 
         if owns_working_span {
             self.dispatch_optimistic_user_submission(
@@ -2206,18 +2262,21 @@ impl App {
         false
     }
 
-    fn check_send_model_ready(&self) -> Result<(), MissingModelReason> {
+    fn model_readiness(&self) -> ModelReadiness {
+        if let Some(pending) = self.pending_model_selection.as_ref() {
+            return ModelReadiness::WaitingForModelSelection(pending.selection_id);
+        }
         let cfg = &self.config_snapshot.providers;
         if cfg.providers.is_empty() {
-            return Err(MissingModelReason::NoProviders);
+            return ModelReadiness::NeedsProvider;
         }
         let Some((provider, _model)) = self.launch.active_model.as_ref() else {
-            return Err(MissingModelReason::NoActiveModel);
+            return ModelReadiness::NeedsModelForConfiguredProvider;
         };
         if !cfg.providers.contains_key(provider) {
-            return Err(MissingModelReason::MissingProvider(provider.clone()));
+            return ModelReadiness::SelectedProviderMissing(provider.clone());
         }
-        Ok(())
+        ModelReadiness::Ready((provider.clone(), _model.clone()))
     }
 
     fn open_missing_model_setup(&mut self, reason: MissingModelReason) {
@@ -2228,30 +2287,30 @@ impl App {
             self.dialog = Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));
             return;
         }
-        let preselect = cfg.providers.iter().find_map(|(provider_id, entry)| {
-            entry
-                .models
-                .first()
-                .map(|model| (provider_id.as_str(), model.id.as_str()))
-        });
-        let dialog = match preselect {
-            Some((provider_id, model_id)) => Dialog::open_model_setup_preselected(
-                &self.launch.cwd,
-                provider_id,
-                model_id,
-                Some(status),
-            ),
-            None => {
-                Dialog::open_setup_wizard(&self.launch.cwd, cockpit_core::wizard::MODEL_WIZARD_ID)
-            }
-        };
-        match dialog {
-            Ok(dialog) => {
-                self.dialog = dialog;
-            }
-            Err(error) => self.show_toast(error, super::ToastKind::Error),
+        // Missing selection/configuration is recovered through `/model`, not
+        // through the editor. The picker can offer explicit add-provider or
+        // add-model actions; it must never imply that configuration is the
+        // result of a failed session selection.
+        self.push_plain(status);
+        let scoped_provider = cfg
+            .active_model
+            .as_ref()
+            .map(|active| active.provider.as_str())
+            .filter(|provider| cfg.providers.contains_key(*provider));
+        if let Some(provider) = scoped_provider {
+            self.open_model_picker_for_provider(provider);
+        } else {
+            self.open_model_picker();
         }
     }
+}
+
+enum ModelReadiness {
+    Ready((String, String)),
+    WaitingForModelSelection(uuid::Uuid),
+    NeedsProvider,
+    NeedsModelForConfiguredProvider,
+    SelectedProviderMissing(String),
 }
 
 enum MissingModelReason {
@@ -2268,7 +2327,7 @@ impl MissingModelReason {
                     .to_string()
             }
             MissingModelReason::NoActiveModel => {
-                "No model is selected yet. Choose one before sending; your message is still in the composer."
+                "No model is selected yet. Choose a configured model before sending; your message is still in the composer."
                     .to_string()
             }
             MissingModelReason::MissingProvider(provider) => format!(
@@ -4151,7 +4210,7 @@ mod queued_message_edit_tests {
 #[cfg(test)]
 mod paste_routing_tests {
     use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
-    use crate::tui::app::{App, Overlay};
+    use crate::tui::app::{App, Overlay, PendingModelSelection};
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
     use crate::tui::paste::{PasteKind, PasteRegistry};
     use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
@@ -4168,6 +4227,57 @@ mod paste_routing_tests {
         app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app
+    }
+
+    #[test]
+    fn immediate_submit_waits_for_pending_model_selection_without_opening_setup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let provider = cockpit_config::providers::ProviderEntry {
+            models: vec![cockpit_config::providers::ModelEntry {
+                id: "new-model".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        app.config_snapshot
+            .providers
+            .providers
+            .insert("p".to_string(), provider);
+        app.launch.active_model = Some(("p".to_string(), "old-model".to_string()));
+        app.pending_model_selection = Some(PendingModelSelection {
+            session_id: app.launch.session_id,
+            selection_id: uuid::Uuid::new_v4(),
+            provider: "p".to_string(),
+            model: "new-model".to_string(),
+            trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+            minimum_generation: app.active_model_state_generation,
+            started_at: std::time::Instant::now(),
+            queued_submission: None,
+        });
+        app.composer.set("send this exact draft".to_string());
+
+        assert!(!app.submit_input());
+        let pending = app
+            .pending_model_selection
+            .as_ref()
+            .expect("selection remains pending until its terminal result");
+        let queued = pending
+            .queued_submission
+            .as_ref()
+            .expect("the exact submission is held behind the selection");
+        assert_eq!(queued.display, "send this exact draft");
+        assert_eq!(
+            queued.submission.display_text.as_deref(),
+            Some("send this exact draft")
+        );
+        assert!(matches!(app.dialog, Dialog::None));
+        assert!(
+            !app.history
+                .iter()
+                .any(|entry| matches!(entry, crate::tui::history::HistoryEntry::User { .. })),
+            "no optimistic send occurs while pending"
+        );
     }
 
     fn runner_with_input_tx(input_tx: mpsc::Sender<UserSubmission>) -> AgentRunner {

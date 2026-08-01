@@ -1793,6 +1793,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | QueueUpdated { session_id, .. }
         | ForegroundInputTarget { session_id, .. }
         | ActiveModelState { session_id, .. }
+        | ModelSelectionResult { session_id, .. }
         | Reconnecting { session_id, .. }
         | AssistantTextDelta { session_id, .. }
         | ReasoningDelta { session_id, .. }
@@ -2173,6 +2174,24 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             config_model,
             diverged,
             generation,
+        },
+        ModelSelectionResult {
+            selection_id,
+            provider,
+            model,
+            reasoning_effort,
+            thinking_mode,
+            prompt_cache_retention,
+            outcome,
+            ..
+        } => TurnEvent::ModelSelectionResult {
+            selection_id,
+            provider,
+            model,
+            reasoning_effort,
+            thinking_mode,
+            prompt_cache_retention,
+            outcome,
         },
         SessionPersistFailed { error, .. } => TurnEvent::SessionPersistFailed { error },
         SessionDriverFailed { error, .. } => TurnEvent::SessionDriverFailed { error },

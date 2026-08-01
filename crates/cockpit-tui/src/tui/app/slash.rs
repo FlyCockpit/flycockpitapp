@@ -818,7 +818,22 @@ fn run_setup(app: &mut App, args: &str) -> bool {
         app.dialog = Dialog::open_setup(&app.launch.cwd);
         return false;
     }
-    match Dialog::open_setup_wizard(&app.launch.cwd, wizard_id) {
+    let dialog = if wizard_id == cockpit_core::wizard::MODEL_WIZARD_ID {
+        Ok(Dialog::open_model_setup_choice(
+            &app.launch.cwd,
+            if app.pending_model_selection.is_none() {
+                app.launch.active_model.clone()
+            } else {
+                None
+            },
+            app.pending_model_selection
+                .as_ref()
+                .map(|pending| (pending.provider.clone(), pending.model.clone())),
+        ))
+    } else {
+        Dialog::open_setup_wizard(&app.launch.cwd, wizard_id)
+    };
+    match dialog {
         Ok(dialog) => app.dialog = dialog,
         Err(error) => app.push_plain(format!("/setup: {error}")),
     }
@@ -1927,6 +1942,12 @@ impl App {
             session_short_id: self.launch.session_short_id.clone(),
             active_agent: self.launch.agent_name.clone(),
             active_model: self.launch.active_model.clone(),
+            pending_model_selection: self.pending_model_selection.as_ref().map(|pending| {
+                format!(
+                    "pending {}: {}/{}",
+                    pending.selection_id, pending.provider, pending.model
+                )
+            }),
             sandbox_enabled: Some(!self.no_sandbox),
         };
         match cockpit_core::diagnostics::tui_snapshot(input) {

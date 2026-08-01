@@ -143,8 +143,9 @@ pub(crate) async fn run_terminal_wizard(
     let mut run = WizardRun::new(descriptor)?;
     while let Some(step) = run.current_step().cloned() {
         match &step.kind {
-            StepKind::Select { options } => {
-                write_select(io, &run, step.prompt, options)?;
+            StepKind::Select { .. } => {
+                let options = run.select_options();
+                write_select(io, &run, step.prompt, &options)?;
                 let answer = loop {
                     let input = read_input(io)?;
                     if go_back(&mut run, &input, io)? {
@@ -155,7 +156,7 @@ pub(crate) async fn run_terminal_wizard(
                     {
                         break Some(WizardAnswer::Select(value));
                     }
-                    if let Some(answer) = select_answer(options, input.trim()) {
+                    if let Some(answer) = select_answer(&options, input.trim()) {
                         break Some(answer);
                     }
                     io.write_line("Choose one of the listed numbers or ids.")?;
@@ -972,7 +973,8 @@ mod tests {
         write_model_wizard_provider(tmp.path());
         let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, tmp.path()).unwrap();
         let mut io = ScriptIo::new(&[
-            "p", "p:m", "frontier", "trusted", "images", "", "", "none", "y", "skip",
+            "p", "p:m", "frontier", "trusted", "images", "", "", "none", "y", "skip", "", "", "",
+            "", "", "", "", "",
         ]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
@@ -988,7 +990,12 @@ mod tests {
             .iter()
             .find(|model| model.id == "m")
             .unwrap();
-        assert_eq!(model.mode, Some(crate::config::extended::LlmMode::Frontier));
+        assert_eq!(
+            model.mode,
+            Some(crate::config::extended::LlmMode::Frontier),
+            "{}",
+            io.output
+        );
         assert_eq!(
             model.trust,
             Some(crate::config::providers::ModelTrust::Trusted)
@@ -998,7 +1005,7 @@ mod tests {
         assert_eq!(model.can_delegate, Some(false));
         assert_eq!(cfg.active_model.as_ref().unwrap().provider, "p");
         assert_eq!(cfg.active_model.as_ref().unwrap().model, "m");
-        assert!(io.output.contains("Applying model settings"));
+        assert!(io.output.contains("Saved model settings to"));
     }
 
     #[tokio::test]

@@ -4951,8 +4951,10 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "list_agents" => Request::ListAgents,
         "list_models" => Request::ListModels { provider: None },
         "set_active_model" => Request::SetActiveModel {
+            selection_id: Uuid::from_u128(3),
             provider: "openai".into(),
             model: "gpt-5".into(),
+            persist_as_default: false,
             trigger: proto::ActiveModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -6220,8 +6222,10 @@ async fn assert_worker_delivery_happy(kind: &str) {
             response: proto::ResolveResponse::Cancel,
         },
         "set_active_model" => Request::SetActiveModel {
+            selection_id: Uuid::from_u128(3),
             provider: "openai".into(),
             model: "gpt-5".into(),
+            persist_as_default: false,
             trigger: proto::ActiveModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -6380,14 +6384,18 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 (
                     "set_active_model",
                     SessionWork::SetActiveModel {
+                        selection_id,
+                        selection_deadline: _,
                         provider,
                         model,
                         trigger,
                         reasoning_effort,
                         thinking_mode,
+                        persist_as_default: _,
                         prompt_cache_retention,
                     },
                 ) => {
+                    assert_eq!(selection_id, Uuid::from_u128(3));
                     assert_eq!(provider, "openai");
                     assert_eq!(model, "gpt-5");
                     assert!(matches!(
@@ -6592,8 +6600,10 @@ async fn assert_attached_required_malformed(kind: &str) {
             response: proto::ResolveResponse::Cancel,
         },
         "set_active_model" => Request::SetActiveModel {
+            selection_id: Uuid::new_v4(),
             provider: "openai".into(),
             model: "gpt-5".into(),
+            persist_as_default: false,
             trigger: proto::ActiveModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -8992,8 +9002,10 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
         CommandMetadataCase {
             request: Request::SetActiveModel {
+                selection_id: Uuid::new_v4(),
                 provider: "openai".into(),
                 model: "gpt".into(),
+                persist_as_default: false,
                 trigger: proto::ActiveModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -10954,8 +10966,10 @@ async fn serialized_requests_apply_in_receipt_order() {
             Envelope::request(
                 set_id,
                 Request::SetActiveModel {
+                    selection_id: Uuid::new_v4(),
                     provider: "openai".to_string(),
                     model: "gpt-5".to_string(),
+                    persist_as_default: false,
                     trigger: proto::ActiveModelSwitchTrigger::Daemon,
                     reasoning_effort: None,
                     thinking_mode: None,
@@ -10983,11 +10997,14 @@ async fn serialized_requests_apply_in_receipt_order() {
 
     match work_rx.recv().await.expect("set-active-model work") {
         SessionWork::SetActiveModel {
+            selection_id: _,
+            selection_deadline: _,
             provider,
             model,
             trigger,
             reasoning_effort,
             thinking_mode,
+            persist_as_default: _,
             prompt_cache_retention,
         } => {
             assert_eq!(provider, "openai");

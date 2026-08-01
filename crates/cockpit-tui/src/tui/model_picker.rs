@@ -9,10 +9,13 @@
 //! follow-up "level" picker appears using the provider-native values. Legacy
 //! `thinking_modes` still get their original `off` / `low` / `medium` /
 //! `high` picker. The result is sent to the daemon, which owns the active
-//! model transaction and config write.
+//! model transaction and performs a config write only for the explicit
+//! make-default action.
 //!
 //! The dialog is independent of `tui/settings.rs` to keep that file's
-//! state machine focused on settings editing.
+//! state machine focused on configuration editing. Enter is session-only;
+//! Ctrl+Enter explicitly asks the daemon to persist the confirmed choice as
+//! the future default.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -50,6 +53,8 @@ pub struct ModelPickerDialog {
     cfg: ProvidersConfig,
     entries: Vec<Entry>,
     active_model: Option<(String, String)>,
+    scope_provider: Option<String>,
+    add_model_provider: Option<String>,
     drift: Option<ModelPickerDrift>,
     filter: TextField,
     /// Cursor and top visible index of the scroll window over the filtered list.
@@ -270,6 +275,8 @@ impl ModelPickerDialog {
             cfg,
             entries,
             active_model,
+            scope_provider: None,
+            add_model_provider: None,
             drift: None,
             filter: TextField::default(),
             pick: ScrollList::at(cursor, scroll),
@@ -285,12 +292,47 @@ impl ModelPickerDialog {
         self.done
     }
 
+    /// Consume an explicit empty-state request to edit models for the scoped provider.
+    pub fn take_add_model_provider(&mut self) -> Option<String> {
+        self.add_model_provider.take()
+    }
+
+    pub fn open_for_provider_with_failures(
+        cfg: cockpit_config::providers::ProvidersConfig,
+        provider: &str,
+        session_active_model: Option<(String, String)>,
+        counts: &HashMap<String, u64>,
+        failures: &crate::tui::auth_failure::AuthFailureAnnotations,
+        now_epoch_secs: i64,
+    ) -> Result<Self, String> {
+        let mut picker =
+            Self::open_with_failures(cfg, session_active_model, counts, failures, now_epoch_secs)?;
+        picker.entries.retain(|entry| entry.provider_id == provider);
+        picker.scope_provider = Some(provider.to_string());
+        picker.active_model = picker
+            .active_model
+            .filter(|(active_provider, _)| active_provider == provider);
+        picker.retarget_pick_position();
+        Ok(picker)
+    }
+
     pub fn set_config_drift(&mut self, drift: Option<ModelPickerDrift>) {
         if self.drift == drift {
             return;
         }
         self.drift = drift;
         self.retarget_pick_position();
+    }
+
+    /// Re-focus a picker on a previously requested pair after the daemon
+    /// rejects its correlated selection. This is visual intent only: it never
+    /// changes the daemon-confirmed active model or persisted configuration.
+    pub fn highlight_requested_model(&mut self, provider: &str, model: &str) {
+        self.filter = TextField::default();
+        let requested = Some((provider.to_string(), model.to_string()));
+        let (cursor, scroll) =
+            initial_pick_position(&self.entries, requested.as_ref(), "", MODEL_WINDOW);
+        self.pick = ScrollList::at(cursor, scroll);
     }
 
     #[cfg(test)]
@@ -309,6 +351,15 @@ impl ModelPickerDialog {
 
     /// Returns true if the dialog should close.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if matches!(key.code, KeyCode::Char('a'))
+            && self.entries.is_empty()
+            && self.filter.text().is_empty()
+            && let Some(provider) = self.scope_provider.clone()
+        {
+            self.add_model_provider = Some(provider);
+            self.done = true;
+            return true;
+        }
         if matches!(key.code, KeyCode::Esc) {
             return true;
         }
@@ -585,9 +636,12 @@ impl ModelPickerDialog {
         self.row_hits.clear();
         self.row_hits
             .resize(area.y.saturating_add(area.height) as usize, None);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" /model — pick the active model ");
+        let title = self
+            .scope_provider
+            .as_deref()
+            .map(|provider| format!(" /model — {provider} models "))
+            .unwrap_or_else(|| " /model — pick the active model ".to_string());
+        let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
@@ -669,11 +723,19 @@ impl ModelPickerDialog {
         let visible = self.filtered_indices();
         if visible.is_empty() {
             let body = if self.entries.is_empty() {
-                "(no models — run `/fetch-models` or add a provider via `/settings`)"
+                match self.scope_provider.as_deref() {
+                    Some(provider) => {
+                        format!(
+                            "(no models configured for {provider} — press `a` to Add model to this provider)"
+                        )
+                    }
+                    None => "(no models — run `/fetch-models` or add a provider via `/settings`)"
+                        .to_string(),
+                }
             } else {
-                "(no matches — try a different filter)"
+                "(no matches — try a different filter)".to_string()
             };
-            lines.push(Line::from(Span::styled(body.to_string(), muted)));
+            lines.push(Line::from(Span::styled(body, muted)));
         } else {
             let mut seen_fav = false;
             let mut seen_other = false;
@@ -1137,7 +1199,28 @@ mod tests {
     /// resolution) — stands in for the pushed snapshot in unit tests.
     fn providers_at(cwd: &std::path::Path) -> cockpit_config::providers::ProvidersConfig {
         let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
-        cockpit_config::providers::ConfigDoc::providers_from_paths(&paths)
+        let mut cfg = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
+        if cfg.providers.is_empty() {
+            let providers_dir = cwd.join(".cockpit").join("providers");
+            if let Ok(entries) = fs::read_dir(providers_dir) {
+                for entry in entries.flatten() {
+                    let Ok(contents) = fs::read_to_string(entry.path()) else {
+                        continue;
+                    };
+                    let Ok(provider) =
+                        serde_json::from_str::<cockpit_config::providers::ProviderEntry>(&contents)
+                    else {
+                        continue;
+                    };
+                    let path = entry.path();
+                    let Some(id) = path.file_stem().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    cfg.providers.insert(id.to_string(), provider);
+                }
+            }
+        }
+        cfg
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -1164,6 +1247,8 @@ mod tests {
             cfg: ProvidersConfig::default(),
             entries: Vec::new(),
             active_model: None,
+            scope_provider: None,
+            add_model_provider: None,
             drift: None,
             filter: TextField::default(),
             pick: ScrollList::new(),
@@ -1276,6 +1361,8 @@ mod tests {
             cfg: ProvidersConfig::default(),
             entries,
             active_model: None,
+            scope_provider: None,
+            add_model_provider: None,
             drift: None,
             filter: TextField::default(),
             pick: ScrollList::new(),
@@ -1292,6 +1379,8 @@ mod tests {
             cfg: ProvidersConfig::default(),
             entries,
             active_model: None,
+            scope_provider: None,
+            add_model_provider: None,
             drift: None,
             filter: TextField::default(),
             pick: ScrollList::new(),
@@ -1401,7 +1490,11 @@ mod tests {
         let cockpit = tmp.path().join(".cockpit");
         fs::create_dir(&cockpit).unwrap();
         let config_path = cockpit.join("config.json");
-        fs::write(&config_path, "{}").unwrap();
+        fs::write(
+            &config_path,
+            r#"{"providers":{"p":{"url":"https://example.test","models":[{"id":"claude"}]}}}"#,
+        )
+        .unwrap();
         let provider_path =
             cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
         fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
@@ -1543,7 +1636,11 @@ mod tests {
         let cockpit = tmp.path().join(".cockpit");
         fs::create_dir(&cockpit).unwrap();
         let config_path = cockpit.join("config.json");
-        fs::write(&config_path, "{}").unwrap();
+        fs::write(
+            &config_path,
+            r#"{"providers":{"p":{"url":"https://example.test","models":[{"id":"claude"}]}}}"#,
+        )
+        .unwrap();
         let provider_path =
             cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
         fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
@@ -1597,7 +1694,7 @@ mod tests {
         let cockpit = tmp.path().join(".cockpit");
         fs::create_dir(&cockpit).unwrap();
         let config_path = cockpit.join("config.json");
-        fs::write(&config_path, "{}").unwrap();
+        fs::write(&config_path, r#"{"providers":{"p":{"url":"https://example.test","models":[{"id":"a","favorite":true},{"id":"b"},{"id":"c","favorite":true}]}}}"#).unwrap();
         let provider_path =
             cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
         fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
@@ -1617,7 +1714,15 @@ mod tests {
             }))
             .unwrap();
 
-        let next = cycle_active_favorite(&providers_at(tmp.path()), &HashMap::new(), true)
+        let mut cfg = providers_at(tmp.path());
+        cfg.active_model = Some(ActiveModelRef {
+            provider: "p".into(),
+            model: "a".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        });
+        let next = cycle_active_favorite(&cfg, &HashMap::new(), true)
             .unwrap()
             .expect("next favorite");
         assert_eq!(next.provider, "p");
@@ -1627,7 +1732,8 @@ mod tests {
             .write_active_model(Some(&next))
             .unwrap();
 
-        let prev = cycle_active_favorite(&providers_at(tmp.path()), &HashMap::new(), false)
+        cfg.active_model = Some(next.clone());
+        let prev = cycle_active_favorite(&cfg, &HashMap::new(), false)
             .unwrap()
             .expect("previous favorite");
         assert_eq!(prev.provider, "p");
@@ -1703,7 +1809,11 @@ mod tests {
         let cockpit = tmp.path().join(".cockpit");
         fs::create_dir(&cockpit).unwrap();
         let config_path = cockpit.join("config.json");
-        fs::write(&config_path, "{}").unwrap();
+        fs::write(
+            &config_path,
+            r#"{"providers":{"p":{"url":"https://example.test","models":[{"id":"claude"}]}}}"#,
+        )
+        .unwrap();
         let provider_path =
             cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
         fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
@@ -1748,7 +1858,11 @@ mod tests {
         let cockpit = tmp.path().join(".cockpit");
         fs::create_dir(&cockpit).unwrap();
         let config_path = cockpit.join("config.json");
-        fs::write(&config_path, "{}").unwrap();
+        fs::write(
+            &config_path,
+            r#"{"providers":{"p":{"url":"https://example.test","models":[{"id":"claude"}]}}}"#,
+        )
+        .unwrap();
         let provider_path =
             cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
         fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
@@ -1783,6 +1897,8 @@ mod tests {
             cfg: ProvidersConfig::default(),
             entries,
             active_model,
+            scope_provider: None,
+            add_model_provider: None,
             drift: None,
             filter: TextField::default(),
             pick: ScrollList::at(cursor, scroll),

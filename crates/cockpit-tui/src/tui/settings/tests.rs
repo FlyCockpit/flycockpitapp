@@ -1827,8 +1827,39 @@ fn no_providers_auto_opens_wizard() {
 }
 
 #[test]
+fn model_setup_choice_distinguishes_confirmed_and_pending_models() {
+    let tmp = TempDir::new().unwrap();
+    let confirmed = Dialog::open_model_setup_choice(
+        tmp.path(),
+        Some(("provider".to_string(), "model".to_string())),
+        None,
+    );
+    let rendered = render_dialog_rows(&confirmed, 100, 12).join("\n");
+    assert!(rendered.contains("Configure which model?"), "{rendered}");
+    assert!(
+        rendered.contains("Use the currently selected model: provider/model"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Choose a different model"), "{rendered}");
+
+    let pending = Dialog::open_model_setup_choice(
+        tmp.path(),
+        None,
+        Some(("pending-provider".to_string(), "pending-model".to_string())),
+    );
+    let rendered = render_dialog_rows(&pending, 100, 12).join("\n");
+    assert!(
+        rendered.contains("pending-provider/pending-model is still being selected"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("currently selected model"), "{rendered}");
+}
+
+#[test]
 fn first_run_completion_copy_points_to_security_and_help() {
-    let d = Dialog::open_first_run_complete();
+    let d = Dialog::open_first_run_complete(
+        "Configured p/m as the default model for future sessions.".to_string(),
+    );
     let rendered = render_dialog_rows(&d, 96, 12).join("\n");
 
     assert!(rendered.contains("/setup security"), "{rendered}");

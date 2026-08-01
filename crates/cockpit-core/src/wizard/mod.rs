@@ -185,6 +185,43 @@ impl WizardRun {
             .or_else(|| step.default_answer.clone())
     }
 
+    /// Resolve select options whose valid values depend on earlier answers.
+    /// Model configuration deliberately exposes only models for its selected
+    /// provider; the stored answer remains provider-qualified so existing
+    /// model-scope write resolution stays unambiguous.
+    pub fn select_options(&self) -> Vec<SelectOption> {
+        let Some(step) = self.current_step() else {
+            return Vec::new();
+        };
+        let StepKind::Select { options } = &step.kind else {
+            return Vec::new();
+        };
+        if step.id != "model" {
+            return options.clone();
+        }
+        let Some(context) = self.descriptor.model_context.as_ref() else {
+            return options.clone();
+        };
+        let provider = model_provider_answer(self).or_else(|| context.default_provider.clone());
+        let Some(provider) = provider else {
+            return Vec::new();
+        };
+        let prefix = format!("{provider}:");
+        context
+            .models
+            .keys()
+            .filter(|model_ref| model_ref.starts_with(&prefix))
+            .filter_map(|model_ref| {
+                let (_, model) = model_ref.split_once(':')?;
+                Some(SelectOption {
+                    id: model_ref.clone().into(),
+                    label: model.to_string().into(),
+                    description: "Configure this exact provider/model pair".into(),
+                })
+            })
+            .collect()
+    }
+
     pub fn help(&self) -> Cow<'_, str> {
         let Some(step) = self.current_step() else {
             return Cow::Borrowed("");
@@ -349,22 +386,6 @@ pub fn model_descriptor_with_selection(
             description: "Configure a model from this provider".into(),
         })
         .collect();
-    let mut model_options = Vec::new();
-    for (provider_id, provider) in &cfg.providers {
-        for model in &provider.models {
-            let id = format!("{provider_id}:{}", model.id);
-            let label = model
-                .name
-                .as_ref()
-                .map(|name| format!("{name} ({provider_id}:{})", model.id))
-                .unwrap_or_else(|| id.clone());
-            model_options.push(SelectOption {
-                id: id.into(),
-                label: label.into(),
-                description: "Configure this exact provider/model pair".into(),
-            });
-        }
-    }
     let model_context = model_wizard_context(cfg, global_mode, preselect);
     WizardDescriptor {
         id: MODEL_WIZARD_ID,
@@ -390,10 +411,12 @@ pub fn model_descriptor_with_selection(
             StepDescriptor {
                 id: "model",
                 prompt: "Choose a model",
-                help: "Model ids are provider-qualified as provider:model.",
+                help: "Only models configured for the selected provider are shown.",
                 help_hook: None,
                 kind: StepKind::Select {
-                    options: model_options,
+                    // Resolved from the provider answer by `select_options`.
+                    // Do not restore an all-provider static list here.
+                    options: Vec::new(),
                 },
                 default_answer: None,
                 prefill: Some(model_ref_prefill),
@@ -632,11 +655,11 @@ pub fn model_descriptor_with_selection(
             },
             StepDescriptor {
                 id: "model-save",
-                prompt: "Apply model settings",
-                help: "Only changed model-scope values are written.",
+                prompt: "Ready to save model settings",
+                help: "Only changed model-scope values are written. Press Enter to save; Esc discards.",
                 help_hook: None,
                 kind: StepKind::Action {
-                    progress: "Applying model settings…",
+                    progress: "[Save settings]",
                 },
                 default_answer: None,
                 prefill: None,
@@ -1947,6 +1970,39 @@ mod tests {
         assert_eq!(
             run.prefill(),
             Some(WizardAnswer::Select("q:qm".to_string()))
+        );
+        assert_eq!(
+            run.select_options()
+                .into_iter()
+                .map(|option| option.id.into_owned())
+                .collect::<Vec<_>>(),
+            vec!["q:qm"],
+            "the model step only exposes the chosen provider's models"
+        );
+    }
+
+    #[test]
+    fn model_wizard_provider_change_resets_to_that_providers_model_options() {
+        let cfg = model_test_config();
+        let descriptor = model_descriptor_with_selection(
+            &cfg,
+            crate::config::extended::LlmMode::Normal,
+            Some(("q", "qm")),
+        );
+        let mut run = WizardRun::new(descriptor).unwrap();
+
+        run.submit(WizardAnswer::Select("p".to_string())).unwrap();
+        assert_eq!(
+            run.prefill(),
+            Some(WizardAnswer::Select("p:m1".to_string())),
+            "a valid contextual preselection must not lock a later provider choice"
+        );
+        assert_eq!(
+            run.select_options()
+                .into_iter()
+                .map(|option| option.id.into_owned())
+                .collect::<Vec<_>>(),
+            vec!["p:m1"],
         );
     }
 

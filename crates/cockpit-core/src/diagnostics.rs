@@ -14,6 +14,8 @@ pub struct DiagnosticsInput {
     pub session_short_id: Option<String>,
     pub active_agent: String,
     pub active_model: Option<(String, String)>,
+    /// Redacted TUI-only model-selection lifecycle state.
+    pub pending_model_selection: Option<String>,
     pub sandbox_enabled: Option<bool>,
 }
 
@@ -22,6 +24,7 @@ pub struct DiagnosticsSnapshot {
     pub session: String,
     pub active_agent: String,
     pub active_model: String,
+    pub pending_model_selection: String,
     pub cwd: String,
     pub project_root: String,
     pub workspace_trust: String,
@@ -61,6 +64,7 @@ pub async fn cli_snapshot(
         // rather than the narrower `default_primary_agent` config value.
         active_agent: effective_default_agent(&extended),
         active_model: launch.launch.active_model,
+        pending_model_selection: None,
         sandbox_enabled: Some(!no_sandbox),
     })?;
     let providers = crate::config::providers::ConfigDoc::load_effective(Path::new(&snapshot.cwd));
@@ -86,6 +90,10 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
     out.push_str(&format!("session: {}\n", snapshot.session));
     out.push_str(&format!("agent: {}\n", snapshot.active_agent));
     out.push_str(&format!("model: {}\n", snapshot.active_model));
+    out.push_str(&format!(
+        "model selection: {}\n",
+        snapshot.pending_model_selection
+    ));
     out.push_str(&format!("cwd: {}\n", snapshot.cwd));
     out.push_str(&format!("project root: {}\n", snapshot.project_root));
     out.push_str(&format!("workspace trust: {}\n", snapshot.workspace_trust));
@@ -132,6 +140,10 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
             .active_model
             .as_ref()
             .map(|(p, m)| format!("{p}/{m}"))
+            .unwrap_or_else(|| "none".to_string()),
+        pending_model_selection: input
+            .pending_model_selection
+            .clone()
             .unwrap_or_else(|| "none".to_string()),
         cwd: input.cwd.display().to_string(),
         project_root: trust_root
@@ -928,6 +940,7 @@ mod tests {
             session_short_id: Some("abc123".to_string()),
             active_agent: "Build".to_string(),
             active_model: Some(("p".to_string(), "m".to_string())),
+            pending_model_selection: None,
             sandbox_enabled: Some(true),
         }
     }
@@ -1288,6 +1301,22 @@ mod tests {
         );
         assert!(!rendered.contains("sk-present-secret"), "{rendered}");
         assert!(!rendered.contains("sk-named-secret-value"), "{rendered}");
+    }
+
+    #[test]
+    fn doctor_renders_redacted_pending_model_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = DiagnosticsInput {
+            pending_model_selection: Some(
+                "pending 00000000-0000-0000-0000-000000000000: p/m".to_string(),
+            ),
+            ..base_input(tmp.path())
+        };
+        let rendered = render(&build_snapshot(input).unwrap());
+        assert!(
+            rendered.contains("model selection: pending 00000000-0000-0000-0000-000000000000: p/m"),
+            "{rendered}"
+        );
     }
 
     #[test]

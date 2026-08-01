@@ -886,7 +886,9 @@ fn default_client_protocol_version() -> u32 {
 // below, carrying `session_id` so the client can route it.)
 
 mod event;
-pub use event::{AuthFailureKind, Event, InferenceErrorClass};
+pub use event::{
+    AuthFailureKind, Event, InferenceErrorClass, ModelSelectionActiveState, ModelSelectionOutcome,
+};
 
 // ---- Errors ----------------------------------------------------------------
 

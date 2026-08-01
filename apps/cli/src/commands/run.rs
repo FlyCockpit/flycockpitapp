@@ -1347,6 +1347,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | QueueUpdated { session_id, .. }
         | ForegroundInputTarget { session_id, .. }
         | ActiveModelState { session_id, .. }
+        | ModelSelectionResult { session_id, .. }
         | Reconnecting { session_id, .. }
         | AssistantTextDelta { session_id, .. }
         | ReasoningDelta { session_id, .. }

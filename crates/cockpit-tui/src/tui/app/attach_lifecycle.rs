@@ -137,6 +137,31 @@ impl App {
     /// first-message path and the eager display attach.
     pub(super) fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         if let Ok(r) = &runner {
+            // A runner attach can replace the foreground session. Never let a
+            // result from the old session release the one message held behind
+            // its model transaction into this newly attached conversation.
+            if self
+                .pending_model_selection
+                .as_ref()
+                .is_some_and(|pending| pending.session_id != Some(r.session_id()))
+            {
+                if let Some(pending) = self.pending_model_selection.take() {
+                    tracing::warn!(
+                        old_session_id = ?pending.session_id,
+                        new_session_id = %r.session_id(),
+                        selection_id = %pending.selection_id,
+                        provider = %pending.provider,
+                        model = %pending.model,
+                        trigger = ?pending.trigger,
+                        generation = pending.minimum_generation,
+                        "model selection cancelled by session replacement"
+                    );
+                }
+                self.push_plain(
+                    "Model selection was cancelled by session replacement; your draft was kept."
+                        .to_string(),
+                );
+            }
             let live_btw_fork = r.btw_fork.clone();
             self.reset_display_attach_backoff();
             // In daemonless mode this runner spawned our own ephemeral

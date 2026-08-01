@@ -1538,14 +1538,49 @@ pub(super) async fn run_worker(
                     }
                 }
                 SessionWork::SetActiveModel {
+                    selection_id,
+                    selection_deadline,
                     provider,
                     model,
+                    persist_as_default,
                     trigger,
                     reasoning_effort,
                     thinking_mode,
                     prompt_cache_retention,
                 } => {
+                    if std::time::Instant::now() >= selection_deadline {
+                        send_current_session_event(
+                            &session,
+                            &event_tx,
+                            &redaction,
+                            proto::Event::ModelSelectionResult {
+                                session_id,
+                                selection_id,
+                                provider,
+                                model,
+                                reasoning_effort,
+                                thinking_mode,
+                                prompt_cache_retention,
+                                outcome: proto::ModelSelectionOutcome::Rejected {
+                                    user_message: "Model selection timed out before the daemon could apply it; retry from /model.".to_string(),
+                                    diagnostic_code: "model_selection_deadline_exceeded".to_string(),
+                                },
+                            },
+                            NoticeSource::DaemonDirect,
+                        );
+                        tracing::warn!(
+                            %session_id,
+                            %selection_id,
+                            "model selection deadline expired before driver dispatch"
+                        );
+                        continue;
+                    }
                     active_model_for_toggles = (provider.clone(), model.clone());
+                    let rejected_provider = provider.clone();
+                    let rejected_model = model.clone();
+                    let rejected_reasoning_effort = reasoning_effort.clone();
+                    let rejected_thinking_mode = thinking_mode.clone();
+                    let rejected_prompt_cache_retention = prompt_cache_retention.clone();
                     // Mid-session model switch (implementation note):
                     // route the new `(provider, model)` to the running driver. The
                     // driver owns the whole daemon-side transaction: build first,
@@ -1554,11 +1589,19 @@ pub(super) async fn run_worker(
                     // config/session drift (for example an on-disk edit while the
                     // session is live) is reported back to every attached client
                     // instead of being silently reconciled here.
-                    if !send_driver_control_or_fail(
+                    let terminal_claimed =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+                    let sent = send_driver_control_or_fail(
                         &driver_control_tx,
-                        crate::engine::driver::DriverControl::SetActiveModel {
+                        crate::engine::driver::DriverControl::SetActiveModelWithDeadline {
+                            selection_id,
+                            deadline: selection_deadline,
+                            terminal_claimed: terminal_claimed.clone(),
+                            completion: completion_tx,
                             provider,
                             model,
+                            persist_as_default,
                             trigger,
                             reasoning_effort,
                             thinking_mode,
@@ -1570,8 +1613,54 @@ pub(super) async fn run_worker(
                         session_id,
                         &mut driver_failed,
                     )
-                    .await
+                    .await;
+                    let failure = if !sent {
+                        Some((
+                            "The daemon driver stopped before it could apply the model selection. Retry from /model.",
+                            "model_selection_driver_unavailable",
+                        ))
+                    } else {
+                        match tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(selection_deadline),
+                            &mut completion_rx,
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => None,
+                            Ok(Err(_)) => Some((
+                                "The daemon driver stopped before it could apply the model selection. Retry from /model.",
+                                "model_selection_driver_unavailable",
+                            )),
+                            Err(_) => Some((
+                                "Model selection timed out before the daemon could apply it; retry from /model.",
+                                "model_selection_deadline_exceeded",
+                            )),
+                        }
+                    };
+                    if let Some((user_message, diagnostic_code)) = failure
+                        && !terminal_claimed.swap(true, std::sync::atomic::Ordering::AcqRel)
                     {
+                        send_current_session_event(
+                            &session,
+                            &event_tx,
+                            &redaction,
+                            proto::Event::ModelSelectionResult {
+                                session_id,
+                                selection_id,
+                                provider: rejected_provider,
+                                model: rejected_model,
+                                reasoning_effort: rejected_reasoning_effort,
+                                thinking_mode: rejected_thinking_mode,
+                                prompt_cache_retention: rejected_prompt_cache_retention,
+                                outcome: proto::ModelSelectionOutcome::Rejected {
+                                    user_message: user_message.to_string(),
+                                    diagnostic_code: diagnostic_code.to_string(),
+                                },
+                            },
+                            NoticeSource::DaemonDirect,
+                        );
+                    }
+                    if !sent {
                         break WorkerStop::DriverFailed;
                     }
                 }

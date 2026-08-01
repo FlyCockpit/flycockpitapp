@@ -187,11 +187,30 @@ pub enum DriverControl {
     /// model. Breaking the prompt cache is expected (new model = new cache
     /// key). On an unconfigured/bad target it **fails loudly** via
     /// [`TurnEvent::Notice`] and keeps the current model active (never a silent
-    /// no-op). The daemon-owned transaction writes the session row and config
-    /// after a successful build; failures restore the prior live model.
+    /// no-op). The daemon-owned transaction always writes the session row and
+    /// writes config only when `persist_as_default` explicitly requests a
+    /// future-session default; failures restore the prior live model.
     SetActiveModel {
+        selection_id: uuid::Uuid,
         provider: String,
         model: String,
+        persist_as_default: bool,
+        trigger: crate::session::ModelSwitchTrigger,
+        reasoning_effort: Option<String>,
+        thinking_mode: Option<String>,
+        prompt_cache_retention: Option<crate::config::providers::PromptCacheRetention>,
+    },
+    /// Production selection lifecycle: the worker awaits `completion` until
+    /// the fixed deadline, while `terminal_claimed` guarantees exactly one
+    /// terminal result across timeout and driver completion.
+    SetActiveModelWithDeadline {
+        selection_id: uuid::Uuid,
+        deadline: std::time::Instant,
+        terminal_claimed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        completion: tokio::sync::oneshot::Sender<()>,
+        provider: String,
+        model: String,
+        persist_as_default: bool,
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<String>,
@@ -3364,8 +3383,10 @@ impl Driver {
                 self.set_max_primary_rounds(max_rounds);
             }
             DriverControl::SetActiveModel {
+                selection_id,
                 provider,
                 model,
+                persist_as_default,
                 trigger,
                 reasoning_effort,
                 thinking_mode,
@@ -3384,7 +3405,56 @@ impl Driver {
                     }),
                     prompt_cache_retention,
                 };
-                self.set_active_model_live(target, trigger, tx).await;
+                let _ = self
+                    .set_active_model_live(
+                        selection_id,
+                        target,
+                        persist_as_default,
+                        None,
+                        None,
+                        trigger,
+                        tx,
+                    )
+                    .await;
+            }
+            DriverControl::SetActiveModelWithDeadline {
+                selection_id,
+                deadline,
+                terminal_claimed,
+                completion,
+                provider,
+                model,
+                persist_as_default,
+                trigger,
+                reasoning_effort,
+                thinking_mode,
+                prompt_cache_retention,
+            } => {
+                let target = crate::config::providers::ActiveModelRef {
+                    provider,
+                    model,
+                    reasoning_effort: reasoning_effort
+                        .map(|value| crate::config::providers::ActiveReasoningEffort { value }),
+                    thinking_mode: thinking_mode.and_then(|value| {
+                        serde_json::from_value::<crate::config::providers::ThinkingMode>(
+                            serde_json::Value::String(value),
+                        )
+                        .ok()
+                    }),
+                    prompt_cache_retention,
+                };
+                let _ = self
+                    .set_active_model_live(
+                        selection_id,
+                        target,
+                        persist_as_default,
+                        Some(deadline),
+                        Some(&terminal_claimed),
+                        trigger,
+                        tx,
+                    )
+                    .await;
+                let _ = completion.send(());
             }
         }
     }

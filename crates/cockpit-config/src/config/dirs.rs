@@ -148,13 +148,23 @@ pub fn config_file_paths_for_load(cwd: &Path) -> Vec<PathBuf> {
         && !path.is_empty()
     {
         let path = PathBuf::from(path);
-        if crate::config::trust::project_config_allowed(path.parent().unwrap_or(Path::new(""))) {
+        if explicit_config_write_allowed(&path) {
             return vec![path];
         }
         return Vec::new();
     }
 
     file_paths_for_load(cwd, CONFIG_FILE)
+}
+
+fn explicit_config_write_allowed(path: &Path) -> bool {
+    let parent = path.parent().unwrap_or(Path::new(""));
+    // Only conventional project `.cockpit/config.json` requires workspace trust.
+    if parent.file_name().is_some_and(|name| name == ".cockpit") {
+        crate::config::trust::project_config_write_allowed(parent)
+    } else {
+        true
+    }
 }
 
 /// `providers/<provider-id>.json` write target for a runtime mutation that
@@ -169,9 +179,7 @@ pub fn config_write_target_for_provider(cwd: &Path, provider_id: &str) -> Option
         && !path.is_empty()
     {
         let path = PathBuf::from(path);
-        if !crate::config::trust::project_config_write_allowed(
-            path.parent().unwrap_or(Path::new("")),
-        ) {
+        if !explicit_config_write_allowed(&path) {
             return None;
         }
         return crate::config::providers::provider_file_path_for_config(&path, provider_id).ok();
@@ -200,9 +208,7 @@ pub fn most_specific_config_write_target(cwd: &Path) -> Option<PathBuf> {
         && !path.is_empty()
     {
         let path = PathBuf::from(path);
-        if crate::config::trust::project_config_write_allowed(
-            path.parent().unwrap_or(Path::new("")),
-        ) {
+        if explicit_config_write_allowed(&path) {
             return Some(path);
         }
         return None;

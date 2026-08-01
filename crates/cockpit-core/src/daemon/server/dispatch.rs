@@ -996,8 +996,10 @@ pub(super) async fn handle_serialized_request(
         Request::ListModels { provider } => list_models(ctx, state, provider.as_deref()).await,
 
         Request::SetActiveModel {
+            selection_id,
             provider,
             model,
+            persist_as_default,
             trigger,
             reasoning_effort,
             thinking_mode,
@@ -1006,8 +1008,12 @@ pub(super) async fn handle_serialized_request(
             let att = require_attached(state)?;
             att.handle
                 .send_work(SessionWork::SetActiveModel {
+                    selection_id,
+                    selection_deadline: std::time::Instant::now()
+                        + std::time::Duration::from_secs(60),
                     provider,
                     model,
+                    persist_as_default,
                     trigger: active_model_trigger_from_proto(trigger),
                     reasoning_effort,
                     thinking_mode,

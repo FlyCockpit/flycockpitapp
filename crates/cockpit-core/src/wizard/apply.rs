@@ -960,11 +960,16 @@ mod tests {
         let home_provider = write_model_wizard_provider_at(&home_config);
         std::fs::write(&project_config, "{}").unwrap();
 
-        let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, &project).unwrap();
-        let mut run = WizardRun::new(descriptor).unwrap();
-        submit_model_wizard_until_save(&mut run, vec!["images"], vec![]);
-
-        let saved = apply_model_answers(&project, &run).unwrap();
+        let policy = trust_policy_for(
+            &project,
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        );
+        let saved = crate::config::trust::with_workspace_trust_policy(policy, || {
+            let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, &project).unwrap();
+            let mut run = WizardRun::new(descriptor).unwrap();
+            submit_model_wizard_until_save(&mut run, vec!["images"], vec![]);
+            apply_model_answers(&project, &run).unwrap()
+        });
 
         assert_eq!(saved.as_deref(), Some(home_provider.as_path()));
         let home_cfg = ConfigDoc::load(&home_config).unwrap().providers();
@@ -1011,11 +1016,16 @@ mod tests {
         )
         .unwrap();
 
-        let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, &project).unwrap();
-        let mut run = WizardRun::new(descriptor).unwrap();
-        submit_model_wizard_until_save(&mut run, vec!["images"], vec![]);
-
-        let saved = apply_model_answers(&project, &run).unwrap();
+        let policy = trust_policy_for(
+            &project,
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        );
+        let saved = crate::config::trust::with_workspace_trust_policy(policy, || {
+            let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, &project).unwrap();
+            let mut run = WizardRun::new(descriptor).unwrap();
+            submit_model_wizard_until_save(&mut run, vec!["images"], vec![]);
+            apply_model_answers(&project, &run).unwrap()
+        });
 
         assert_eq!(saved.as_deref(), Some(project_provider.as_path()));
         assert_eq!(

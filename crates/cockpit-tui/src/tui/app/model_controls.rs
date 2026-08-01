@@ -176,71 +176,10 @@ impl App {
         }
     }
 
-    pub(super) fn open_config_drift_dialog(&mut self) {
-        let can_switch = self
-            .config_drift
-            .as_ref()
-            .and_then(ConfigDriftState::config_active_model)
-            .is_some();
-        self.footer_selection = None;
-        self.footer_agent_picker = None;
-        self.footer_mode_picker = None;
-        self.overlay = Overlay::ConfigDrift(
-            crate::tui::config_drift_dialog::ConfigDriftDialog::new(can_switch),
-        );
-    }
-
-    pub(super) fn apply_config_drift_action(
-        &mut self,
-        action: crate::tui::config_drift_dialog::ConfigDriftAction,
-    ) {
-        self.overlay = Overlay::None;
-        match action {
-            crate::tui::config_drift_dialog::ConfigDriftAction::SwitchToConfig => {
-                if let Some(active) = self
-                    .config_drift
-                    .as_ref()
-                    .and_then(ConfigDriftState::config_active_model)
-                {
-                    self.notify_active_model_selected(
-                        active,
-                        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
-                    );
-                }
-            }
-            crate::tui::config_drift_dialog::ConfigDriftAction::KeepSession => {}
-            crate::tui::config_drift_dialog::ConfigDriftAction::OpenPicker => {
-                self.open_model_picker();
-            }
-        }
-    }
-
     pub(super) fn refresh_config_drift_surfaces(&mut self) {
-        if !self.launch.active_model_diverged {
-            if matches!(self.overlay, Overlay::ConfigDrift(_)) {
-                self.overlay = Overlay::None;
-            }
-            if let Overlay::ModelPicker(picker) = &mut self.overlay {
-                picker.set_config_drift(None);
-            }
-            return;
-        }
-
         let drift = self.model_picker_drift();
         if let Overlay::ModelPicker(picker) = &mut self.overlay {
             picker.set_config_drift(drift);
-        }
-        let can_switch = self
-            .config_drift
-            .as_ref()
-            .and_then(ConfigDriftState::config_active_model)
-            .is_some();
-        if let Overlay::ConfigDrift(dialog) = &mut self.overlay
-            && dialog.can_switch() != can_switch
-        {
-            self.overlay = Overlay::ConfigDrift(
-                crate::tui::config_drift_dialog::ConfigDriftDialog::new(can_switch),
-            );
         }
     }
 
@@ -356,20 +295,40 @@ impl App {
 
     pub(super) fn close_model_picker(&mut self, accepted: bool) {
         let selected = match std::mem::take(&mut self.overlay) {
-            Overlay::ModelPicker(picker) if accepted => picker.selected_active_model(),
+            Overlay::ModelPicker(picker) if accepted => picker
+                .selected_active_model()
+                .map(|active| (active, picker.persists_as_default())),
             other => {
                 self.overlay = other;
                 None
             }
         };
         self.overlay = Overlay::None;
-        if let Some(active) = selected {
-            let line = format!("Selected model: {}/{}", active.provider, active.model);
+        if let Some((active, persist_as_default)) = selected {
+            let provider = active.provider.clone();
+            let model = active.model.clone();
+            let default_error = if persist_as_default {
+                write_active_model_preference(&self.launch.cwd, &active).err()
+            } else {
+                None
+            };
+            let selected_active = active.clone();
             self.notify_active_model_selected(
                 active,
                 cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
             );
-            self.push_plain(line);
+            if let Some(error) = default_error {
+                self.push_plain(format!("Selected model for this session: {provider}/{model}; default was not updated: {error}"));
+            } else if persist_as_default {
+                self.config_snapshot.providers.active_model = Some(selected_active);
+                self.push_plain(format!(
+                    "Selected model for this session and as default: {provider}/{model}"
+                ));
+            } else {
+                self.push_plain(format!(
+                    "Selected model for this session only: {provider}/{model}"
+                ));
+            }
         }
     }
 

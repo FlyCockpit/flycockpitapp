@@ -49,7 +49,6 @@ pub fn status_line_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
 pub enum FooterControl {
     Agent,
     Model,
-    ConfigDrift,
     Mode,
 }
 
@@ -141,26 +140,6 @@ pub fn left_status(
             start,
             end: col,
         });
-        if info.active_model_diverged {
-            push_span(&mut spans, &mut col, Span::styled(" ".to_string(), muted));
-            let drift_start = col;
-            push_span(
-                &mut spans,
-                &mut col,
-                Span::styled(
-                    "model ≠ config".to_string(),
-                    selected_style(
-                        Style::default().fg(WARNING_TEXT),
-                        selected == Some(FooterControl::ConfigDrift),
-                    ),
-                ),
-            );
-            hits.push(FooterHit {
-                control: FooterControl::ConfigDrift,
-                start: drift_start,
-                end: col,
-            });
-        }
     }
 
     push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
@@ -469,13 +448,12 @@ mod tests {
     }
 
     #[test]
-    fn config_drift_status_copy_renders_when_diverged() {
+    fn left_status_never_renders_model_config_drift_badge() {
         let mut info = launch_info("Build");
         info.active_model_diverged = true;
-
-        let spans = left_status(
+        let text = left_status(
             &info,
-            LlmMode::Defensive,
+            LlmMode::Normal,
             std::slice::from_ref(&info.agent_name),
             None,
             SandboxMode::Sandbox,
@@ -483,102 +461,12 @@ mod tests {
             false,
             true,
         )
-        .spans;
-
-        let text = spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert_eq!(
-            text,
-            "Build · openai/gpt-test model ≠ config · defensive · sandbox"
-        );
-        let drift_idx = spans
-            .iter()
-            .position(|span| span.content == "model ≠ config")
-            .expect("drift span rendered");
-        assert!(drift_idx > 0, "drift span must have a separator");
-        let separator = &spans[drift_idx - 1];
-        assert_eq!(separator.content, " ");
-        assert_eq!(separator.style.fg, Some(Color::Indexed(MUTED_COLOR_INDEX)));
-        assert!(!spans.iter().any(|span| span.content == " model ≠ config"));
-        assert!(!spans.iter().any(|span| span.content == " != config"));
-
-        info.active_model_diverged = false;
-        let spans = left_status(
-            &info,
-            LlmMode::Defensive,
-            std::slice::from_ref(&info.agent_name),
-            None,
-            SandboxMode::Sandbox,
-            true,
-            false,
-            true,
-        )
-        .spans;
-        assert!(!spans.iter().any(|span| span.content == "model ≠ config"));
-        assert!(!spans.iter().any(|span| span.content == " "));
-        assert!(!spans.iter().any(|span| span.content == " model ≠ config"));
-        assert!(!spans.iter().any(|span| span.content == " != config"));
-    }
-
-    #[test]
-    fn config_drift_underline_excludes_leading_separator() {
-        let mut info = launch_info("Build");
-        info.active_model_diverged = true;
-
-        let status = left_status(
-            &info,
-            LlmMode::Defensive,
-            std::slice::from_ref(&info.agent_name),
-            Some(FooterControl::ConfigDrift),
-            SandboxMode::Sandbox,
-            true,
-            false,
-            true,
-        );
-        let drift_idx = status
-            .spans
-            .iter()
-            .position(|span| span.content == "model ≠ config")
-            .expect("drift span rendered");
-        let drift = &status.spans[drift_idx];
-        let separator = &status.spans[drift_idx - 1];
-
-        assert_eq!(separator.content, " ");
-        assert_eq!(separator.style.fg, Some(Color::Indexed(MUTED_COLOR_INDEX)));
-        assert!(
-            !separator
-                .style
-                .add_modifier
-                .contains(ratatui::style::Modifier::UNDERLINED)
-        );
-        assert!(
-            !separator
-                .style
-                .add_modifier
-                .contains(ratatui::style::Modifier::BOLD)
-        );
-        assert!(
-            drift
-                .style
-                .add_modifier
-                .contains(ratatui::style::Modifier::UNDERLINED)
-        );
-        assert!(
-            drift
-                .style
-                .add_modifier
-                .contains(ratatui::style::Modifier::BOLD)
-        );
-
-        let hit = status
-            .hits
-            .iter()
-            .find(|hit| hit.control == FooterControl::ConfigDrift)
-            .expect("config drift hit");
-        assert_eq!(hit.end - hit.start, drift.width() as u16);
-        assert_eq!(drift.width(), 14);
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+        assert!(!text.contains("model ≠ config"), "{text}");
+        assert!(!text.contains("!= config"), "{text}");
     }
 
     #[test]

@@ -165,13 +165,7 @@ impl App {
             .question_dialog
             .as_ref()
             .map(|d| d.desired_height())
-            .unwrap_or_else(|| {
-                if matches!(self.overlay, Overlay::ConfigDrift(_)) {
-                    crate::tui::config_drift_dialog::DIALOG_HEIGHT
-                } else {
-                    0
-                }
-            });
+            .unwrap_or_else(|| 0);
         PaneGeometry::compute(
             self.input_height(),
             self.indicator_lines(),

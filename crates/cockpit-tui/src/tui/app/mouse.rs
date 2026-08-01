@@ -257,7 +257,6 @@ impl App {
                 return;
             }
             Overlay::ModelPicker(_)
-            | Overlay::ConfigDrift(_)
             | Overlay::Multireview(_)
             | Overlay::Usage(_)
             | Overlay::Resources(_)
@@ -309,10 +308,6 @@ impl App {
             })
         {
             self.selection = None;
-            if hit.control == crate::tui::chrome::FooterControl::ConfigDrift {
-                self.open_config_drift_dialog();
-                return;
-            }
             let already_selected = self.footer_selection == Some(hit.control);
             self.footer_selection = Some(hit.control);
             self.footer_agent_picker = None;
@@ -321,7 +316,6 @@ impl App {
                 match hit.control {
                     crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
                     crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
-                    crate::tui::chrome::FooterControl::ConfigDrift => {}
                     crate::tui::chrome::FooterControl::Mode => self.open_footer_mode_picker(),
                 }
             }
@@ -653,10 +647,7 @@ impl App {
             || self.daemon_prompt.is_some()
             || self.context_menu.is_some()
             || self.keys_overlay.is_some()
-            || matches!(
-                self.overlay,
-                Overlay::ModelPicker(_) | Overlay::ConfigDrift(_)
-            )
+            || matches!(self.overlay, Overlay::ModelPicker(_))
             || self.footer_agent_picker.is_some()
             || self.footer_mode_picker.is_some()
             || matches!(

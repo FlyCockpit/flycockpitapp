@@ -456,14 +456,6 @@ impl App {
                 }
                 return false;
             }
-            Overlay::ConfigDrift(mut dialog) => {
-                if let Some(action) = dialog.handle_key(key) {
-                    self.apply_config_drift_action(action);
-                } else {
-                    self.overlay = Overlay::ConfigDrift(dialog);
-                }
-                return false;
-            }
             Overlay::Multireview(mut dialog) => {
                 let should_close = dialog.handle_key(key);
                 let kickoff = dialog.take_done();
@@ -829,7 +821,6 @@ impl App {
                 match selected {
                     crate::tui::chrome::FooterControl::Agent => self.footer_cycle_agent(),
                     crate::tui::chrome::FooterControl::Model => self.cycle_footer_model(false),
-                    crate::tui::chrome::FooterControl::ConfigDrift => {}
                     crate::tui::chrome::FooterControl::Mode => {
                         self.set_footer_llm_mode(App::previous_llm_mode(self.llm_mode));
                     }
@@ -840,7 +831,6 @@ impl App {
                 match selected {
                     crate::tui::chrome::FooterControl::Agent => self.footer_cycle_agent(),
                     crate::tui::chrome::FooterControl::Model => self.cycle_footer_model(true),
-                    crate::tui::chrome::FooterControl::ConfigDrift => {}
                     crate::tui::chrome::FooterControl::Mode => {
                         self.set_footer_llm_mode(self.llm_mode.cycled());
                     }
@@ -853,9 +843,6 @@ impl App {
                     crate::tui::chrome::FooterControl::Model => {
                         self.footer_selection = None;
                         self.open_model_picker();
-                    }
-                    crate::tui::chrome::FooterControl::ConfigDrift => {
-                        self.open_config_drift_dialog();
                     }
                     crate::tui::chrome::FooterControl::Mode => {
                         self.open_footer_mode_picker();
@@ -2633,7 +2620,6 @@ impl App {
                     | Overlay::Permissions(_)
                     | Overlay::Resources(_)
                     | Overlay::Quick(_)
-                    | Overlay::ConfigDrift(_)
                     | Overlay::Context(_)
                     | Overlay::Diff(_)
             )

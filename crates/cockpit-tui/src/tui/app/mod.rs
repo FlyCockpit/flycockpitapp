@@ -983,7 +983,6 @@ pub(super) enum Overlay {
     #[default]
     None,
     ModelPicker(crate::tui::model_picker::ModelPickerDialog),
-    ConfigDrift(crate::tui::config_drift_dialog::ConfigDriftDialog),
     Multireview(crate::tui::multireview_dialog::MultireviewDialog),
     Stats(crate::tui::stats_pane::StatsPane),
     Usage(crate::tui::usage_pane::UsagePane),
@@ -1008,7 +1007,6 @@ impl Overlay {
     pub(super) fn dialog_height(&self) -> u16 {
         match self {
             Self::ModelPicker(_) => crate::tui::model_picker::DIALOG_HEIGHT,
-            Self::ConfigDrift(_) => 0,
             Self::Quick(_) => 14,
             Self::Multireview(_) => crate::tui::multireview_dialog::DIALOG_HEIGHT,
             _ => 0,
@@ -1020,7 +1018,6 @@ impl Overlay {
         match self {
             Self::None => None,
             Self::ModelPicker(_) => Some(KeyContext::ModelPicker),
-            Self::ConfigDrift(_) => Some(KeyContext::ModelPicker),
             Self::Multireview(_) => Some(KeyContext::Settings),
             Self::Sessions(_) => Some(KeyContext::Sessions),
             Self::Permissions(_) => Some(KeyContext::Permissions),

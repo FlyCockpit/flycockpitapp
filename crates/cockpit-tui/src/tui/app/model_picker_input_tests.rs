@@ -11,6 +11,15 @@ fn press(code: KeyCode) -> KeyEvent {
     }
 }
 
+fn ctrl_press(code: KeyCode) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::CONTROL,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::empty(),
+    }
+}
+
 fn write_config(path: &std::path::Path) {
     fs::write(path, "{}").unwrap();
     let provider_path =
@@ -53,6 +62,78 @@ fn model_picker_selection_closes_without_local_config_write() {
         .providers()
         .active_model;
     assert_eq!(active, None);
+}
+
+#[test]
+fn model_picker_session_and_default_writes_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let cockpit = tmp.path().join("config").join("cockpit");
+    fs::create_dir_all(&cockpit).unwrap();
+    let config_path = cockpit.join("config.json");
+    write_config(&config_path);
+    let mut app = App::new(Some(tmp.path()), false);
+    app.daemon_prompt = None;
+    let mut picker = crate::tui::model_picker::ModelPickerDialog::open_with_failures(
+        cockpit_config::providers::ConfigDoc::load(&config_path)
+            .unwrap()
+            .providers(),
+        None,
+        &app.usage_models,
+        &Default::default(),
+        chrono::Utc::now().timestamp(),
+    )
+    .unwrap();
+    assert!(picker.handle_key(ctrl_press(KeyCode::Enter)));
+    app.overlay = Overlay::ModelPicker(picker);
+    app.close_model_picker(true);
+    assert!(
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("session and as default")),
+        "history: {:?}",
+        app.history.last()
+    );
+    let active = cockpit_config::providers::ConfigDoc::providers_from_paths(
+        &cockpit_config::dirs::config_file_paths_for_load(tmp.path()),
+    )
+    .active_model
+    .unwrap();
+    assert_eq!(
+        (active.provider.as_str(), active.model.as_str()),
+        ("p", "a")
+    );
+    assert_eq!(app.usage_models.get("p/a"), Some(&1));
+    assert!(
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("session and as default"))
+    );
+}
+
+#[test]
+fn model_picker_default_write_failure_still_applies_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let source = tempfile::tempdir().unwrap();
+    let source_config = source.path().join("config.json");
+    write_config(&source_config);
+    _env.set_cockpit_config(&tmp.path().join("missing.json"));
+    let mut app = App::new(Some(tmp.path()), false);
+    app.daemon_prompt = None;
+    let mut picker = crate::tui::model_picker::ModelPickerDialog::open_with_failures(
+        cockpit_config::providers::ConfigDoc::load(&source_config)
+            .unwrap()
+            .providers(),
+        None,
+        &app.usage_models,
+        &Default::default(),
+        chrono::Utc::now().timestamp(),
+    )
+    .unwrap();
+    assert!(picker.handle_key(ctrl_press(KeyCode::Enter)));
+    app.overlay = Overlay::ModelPicker(picker);
+    app.close_model_picker(true);
+    assert_eq!(app.usage_models.get("p/a"), Some(&1));
+    assert!(
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("default was not updated"))
+    );
 }
 
 #[test]
@@ -189,41 +270,6 @@ fn config_drift_state_retains_config_model_fields() {
     let drift = app.config_drift.as_ref().expect("drift state retained");
     assert_eq!(drift.config_label(), "config-p/config-m");
     assert_eq!(app.session_model_label(), "session-p/session-m");
-}
-
-#[test]
-fn config_drift_resolution_autocloses_dialog() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let cockpit = tmp.path().join(".cockpit");
-    fs::create_dir(&cockpit).unwrap();
-    write_config(&cockpit.join("config.json"));
-
-    let mut app = App::new(Some(tmp.path()), false);
-    app.daemon_prompt = None;
-    app.apply_event(cockpit_core::engine::TurnEvent::ActiveModelState {
-        provider: "session-p".to_string(),
-        model: "session-m".to_string(),
-        config_provider: Some("p".to_string()),
-        config_model: Some("a".to_string()),
-        diverged: true,
-        generation: 2,
-    });
-    app.open_config_drift_dialog();
-    assert!(matches!(app.overlay, Overlay::ConfigDrift(_)));
-
-    app.apply_event(cockpit_core::engine::TurnEvent::ActiveModelState {
-        provider: "p".to_string(),
-        model: "a".to_string(),
-        config_provider: Some("p".to_string()),
-        config_model: Some("a".to_string()),
-        diverged: false,
-        generation: 3,
-    });
-
-    assert!(!app.launch.active_model_diverged);
-    assert!(app.config_drift.is_none());
-    assert!(matches!(app.overlay, Overlay::None));
 }
 
 #[test]

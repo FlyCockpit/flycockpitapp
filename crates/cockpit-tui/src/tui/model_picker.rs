@@ -57,6 +57,7 @@ pub struct ModelPickerDialog {
     step: Step,
     error: Option<String>,
     done: bool,
+    persist_as_default: bool,
     row_hits: Vec<Option<RowHit>>,
 }
 
@@ -275,6 +276,7 @@ impl ModelPickerDialog {
             step: Step::Pick,
             error: None,
             done: false,
+            persist_as_default: false,
             row_hits: Vec::new(),
         })
     }
@@ -396,6 +398,8 @@ impl ModelPickerDialog {
                         active.reasoning_effort,
                         active.thinking_mode,
                         active.prompt_cache_retention,
+                        key.modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL),
                     );
                 }
                 let entry_cursor = self.pick.cursor().saturating_sub(drift_offset);
@@ -424,6 +428,8 @@ impl ModelPickerDialog {
                             None,
                             None,
                             None,
+                            key.modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL),
                         );
                     } else {
                         let modes = entry.thinking_modes.clone();
@@ -487,7 +493,15 @@ impl ModelPickerDialog {
                 let mode = modes.get(*cursor).copied();
                 let p = provider_id.clone();
                 let m = model_id.clone();
-                return self.commit_active_model(p, m, None, mode, None);
+                return self.commit_active_model(
+                    p,
+                    m,
+                    None,
+                    mode,
+                    None,
+                    key.modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL),
+                );
             }
             _ => {}
         }
@@ -523,7 +537,15 @@ impl ModelPickerDialog {
                     });
                 let p = provider_id.clone();
                 let m = model_id.clone();
-                return self.commit_active_model(p, m, effort, None, None);
+                return self.commit_active_model(
+                    p,
+                    m,
+                    effort,
+                    None,
+                    None,
+                    key.modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL),
+                );
             }
             _ => {}
         }
@@ -537,6 +559,7 @@ impl ModelPickerDialog {
         reasoning_effort: Option<ActiveReasoningEffort>,
         thinking_mode: Option<ThinkingMode>,
         prompt_cache_retention: Option<PromptCacheRetention>,
+        persist_as_default: bool,
     ) -> bool {
         self.cfg.active_model = Some(ActiveModelRef {
             provider: provider_id,
@@ -545,8 +568,13 @@ impl ModelPickerDialog {
             thinking_mode,
             prompt_cache_retention,
         });
+        self.persist_as_default = persist_as_default;
         self.done = true;
         true
+    }
+
+    pub fn persists_as_default(&self) -> bool {
+        self.done && self.persist_as_default
     }
 
     pub fn selected_active_model(&self) -> Option<ActiveModelRef> {
@@ -569,9 +597,15 @@ impl ModelPickerDialog {
             Step::ChooseReasoning { .. } => self.render_reasoning(frame, layout[0]),
         }
         let help = match &self.step {
-            Step::Pick => "type to filter  ↑/↓ or Ctrl+n/Ctrl+p  enter: pick  esc: cancel",
-            Step::ChooseThinking { .. } => "↑/↓  enter: confirm  ←: back  esc: cancel",
-            Step::ChooseReasoning { .. } => "↑/↓  enter: confirm  ←: back  esc: cancel",
+            Step::Pick => {
+                "type to filter  ↑/↓ or Ctrl+n/Ctrl+p  enter: session  Ctrl+enter: session + default  esc: cancel"
+            }
+            Step::ChooseThinking { .. } => {
+                "↑/↓  enter: session  Ctrl+enter: session + default  ←: back  esc: cancel"
+            }
+            Step::ChooseReasoning { .. } => {
+                "↑/↓  enter: session  Ctrl+enter: session + default  ←: back  esc: cancel"
+            }
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -1115,6 +1149,15 @@ mod tests {
         }
     }
 
+    fn ctrl_press(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
     fn empty_dialog() -> ModelPickerDialog {
         // Build a dialog with no entries — exercises only key routing.
         ModelPickerDialog {
@@ -1127,6 +1170,7 @@ mod tests {
             step: Step::Pick,
             error: None,
             done: false,
+            persist_as_default: false,
             row_hits: Vec::new(),
         }
     }
@@ -1238,6 +1282,7 @@ mod tests {
             step: Step::Pick,
             error: None,
             done: false,
+            persist_as_default: false,
             row_hits: Vec::new(),
         }
     }
@@ -1253,6 +1298,7 @@ mod tests {
             step: Step::Pick,
             error: None,
             done: false,
+            persist_as_default: false,
             row_hits: Vec::new(),
         }
     }
@@ -1286,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    fn config_drift_model_picker_banner_parity() {
+    fn model_picker_can_switch_session_to_config_model() {
         let mut normal = dialog_with(vec![entry("a")]);
         let rendered = rendered_text(&mut normal, 100, 20);
         assert!(!rendered.contains("This session is running"), "{rendered}");
@@ -1492,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_selection_closes_and_marks_done() {
+    fn model_picker_session_only_does_not_write_config() {
         let tmp = tempfile::tempdir().unwrap();
         let cockpit = tmp.path().join(".cockpit");
         fs::create_dir(&cockpit).unwrap();
@@ -1517,6 +1563,32 @@ mod tests {
         assert_eq!(active.model, "a");
         let saved = ConfigDoc::load(&config_path).unwrap().providers();
         assert_eq!(saved.active_model, None);
+    }
+
+    #[test]
+    fn model_picker_ctrl_enter_marks_selection_for_default_write() {
+        let mut dialog = dialog_with(vec![entry("a")]);
+        assert!(dialog.handle_key(ctrl_press(KeyCode::Enter)));
+        assert!(dialog.persists_as_default());
+    }
+
+    #[test]
+    fn model_picker_help_mentions_session_and_default() {
+        let mut dialog = dialog_with(vec![entry("a")]);
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| dialog.render(frame, frame.area()))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("session"));
+        assert!(text.contains("default"));
     }
 
     #[test]
@@ -1717,6 +1789,7 @@ mod tests {
             step: Step::Pick,
             error: None,
             done: false,
+            persist_as_default: false,
             row_hits: Vec::new(),
         }
     }

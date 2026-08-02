@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! UI-free application layer for Cockpit.
 //!
 //! This crate owns the reusable session, daemon, engine, tools, auth,

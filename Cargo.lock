@@ -965,7 +965,6 @@ dependencies = [
  "csv",
  "dirs",
  "dotenvy",
- "firecrawl",
  "flycockpit-relay-protocol",
  "futures",
  "globset",
@@ -2168,9 +2167,9 @@ checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 
 [[package]]
 name = "firecrawl"
-version = "2.11.0"
+version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "818a1faba82b5070b71728810488273e4e7fe466e64d7542572abbbbf3b118c5"
+checksum = "ea59c3089ef7141efda017bc7bc9714bbf58f5958bfe87a123bb4aee1a6da3b5"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
